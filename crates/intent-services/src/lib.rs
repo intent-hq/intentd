@@ -119,7 +119,7 @@ pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
     cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
-    migrate_default_vocabulary, InMemorySecretStore, SecretStore,
+    migrate_default_vocabulary, migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -950,8 +950,6 @@ impl Services {
     /// settings-derived provider shared across every specialist, so a
     /// specialist pinned to another provider (frontmatter `codingAgent` or a
     /// compound `model` prefix) still shows the default it actually pins.
-    /// `is_background = true` matches `agent.delegate` always marking its
-    /// children background, so `backgroundAgents.*` settings apply here too.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -1002,7 +1000,6 @@ impl Services {
                         Some(id),
                         workspace_path,
                         Some(&provider),
-                        true,
                     ),
                     options,
                 })
@@ -5328,9 +5325,7 @@ fn specialist_preview_provider(services: &Services, provider: Option<String>) ->
 /// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
 /// so the preview matches what a no-model create would actually pin. Both
 /// fields are omitted when resolution yields the provider CLI default
-/// (clients render "Provider default"). Previews are context-free
-/// (`is_background = false`), so the background-only `backgroundAgents.*`
-/// settings steps do not apply.
+/// (clients render "Provider default").
 fn decorate_specialist_resolved(
     services: &Services,
     def: &mut serde_json::Value,
@@ -5344,13 +5339,9 @@ fn decorate_specialist_resolved(
     else {
         return;
     };
-    let Some(model) = agent_ops::resolve_agent_default_model(
-        services,
-        Some(&id),
-        workspace_path,
-        Some(provider),
-        false,
-    ) else {
+    let Some(model) =
+        agent_ops::resolve_agent_default_model(services, Some(&id), workspace_path, Some(provider))
+    else {
         return;
     };
     if let Some(obj) = def.as_object_mut() {

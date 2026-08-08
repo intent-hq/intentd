@@ -4889,13 +4889,11 @@ async fn specialist_model_options_default_honors_specialist_coding_agent_overrid
     );
 }
 
-/// Delegated agents are always background (`agent.delegate` sets
-/// `metadata.isBackground: true`), so the hint's default must apply
-/// `backgroundAgents.typeOverrides`/`defaultModel` — matching what a real
-/// delegate to this specialist actually pins (PR #958 review: the preview
-/// previously passed `is_background: false`, hiding these settings).
+/// monorepo#1729: the quick-action model settings are scoped to single-shot
+/// quick actions, so the delegation hint's default must ignore them and show
+/// the settings default a real delegate would actually pin.
 #[tokio::test]
-async fn specialist_model_options_default_honors_background_agent_settings() {
+async fn specialist_model_options_default_ignores_quick_action_settings() {
     let dir = TempSpecialistsDir::new();
     dir.write(
         "chooser",
@@ -4905,11 +4903,14 @@ async fn specialist_model_options_default_honors_background_agent_settings() {
     services
         .settings_registry()
         .expect("registry wired")
-        .apply(&[(
-            "backgroundAgents.typeOverrides".to_string(),
-            json!({ "chooser": "auggie:background-model" }),
-        )])
-        .expect("set background type override");
+        .apply(&[
+            (
+                "quickActions.typeOverrides".to_string(),
+                json!({ "chooser": "auggie:quick-action-model" }),
+            ),
+            ("model.default".to_string(), json!("auggie:settings-model")),
+        ])
+        .expect("set quick-action type override + default model");
 
     let listed = services.specialist_model_options(None);
     let chooser = listed
@@ -4918,9 +4919,8 @@ async fn specialist_model_options_default_honors_background_agent_settings() {
         .expect("chooser listed");
     assert_eq!(
         chooser.default_model.as_deref(),
-        Some("auggie:background-model"),
-        "background-agent type override must apply since agent.delegate always \
-         creates background agents"
+        Some("auggie:settings-model"),
+        "quick-action type override must not apply to a delegated specialist"
     );
 }
 

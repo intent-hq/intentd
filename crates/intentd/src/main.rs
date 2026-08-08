@@ -735,6 +735,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         intent_services::SettingsRegistry::load(&config.config_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
+    // One-time carry-over of the renamed `[backgroundAgents]` table into the
+    // `quickActions.*` keys (monorepo#1729), before the legacy import below
+    // discards and strips it. Unset quick-action keys inherit the old value;
+    // already-set ones are left alone.
+    intent_services::migrate_quick_action_settings(&settings_registry)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time legacy handling: retired keys still present in config.toml
     // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
     // captured by the load above; import any that still have a catalog entry

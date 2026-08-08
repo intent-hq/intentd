@@ -48,7 +48,7 @@ use crate::error::{Error, Result};
 pub struct SettingsFile {
     pub providers: ProvidersSettings,
     pub model: ModelSettings,
-    pub background_agents: BackgroundAgentsSettings,
+    pub quick_actions: QuickActionsSettings,
     pub specialists: SpecialistsSettings,
     pub workspace: WorkspaceSettings,
     pub git: GitSettings,
@@ -101,15 +101,20 @@ pub struct ModelSettings {
     pub default_reasoning_effort: Option<String>,
 }
 
-/// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
+/// `[quickActions]` — model config for single-shot quick actions
+/// (`quickActions.*`): commit messages, PR descriptions, quick tasks. These
+/// keys never apply to interactive or delegated agent sessions
+/// (monorepo#1729); the group was named `backgroundAgents` before that
+/// rename (see [`LEGACY_SETTINGS_PATHS`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct BackgroundAgentsSettings {
-    /// `backgroundAgents.defaultModel` — model for background agents.
+pub struct QuickActionsSettings {
+    /// `quickActions.defaultModel` — model for quick actions.
     pub default_model: Option<String>,
-    /// `backgroundAgents.typeOverrides` — per-agent-type model overrides.
+    /// `quickActions.typeOverrides` — per-quick-action model overrides
+    /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
-    /// `backgroundAgents.providerSettings` — per-provider background settings
+    /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
 }
@@ -775,12 +780,16 @@ where
 /// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
 /// discarded (no catalog entry remains) and stripped from the file.
 /// `workspace.autoFetch` is likewise retired outright (the periodic-fetch
-/// feature was removed) — discarded and stripped.
+/// feature was removed) — discarded and stripped. `backgroundAgents` covers
+/// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
+/// values are migrated into the `quickActions.*` keys at boot and the table is
+/// then stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
     "server.listenMode",
     "workspace.autoFetch",
+    "backgroundAgents",
 ];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
@@ -993,12 +1002,13 @@ providerDefaults = {}
 # value is provider-defined and stored as-is, and a blank value means unset.
 # defaultReasoningEffort = "high"
 
-[backgroundAgents]
-# Background default model -- model for background agents.
+[quickActions]
+# Quick action default model -- model for single-shot quick actions (commit
+# messages, PR descriptions, quick tasks); never applied to agent sessions.
 # defaultModel = "claude-sonnet-4-5"
-# Background type overrides -- per-agent-type model overrides.
+# Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
-# Background provider settings -- per-provider background settings.
+# Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 
 [specialists]
@@ -1238,7 +1248,7 @@ mod tests {
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
         assert_eq!(d.model.default_reasoning_effort, None);
-        assert!(d.background_agents.provider_settings.is_empty());
+        assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert!(d.mcp.enable_user_servers);
@@ -1474,7 +1484,7 @@ mod tests {
     #[test]
     fn provider_maps_and_lists_parse() {
         let parsed = SettingsFile::parse_str(
-            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[backgroundAgents.providerSettings.claude-code]\nmode = \"fast\"\n",
+            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[quickActions.providerSettings.claude-code]\nmode = \"fast\"\n",
         )
         .unwrap();
         assert_eq!(parsed.providers.active.as_deref(), Some("claude-code"));
@@ -1491,7 +1501,7 @@ mod tests {
             Some(vec!["https://app.example.com".to_string()])
         );
         assert!(parsed
-            .background_agents
+            .quick_actions
             .provider_settings
             .contains_key("claude-code"));
     }

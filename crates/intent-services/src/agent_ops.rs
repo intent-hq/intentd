@@ -147,46 +147,23 @@ mod tests_settings_default_effort;
 
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
-/// was removed in monorepo#1000):
-/// 1. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
-/// 2. `model.providerDefaults[resolved provider]`
-/// 3. `model.default`
-/// 4. None → CLI default (current behavior, last resort)
+/// was removed in monorepo#1000; the background-agent tier was removed in
+/// monorepo#1729 — the renamed `quickActions.*` keys scope to single-shot
+/// quick actions and never to agent sessions, delegated ones included):
+/// 1. `model.providerDefaults[resolved provider]`
+/// 2. `model.default`
+/// 3. None → CLI default (current behavior, last resort)
 ///
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
 fn resolve_default_model_from_settings(
     services: &Services,
-    is_background: bool,
-    agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. For background/delegated agents, check type-specific override, then default
-    if is_background {
-        // 1a. Check agent type override
-        if let Some(typ) = agent_type {
-            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
-                if !model.is_empty() {
-                    return Some(model.clone());
-                }
-            }
-        }
-
-        // 1b. Check background agents default
-        if let Some(model) = settings
-            .background_agents
-            .default_model
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            return Some(model.to_string());
-        }
-    }
-
-    // 2. Check provider defaults. With no explicit provider, key the lookup
+    // 1. Check provider defaults. With no explicit provider, key the lookup
     // by the settings-derived default (model.default prefix, else
     // providers.active), bottoming out at the first registered provider.
     let derived;
@@ -204,12 +181,12 @@ fn resolve_default_model_from_settings(
         }
     }
 
-    // 3. Check global default
+    // 2. Check global default
     if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
         return Some(model.to_string());
     }
 
-    // 4. None → CLI default (session.model stays None)
+    // 3. None → CLI default (session.model stays None)
     None
 }
 
@@ -243,29 +220,21 @@ pub(crate) enum DefaultModelSource {
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
-/// 3. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+/// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
 /// 4. `None` → provider CLI default (`session.model` stays unset).
 ///
-/// The `specialist` id doubles as the `agent_type` for the settings chain's
-/// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
-/// when `None`, that tier is skipped and the chain falls through to
-/// `backgroundAgents.defaultModel` / `model.default`.
+/// The chain is background-agnostic (monorepo#1729): the quick-action model
+/// settings apply to single-shot quick actions only, so a delegated
+/// specialist resolves the provider default exactly like an interactive
+/// session does.
 pub(crate) fn resolve_agent_default_model(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
     provider: Option<&str>,
-    is_background: bool,
 ) -> Option<String> {
-    resolve_agent_default_model_with_source(
-        services,
-        specialist,
-        workspace_path,
-        provider,
-        is_background,
-    )
-    .0
+    resolve_agent_default_model_with_source(services, specialist, workspace_path, provider).0
 }
 
 /// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
@@ -276,7 +245,6 @@ pub(crate) fn resolve_agent_default_model_with_source(
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
     provider: Option<&str>,
-    is_background: bool,
 ) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
@@ -317,9 +285,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
-    let Some(m) =
-        resolve_default_model_from_settings(services, is_background, specialist, provider)
-    else {
+    let Some(m) = resolve_default_model_from_settings(services, provider) else {
         return (None, DefaultModelSource::CliDefault);
     };
     if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
@@ -2376,7 +2342,6 @@ impl Services {
                 specialist.as_deref(),
                 spec_wp.as_deref(),
                 provider.as_deref(),
-                is_background,
             ),
         };
 
@@ -5390,8 +5355,6 @@ impl Services {
                 input.specialist.as_deref(),
                 workspace_path.as_deref(),
                 delegate_provider.as_deref(),
-                // Delegated children are always background agents.
-                true,
             )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
@@ -7611,21 +7574,13 @@ impl Services {
         // Same effective-model rule as `agent.delegate`: fall through to the
         // full default-model resolution (specialist pin, then the settings
         // chain) so a `modelOptions` entry keyed on the settings default
-        // model is still matched. `is_background` mirrors what
-        // `build_create_metadata` will persist (default `true`).
+        // model is still matched.
         let effort_model = model.clone().or_else(|| {
-            let is_background = create_opts
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("isBackground"))
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
             resolve_agent_default_model(
                 self,
                 specialist.as_deref(),
                 workspace_path.as_deref(),
                 provider.as_deref(),
-                is_background,
             )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
