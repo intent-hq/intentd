@@ -591,6 +591,14 @@ pub struct Services {
     /// coalescing tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_status_scan_probe`.
     git_status_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Single-flight registry for the full `accept-changes.getStatus` build
+    /// (monorepo#1693 Finding B), keyed by workspace id: concurrent callers
+    /// for one workspace coalesce onto a single blocking-pool
+    /// `build_git_status_value_with` run and share its result, on top of the
+    /// working-tree scan coalescing `git_status_cache` already provides.
+    /// Coalescing only — no cache/TTL, so a call after the flight settles
+    /// always runs a fresh build. Shared across clones.
+    ac_status_inflight: Arc<ac_status_singleflight::AcStatusSingleFlight>,
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
@@ -718,6 +726,7 @@ impl Services {
             git_diffs_walk_probe: None,
             git_status_cache: Arc::new(git_status_cache::GitStatusCache::new()),
             git_status_scan_probe: None,
+            ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
             hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
@@ -1226,6 +1235,13 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn git_status_waiters(&self, worktree: &Path) -> usize {
         self.git_status_cache.waiters(worktree)
+    }
+
+    /// Test seam: number of followers currently awaiting the in-flight full
+    /// `accept-changes.getStatus` build for `workspace_id`.
+    #[cfg(test)]
+    pub(crate) fn ac_status_waiters(&self, workspace_id: &WorkspaceId) -> usize {
+        self.ac_status_inflight.waiters(workspace_id)
     }
 
     /// Test-only: rebuild the status cache with a compressed fallback TTL so
@@ -20527,28 +20543,80 @@ impl Services {
         if ws.is_remote {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
-        match git_ops::worktree_path(&ws) {
-            Some(worktree) => {
-                // The working-tree scan is the cost `git.status` also pays, so
-                // take it through the shared per-worktree single-flight
-                // (monorepo#1648) and hand the result to the builder. The
-                // remaining libgit2 work (remote/trunk resolve, ahead/behind,
-                // bounded history walk) still runs per call, on the blocking
-                // pool so a slow repo cannot stall other RPCs.
-                let scanned = if worktree.join(".git").exists() {
-                    Some(self.scan_git_status(&worktree).await?)
-                } else {
-                    None
-                };
-                tokio::task::spawn_blocking(move || {
-                    accept_changes::build_git_status_value_with(&worktree, &ws, scanned)
-                })
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
-                })?
+        let Some(worktree) = git_ops::worktree_path(&ws) else {
+            return Ok(accept_changes::minimal_status_value(&ws, &trunk));
+        };
+        // Concurrent `accept-changes.getStatus` calls for the same workspace
+        // coalesce onto one full build (monorepo#1693 Finding B): the
+        // working-tree scan already single-flights per worktree
+        // (monorepo#1648), but the remaining per-call work — remote/trunk
+        // resolve, ahead/behind, bounded history walk — used to still run
+        // once per concurrent caller. The leader runs scan + build; followers
+        // await the shared result over the workspace-keyed flight.
+        let inflight = Arc::clone(&self.ac_status_inflight);
+        loop {
+            match inflight.join(&workspace_id) {
+                ac_status_singleflight::Join::Leader(guard) => {
+                    let scanned = if worktree.join(".git").exists() {
+                        match self.scan_git_status(&worktree).await {
+                            Ok(scanned) => Some(scanned),
+                            Err(e) => {
+                                guard.finish(Err(match &e {
+                                    Error::Internal(msg) => msg.clone(),
+                                    other => other.to_string(),
+                                }));
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let build_worktree = worktree.clone();
+                    let build_ws = ws.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        accept_changes::build_git_status_value_with(
+                            &build_worktree,
+                            &build_ws,
+                            scanned,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
+                    })?;
+                    return match result {
+                        Ok(value) => {
+                            guard.finish(Ok(Arc::new(value.clone())));
+                            Ok(value)
+                        }
+                        Err(e) => {
+                            guard.finish(Err(match &e {
+                                Error::Internal(msg) => msg.clone(),
+                                other => other.to_string(),
+                            }));
+                            Err(e)
+                        }
+                    };
+                }
+                ac_status_singleflight::Join::Follower(mut rx) => {
+                    tracing::debug!(
+                        workspace_id = %workspace_id.as_str(),
+                        "accept-changes.getStatus: coalesced into identical in-flight build"
+                    );
+                    match rx.wait_for(|slot| slot.is_some()).await {
+                        Ok(slot) => {
+                            return match slot.clone().expect("wait_for guarantees Some") {
+                                Ok(shared) => Ok((*shared).clone()),
+                                Err(msg) => Err(Error::Internal(msg)),
+                            };
+                        }
+                        // The leader vanished without publishing (cancelled
+                        // RPC / panicked build): retry — the next join elects
+                        // a new leader.
+                        Err(_) => continue,
+                    }
+                }
             }
-            None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }
 
@@ -22170,6 +22238,7 @@ pub mod skills;
 mod specialists;
 
 // Code Changes Review modules (§17).
+mod ac_status_singleflight;
 mod accept_changes;
 pub mod diffs;
 pub mod file_tracking;
