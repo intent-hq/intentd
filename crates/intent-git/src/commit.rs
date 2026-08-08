@@ -17,6 +17,7 @@ use git2::{Commit, Repository, Tree};
 use intent_core::{Error, Result};
 
 use crate::map_git_err;
+use crate::submodule::reject_submodule_internal_paths;
 
 /// Error message returned when the staged tree matches the parent commit exactly
 /// (nothing to commit). Public so auto-commit can recognize this benign skip condition.
@@ -93,6 +94,12 @@ pub fn commit_paths_with_trailers(
 ) -> Result<CommitOutcome> {
     let body = build_commit_message(message, agent_id, linked_note_id);
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    // Refuse any path strictly inside a registered submodule BEFORE any index
+    // mutation (monorepo#1714): a rejected batch leaves the in-memory tree
+    // build below untouched, and since the post-commit index refresh loop
+    // iterates the same `paths`, it can never re-add a submodule-internal
+    // path either. The gitlink path itself (a pin bump) is unaffected.
+    reject_submodule_internal_paths(&repo, paths)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
@@ -392,6 +399,112 @@ mod tests {
         assert!(
             st.files.iter().all(|f| f.path != "gone.txt"),
             "deletion committed: {st:?}"
+        );
+    }
+
+    #[test]
+    fn commit_paths_rejects_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("commit-sub-child");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("commit-sub-parent");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        let head_before = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        let err = commit_paths_with_trailers(
+            dir.path(),
+            "flatten sub",
+            Some("agent-1"),
+            None,
+            &["sub/a.txt".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+
+        // HEAD did not advance, and the gitlink + on-disk index are intact.
+        let head_after = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+        assert_eq!(head_before, head_after, "no commit must have been made");
+        let st = crate::status::status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| f.path != "sub/a.txt"),
+            "submodule-internal path must not be staged/committed: {st:?}"
+        );
+    }
+
+    #[test]
+    fn commit_paths_gitlink_pin_bump_succeeds() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("commit-sub-child-pin");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("commit-sub-parent-pin");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        // Advance the submodule's checked-out commit so the gitlink in the
+        // parent's worktree/index differs from HEAD's recorded gitlink.
+        commit_file(&dir.path().join("sub"), "b.txt", "b\n");
+
+        let out = commit_paths_with_trailers(
+            dir.path(),
+            "bump sub pin",
+            Some("agent-1"),
+            None,
+            &["sub".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.files, vec!["sub".to_string()]);
+    }
+
+    #[test]
+    fn commit_paths_mixed_list_with_submodule_internal_errors_without_committing() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("commit-sub-child-mixed");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("commit-sub-parent-mixed");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        let head_before = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+
+        write_file(dir.path(), "normal.txt", "normal\n");
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        let err = commit_paths_with_trailers(
+            dir.path(),
+            "mixed",
+            Some("agent-1"),
+            None,
+            &["normal.txt".to_string(), "sub/a.txt".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+
+        let head_after = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+        assert_eq!(head_before, head_after, "no commit must have been made");
+        // `normal.txt` must not have been committed or staged either — the
+        // whole batch is rejected atomically, before any index mutation.
+        let st = crate::status::status(dir.path()).unwrap();
+        let normal = st
+            .files
+            .iter()
+            .find(|f| f.path == "normal.txt")
+            .expect("normal.txt still present as an uncommitted change");
+        assert!(
+            !normal.staged,
+            "normal.txt must not have been staged either: {st:?}"
         );
     }
 

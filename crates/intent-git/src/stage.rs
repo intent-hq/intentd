@@ -14,10 +14,16 @@ use git2::{ObjectType, Repository};
 use intent_core::{Error, Result};
 
 use crate::map_git_err;
+use crate::submodule::reject_submodule_internal_paths;
 
-/// Stage `paths` (already split and validated) in the worktree.
+/// Stage `paths` (already split and validated) in the worktree. Refuses any
+/// path strictly inside a registered submodule (parity with `git add`'s
+/// "is in submodule" pathspec error) before touching the index, so a caller
+/// can never flatten a submodule's gitlink into the superproject
+/// (monorepo#1714). Staging the gitlink path itself (a pin bump) is unaffected.
 pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    reject_submodule_internal_paths(&repo, paths)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
@@ -427,6 +433,48 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = stage(dir.path(), &["nope.txt".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("did not match any files"));
+    }
+
+    #[test]
+    fn stage_rejects_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        // Dirty a file *inside* the submodule's own worktree.
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        let err = stage(dir.path(), &["sub/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // Nothing was staged: index still has the gitlink, not blobs.
+        let st = status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| f.path != "sub/a.txt"),
+            "submodule-internal path must not be staged: {st:?}"
+        );
+    }
+
+    #[test]
+    fn stage_gitlink_path_itself_succeeds() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-pin");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-pin");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        // Bump the submodule's checked-out commit (simulating a pointer bump)
+        // by re-pointing the submodule's worktree to a different commit via a
+        // fresh commit inside the submodule.
+        commit_file(&dir.path().join("sub"), "b.txt", "b\n");
+        // Staging the gitlink path itself (not a path inside it) must succeed.
+        stage(dir.path(), &["sub".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "sub");
+        assert!(f.is_some() && f.unwrap().staged, "gitlink pin bump staged");
     }
 
     #[test]

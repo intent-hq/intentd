@@ -9,7 +9,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use git2::{FileMode, Repository, TreeWalkMode, TreeWalkResult};
 use intent_core::{Error, Result};
+
+use crate::map_git_err;
 
 /// Wall-clock bound for `git submodule update`. Chosen below the service-layer
 /// `GIT_PULL_TIMEOUT` (120s) so the submodule-update child is killed cleanly
@@ -89,6 +92,100 @@ pub(crate) fn update_submodules_with_timeout(
 /// `.gitmodules` file in the worktree root.
 pub fn has_submodules(worktree_path: &Path) -> bool {
     worktree_path.join(".gitmodules").exists()
+}
+
+/// The set of registered submodule (gitlink) paths in `repo`, worktree-relative
+/// with forward-slash separators. Guards a `commit_paths_with_trailers`/`stage`
+/// caller from ever flattening a submodule into the superproject (monorepo#1714):
+/// a path strictly inside one of these is refused before it reaches
+/// `index.add_path`, while the gitlink path itself (a pin bump) stays allowed.
+///
+/// Collected from three sources, unioned defensively since no single one is
+/// complete on its own:
+/// - the HEAD tree (filemode `160000` / [`FileMode::Commit`] entries) — covers
+///   a submodule already committed even if `.gitmodules` was later deleted;
+/// - the on-disk index (same filemode check) — covers a submodule staged for
+///   removal or add that HEAD does not yet reflect;
+/// - [`Repository::submodules`] (`.gitmodules` + config) — the backstop for a
+///   submodule registered but not yet committed anywhere.
+pub fn submodule_paths(repo: &Repository) -> Result<std::collections::BTreeSet<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    let commit_mode = i32::from(FileMode::Commit);
+
+    if let Ok(head) = repo.head() {
+        if let Some(oid) = head.target() {
+            if let Ok(commit) = repo.find_commit(oid) {
+                let tree = commit.tree().map_err(map_git_err)?;
+                tree.walk(TreeWalkMode::PreOrder, |root, entry| {
+                    if entry.filemode() == commit_mode {
+                        if let Ok(name) = entry.name() {
+                            paths.insert(format!("{root}{name}"));
+                        }
+                    }
+                    TreeWalkResult::Ok
+                })
+                .map_err(map_git_err)?;
+            }
+        }
+    }
+
+    let index = repo.index().map_err(map_git_err)?;
+    let commit_mode_u32 = u32::from(FileMode::Commit);
+    for entry in index.iter() {
+        if entry.mode == commit_mode_u32 {
+            paths.insert(String::from_utf8_lossy(&entry.path).to_string());
+        }
+    }
+
+    if let Ok(submodules) = repo.submodules() {
+        for sm in submodules {
+            paths.insert(sm.path().to_string_lossy().to_string());
+        }
+    }
+
+    Ok(paths)
+}
+
+/// When `rel_path` lies strictly inside one of `submodules`, returns the
+/// containing submodule path; `None` when `rel_path` names the submodule
+/// itself (a pin-bump commit/stage target, always allowed) or is unrelated.
+pub fn submodule_containing<'a>(
+    submodules: &'a std::collections::BTreeSet<String>,
+    rel_path: &str,
+) -> Option<&'a str> {
+    let target = Path::new(rel_path);
+    for sm in submodules {
+        let sm_path = Path::new(sm);
+        if target == sm_path {
+            continue;
+        }
+        if let Ok(rest) = target.strip_prefix(sm_path) {
+            if !rest.as_os_str().is_empty() {
+                return Some(sm.as_str());
+            }
+        }
+    }
+    None
+}
+
+/// Refuse any of `paths` that lies strictly inside a registered submodule,
+/// with a message naming the offending path and its containing submodule
+/// (parity with real `git add`'s "is in submodule" pathspec error). Callers
+/// invoke this once, before any index mutation, so a rejected batch leaves
+/// the index and HEAD untouched.
+pub fn reject_submodule_internal_paths(repo: &Repository, paths: &[String]) -> Result<()> {
+    let submodules = submodule_paths(repo)?;
+    if submodules.is_empty() {
+        return Ok(());
+    }
+    for raw in paths {
+        if let Some(sm) = submodule_containing(&submodules, raw) {
+            return Err(Error::Internal(format!(
+                "fatal: Pathspec '{raw}' is in submodule '{sm}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {
