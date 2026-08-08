@@ -7,10 +7,9 @@
 //! ([`Store::get_agent_session_message_projections`]): a bounded aggregate
 //! `COUNT` over `agent_message` joined to every session in the workspace,
 //! plus the persisted last-user/assistant preview columns (monorepo#958,
-//! 0066) with the per-agent `heal_session_preview_columns` fallback. Bounded,
-//! but still a full-workspace aggregate repeated for every workspace on each
-//! focus burst; on large workspaces it dominates a post-focus `sample(1)` of
-//! intentd.
+//! 0066). Bounded, but still a full-workspace aggregate repeated for every
+//! workspace on each focus burst; on large workspaces it dominates a
+//! post-focus `sample(1)` of intentd.
 //!
 //! Session metadata (`list_agent_session_summaries`) stays uncached so
 //! status/name edits stay live. Only the message projection map is cached.
