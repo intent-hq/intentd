@@ -785,3 +785,62 @@ jobs:
           test "$(dpkg-deb --field intentd_0.0.0_amd64.deb Architecture)" = amd64
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/bin/intentd$'
           dpkg-deb --contents intentd_0.0.0_amd64.deb | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+
+  # Single required status check for branch protection / the merge queue: fans
+  # in check, build, coverage-e2e, coverage-all, pr-title, conflict-markers,
+  # and deb-packaging (ported from cloudlands-fe's "CI Gate" pattern — see
+  # packages/cloudlands-fe/.github/workflows/intent-pr.yml). check / build /
+  # deb-packaging must succeed outright: none of the three carries an
+  # event-gated `if`, so a skip there is itself a failure signal (and a route
+  # failure already propagates into check/build failing). coverage-e2e /
+  # coverage-all accept success OR skipped — they are job-level skipped on
+  # release-fast-path PRs (fast_path == 'true') and on a route failure (see
+  # release-fast-path above), both legitimate. pr-title / conflict-markers
+  # accept success OR skipped since both carry
+  # `if: github.event_name == 'pull_request'` and are legitimately skipped on
+  # push / merge_group runs — requiring strict success there would fail the
+  # gate outside pull_request events.
+  gate:
+    name: CI Gate
+    # Seconds-long job: pinned to ubuntu-latest (see pr-title).
+    runs-on: ubuntu-latest
+    permissions: {}
+    if: always()
+    needs: [check, build, coverage-e2e, coverage-all, pr-title, conflict-markers, deb-packaging]
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.check.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.deb-packaging.result }}" != "success" ]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          case "${{ needs.coverage-e2e.result }}" in
+            success|skipped) ;;
+            *)
+              echo "coverage-e2e did not succeed or skip"
+              exit 1
+              ;;
+          esac
+          case "${{ needs.coverage-all.result }}" in
+            success|skipped) ;;
+            *)
+              echo "coverage-all did not succeed or skip"
+              exit 1
+              ;;
+          esac
+          case "${{ needs.pr-title.result }}" in
+            success|skipped) ;;
+            *)
+              echo "pr-title did not succeed or skip"
+              exit 1
+              ;;
+          esac
+          case "${{ needs.conflict-markers.result }}" in
+            success|skipped) ;;
+            *)
+              echo "conflict-markers did not succeed or skip"
+              exit 1
+              ;;
+          esac
