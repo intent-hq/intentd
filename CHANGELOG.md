@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-08-08
+
+### 🚀 Features
+
+- Ws.pr.monitor — centralized PR monitoring with merge-requirements checklist
+- Provider-neutral agent.completeOnce via ephemeral ACP sessions ([#991](https://github.com/intent-hq/intentd/pull/991))
+- Persist and serve session-discovered reasoning-effort levels ([#992](https://github.com/intent-hq/intentd/pull/992))
+- Cache provider discovery results and prewarm login-shell PATH ([#994](https://github.com/intent-hq/intentd/pull/994))
+
+### 🐛 Bug Fixes
+
+- *(git)* Resolve inherited origin in CoW checkout provisioning ([#996](https://github.com/intent-hq/intentd/pull/996))
+- *(test)* Retry writes in gitignore-suppression e2e under load ([#998](https://github.com/intent-hq/intentd/pull/998))
+
+### 🧪 Testing
+
+- *(services)* Hermetic unit coverage for the unresolvable-adapter unavailable envelope ([#993](https://github.com/intent-hq/intentd/pull/993))
+
+
 ## [0.6.0] - 2026-08-07
 
 ### 🚀 Features
