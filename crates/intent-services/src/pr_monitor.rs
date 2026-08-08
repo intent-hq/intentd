@@ -705,6 +705,7 @@ impl Services {
                 pr_number: pr_number as i64,
                 state: PrMonitorState::Active,
                 last_snapshot: baseline.clone(),
+                baseline_snapshot: baseline.clone(),
                 pending_changes: Vec::new(),
                 pending_since: None,
                 last_change_at: None,
@@ -755,6 +756,7 @@ impl Services {
             .update_pr_monitor_poll(
                 &m.monitor_id,
                 baseline.as_deref(),
+                baseline.as_deref(),
                 &[],
                 None,
                 None,
@@ -767,7 +769,8 @@ impl Services {
         if !updated {
             return Ok(None);
         }
-        m.last_snapshot = baseline;
+        m.last_snapshot = baseline.clone();
+        m.baseline_snapshot = baseline;
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
@@ -1111,6 +1114,7 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 baseline.as_deref(),
+                monitor.baseline_snapshot.as_deref(),
                 &pending,
                 pending_since.as_deref(),
                 last_change_at.as_deref(),
@@ -1223,6 +1227,7 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 monitor.last_snapshot.as_deref(),
+                monitor.baseline_snapshot.as_deref(),
                 &[],
                 None,
                 None,
@@ -1262,6 +1267,7 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 monitor.last_snapshot.as_deref(),
+                monitor.baseline_snapshot.as_deref(),
                 &[],
                 None,
                 None,
@@ -1315,6 +1321,7 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 monitor.last_snapshot.as_deref(),
+                monitor.baseline_snapshot.as_deref(),
                 &monitor.pending_changes,
                 monitor.pending_since.as_deref(),
                 monitor.last_change_at.as_deref(),
@@ -2597,6 +2604,7 @@ mod tests {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 held.last_snapshot.as_deref(),
+                held.baseline_snapshot.as_deref(),
                 &held.pending_changes,
                 Some("2020-01-01T00:00:00Z"),
                 Some("2020-01-01T00:00:00Z"),
@@ -2679,6 +2687,7 @@ mod tests {
             pr_number: 42,
             state: PrMonitorState::Active,
             last_snapshot: Some(serde_json::to_string(&snapshot(|_| {})).unwrap()),
+            baseline_snapshot: None,
             pending_changes: Vec::new(),
             pending_since: None,
             last_change_at: None,
