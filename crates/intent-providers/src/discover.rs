@@ -217,6 +217,25 @@ pub fn discover_providers_with_overrides(
         .collect()
 }
 
+/// Resolve a single registered provider's availability by id, applying
+/// `providers.paths` overrides the same way [`discover_providers_with_overrides`]
+/// does. Returns `None` when `provider_id` is not registered. Exposed so
+/// callers that cache per-provider results (the daemon's discovery cache,
+/// keyed by provider id) can resolve one provider without re-walking and
+/// re-resolving the entire registry.
+pub fn provider_availability_for(
+    provider_id: &str,
+    override_path: &dyn Fn(&str) -> Option<String>,
+) -> Option<ProviderAvailability> {
+    let provider = ACP_PROVIDERS.iter().find(|p| p.id == provider_id)?;
+    Some(availability_for(
+        provider,
+        gated_reason(provider),
+        &|id, cmd| find_provider_binary(id, cmd, None),
+        override_path,
+    ))
+}
+
 /// Compute one provider's availability from injected resolvers (test seam —
 /// lets unit tests exercise the override/auto combinations without touching
 /// the real filesystem or `PATH`). `resolve_auto` performs the override-free
