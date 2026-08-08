@@ -11290,6 +11290,56 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     );
 }
 
+/// Unified external-wait classification: an owner-initiated `pr.unmonitor`
+/// (`caller = Some`) delivers no self-wake, so the resettle backstop must
+/// synthesize the child's deferred completion directly — mirrors
+/// `external_hook_cancel_settles_deferred_watch`'s FE-cancel case but through
+/// the no-wake owner-cancel path instead.
+#[tokio::test]
+async fn owner_pr_unmonitor_settles_deferred_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 55).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle with the monitor active: deferred (marker recorded, watch armed).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // The owner cancels its own monitor (`ws.pr.unmonitor`, no self-wake):
+    // the terminal-transition backstop synthesizes the child's completion
+    // directly and the deferred watch fires.
+    svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&child))
+        .await
+        .expect("cancel monitor");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "deferred watch fires when the owner cancels its last active monitor"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("completed"),
+        "parent got the completion wake: {text}"
+    );
+}
+
 /// Unified external-wait classification at rehydration: a rehydrated watch on
 /// a child that is idle WITH an active PR monitor must not refire at boot —
 /// reconciliation defers to the child's genuine completion, mirroring
