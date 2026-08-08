@@ -10,7 +10,10 @@
 //! file is read once ([`process_config_change`], the testable core):
 //!
 //! - self-writes (the daemon's own `settings.update` write-back) are skipped
-//!   via the registry's content-hash guard,
+//!   via the registry's content-hash guard, which matches any *recent*
+//!   self-write — so a stale or coalesced read observing an earlier
+//!   write-back during a rapid write burst is skipped too, never adopted as
+//!   an external edit,
 //! - valid content is adopted through [`SettingsRegistry::reload`] (pins keep
 //!   winning; registry subscribers are notified) and the `on_change` callback
 //!   runs so the composition root can apply server runtime hooks and emit
@@ -284,6 +287,54 @@ mod tests {
             ReloadOutcome::SelfWrite
         ));
         assert!(!rx.has_changed().expect("sender alive"));
+        assert_eq!(reg.get("rtk.enabled"), Some(json!(true)));
+    }
+
+    #[test]
+    fn stale_read_of_an_earlier_self_write_is_suppressed() {
+        let (_dir, reg) = temp_registry(None);
+        reg.apply(&[("rtk.enabled".to_string(), json!(false))])
+            .expect("apply A");
+        let write_a = std::fs::read_to_string(reg.config_path()).expect("read A");
+        reg.apply(&[("rtk.enabled".to_string(), json!(true))])
+            .expect("apply B");
+        let rx = reg.subscribe();
+        // A debounced/coalesced watcher read observing the file at write A's
+        // bytes (stale read across the atomic rename) must be skipped as a
+        // self-write, not adopted as an external edit.
+        std::fs::write(reg.config_path(), &write_a).expect("rewrite as A");
+        assert!(matches!(
+            process_config_change(&reg),
+            ReloadOutcome::SelfWrite
+        ));
+        // In-memory values stay at write B's state; no notification.
+        assert_eq!(reg.get("rtk.enabled"), Some(json!(true)));
+        assert!(!rx.has_changed().expect("sender alive"));
+    }
+
+    #[test]
+    fn manual_revert_after_adopted_external_edit_applies() {
+        let (_dir, reg) = temp_registry(None);
+        reg.apply(&[("rtk.enabled".to_string(), json!(true))])
+            .expect("apply");
+        let self_written = std::fs::read_to_string(reg.config_path()).expect("read");
+        // A genuine external edit (novel bytes) still live-reloads…
+        std::fs::write(reg.config_path(), "[rtk]\nenabled = false\n").expect("edit");
+        match process_config_change(&reg) {
+            ReloadOutcome::Applied(notice) => {
+                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}")
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        // …and once adopted it supersedes the self-write history: a manual
+        // revert to the earlier self-written bytes is external, not skipped.
+        std::fs::write(reg.config_path(), &self_written).expect("revert");
+        match process_config_change(&reg) {
+            ReloadOutcome::Applied(notice) => {
+                assert!(notice.changed.contains("rtk.enabled"), "{notice:?}")
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
         assert_eq!(reg.get("rtk.enabled"), Some(json!(true)));
     }
 
