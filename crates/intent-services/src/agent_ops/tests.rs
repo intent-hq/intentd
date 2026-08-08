@@ -10721,6 +10721,41 @@ async fn seed_active_hook(
     hook
 }
 
+/// Seed one ACTIVE PR-monitor row owned by `agent` directly in the store —
+/// the idle-visibility lookups read persisted monitor rows, so no poll loop
+/// is needed. Mirrors [`seed_active_hook`] for the pr-monitor-waiting
+/// classification.
+async fn seed_active_pr_monitor(
+    svc: &Services,
+    ws: &WorkspaceId,
+    agent: &AgentId,
+    pr_number: i64,
+) -> intent_core::PrMonitor {
+    let now = now_iso();
+    let monitor = intent_core::PrMonitor {
+        monitor_id: intent_core::PrMonitorId::new(),
+        workspace_id: ws.clone(),
+        agent_id: agent.clone(),
+        repo_owner: "acme".to_string(),
+        repo_name: "widgets".to_string(),
+        pr_number,
+        state: intent_core::PrMonitorState::Active,
+        last_snapshot: None,
+        pending_changes: Vec::new(),
+        pending_since: None,
+        last_change_at: None,
+        last_polled_at: None,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    svc.store()
+        .insert_pr_monitor(&monitor)
+        .await
+        .expect("insert pr monitor");
+    monitor
+}
+
 /// Idle-visibility deferral (a)+(b): a watched child going idle while owning
 /// an active hook delivers NO wake and the watch STAYS ARMED; the child's
 /// later idle with no active hooks fires the watch exactly once as a normal
@@ -10993,6 +11028,159 @@ async fn immediate_wake_paths_ignore_active_hooks() {
     );
 }
 
+/// Unified external-wait classification: a watched child going idle while
+/// owning an active PR monitor delivers NO wake and the watch STAYS ARMED,
+/// mirroring `hook_waiting_idle_defers_watch_until_hookless_idle` exactly;
+/// once the monitor is cancelled, the child's next idle is its real
+/// completion and the watch fires exactly once.
+#[tokio::test]
+async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle while the monitor is active: deferred — no wake, watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake while the child waits on its PR monitor"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed through the deferred idle"
+    );
+
+    // The monitor completes (terminal) and the wake turn ends: the next idle
+    // is the child's real completion — the watch fires once.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Completed,
+            &now_iso(),
+        )
+        .await
+        .expect("complete monitor");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "PR merged" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retires at the real completion"
+    );
+}
+
+/// Unified external-wait classification in after_all groups: a
+/// pr-monitor-waiting child does NOT count as settled — the sealed group
+/// stays open past its idle — and settles with one aggregated wake once the
+/// monitor resolves, mirroring `after_all_group_waits_for_hook_waiting_child`.
+#[tokio::test]
+async fn after_all_group_waits_for_pr_monitor_waiting_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 7).await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // Child idles while its PR monitor is active: NOT recorded as settled.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    // Parent idles: the group seals but stays open — the pr-monitor-waiting
+    // child is unsettled, so no aggregated wake fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "sealed group waits for the pr-monitor-waiting child"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The monitor is cancelled and the child's wrap-up idle ends
+    // monitorless: the group records the real completion and fires exactly
+    // one wake.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Cancelled,
+            &now_iso(),
+        )
+        .await
+        .expect("cancel monitor");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "monitor cancelled, wrapped up" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "grouped watches removed at settlement"
+    );
+}
+
 /// Idle-visibility deferral (e): an external (FE) `hook.cancel` on an idle
 /// child whose watch was deferred fires the deferred watch — the cancel was
 /// the last active hook's terminal transition, and its owner wake +
@@ -11099,6 +11287,117 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
         restarted.find_watches_for_child(&child).len(),
         1,
         "rehydrated watch stays armed for the post-hook completion"
+    );
+}
+
+/// Unified external-wait classification: an owner-initiated `pr.unmonitor`
+/// (`caller = Some`) delivers no self-wake, so the resettle backstop must
+/// synthesize the child's deferred completion directly — mirrors
+/// `external_hook_cancel_settles_deferred_watch`'s FE-cancel case but through
+/// the no-wake owner-cancel path instead.
+#[tokio::test]
+async fn owner_pr_unmonitor_settles_deferred_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 55).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle with the monitor active: deferred (marker recorded, watch armed).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // The owner cancels its own monitor (`ws.pr.unmonitor`, no self-wake):
+    // the terminal-transition backstop synthesizes the child's completion
+    // directly and the deferred watch fires.
+    svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&child))
+        .await
+        .expect("cancel monitor");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "deferred watch fires when the owner cancels its last active monitor"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("completed"),
+        "parent got the completion wake: {text}"
+    );
+}
+
+/// Unified external-wait classification at rehydration: a rehydrated watch on
+/// a child that is idle WITH an active PR monitor must not refire at boot —
+/// reconciliation defers to the child's genuine completion, mirroring
+/// `rehydrated_watch_on_hook_waiting_idle_child_does_not_refire`.
+#[tokio::test]
+async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        seed_active_pr_monitor(&svc, &ws, &child, 99).await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        // The child looks genuinely complete by the STAB-108 predicate
+        // (Completed + report) — only its active PR monitor defers the
+        // refire.
+        let mut s = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::Completed;
+        s.completion_report = Some("waiting on my PR".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+        (parent, child)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &parent).await,
+        0,
+        "no synthetic wake at boot while the child owns an active PR monitor"
+    );
+    assert_eq!(
+        restarted.find_watches_for_child(&child).len(),
+        1,
+        "rehydrated watch stays armed for the post-monitor completion"
     );
 }
 
@@ -12661,6 +12960,132 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
         .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
         .await
         .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1483 regression, PR-monitor variant: a coordinator that owns an
+/// ACTIVE PR monitor still seals its open after_all group when it goes
+/// queue-idle — the pr-monitor-waiting classification defers only the
+/// agent's own settlement as a child, never the parent-side seal. Mirrors
+/// `hook_owning_parent_idle_seals_group_and_wake_delivers`.
+#[tokio::test]
+async fn pr_monitor_owning_parent_idle_seals_group_and_wake_delivers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    seed_active_pr_monitor(&svc, &ws, &parent, 1).await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    // The monitor-owning parent idles: its delegating turn is over, so the
+    // group seals despite the active monitor.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group awaits its child");
+    assert!(
+        group.sealed,
+        "queue-idle seals the group despite the parent's active PR monitor"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The child settles: the sealed + complete group fires exactly one
+    // aggregated wake and is removed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake delivered despite the parent's active PR monitor"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "delivered group removed"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1483 guard, PR-monitor variant: a grouped CHILD going idle while
+/// owning an active PR monitor is still NOT recorded as settled — the seal
+/// gating change is scoped to the parent's own idle, and the sealed group
+/// keeps waiting for the pr-monitor-waiting child's genuine completion.
+/// Mirrors `hook_waiting_child_settlement_still_deferred_after_seal`.
+#[tokio::test]
+async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 2).await;
+
+    // Parent idles: seals the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert!(
+        svc.delegation_group_for_parent(&parent)
+            .expect("group open")
+            .sealed
+    );
+
+    // Child idles while its PR monitor is active: deferred — not recorded,
+    // no fire.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("sealed group still waits for the pr-monitor-waiting child");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "pr-monitor-waiting idle is not recorded as settlement"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The monitor completes; the child's next idle is its real completion —
+    // the group records it and fires exactly one aggregated wake.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Completed,
+            &now_iso(),
+        )
+        .await
+        .expect("complete monitor");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,

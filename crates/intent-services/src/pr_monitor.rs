@@ -730,6 +730,13 @@ impl Services {
         self.pr_monitor_catch_up.lock().unwrap().remove(monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
+        // FE-cancel (no agent caller) wakes the owner with a notice — the
+        // wake runs the deferral backstop itself, inside
+        // `wake_pr_monitor_owner`, after the delivery attempt. Owner-side
+        // cancel (`ws.pr.unmonitor`) delivers no wake, so a deferred
+        // completion watch on the (idle) owner would otherwise never settle
+        // when this was its last active monitor — run the backstop directly,
+        // mirroring `cancel_active_hook`.
         if caller.is_none() {
             let label = monitor_label(&monitor);
             let notice = format!(
@@ -737,6 +744,9 @@ impl Services {
                  report again."
             );
             self.wake_pr_monitor_owner(&monitor, &notice, "cancelled")
+                .await;
+        } else {
+            self.resettle_owner_after_pr_monitor_terminal(&monitor)
                 .await;
         }
         Ok(monitor)
@@ -1126,10 +1136,35 @@ impl Services {
         Ok(resumed)
     }
 
+    /// Idle-visibility deferral backstop (mirrors
+    /// [`Services::resettle_owner_after_hook_terminal`](crate::Services::resettle_owner_after_hook_terminal)):
+    /// after a PR monitor reaches a terminal state, re-run the
+    /// deferred-completion redelivery for the owner. A completion watch on
+    /// an idle owner defers while it owns active PR monitors; the
+    /// wake-carrying transitions (changed/completed/FE-cancel) resolve via
+    /// the owner's wake turn ending, but a terminal transition whose wake
+    /// was not delivered (owner-side `ws.pr.unmonitor` of the last monitor,
+    /// or a failed wake delivery) would otherwise strand the deferred watch
+    /// forever. Routes through
+    /// [`Services::redeliver_completion_after_queue_mutation`], whose guards
+    /// make this a no-op in every other situation.
+    async fn resettle_owner_after_pr_monitor_terminal(&self, monitor: &PrMonitor) {
+        self.redeliver_completion_after_queue_mutation(&monitor.agent_id)
+            .await;
+    }
+
     /// Wake a monitor's owning agent via the automatic-delivery
     /// `agent.sendMessage` path (queued behind an in-flight turn, never
     /// interrupts). Best-effort: a delivery failure is logged, never
     /// propagated — the monitor's own state transition already persisted.
+    ///
+    /// Every wake reason (`changed` / `completed` / `cancelled`) marks a
+    /// terminal-or-progressing monitor transition; `cancelled` and
+    /// `completed` are terminal, so the deferral backstop runs after the
+    /// delivery attempt — a FAILED wake on an idle owner whose last monitor
+    /// just terminated must still settle the owner's deferred completion
+    /// watches (a successful wake makes the backstop a no-op — the
+    /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
         let metadata = json!({
             "type": "pr_monitor_wake",
@@ -1153,6 +1188,9 @@ impl Services {
                 error = %e,
                 "pr monitor owner wake delivery failed"
             );
+        }
+        if reason == "cancelled" || reason == "completed" {
+            self.resettle_owner_after_pr_monitor_terminal(monitor).await;
         }
     }
 
@@ -1261,6 +1299,30 @@ impl Services {
     ) -> Result<Value> {
         let flushed = self.pr_monitor_flush(workspace_id, monitor_id).await?;
         Ok(json!({ "ok": true, "flushed": flushed }))
+    }
+
+    /// Idle-visibility deferral (mirrors
+    /// [`Services::active_hooks_for_agent`](crate::Services::active_hooks_for_agent)):
+    /// the caller's ACTIVE PR monitors, oldest first. Empty when the agent
+    /// owns no active monitor; a store failure is logged and reads as empty
+    /// (visibility is best-effort and must never block an idle emit or wake
+    /// delivery).
+    pub(crate) async fn active_pr_monitors_for_agent(&self, agent_id: &AgentId) -> Vec<PrMonitor> {
+        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "active-pr-monitors lookup failed; pr-monitor-waiting reads as empty"
+                );
+                return Vec::new();
+            }
+        };
+        monitors
+            .into_iter()
+            .filter(|m| m.state == PrMonitorState::Active)
+            .collect()
     }
 
     /// The per-turn snapshot's `prMonitors` field: one
