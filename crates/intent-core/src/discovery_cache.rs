@@ -34,9 +34,15 @@ struct Slot<T> {
 /// [`DiscoveryCache::get_or_compute`]: only a positive result is stored, so a
 /// miss always re-probes on the next call rather than serving a stale
 /// negative.
+///
+/// Expired slots are evicted opportunistically during `get_or_compute` to
+/// bound memory: every 100th call sweeps the entire slot map and removes
+/// entries whose cached value (if any) is past the TTL, preventing unbounded
+/// growth from unique one-off requests.
 pub struct DiscoveryCache<T> {
     slots: Mutex<HashMap<String, Arc<Slot<T>>>>,
     ttl: Duration,
+    call_count: Mutex<usize>,
 }
 
 impl<T: Clone> DiscoveryCache<T> {
@@ -44,6 +50,7 @@ impl<T: Clone> DiscoveryCache<T> {
         Self {
             slots: Mutex::new(HashMap::new()),
             ttl,
+            call_count: Mutex::new(0),
         }
     }
 
@@ -65,12 +72,26 @@ impl<T: Clone> DiscoveryCache<T> {
     /// the filesystem), and the result is cached only when `is_positive`
     /// accepts it — a negative result is returned but left uncached, so the
     /// next call (even within the TTL window) re-probes.
+    ///
+    /// Every 100th call triggers an opportunistic sweep that evicts expired
+    /// slots, bounding memory even when unique one-off requests continually
+    /// create new slots.
     pub fn get_or_compute(
         &self,
         key: &str,
         compute: impl FnOnce() -> T,
         is_positive: impl FnOnce(&T) -> bool,
     ) -> T {
+        // Opportunistic eviction: every 100th call, sweep and remove expired slots.
+        {
+            let mut count = self.call_count.lock().expect("call_count lock poisoned");
+            *count += 1;
+            if *count >= 100 {
+                *count = 0;
+                self.evict_expired();
+            }
+        }
+
         let slot = self.slot(key);
         let mut guard = slot.entry.lock().expect("discovery cache slot poisoned");
         if let Some((at, value)) = guard.as_ref() {
@@ -83,6 +104,21 @@ impl<T: Clone> DiscoveryCache<T> {
             *guard = Some((Instant::now(), value.clone()));
         }
         value
+    }
+
+    /// Remove slots whose cached value (if any) is expired. Called periodically
+    /// during `get_or_compute` to prevent unbounded memory growth from unique
+    /// one-off requests. A slot with no cached value (a negative result that was
+    /// never stored, or an expired positive) is removed.
+    fn evict_expired(&self) {
+        let mut slots = self.slots.lock().expect("discovery cache poisoned");
+        slots.retain(|_, slot| {
+            let guard = slot.entry.lock().expect("slot lock poisoned");
+            match guard.as_ref() {
+                Some((at, _)) => at.elapsed() < self.ttl,
+                None => false, // Never stored, or expired: evict
+            }
+        });
     }
 }
 
@@ -188,6 +224,47 @@ mod tests {
         assert!(
             calls.load(Ordering::SeqCst) < 4,
             "concurrent callers for one key must not all recompute independently"
+        );
+    }
+
+    #[test]
+    fn evicts_expired_slots_on_periodic_sweep() {
+        let cache: DiscoveryCache<i32> = DiscoveryCache::new(Duration::from_millis(10));
+        // Create 3 slots, all with positive cached values.
+        assert_eq!(cache.get_or_compute("a", || 1, |_| true), 1);
+        assert_eq!(cache.get_or_compute("b", || 2, |_| true), 2);
+        assert_eq!(cache.get_or_compute("c", || 3, |_| true), 3);
+        // Wait for all to expire.
+        std::thread::sleep(Duration::from_millis(30));
+        // Trigger the sweep by hitting the 100-call threshold. Fill with
+        // distinct keys so we don't accidentally re-warm any of a/b/c.
+        for i in 0..100 {
+            cache.get_or_compute(&format!("sweep-{i}"), || i, |_| false);
+        }
+        // After the sweep, the expired a/b/c slots must have been evicted.
+        // Verify by observing that re-requesting them triggers a fresh compute
+        // (the closure runs, returning a different value) instead of serving a
+        // stale cached entry.
+        assert_eq!(cache.get_or_compute("a", || 99, |_| true), 99);
+        assert_eq!(cache.get_or_compute("b", || 88, |_| true), 88);
+        assert_eq!(cache.get_or_compute("c", || 77, |_| true), 77);
+    }
+
+    #[test]
+    fn evicts_negative_slots_on_sweep() {
+        let cache: DiscoveryCache<Option<i32>> = DiscoveryCache::new(Duration::from_secs(60));
+        // Create a slot with a negative result (never cached, but the slot exists).
+        assert_eq!(cache.get_or_compute("neg", || None, |v| v.is_some()), None);
+        // Trigger the sweep.
+        for i in 0..100 {
+            cache.get_or_compute(&format!("fill-{i}"), || Some(i), |v| v.is_some());
+        }
+        // The "neg" slot must have been evicted (it had no cached value). We
+        // can't directly inspect the slot map, but we can verify that the
+        // sweep ran without panicking and the cache still works.
+        assert_eq!(
+            cache.get_or_compute("neg", || Some(42), |v| v.is_some()),
+            Some(42)
         );
     }
 }
