@@ -223,30 +223,55 @@ fn git_init(root: &Path) {
     run(&["config", "user.name", "E2E"]);
 }
 
-/// Drain `events.event` frames until the control path's `file:*` event
-/// arrives (proving the watcher processed the batch), asserting no frame for
-/// a suppressed path shows up — then keep draining through an 800 ms quiet
-/// window to catch stragglers flushed after the control.
+/// Repeatedly write the ignored paths followed by the control file (fresh
+/// content each pass, ~1 s cadence) while draining `events.event` frames,
+/// until the control path's `file:*` event arrives (proving the watcher
+/// processed a batch), asserting no frame for a suppressed path shows up —
+/// then keep draining through an 800 ms quiet window to catch stragglers
+/// flushed after the control.
+///
+/// The bounded write-retry loop makes the test robust under parallel test
+/// load (intent-hq/monorepo#1621): a one-shot write after a fixed warm-up
+/// sleep is lost forever if the OS watch (FSEvents/inotify) establishes
+/// late, whereas re-writing until the control surfaces guarantees a
+/// late-established watch still observes a fresh batch. Re-writes stop once
+/// the control is seen so the quiet window stays meaningful.
 async fn expect_suppressed_over_wss<S>(
     ws: &mut WebSocketStream<S>,
+    checkout: &Path,
     suppressed: &[&str],
     control: &str,
-    secs: u64,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(20));
+    let write_cadence = Duration::from_secs(1);
     let mut seen_control = false;
+    let mut next_write = tokio::time::Instant::now();
+    let mut attempt: u64 = 0;
     loop {
+        if !seen_control && tokio::time::Instant::now() >= next_write {
+            attempt += 1;
+            let body = format!("attempt-{attempt}");
+            // Ignored writes first, then the control: the control frame
+            // arriving proves the batch was processed while the ignored
+            // paths stayed silent.
+            std::fs::write(checkout.join("generated/out.js"), &body).expect("write ignored");
+            std::fs::write(checkout.join("data.secret"), &body).expect("write ignored glob");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::fs::write(checkout.join(control), &body).expect("write control");
+            next_write = tokio::time::Instant::now() + write_cadence;
+        }
         let wait = if seen_control {
             Duration::from_millis(800)
         } else {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
             assert!(
                 !remaining.is_zero(),
                 "control event for {control} never arrived"
             );
-            remaining
+            remaining.min(next_write.saturating_duration_since(now))
         };
         match timeout(wait, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => {
@@ -280,7 +305,8 @@ async fn expect_suppressed_over_wss<S>(
                 if seen_control {
                     return;
                 }
-                // Keep waiting until the outer deadline trips the assert.
+                // No control yet: loop back to re-write a fresh batch (or
+                // trip the deadline assert once the budget is exhausted).
             }
         }
     }
@@ -345,22 +371,14 @@ async fn gitignored_write_is_suppressed_over_wss() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Let the lifecycle event route through the registry and the OS watch
-    // establish before mutating (FSEvents/inotify warm-up).
-    tokio::time::sleep(Duration::from_millis(750)).await;
-
-    // Ignored writes first, then the control: the control frame arriving
-    // proves the batch was processed while the ignored paths stayed silent.
-    std::fs::write(checkout.join("generated/out.js"), b"x").expect("write ignored");
-    std::fs::write(checkout.join("data.secret"), b"x").expect("write ignored glob");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    std::fs::write(checkout.join("control.txt"), b"c").expect("write control");
-
+    // The write phase lives inside the drain loop: it re-writes the ignored
+    // paths and the control on a ~1 s cadence until the control event lands,
+    // so no fixed FSEvents/inotify warm-up sleep is needed (#1621).
     expect_suppressed_over_wss(
         &mut sub,
+        &checkout,
         &["generated", "generated/out.js", "data.secret"],
         "control.txt",
-        20,
     )
     .await;
 }
