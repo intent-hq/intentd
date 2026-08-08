@@ -300,6 +300,10 @@ async fn delegate_ignores_quick_action_default_model() {
 /// monorepo#1729: a `quickActions.typeOverrides` entry keyed on the
 /// specialist id must not leak into delegation either — the specialist id is
 /// no longer an agent-type key for the settings chain.
+///
+/// Seeded through `model.providerDefaults` rather than `model.default`: a
+/// compound `model.default` makes `resolve_delegate_provider` derive that
+/// provider and assert it is installed, which no CI runner guarantees.
 #[tokio::test]
 async fn delegate_ignores_quick_action_type_override() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
@@ -308,13 +312,16 @@ async fn delegate_ignores_quick_action_type_override() {
     svc.settings_registry()
         .expect("registry wired")
         .apply(&[
-            ("model.default".to_string(), json!("auggie:fable-5")),
+            (
+                "model.providerDefaults".to_string(),
+                json!({ "auggie": "fable-5" }),
+            ),
             (
                 "quickActions.typeOverrides".to_string(),
                 json!({ "implementor-test": "auggie:sonnet5-high" }),
             ),
         ])
-        .expect("set default model + quick-action type override");
+        .expect("set provider default + quick-action type override");
 
     let resp = svc
         .agent_delegate_op(
@@ -332,7 +339,7 @@ async fn delegate_ignores_quick_action_type_override() {
     let got = svc.agent_get_op(child.clone(), None).await.expect("get");
     assert_eq!(
         got.model.as_deref(),
-        Some("auggie:fable-5"),
+        Some("fable-5"),
         "a quick-action type override keyed on the specialist id must not apply"
     );
 }
