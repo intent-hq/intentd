@@ -54,6 +54,84 @@ pub(crate) fn assert_agent_commit_allowed(
     Err(Error::Internal(AUTO_COMMIT_DISABLED_MSG.to_string()))
 }
 
+/// Drop submodule-internal entries from the attribution-filtered
+/// `git.agentCommit` commit set (monorepo#1714 follow-up): auto-commit must
+/// never flatten a submodule's gitlink into the superproject, so a path that
+/// lands strictly inside a registered submodule is dropped here — before the
+/// caller's emptiness check — rather than committed. The gitlink path itself
+/// (a pin bump) is never dropped. Detection is delegated to
+/// `intent_git::submodule` (Task 1's helper); this function only does the
+/// filtering + per-submodule drop-count bookkeeping for the caller's debug
+/// log. When the worktree cannot be opened as a repo or has no registered
+/// submodules, `paths` passes through unchanged.
+pub(crate) fn drop_submodule_internal_paths(
+    worktree: &Path,
+    paths: Vec<String>,
+) -> (Vec<String>, Vec<(String, usize)>) {
+    let Ok(repo) = git2::Repository::open(worktree) else {
+        return (paths, Vec::new());
+    };
+    let Ok(submodules) = intent_git::submodule::submodule_paths(&repo) else {
+        return (paths, Vec::new());
+    };
+    if submodules.is_empty() {
+        return (paths, Vec::new());
+    }
+    let mut dropped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let kept: Vec<String> = paths
+        .into_iter()
+        .filter(
+            |p| match intent_git::submodule::submodule_containing(&submodules, p) {
+                Some(sm) => {
+                    *dropped.entry(sm.to_string()).or_insert(0) += 1;
+                    false
+                }
+                None => true,
+            },
+        )
+        .collect();
+    (kept, dropped.into_iter().collect())
+}
+
+/// Refuse an explicit `git.agentCommit` `files` list that names a path
+/// strictly inside a registered submodule (monorepo#1714 follow-up): unlike
+/// the attribution-filtered fallback, an explicit request cannot be silently
+/// pruned — it fails with a message naming the offending path(s), the
+/// containing submodule, and advising the caller to commit from within the
+/// submodule repo instead. The gitlink path itself (a pin bump) is always
+/// allowed. Detection is delegated to `intent_git::submodule` (Task 1's
+/// helper) — no duplicate detection logic here. A no-op when the worktree
+/// cannot be opened as a repo or has no registered submodules (the caller's
+/// downstream commit call surfaces any real repo problem).
+pub(crate) fn reject_submodule_internal_files(worktree: &Path, files: &[String]) -> Result<()> {
+    let Ok(repo) = git2::Repository::open(worktree) else {
+        return Ok(());
+    };
+    let submodules = intent_git::submodule::submodule_paths(&repo)?;
+    if submodules.is_empty() {
+        return Ok(());
+    }
+    let mut by_submodule: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for f in files {
+        if let Some(sm) = intent_git::submodule::submodule_containing(&submodules, f) {
+            by_submodule.entry(sm).or_default().push(f.as_str());
+        }
+    }
+    if by_submodule.is_empty() {
+        return Ok(());
+    }
+    let detail = by_submodule
+        .into_iter()
+        .map(|(sm, paths)| format!("{} (submodule '{sm}')", paths.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::Internal(format!(
+        "Cannot commit path(s) inside a submodule from the superproject: {detail}. \
+         Commit these changes from within the submodule repo instead."
+    )))
+}
+
 /// Resolve a workspace's worktree path: the explicit `worktreePath`, else the
 /// `repositoryPath` (TS parity). `None` when neither is set.
 pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {

@@ -721,6 +721,128 @@ async fn uds_git_read_ops_round_trip() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// Register `child` as a submodule of `parent` at `sub_rel` via a real `git`
+/// CLI round trip (mirroring `intent_git::testutil::add_submodule`, private
+/// to that crate) — a real gitlink + `.gitmodules` fixture for the
+/// submodule-guard e2e below.
+fn add_submodule(parent: &Path, child: &Path, sub_rel: &str) {
+    git(
+        parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            sub_rel,
+        ],
+    );
+    git(parent, &["commit", "-q", "-m", "add submodule"]);
+}
+
+/// Over-the-wire submodule-gitlink guard (monorepo#1714 follow-up):
+/// `git.agentCommit`'s explicit `files` list refuses a path strictly inside a
+/// registered submodule with a clear error naming the offending path and its
+/// containing submodule, and no commit lands.
+#[tokio::test]
+async fn uds_git_agent_commit_rejects_submodule_internal_file() {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let base = Path::new("/tmp").join(format!("intentd-gitsub-{}", &short[..8]));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let child = base.join("child");
+    seed_repo(&child);
+    let repo = base.join("repo");
+    seed_repo(&repo);
+    add_submodule(&repo, &child, "sub");
+
+    let config = {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+        Config::resolve().expect("resolve config")
+    };
+
+    let ws_id = WorkspaceId::from("ws-gitsub");
+    {
+        let store = Store::open(&config.db_path).await.expect("open store");
+        store
+            .insert_workspace(&seed_workspace(&ws_id, repo.to_str().unwrap()))
+            .await
+            .expect("seed ws");
+    }
+
+    let store = Store::open(&config.db_path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let socket = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_uds(services, bus, &socket, None, async move {
+            let _ = rx.await;
+        })
+        .await
+        .expect("serve");
+    });
+    for _ in 0..50 {
+        if config.socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let head_before = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    // Dirty a file strictly inside the submodule's own worktree, then try to
+    // commit it explicitly through the superproject workspace.
+    std::fs::write(repo.join("sub").join("seed.txt"), "changed inside sub\n").unwrap();
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.agentCommit","params":{"workspaceId":"ws-gitsub","message":"flatten sub","files":["sub/seed.txt"]}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+    let msg = resp["error"]["data"]
+        .as_str()
+        .or_else(|| resp["error"]["message"].as_str())
+        .unwrap_or_default();
+    assert!(msg.contains("sub/seed.txt"), "names the path: {resp}");
+    assert!(
+        msg.contains("submodule 'sub'"),
+        "names the containing submodule: {resp}"
+    );
+
+    // No commit landed on the superproject.
+    let head_after = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    assert_eq!(head_before, head_after, "no commit must have been made");
+
+    let _ = tx.send(());
+    let _ = server.await;
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// Over-the-wire per-commit read slice: `git.commitDetails` returns metadata +
 /// `fileDetails`, and `git.diffs` with `commitHash` returns the commit's own
 /// per-file hunks.

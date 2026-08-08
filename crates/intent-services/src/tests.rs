@@ -9351,6 +9351,43 @@ mod file_tracking {
             .unwrap();
     }
 
+    /// Register `child` as a submodule of `parent` at `sub_rel`, mirroring
+    /// `intent_git::testutil::add_submodule` (private to that crate) for the
+    /// submodule-guard regression tests below: a real gitlink + `.gitmodules`
+    /// fixture rather than a synthetic path.
+    fn add_submodule(parent: &std::path::Path, child: &std::path::Path, sub_rel: &str) {
+        let repo = Repository::open(parent).unwrap();
+        let url = child.to_string_lossy().to_string();
+        let sub_path = parent.join(sub_rel);
+        let mut sm = repo
+            .submodule(&url, std::path::Path::new(sub_rel), true)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&sub_path);
+        Repository::clone(&url, &sub_path).unwrap();
+        sm.add_to_index(true).unwrap();
+        sm.add_finalize().unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parents = match repo.head().ok().and_then(|h| h.target()) {
+            Some(oid) => vec![repo.find_commit(oid).unwrap()],
+            None => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "add submodule",
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
     fn tracked(ws: &WorkspaceId, path: &str, stage: &str, agent: Option<&str>) -> NewTrackedChange {
         NewTrackedChange {
             workspace_id: ws.clone(),
@@ -9958,6 +9995,94 @@ mod file_tracking {
             .unwrap();
         assert_eq!(r.files, vec!["dirty.txt".to_string()]);
         assert_eq!(r.file_count, 1);
+    }
+
+    /// Attribution-filtered branch (monorepo#1714 follow-up): a
+    /// `tracked_changes` row attributes a path strictly inside a registered
+    /// submodule to the committing agent, and the submodule's worktree is
+    /// dirty. `git_agent_commit` must drop that path from the commit set —
+    /// nothing from inside the submodule is committed, and since it was the
+    /// only attributed change the call degenerates to the benign "no
+    /// uncommitted changes" skip (auto-commit treats this as silent). The
+    /// parent's gitlink entry for the submodule survives unchanged.
+    #[tokio::test]
+    async fn agent_commit_drops_submodule_internal_attributed_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        // Dirty a file strictly inside the submodule's own worktree.
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "sub/inner.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "agent sub edit".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("No uncommitted changes found for this agent"),
+            "got: {err}"
+        );
+        // No new commit landed, and the submodule gitlink in the parent's
+        // status is unaffected (still just the worktree-modified marker, not
+        // staged/committed).
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "seed + add-submodule commits only");
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let sub_entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "sub")
+            .expect("submodule gitlink still reported dirty");
+        assert!(!sub_entry.staged, "gitlink must not have been staged");
+    }
+
+    /// Explicit `files` branch (monorepo#1714 follow-up): naming a path
+    /// strictly inside a registered submodule fails with a clear error naming
+    /// the offending path and its containing submodule, advising the caller
+    /// to commit from within the submodule repo instead — no commit lands.
+    #[tokio::test]
+    async fn agent_commit_explicit_files_rejects_submodule_internal_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "explicit sub".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["sub/inner.txt".to_string()]),
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sub/inner.txt"), "names the path: {msg}");
+        assert!(
+            msg.contains("submodule 'sub'"),
+            "names the containing submodule: {msg}"
+        );
+        assert!(
+            msg.contains("Commit these changes from within the submodule repo"),
+            "advises committing in the submodule: {msg}"
+        );
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "no new commit must have landed");
     }
 
     /// A `userRequested` no-files checkpoint still commits only the
