@@ -69,6 +69,14 @@ impl CowProvisionTimings {
 /// the commit the checkout lands on. On failure after the clone, the partially
 /// provisioned `checkout_path` is removed best-effort.
 ///
+/// The clone inherits the source's `origin` remote verbatim, so it is resolved
+/// the same way as in [`provision_local_clone_checkout`]
+/// ([`resolve_source_origin`]): a relative local path is absolutized against
+/// the SOURCE repository so it still names the same upstream, a local path
+/// resolving to the source checkout itself is removed, and network URLs /
+/// already-absolute local paths carry over verbatim. A source with no
+/// `origin` inherits nothing, so nothing is fixed up.
+///
 /// A `repo_path` that is itself a linked git worktree (its `.git` is a
 /// gitfile) is refused with `Error::Unsupported`: the cloned gitfile would
 /// still point into the ORIGINAL repository's `.git/worktrees/<name>`, so the
@@ -155,6 +163,7 @@ pub fn provision_cow_checkout_timed(
         let strip_started = Instant::now();
         strip_worktree_registrations(checkout_path)?;
         timings.strip_registrations = strip_started.elapsed();
+        resolve_inherited_origin(repo_path, checkout_path)?;
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;
         timings.checkout = checkout_started.elapsed();
@@ -185,6 +194,36 @@ fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
             checkout = %checkout_path.display(),
             "provision_cow_checkout: removed stale .git/worktrees registrations from clone"
         );
+    }
+    Ok(())
+}
+
+/// The CoW clone is a byte-for-byte copy, so it inherits the source's
+/// `origin` remote verbatim. Resolve it via [`resolve_source_origin`] so the
+/// clone's `origin` is valid from its own directory: a relative local path is
+/// absolutized against the SOURCE repository, a local path resolving to the
+/// source checkout itself is removed, and network URLs / already-absolute
+/// local paths are left verbatim. A source with no `origin` is a no-op.
+fn resolve_inherited_origin(source_repo: &Path, checkout_path: &Path) -> Result<()> {
+    let clone = Repository::open(checkout_path).map_err(map_git_err)?;
+    let inherited = clone
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().map(str::to_owned).ok());
+    let Some(url) = inherited else {
+        return Ok(());
+    };
+    match resolve_source_origin(source_repo, &url) {
+        Some(resolved) => {
+            if resolved != url {
+                clone
+                    .remote_set_url("origin", &resolved)
+                    .map_err(map_git_err)?;
+            }
+        }
+        None => {
+            clone.remote_delete("origin").map_err(map_git_err)?;
+        }
     }
     Ok(())
 }
@@ -707,6 +746,104 @@ mod tests {
             timings.slowest_subtrees_display().is_empty(),
             timings.slowest_subtrees.is_empty()
         );
+    }
+
+    /// A **relative** local-path `origin` (`../upstream`) inherited by the
+    /// CoW clone resolves against the clone's own directory, where it names
+    /// something else entirely. It is absolutized against the SOURCE so it
+    /// still names the same upstream (monorepo#1582).
+    #[test]
+    fn cow_checkout_absolutizes_a_relative_local_origin() {
+        // `<tmp>/<parent>/{upstream,source}`, so `../upstream` is meaningful
+        // from the source but not from the clone's own directory.
+        let parent = unique_checkout("cowchk-relparent");
+        let _cleanup_parent = Cleanup(parent.clone());
+        std::fs::create_dir_all(&parent).unwrap();
+        let upstream = parent.join("upstream");
+        init_repo_at(&upstream);
+        commit_file(&upstream, "a.txt", "one\n");
+        let source = parent.join("source");
+        init_repo_at(&source);
+        {
+            let repo = Repository::open(&source).unwrap();
+            repo.remote("origin", "../upstream").unwrap();
+        }
+        commit_file(&source, "a.txt", "one\n");
+        if !cow_available(&source) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-relorigin");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        let origin = clone.find_remote("origin").unwrap();
+        let url = std::path::Path::new(origin.url().unwrap());
+        assert!(url.is_absolute(), "relative origin must be absolutized");
+        assert_eq!(
+            std::fs::canonicalize(url).unwrap(),
+            std::fs::canonicalize(&upstream).unwrap(),
+            "absolutized origin still names the same upstream"
+        );
+        assert_self_contained(&checkout, &source);
+    }
+
+    /// A local-path `origin` resolving to the source checkout ITSELF (so the
+    /// source is its own upstream): the inherited remote is removed rather
+    /// than pinning the clone to a directory that dies with the source
+    /// (monorepo#1582).
+    #[test]
+    fn cow_checkout_removes_origin_pointing_at_the_source_itself() {
+        let source = init_repo("cowchk-selforigin");
+        commit_file(source.path(), "a.txt", "one\n");
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &source.path().display().to_string())
+                .unwrap();
+        }
+        if !cow_available(source.path()) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-selforigin");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "an origin naming the source checkout must be removed"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// A network-URL `origin` is location-independent, so the CoW clone
+    /// carries it over verbatim.
+    #[test]
+    fn cow_checkout_carries_network_origin_verbatim() {
+        let source = init_repo("cowchk-neturl");
+        commit_file(source.path(), "a.txt", "one\n");
+        let network_url = "https://example.com/upstream.git";
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", network_url).unwrap();
+        }
+        if !cow_available(source.path()) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-neturl");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert_eq!(
+            clone.find_remote("origin").unwrap().url().unwrap(),
+            network_url,
+            "network origin carries over verbatim"
+        );
+        assert_self_contained(&checkout, source.path());
     }
 
     /// Every value in the clone's own (local) config, so a test can assert
