@@ -111,6 +111,40 @@ async fn migration_status_reports_current_after_open() {
     );
 }
 
+/// `Store::open` refuses to run against a database whose `_sqlx_migrations`
+/// table records a version not embedded in this build (i.e. the DB was
+/// created by a newer intentd): it must surface a clear "downgrades are
+/// unsupported" error naming the offending version, not the raw sqlx
+/// `VersionMissing` message or a generic migration failure.
+#[tokio::test]
+async fn open_rejects_database_from_newer_build() {
+    let tmp = TempDb::new();
+    {
+        let store = Store::open(&tmp.path).await.expect("initial open");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (999999, 'from the future', CURRENT_TIMESTAMP, 1, x'00', 0)",
+        )
+        .execute(store.write_pool())
+        .await
+        .expect("seed future migration row");
+    }
+
+    let result = Store::open(&tmp.path).await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("reopen must refuse a schema from a newer build"),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("downgrades are unsupported"), "got {msg:?}");
+    assert!(msg.contains("999999"), "got {msg:?}");
+    assert!(
+        msg.contains("upgrade intentd to the version that created this database"),
+        "got {msg:?}"
+    );
+}
+
 /// The 0031 backfill derives `repository_name` from the `repository_path`
 /// basename for rows missing a name, leaves explicit names untouched, and
 /// skips rows without a path. Exercised by re-running the migration SQL
