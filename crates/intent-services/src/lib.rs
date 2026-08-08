@@ -232,6 +232,12 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override for npx discovery on the one-shot ACP route
+    /// (`agent.completeOnce` §5.32). Outer `None` (production) resolves via
+    /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
+    /// `Some(None)` to simulate a host without npx, which cannot be arranged
+    /// hermetically through the real discovery.
+    one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
     /// idle auto-commit path uses its ~30s default; tests compress it so the
@@ -651,6 +657,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            one_shot_npx: None,
             auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -2256,6 +2263,17 @@ impl Services {
     /// so the one-shot CLI path is deterministic.
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
+        self
+    }
+
+    /// Pin npx discovery for the one-shot ACP route (`agent.completeOnce`
+    /// §5.32). `None` simulates a host without npx — unreachable through the
+    /// real `find_npx` on any machine with node installed — so the
+    /// unresolvable-adapter `{ available: false, reason }` mapping is testable
+    /// hermetically.
+    #[cfg(test)]
+    pub(crate) fn with_one_shot_npx(mut self, npx: Option<PathBuf>) -> Self {
+        self.one_shot_npx = Some(npx);
         self
     }
 

@@ -249,9 +249,14 @@ impl Services {
                 )
             })
             .flatten();
-        let Some(cmd) =
-            one_shot_launch(provider, resolved_bin, intent_providers::find_npx(), model)
-        else {
+        // npx discovery honors the test seam (`one_shot_npx`): `Some(inner)`
+        // pins the result so the unresolvable branch below is reachable
+        // hermetically on hosts where npx is installed.
+        let npx = match &self.one_shot_npx {
+            Some(pinned) => pinned.clone(),
+            None => intent_providers::find_npx(),
+        };
+        let Some(cmd) = one_shot_launch(provider, resolved_bin, npx, model) else {
             return Ok(unavailable(format!(
                 "{provider_id}: no adapter could be resolved (binary not found and npx unavailable)"
             )));
@@ -487,6 +492,32 @@ rl.on('line', (line) => {{
                 "available": false,
                 "reason": "completeOnce is not supported for the effective default provider: opencode"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_once_unavailable_when_adapter_unresolvable() {
+        // The unresolvable-adapter branch, asserted hermetically: claude-code
+        // is npx-only, so with npx pinned absent (the `one_shot_npx` seam —
+        // real `find_npx` succeeds on any host with node) the launch resolves
+        // to nothing and the op maps it to the exact `{ available: false,
+        // reason }` envelope. Complements the env-gated
+        // `wss_agent_complete_once_unavailable_when_adapter_unresolvable`
+        // e2e, which self-skips wherever npx is installed.
+        let (_tmp, services) =
+            services_with_settings(&[("providers.active", serde_json::json!("claude-code"))]).await;
+        let services = services.with_one_shot_npx(None);
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "available": false,
+                "reason": "claude-code: no adapter could be resolved (binary not found and npx unavailable)"
+            }),
+            "an unresolvable adapter is a typed unavailable result, never an error"
         );
     }
 
