@@ -77,18 +77,19 @@ pub(crate) fn drop_submodule_internal_paths(
     if submodules.is_empty() {
         return (paths, Vec::new());
     }
+    let ignore_case = intent_git::submodule::ignores_case(&repo);
     let mut dropped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let kept: Vec<String> = paths
         .into_iter()
-        .filter(
-            |p| match intent_git::submodule::submodule_containing(&submodules, p) {
+        .filter(|p| {
+            match intent_git::submodule::submodule_containing(&submodules, p, ignore_case) {
                 Some(sm) => {
                     *dropped.entry(sm.to_string()).or_insert(0) += 1;
                     false
                 }
                 None => true,
-            },
-        )
+            }
+        })
         .collect();
     (kept, dropped.into_iter().collect())
 }
@@ -113,12 +114,15 @@ pub(crate) fn reject_submodule_internal_files(worktree: &Path, files: &[String])
     if submodules.is_empty() {
         return Ok(());
     }
+    let ignore_case = intent_git::submodule::ignores_case(&repo);
     let workdir = repo.workdir().map(Path::to_path_buf);
     let mut by_submodule: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
     for f in files {
-        let rel = intent_git::submodule::to_repo_relative(workdir.as_deref(), f);
-        if let Some(sm) = intent_git::submodule::submodule_containing(&submodules, &rel) {
+        let rel = intent_git::submodule::to_repo_relative(workdir.as_deref(), f, ignore_case);
+        if let Some(sm) =
+            intent_git::submodule::submodule_containing(&submodules, &rel, ignore_case)
+        {
             by_submodule.entry(sm).or_default().push(f.as_str());
         }
     }

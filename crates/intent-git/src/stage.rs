@@ -504,6 +504,77 @@ mod tests {
         );
     }
 
+    /// Regression (case-variant bypass): with `core.ignorecase` — git's default
+    /// on macOS/Windows — `SUB/a.txt` resolves to the same file on disk as
+    /// `sub/a.txt`, so a byte-exact guard missed it and `index.add_path` wrote a
+    /// flattened `SUB` tree over the `160000` gitlink. Real `git add SUB/a.txt`
+    /// is a no-op that keeps the gitlink. `core.ignorecase` is set explicitly so
+    /// the comparison logic is exercised on case-sensitive filesystems too.
+    #[test]
+    fn stage_rejects_case_variant_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-case");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-case");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+
+        let err = stage(dir.path(), &["SUB/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // The gitlink survives: nothing under `sub/`/`SUB/` reached the index.
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index.iter().all(|e| {
+                let p = String::from_utf8_lossy(&e.path).to_lowercase();
+                !p.starts_with("sub/")
+            }),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+    }
+
+    /// The case-variant guard must not swallow a *sibling* directory that
+    /// merely shares a prefix with the submodule path.
+    #[test]
+    fn stage_allows_sibling_prefix_directory_under_ignorecase() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-sibling");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-sibling");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        write_file(dir.path(), "subdir/a.txt", "sibling\n");
+
+        stage(dir.path(), &["subdir/a.txt".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "subdir/a.txt");
+        assert!(
+            f.is_some() && f.unwrap().staged,
+            "sibling path staged: {st:?}"
+        );
+    }
+
     #[test]
     fn stage_gitlink_path_itself_succeeds() {
         use crate::testutil::add_submodule;
