@@ -2493,6 +2493,7 @@ impl Services {
             name_explicitly_set,
             model: resolved_model,
             reasoning_effort,
+            effort_levels: None,
             provider,
             system_prompt: None,
             specialist,

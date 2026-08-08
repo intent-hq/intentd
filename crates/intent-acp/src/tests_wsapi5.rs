@@ -732,6 +732,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         status,
         is_active: false,

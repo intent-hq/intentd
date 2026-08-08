@@ -6619,6 +6619,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         status: AgentStatus::Completed,
         is_active: false,

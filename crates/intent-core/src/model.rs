@@ -2128,6 +2128,13 @@ pub struct AgentSession {
     /// `None` = provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Effort levels the provider's `thought_level` config option advertised
+    /// at the most recent session open (PROTOCOL §5.5, Option C), minus the
+    /// adapter's `"default"` sentinel. Replaced wholesale at every session
+    /// open; `None` when the provider advertised no such option (the FE falls
+    /// back to catalog metadata). Never `Some(empty)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2395,6 +2402,11 @@ pub struct AgentLite {
     /// mirrors [`AgentSession::reasoning_effort`]. Omitted when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Session-discovered effort levels (PROTOCOL §5.5, Option C); mirrors
+    /// [`AgentSession::effort_levels`]. Omitted when the provider advertised
+    /// no `thought_level` option at session open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub status: AgentStatus,
@@ -2542,6 +2554,7 @@ impl AgentLite {
             name_explicitly_set: session.name_explicitly_set,
             model: session.model,
             reasoning_effort: session.reasoning_effort,
+            effort_levels: session.effort_levels,
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
@@ -4024,6 +4037,7 @@ mod tests {
             name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".to_string()),
@@ -4103,6 +4117,7 @@ mod tests {
             name_explicitly_set: true,
             model: Some("opus".to_string()),
             reasoning_effort: None,
+            effort_levels: Some(vec!["low".to_string(), "high".to_string()]),
             provider: Some("auggie".to_string()),
             system_prompt: None,
             specialist: None,
@@ -4151,6 +4166,7 @@ mod tests {
                 "name": "Builder",
                 "nameExplicitlySet": true,
                 "model": "opus",
+                "effortLevels": ["low", "high"],
                 "provider": "auggie",
                 "status": "active",
                 "isActive": true,

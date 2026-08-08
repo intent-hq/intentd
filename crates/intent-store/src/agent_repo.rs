@@ -23,7 +23,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
-    stop_reason_timestamp, reasoning_effort";
+    stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
 /// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
@@ -33,7 +33,7 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
-    sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort";
+    sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -394,7 +394,30 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
     .transpose()
 }
 
-/// Bind the full 34-column `agent_session` insert value list onto `query`, in
+/// Encode the `effort_levels` string array as its JSON TEXT form, `None`
+/// staying NULL. `serde_json` string-array encoding is deterministic, so the
+/// encoded form doubles as the change-detection comparand in
+/// [`Store::set_agent_effort_levels`].
+fn effort_levels_to_db(levels: &Option<Vec<String>>) -> Result<Option<String>> {
+    levels
+        .as_ref()
+        .map(|v| {
+            serde_json::to_string(v)
+                .map_err(|e| Error::Internal(format!("encode effort_levels failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Decode the `effort_levels` JSON TEXT column back into its string array.
+fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
+    raw.map(|s| {
+        serde_json::from_str(&s)
+            .map_err(|e| Error::Internal(format!("decode effort_levels failed: {e}")))
+    })
+    .transpose()
+}
+
+/// Bind the full 35-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
@@ -436,7 +459,8 @@ fn bind_session_insert<'q>(
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
-        .bind(&s.reasoning_effort))
+        .bind(&s.reasoning_effort)
+        .bind(effort_levels_to_db(&s.effort_levels)?))
 }
 
 impl Store {
@@ -451,7 +475,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -509,7 +533,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1363,7 +1387,11 @@ impl Store {
         // full-row UPDATE: a long-lived in-memory `AgentSession` persisted
         // here mid-race must not resurrect a request that
         // `clear_attention_request` already NULLed (or clobber one that
-        // `set_attention_request` just wrote). Those two narrow writers are
+        // `set_attention_request` just wrote). `effort_levels` is excluded on
+        // the same grounds: `set_agent_effort_levels` (called at session
+        // open) is its only post-insert mutator, so a stale in-memory session
+        // persisted here cannot wipe freshly discovered levels.
+        // Those two attention writers are
         // the only post-insert mutators of the attention columns.
         let rows = sqlx::query(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
@@ -1791,6 +1819,54 @@ impl Store {
         Ok(true)
     }
 
+    /// Replace the session's `effort_levels` wholesale (PROTOCOL §5.5,
+    /// Option C): the levels the provider's `thought_level` option advertised
+    /// at session open, `None` when it advertised none. Returns `true` when
+    /// the stored value actually changed — the write is guarded by an
+    /// `IS NOT` comparison against the deterministic JSON encoding, so an
+    /// unchanged set is a no-op (no write, no `updated_at` bump, no event
+    /// from the caller). The ONLY post-insert mutator of the column (the
+    /// full-row [`Store::update_agent_session`] deliberately excludes it).
+    /// `NotFound` if the session is absent or the workspace does not match.
+    pub async fn set_agent_effort_levels(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        levels: Option<&[String]>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let encoded = effort_levels_to_db(&levels.map(<[String]>::to_vec))?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET effort_levels=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND effort_levels IS NOT ?",
+        )
+        .bind(&encoded)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(&encoded)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set effort levels failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists with the identical set — the common case.
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
     /// post-restart recovery). ACP sessions are process-local and cannot survive
     /// a daemon restart, so any `is_active=1` flag after boot is stale. Called
@@ -2050,6 +2126,7 @@ fn map_session_row_with_system_prompt(
         name_explicitly_set: col::<i64>(row, "name_explicitly_set")? != 0,
         model: col(row, "model")?,
         reasoning_effort: col(row, "reasoning_effort")?,
+        effort_levels: effort_levels_from_db(col(row, "effort_levels")?)?,
         provider: col(row, "provider")?,
         specialist: col(row, "specialist")?,
         status: enum_from_db::<AgentStatus>(&col::<String>(row, "status")?)?,
@@ -3000,6 +3077,7 @@ mod tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3113,6 +3191,7 @@ mod tests {
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3267,6 +3346,7 @@ mod tests {
             name_explicitly_set: false,
             model: Some("opus-4.8".to_string()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -3941,6 +4021,90 @@ mod tests {
             .expect("update");
         let cleared = store.get_agent_session(&agent_id).await.expect("get");
         assert_eq!(cleared.reasoning_effort, None, "cleared on update");
+    }
+
+    /// `effort_levels` (PROTOCOL §5.5, Option C) round-trips through insert →
+    /// read (full + summary projections), is replaced wholesale by
+    /// `set_agent_effort_levels` (change-detecting: `true` on change, `false`
+    /// on the identical set), clears to NULL, survives the full-row
+    /// `update_agent_session` (which deliberately excludes the column), and
+    /// is `NotFound` for an absent session.
+    #[tokio::test]
+    async fn effort_levels_roundtrip_set_and_clear() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort-levels".to_string());
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let levels = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.effort_levels = Some(levels.clone());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let full = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(full.effort_levels.as_deref(), Some(levels.as_slice()));
+        let summary = store
+            .get_agent_session_summary(&agent_id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.effort_levels.as_deref(), Some(levels.as_slice()));
+
+        // The identical set is a no-op (`false`); a different set writes.
+        let unchanged = store
+            .set_agent_effort_levels(&ws_id, &agent_id, Some(&levels), &now_iso())
+            .await
+            .expect("set identical");
+        assert!(!unchanged, "identical set must not report a change");
+        let with_max: Vec<String> = ["low", "medium", "high", "max"].map(String::from).to_vec();
+        let changed = store
+            .set_agent_effort_levels(&ws_id, &agent_id, Some(&with_max), &now_iso())
+            .await
+            .expect("set changed");
+        assert!(changed, "different set must report a change");
+        let read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.effort_levels.as_deref(), Some(with_max.as_slice()));
+
+        // The full-row update excludes the column — a stale in-memory session
+        // (still carrying the insert-time levels) must not clobber it.
+        store
+            .update_agent_session(&ws_id, &session)
+            .await
+            .expect("full-row update");
+        let preserved = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(
+            preserved.effort_levels.as_deref(),
+            Some(with_max.as_slice()),
+            "full-row update must not clobber effort_levels"
+        );
+
+        // `None` clears to NULL (`true` — a change), then repeats as a no-op.
+        let cleared = store
+            .set_agent_effort_levels(&ws_id, &agent_id, None, &now_iso())
+            .await
+            .expect("clear");
+        assert!(cleared, "clearing a present set is a change");
+        let read = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(read.effort_levels, None);
+        let cleared_again = store
+            .set_agent_effort_levels(&ws_id, &agent_id, None, &now_iso())
+            .await
+            .expect("clear again");
+        assert!(!cleared_again, "clearing NULL is a no-op");
+
+        // Absent session → NotFound.
+        let missing = AgentId("agent-missing".to_string());
+        let err = store
+            .set_agent_effort_levels(&ws_id, &missing, Some(&levels), &now_iso())
+            .await
+            .expect_err("missing session");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     }
 
     /// Migration 0080 splits legacy codex `{base}/{effort}` compound model
@@ -4647,6 +4811,7 @@ mod tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -4803,6 +4968,7 @@ mod tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("auggie".to_string()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -5018,6 +5184,7 @@ mod tests {
                 name_explicitly_set: false,
                 model: None,
                 reasoning_effort: None,
+                effort_levels: None,
                 provider: None,
                 status: AgentStatus::Idle,
                 is_active: false,

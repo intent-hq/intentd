@@ -739,6 +739,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
