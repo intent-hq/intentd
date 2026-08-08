@@ -164,10 +164,13 @@ pub fn provision_cow_checkout_timed(
         let strip_started = Instant::now();
         strip_worktree_registrations(checkout_path)?;
         timings.strip_registrations = strip_started.elapsed();
-        resolve_inherited_origin(repo_path, checkout_path)?;
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;
         timings.checkout = checkout_started.elapsed();
+        // AFTER checkout: removing a self-referencing origin drops
+        // `refs/remotes/origin/*`, which base-ref resolution above tries
+        // first — same ordering as `provision_plain_clone_checkout`.
+        resolve_inherited_origin(repo_path, checkout_path)?;
         Ok(sha)
     })()
     .inspect_err(|_| {
@@ -837,6 +840,55 @@ mod tests {
         assert!(
             clone.find_remote("origin").is_err(),
             "an origin naming the source checkout must be removed"
+        );
+        assert_self_contained(&checkout, source.path());
+    }
+
+    /// Origin removal must not break base-ref resolution: a self-referencing
+    /// `origin` is removed (dropping `refs/remotes/origin/*` with it) only
+    /// AFTER checkout, so a `base_ref` surviving solely as a remote-tracking
+    /// ref still resolves — same ordering as the plain-clone path.
+    #[test]
+    fn cow_checkout_resolves_remote_tracking_base_ref_before_removing_origin() {
+        let source = init_repo("cowchk-selforigin-remoteref");
+        commit_file(source.path(), "a.txt", "one\n");
+        let pinned_sha = head_sha(&source);
+        {
+            let repo = Repository::open(source.path()).unwrap();
+            repo.remote("origin", &source.path().display().to_string())
+                .unwrap();
+            // A branch that exists ONLY as a remote-tracking ref (as if
+            // fetched once and then deleted locally).
+            let oid = git2::Oid::from_str(&pinned_sha).unwrap();
+            repo.reference("refs/remotes/origin/only-remote", oid, false, "test")
+                .unwrap();
+        }
+        commit_file(source.path(), "b.txt", "two\n");
+        if !cow_available(source.path()) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-selforigin-remoteref");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha = provision_cow_checkout(
+            source.path(),
+            &checkout,
+            "cow-ws",
+            Some("only-remote"),
+            "origin",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            sha, pinned_sha,
+            "base_ref resolves via the remote-tracking ref before origin removal"
+        );
+        let clone = Repository::open(&checkout).unwrap();
+        assert_eq!(clone.head().unwrap().shorthand().unwrap(), "cow-ws");
+        assert!(
+            clone.find_remote("origin").is_err(),
+            "the self-referencing origin is still removed afterwards"
         );
         assert_self_contained(&checkout, source.path());
     }
