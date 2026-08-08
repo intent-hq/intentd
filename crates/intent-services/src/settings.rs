@@ -1470,7 +1470,19 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
         return Ok(());
     };
     let mut migrated: Vec<String> = Vec::new();
-    for member in ["defaultModel", "typeOverrides", "providerSettings"] {
+    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
+    let unknown: Vec<&str> = table
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !MEMBERS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            members = ?unknown,
+            "legacy [backgroundAgents] members have no quickActions.* counterpart; dropping"
+        );
+    }
+    for member in MEMBERS {
         let Some(value) = table.get(member) else {
             continue;
         };
@@ -3148,6 +3160,22 @@ mod tests {
             ));
         }
 
+        // A batch mixing a retired path with a live one still applies the live
+        // entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
+                { "path": "quickActions.defaultModel", "value": "auggie:opus" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "quickActions.defaultModel");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:opus"))
+        );
+
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
@@ -3168,7 +3196,7 @@ mod tests {
         let config_path = std::env::temp_dir().join(format!("intentd-settings-qamig-{tag}.toml"));
         std::fs::write(
             &config_path,
-            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\nproviderSettings = { claude-code = { mode = \"fast\" } }\n",
         )
         .expect("seed legacy config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
@@ -3182,6 +3210,11 @@ mod tests {
             registry.get("quickActions.typeOverrides"),
             Some(json!({ "commit": "auggie:fast" }))
         );
+        assert_eq!(
+            registry.get("quickActions.providerSettings"),
+            Some(json!({ "claude-code": { "mode": "fast" } })),
+            "the structurally-validated member carries over too"
+        );
 
         import_legacy_settings(&registry, &store)
             .await
@@ -3189,6 +3222,19 @@ mod tests {
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(!text.contains("backgroundAgents"), "{text}");
         assert!(text.contains("quickActions"), "{text}");
+
+        // Second boot: the stripped file reloads, the migration is a no-op and
+        // the carried-over values stay put.
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_quick_action_settings(&registry2).expect("migrate again");
+        assert_eq!(
+            registry2.get("quickActions.defaultModel"),
+            Some(json!("auggie:haiku"))
+        );
+        assert_eq!(
+            registry2.get("quickActions.providerSettings"),
+            Some(json!({ "claude-code": { "mode": "fast" } }))
+        );
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -3202,14 +3248,15 @@ mod tests {
     /// PR #1010 review: one malformed legacy member must not take its valid
     /// siblings down with it — members are applied individually, so the bad
     /// one is skipped and the rest still carry over before the legacy table
-    /// is stripped.
+    /// is stripped. A member with no `quickActions.*` counterpart is dropped
+    /// (warned about) rather than failing the carry-over.
     #[tokio::test]
     async fn quick_action_migration_skips_only_the_malformed_member() {
         let tag = uuid::Uuid::new_v4();
         let config_path = std::env::temp_dir().join(format!("intentd-settings-qabad-{tag}.toml"));
         std::fs::write(
             &config_path,
-            "[backgroundAgents]\ndefaultModel = 1\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+            "[backgroundAgents]\ndefaultModel = 1\ntypeOverrides = { commit = \"auggie:fast\" }\nsomethingRetired = true\n",
         )
         .expect("seed config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
