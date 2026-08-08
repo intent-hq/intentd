@@ -49,6 +49,18 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// boot.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
+/// The retired `backgroundAgents.*` paths, renamed to `quickActions.*`
+/// (monorepo#1729). No catalog entry remains: `settings.get`/`settings.reset`
+/// reject them as unknown, but old clients still writing them via
+/// `settings.update` are tolerated-and-ignored rather than failing the whole
+/// batch. A stored `config.toml` `[backgroundAgents]` table is carried over to
+/// the new keys once by [`migrate_quick_action_settings`].
+pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
+    "backgroundAgents.defaultModel",
+    "backgroundAgents.typeOverrides",
+    "backgroundAgents.providerSettings",
+];
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -777,23 +789,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
         ),
         string(
-            "backgroundAgents.defaultModel",
-            "Background default model",
-            "Model for background agents",
+            "quickActions.defaultModel",
+            "Default quick action model",
+            "Model for single-shot quick actions (commit messages, PR descriptions, quick tasks); never applied to agent sessions",
             "providers",
             None,
         ),
         object(
-            "backgroundAgents.typeOverrides",
-            "Background type overrides",
-            "Per-agent-type model overrides",
+            "quickActions.typeOverrides",
+            "Quick action model overrides",
+            "Per-quick-action model overrides (commit, pr, review, fast)",
             "providers",
             Some(json!({})),
         ),
         object(
-            "backgroundAgents.providerSettings",
-            "Background provider settings",
-            "Per-provider background settings",
+            "quickActions.providerSettings",
+            "Per-provider quick action settings",
+            "Per-provider quick-action settings",
             "providers",
             Some(json!({})),
         ),
@@ -1382,9 +1394,11 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// when it matches its catalog definition (overwriting any existing row —
 /// the file value is the user's most recent intent) or discarded with a
 /// warning when it does not (all current legacy keys — `[ai]`,
-/// `server.listenMode`, `model.workspaceOverrides`, `workspace.autoFetch` —
-/// are retired without a catalog entry, so they are discarded), and the keys
-/// are then stripped from the file with a comment-preserving rewrite.
+/// `server.listenMode`, `model.workspaceOverrides`, `workspace.autoFetch`,
+/// `[backgroundAgents]` — are retired without a catalog entry, so they are
+/// discarded; the `[backgroundAgents]` values are carried over into
+/// `quickActions.*` beforehand by [`migrate_quick_action_settings`]), and the
+/// keys are then stripped from the file with a comment-preserving rewrite.
 /// Nothing is stripped when a
 /// SQLite write fails, so the next boot retries the import. The strip itself
 /// is best-effort: once the values are safely in SQLite, a failed file
@@ -1431,6 +1445,50 @@ pub async fn import_legacy_settings(
         tracing::info!(?stripped, "stripped legacy keys from config.toml");
     }
     Ok(stripped)
+}
+
+/// One-time boot carry-over of the renamed `[backgroundAgents]` table into
+/// `quickActions.*` (monorepo#1729). The registry's load captured the whole
+/// legacy table; each of its `defaultModel` / `typeOverrides` /
+/// `providerSettings` members is written to the matching `quickActions.*` key
+/// **only** when that key is still at its schema default, so an already-
+/// migrated (or deliberately re-picked) value is never clobbered. Runs before
+/// [`import_legacy_settings`], which then discards and strips the legacy
+/// table. Values that fail the typed schema are skipped with a warning; a
+/// file with no `[backgroundAgents]` table is a no-op.
+pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+    let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
+        return Ok(());
+    };
+    let Some(table) = legacy.as_object() else {
+        tracing::warn!("legacy [backgroundAgents] is not a table; discarding");
+        return Ok(());
+    };
+    let mut changes: Vec<(String, Value)> = Vec::new();
+    for member in ["defaultModel", "typeOverrides", "providerSettings"] {
+        let Some(value) = table.get(member) else {
+            continue;
+        };
+        let path = format!("quickActions.{member}");
+        if registry.origin(&path) != Some(SettingOrigin::Default) {
+            tracing::debug!(path, "quick-action key already set; keeping current value");
+            continue;
+        }
+        changes.push((path, value.clone()));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(error = %e, "failed to migrate [backgroundAgents] into quickActions.*; discarding");
+        return Ok(());
+    }
+    let paths: Vec<&str> = changes.iter().map(|(p, _)| p.as_str()).collect();
+    tracing::info!(
+        ?paths,
+        "migrated legacy [backgroundAgents] into quickActions.*"
+    );
+    Ok(())
 }
 
 /// One-time boot cleanup of stale SQLite rows for retired settings. The
@@ -1670,7 +1728,12 @@ impl<'a> SettingsService<'a> {
             // pick. Tolerate-and-ignore the entry (nothing validated,
             // persisted, echoed, or published) instead of rejecting the whole
             // batch as an unknown path.
-            if path == RETIRED_WORKSPACE_OVERRIDES_PATH {
+            // monorepo#1729 compatibility: pre-rename clients still write the
+            // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
+            // the renamed `quickActions.*` keys are the only writable surface.
+            if path == RETIRED_WORKSPACE_OVERRIDES_PATH
+                || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+            {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
             }
@@ -3044,6 +3107,116 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// monorepo#1729: the renamed `backgroundAgents.*` paths are tolerated-
+    /// and-ignored by `settings.update` (pre-rename clients keep writing them)
+    /// and rejected as unknown by `settings.get`/`settings.reset`.
+    #[tokio::test]
+    async fn background_agent_paths_update_is_tolerated_and_ignored() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-bgagents-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-bgagents-{tag}.toml"));
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let applied = svc
+            .update(&json!([
+                { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
+                { "path": "backgroundAgents.typeOverrides", "value": { "commit": "m" } },
+                { "path": "backgroundAgents.providerSettings", "value": {} },
+            ]))
+            .await
+            .expect("renamed paths must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(registry.get("quickActions.defaultModel"), Some(Value::Null));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("backgroundAgents"), "{text}");
+
+        for path in RETIRED_BACKGROUND_AGENT_PATHS {
+            assert!(matches!(svc.get(path).await, Err(Error::InvalidParams(_))));
+            assert!(matches!(
+                svc.reset(path).await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// monorepo#1729: a `config.toml` still carrying `[backgroundAgents]` has
+    /// its values carried over into the unset `quickActions.*` keys, and the
+    /// legacy table is then stripped by [`import_legacy_settings`].
+    #[tokio::test]
+    async fn quick_action_migration_carries_over_legacy_table() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-qamig-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qamig-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+        )
+        .expect("seed legacy config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:haiku"))
+        );
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({ "commit": "auggie:fast" }))
+        );
+
+        import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("backgroundAgents"), "{text}");
+        assert!(text.contains("quickActions"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// The carry-over never clobbers a `quickActions.*` key the user already
+    /// set (a re-run after the first migration, or a deliberate re-pick).
+    #[tokio::test]
+    async fn quick_action_migration_keeps_existing_value() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qakeep-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\n\n[quickActions]\ndefaultModel = \"auggie:opus\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:opus")),
+            "an already-set quick-action key must win over the legacy value"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// [`cleanup_retired_settings`] deletes the stale SQLite row left behind

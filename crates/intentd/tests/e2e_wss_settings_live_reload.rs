@@ -506,3 +506,91 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     assert_eq!(get["result"]["value"], json!("recovered/"), "{get}");
     assert_eq!(get["result"]["origin"], json!("file"), "{get}");
 }
+
+/// monorepo#1729 over the wire: a `config.toml` still carrying the renamed
+/// `[backgroundAgents]` table is migrated into `quickActions.*` at boot and
+/// the legacy table is stripped; the retired paths are gone from
+/// `settings.list` and rejected by `settings.get`, while `settings.update`
+/// still tolerates-and-ignores them for pre-rename clients.
+#[tokio::test]
+async fn background_agents_table_migrates_to_quick_actions_over_wss() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+    )
+    .expect("seed legacy config.toml");
+
+    let (_daemon, mut rpc, _sub) = boot_with_wss(&data_dir).await;
+
+    // The legacy values landed on the renamed keys, read back over the wire.
+    let get = wss_rpc(
+        &mut rpc,
+        10,
+        "settings.get",
+        json!({ "path": "quickActions.defaultModel" }),
+    )
+    .await;
+    assert_eq!(get["result"]["value"], json!("auggie:haiku"), "{get}");
+    let get = wss_rpc(
+        &mut rpc,
+        11,
+        "settings.get",
+        json!({ "path": "quickActions.typeOverrides" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!({ "commit": "auggie:fast" }),
+        "{get}"
+    );
+
+    // The legacy table is stripped from disk.
+    let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(!text.contains("backgroundAgents"), "{text}");
+
+    // The retired path is gone from the catalog and rejected by settings.get.
+    let list = wss_rpc(&mut rpc, 12, "settings.list", json!({})).await;
+    let paths: Vec<&str> = list["result"]["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .filter_map(|d| d["path"].as_str())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.starts_with("backgroundAgents.")),
+        "retired paths must not be advertised: {paths:?}"
+    );
+    assert!(paths.contains(&"quickActions.defaultModel"), "{paths:?}");
+    let get = wss_rpc(
+        &mut rpc,
+        13,
+        "settings.get",
+        json!({ "path": "backgroundAgents.defaultModel" }),
+    )
+    .await;
+    assert_eq!(get["error"]["code"], json!(-32602), "{get}");
+
+    // settings.update on the retired path is tolerated and ignored.
+    let update = wss_rpc(
+        &mut rpc,
+        14,
+        "settings.update",
+        json!({ "changes": [{ "path": "backgroundAgents.defaultModel", "value": "auggie:opus" }] }),
+    )
+    .await;
+    assert_eq!(update["result"], json!({ "applied": [] }), "{update}");
+    let get = wss_rpc(
+        &mut rpc,
+        15,
+        "settings.get",
+        json!({ "path": "quickActions.defaultModel" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!("auggie:haiku"),
+        "an ignored retired write must not change the renamed key: {get}"
+    );
+}
