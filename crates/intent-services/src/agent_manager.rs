@@ -3034,6 +3034,12 @@ impl AgentManager {
                 self.services
                     .annotate_waiting_on_hooks(agent_id, &mut data)
                     .await;
+                // Idle-visibility (unified external-wait): same
+                // `waitingOnPrMonitors` stamp as the settlement idle
+                // (omitted when the agent owns no active monitor).
+                self.services
+                    .annotate_waiting_on_pr_monitors(agent_id, &mut data)
+                    .await;
                 self.services
                     .publish_agent_event(
                         &workspace_id,

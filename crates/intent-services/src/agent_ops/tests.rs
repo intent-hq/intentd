@@ -12382,6 +12382,80 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     );
 }
 
+/// Idle-visibility on the read surfaces (unified external-wait, mirrors
+/// `status_list_and_diagnostics_surface_waiting_on_hooks`): `agent.get`/
+/// `agent.list` overlay `waitingOnPrMonitors` for monitor-owning agents
+/// (omitted when empty) and `agent.diagnostics` agent rows carry the same
+/// list.
+#[tokio::test]
+async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
+    let (_t, svc, ws) = setup().await;
+    let monitored = create_agent(&svc, &ws, "Monitored").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &monitored, 42).await;
+
+    // agent.get (the projection behind ws.agent.status).
+    let lite = svc
+        .agent_get_op(monitored.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert_eq!(lite.waiting_on_pr_monitors.len(), 1);
+    let entry = &lite.waiting_on_pr_monitors[0];
+    assert_eq!(entry["monitorId"], json!(monitor.monitor_id));
+    assert_eq!(entry["repo"], json!("acme/widgets"));
+    assert_eq!(entry["prNumber"], json!(42));
+    assert!(entry.get("lastSnapshot").is_none(), "payload stays light");
+    // Omitted (not `[]`) on the wire when empty.
+    let wire = serde_json::to_value(&lite).unwrap();
+    assert!(wire.get("waitingOnPrMonitors").is_some());
+    let bare_lite = svc
+        .agent_get_op(bare.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(bare_lite.waiting_on_pr_monitors.is_empty());
+    let bare_wire = serde_json::to_value(&bare_lite).unwrap();
+    assert!(
+        bare_wire.get("waitingOnPrMonitors").is_none(),
+        "field omitted for monitor-less agents: {bare_wire}"
+    );
+
+    // agent.list overlays the same data from the workspace-batched query.
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let by_id = |id: &AgentId| {
+        listed
+            .iter()
+            .find(|a| &a.id == id)
+            .expect("agent listed")
+            .clone()
+    };
+    assert_eq!(by_id(&monitored).waiting_on_pr_monitors.len(), 1);
+    assert_eq!(
+        by_id(&monitored).waiting_on_pr_monitors[0]["prNumber"],
+        json!(42)
+    );
+    assert!(by_id(&bare).waiting_on_pr_monitors.is_empty());
+
+    // agent.diagnostics agent rows.
+    let diag = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .unwrap();
+    let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
+    let row = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(
+        row(&monitored)["waitingOnPrMonitors"][0]["prNumber"],
+        json!(42)
+    );
+    assert!(
+        row(&bare).get("waitingOnPrMonitors").is_none(),
+        "diagnostics omits the field for monitor-less agents"
+    );
+}
+
 /// Two after_all delegates from one parent share a single group whose expected
 /// set has both children, with two grouped watches and zero ungrouped watches.
 #[tokio::test]

@@ -518,6 +518,7 @@ mod tests {
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: vec![],
             waiting_on_hooks: vec![],
+            waiting_on_pr_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: None,

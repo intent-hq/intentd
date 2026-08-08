@@ -1778,13 +1778,20 @@ impl Services {
         // (`waitingOnHooks`, omitted when empty) from one workspace-wide
         // hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty) from one
+        // workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         Ok(sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
+                let waiting_on_pr_monitors =
+                    pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
+                lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
                 lite
             })
             .collect())
@@ -1824,8 +1831,17 @@ impl Services {
         // Idle-visibility: overlay the agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty).
         let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty).
+        let waiting_on_pr_monitors = self
+            .active_pr_monitors_for_agent(&agent_id)
+            .await
+            .iter()
+            .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
+            .collect();
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
+        lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
         Ok(lite)
     }
 
@@ -6855,6 +6871,10 @@ impl Services {
         // Idle-visibility: per-agent active-hook metadata (`waitingOnHooks`,
         // omitted when empty) from one workspace-wide hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): per-agent active PR
+        // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
+        // one workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -6922,6 +6942,11 @@ impl Services {
             if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
                 if !hooks.is_empty() {
                     row.insert("waitingOnHooks".into(), Value::Array(hooks));
+                }
+            }
+            if let Some(monitors) = pr_monitors_by_agent.remove(id.as_str()) {
+                if !monitors.is_empty() {
+                    row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
             }
             agent_rows.push(Value::Object(row));

@@ -313,6 +313,29 @@ fn monitor_label(m: &PrMonitor) -> String {
     format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number)
 }
 
+/// Light metadata for one ACTIVE PR monitor — the idle-visibility
+/// `waitingOnPrMonitors` entry shape: `{ monitorId, repo, prNumber, title? }`.
+/// `title` is read off the persisted baseline snapshot (absent until the
+/// first successful poll) and omitted when unknown; no requirements
+/// hydration otherwise, keeping payloads light (mirrors the hook manager's
+/// `waiting_on_hooks_entry`).
+pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
+    let mut v = json!({
+        "monitorId": m.monitor_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+    });
+    let title = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        .map(|s| s.title);
+    if let Some(title) = title {
+        v["title"] = Value::String(title);
+    }
+    v
+}
+
 /// The list-surface projection of one monitor: identity + lifecycle plus the
 /// hover/click fields the FE needs — PR title/URL and a compact summary of
 /// the last-refresh snapshot, whether changes are accumulated awaiting the
@@ -1308,7 +1331,7 @@ impl Services {
     /// (visibility is best-effort and must never block an idle emit or wake
     /// delivery).
     pub(crate) async fn active_pr_monitors_for_agent(&self, agent_id: &AgentId) -> Vec<PrMonitor> {
-        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+        match self.store.list_active_pr_monitors_by_agent(agent_id).await {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -1316,13 +1339,73 @@ impl Services {
                     error = %e,
                     "active-pr-monitors lookup failed; pr-monitor-waiting reads as empty"
                 );
-                return Vec::new();
+                Vec::new()
+            }
+        }
+    }
+
+    /// Workspace-batched variant of
+    /// [`active_pr_monitors_for_agent`](Self::active_pr_monitors_for_agent)
+    /// for `agent.list`: one store query for the whole workspace, grouped by
+    /// owning agent id as light `waitingOnPrMonitors` entries (agents with no
+    /// active monitor are absent). A store failure is logged and reads as
+    /// empty, mirroring
+    /// [`Services::active_hooks_by_agent`](crate::Services::active_hooks_by_agent).
+    pub(crate) async fn active_pr_monitors_by_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> HashMap<String, Vec<Value>> {
+        let monitors = match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-pr-monitors workspace lookup failed; waitingOnPrMonitors reads as empty"
+                );
+                return HashMap::new();
             }
         };
-        monitors
-            .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-            .collect()
+        let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for m in monitors {
+            let agent = m.agent_id.0.clone();
+            by_agent
+                .entry(agent)
+                .or_default()
+                .push(waiting_on_pr_monitors_entry(&m));
+        }
+        by_agent
+    }
+
+    /// Stamp `waitingOnPrMonitors` onto an `agent:idle`-style event `data`
+    /// object when `agent_id` owns at least one active PR monitor (the field
+    /// is omitted — never `[]` — otherwise, and an existing stamp is left
+    /// untouched). Returns the stamped list (empty when nothing was stamped
+    /// and no stamp was present). Mirrors
+    /// [`Services::annotate_waiting_on_hooks`](crate::Services::annotate_waiting_on_hooks).
+    pub(crate) async fn annotate_waiting_on_pr_monitors(
+        &self,
+        agent_id: &AgentId,
+        data: &mut Value,
+    ) -> Vec<Value> {
+        if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
+            return existing.clone();
+        }
+        let monitors = self.active_pr_monitors_for_agent(agent_id).await;
+        let entries: Vec<Value> = monitors.iter().map(waiting_on_pr_monitors_entry).collect();
+        if !entries.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(
+                    "waitingOnPrMonitors".to_string(),
+                    Value::Array(entries.clone()),
+                );
+            }
+        }
+        entries
     }
 
     /// The per-turn snapshot's `prMonitors` field: one
@@ -2494,6 +2577,79 @@ mod tests {
         assert!(owner_messages(&svc, &owner)
             .await
             .contains("cancelled from the app"));
+    }
+
+    /// Idle-visibility gating: the `waitingOnPrMonitors` stamp applied by
+    /// every `agent:idle` emit site carries the owner's ACTIVE monitors only
+    /// — light `{ monitorId, repo, prNumber, title? }` metadata, no
+    /// requirements/pendingChanges — and is omitted entirely (never `[]`)
+    /// when the agent owns no active monitor. Mirrors
+    /// `annotate_waiting_on_hooks_stamps_only_when_active_hooks_exist` in
+    /// `hook_manager.rs`.
+    #[tokio::test]
+    async fn annotate_waiting_on_pr_monitors_stamps_only_when_active_monitors_exist() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        // No monitors at all: nothing stamped.
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert!(stamped.is_empty());
+        assert!(
+            data.get("waitingOnPrMonitors").is_none(),
+            "field omitted when no active monitors: {data}"
+        );
+
+        // An active monitor stamps the light entry.
+        let monitor = register(&svc, &ws, &owner).await;
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert_eq!(stamped.len(), 1);
+        let entry = &data["waitingOnPrMonitors"][0];
+        assert_eq!(entry["monitorId"], json!(monitor.monitor_id));
+        assert_eq!(entry["repo"], json!("o/r"));
+        assert_eq!(entry["prNumber"], json!(42));
+        assert_eq!(entry["title"], json!("Add thing"), "{entry}");
+        // Payloads stay light: no requirements/pendingChanges.
+        assert!(entry.get("lastSnapshot").is_none());
+        assert!(entry.get("pendingChanges").is_none());
+
+        // A cancelled monitor is not active: nothing stamped.
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        let mut data = json!({ "agentId": owner.0 });
+        svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert!(
+            data.get("waitingOnPrMonitors").is_none(),
+            "cancelled monitors never stamp: {data}"
+        );
+
+        // Another agent's idle is unaffected by this owner's monitors.
+        register(&svc, &ws, &owner).await;
+        let other = AgentId::from("agent-other");
+        let mut data = json!({ "agentId": other.0 });
+        svc.annotate_waiting_on_pr_monitors(&other, &mut data).await;
+        assert!(data.get("waitingOnPrMonitors").is_none());
+    }
+
+    /// Workspace-batched variant used by `agent.list`/`agent.diagnostics`:
+    /// one query groups active monitors by owning agent, and an agent with
+    /// none is absent from the map.
+    #[tokio::test]
+    async fn active_pr_monitors_by_agent_groups_by_owner() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        assert!(svc.active_pr_monitors_by_agent(&ws).await.is_empty());
+
+        let monitor = register(&svc, &ws, &owner).await;
+        let by_agent = svc.active_pr_monitors_by_agent(&ws).await;
+        assert_eq!(by_agent.len(), 1);
+        let entries = &by_agent[&owner.0];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["monitorId"], json!(monitor.monitor_id));
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert!(svc.active_pr_monitors_by_agent(&ws).await.is_empty());
     }
 
     /// The per-turn snapshot's `prMonitors` labels: active monitors only, with

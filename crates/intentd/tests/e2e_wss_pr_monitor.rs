@@ -848,3 +848,60 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(rows[0]["state"], "completed");
     assert_eq!(rows[0]["lastSnapshot"]["state"], "merged");
 }
+
+/// Idle-visibility (unified external-wait, mirrors the hook-lifecycle
+/// `waitingOnHooks` e2e coverage): `agent.get` over the wire overlays the
+/// light `waitingOnPrMonitors` list on the `AgentLite` projection for an
+/// agent owning an ACTIVE monitor, and omits the field entirely for a
+/// monitor-less agent. (Emit-site coverage of the same stamp on the
+/// `agent:idle` event itself lives in `intent-services` unit tests, which
+/// can reach the private `annotate_waiting_on_pr_monitors` helper directly;
+/// this fixture has no ACP provider to drive a real agent turn.)
+#[tokio::test]
+async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.get",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    let waiting = got["agent"]["waitingOnPrMonitors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent.get serves waitingOnPrMonitors: {got}"));
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(waiting[0]["repo"], "o/r");
+    assert_eq!(waiting[0]["prNumber"], 42);
+    assert_eq!(waiting[0]["title"], "Add thing");
+    assert!(
+        waiting[0].get("lastSnapshot").is_none(),
+        "payload stays light: {got}"
+    );
+
+    // Cancelled: no longer active, field omitted entirely (never `[]`).
+    fx.services
+        .pr_monitor_cancel(&fx.ws_id, &monitor.monitor_id, Some(&fx.agent_id))
+        .await
+        .expect("cancel");
+    let got_after = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.get",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    assert!(
+        got_after["agent"].get("waitingOnPrMonitors").is_none(),
+        "field omitted once the monitor is cancelled: {got_after}"
+    );
+}
