@@ -2940,17 +2940,18 @@ impl Services {
         //
         // monorepo#1483: the seal gates on the QUEUE/BUSY classification
         // alone. A hook-waiting idle (the agent owns active background
-        // hooks, monorepo#1336) defers only the agent's own settlement AS A
+        // hooks, monorepo#1336) or a pr-monitor-waiting idle (the agent owns
+        // active PR monitors) defers only the agent's own settlement AS A
         // CHILD — watch delivery and grouped recording — but its delegating
-        // turn is still over (a hook wake redrives a NEW turn). Gating the
-        // seal on `hook_waiting` too would starve a hook-chaining
-        // coordinator's group forever.
+        // turn is still over (a hook/monitor wake redrives a NEW turn).
+        // Gating the seal on `hook_waiting` or `pr_monitor_waiting` too would
+        // starve a hook- or PR-monitor-chaining coordinator's group forever.
         if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
-                if classification.hook_waiting {
-                    // On the canonical hook-waiting-only idle the group was
-                    // already sealed by the inline redelivery's hook guard
-                    // (delivery's tail re-check runs it first), so this
+                if classification.hook_waiting || classification.pr_monitor_waiting {
+                    // On the canonical hook-/pr-monitor-waiting-only idle the
+                    // group was already sealed by the inline redelivery's
+                    // guard (delivery's tail re-check runs it first), so this
                     // branch is the backstop for the races where that
                     // redelivery early-returns without sealing (e.g. an
                     // enqueue drained into a busy turn between the entry
@@ -2958,7 +2959,7 @@ impl Services {
                     tracing::debug!(
                         parent = %child.0,
                         group = %gid,
-                        "sealed after_all group at a hook-waiting queue-idle (monorepo#1483)"
+                        "sealed after_all group at a hook-/pr-monitor-waiting queue-idle (monorepo#1483)"
                     );
                 }
                 self.try_fire_group(&gid).await;
@@ -3304,19 +3305,22 @@ impl Services {
             return;
         }
         // Idle-visibility deferral: an idle agent still owning active
-        // background hooks has not settled — leave the marker in place (like
-        // the busy guard) so the hook's own terminal transition (dispatch /
-        // eviction / expiry wake → turn-end idle, or the external-cancel
-        // call into this function) synthesizes the completion later.
+        // background hooks OR active PR monitors has not settled — leave the
+        // marker in place (like the busy guard) so the hook's own terminal
+        // transition (dispatch / eviction / expiry wake → turn-end idle, or
+        // the external-cancel call into this function) — or the PR monitor's
+        // own poll loop wake — synthesizes the completion later.
         //
-        // monorepo#1483: hook deferral is scoped to the agent's settlement
-        // AS A CHILD (the synthesized watch delivery below); the agent is
-        // queue-idle here (empty queue, no worker in flight), so its
-        // delegating turn is over — seal its open after_all group NOW
-        // rather than starving the seal until the hooks resolve. Box::pin
+        // monorepo#1483: hook/pr-monitor deferral is scoped to the agent's
+        // settlement AS A CHILD (the synthesized watch delivery below); the
+        // agent is queue-idle here (empty queue, no worker in flight), so its
+        // delegating turn is over — seal its open after_all group NOW rather
+        // than starving the seal until the hooks/monitors resolve. Box::pin
         // mirrors the seal below (try_fire_group → deliver_parent_wake →
         // send_message → try_drain_queue → this function).
-        if !self.active_hooks_for_agent(child_id).await.is_empty() {
+        if !self.active_hooks_for_agent(child_id).await.is_empty()
+            || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
@@ -3384,8 +3388,9 @@ impl Services {
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
-        // QUEUE/BUSY classification (monorepo#1483: `hook_waiting` never
-        // gates the seal): an enqueue landing between this function's
+        // QUEUE/BUSY classification (monorepo#1483: neither `hook_waiting`
+        // nor `pr_monitor_waiting` gates the seal): an enqueue landing
+        // between this function's
         // `has_ready_to_send` guard and the delivery re-classifies the
         // synthesized idle as interim (marker re-recorded, so a later
         // mutation/drain retries), and the seal must agree with that
@@ -3441,6 +3446,17 @@ impl Services {
     /// idling agent's own parent-side after_all seal gates on the
     /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
+    /// Idle-visibility deferral (unified external-wait classification): an
+    /// `agent:idle` for a child that owns ACTIVE PR monitors is deferred the
+    /// same way and for the same reason as hook-waiting — a monitored PR's
+    /// own centralized poll loop (`pr_monitor.rs`) is what will wake the
+    /// agent next, so the idle is not the child's genuine settlement.
+    /// Classified live via [`Services::active_pr_monitors_for_agent`]
+    /// (fail-open on a probe error, same as the hook probe); a monitor that
+    /// completed or was cancelled between emit and delivery never defers.
+    /// PR-monitor deferral is likewise scoped to the agent's settlement AS A
+    /// CHILD — it does not gate the child's own after_all seal either.
+    ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
     /// same-workspace delegation and `__chief__` for chief parents.
@@ -3480,9 +3496,9 @@ impl Services {
     /// group-seal decisions (`handle_completion_event`,
     /// `redeliver_completion_after_queue_mutation`) share it instead of
     /// re-probing the queue (monorepo#1281) — and gate on `queue_interim`
-    /// alone, because neither `hook_waiting` (monorepo#1483) nor
-    /// agent-waiting (not in the snapshot at all) may block the parent-side
-    /// seal.
+    /// alone, because neither `hook_waiting` nor `pr_monitor_waiting`
+    /// (monorepo#1483) nor agent-waiting (not in the snapshot at all) may
+    /// block the parent-side seal.
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
@@ -3513,6 +3529,14 @@ impl Services {
         // for groups; a hook-waiting one must not).
         let hook_waiting = event.event_type == AGENT_IDLE
             && !self.active_hooks_for_agent(child_id).await.is_empty();
+        // Idle-visibility deferral (unified external-wait, mirrors
+        // `hook_waiting` exactly): an `agent:idle` for a child that owns
+        // active PR monitors is not its real completion — a monitored PR's
+        // own poll loop will wake the agent when it changes or settles.
+        // Probed live, same as the hook probe, and independently of
+        // `hook_waiting` so the GROUPED branch below can defer on either.
+        let pr_monitor_waiting = event.event_type == AGENT_IDLE
+            && !self.active_pr_monitors_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
@@ -3527,14 +3551,15 @@ impl Services {
         let agent_waiting =
             event.event_type == AGENT_IDLE && self.agent_is_waiting_on_agents(child_id);
         // Two interim notions:
-        // - `seal_interim` (queue/busy/hook): the child may run ANOTHER turn
-        //   that delegates more children, so its open after_all group is not
-        //   final — the caller must not seal. Agent-waiting is excluded: the
-        //   post-wait turn reopens a FRESH group, so the current one seals now.
+        // - `seal_interim` (queue/busy/hook/pr-monitor): the child may run
+        //   ANOTHER turn that delegates more children, so its open after_all
+        //   group is not final — the caller must not seal. Agent-waiting is
+        //   excluded: the post-wait turn reopens a FRESH group, so the
+        //   current one seals now.
         // - `interim_idle`: seal-interim OR agent-waiting — the child has not
         //   settled, so its ungrouped watchers neither deliver nor retire and
         //   its grouped memberships skip the settlement record.
-        let seal_interim = queue_interim || hook_waiting;
+        let seal_interim = queue_interim || hook_waiting || pr_monitor_waiting;
         let interim_idle = seal_interim || agent_waiting;
         // Test seam: park in the classify→mark window so a test can land a
         // concurrent watch removal between the `agent_waiting` probe above
@@ -3619,12 +3644,14 @@ impl Services {
                 // ITS parent's group; the child's OWN after_all group seal is
                 // gated separately on `seal_interim` (which excludes
                 // agent-waiting) so an after_all coordinator never deadlocks.
-                if (hook_waiting || agent_waiting) && event.event_type == AGENT_IDLE {
+                if (hook_waiting || pr_monitor_waiting || agent_waiting)
+                    && event.event_type == AGENT_IDLE
+                {
                     tracing::debug!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         group = %gid,
-                        "deferring grouped agent:idle settlement — child owns active background hooks or outgoing agent watches"
+                        "deferring grouped agent:idle settlement — child owns active background hooks, active PR monitors, or outgoing agent watches"
                     );
                     continue;
                 }
@@ -3697,20 +3724,21 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-/busy-/hook-/agent-waiting completion): the
-            // child still has ready-to-send queued messages, a turn already
-            // in flight, active background hooks, or outgoing watches on
-            // unsettled agents it is waiting on, so this idle is not its real
-            // completion — deliver nothing and leave the watch (including a
-            // report_delivered one, which retires at the real completion)
-            // armed for the settlement that follows the queue drain / running
-            // turn / hook resolution / watched-target completion. The
+            // Interim idle (queue-/busy-/hook-/pr-monitor-/agent-waiting
+            // completion): the child still has ready-to-send queued messages,
+            // a turn already in flight, active background hooks, active PR
+            // monitors, or outgoing watches on unsettled agents it is waiting
+            // on, so this idle is not its real completion — deliver nothing
+            // and leave the watch (including a report_delivered one, which
+            // retires at the real completion) armed for the settlement that
+            // follows the queue drain / running turn / hook resolution / PR
+            // monitor resolution / watched-target completion. The
             // interim-skip marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, active background hooks, or outgoing agent watches (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, active background hooks, active PR monitors, or outgoing agent watches (interim idle)"
                 );
                 continue;
             }
@@ -3853,6 +3881,7 @@ impl Services {
         CompletionIdleClassification {
             queue_interim,
             hook_waiting,
+            pr_monitor_waiting,
         }
     }
 
@@ -7649,6 +7678,12 @@ pub(crate) struct CompletionIdleClassification {
     /// recording) defers until the hooks resolve, but this alone must NOT
     /// gate the parent-side after_all seal (monorepo#1483).
     pub(crate) hook_waiting: bool,
+    /// PR-monitor-waiting: the agent owns active PR monitors — mirrors
+    /// `hook_waiting` exactly (same settlement-as-a-child deferral, same
+    /// monorepo#1483 seal exemption): a monitored PR's own poll loop is what
+    /// eventually wakes the agent, so this alone must NOT gate the
+    /// parent-side after_all seal either.
+    pub(crate) pr_monitor_waiting: bool,
 }
 
 /// STAB-129: the group members whose recorded terminal event was

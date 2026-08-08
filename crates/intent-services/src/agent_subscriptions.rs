@@ -1613,6 +1613,23 @@ impl Services {
                         {
                             continue;
                         }
+                        // Idle-visibility deferral (unified external-wait,
+                        // mirrors the hook check above): an idle child that
+                        // still owns active PR monitors has not settled — do
+                        // NOT record it at rehydration; the monitor's own
+                        // centralized poll loop resumes independently and
+                        // wakes the child on its next change/completion, so
+                        // the child's genuine completion (post-monitor idle /
+                        // failure / deletion) records through the live
+                        // delivery path later.
+                        if event_type == intent_core::events::AGENT_IDLE
+                            && !self
+                                .active_pr_monitors_for_agent(&child_id)
+                                .await
+                                .is_empty()
+                        {
+                            continue;
+                        }
                         // Agent-waiting deferral (issue intent-hq/monorepo#1468):
                         // an idle child that itself holds live outgoing
                         // completion watches on other agents has not settled
@@ -1743,6 +1760,14 @@ impl Services {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|hooks| !hooks.is_empty())
         {
+            return;
+        }
+        // Idle-visibility deferral (unified external-wait, mirrors the hook
+        // check above): an agent that owns active PR monitors has not
+        // settled — its group completion must not be recorded yet. Not
+        // stamped onto `event_data` (internal classification only), so
+        // probed live here, matching the agent-waiting check below.
+        if !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle

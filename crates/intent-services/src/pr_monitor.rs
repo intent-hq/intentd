@@ -1263,6 +1263,30 @@ impl Services {
         Ok(json!({ "ok": true, "flushed": flushed }))
     }
 
+    /// Idle-visibility deferral (mirrors
+    /// [`Services::active_hooks_for_agent`](crate::Services::active_hooks_for_agent)):
+    /// the caller's ACTIVE PR monitors, oldest first. Empty when the agent
+    /// owns no active monitor; a store failure is logged and reads as empty
+    /// (visibility is best-effort and must never block an idle emit or wake
+    /// delivery).
+    pub(crate) async fn active_pr_monitors_for_agent(&self, agent_id: &AgentId) -> Vec<PrMonitor> {
+        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "active-pr-monitors lookup failed; pr-monitor-waiting reads as empty"
+                );
+                return Vec::new();
+            }
+        };
+        monitors
+            .into_iter()
+            .filter(|m| m.state == PrMonitorState::Active)
+            .collect()
+    }
+
     /// The per-turn snapshot's `prMonitors` field: one
     /// `"<owner>/<name>#<number>"` label per ACTIVE monitor this agent owns,
     /// suffixed with `" (changes pending)"` while a debounced emit is
