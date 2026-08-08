@@ -14,10 +14,20 @@ use git2::{ObjectType, Repository};
 use intent_core::{Error, Result};
 
 use crate::map_git_err;
+use crate::submodule::reject_submodule_internal_paths;
 
-/// Stage `paths` (already split and validated) in the worktree.
+/// Stage `paths` (already split and validated) in the worktree. Refuses any
+/// path strictly inside a registered submodule (parity with `git add`'s
+/// "is in submodule" pathspec error) before touching the index, so a caller
+/// can never flatten a submodule's gitlink into the superproject
+/// (monorepo#1714). Staging the gitlink path itself (a pin bump) is unaffected.
+/// The guard matches on the repo-relative form of each path, so an in-worktree
+/// absolute path (`/repo/sub/a.txt`) is refused exactly like its relative
+/// spelling — it would otherwise slip past the guard and be normalized into
+/// `sub/a.txt` on the way to `index.add_path`.
 pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    reject_submodule_internal_paths(&repo, paths)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
@@ -427,6 +437,161 @@ mod tests {
         commit_file(dir.path(), "seed.txt", "seed\n");
         let err = stage(dir.path(), &["nope.txt".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("did not match any files"));
+    }
+
+    #[test]
+    fn stage_rejects_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        // Dirty a file *inside* the submodule's own worktree.
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        let err = stage(dir.path(), &["sub/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // Nothing was staged: index still has the gitlink, not blobs.
+        let st = status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| f.path != "sub/a.txt"),
+            "submodule-internal path must not be staged: {st:?}"
+        );
+    }
+
+    /// Regression: the guard must run on the *normalized* (repo-relative)
+    /// path. An in-worktree absolute path does not match the registered
+    /// relative submodule path (`sub`), so a guard that inspected the raw
+    /// spelling let it through and `normalize_rel` then handed
+    /// `sub/a.txt` to `index.add_path` — flattening the gitlink after all.
+    #[test]
+    fn stage_rejects_absolute_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-abs");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-abs");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+
+        let abs = dir.path().join("sub").join("a.txt");
+        let err = stage(dir.path(), &[abs.to_string_lossy().to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // The gitlink survives: nothing under `sub/` reached the index.
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index
+                .iter()
+                .all(|e| !String::from_utf8_lossy(&e.path).starts_with("sub/")),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+        let st = status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| !f.path.starts_with("sub/")),
+            "submodule-internal path must not be staged: {st:?}"
+        );
+    }
+
+    /// Regression (case-variant bypass): with `core.ignorecase` — git's default
+    /// on macOS/Windows — `SUB/a.txt` resolves to the same file on disk as
+    /// `sub/a.txt`, so a byte-exact guard missed it and `index.add_path` wrote a
+    /// flattened `SUB` tree over the `160000` gitlink. Real `git add SUB/a.txt`
+    /// is a no-op that keeps the gitlink. `core.ignorecase` is set explicitly so
+    /// the comparison logic is exercised on case-sensitive filesystems too.
+    #[test]
+    fn stage_rejects_case_variant_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-case");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-case");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+
+        let err = stage(dir.path(), &["SUB/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // The gitlink survives: nothing under `sub/`/`SUB/` reached the index.
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index.iter().all(|e| {
+                let p = String::from_utf8_lossy(&e.path).to_lowercase();
+                !p.starts_with("sub/")
+            }),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+    }
+
+    /// The case-variant guard must not swallow a *sibling* directory that
+    /// merely shares a prefix with the submodule path.
+    #[test]
+    fn stage_allows_sibling_prefix_directory_under_ignorecase() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-sibling");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-sibling");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        write_file(dir.path(), "subdir/a.txt", "sibling\n");
+
+        stage(dir.path(), &["subdir/a.txt".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "subdir/a.txt");
+        assert!(
+            f.is_some() && f.unwrap().staged,
+            "sibling path staged: {st:?}"
+        );
+    }
+
+    #[test]
+    fn stage_gitlink_path_itself_succeeds() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-pin");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-pin");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        // Bump the submodule's checked-out commit (simulating a pointer bump)
+        // by re-pointing the submodule's worktree to a different commit via a
+        // fresh commit inside the submodule.
+        commit_file(&dir.path().join("sub"), "b.txt", "b\n");
+        // Staging the gitlink path itself (not a path inside it) must succeed.
+        stage(dir.path(), &["sub".to_string()]).unwrap();
+        let st = status(dir.path()).unwrap();
+        let f = st.files.iter().find(|f| f.path == "sub");
+        assert!(f.is_some() && f.unwrap().staged, "gitlink pin bump staged");
     }
 
     #[test]

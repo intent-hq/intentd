@@ -16799,7 +16799,10 @@ impl WorkspaceApi for Services {
             // file. Without an `agent_id` attribution is impossible, so the
             // commit is refused rather than sweeping the whole worktree.
             let (to_commit, needs_stage, attribution_filtered) = match files {
-                Some(f) if !f.is_empty() => (f, true, false),
+                Some(f) if !f.is_empty() => {
+                    git_ops::reject_submodule_internal_files(&worktree, &f)?;
+                    (f, true, false)
+                }
                 _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
                 _ => {
                     let Some(agent) = agent_id.as_ref() else {
@@ -16825,6 +16828,21 @@ impl WorkspaceApi for Services {
                         .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
                         .cloned()
                         .collect();
+                    // Drop submodule-internal paths before the emptiness
+                    // check (monorepo#1714 follow-up): auto-commit must never
+                    // flatten a submodule's gitlink into the superproject.
+                    let (filtered, dropped_by_submodule) =
+                        git_ops::drop_submodule_internal_paths(&worktree, filtered);
+                    for (submodule, dropped) in &dropped_by_submodule {
+                        tracing::debug!(
+                            workspace = %workspace_id.0,
+                            agent = %agent.as_str(),
+                            submodule = %submodule,
+                            dropped,
+                            "agentCommit: dropped submodule-internal paths from \
+                             attribution-filtered commit set"
+                        );
+                    }
                     if filtered.is_empty() && !changed.is_empty() {
                         // Diagnosable skip (monorepo#939 trade-off): agent
                         // work not visible to the attribution pipeline (e.g.

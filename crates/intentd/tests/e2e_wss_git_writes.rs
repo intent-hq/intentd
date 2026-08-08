@@ -250,6 +250,37 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     repo
 }
 
+/// Materialise a source repository that carries a real submodule gitlink at
+/// `sub` (cloned from a second tiny repo in `dir`), returning its path. The
+/// `protocol.file.allow` override is required for `file://`-style submodule
+/// clones on modern git.
+fn make_source_repo_with_submodule(dir: &Path) -> PathBuf {
+    let child = dir.join("child-repo");
+    std::fs::create_dir_all(&child).expect("mkdir child repo");
+    run_git(&["init", "-q", "-b", "main"], &child);
+    run_git(&["config", "user.name", "e2e"], &child);
+    run_git(&["config", "user.email", "e2e@example.com"], &child);
+    std::fs::write(child.join("inner.txt"), "inner\n").unwrap();
+    run_git(&["add", "inner.txt"], &child);
+    run_git(&["commit", "-q", "-m", "inner seed"], &child);
+
+    let repo = make_source_repo(dir);
+    run_git(
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            child.to_str().unwrap(),
+            "sub",
+        ],
+        &repo,
+    );
+    run_git(&["commit", "-q", "-m", "add submodule"], &repo);
+    repo
+}
+
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
     let scratch = scratch_dir("scratch");
@@ -681,6 +712,84 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["removed"], json!(true));
     assert!(!lock.exists(), "index.lock deleted from linked gitdir");
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// WSS counterpart of the UDS submodule-gitlink guard (monorepo#1714 follow-up):
+/// over the production TLS/WebSocket envelope, `git.agentCommit`'s explicit
+/// `files` list refuses a path strictly inside a registered submodule with the
+/// PROTOCOL.md §9 `-32603` error naming the path and its containing submodule,
+/// and no commit lands. Both the relative and the in-worktree absolute spelling
+/// are refused — the absolute form used to slip past the guard and be
+/// normalized into the submodule-internal relative path on the way to the index.
+#[tokio::test]
+async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-submodule");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo_with_submodule(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — submodule guard").await;
+
+    let head_before = run_git(&["rev-parse", "HEAD"], &wt);
+
+    // Dirty a file strictly inside the submodule's own worktree. A linked
+    // worktree does not check out submodules, so materialise the directory
+    // first — the guard is a pathspec check, not an on-disk probe.
+    let sub = wt.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("inner.txt"), "changed inside sub\n").unwrap();
+
+    for (id, spelling) in [
+        (30i64, "sub/inner.txt".to_string()),
+        (31, sub.join("inner.txt").to_string_lossy().to_string()),
+    ] {
+        let resp = wss_rpc(
+            &mut ws,
+            id,
+            "git.agentCommit",
+            json!({
+                "workspaceId": ws_id,
+                "message": "flatten sub",
+                "files": [spelling],
+                "userRequested": true,
+            }),
+        )
+        .await;
+        assert_eq!(resp["jsonrpc"], json!("2.0"));
+        assert_eq!(resp["id"], json!(id));
+        assert!(resp.get("result").is_none(), "{spelling}: {resp}");
+        assert_eq!(resp["error"]["code"], json!(-32603), "{spelling}: {resp}");
+        let msg = resp["error"]["data"]
+            .as_str()
+            .or_else(|| resp["error"]["message"].as_str())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("inner.txt"),
+            "{spelling}: names the path: {resp}"
+        );
+        assert!(
+            msg.contains("submodule 'sub'"),
+            "{spelling}: names the containing submodule: {resp}"
+        );
+    }
+
+    // No commit landed on the superproject, and the gitlink survived.
+    assert_eq!(
+        run_git(&["rev-parse", "HEAD"], &wt),
+        head_before,
+        "no commit must have been made"
+    );
+    let ls = run_git(&["ls-files", "-s", "sub"], &wt);
+    assert!(
+        ls.starts_with("160000"),
+        "gitlink entry intact, got: {ls:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
