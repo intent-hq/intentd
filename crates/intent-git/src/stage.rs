@@ -94,8 +94,18 @@ pub fn unstage(worktree_path: &Path, paths: &[String]) -> Result<()> {
 /// non-ENOENT filesystem error on untracked deletion is best-effort (silently
 /// swallowed, matching the reference's per-file warn-and-continue behavior);
 /// tracked-batch checkout failures propagate as `Error::Git`.
+///
+/// A path strictly inside a registered submodule is refused with the same
+/// "is in submodule" error as [`stage`] (monorepo#1733): the superproject index
+/// has no entry for it, so it would otherwise classify as untracked and be
+/// unlinked, destroying an uncommitted submodule edit — real
+/// `git checkout -- sub/a.txt` refuses. The guard runs before the
+/// tracked/untracked partition and before any filesystem mutation, so a batch
+/// containing one such path discards nothing at all. The gitlink path itself
+/// stays allowed: checking out a `160000` entry is a benign no-op.
 pub fn discard(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    reject_submodule_internal_paths(&repo, paths)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
@@ -750,6 +760,130 @@ mod tests {
         assert!(matches!(err, Error::InvalidParams(_)));
         let err = discard(dir.path(), &["".to_string()]).unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    /// Build a superproject with a registered submodule at `sub` whose own
+    /// worktree carries an uncommitted edit to `a.txt`, the fixture shape for
+    /// the discard submodule-guard regressions below.
+    fn submodule_fixture(name: &str) -> (crate::testutil::TempDir, crate::testutil::TempDir) {
+        use crate::testutil::add_submodule;
+        let child = init_repo(&format!("{name}-child"));
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo(&format!("{name}-parent"));
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        write_file(&dir.path().join("sub"), "a.txt", "uncommitted\n");
+        (dir, child)
+    }
+
+    /// Assert the submodule's uncommitted working-copy edit survived and the
+    /// superproject still records `sub` as a `160000` gitlink.
+    fn assert_submodule_intact(worktree: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("sub").join("a.txt")).unwrap(),
+            "uncommitted\n",
+            "submodule working-copy file must survive"
+        );
+        let repo = Repository::open(worktree).unwrap();
+        let index = repo.index().unwrap();
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+    }
+
+    /// Regression (monorepo#1733): `discard` classified a submodule-internal
+    /// path as untracked in the superproject and unlinked it, destroying the
+    /// submodule's uncommitted edit. Real `git checkout -- sub/a.txt` refuses.
+    #[test]
+    fn discard_rejects_submodule_internal_path() {
+        let (dir, _child) = submodule_fixture("discard-sub");
+        let err = discard(dir.path(), &["sub/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// The guard matches the repo-relative form, so an in-worktree absolute
+    /// spelling is refused exactly like its relative one.
+    #[test]
+    fn discard_rejects_absolute_submodule_internal_path() {
+        let (dir, _child) = submodule_fixture("discard-sub-abs");
+        let abs = dir.path().join("sub").join("a.txt");
+        let err = discard(dir.path(), &[abs.to_string_lossy().to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// With `core.ignorecase` (git's default on macOS/Windows) `SUB/a.txt`
+    /// names the same file on disk, so it must be refused too. Set explicitly
+    /// so the comparison is exercised on case-sensitive filesystems as well.
+    #[test]
+    fn discard_rejects_case_variant_submodule_internal_path() {
+        let (dir, _child) = submodule_fixture("discard-sub-case");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        let err = discard(dir.path(), &["SUB/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// The batch is atomic: one submodule-internal path refuses the whole
+    /// call, and the innocent paths alongside it are left untouched (neither
+    /// restored from the index nor unlinked).
+    #[test]
+    fn discard_submodule_internal_path_rejects_whole_batch() {
+        let (dir, _child) = submodule_fixture("discard-sub-batch");
+        commit_file(dir.path(), "tracked.txt", "clean\n");
+        write_file(dir.path(), "tracked.txt", "dirty\n");
+        write_file(dir.path(), "untracked.txt", "new\n");
+
+        let err = discard(
+            dir.path(),
+            &[
+                "tracked.txt".to_string(),
+                "sub/a.txt".to_string(),
+                "untracked.txt".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "dirty\n",
+            "tracked path must not be restored when the batch is refused"
+        );
+        assert!(
+            dir.path().join("untracked.txt").exists(),
+            "untracked path must not be deleted when the batch is refused"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// The gitlink path itself stays allowed: `git checkout -- sub` is a
+    /// benign no-op that leaves the submodule's worktree (and its uncommitted
+    /// edit) alone.
+    #[test]
+    fn discard_gitlink_path_itself_is_a_benign_noop() {
+        let (dir, _child) = submodule_fixture("discard-sub-gitlink");
+        discard(dir.path(), &["sub".to_string()]).unwrap();
+        assert_submodule_intact(dir.path());
     }
 
     /// A single-line unified-diff patch that turns the seed file's content
