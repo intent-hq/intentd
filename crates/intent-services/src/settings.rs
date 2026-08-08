@@ -1454,8 +1454,13 @@ pub async fn import_legacy_settings(
 /// **only** when that key is still at its schema default, so an already-
 /// migrated (or deliberately re-picked) value is never clobbered. Runs before
 /// [`import_legacy_settings`], which then discards and strips the legacy
-/// table. Values that fail the typed schema are skipped with a warning; a
-/// file with no `[backgroundAgents]` table is a no-op.
+/// table. A file with no `[backgroundAgents]` table is a no-op.
+///
+/// Each member is applied on its own: `apply` validates a batch atomically, so
+/// batching them would let one malformed legacy value (say `defaultModel = 1`)
+/// discard the valid siblings the same boot that strips the legacy table. A
+/// member that fails the typed schema is skipped with a warning and the rest
+/// still carry over.
 pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
     let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
         return Ok(());
@@ -1464,7 +1469,7 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
         tracing::warn!("legacy [backgroundAgents] is not a table; discarding");
         return Ok(());
     };
-    let mut changes: Vec<(String, Value)> = Vec::new();
+    let mut migrated: Vec<String> = Vec::new();
     for member in ["defaultModel", "typeOverrides", "providerSettings"] {
         let Some(value) = table.get(member) else {
             continue;
@@ -1474,20 +1479,18 @@ pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> 
             tracing::debug!(path, "quick-action key already set; keeping current value");
             continue;
         }
-        changes.push((path, value.clone()));
+        if let Err(e) = registry.apply(&[(path.clone(), value.clone())]) {
+            tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; discarding");
+            continue;
+        }
+        migrated.push(path);
     }
-    if changes.is_empty() {
-        return Ok(());
+    if !migrated.is_empty() {
+        tracing::info!(
+            paths = ?migrated,
+            "migrated legacy [backgroundAgents] into quickActions.*"
+        );
     }
-    if let Err(e) = registry.apply(&changes) {
-        tracing::warn!(error = %e, "failed to migrate [backgroundAgents] into quickActions.*; discarding");
-        return Ok(());
-    }
-    let paths: Vec<&str> = changes.iter().map(|(p, _)| p.as_str()).collect();
-    tracing::info!(
-        ?paths,
-        "migrated legacy [backgroundAgents] into quickActions.*"
-    );
     Ok(())
 }
 
@@ -3194,6 +3197,36 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// PR #1010 review: one malformed legacy member must not take its valid
+    /// siblings down with it — members are applied individually, so the bad
+    /// one is skipped and the rest still carry over before the legacy table
+    /// is stripped.
+    #[tokio::test]
+    async fn quick_action_migration_skips_only_the_malformed_member() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qabad-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = 1\ntypeOverrides = { commit = \"auggie:fast\" }\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({ "commit": "auggie:fast" })),
+            "a valid sibling must survive a malformed member"
+        );
+        assert_eq!(
+            registry.origin("quickActions.defaultModel"),
+            Some(SettingOrigin::Default),
+            "the malformed member must be skipped, not persisted"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// The carry-over never clobbers a `quickActions.*` key the user already
