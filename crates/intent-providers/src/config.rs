@@ -42,6 +42,15 @@ pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.14";
 /// model-catalog probe in `intent-services::provider_models`.
 pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
 
+/// Minimum `pi` CLI version the pinned [`PI_ACP_NPX_PACKAGE`] adapter
+/// requires. Feeds the pure version-gate decision in
+/// [`crate::version_gate`]; re-check when bumping the pin.
+pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
+
+/// Pi CLI version requirement for user-facing messages. Must match
+/// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
+pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);

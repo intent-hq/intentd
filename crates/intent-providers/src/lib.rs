@@ -26,6 +26,7 @@ pub mod args;
 pub mod config;
 pub mod discover;
 pub mod models;
+pub mod version_gate;
 
 pub use args::{
     apply_codex_config_args, build_provider_args, build_provider_env, build_provider_env_for_spawn,
@@ -37,7 +38,7 @@ pub use config::{
     find_provider, first_provider_config, first_provider_id, is_provider_authentication_error,
     provider_config, InjectionMechanism, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
-    PI_ACP_NPX_PACKAGE,
+    PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 pub use discover::{
     discover_providers, discover_providers_with_overrides, find_npx, find_provider_binary,
@@ -50,6 +51,7 @@ pub use models::{
     parse_grok_initialize_response_from_stdout, parse_grok_models_command_output,
     resolve_preferred_model, GrokModel, GrokModelsCommandOutput, GrokParsedModels,
 };
+pub use version_gate::{pi_cli_gate, PiCliGate, PiCliProbe};
 
 #[cfg(test)]
 mod tests;
