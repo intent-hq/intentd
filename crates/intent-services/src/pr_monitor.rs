@@ -1331,7 +1331,7 @@ impl Services {
     /// (visibility is best-effort and must never block an idle emit or wake
     /// delivery).
     pub(crate) async fn active_pr_monitors_for_agent(&self, agent_id: &AgentId) -> Vec<PrMonitor> {
-        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+        match self.store.list_active_pr_monitors_by_agent(agent_id).await {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -1339,13 +1339,9 @@ impl Services {
                     error = %e,
                     "active-pr-monitors lookup failed; pr-monitor-waiting reads as empty"
                 );
-                return Vec::new();
+                Vec::new()
             }
-        };
-        monitors
-            .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-            .collect()
+        }
     }
 
     /// Workspace-batched variant of
@@ -1359,7 +1355,11 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
-        let monitors = match self.store.list_pr_monitors_by_workspace(workspace_id).await {
+        let monitors = match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -1371,10 +1371,7 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for m in monitors
-            .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-        {
+        for m in monitors {
             let agent = m.agent_id.0.clone();
             by_agent
                 .entry(agent)
