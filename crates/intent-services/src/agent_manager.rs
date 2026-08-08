@@ -1993,6 +1993,7 @@ impl AgentManager {
         // config option the provider advertised — see
         // `install_and_apply_thought_level`.
         let stored_effort = session_record.reasoning_effort.clone();
+        let workspace_id = session_record.workspace_id.clone();
 
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
@@ -2056,6 +2057,7 @@ impl AgentManager {
                 .await;
                 self.install_and_apply_thought_level(
                     conn.as_ref(),
+                    &workspace_id,
                     agent_id,
                     &opened.session_id,
                     opened.thought_level.clone(),
@@ -2108,6 +2110,7 @@ impl AgentManager {
             .await;
             self.install_and_apply_thought_level(
                 conn.as_ref(),
+                &workspace_id,
                 agent_id,
                 &opened.session_id,
                 opened.thought_level.clone(),
@@ -2140,6 +2143,7 @@ impl AgentManager {
         .await;
         self.install_and_apply_thought_level(
             conn.as_ref(),
+            &workspace_id,
             agent_id,
             &opened.session_id,
             opened.thought_level.clone(),
@@ -2155,16 +2159,22 @@ impl AgentManager {
     /// the config id comes from the adapter's own `configOptions`
     /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
     /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. Best-effort — a rejected call
-    /// is logged and never fails session startup.
+    /// such option silently ignores the field. Also persists the selector's
+    /// surfaced levels wholesale (Option C — `agent:updated` on change only;
+    /// see [`Services::persist_session_effort_levels`]). Best-effort — a
+    /// rejected call is logged and never fails session startup.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
+        workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         acp_session_id: &str,
         thought_level: Option<ThoughtLevelOption>,
         stored_effort: Option<&str>,
     ) {
+        self.services
+            .persist_session_effort_levels(workspace_id, agent_id, thought_level.as_ref())
+            .await;
         if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
             handle.thought_level = thought_level;
         }
@@ -8086,6 +8096,7 @@ mod role_reminder_tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -9968,6 +9979,7 @@ mod agent_retry_tests {
             name_explicitly_set: false,
             model: Some("model-1".to_string()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("provider-1".to_string()),
             system_prompt: None,
             specialist: None,

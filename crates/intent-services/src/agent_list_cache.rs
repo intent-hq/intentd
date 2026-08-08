@@ -282,6 +282,7 @@ mod tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,

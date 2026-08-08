@@ -599,6 +599,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -3911,6 +3912,159 @@ async fn resume_session_discovers_thought_level_option() {
         opened.thought_level.expect("discovered").config_id,
         "effort"
     );
+}
+
+/// A `session/new` result shaped like claude-agent-acp's: the `thought_level`
+/// select lists a `default` sentinel alongside the real levels
+/// (default/low/medium/high/max).
+fn claude_shaped_thought_level_session_result() -> Value {
+    json!({
+        "sessionId": ACP_SID,
+        "configOptions": [
+            { "id": "effort", "name": "Effort", "category": "thought_level",
+              "type": "select", "currentValue": "default",
+              "options": [ { "value": "default", "name": "Default" },
+                           { "value": "low", "name": "Low" },
+                           { "value": "medium", "name": "Medium" },
+                           { "value": "high", "name": "High" },
+                           { "value": "max", "name": "Max" } ] }
+        ]
+    })
+}
+
+/// [`ThoughtLevelOption::surfaced_levels`] drops the case-insensitive
+/// `"default"` sentinel and returns `None` (not `Some(empty)`) when nothing
+/// remains.
+#[test]
+fn surfaced_levels_filters_default_sentinel() {
+    let mut tl = super::ThoughtLevelOption {
+        config_id: "effort".to_string(),
+        initial_value: "Default".to_string(),
+        current_value: "Default".to_string(),
+        values: ["Default", "low", "medium", "high", "max"]
+            .map(String::from)
+            .to_vec(),
+    };
+    assert_eq!(
+        tl.surfaced_levels().as_deref(),
+        Some(
+            ["low", "medium", "high", "max"]
+                .map(String::from)
+                .as_slice()
+        )
+    );
+    tl.values = vec!["DEFAULT".to_string()];
+    assert_eq!(tl.surfaced_levels(), None, "all-sentinel list yields None");
+    tl.values = Vec::new();
+    assert_eq!(tl.surfaced_levels(), None, "empty list yields None");
+}
+
+/// Regression (PROTOCOL §5.5, Option C): a claude-code-shaped `configOptions`
+/// (thought_level select with default/low/medium/high/max) yields
+/// `effortLevels: ["low","medium","high","max"]` on the wire — persisted via
+/// `persist_session_effort_levels`, carried by the `AgentLite` projection,
+/// and announced by ONE `agent:updated`; the identical re-persist (the next
+/// session open) emits nothing.
+#[tokio::test]
+async fn session_open_persists_effort_levels_and_emits_on_change_only() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-persist");
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) =
+        connect_with_session_result(claude_shaped_thought_level_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    services
+        .persist_session_effort_levels(&ws, &session.id, opened.thought_level.as_ref())
+        .await;
+    let expected = ["low", "medium", "high", "max"].map(String::from).to_vec();
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.effort_levels.as_deref(), Some(expected.as_slice()));
+    // The wire projection carries the camelCase field.
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None);
+    assert_eq!(
+        serde_json::to_value(&lite).unwrap()["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+    // One agent:updated announced the change.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let updated = batch
+        .iter()
+        .find(|e| e.event_type == "agent:updated")
+        .expect("agent:updated on the wire");
+    assert_eq!(updated.data["agentId"], json!(session.id.0));
+    assert_eq!(
+        updated.data["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+
+    // The identical set on the next open is a no-op: no event.
+    services
+        .persist_session_effort_levels(&ws, &session.id, opened.thought_level.as_ref())
+        .await;
+    services
+        .publish_agent_event(&ws, &session.id, "test:flush", json!({}))
+        .await;
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    assert!(
+        !batch.iter().any(|e| e.event_type == "agent:updated"),
+        "unchanged set must not re-emit agent:updated"
+    );
+}
+
+/// A provider that advertises no `thought_level` selector CLEARS a previously
+/// persisted set (a provider switch must not leave the old provider's levels
+/// on the wire), and the `agent:updated` announcing it carries
+/// `effortLevels: null`.
+#[tokio::test]
+async fn session_open_without_selector_clears_persisted_effort_levels() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-clear");
+    session.effort_levels = Some(vec!["low".to_string(), "high".to_string()]);
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    services
+        .persist_session_effort_levels(&ws, &session.id, None)
+        .await;
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.effort_levels, None, "cleared on none advertised");
+    // The wire projection omits the field entirely.
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None);
+    assert!(
+        serde_json::to_value(&lite)
+            .unwrap()
+            .get("effortLevels")
+            .is_none(),
+        "cleared levels must be omitted from the wire"
+    );
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
+    let updated = batch
+        .iter()
+        .find(|e| e.event_type == "agent:updated")
+        .expect("agent:updated on the wire");
+    assert_eq!(updated.data["effortLevels"], Value::Null);
 }
 
 /// `agent:stream:activity` leading-edge throttle (PROTOCOL §7): the first
