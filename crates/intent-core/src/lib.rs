@@ -21,6 +21,7 @@ pub mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;
 pub mod config;
+pub mod discovery_cache;
 pub mod error;
 pub mod events;
 pub mod ids;
@@ -44,6 +45,7 @@ pub use agent_logs::{
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
+pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
@@ -85,6 +87,7 @@ pub use model::{
     WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
     WorkspaceTaskStats, WorkspaceUpdate,
 };
+pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use settings_file::{
