@@ -628,6 +628,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // store/services are initialized so the cache is ready when sandbox provisioning
     // needs it. The probe result is also reported by `intentd doctor`.
     probe_cow_at_startup(&config);
+    // Prewarm the login-shell PATH capture (`$SHELL -ilc`, ~5-10s cold: an
+    // interactive-shell attempt plus a non-interactive fallback, each up to
+    // 5s) off the async runtime so it races startup instead of blocking the
+    // first `host.providerDiscovery` / `host.findBinary` / `host.toolAvailability`
+    // RPC. `spawn_blocking` fires-and-forgets: the shared `OnceLock` behind it
+    // (`intent_core::path_utils::login_shell_dirs`) makes the eventual
+    // on-demand caller either reuse this warm result or, if it runs first,
+    // perform the one real capture itself — either way the shell spawns at
+    // most once per process.
+    tokio::task::spawn_blocking(intent_core::prewarm_login_shell_path);
     // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard

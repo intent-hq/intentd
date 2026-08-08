@@ -235,6 +235,17 @@ pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
     LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
 }
 
+/// Force the login-shell PATH capture (`$SHELL -ilc`, falling back to `-lc`;
+/// up to ~5s per attempt) to run now instead of on the first caller. Intended
+/// to be spawned off the async runtime (e.g. via `tokio::task::spawn_blocking`)
+/// at daemon startup so the first `host.providerDiscovery` / `host.findBinary`
+/// / `host.toolAvailability` RPC does not pay the cold-shell cost. Idempotent
+/// — the underlying `OnceLock` runs the shell probe at most once per process,
+/// so a redundant call (or one racing an on-demand caller) is a no-op.
+pub fn prewarm_login_shell_path() {
+    login_shell_dirs();
+}
+
 /// Helper to push a directory to the list if it's not empty and not already seen.
 pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathBuf) {
     if dir.as_os_str().is_empty() {
