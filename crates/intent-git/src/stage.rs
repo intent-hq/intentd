@@ -21,6 +21,10 @@ use crate::submodule::reject_submodule_internal_paths;
 /// "is in submodule" pathspec error) before touching the index, so a caller
 /// can never flatten a submodule's gitlink into the superproject
 /// (monorepo#1714). Staging the gitlink path itself (a pin bump) is unaffected.
+/// The guard matches on the repo-relative form of each path, so an in-worktree
+/// absolute path (`/repo/sub/a.txt`) is refused exactly like its relative
+/// spelling — it would otherwise slip past the guard and be normalized into
+/// `sub/a.txt` on the way to `index.add_path`.
 pub fn stage(worktree_path: &Path, paths: &[String]) -> Result<()> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     reject_submodule_internal_paths(&repo, paths)?;
@@ -454,6 +458,48 @@ mod tests {
         let st = status(dir.path()).unwrap();
         assert!(
             st.files.iter().all(|f| f.path != "sub/a.txt"),
+            "submodule-internal path must not be staged: {st:?}"
+        );
+    }
+
+    /// Regression: the guard must run on the *normalized* (repo-relative)
+    /// path. An in-worktree absolute path does not match the registered
+    /// relative submodule path (`sub`), so a guard that inspected the raw
+    /// spelling let it through and `normalize_rel` then handed
+    /// `sub/a.txt` to `index.add_path` — flattening the gitlink after all.
+    #[test]
+    fn stage_rejects_absolute_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("stage-sub-child-abs");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("stage-sub-parent-abs");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+
+        let abs = dir.path().join("sub").join("a.txt");
+        let err = stage(dir.path(), &[abs.to_string_lossy().to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        // The gitlink survives: nothing under `sub/` reached the index.
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index
+                .iter()
+                .all(|e| !String::from_utf8_lossy(&e.path).starts_with("sub/")),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+        let st = status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| !f.path.starts_with("sub/")),
             "submodule-internal path must not be staged: {st:?}"
         );
     }

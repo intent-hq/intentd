@@ -173,19 +173,70 @@ pub fn submodule_containing<'a>(
 /// (parity with real `git add`'s "is in submodule" pathspec error). Callers
 /// invoke this once, before any index mutation, so a rejected batch leaves
 /// the index and HEAD untouched.
+///
+/// Each path is matched in its **repo-relative** form: registered submodule
+/// paths are worktree-relative, so an in-worktree *absolute* path
+/// (`/repo/sub/a.txt`) would otherwise miss the guard and still reach
+/// `index.add_path` once the caller normalizes it — recreating the
+/// gitlink-flattening bug (monorepo#1714). The error message keeps the
+/// caller's original spelling.
 pub fn reject_submodule_internal_paths(repo: &Repository, paths: &[String]) -> Result<()> {
     let submodules = submodule_paths(repo)?;
     if submodules.is_empty() {
         return Ok(());
     }
+    let workdir = repo.workdir().map(Path::to_path_buf);
     for raw in paths {
-        if let Some(sm) = submodule_containing(&submodules, raw) {
+        let rel = to_repo_relative(workdir.as_deref(), raw);
+        if let Some(sm) = submodule_containing(&submodules, &rel) {
             return Err(Error::Internal(format!(
                 "fatal: Pathspec '{raw}' is in submodule '{sm}'"
             )));
         }
     }
     Ok(())
+}
+
+/// Repo-relative form of `raw`: relative paths pass through unchanged, and an
+/// absolute path is stripped of the worktree prefix. The strip is retried
+/// against the canonicalized worktree so a symlinked worktree root (macOS
+/// `/tmp` → `/private/tmp`) still matches without requiring `raw` to exist on
+/// disk (a staged deletion names a missing path). An absolute path that is not
+/// under the worktree is returned unchanged — it can never name a submodule
+/// path, and the caller's own normalization leaves it alone too.
+///
+/// Public so the service-layer guard (`git.agentCommit`'s explicit `files`
+/// rejection) matches submodule paths in the same normalized space instead of
+/// duplicating the logic.
+pub fn to_repo_relative(workdir: Option<&Path>, raw: &str) -> String {
+    let p = Path::new(raw);
+    if !p.is_absolute() {
+        return raw.to_string();
+    }
+    let Some(workdir) = workdir else {
+        return raw.to_string();
+    };
+    if let Ok(rest) = p.strip_prefix(workdir) {
+        return rest.to_string_lossy().to_string();
+    }
+    if let (Ok(w), Some(full)) = (std::fs::canonicalize(workdir), canonical_ish(p)) {
+        if let Ok(rest) = full.strip_prefix(&w) {
+            return rest.to_string_lossy().to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// Canonicalize `p`, falling back to canonicalizing its parent and re-joining
+/// the file name so a path that does not exist on disk (a staged deletion)
+/// still resolves its symlinked ancestry.
+fn canonical_ish(p: &Path) -> Option<std::path::PathBuf> {
+    if let Ok(full) = std::fs::canonicalize(p) {
+        return Some(full);
+    }
+    let parent = p.parent()?;
+    let name = p.file_name()?;
+    std::fs::canonicalize(parent).ok().map(|c| c.join(name))
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {

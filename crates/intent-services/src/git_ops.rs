@@ -100,7 +100,9 @@ pub(crate) fn drop_submodule_internal_paths(
 /// containing submodule, and advising the caller to commit from within the
 /// submodule repo instead. The gitlink path itself (a pin bump) is always
 /// allowed. Detection is delegated to `intent_git::submodule` (Task 1's
-/// helper) — no duplicate detection logic here. A no-op when the worktree
+/// helper) — no duplicate detection logic here. Matching happens on the
+/// repo-relative form of each entry so an in-worktree absolute path is
+/// refused exactly like its relative spelling. A no-op when the worktree
 /// cannot be opened as a repo or has no registered submodules (the caller's
 /// downstream commit call surfaces any real repo problem).
 pub(crate) fn reject_submodule_internal_files(worktree: &Path, files: &[String]) -> Result<()> {
@@ -111,10 +113,12 @@ pub(crate) fn reject_submodule_internal_files(worktree: &Path, files: &[String])
     if submodules.is_empty() {
         return Ok(());
     }
+    let workdir = repo.workdir().map(Path::to_path_buf);
     let mut by_submodule: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
     for f in files {
-        if let Some(sm) = intent_git::submodule::submodule_containing(&submodules, f) {
+        let rel = intent_git::submodule::to_repo_relative(workdir.as_deref(), f);
+        if let Some(sm) = intent_git::submodule::submodule_containing(&submodules, &rel) {
             by_submodule.entry(sm).or_default().push(f.as_str());
         }
     }

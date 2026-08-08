@@ -440,6 +440,56 @@ mod tests {
         );
     }
 
+    /// Regression companion to `stage_rejects_absolute_submodule_internal_path`:
+    /// the guard matches on the repo-relative form, so an in-worktree absolute
+    /// path to a submodule-internal file is refused before any tree build and
+    /// HEAD/gitlink/index stay intact.
+    #[test]
+    fn commit_paths_rejects_absolute_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("commit-sub-child-abs");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("commit-sub-parent-abs");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        let head_before = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        let abs = dir.path().join("sub").join("a.txt");
+        let err = commit_paths_with_trailers(
+            dir.path(),
+            "flatten sub via absolute path",
+            Some("agent-1"),
+            None,
+            &[abs.to_string_lossy().to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+
+        let head_after = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+        assert_eq!(head_before, head_after, "no commit must have been made");
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index
+                .iter()
+                .all(|e| !String::from_utf8_lossy(&e.path).starts_with("sub/")),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+    }
+
     #[test]
     fn commit_paths_gitlink_pin_bump_succeeds() {
         use crate::testutil::add_submodule;
