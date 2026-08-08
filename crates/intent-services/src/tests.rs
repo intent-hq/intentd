@@ -10738,6 +10738,69 @@ mod file_tracking {
         assert_eq!(value["stagedCount"], 0);
     }
 
+    /// Regression (monorepo#1693 Finding B): concurrent `accept-changes.getStatus`
+    /// calls for the same workspace coalesce onto ONE full build — not just the
+    /// shared working-tree scan. The scan probe parks the leader mid-scan; while
+    /// parked, three more calls join and must register as followers of the
+    /// *ac-status* flight (not merely as independent followers of the scan), so
+    /// each of them skips the scan entirely and shares the leader's full result.
+    #[tokio::test]
+    async fn accept_changes_get_status_concurrent_calls_coalesce_into_one_build() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.accept_changes_get_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let followers: Vec<_> = (0..3)
+            .map(|_| {
+                let svc = svc.clone();
+                let ws = ws_id.clone();
+                tokio::spawn(async move { svc.accept_changes_get_status(ws).await })
+            })
+            .collect();
+        wait_until("followers to join the in-flight ac-status build", || {
+            svc.ac_status_waiters(&ws_id) == 3
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let first = leader.await.unwrap().unwrap();
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap(), first, "shared result");
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "one underlying scan — followers never re-entered the scan"
+        );
+        assert_eq!(first["uncommittedCount"], 1);
+    }
+
     /// Concurrent status scans for *different* worktrees never coalesce — they
     /// must not serialize against each other.
     #[tokio::test]
