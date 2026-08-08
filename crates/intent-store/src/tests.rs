@@ -139,7 +139,10 @@ async fn open_rejects_database_from_newer_build() {
     let msg = err.to_string();
     assert!(msg.contains("downgrades are unsupported"), "got {msg:?}");
     assert!(msg.contains("999999"), "got {msg:?}");
-    assert!(msg.contains("intentd doctor"), "got {msg:?}");
+    assert!(
+        msg.contains("upgrade intentd to the version that created this database"),
+        "got {msg:?}"
+    );
 }
 
 /// The 0031 backfill derives `repository_name` from the `repository_path`

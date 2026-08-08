@@ -243,9 +243,9 @@ impl Store {
         // Run migrations on the write pool (migrations are write operations).
         MIGRATOR.run(&write_pool).await.map_err(|e| match e {
             sqlx::migrate::MigrateError::VersionMissing(version) => Error::Internal(format!(
-                "database schema is newer than this intentd build, downgrades are \
-                 unsupported (found applied migration {version} that is not recognized \
-                 by this build); run `intentd doctor` for details"
+                "database schema is newer than this intentd build (found applied \
+                 migration {version} not known to this build); downgrades are \
+                 unsupported — upgrade intentd to the version that created this database"
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
