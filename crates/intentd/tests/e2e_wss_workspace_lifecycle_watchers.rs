@@ -390,8 +390,11 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
 
     // Retry writes may have queued further debounced emissions; drain until
     // the socket stays quiet so leftovers cannot pollute the post-delete
-    // silence assertion (window comfortably beyond the 500ms debounce).
-    while drain_extra(&mut sub, "specialists:changed", 1000)
+    // silence assertion (window comfortably beyond the 500ms debounce and
+    // scaled like the other waits, so a load-delayed debounce cannot slip
+    // past the drain).
+    let drain_window_ms = common::test_timeout(Duration::from_millis(1000)).as_millis() as u64;
+    while drain_extra(&mut sub, "specialists:changed", drain_window_ms)
         .await
         .is_some()
     {}
