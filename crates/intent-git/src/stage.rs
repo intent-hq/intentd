@@ -246,16 +246,33 @@ fn lexical_normalize(path: &Path) -> std::path::PathBuf {
 }
 
 /// Normalize a path to be relative to the worktree, mirroring the TS
-/// `path.isAbsolute(p) ? path.relative(worktree, p) : p`.
+/// `path.isAbsolute(p) ? path.relative(worktree, p) : p`, then stripping
+/// lexical `.` noise via [`drop_curdir`].
 fn normalize_rel(workdir: &Path, raw: &str) -> String {
     let p = Path::new(raw);
     if p.is_absolute() {
         p.strip_prefix(workdir)
-            .map(|r| r.to_string_lossy().to_string())
-            .unwrap_or_else(|_| raw.to_string())
+            .map(drop_curdir)
+            .unwrap_or_else(|_| drop_curdir(p))
     } else {
-        raw.to_string()
+        drop_curdir(p)
     }
+}
+
+/// Drop `CurDir` (`.`) components from `p`, the spelling noise that
+/// `Path::components` preserves at the head of a relative path (`./sub`).
+/// Without this the classification below probes the index with a literal
+/// `./sub`, which libgit2 rejects outright ("repo path should not start with
+/// `.`"), and the path falls through to untracked deletion (monorepo#1733).
+/// `ParentDir` is deliberately preserved so [`is_safe_rel`]'s `..` refusal
+/// still sees it.
+fn drop_curdir(p: &Path) -> String {
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .map(|c| c.as_os_str())
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Apply a unified-diff `patch` to the index only (`git apply --cached`),
@@ -883,6 +900,72 @@ mod tests {
     fn discard_gitlink_path_itself_is_a_benign_noop() {
         let (dir, _child) = submodule_fixture("discard-sub-gitlink");
         discard(dir.path(), &["sub".to_string()]).unwrap();
+        assert_submodule_intact(dir.path());
+    }
+
+    /// Regression (`./` bypass of the monorepo#1733 guard): a leading `./` is
+    /// lexical noise that `Path::components` preserves, so the guard's
+    /// component-wise prefix match missed `./sub/a.txt`, `discard` classified
+    /// it as untracked and unlinked the submodule's uncommitted edit.
+    #[test]
+    fn discard_rejects_dot_slash_submodule_internal_path() {
+        let (dir, _child) = submodule_fixture("discard-sub-dotslash");
+        let err = discard(dir.path(), &["./sub/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// The same bypass with the `./` deeper in the path, and with a doubled
+    /// separator — both name the same file and must be refused.
+    #[test]
+    fn discard_rejects_interior_dot_and_double_slash_submodule_paths() {
+        let (dir, _child) = submodule_fixture("discard-sub-interior");
+        for spelling in ["sub/./a.txt", "sub//a.txt", ".///sub/./a.txt"] {
+            let err = discard(dir.path(), &[spelling.to_string()]).unwrap_err();
+            assert!(
+                format!("{err}").contains("is in submodule"),
+                "unexpected error for {spelling}: {err}"
+            );
+            assert_submodule_intact(dir.path());
+        }
+    }
+
+    /// The worst case of the `./` bypass: `./sub` names the gitlink itself, so
+    /// the guard allows it — but the un-normalized spelling missed the index
+    /// probe, classified as untracked, and `remove_dir_all` wiped the WHOLE
+    /// submodule working copy. It must stay a benign no-op like `sub`.
+    #[test]
+    fn discard_dot_slash_gitlink_never_removes_submodule_worktree() {
+        let (dir, _child) = submodule_fixture("discard-sub-dotslash-gitlink");
+        discard(dir.path(), &["./sub".to_string()]).unwrap();
+        assert!(
+            dir.path().join("sub").join(".git").exists(),
+            "submodule working copy must not be removed"
+        );
+        assert_submodule_intact(dir.path());
+    }
+
+    /// `stage` shares the guard, so the `./` spelling is refused there too and
+    /// no submodule-internal blob reaches the index.
+    #[test]
+    fn stage_rejects_dot_slash_submodule_internal_path() {
+        let (dir, _child) = submodule_fixture("stage-sub-dotslash");
+        let err = stage(dir.path(), &["./sub/a.txt".to_string()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("is in submodule"),
+            "unexpected error: {err}"
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            !index
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.path).starts_with("sub/")),
+            "no submodule-internal blob may be in the index"
+        );
         assert_submodule_intact(dir.path());
     }
 
