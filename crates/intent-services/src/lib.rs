@@ -18005,12 +18005,20 @@ impl WorkspaceApi for Services {
         prompt: String,
         system_prompt: Option<String>,
         model: Option<String>,
+        quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_complete_once_op(prompt, system_prompt, model, workspace_id, timeout_ms)
-                .await
+            self.agent_complete_once_op(
+                prompt,
+                system_prompt,
+                model,
+                quick_action_type,
+                workspace_id,
+                timeout_ms,
+            )
+            .await
         })
     }
 

@@ -1424,6 +1424,12 @@ async fn dispatch(
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
+            // Optional quick-action `type` hint (`commit` / `pr` / `review` /
+            // `fast`): keys `quickActions.typeOverrides` in the daemon-side
+            // resolution the op applies when no explicit `model` is sent
+            // (monorepo#1734). Free-form on the wire — an unknown key simply
+            // misses the override map.
+            let quick_action_type = opt_nonempty_str(params, "type");
             let ws = opt_workspace_id(params);
             let timeout_ms = match params.get("timeoutMs") {
                 None | Some(Value::Null) => None,
@@ -1434,7 +1440,14 @@ async fn dispatch(
                 ),
             };
             let result = api
-                .agent_complete_once(prompt, system_prompt, model, ws, timeout_ms)
+                .agent_complete_once(
+                    prompt,
+                    system_prompt,
+                    model,
+                    quick_action_type,
+                    ws,
+                    timeout_ms,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

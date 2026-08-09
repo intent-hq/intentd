@@ -3852,6 +3852,63 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_resolves_quick_action_settings() {
+    // monorepo#1734: over the wire, a `agent.completeOnce` call with no
+    // explicit `model` picks up the user's quick-action settings —
+    // `quickActions.typeOverrides[type]` first, then
+    // `quickActions.defaultModel` — while an explicit `model` still wins.
+    // The fixture CLI echoes its own argv so the resolved `--model` is
+    // observable in the `{ text }` envelope.
+    let (_auggie_dir, bin) = fake_auggie_script("quick-actions", "printf '🤖\\n%s\\n' \"$*\"");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
+    srv.set_setting(
+        "quickActions.typeOverrides",
+        serde_json::json!({ "commit": "haiku4.5" }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":49,"method":"agent.completeOnce","params":{"prompt":"msg","type":"commit"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 49);
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model haiku4.5"),
+        "the commit type override must be resolved daemon-side, got {resp}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":50,"method":"agent.completeOnce","params":{"prompt":"msg","type":"pr"}}"#,
+    )
+    .await;
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model sonnet4.5"),
+        "an unset override falls through to quickActions.defaultModel, got {resp}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":51,"method":"agent.completeOnce","params":{"prompt":"msg","type":"commit","model":"opus4.7"}}"#,
+    )
+    .await;
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model opus4.7"),
+        "an explicit model outranks the quick-action settings, got {resp}"
+    );
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn wss_agent_complete_once_cli_missing_is_internal_error() {
     // A missing/unspawnable auggie binary surfaces as -32603 rather than
