@@ -386,9 +386,9 @@ mod tests {
         let tmp = dir.path().join(".config.toml.editor-save");
         std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
         std::fs::rename(&tmp, reg.config_path()).expect("rename over config");
-        let notice = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let notice = tokio::time::timeout(crate::events::LIVENESS, rx.recv())
             .await
-            .expect("watcher should observe the atomic save within 10s")
+            .expect("watcher should observe the atomic save within the liveness bound")
             .expect("watcher task alive");
         assert!(notice.changed.contains("git.autoCommit"), "{notice:?}");
         assert_eq!(reg.get("git.autoCommit"), Some(json!(false)));
