@@ -1,5 +1,10 @@
 name: CI
 on:
+  # Push-to-main runs only the release build matrix (+ deb-packaging + gate).
+  # The main ruleset enforces strict up-to-date required checks and blocks
+  # direct pushes, so every main commit's tree is identical to one the PR CI
+  # just tested — the test jobs (route/check/coverage-e2e/coverage-all) are
+  # push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
   pull_request:
@@ -40,6 +45,11 @@ jobs:
   # The mac build is intentionally not routed — it runs on a GitHub-hosted
   # macOS runner (see the build job's matrix).
   route:
+    # Skipped on push to main: its only consumers (check / coverage-e2e /
+    # coverage-all) are push-skipped as redundant (see the `on: push`
+    # comment) and the build matrix is intentionally not routed, so the
+    # probe would spend API calls placing jobs that never run.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -104,6 +114,11 @@ jobs:
             core.setOutput("linux_burst", String(useBurst));
 
   check:
+    # Skipped on push to main — redundant re-test of a tree the PR CI already
+    # checked (see the `on: push` comment). The expression carries no status
+    # function, so the implicit success() still applies: a route failure
+    # skips this job on pull_request / merge_group exactly as before.
+    if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 15
@@ -386,9 +401,12 @@ jobs:
     # non-matrix jobs — a skipped job still reports its required context;
     # see release-fast-path). Fail-safe: skips only when the output is
     # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job.
+    # behavior that a route failure skips this job. Also skipped on push to
+    # main — redundant re-test (see the `on: push` comment); the route.result
+    # guard would skip it there anyway (route is push-skipped), the explicit
+    # event guard just makes the intent visible.
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -540,9 +558,12 @@ jobs:
     # non-matrix jobs — a skipped job still reports its required context;
     # see release-fast-path). Fail-safe: skips only when the output is
     # exactly 'true'. The route.result guard preserves the pre-existing
-    # behavior that a route failure skips this job.
+    # behavior that a route failure skips this job. Also skipped on push to
+    # main — redundant re-test (see the `on: push` comment); the route.result
+    # guard would skip it there anyway (route is push-skipped), the explicit
+    # event guard just makes the intent visible.
     needs: [route, release-fast-path]
-    if: ${{ !cancelled() && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && needs.release-fast-path.outputs.fast_path != 'true' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -789,13 +810,17 @@ jobs:
   # Single required status check for branch protection / the merge queue: fans
   # in check, build, coverage-e2e, coverage-all, pr-title, conflict-markers,
   # and deb-packaging (ported from cloudlands-fe's "CI Gate" pattern — see
-  # packages/cloudlands-fe/.github/workflows/intent-pr.yml). check / build /
-  # deb-packaging must succeed outright: none of the three carries an
-  # event-gated `if`, so a skip there is itself a failure signal (and a route
-  # failure already propagates into check/build failing). coverage-e2e /
-  # coverage-all accept success OR skipped — they are job-level skipped on
-  # release-fast-path PRs (fast_path == 'true') and on a route failure (see
-  # release-fast-path above), both legitimate. pr-title / conflict-markers
+  # packages/cloudlands-fe/.github/workflows/intent-pr.yml). build /
+  # deb-packaging must succeed outright: neither carries an event-gated `if`,
+  # so a skip there is itself a failure signal. check must succeed outright
+  # on pull_request / merge_group runs (a skip there — e.g. after a route
+  # failure — fails the gate, exactly as before); only on push to main, where
+  # it is job-skipped as redundant (see the `on: push` comment), does the
+  # gate accept skipped — the event-aware branch below keeps the PR /
+  # merge_group semantics unweakened. coverage-e2e / coverage-all accept
+  # success OR skipped — they are job-level skipped on release-fast-path PRs
+  # (fast_path == 'true'), on a route failure (see release-fast-path above),
+  # and on push to main, all legitimate. pr-title / conflict-markers
   # accept success OR skipped since both carry
   # `if: github.event_name == 'pull_request'` and are legitimately skipped on
   # push / merge_group runs — requiring strict success there would fail the
@@ -810,9 +835,23 @@ jobs:
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.check.result }}" != "success" ] || \
-             [ "${{ needs.build.result }}" != "success" ] || \
+          if [ "${{ needs.build.result }}" != "success" ] || \
              [ "${{ needs.deb-packaging.result }}" != "success" ]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          # Event-aware on purpose: check must succeed outright on
+          # pull_request / merge_group; only push runs (where it is
+          # job-skipped as redundant) accept skipped.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ needs.check.result }}" in
+              success|skipped) ;;
+              *)
+                echo "check did not succeed or skip"
+                exit 1
+                ;;
+            esac
+          elif [ "${{ needs.check.result }}" != "success" ]; then
             echo "One or more required jobs failed"
             exit 1
           fi
