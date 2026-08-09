@@ -91,8 +91,9 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id`), or
-    /// `NotFound`. `activity` is derived and never persisted (§9.9).
+    /// Update an existing workspace (full row replace, except `id` and the
+    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
+    /// derived and never persisted (§9.9).
     ///
     /// `last_activity` is the one exception to the full-row replace
     /// (monorepo#1585): it goes through the same monotonic guard as
