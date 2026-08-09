@@ -318,7 +318,11 @@ fn confirm_enable_wss() -> anyhow::Result<bool> {
     eprint!("The WSS listener is not running. Enable it now? [Y/n] ");
     std::io::stderr().flush()?;
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
+    // EOF (0 bytes read, e.g. Ctrl-D before any input) is not a response —
+    // only an actual empty *line* (plain Enter) means the default yes.
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
     let answer = line.trim().to_ascii_lowercase();
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
