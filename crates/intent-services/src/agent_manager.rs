@@ -6966,13 +6966,42 @@ async fn run_message_worker(
     }
     mgr.clear_worker(&agent_id);
     // The agent finished its work (queue drained, slot released): raise the
-    // server-owned `attention` blue dot so every client surfaces it (§9.9).
-    if let Err(e) = mgr
-        .services
-        .raise_attention(&workspace_id, WorkspaceAttention::Unread)
-        .await
-    {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    // server-owned `attention` blue dot so every client surfaces it (§9.9) —
+    // but only for TOP-LEVEL FOREGROUND agents (monorepo#1781): a delegated
+    // child or background agent's completion is surfaced to its
+    // parent/coordinator, not the user.
+    if should_raise_turn_end_unread(&mgr.services, &agent_id).await {
+        if let Err(e) = mgr
+            .services
+            .raise_attention(&workspace_id, WorkspaceAttention::Unread)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+        }
+    }
+}
+
+/// Turn-end unread gate (monorepo#1781): the drain-end blue dot is reserved
+/// for TOP-LEVEL FOREGROUND agents — a delegated child (`parent_agent_id`
+/// set) or background agent (`is_background`) is a sub-agent whose
+/// completion is its parent/coordinator's attention surface, not the
+/// user's. Same sub-agent definition as the attention-clear gate above and
+/// rules.rs. `NotFound` means the agent was deleted while its drain
+/// finished — nothing to surface, skip. FAIL OPEN on any other store error
+/// (raise anyway): a missed blue dot for a real top-level turn is worse
+/// than a spurious one on a rare store fault.
+pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: &AgentId) -> bool {
+    match services.store.get_agent_session_summary(agent_id).await {
+        Ok(s) => s.parent_agent_id.is_none() && !s.is_background,
+        Err(Error::NotFound(_)) => false,
+        Err(e) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "turn-end unread gate: session lookup failed; raising anyway"
+            );
+            true
+        }
     }
 }
 
