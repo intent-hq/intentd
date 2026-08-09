@@ -752,7 +752,9 @@ impl Services {
 
     /// Whether the workspace owns any ACTIVE PR monitor — the `displayStatus`
     /// promotion signal (§6.5): an idle agent still watching a PR via a
-    /// monitor reads as active work. Best-effort: a store read failure is
+    /// monitor reads as active work. SQL-filtered to active rows so the hot
+    /// list/get enrichment cost is O(active monitors), never O(all monitor
+    /// history in the workspace). Best-effort: a store read failure is
     /// logged and fails open to `false` (mirrors
     /// [`Services::workspace_has_active_hooks`]) so list/get emission is
     /// never wedged and activity is never fabricated.
@@ -760,8 +762,12 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> bool {
-        match self.store.list_pr_monitors_by_workspace(workspace_id).await {
-            Ok(monitors) => monitors.iter().any(|m| m.state == PrMonitorState::Active),
+        match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => !monitors.is_empty(),
             Err(e) => {
                 tracing::warn!(
                     workspace = %workspace_id.0,
