@@ -1770,15 +1770,28 @@ pub trait WorkspaceApi: Send + Sync {
     /// `prompt` before dispatch; `workspace_id` optionally pins the CLI's cwd
     /// (PROTOCOL §5.32). Daemon owns the full lifecycle including reap on
     /// timeout/failure; no session or agent state is created.
+    ///
+    /// `quick_action_type` is the optional quick-action `type` hint keying
+    /// `quickActions.typeOverrides`; with no explicit `model` the daemon
+    /// resolves that override then `quickActions.defaultModel` before the
+    /// provider CLI default (monorepo#1734).
     fn agent_complete_once(
         &self,
         prompt: String,
         system_prompt: Option<String>,
         model: Option<String>,
+        quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (prompt, system_prompt, model, workspace_id, timeout_ms);
+        let _ = (
+            prompt,
+            system_prompt,
+            model,
+            quick_action_type,
+            workspace_id,
+            timeout_ms,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_complete_once not implemented".to_string(),
