@@ -863,15 +863,20 @@ mod captured_env_tests {
         let opts = SpawnOptions::new(provider);
         // Pick a var actually present in the daemon (test process) env that
         // the command does not already set explicitly (provider env / PATH).
+        // Restricted to stable well-known names: scanning all of
+        // `std::env::vars()` can race sibling tests that mutate process env
+        // (e.g. session.rs's INTENTD_PROMPT_IDLE_TIMEOUT_MS guard).
         let baseline = build_command_with_captured_env(&opts, &BTreeMap::new());
         let preset: std::collections::HashSet<String> = baseline
             .as_std()
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
-        let (present, _) = std::env::vars()
-            .find(|(k, _)| !k.is_empty() && !preset.contains(k))
-            .expect("process env has at least one var the command leaves alone");
+        let present = ["HOME", "USER", "TMPDIR", "SHELL", "PWD", "LOGNAME"]
+            .into_iter()
+            .find(|k| std::env::var_os(k).is_some() && !preset.contains(*k))
+            .expect("process env has at least one stable var the command leaves alone")
+            .to_string();
         let mut captured = BTreeMap::new();
         captured.insert(present.clone(), "captured-must-lose".to_string());
         let cmd = build_command_with_captured_env(&opts, &captured);
