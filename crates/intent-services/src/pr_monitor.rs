@@ -380,6 +380,30 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
     v
 }
 
+/// The `messageMetadata` payload attached to every PR-monitor wake delivery
+/// (PROTOCOL §5.42): `{ type: "pr_monitor_wake", monitorId, repo, prNumber,
+/// reason, url? }`. `url` is the PR's HTML URL read off the monitor's
+/// persisted baseline snapshot; the key is OMITTED (never null) when the
+/// monitor has no baseline yet.
+fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
+    let mut metadata = json!({
+        "type": "pr_monitor_wake",
+        "monitorId": m.monitor_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+        "reason": reason,
+    });
+    let url = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        .map(|s| s.url);
+    if let Some(url) = url {
+        metadata["url"] = Value::String(url);
+    }
+    metadata
+}
+
 /// The list-surface projection of one monitor: identity + lifecycle plus the
 /// hover/click fields the FE needs — PR title/URL and a compact summary of
 /// the last-refresh snapshot, whether changes are accumulated awaiting the
@@ -1306,13 +1330,7 @@ impl Services {
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
-        let metadata = json!({
-            "type": "pr_monitor_wake",
-            "monitorId": monitor.monitor_id,
-            "repo": format!("{}/{}", monitor.repo_owner, monitor.repo_name),
-            "prNumber": monitor.pr_number,
-            "reason": reason,
-        });
+        let metadata = pr_monitor_wake_metadata(monitor, reason);
         if let Err(e) = self
             .deliver_wake_message(
                 &monitor.workspace_id,
@@ -2439,6 +2457,12 @@ mod tests {
         let text = owner_messages(&svc, &owner).await;
         assert!(text.contains("was MERGED"), "{text}");
         assert!(text.contains("Monitoring has STOPPED"), "{text}");
+        // The wake's messageMetadata carries the PR url from the baseline.
+        assert!(text.contains("pr_monitor_wake"), "{text}");
+        assert!(
+            text.contains(r#""url":"https://github.com/o/r/pull/42""#),
+            "{text}"
+        );
         // Completed rows stay visible; the loop no longer polls them.
         assert_eq!(svc.pr_monitors_for_agent(&owner).await.unwrap().len(), 1);
         assert!(svc
@@ -2447,6 +2471,41 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn wake_metadata_carries_the_pr_url_and_omits_it_without_a_baseline() {
+        let now = now_iso();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&snapshot(|_| {})).unwrap()),
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let metadata = pr_monitor_wake_metadata(&m, "changed");
+        assert_eq!(metadata["type"], json!("pr_monitor_wake"));
+        assert_eq!(metadata["repo"], json!("o/r"));
+        assert_eq!(metadata["prNumber"], json!(42));
+        assert_eq!(metadata["reason"], json!("changed"));
+        assert_eq!(metadata["url"], json!("https://github.com/o/r/pull/42"));
+
+        // No baseline yet: the key is ABSENT, never null.
+        m.last_snapshot = None;
+        let metadata = pr_monitor_wake_metadata(&m, "cancelled");
+        assert!(metadata.get("url").is_none(), "{metadata}");
+        assert_eq!(metadata["reason"], json!("cancelled"));
     }
 
     #[tokio::test]
