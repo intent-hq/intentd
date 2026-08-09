@@ -374,12 +374,17 @@ pub fn provision_direct_checkout(
 /// never breaks the checkout. Skipped entirely (no subprocess) when the
 /// checkout has no `.gitmodules`.
 ///
-/// The copy is filtered to **live** modules only (the same liveness rule as
-/// the refresh prune, seeded from the checkout's `.gitmodules` with nested
-/// liveness read from the cache's populated work trees), so even a cache
-/// still carrying a dead module dir — e.g. one refreshed before pruning
-/// existed — never leaks it into the checkout. A liveness/copy failure
-/// follows the caller's existing degrade-with-warning path.
+/// The copy is filtered to **live** top-level modules only (the same
+/// liveness rule as the refresh prune, seeded from the checkout's
+/// `.gitmodules`), so a cache still carrying a dead module dir — e.g. one
+/// refreshed before pruning existed — never leaks it into the checkout.
+/// Nested subtrees copy wholesale: the cache work trees sit at the tip,
+/// and a checkout at an older `base_ref` can select a gitlink that still
+/// names a nested module the tip dropped, so nested liveness is only
+/// decidable after the update populates the checkout's own work trees —
+/// the closing [`prune_stale_modules`] then removes the dead nested dirs
+/// the copy kept. A liveness/copy/prune failure follows the caller's
+/// existing degrade-with-warning path.
 fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Result<()> {
     if !crate::submodule::has_submodules(checkout_path) {
         return Ok(());
@@ -387,7 +392,7 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
     let src = cache_path.join(".git").join("modules");
     let dst = checkout_path.join(".git").join("modules");
     if src.is_dir() && !dst.exists() {
-        let copied = match collect_module_liveness(checkout_path, cache_path)? {
+        let copied = match collect_module_liveness(checkout_path, false)? {
             Some(live) => copy_modules_subdir(&src, &dst, Path::new(""), &live),
             // A module name/path we cannot map conservatively: copy
             // everything rather than risk dropping a live module.
@@ -400,6 +405,10 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
         })?;
     }
     update_checkout_submodules(checkout_path)?;
+    // Only now do the checkout's work trees match its checked-out ref, so
+    // nested liveness is decidable: drop the dead nested module dirs the
+    // wholesale copy above kept.
+    prune_stale_modules(checkout_path)?;
     sync_submodule_urls(checkout_path)
 }
 
@@ -492,29 +501,32 @@ fn copy_dir_entry(
 /// module *name*, one directory component per `/`-separated segment) mapped
 /// to the liveness of the module's own nested `modules/` subtree. `None`
 /// marks a live module whose nesting is opaque — its work tree could not be
-/// read — so its subtree is kept (or copied) wholesale rather than guessed
+/// read, or nested liveness was deliberately not judged (the hydration
+/// copy) — so its subtree is kept (or copied) wholesale rather than guessed
 /// at.
 #[derive(Default)]
 struct ModuleLiveness {
     modules: BTreeMap<PathBuf, Option<ModuleLiveness>>,
 }
 
-/// Read the live module set from `config_root/.gitmodules`, resolving each
-/// module's work tree against `worktrees_root` to recurse into nested
-/// submodules (during a refresh both roots are the cache work tree; during
-/// hydration the top-level `.gitmodules` is the checkout's but the nested
-/// work trees are the cache's — the only populated ones at copy time).
+/// Read the live module set from `root/.gitmodules`, recursing into nested
+/// submodules through the work trees under `root` when `recurse_nested` is
+/// set — valid only when those work trees sit at the same ref as the
+/// `.gitmodules` chain being read (the refresh prune on the cache, the
+/// post-update prune on a checkout). With `recurse_nested` unset every
+/// module's nesting is opaque: the hydration copy filter uses this because
+/// at copy time the only populated work trees are the cache's, which sit at
+/// the tip — a checkout at an older `base_ref` can select a gitlink that
+/// still names a nested module the tip dropped, so judging nested liveness
+/// from the tip could drop a live module's git dir.
 ///
 /// Returns `Ok(None)` when a module name or path cannot be mapped to a
 /// module dir safely (non-UTF-8, absolute, `..`, …): the caller must then
 /// treat the whole level as opaque and keep every dir — a kept dead dir is
 /// harmless, a wrongly-pruned live one is not. A missing `.gitmodules`
 /// yields an empty (all-dead) set; an unreadable one is an error.
-fn collect_module_liveness(
-    config_root: &Path,
-    worktrees_root: &Path,
-) -> Result<Option<ModuleLiveness>> {
-    let gitmodules = config_root.join(".gitmodules");
+fn collect_module_liveness(root: &Path, recurse_nested: bool) -> Result<Option<ModuleLiveness>> {
+    let gitmodules = root.join(".gitmodules");
     if !gitmodules.exists() {
         return Ok(Some(ModuleLiveness::default()));
     }
@@ -540,9 +552,9 @@ fn collect_module_liveness(
         else {
             return Ok(None);
         };
-        let worktree = worktrees_root.join(worktree_rel);
-        let nested = if worktree.is_dir() {
-            collect_module_liveness(&worktree, &worktree)?
+        let worktree = root.join(worktree_rel);
+        let nested = if recurse_nested && worktree.is_dir() {
+            collect_module_liveness(&worktree, true)?
         } else {
             None
         };
@@ -576,7 +588,7 @@ pub(crate) fn prune_stale_modules(cache_path: &Path) -> Result<()> {
     if !modules_dir.is_dir() {
         return Ok(());
     }
-    match collect_module_liveness(cache_path, cache_path)? {
+    match collect_module_liveness(cache_path, true)? {
         Some(live) => prune_modules_subdir(&modules_dir, Path::new(""), &live),
         None => Ok(()),
     }
@@ -1966,5 +1978,84 @@ mod tests {
         // The cache keeps its dead dirs — hydration filters, never mutates
         // the cache.
         assert!(cache_modules.join("deadtop").is_dir());
+    }
+
+    /// A `base_ref` older than the cache tip can select a `sub` gitlink
+    /// whose own `.gitmodules` still names a nested module the tip dropped.
+    /// The hydration copy must not judge nested liveness from the tip's
+    /// work trees: a nested module gitdir the cache still carries is copied
+    /// wholesale and the offline update populates it (regression: the
+    /// nested filter read the tip's `.gitmodules`, dropping the
+    /// live-at-base gitdir and leaving the nested submodule unpopulated).
+    #[tokio::test]
+    async fn direct_checkout_populates_nested_submodule_dropped_at_tip() {
+        allow_file_submodules();
+        let (origin, child, grandchild) = nested_submodule_fixture("repocache-nestedbase");
+        let root = CacheRoot::new("nestedbase");
+        let url = file_url(origin.path());
+        // Pin `base` while the nested chain is fully live, and seed the
+        // cache there so it holds the nested module gitdir.
+        crate::testutil::create_branch(origin.path(), "base");
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let inner_gitdir = cache
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("modules")
+            .join("inner");
+        assert!(
+            inner_gitdir.is_dir(),
+            "seeded cache holds the nested gitdir"
+        );
+
+        // Upstream drops the nested module and the superproject follows:
+        // the tip no longer names `inner` anywhere.
+        commit_one_submodule_removal(child.path(), "inner");
+        let new_sub_sha = head_sha(child.path());
+        commit_gitlink_bump(origin.path(), "sub", &new_sub_sha);
+
+        // Refresh the cache to the new tip, restoring the nested gitdir the
+        // refresh prune drops — the shape of a cache refreshed before
+        // pruning existed, still carrying a history-only module.
+        let saved = CacheRoot::new("nestedbase-saved");
+        let saved_inner = saved.path().join("inner");
+        copy_dir_recursive(&inner_gitdir, &saved_inner).unwrap();
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        assert!(
+            !inner_gitdir.exists(),
+            "refresh prunes the tip-dead nested gitdir"
+        );
+        copy_dir_recursive(&saved_inner, &inner_gitdir).unwrap();
+
+        let inner_sha = head_sha(grandchild.path());
+        // No network: the nested module's only remote goes away, so its
+        // population must come from the copied gitdir alone.
+        drop(grandchild);
+        drop(child);
+
+        let checkout_root = CacheRoot::new("nestedbase-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", Some("base")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "nested submodule work tree is populated at the base ref"
+        );
+        assert_eq!(head_sha(&checkout.join("sub").join("inner")), inner_sha);
+        assert!(
+            checkout
+                .join(".git")
+                .join("modules")
+                .join("sub")
+                .join("modules")
+                .join("inner")
+                .is_dir(),
+            "nested module gitdir is copied despite being dead at the tip"
+        );
     }
 }

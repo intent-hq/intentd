@@ -186,18 +186,17 @@ pub fn provision_cow_checkout_timed(
         let strip_started = Instant::now();
         strip_worktree_registrations(checkout_path)?;
         timings.strip_registrations = strip_started.elapsed();
-        // Submodule paths as byte-copied from the source tip, captured
-        // before the branch switch/hard reset below moves HEAD: any of
-        // them the checked-out ref no longer registers is an orphaned work
-        // tree to remove after the reset. Gated on a cheap probe so
-        // no-submodule repos never pay the read; unreadable state degrades
-        // to no orphan cleanup.
+        // Submodule paths as byte-copied from the source tip — nested ones
+        // included, since a reset can orphan `sub/inner` while `sub` itself
+        // survives — captured before the branch switch/hard reset below
+        // moves HEAD: any of them the checked-out state no longer registers
+        // is an orphaned work tree to remove after the reset. Gated on a
+        // cheap probe so no-submodule repos never pay the read; unreadable
+        // state degrades to no orphan cleanup.
         let pre_reset_submodules = if crate::submodule::has_submodules(checkout_path)
             || checkout_path.join(".git").join("modules").is_dir()
         {
-            Repository::open(checkout_path)
-                .map_err(map_git_err)
-                .and_then(|repo| crate::submodule::submodule_paths(&repo))
+            crate::submodule::recursive_submodule_paths(checkout_path)
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         checkout = %checkout_path.display(),
@@ -290,16 +289,20 @@ fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
 }
 
 /// Remove submodule work trees the byte copy carried from the source tip
-/// that the checked-out ref no longer registers, plus their now-dead
-/// `.git/modules` entries. `pre_reset` is the submodule path set captured
-/// before the branch switch/hard reset; orphans are that set minus the
-/// post-reset set. Each orphan is a nested repository, which both the hard
-/// reset and a plain superproject clean skip — the identified paths are
-/// removed explicitly instead of via a blanket `clean -ffdx`, which would
-/// also delete the legitimate untracked files the CoW copy intentionally
-/// preserves. A path the checked-out ref still tracks as ordinary content
-/// (a submodule turned plain directory/file) is left alone: removing it
-/// would delete tracked files the reset just wrote.
+/// that the checked-out state no longer registers, plus their now-dead
+/// `.git/modules` entries. `pre_reset` is the recursive submodule path set
+/// captured before the branch switch/hard reset (nested paths like
+/// `sub/inner` included); orphans are that set minus the post-reset
+/// recursive set — which also catches a nested submodule dropped by its
+/// parent's own sync while the parent survives. Each orphan is a nested
+/// repository, which both the hard reset and a plain superproject clean
+/// skip — the identified paths are removed explicitly instead of via a
+/// blanket `clean -ffdx`, which would also delete the legitimate untracked
+/// files the CoW copy intentionally preserves. A path the checked-out
+/// state still tracks as ordinary content (a submodule turned plain
+/// directory/file) is left alone: removing it would delete tracked files
+/// the reset just wrote. Iteration is in sorted order, so a removed parent
+/// simply makes its nested orphans vanish from disk before their turn.
 fn remove_orphaned_submodules(
     checkout_path: &Path,
     pre_reset: &std::collections::BTreeSet<String>,
@@ -307,17 +310,12 @@ fn remove_orphaned_submodules(
     if pre_reset.is_empty() {
         return Ok(());
     }
-    let repo = Repository::open(checkout_path).map_err(map_git_err)?;
-    let post_reset = crate::submodule::submodule_paths(&repo)?;
-    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let post_reset = crate::submodule::recursive_submodule_paths(checkout_path)?;
     for orphan in pre_reset.difference(&post_reset) {
         let Some(rel) = crate::repo_cache::safe_rel_path(orphan) else {
             continue;
         };
-        if head_tree
-            .as_ref()
-            .is_some_and(|tree| tree.get_path(&rel).is_ok())
-        {
+        if is_tracked_content(checkout_path, &post_reset, orphan, &rel) {
             continue;
         }
         let target = checkout_path.join(&rel);
@@ -344,6 +342,49 @@ fn remove_orphaned_submodules(
     // the checked-out ref no longer names them; prune with the same
     // liveness rule as the cache refresh.
     crate::repo_cache::prune_stale_modules(checkout_path)
+}
+
+/// Whether the checked-out state tracks `orphan` as ordinary content (a
+/// submodule turned plain directory/file). Checked against the HEAD tree
+/// of the deepest post-reset submodule containing the orphan — for a
+/// nested candidate like `sub/inner` the superproject's tree only holds
+/// the `sub` gitlink, so the containing submodule's own tree is the one
+/// that can track `inner` as content. Unreadable state answers `false`:
+/// the candidate was a registered submodule moments ago, so removal is the
+/// safe default.
+fn is_tracked_content(
+    checkout_path: &Path,
+    post_reset: &std::collections::BTreeSet<String>,
+    orphan: &str,
+    rel: &Path,
+) -> bool {
+    let container = post_reset
+        .iter()
+        .filter(|sm| {
+            orphan
+                .strip_prefix(sm.as_str())
+                .is_some_and(|r| r.starts_with('/'))
+        })
+        .max_by_key(|sm| sm.len());
+    let (repo_path, inner_rel) = match container {
+        Some(sm) => {
+            let Some(sm_rel) = crate::repo_cache::safe_rel_path(sm) else {
+                return false;
+            };
+            (
+                checkout_path.join(sm_rel),
+                Path::new(&orphan[sm.len() + 1..]).to_path_buf(),
+            )
+        }
+        None => (checkout_path.to_path_buf(), rel.to_path_buf()),
+    };
+    let Ok(repo) = Repository::open(&repo_path) else {
+        return false;
+    };
+    repo.head()
+        .ok()
+        .and_then(|h| h.peel_to_tree().ok())
+        .is_some_and(|tree| tree.get_path(&inner_rel).is_ok())
 }
 
 /// The CoW clone is a byte-for-byte copy, so it inherits the source's
@@ -1551,6 +1592,91 @@ mod tests {
             "sub one\n"
         );
         assert!(source.join(".git").join("modules").join("sub").exists());
+    }
+
+    /// A nested submodule orphaned by the reset while its parent survives:
+    /// `base` pins the parent gitlink at a revision without `inner`, the
+    /// source tip carries `inner` populated. The nested work tree and its
+    /// module git dir must both go, and the parent submodule reports a
+    /// clean status (regression: only superproject-level gitlinks were
+    /// captured, so `sub/inner` survived as an untracked nested repo with
+    /// a dangling gitfile after its gitdir was pruned).
+    #[test]
+    fn cow_checkout_removes_nested_submodule_orphaned_by_parent_reset() {
+        crate::testutil::allow_file_submodules();
+        let grandchild = init_repo("cowchk-nestorph-grand");
+        commit_file(grandchild.path(), "g.txt", "deep one\n");
+        let child = init_repo("cowchk-nestorph-child");
+        commit_file(child.path(), "c.txt", "sub one\n");
+        let origin = init_repo("cowchk-nestorph-origin");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::add_submodule(origin.path(), child.path(), "sub");
+        // Pin `base` while `sub` has no nested module, then add `inner`
+        // inside `sub` and bump the pin on the tip.
+        crate::testutil::create_branch(origin.path(), "base");
+        crate::testutil::add_submodule(child.path(), grandchild.path(), "inner");
+        let new_sub_sha = head_sha(&child);
+        crate::testutil::commit_gitlink_bump(origin.path(), "sub", &new_sub_sha);
+
+        // Source at the tip: `sub` populated with `inner` inside it.
+        let source = recursive_clone(origin.path(), "cowchk-nestorph-src");
+        let _cleanup_src = Cleanup(source.clone());
+        assert!(
+            source.join("sub").join("inner").join("g.txt").exists(),
+            "source carries the nested submodule populated"
+        );
+        if !cow_available(&source) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-nestorph-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+
+        assert!(
+            checkout.join("sub").join("c.txt").exists(),
+            "parent submodule work tree survives the reset"
+        );
+        assert!(
+            !checkout.join("sub").join("inner").exists(),
+            "orphaned nested submodule work tree is removed"
+        );
+        assert!(
+            !checkout
+                .join(".git")
+                .join("modules")
+                .join("sub")
+                .join("modules")
+                .join("inner")
+                .exists(),
+            "dead nested module git dir is pruned"
+        );
+        // The parent submodule reports a clean status — no untracked
+        // leftover from the removed nested repo.
+        let sub = Repository::open(checkout.join("sub")).unwrap();
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let statuses = sub.statuses(Some(&mut opts)).unwrap();
+        let dirty: Vec<String> = statuses
+            .iter()
+            .filter_map(|s| s.path().map(str::to_owned).ok())
+            .collect();
+        assert!(
+            dirty.is_empty(),
+            "parent submodule status is clean: {dirty:?}"
+        );
+        // The source keeps its populated nested submodule and module dirs.
+        assert_eq!(
+            std::fs::read_to_string(source.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n"
+        );
+        assert!(source
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("modules")
+            .join("inner")
+            .exists());
     }
 
     /// After CoW hydration the checkout's `submodule.<name>.url` config
