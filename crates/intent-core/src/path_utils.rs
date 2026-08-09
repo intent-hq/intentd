@@ -221,10 +221,14 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     use std::sync::{Arc, Mutex};
 
     // Build command with sentinel-wrapped printf for PATH, plus a second
-    // sentinel pair wrapping a NUL-separated env dump in the SAME invocation
-    // (`|| true` keeps an env failure from failing the whole capture).
+    // sentinel pair wrapping a NUL-separated env dump in the SAME invocation.
+    // `env -0` is present on GNU coreutils and modern macOS (FreeBSD-derived
+    // env); where it is missing, fall back to POSIX awk's ENVIRON, which
+    // emits the same NUL-separated shape (`%c`, 0). `|| true` keeps an env
+    // dump failure from failing the whole capture — the env payload is
+    // optional and degrades to an empty map.
     let cmd = format!(
-        r#"printf '{}%s{}'  "$PATH"; printf '{}'; /usr/bin/env -0 2>/dev/null || true; printf '{}'"#,
+        r#"printf '{}%s{}'  "$PATH"; printf '{}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{}'"#,
         PATH_START_SENTINEL, PATH_END_SENTINEL, ENV_START_SENTINEL, ENV_END_SENTINEL
     );
     let mut args = flags.to_vec();
