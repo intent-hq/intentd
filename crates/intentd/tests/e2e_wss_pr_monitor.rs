@@ -1134,6 +1134,7 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 row.last_snapshot.as_deref(),
+                row.baseline_snapshot.as_deref(),
                 &row.pending_changes,
                 row.pending_since.as_deref(),
                 row.last_change_at.as_deref(),

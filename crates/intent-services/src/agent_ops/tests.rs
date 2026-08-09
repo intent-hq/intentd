@@ -10843,6 +10843,7 @@ async fn seed_active_pr_monitor(
         pr_number,
         state: intent_core::PrMonitorState::Active,
         last_snapshot: None,
+        baseline_snapshot: None,
         pending_changes: Vec::new(),
         pending_since: None,
         last_change_at: None,
