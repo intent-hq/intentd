@@ -88,6 +88,7 @@ mod model_catalog;
 mod note_ops;
 mod one_shot_acp;
 mod pagination;
+pub mod pi_cli;
 mod pr_monitor;
 mod pr_ops;
 mod primitive_ops;
@@ -22581,6 +22582,16 @@ pub fn discover_providers_with_npx_overrides(
         (None, false)
     };
 
+    // The pi provider additionally requires the `pi` CLI (which the pi-acp
+    // adapter spawns) at PI_CLI_MIN_VERSION or newer (monorepo#1662). Probe
+    // once per discovery call — same subprocess-probe precedent as the npx
+    // version probe above (host.providerDiscovery is not a hot RPC) — and
+    // skip it entirely when the pi row is gated off (never probed).
+    let pi_cli_status = providers
+        .iter()
+        .any(|p| p.id == "pi" && p.gated_off.is_none())
+        .then(crate::pi_cli::probe_pi_cli);
+
     let provider_array: Vec<serde_json::Value> = providers
         .iter()
         .map(|p| {
@@ -22588,7 +22599,18 @@ pub fn discover_providers_with_npx_overrides(
             obj.insert("id".to_string(), serde_json::json!(p.id));
             obj.insert("displayName".to_string(), serde_json::json!(p.display_name));
             obj.insert("command".to_string(), serde_json::json!(p.command));
-            obj.insert("installed".to_string(), serde_json::json!(p.installed));
+            let mut installed = p.installed;
+            // Fold the pi CLI verdict into the pi row: a missing or
+            // known-too-old CLI marks pi uninstallable with an actionable
+            // reason (FE availability keys off the `pi` CLI, not npx). An
+            // Unknown verdict is permissive — WARN only (version_gate.rs
+            // policy).
+            if p.id == "pi" {
+                if let Some(status) = &pi_cli_status {
+                    apply_pi_cli_fields(&mut obj, &mut installed, status);
+                }
+            }
+            obj.insert("installed".to_string(), serde_json::json!(installed));
             if let Some(ref path) = p.resolved_path {
                 obj.insert(
                     "resolvedPath".to_string(),
@@ -22658,6 +22680,54 @@ pub fn discover_providers_with_npx_overrides(
         "providers": provider_array,
         "npx": serde_json::Value::Object(npx_obj),
     })
+}
+
+/// Fold a probed [`crate::pi_cli::PiCliStatus`] into the pi discovery row
+/// (monorepo#1662): always emit `cliCommand` / `cliResolved` /
+/// `cliVersionOk` / `cliRequirement`, plus `cliResolvedPath` / `cliVersion`
+/// when known and `unavailableReason` when the gate fires. A gating verdict
+/// (Missing / TooOld) forces `installed` to `false`; Unknown stays
+/// permissive with a WARN. Split out of the payload builder so the
+/// gate-to-fields mapping is unit-testable without a real probe.
+fn apply_pi_cli_fields(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    installed: &mut bool,
+    status: &crate::pi_cli::PiCliStatus,
+) {
+    use intent_providers::PiCliGate;
+
+    obj.insert("cliCommand".to_string(), serde_json::json!(status.command));
+    obj.insert(
+        "cliResolved".to_string(),
+        serde_json::json!(status.resolved_path.is_some()),
+    );
+    if let Some(path) = &status.resolved_path {
+        obj.insert(
+            "cliResolvedPath".to_string(),
+            serde_json::json!(path.display().to_string()),
+        );
+    }
+    if let Some(version) = &status.version_output {
+        obj.insert("cliVersion".to_string(), serde_json::json!(version));
+    }
+    obj.insert(
+        "cliVersionOk".to_string(),
+        serde_json::json!(matches!(status.gate, PiCliGate::Ok)),
+    );
+    obj.insert(
+        "cliRequirement".to_string(),
+        serde_json::json!(intent_providers::PI_CLI_REQUIREMENT),
+    );
+    if let Some(reason) = intent_providers::pi_gate_reason(&status.gate) {
+        *installed = false;
+        obj.insert("unavailableReason".to_string(), serde_json::json!(reason));
+    } else if status.gate == PiCliGate::Unknown {
+        tracing::warn!(
+            command = %status.command,
+            version_output = status.version_output.as_deref().unwrap_or(""),
+            "pi CLI version probe inconclusive; not gating the pi provider"
+        );
+    }
 }
 
 fn probe_npx_version_internal(npx_path: &Path) -> Option<String> {

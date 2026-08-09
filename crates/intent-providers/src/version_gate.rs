@@ -11,7 +11,7 @@
 //! so a changed `--version` format never false-negatives the provider;
 //! callers log a warning instead.
 
-use crate::config::PI_CLI_MIN_VERSION;
+use crate::config::{PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT};
 
 /// Result of probing the `pi` CLI, as fed to [`pi_cli_gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,23 @@ impl PiCliGate {
     /// and [`Self::Missing`] gate; [`Self::Unknown`] is permissive.
     pub fn gates(&self) -> bool {
         matches!(self, Self::TooOld(_) | Self::Missing)
+    }
+}
+
+/// Human-readable, actionable reason the pi provider is unavailable, or
+/// `None` when the gate is permissive ([`PiCliGate::Ok`] /
+/// [`PiCliGate::Unknown`]). Shared by discovery (`unavailableReason`),
+/// doctor, and the spawn fail-fast so every surface names the same found
+/// version, requirement, and adapter pin.
+pub fn pi_gate_reason(gate: &PiCliGate) -> Option<String> {
+    match gate {
+        PiCliGate::TooOld(found) => Some(format!(
+            "pi CLI {found} is too old — {PI_CLI_REQUIREMENT} is required by {PI_ACP_NPX_PACKAGE}"
+        )),
+        PiCliGate::Missing => Some(format!(
+            "pi CLI not found — {PI_CLI_REQUIREMENT} is required by {PI_ACP_NPX_PACKAGE}"
+        )),
+        PiCliGate::Ok | PiCliGate::Unknown => None,
     }
 }
 
@@ -159,5 +176,18 @@ mod tests {
         let gate = pi_cli_gate(&PiCliProbe::Missing);
         assert_eq!(gate, PiCliGate::Missing);
         assert!(gate.gates());
+    }
+
+    #[test]
+    fn gate_reasons_name_version_requirement_and_pin() {
+        let too_old = pi_gate_reason(&PiCliGate::TooOld("0.79.0".into())).unwrap();
+        assert!(too_old.contains("0.79.0"));
+        assert!(too_old.contains(PI_CLI_REQUIREMENT));
+        assert!(too_old.contains(PI_ACP_NPX_PACKAGE));
+        let missing = pi_gate_reason(&PiCliGate::Missing).unwrap();
+        assert!(missing.contains(PI_CLI_REQUIREMENT));
+        assert!(missing.contains(PI_ACP_NPX_PACKAGE));
+        assert_eq!(pi_gate_reason(&PiCliGate::Ok), None);
+        assert_eq!(pi_gate_reason(&PiCliGate::Unknown), None);
     }
 }

@@ -928,10 +928,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.33) reads to override the `pi` binary it spawns
-/// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
-/// `create_agent` points it at the generated wrapper script.
-const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
+use crate::pi_cli::{resolve_real_pi_command, PI_ACP_PI_COMMAND_ENV};
 
 /// Env var the bundled pi extension reads for the per-agent MCP bridge's
 /// loopback TCP address (`host:port`, see [`McpBridge::connect_addr`]).
@@ -1027,16 +1024,6 @@ fn pi_extension_delivery(
 /// suppress all expansion, and embedded `'` uses the standard `'\''` escape.
 fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
-/// daemon env (the value pi-acp itself would have used, which the wrapper
-/// override shadows) or `pi` from the child's PATH — pi-acp's own fallback.
-fn resolve_real_pi_command() -> String {
-    std::env::var(PI_ACP_PI_COMMAND_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "pi".to_string())
 }
 
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
@@ -1523,6 +1510,17 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
+        //
+        // Fail fast before spawning when the `pi` CLI the wrapper would exec
+        // is missing or known-too-old for the pinned pi-acp adapter
+        // (monorepo#1662) — a clear error instead of a silent hang. The probe
+        // is blocking (subprocess, ≤3s budget), so it runs off the runtime.
+        if opts.provider.mcp_via_pi_extension {
+            let status = tokio::task::spawn_blocking(crate::pi_cli::probe_pi_cli)
+                .await
+                .map_err(|e| Error::Internal(format!("pi CLI probe task failed: {e}")))?;
+            crate::pi_cli::check_pi_cli_for_spawn(&status)?;
+        }
         let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup

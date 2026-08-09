@@ -578,6 +578,20 @@ pub fn find_npx() -> Option<PathBuf> {
     find_in_enhanced_dirs("npx")
 }
 
+/// Resolve the real `pi` CLI — the binary pi-acp spawns (and the generated
+/// wrapper script execs) — to an absolute path. A command carrying a path
+/// separator (the `PI_ACP_PI_COMMAND` override shape) is validated directly
+/// as an executable file; a bare name scans the same enhanced PATH
+/// directories as provider binaries (inherited PATH + enriched tool dirs +
+/// login-shell capture), matching what the spawned child would resolve.
+pub fn find_pi_cli(command: &str) -> Option<PathBuf> {
+    let as_path = PathBuf::from(command);
+    if as_path.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(&as_path).then_some(as_path);
+    }
+    find_in_enhanced_dirs(command)
+}
+
 #[cfg(test)]
 mod find_provider_binary_tests {
     use super::*;
