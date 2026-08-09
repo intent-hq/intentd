@@ -155,12 +155,14 @@ impl Services {
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`.
-        // Active background hooks fold into the promotion (§6.5): an
-        // idle agent still watching via a hook reads as active work.
+        // Active background hooks and PR monitors fold into the promotion
+        // (§6.5): an idle agent still watching via a hook or a PR monitor
+        // reads as active work.
         let display_status = compute_display_status(
             self.workspace_attention_signals(&ws.id, ws.attention).await,
             ws.activity == WorkspaceActivity::AgentRunning
                 || self.workspace_has_active_hooks(&ws.id).await
+                || self.workspace_has_active_pr_monitors(&ws.id).await
                 || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
@@ -209,6 +211,7 @@ impl Services {
             signals,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
                 || self.workspace_has_active_hooks(workspace_id).await
+                || self.workspace_has_active_pr_monitors(workspace_id).await
                 || self
                     .workspace_has_waiting_agent_subscriptions(workspace_id)
                     .await,
@@ -355,9 +358,11 @@ pub(crate) struct AttentionSignals {
 ///    the user (discussion request or pending structured questions) or the
 ///    `review_required` workspace attention flag — outranks a running agent.
 /// 3. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says. Callers fold active-hook
-///    state into this flag ([`Services::workspace_has_active_hooks`]) so an
-///    idle agent still watching via a background hook reads the same.
+///    work, whatever the PR/task rollup says. Callers fold active-hook and
+///    active-PR-monitor state into this flag
+///    ([`Services::workspace_has_active_hooks`] /
+///    [`Services::workspace_has_active_pr_monitors`]) so an idle agent
+///    still watching via a background hook or a PR monitor reads the same.
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
