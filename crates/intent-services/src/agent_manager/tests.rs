@@ -1078,6 +1078,144 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
     assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
+/// Timing proof for the batch stop path (the `workspace.delete` sweep): N
+/// tracked agents whose children ignore SIGTERM tear down in ~ONE shared
+/// grace window via `stop_many` — mirroring `kill_sweep_tests` — with the
+/// per-agent `stop()` semantics (handle removal, deregistration) applied to
+/// every agent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
+    const N: usize = 4;
+    let grace = super::PROCESS_GROUP_TERM_GRACE;
+    let (_tmp, mgr) = manager().await;
+    let mut ids = Vec::with_capacity(N);
+    let mut pids = Vec::with_capacity(N);
+    for i in 0..N {
+        let id = AgentId::from(format!("a-batch-{i}").as_str());
+        let mut cmd = tokio::process::Command::new("sh");
+        // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
+        // forcing the full grace window to elapse.
+        cmd.args(["-c", "trap '' TERM; sleep 30"]);
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn slow child");
+        let pid = child.id().expect("live child has a pid");
+        let mut handle = mock_handle();
+        handle._child = Some(child);
+        handle.child_pid = Some(pid);
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        ids.push(id);
+        pids.push(pid);
+    }
+    // Let each sh install its trap before SIGTERM arrives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let start = std::time::Instant::now();
+    let fence = mgr.stop_many(&ids).await;
+    let elapsed = start.elapsed();
+
+    // Serial teardown would take ~N * grace (8s for 4 children); the shared
+    // window must finish in ~one grace period (<4s total).
+    assert!(
+        elapsed < grace * 2,
+        "batch stop took {elapsed:?}, expected ~one {grace:?} grace window"
+    );
+    // The children ignored SIGTERM, so the full shared grace must have
+    // elapsed (proves the window ran once, not that children died early).
+    assert!(
+        elapsed >= grace - Duration::from_millis(500),
+        "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
+    );
+    // Per-agent `stop()` semantics applied to every agent in the batch.
+    assert!(mgr.is_empty(), "all handles removed");
+    assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
+    // The kill itself, not just the elapsed window: every child must be
+    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
+    // a zombie until its wait task reaps it (stragglers past
+    // KILL_SWEEP_REAP_GRACE reap in the background).
+    for &pid in &pids {
+        let mut dead = !pid_alive(pid);
+        for _ in 0..100 {
+            if dead {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            dead = !pid_alive(pid);
+        }
+        assert!(dead, "child {pid} killed by the batch sweep");
+    }
+    // The returned fence keeps every swept agent blocked from the
+    // lazy-spawn paths until dropped, then re-opens them.
+    for id in &ids {
+        assert!(
+            mgr.stopping.lock().unwrap().contains(id),
+            "{id} fenced while the TeardownFence is held"
+        );
+    }
+    drop(fence);
+    assert!(
+        mgr.stopping.lock().unwrap().is_empty(),
+        "fence drop clears the stopping set"
+    );
+}
+
+/// Ghost-agent race regression (PR #1038 review): while a `stop_many`
+/// teardown fence is held, the lazy-spawn path (`ensure_started`) must
+/// refuse to spawn a replacement child for a swept agent — otherwise a
+/// concurrent `agent.sendMessage` racing `workspace.delete`'s shared grace
+/// wait could leave a live process whose session row the cascade then
+/// deletes. Once the fence drops, the spawn path is open again.
+#[tokio::test]
+async fn stop_many_fence_blocks_lazy_respawn_until_dropped() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-fence");
+    let agent_id = AgentId::from("a-fence-respawn");
+    mgr.services
+        .store
+        .insert_workspace(&super::role_reminder_tests::workspace(&ws))
+        .await
+        .expect("insert workspace");
+    let session = super::role_reminder_tests::session(&agent_id, &ws, None);
+    mgr.services
+        .store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let fence = mgr.stop_many(std::slice::from_ref(&agent_id)).await;
+    // Session row still present (the delete cascade has not run), yet the
+    // spawn is refused: the fence, not the store check, blocks it.
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("fenced agent must not respawn");
+    assert!(
+        matches!(err, Error::NotFound(_)),
+        "fence surfaces NotFound (non-retryable for retry_spawn), got: {err:?}"
+    );
+    assert!(mgr.is_empty(), "no handle installed for the fenced agent");
+
+    drop(fence);
+    // Fence lifted, session row deleted (as the workspace.delete cascade
+    // does): the spawn path proceeds past the teardown guard and now fails
+    // on its own store read — proving the fence no longer fires.
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &agent_id)
+        .await
+        .expect("delete session");
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("session row gone");
+    assert!(
+        !err.to_string().contains("is being deleted"),
+        "unfenced agent proceeds past the teardown guard, got: {err:?}"
+    );
+}
+
 /// Signal-0 liveness probe used by the process-group teardown test.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {

@@ -11870,15 +11870,29 @@ impl WorkspaceApi for Services {
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
             let sessions = store.list_agent_sessions(&id).await?;
-            for session in &sessions {
-                if let Some(manager) = manager.as_ref() {
-                    // Aborts the worker, drops the handle (kill_child_tree on
-                    // the ACP child), clears busy + agent_ws, and
-                    // deregisters the process — the `agent.stop` semantics.
-                    manager.stop(&session.id).await;
+            // Batch stop: aborts each worker, drops each handle, clears
+            // busy + agent_ws, and deregisters each process — the
+            // `agent.stop` semantics per agent — then kills all detached
+            // ACP children's process groups under ONE shared grace
+            // window (`kill_child_trees`), so the delete ack pays ~one
+            // grace period total instead of one per live agent.
+            // The returned fence keeps the swept agents blocked from the
+            // lazy-spawn paths until this future completes (it drops at the
+            // end of this scope, after the store cascade below deletes the
+            // session rows): a concurrent `agent.sendMessage` that passed
+            // its store check before the sweep would otherwise respawn a
+            // replacement child during the shared grace wait and leave it
+            // running as a ghost process after the rows are gone.
+            let _teardown_fence = match manager.as_ref() {
+                Some(manager) => {
+                    let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                    Some(manager.stop_many(&ids).await)
                 }
+                None => None,
+            };
+            for session in &sessions {
                 // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop`); drop them so a
+                // maps (not touched by `manager.stop_many`); drop them so a
                 // same-slug recreate observes no ghost state. Recover through
                 // a poisoned lock via `into_inner` — the delete path is the
                 // last chance to unlink this state, so best-effort teardown
