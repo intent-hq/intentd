@@ -38,8 +38,9 @@
 //!     every run dispatches — the validation-run dispatch wakes the owner AND
 //!     persists an ACTIVE schedule (`dispatchCount: 1`), a `hook.runNow` fire
 //!     wakes again and stays `scheduled` (`dispatchCount: 2`), each wake
-//!     articulates "fired + still active", and the TTL finally expires the
-//!     hook with a notice reporting runs AND dispatches.
+//!     says the hook remains active (`hookStillActive: true` in its
+//!     metadata), and the TTL finally expires the hook with a notice
+//!     reporting runs AND dispatches.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -682,6 +683,12 @@ async fn hook_lifecycle_over_wss() {
         .find(|m| m["messageMetadata"]["type"] == json!("hook_wake"))
         .unwrap_or_else(|| panic!("hook_wake entry queued mid-turn: {queue}"));
     assert_eq!(wake["messageMetadata"]["hookName"], "dispatcher");
+    // A one-shot dispatch wake tags its metadata hookStillActive=false.
+    assert_eq!(
+        wake["messageMetadata"]["hookStillActive"],
+        json!(false),
+        "{wake}"
+    );
     assert!(
         wake["content"]
             .as_str()
@@ -693,7 +700,7 @@ async fn hook_lifecycle_over_wss() {
         wake["content"]
             .as_str()
             .unwrap_or("")
-            .contains("has now fired and is retired"),
+            .contains("now retired and will not run again"),
         "dispatch wake carries the terminal-state note: {wake}"
     );
 
@@ -712,7 +719,7 @@ async fn hook_lifecycle_over_wss() {
         101,
         &ws_id,
         &agent_id,
-        "has now fired and is retired",
+        "now retired and will not run again",
     )
     .await;
 
@@ -1236,8 +1243,9 @@ async fn hook_lifecycle_over_wss() {
         "re-armed with a fresh nextRunAt: {forever}"
     );
 
-    // The perpetual fire's wake states BOTH facts — it fired, and it stays
-    // active until its TTL — instead of the one-shot "retired" note.
+    // The perpetual fire's wake says the hook stays active until its TTL —
+    // instead of the one-shot "retired" note — and its metadata tags the
+    // wake hookStillActive=true.
     await_conversation_contains(
         &mut rpc,
         810,
@@ -1246,14 +1254,8 @@ async fn hook_lifecycle_over_wss() {
         "[Background hook \\\"forever\\\"] perpetual fire 1",
     )
     .await;
-    await_conversation_contains(
-        &mut rpc,
-        820,
-        &ws_id,
-        &agent_id,
-        "it is PERPETUAL — it remains active",
-    )
-    .await;
+    await_conversation_contains(&mut rpc, 820, &ws_id, &agent_id, "remains active until").await;
+    await_conversation_contains(&mut rpc, 825, &ws_id, &agent_id, "\"hookStillActive\":true").await;
 
     // A second fire (FE-triggered) wakes again and re-arms again: the hook is
     // still `scheduled` and `dispatchCount` advances, so `hook:dispatched` is
