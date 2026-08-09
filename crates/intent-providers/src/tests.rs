@@ -641,6 +641,23 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
 
+    // Spawn-time npx signal: an npx spawn always runs a Node child, so even
+    // a declared-Native provider (codex's npx fallback) gets the cap; the
+    // same provider without the signal (resolved native binary) stays
+    // untouched (intent-hq/monorepo#1661).
+    let codex = find_provider("codex").unwrap();
+    let codex_via_npx = args::build_provider_env_for_spawn(codex, None, None, None, None, true);
+    assert_eq!(
+        codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
+        Some("--max-old-space-size=8192"),
+        "codex npx-fallback spawn must get the heap cap"
+    );
+    let codex_native = args::build_provider_env_for_spawn(codex, None, None, None, None, false);
+    assert!(
+        !codex_native.contains_key("NODE_OPTIONS"),
+        "codex resolved-binary spawn must not get NODE_OPTIONS"
+    );
+
     // Override seam produces the requested cap for all V8 providers.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
     assert_eq!(args::max_old_space_mb(), 4096);
