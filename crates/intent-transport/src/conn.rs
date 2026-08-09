@@ -113,6 +113,9 @@ impl ConnSubs {
 /// rejected immediately with `-32011 "Server overloaded"` (notifications are
 /// dropped silently) rather than queued. The permit is moved into the spawned
 /// task, so the slot is released when the task ends — panic unwinds included.
+/// Frames that fail parse/envelope validation are exempt: they are answered
+/// inline with the router's `-32700`/`-32600`, so the error matrix does not
+/// change under load.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
@@ -333,6 +336,19 @@ pub(crate) async fn process_frame(
         .as_ref()
         .map(panic_guard::request_identity)
         .unwrap_or_else(|| (Some(Value::Null), String::new()));
+    // A frame that fails parse/envelope validation never reaches a service:
+    // `handle_message` answers it with `-32700`/`-32600` immediately. Gating it
+    // on the limiter would mask those codes behind `-32011` (and would silently
+    // drop an invalid notification-shaped frame that the router must still
+    // answer), so run it inline — it is pure, instant work on the read loop.
+    if !is_dispatchable(parsed.as_ref()) {
+        let frame =
+            panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), raw)).await;
+        return match frame {
+            Some(frame) => out_tx.send(frame).await.is_ok(),
+            None => true,
+        };
+    }
     let Ok(permit) = limiter.try_acquire() else {
         return reject_overloaded(&method, rpc_id, out_tx).await;
     };
@@ -352,6 +368,28 @@ pub(crate) async fn process_frame(
         .await
     });
     true
+}
+
+/// Whether a generic frame can actually reach a service handler, i.e. it
+/// passes the envelope validation [`handle_message`] performs before dispatch
+/// (§9: `-32700` for unparseable JSON, `-32600` for a bad envelope). Only
+/// dispatchable frames are gated by the outstanding-RPC limiter; everything
+/// else is answered inline so the error matrix is unchanged under load.
+fn is_dispatchable(parsed: Option<&Value>) -> bool {
+    let Some(obj) = parsed.and_then(Value::as_object) else {
+        return false;
+    };
+    let jsonrpc_ok = obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let method_ok = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    let id_type_ok = match obj.get("id") {
+        None => true,
+        Some(v) => v.is_string() || v.is_number() || v.is_null(),
+    };
+    jsonrpc_ok && method_ok && id_type_ok
 }
 
 /// Reject one over-limit slow-path frame (`server.maxOutstandingRpcs`): a
@@ -860,6 +898,35 @@ mod tests {
         let open = reject_overloaded("agent.list", None, &tx).await;
         assert!(open, "the connection must stay open");
         assert!(rx.try_recv().is_err(), "notifications get no response");
+    }
+
+    /// Only frames that survive envelope validation are gated by the limiter;
+    /// unparseable and invalid frames stay on the inline path so the router
+    /// keeps owning `-32700` / `-32600` even at the cap.
+    #[test]
+    fn only_valid_envelopes_are_limiter_gated() {
+        let parse = |raw: &str| serde_json::from_str::<Value>(raw).ok();
+        assert!(is_dispatchable(
+            parse(r#"{"jsonrpc":"2.0","id":1,"method":"agent.list"}"#).as_ref()
+        ));
+        assert!(
+            is_dispatchable(parse(r#"{"jsonrpc":"2.0","method":"agent.list"}"#).as_ref()),
+            "a valid notification still dispatches"
+        );
+        for invalid in [
+            "not json",
+            "[1,2,3]",
+            r#"{"jsonrpc":"1.0","method":"agent.list"}"#,
+            r#"{"id":1,"method":"agent.list"}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":""}"#,
+            r#"{"jsonrpc":"2.0","id":{"a":1},"method":"agent.list"}"#,
+        ] {
+            assert!(
+                !is_dispatchable(parse(invalid).as_ref()),
+                "must not be limiter-gated: {invalid}"
+            );
+        }
     }
 
     /// A closed outbound channel is reported so the read loop can end.

@@ -226,6 +226,64 @@ async fn over_limit_notifications_get_no_response() {
     assert!(first.get("error").is_none(), "in-flight succeeds: {first}");
 }
 
+/// Envelope validation is not masked by the cap: with the limiter saturated,
+/// malformed JSON still answers `-32700` and an invalid envelope still answers
+/// `-32600` — including an invalid notification-shaped frame, which the router
+/// must answer even though valid notifications get no response.
+#[tokio::test]
+async fn invalid_frames_keep_their_error_codes_at_the_cap() {
+    let fx = boot(1).await;
+    let mut ws = connect(fx.port).await;
+
+    // Saturate the single slot.
+    send(&mut ws, sleep_request(1, "2")).await;
+
+    // Malformed JSON → -32700 with a null id.
+    send(&mut ws, Message::Text("{ not json".to_string().into())).await;
+    // Invalid envelope, notification-shaped (no id) → -32600 with a null id.
+    send(
+        &mut ws,
+        Message::Text(
+            json!({ "jsonrpc": "1.0", "method": "workspace.list" })
+                .to_string()
+                .into(),
+        ),
+    )
+    .await;
+
+    let frames = timeout(common::rpc_read_timeout(), async {
+        let mut got: Vec<Value> = Vec::new();
+        while got.len() < 2 {
+            match ws.next().await.expect("stream open").expect("frame") {
+                Message::Text(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v["id"].is_null() && v.get("error").is_some() {
+                        got.push(v);
+                    }
+                }
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        got
+    })
+    .await
+    .expect("error frames timed out");
+
+    let codes: Vec<i64> = frames
+        .iter()
+        .map(|f| f["error"]["code"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        codes,
+        vec![-32700, -32600],
+        "the cap must not mask the router's error matrix: {frames:?}"
+    );
+
+    let [(_, first)] = collect_responses(&mut ws, &[1]).await.try_into().unwrap();
+    assert!(first.get("error").is_none(), "in-flight succeeds: {first}");
+}
+
 /// With the cap unset (`0` = unlimited) a concurrent burst is unaffected: every
 /// request succeeds and none is rejected.
 #[tokio::test]
