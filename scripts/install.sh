@@ -12,7 +12,27 @@
 #   2. /usr/local/bin, when it exists and is writable
 #   3. ~/.local/bin (created if missing)
 #
-# Idempotent: re-running replaces the installed binary atomically.
+# After a successful install it offers to register intentd as a per-user
+# service that starts at login and to start it now:
+#
+#   Linux  systemd user unit   ~/.config/systemd/user/intentd.service
+#          (same unit the .deb ships, pointed at the installed binary)
+#   macOS  launchd LaunchAgent ~/Library/LaunchAgents/com.intenthq.intentd.plist
+#          (same shape as the Homebrew formula's brew-services plist)
+#
+# The prompt reads from /dev/tty, so it works under `curl ... | sh`; without
+# a usable terminal it never hangs — it skips with a hint. Force either way:
+#
+#   INTENTD_INSTALL_SERVICE=1  (or --service, on direct runs)     set up
+#   INTENTD_INSTALL_SERVICE=0  (or --no-service, on direct runs)  skip
+#
+# INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
+# INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
+# serves the same data dir the install-time CLI used.
+#
+# Idempotent: re-running replaces the installed binary atomically, and
+# service setup restarts an already-registered service instead of
+# duplicating it.
 set -eu
 
 BASE_URL="https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest"
@@ -21,6 +41,13 @@ info() { printf '%s\n' "install.sh: $*"; }
 warn() { printf '%s\n' "install.sh: warning: $*" >&2; }
 fail() { printf '%s\n' "install.sh: error: $*" >&2; exit 1; }
 
+# Escape a value for a double-quoted word in a systemd unit: backslash-escape
+# \ and ", and double % (systemd specifier syntax).
+systemd_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
+
+# Escape a value for XML text content (launchd plist).
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 tmpdir=""
 staged=""
 cleanup() {
@@ -28,7 +55,170 @@ cleanup() {
   if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi
 }
 
+# Poll `intentd status` until the daemon answers. First service start can be
+# slow: the sitter downloads the real daemon before serving.
+verify_daemon() {
+  info "waiting for the daemon to respond (first start downloads the daemon binary)..."
+  waited=0
+  while [ "$waited" -lt 60 ]; do
+    if "$install_dir/intentd" status >/dev/null 2>&1; then
+      info "daemon is up — 'intentd status' responds"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
+}
+
+setup_service_linux() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
+    return 0
+  fi
+
+  unit_name=${INTENTD_SERVICE_NAME:-intentd}
+  unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir" || fail "cannot create $unit_dir"
+  # Carry a custom data dir into the service so it serves the same data dir
+  # the install-time CLI used.
+  env_line=""
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$INTENTD_DATA_DIR")\""
+  fi
+  # Same unit the .deb ships (packaging/deb/intentd.service), pointed at the
+  # installed binary. ExecStart/ExecStop are quoted: install dirs can contain
+  # spaces, and systemd honors quoted words; systemd_escape handles \ " %.
+  exec_path=$(systemd_escape "$install_dir/intentd")
+  cat >"$unit_dir/$unit_name.service" <<EOF
+[Unit]
+Description=Intent backend daemon (intentd)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart="$exec_path" serve --resume-all
+ExecStop="$exec_path" stop
+Restart=on-failure
+$env_line
+
+[Install]
+WantedBy=default.target
+EOF
+
+  # Written before this check so the hint below is actionable: from an
+  # SSH/headless session without a user manager the unit still lands on disk.
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    warn "unit written to $unit_dir/$unit_name.service, but cannot talk to the systemd user manager for this session — enable it later from a login session with:
+  systemctl --user enable --now $unit_name"
+    return 0
+  fi
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$unit_name.service" 2>/dev/null \
+    || warn "systemctl --user enable $unit_name failed — the service will not start at login"
+  # restart, not start: a re-run replaces the binary and must pick it up.
+  systemctl --user restart "$unit_name.service" \
+    || fail "systemctl --user restart $unit_name failed — inspect with: systemctl --user status $unit_name"
+  info "systemd user unit installed and started: $unit_dir/$unit_name.service"
+
+  # User units only run while the user has a session; lingering starts them
+  # at boot — essential on headless boxes.
+  if command -v loginctl >/dev/null 2>&1; then
+    user=$(id -un)
+    if [ "$(loginctl show-user "$user" --property=Linger 2>/dev/null)" != "Linger=yes" ]; then
+      info "note: user services run only while you are logged in. To start intentd at boot (headless/server), enable lingering:
+  sudo loginctl enable-linger $user"
+    fi
+  fi
+
+  verify_daemon
+  info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
+}
+
+setup_service_macos() {
+  label=${INTENTD_SERVICE_NAME:-com.intenthq.intentd}
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" || fail "cannot create ~/Library/LaunchAgents"
+  # Interpolated values are XML-escaped: a path with & or < would otherwise
+  # produce an invalid plist and an opaque bootstrap failure.
+  xml_bin=$(xml_escape "$install_dir/intentd")
+  xml_home=$(xml_escape "$HOME")
+  # Carry a custom data dir into the service so it serves the same data dir
+  # the install-time CLI used.
+  env_block=""
+  if [ -n "${INTENTD_DATA_DIR:-}" ]; then
+    env_block="	<key>EnvironmentVariables</key>
+	<dict>
+		<key>INTENTD_DATA_DIR</key>
+		<string>$(xml_escape "$INTENTD_DATA_DIR")</string>
+	</dict>
+"
+  fi
+  # Same shape the Homebrew formula's `brew services` plist uses: RunAtLoad
+  # for start-at-login, KeepAlive relaunches the sitter after a crash but not
+  # after a clean exit (`intentd stop` stays stopped until next login).
+  cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$xml_bin</string>
+		<string>serve</string>
+		<string>--resume-all</string>
+	</array>
+$env_block	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>Crashed</key>
+		<true/>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>$xml_home/Library/Logs/intentd.log</string>
+	<key>StandardErrorPath</key>
+	<string>$xml_home/Library/Logs/intentd.err.log</string>
+</dict>
+</plist>
+EOF
+
+  uid=$(id -u)
+  # bootout tears down any previous registration (idempotent re-runs);
+  # bootstrap loads the fresh plist and RunAtLoad starts the agent. bootout
+  # is asynchronous — bootstrapping while the old agent is still tearing
+  # down fails with EIO — so wait until the label is gone.
+  if launchctl bootout "gui/$uid/$label" 2>/dev/null; then
+    waited=0
+    while launchctl print "gui/$uid/$label" >/dev/null 2>&1; do
+      [ "$waited" -lt 10 ] || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+  launchctl bootstrap "gui/$uid" "$plist" \
+    || fail "launchctl bootstrap failed for $plist"
+  info "LaunchAgent installed and started: $plist"
+
+  verify_daemon
+  info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
+}
+
 main() {
+  service_arg=""
+  for arg in "$@"; do
+    case "$arg" in
+      --service) service_arg="yes" ;;
+      --no-service) service_arg="no" ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service)" ;;
+    esac
+  done
+
   os=$(uname -s)
   case "$os" in
     Darwin) vendor_os="apple-darwin" ;;
@@ -137,11 +327,51 @@ main() {
   export PATH=\"$install_dir:\$PATH\"" ;;
   esac
 
+  # Service setup decision: flags beat the env var beats the prompt. The
+  # prompt talks to /dev/tty because `curl | sh` occupies stdin; when no
+  # terminal is available (CI, provisioning) it must never hang, so the
+  # default there is to skip with a hint.
+  service_mode="$service_arg"
+  if [ -z "$service_mode" ]; then
+    # Case-insensitive to match install.ps1 (FALSE/No must also mean skip).
+    case "${INTENTD_INSTALL_SERVICE:-}" in
+      '') ;;
+      0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo]) service_mode="no" ;;
+      *) service_mode="yes" ;;
+    esac
+  fi
+  if [ -z "$service_mode" ]; then
+    if (exec </dev/tty) 2>/dev/null; then
+      printf 'Set up intentd to start at login and start it now? [Y/n] ' >/dev/tty
+      reply=""
+      read -r reply </dev/tty || reply=""
+      case "$reply" in
+        [nN]*) service_mode="no" ;;
+        *) service_mode="yes" ;;
+      esac
+    else
+      service_mode="skip"
+    fi
+  fi
+
+  if [ "$service_mode" = "yes" ]; then
+    if [ "$os" = "Darwin" ]; then
+      setup_service_macos
+    else
+      setup_service_linux
+    fi
+    return 0
+  fi
+
+  if [ "$service_mode" = "skip" ]; then
+    info "skipping service setup (no interactive terminal detected). To set it up, re-run with INTENTD_INSTALL_SERVICE=1"
+  fi
   printf '%s\n' "
 Next steps:
   intentd serve   # start the daemon in the foreground (downloads the real daemon on first run)
 
-To run intentd as a managed background service instead, use a package-manager install:
+To run intentd at login as a background service, re-run this installer with
+INTENTD_INSTALL_SERVICE=1, or use a package-manager install:
   Homebrew (macOS/Linux):  brew install intent-hq/tap/intentd && brew services start intentd
   Debian/Ubuntu (.deb):    installs a systemd user unit — systemctl --user enable --now intentd"
 }
