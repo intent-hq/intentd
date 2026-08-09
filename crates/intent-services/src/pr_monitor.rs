@@ -868,7 +868,11 @@ impl Services {
     /// typically a monitor that was just registered or re-registered, whose
     /// registration fetch already stamped a current baseline. Catch-up-marked
     /// monitors (boot rehydration) are never skipped.
-    pub(crate) async fn poll_due_pr_monitors(&self) {
+    ///
+    /// `pub` for the same reason as [`Self::poll_pr_monitors`]: integration
+    /// tests drive one deterministic due-sweep instead of racing the loop's
+    /// timer.
+    pub async fn poll_due_pr_monitors(&self) {
         self.sweep_pr_monitors(true).await;
     }
 
