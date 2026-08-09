@@ -374,6 +374,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory.
     struct TempDir {
@@ -454,7 +455,7 @@ mod tests {
         let watch = watch_root(root, md_only, || {});
 
         assert!(
-            wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
+            wait_for(|| watch.watched().is_some(), LIVENESS).await,
             "ancestor watch must establish"
         );
         let (path, recursive) = watch.watched().expect("watched");
@@ -480,24 +481,20 @@ mod tests {
         });
 
         assert!(
-            wait_for(|| watch.watched().is_some(), Duration::from_secs(5)).await,
+            wait_for(|| watch.watched().is_some(), LIVENESS).await,
             "ancestor watch must establish"
         );
 
         std::fs::create_dir_all(&root).expect("create root");
         assert!(
-            wait_for(
-                || watch.watched() == Some((root.clone(), true)),
-                Duration::from_secs(10)
-            )
-            .await,
+            wait_for(|| watch.watched() == Some((root.clone(), true)), LIVENESS).await,
             "watch must promote to a recursive watch on the created root, got {:?}",
             watch.watched()
         );
         // Promotion fires a catch-up notification for anything created
         // before the recursive watch was established.
         assert!(
-            wait_for(|| hits.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)).await,
+            wait_for(|| hits.load(Ordering::SeqCst) >= 1, LIVENESS).await,
             "promotion must fire a catch-up notification"
         );
 
@@ -507,11 +504,7 @@ mod tests {
         let before = hits.load(Ordering::SeqCst);
         std::fs::write(root.join("new.md"), "x").expect("write md");
         assert!(
-            wait_for(
-                || hits.load(Ordering::SeqCst) > before,
-                Duration::from_secs(10)
-            )
-            .await,
+            wait_for(|| hits.load(Ordering::SeqCst) > before, LIVENESS).await,
             "file changes under the promoted root must be detected"
         );
     }
@@ -531,11 +524,7 @@ mod tests {
             h.fetch_add(1, Ordering::SeqCst);
         });
         assert!(
-            wait_for(
-                || watch.watched() == Some((root.clone(), true)),
-                Duration::from_secs(5)
-            )
-            .await,
+            wait_for(|| watch.watched() == Some((root.clone(), true)), LIVENESS).await,
             "recursive watch must establish"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -544,7 +533,7 @@ mod tests {
         // events, which the filter must still forward.
         std::fs::remove_dir_all(&root).expect("remove tier dir");
         assert!(
-            wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
+            wait_for(|| hits.load(Ordering::SeqCst) > 0, LIVENESS).await,
             "tier-directory deletion must forward an event"
         );
     }
@@ -581,11 +570,7 @@ mod tests {
         );
 
         assert!(
-            wait_for(
-                || watch.watched() == Some((root.clone(), true)),
-                Duration::from_secs(10)
-            )
-            .await,
+            wait_for(|| watch.watched() == Some((root.clone(), true)), LIVENESS).await,
             "the watch must still establish in the background"
         );
     }
@@ -618,7 +603,7 @@ mod tests {
         std::fs::write(root.join("a.md"), "x").expect("write file");
 
         assert!(
-            wait_for(|| hits.load(Ordering::SeqCst) > 0, Duration::from_secs(10)).await,
+            wait_for(|| hits.load(Ordering::SeqCst) > 0, LIVENESS).await,
             "a change landing before registration must still trigger a flush"
         );
     }

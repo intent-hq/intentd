@@ -13,13 +13,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::error::{AcpError, AcpResult, JsonRpcError};
@@ -245,11 +245,19 @@ fn truncate_middle(s: &str, max: usize) -> String {
 
 /// Route one parsed JSON-RPC message to the pending map / request hook /
 /// notification hook (§6.3 reader dispatch).
+///
+/// Every response line (a message with an `id` and no `method`) bumps the
+/// response watermark BEFORE the pending-map lookup, so a response whose
+/// pending entry was already removed (the caller dropped its request future —
+/// see [`PendingEntryGuard`]) still advances the watermark. This is
+/// client-side bookkeeping only; nothing changes on the wire.
 fn dispatch(
     value: Value,
     pending: &PendingMap,
     requests: &Option<mpsc::UnboundedSender<IncomingRequest>>,
     notifications: &Option<mpsc::UnboundedSender<IncomingNotification>>,
+    response_seq: &AtomicU64,
+    response_notify: &Notify,
 ) {
     let Some(obj) = value.as_object() else { return };
     let method = obj.get("method").and_then(|m| m.as_str());
@@ -274,6 +282,8 @@ fn dispatch(
     }
 
     let Some(id) = id else { return };
+    response_seq.fetch_add(1, Ordering::SeqCst);
+    response_notify.notify_waiters();
     let Some(key) = id.as_i64() else { return };
     let Some(sender) = pending.lock().unwrap().remove(&key) else {
         return;
@@ -303,6 +313,8 @@ pub struct Connection {
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
     next_id: AtomicI64,
+    response_seq: Arc<AtomicU64>,
+    response_notify: Arc<Notify>,
     stderr: Arc<Mutex<StderrBuffer>>,
     auth_error: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
@@ -321,6 +333,8 @@ impl Connection {
         R: AsyncRead + Unpin + Send + 'static,
     {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let response_seq = Arc::new(AtomicU64::new(0));
+        let response_notify = Arc::new(Notify::new());
         let stderr_buf = Arc::new(Mutex::new(StderrBuffer::default()));
         let auth_error = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
@@ -341,6 +355,8 @@ impl Connection {
 
         // Reader task: frame on `\n`, parse, dispatch.
         let pending_reader = Arc::clone(&pending);
+        let seq_reader = Arc::clone(&response_seq);
+        let notify_reader = Arc::clone(&response_notify);
         let requests = hooks.requests;
         let notifications = hooks.notifications;
         tasks.push(tokio::spawn(async move {
@@ -350,19 +366,33 @@ impl Connection {
                     continue;
                 }
                 match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => dispatch(value, &pending_reader, &requests, &notifications),
+                    Ok(value) => dispatch(
+                        value,
+                        &pending_reader,
+                        &requests,
+                        &notifications,
+                        &seq_reader,
+                        &notify_reader,
+                    ),
                     Err(e) => tracing::warn!(error = %e, "failed to parse ACP stdout line"),
                 }
             }
             // stdout closed: fail every still-pending request.
-            let mut map = pending_reader.lock().unwrap();
-            for (_, sender) in map.drain() {
-                let _ = sender.send(Err(JsonRpcError {
-                    code: 0,
-                    message: "agent stdout closed".to_string(),
-                    data: None,
-                }));
+            {
+                let mut map = pending_reader.lock().unwrap();
+                for (_, sender) in map.drain() {
+                    let _ = sender.send(Err(JsonRpcError {
+                        code: 0,
+                        message: "agent stdout closed".to_string(),
+                        data: None,
+                    }));
+                }
             }
+            // Wake watermark waiters so they recheck instead of sleeping out
+            // their full timeout against a dead child; no response arrived,
+            // so the seq is NOT bumped and `await_response_after`'s timeout
+            // remains the backstop.
+            notify_reader.notify_waiters();
         }));
 
         // Stderr task: ring-buffer recent lines, flag auth-error patterns, and
@@ -401,6 +431,8 @@ impl Connection {
             writer_tx,
             pending,
             next_id: AtomicI64::new(1),
+            response_seq,
+            response_notify,
             stderr: stderr_buf,
             auth_error,
             tasks,
@@ -449,6 +481,44 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.lock().unwrap().len()
+    }
+
+    /// Current response watermark: the number of response lines the reader
+    /// has dispatched so far. The counter is bumped for EVERY response line
+    /// (a message with an `id` and no `method`) before the pending-map
+    /// lookup, so it also counts responses to abandoned requests whose
+    /// pending entry the drop-guard already removed. Client-side transport
+    /// bookkeeping only — nothing changes on the wire.
+    pub fn response_seq(&self) -> u64 {
+        self.response_seq.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the response watermark advances past `since` (i.e.
+    /// `response_seq() > since`), returning `true` when it does and `false`
+    /// on timeout. Lets a caller that abandoned a request (dropped its
+    /// future) wait — bounded — for the straggling response to actually
+    /// arrive. Cancel-safe: dropping this future mid-wait mutates nothing.
+    pub async fn await_response_after(&self, since: u64, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Arm the waiter BEFORE the recheck so a bump+notify landing
+            // between the load and the await cannot be missed.
+            let notified = self.response_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.response_seq.load(Ordering::SeqCst) > since {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.response_seq.load(Ordering::SeqCst) > since;
+            }
+        }
+    }
+
+    /// Whether any request correlation entries are still in flight (their
+    /// futures are live and awaiting a response).
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
     }
 
     /// Send a notification (no id, no response).
@@ -524,4 +594,105 @@ fn encode_message(id: Option<i64>, method: &str, params: &Value) -> AcpResult<St
         }),
     };
     Ok(format!("{}\n", serde_json::to_string(&msg)?))
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A duplex-backed `Connection` whose "agent" never responds on its own:
+    /// the test holds both remote ends and writes response lines by hand.
+    fn silent_connection() -> (Connection, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        (conn, c2a_agent, a2c_agent)
+    }
+
+    /// The response to an abandoned request (future dropped, pending entry
+    /// removed by the drop guard) still bumps the watermark — the bump
+    /// happens before the pending-map lookup.
+    #[tokio::test]
+    async fn abandoned_request_response_still_bumps_watermark() {
+        let (conn, _c2a_agent, mut a2c_agent) = silent_connection();
+        assert_eq!(conn.response_seq(), 0);
+
+        let mut fut =
+            Box::pin(conn.request_timeout("session/prompt", json!({}), Duration::from_secs(60)));
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        drop(fut);
+        assert!(!conn.has_pending_requests(), "drop guard removed the entry");
+
+        // The straggling response for the abandoned id (first id is 1).
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+
+        assert!(
+            conn.await_response_after(0, Duration::from_secs(2)).await,
+            "watermark advances for the abandoned request's response"
+        );
+        assert_eq!(conn.response_seq(), 1);
+        assert!(!conn.has_pending_requests());
+    }
+
+    /// `await_response_after` resolves `true` when a later response lands and
+    /// `false` on timeout when none does.
+    #[tokio::test]
+    async fn await_response_after_resolves_and_times_out() {
+        let (conn, _c2a_agent, mut a2c_agent) = silent_connection();
+
+        assert!(
+            !conn
+                .await_response_after(conn.response_seq(), Duration::from_millis(50))
+                .await,
+            "no response → false on timeout"
+        );
+
+        // Arm a waiter first, then land a response (an id with no pending
+        // entry still counts — the bump precedes the lookup).
+        let conn = Arc::new(conn);
+        let waiter = {
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move { conn.await_response_after(0, Duration::from_secs(2)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":null}\n")
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+        assert!(waiter.await.unwrap(), "later response → true");
+        assert_eq!(conn.response_seq(), 1);
+    }
+
+    /// `has_pending_requests` tracks the in-flight vs settled state of the
+    /// correlation map.
+    #[tokio::test]
+    async fn has_pending_requests_reflects_in_flight_state() {
+        let (conn, _c2a_agent, mut a2c_agent) = silent_connection();
+        assert!(!conn.has_pending_requests(), "fresh connection: none");
+
+        let mut fut =
+            Box::pin(conn.request_timeout("session/ping", json!({}), Duration::from_secs(60)));
+        tokio::select! {
+            _ = &mut fut => panic!("request must still be pending"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert!(conn.has_pending_requests(), "in-flight request: pending");
+
+        a2c_agent
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+            .await
+            .unwrap();
+        a2c_agent.flush().await.unwrap();
+        fut.await.expect("request resolves");
+        assert!(!conn.has_pending_requests(), "settled request: none");
+    }
 }
