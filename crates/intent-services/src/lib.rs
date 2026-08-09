@@ -11870,15 +11870,29 @@ impl WorkspaceApi for Services {
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
             let sessions = store.list_agent_sessions(&id).await?;
-            for session in &sessions {
-                if let Some(manager) = manager.as_ref() {
-                    // Aborts the worker, drops the handle (kill_child_tree on
-                    // the ACP child), clears busy + agent_ws, and
-                    // deregisters the process — the `agent.stop` semantics.
-                    manager.stop(&session.id).await;
+            // Batch stop: aborts each worker, drops each handle, clears
+            // busy + agent_ws, and deregisters each process — the
+            // `agent.stop` semantics per agent — then kills all detached
+            // ACP children's process groups under ONE shared grace
+            // window (`kill_child_trees`), so the delete ack pays ~one
+            // grace period total instead of one per live agent.
+            // The returned fence keeps the swept agents blocked from the
+            // lazy-spawn paths until this future completes (it drops at the
+            // end of this scope, after the store cascade below deletes the
+            // session rows): a concurrent `agent.sendMessage` that passed
+            // its store check before the sweep would otherwise respawn a
+            // replacement child during the shared grace wait and leave it
+            // running as a ghost process after the rows are gone.
+            let _teardown_fence = match manager.as_ref() {
+                Some(manager) => {
+                    let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                    Some(manager.stop_many(&ids).await)
                 }
+                None => None,
+            };
+            for session in &sessions {
                 // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop`); drop them so a
+                // maps (not touched by `manager.stop_many`); drop them so a
                 // same-slug recreate observes no ghost state. Recover through
                 // a poisoned lock via `into_inner` — the delete path is the
                 // last chance to unlink this state, so best-effort teardown
@@ -19260,6 +19274,42 @@ impl WorkspaceApi for Services {
                 "branches": github_browse_ops::branch_names(&page.items),
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
             }))
+        })
+    }
+
+    fn github_branches_list_cached(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        // Mirror `workspace.create`'s parent resolution (worktreesLocation
+        // unless startup-pinned) so a cache warmed by workspace creation under
+        // a custom `workspace.worktreesLocation` is found by this reader too.
+        // Unlike the write path this never creates the directory.
+        let cache_parent = self
+            .configured_worktrees_location()
+            .or_else(|| self.workspaces_root.clone())
+            .unwrap_or_else(default_workspaces_root);
+        Box::pin(async move {
+            let cache_root = cache_parent.join(".repo-cache");
+            match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
+                Some(cached) => {
+                    let mut result = serde_json::json!({
+                        "cached": true,
+                        "branches": cached.branches,
+                    });
+                    // `defaultBranch` is optional on the wire: omitted (not
+                    // null) when `origin/HEAD` is unresolvable.
+                    if let Some(default) = cached.default_branch {
+                        result["defaultBranch"] = serde_json::Value::String(default);
+                    }
+                    Ok(result)
+                }
+                None => Ok(serde_json::json!({
+                    "cached": false,
+                    "branches": [],
+                })),
+            }
         })
     }
 
