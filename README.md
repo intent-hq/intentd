@@ -84,11 +84,32 @@ directly.
 
 > **Note:** although this repository is private, the install commands below work
 > unauthenticated: the daemon's channel manifests and platform archives **and** the
-> sitter installer assets (archives, `.deb` packages, and the archives the Homebrew
-> formula downloads) are all mirrored to the public
-> [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) repo —
-> the temporary public mirror for release assets until this repo is open-sourced. The
-> formula itself lives in the public `intent-hq/homebrew-tap`.
+> sitter installer assets (archives, `.deb` packages, the `install.sh` / `install.ps1`
+> scripts, and the archives the Homebrew formula downloads) are all mirrored to the
+> public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
+> repo — the temporary public mirror for release assets until this repo is
+> open-sourced. The formula itself lives in the public `intent-hq/homebrew-tap`.
+
+### One-line script (macOS / Linux)
+
+```sh
+curl -fsSL https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/install.sh | sh
+```
+
+Detects OS and architecture, downloads the matching `sitter-latest` archive, verifies
+its `.sha256` sidecar, and installs `intentd` to `/usr/local/bin` when writable, else
+`~/.local/bin` (override with `INTENTD_INSTALL_DIR`). Re-running updates in place.
+Start the daemon with `intentd serve`, or use the Homebrew / `.deb` installs below for
+a managed background service.
+
+### One-line script (Windows)
+
+```powershell
+powershell -c "irm https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/install.ps1 | iex"
+```
+
+Installs `intentd.exe` to `%LOCALAPPDATA%\intentd\bin` (override with
+`INTENTD_INSTALL_DIR`) and adds that directory to the user `PATH`.
 
 ### Homebrew (macOS / Linux)
 
