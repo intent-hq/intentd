@@ -14,7 +14,8 @@
 # * smoke-tests each packaged binary with `--sitter-version`
 # * publishes a GitHub Release on the tag (never marked "latest", so daemon
 #   releases keep `releases/latest` semantics) and refreshes the fixed
-#   `sitter-latest` release so stable install URLs exist
+#   `sitter-latest` release so stable install URLs exist (including the
+#   scripts/install.sh + scripts/install.ps1 one-line installer scripts)
 #
 # Packaging jobs hang off `publish` (the fan-in):
 #
@@ -289,6 +290,11 @@ jobs:
             fi
           fi
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          # One-line installer scripts, refreshed alongside the archives so
+          # `curl … install.sh | sh` / `irm … install.ps1 | iex` URLs stay
+          # stable and current.
+          gh release upload sitter-latest scripts/install.sh scripts/install.ps1 \
+            --repo "$GITHUB_REPOSITORY" --clobber
           # Re-stamp published_at so the fixed release reflects this refresh
           # (GitHub never updates it on asset uploads).
           ./scripts/refresh-release-published-at.sh sitter-latest "$GITHUB_REPOSITORY"
@@ -323,8 +329,9 @@ jobs:
       TAG: ${{ needs.plan.outputs.tag }}
       MIRROR_REPO: intent-hq/intentd-releases
       # Sitter release assets: platform archives plus versioned and
-      # constant-named .deb packages, each with a .sha256 sidecar.
-      SITTER_ASSET_REGEX: ^(intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)|intentd_([^_]+_)?(amd64|arm64)\.deb)(\.sha256)?$
+      # constant-named .deb packages, each with a .sha256 sidecar, plus the
+      # one-line installer scripts (sitter-latest only; no sidecars).
+      SITTER_ASSET_REGEX: ^(intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)|intentd_([^_]+_)?(amd64|arm64)\.deb|install\.(sh|ps1))(\.sha256)?$
     steps:
       - uses: actions/checkout@v7
         with:
