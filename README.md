@@ -263,6 +263,25 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Pairing a remote client (WSS)
+
+`intentd pair` renders the `intent://pair?…` QR code / payload URI a LAN client (e.g.
+the iOS app) scans to connect over the WSS/TLS listener. The payload embeds the bearer
+token and TLS fingerprint, so the command is local-only (it queries `pairing.getInfo`
+over the UDS socket).
+
+```bash
+intentd pair                  # QR code + payload URI in the terminal
+intentd pair --png pair.png   # also export the QR code as an image (0600)
+```
+
+If the WSS listener is not running, `pair` offers to enable it on the spot: it persists
+`server.wsApi.enabled = true` to `config.toml` via the daemon's `settings.update`
+pipeline (the same path the settings UI uses), which also starts the listener
+immediately — no restart needed. Interactively this is a `[Y/n]` prompt; unattended
+runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the command fails with
+guidance. `intentd token` prints the same credentials in plaintext.
+
 ## Current status
 
 The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
@@ -293,8 +312,9 @@ in the monorepo's git history.
   / accept-changes pipeline, and ripgrep-backed search.
 - **Terminals & scripts:** a unified `intent-pty` host backing both interactive terminals and
   scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
-- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, and `mcp-bridge`. The daemon
-  does not manage its own service unit: supervision is owned by the platform package manager —
+- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `token`, `pair` (auto-enables the
+  WSS listener on demand), `import`, and `mcp-bridge`. The daemon does not manage its own
+  service unit: supervision is owned by the platform package manager —
   `brew services start intentd` on macOS, and the .deb's systemd user unit on Linux.
 - **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
   (WAL, `foreign_keys`, `busy_timeout`).
