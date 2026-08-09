@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-08-09
+
+### 🐛 Bug Fixes
+
+- *(services)* Apply report_delivered filter to waiting projections ([#1017](https://github.com/intent-hq/intentd/pull/1017))
+- *(store,services)* Guard last_activity against full-row clobber and persist derived value ([#1018](https://github.com/intent-hq/intentd/pull/1018))
+- *(services)* Derive delegation-group subscription linkage from grouped watches in diagnostics ([#1016](https://github.com/intent-hq/intentd/pull/1016))
+- *(services)* Gate turn-end unread raise on top-level foreground agents ([#1021](https://github.com/intent-hq/intentd/pull/1021))
+
+### ⚡ Performance
+
+- *(services)* Dedup pr.monitor forge fetches per (repo, pr) within a sweep ([#1020](https://github.com/intent-hq/intentd/pull/1020))
+
+
 ## [0.6.2] - 2026-08-09
 
 ### 🚀 Features
