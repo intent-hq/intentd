@@ -9,6 +9,10 @@
 # and adds the install dir to the user PATH. Idempotent: re-running replaces
 # the installed binary.
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
+# dramatically) and force TLS 1.2, which older .NET defaults omit.
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $BaseUrl = 'https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest'
 $Archive = 'intentd-x86_64-pc-windows-msvc.zip'
@@ -64,11 +68,24 @@ try {
 }
 
 # Add the install dir to the user PATH (persisted) and the current session.
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-$parts = @(($userPath -split ';') | Where-Object { $_ -ne '' })
-if ($parts -notcontains $installDir) {
-    [Environment]::SetEnvironmentVariable('Path', (($parts + $installDir) -join ';'), 'User')
-    Write-Host "install.ps1: added $installDir to your user PATH (new terminals pick it up automatically)"
+# Read/write the registry value raw so REG_EXPAND_SZ entries like
+# %USERPROFILE%\bin are preserved verbatim ([Environment]:: expands them,
+# which would flatten the stored value on rewrite).
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+try {
+    $userPath = ''
+    $valueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    if ($envKey.GetValueNames() -contains 'Path') {
+        $userPath = [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $valueKind = $envKey.GetValueKind('Path')
+    }
+    $parts = @(($userPath -split ';') | Where-Object { $_ -ne '' })
+    if ($parts -notcontains $installDir) {
+        $envKey.SetValue('Path', (($parts + $installDir) -join ';'), $valueKind)
+        Write-Host "install.ps1: added $installDir to your user PATH (new terminals pick it up automatically)"
+    }
+} finally {
+    $envKey.Close()
 }
 if (@($env:Path -split ';') -notcontains $installDir) {
     $env:Path = "$env:Path;$installDir"
