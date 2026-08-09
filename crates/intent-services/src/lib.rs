@@ -3204,7 +3204,10 @@ impl Services {
     /// retires it inline without waking the holder — it can only ever deliver
     /// an `agent:failed` / `agent:deleted` signal, which is not something the
     /// holder is waiting FOR. Counting it deferred the holder's own completion
-    /// with no future trigger, stranding its `after_all` group forever.
+    /// with no future trigger, stranding its `after_all` group forever. The
+    /// filter lives in [`Services::waiting_watches_for_parent`], shared with
+    /// the `isWaitingForOtherAgents` / `waitingForAgentIds` projections so
+    /// display and settlement cannot drift (issue intent-hq/monorepo#1649).
     ///
     /// This does not weaken the "grouped watches count too" rule above:
     /// `report_delivered` is only ever set on UNGROUPED watches, because
@@ -3215,9 +3218,8 @@ impl Services {
     /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
         let outgoing: Vec<AgentId> = self
-            .list_watches_for_parent(agent_id)
+            .waiting_watches_for_parent(agent_id)
             .into_iter()
-            .filter(|w| !w.report_delivered)
             .map(|w| w.child_agent_id)
             .collect();
         let incoming: Vec<AgentId> = self

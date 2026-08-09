@@ -2346,6 +2346,108 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     assert_eq!(cv["waitingForAgentIds"], json!([]));
 }
 
+/// issue intent-hq/monorepo#1649: the `isWaitingForOtherAgents` /
+/// `waitingForAgentIds` projections must apply the same `report_delivered`
+/// filter as the settlement predicate (`agent_is_waiting_on_agents`), so a
+/// holder whose only outgoing watch has already delivered its report-time
+/// wake no longer displays as waiting while settlement treats it as settled.
+#[tokio::test]
+async fn agent_lite_waiting_projection_excludes_report_delivered_watches() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let watch_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // Report-time wake delivered: the watch stops being a waiting reason for
+    // settlement, so the projection must stop counting it too.
+    assert!(svc.mark_watch_report_delivered(&watch_id));
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], false);
+    assert_eq!(v["waitingForAgentIds"], json!([]));
+
+    // Mixed set: a live watch on another child still projects — only the
+    // report_delivered edge is filtered, not the whole watch list.
+    let other = create_agent(&svc, &ws, "Other").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        other.clone(),
+        None,
+    )
+    .expect("register second watch");
+    let v = serde_json::to_value(svc.agent_get_op(parent, None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([other.0]));
+}
+
+/// `agent.reportToParent` marks the parent's ungrouped watches
+/// `report_delivered`, which flips the waiting projection — so it must
+/// publish `agent:subscriptions-changed` with the refreshed flags instead of
+/// leaving clients on a stale `isWaitingForOtherAgents: true` snapshot
+/// (monorepo#1649).
+#[tokio::test]
+async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child))
+        .await
+        .expect("report");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after reportToParent")
+        .expect("batch");
+    let last = batch.last().expect("event");
+    assert_eq!(last.data["agentId"], json!(parent.0));
+    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
+    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+}
+
 /// STAB-125: `agent.get` surfaces turn-liveness — `turnInFlight` and
 /// `lastStreamActivityAt` — from the live-turn slot so a poller can tell a
 /// long-but-alive turn from a wedged agent before anything persists.
