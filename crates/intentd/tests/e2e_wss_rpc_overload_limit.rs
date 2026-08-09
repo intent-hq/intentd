@@ -1,9 +1,10 @@
 //! End-to-end coverage for the daemon-wide outstanding-slow-path-RPC cap
-//! (`server.maxOutstandingRpcs`). Drives a real [`WsApiServer`] over plain
-//! `ws://` (insecure dev mode) so the WebSocket-upgrade → JSON-RPC → limiter →
-//! router round-trip is exercised end-to-end, plus a UDS listener sharing the
-//! same limiter so the "daemon-wide, both transports" claim is asserted rather
-//! than assumed.
+//! (`server.maxOutstandingRpcs`). Drives a real [`WsApiServer`] over the
+//! production transport path — TLS with a pinned self-signed fingerprint and
+//! bearer-token auth — so the WSS upgrade → JSON-RPC → limiter → router
+//! round-trip is exercised end-to-end, plus a UDS listener sharing the same
+//! limiter so the "daemon-wide, both transports" claim is asserted rather than
+//! assumed.
 //!
 //! The contract under test: once the cap is reached, further slow-path requests
 //! are REJECTED immediately with `-32011 "Server overloaded"` echoing the
@@ -18,28 +19,126 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::WorkspaceApi;
+use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
-    serve_uds_with_reverse, PrimaryReverseRegistry, RpcLimiter, WsApiServer, WsOptions,
+    ensure_tls_certificate, serve_uds_with_reverse, AsyncTokenStore, PrimaryReverseRegistry,
+    RpcLimiter, TokenStore, WsApiServer, WsOptions,
 };
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use common::TlsWs;
+
+/// A fixed 64-char hex token (valid shape) shared by server + client.
+const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+/// In-memory [`TokenStore`] so tests never touch the real OS keychain.
+#[derive(Default)]
+struct MemTokenStore(Mutex<Option<String>>);
+
+impl TokenStore for MemTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn store_token(&self, token: &str) -> CoreResult<()> {
+        *self.0.lock().unwrap() = Some(token.to_string());
+        Ok(())
+    }
+}
+
+/// Client cert verifier that pins the server's SHA-256 fingerprint (colon hex)
+/// and otherwise validates the handshake signature with the ring provider.
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
+}
 
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
+    cfg: Arc<ClientConfig>,
     /// UDS listener sharing the WSS listener's limiter.
     socket: PathBuf,
     _uds_shutdown: tokio::sync::oneshot::Sender<()>,
@@ -55,9 +154,11 @@ fn slot_hold_seconds() -> String {
         .to_string()
 }
 
-/// Boot a daemon whose UDS+WSS listeners share one limiter capped at
-/// `max_outstanding` (`0` = unlimited, the shipped "off" value). The temp dir
-/// is rooted at `/tmp` so `data_dir/intentd.sock` fits within `SUN_LEN`.
+/// Boot a daemon whose UDS + TLS-WSS listeners share one limiter capped at
+/// `max_outstanding` (`0` = unlimited, the shipped "off" value). The WSS
+/// listener runs the production transport path: a self-signed certificate the
+/// client pins by fingerprint plus bearer-token auth. The temp dir is rooted at
+/// `/tmp` so `data_dir/intentd.sock` fits within `SUN_LEN`.
 async fn boot(max_outstanding: u32) -> Fixture {
     let dir = common::test_tempdir_in("/tmp", "itd-rpclimit-");
     let store = Store::open(&dir.path().join("intentd.db"))
@@ -71,13 +172,19 @@ async fn boot(max_outstanding: u32) -> Fixture {
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let limiter = RpcLimiter::new(max_outstanding);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).expect("seed token");
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         rpc_limiter: limiter.clone(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure(Arc::clone(&api), bus.clone(), opts, None);
+    let ws = WsApiServer::new(Arc::clone(&api), bus.clone(), &tls, token_store, opts, None)
+        .expect("server");
+    let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
 
     // The same limiter instance also backs a UDS listener, so the cap is
@@ -109,29 +216,31 @@ async fn boot(max_outstanding: u32) -> Fixture {
     Fixture {
         _ws: ws,
         port,
+        cfg,
         socket,
         _uds_shutdown: uds_shutdown,
         _dir: dir,
     }
 }
 
-/// A WebSocket plus a buffer of already-read frames. Responses arrive in an
-/// order the test does not control (a rejection can land before or after the
-/// in-flight response), so frames outside the currently awaited id set are
-/// buffered instead of discarded — discarding them would hang the next read.
+/// A pinned-TLS WebSocket plus a buffer of already-read frames. Responses
+/// arrive in an order the test does not control (a rejection can land before or
+/// after the in-flight response), so frames outside the currently awaited id
+/// set are buffered instead of discarded — discarding them would hang the next
+/// read.
 struct Conn {
-    ws: PlainWs,
+    ws: TlsWs,
     buffered: Vec<(i64, Value)>,
     /// Id-less error frames (`-32700`/`-32600`), which carry a null id.
     null_id_errors: Vec<Value>,
 }
 
 impl Conn {
-    async fn connect(port: u16) -> Self {
-        let url = format!("ws://127.0.0.1:{port}/ws");
-        let (ws, _resp) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("plain ws handshake");
+    /// Authenticated WSS connection over pinned TLS (token in the query
+    /// string), i.e. the same path production clients take.
+    async fn connect(fx: &Fixture) -> Self {
+        let url = format!("wss://localhost:{}/ws?token={TOKEN}", fx.port);
+        let ws = common::wss_connect_with_retry(fx.port, fx.cfg.clone(), &url).await;
         Self {
             ws,
             buffered: Vec::new(),
@@ -264,7 +373,7 @@ fn assert_overload(id: i64, frame: &Value) {
 #[tokio::test]
 async fn over_limit_requests_are_rejected_and_slots_are_reusable() {
     let fx = boot(1).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
     let hold = slot_hold_seconds();
 
     // Occupy the single slot with a slow request, then flood.
@@ -292,7 +401,7 @@ async fn over_limit_requests_are_rejected_and_slots_are_reusable() {
 #[tokio::test]
 async fn over_limit_notifications_get_no_response() {
     let fx = boot(1).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
     let hold = slot_hold_seconds();
 
     conn.send(sleep_request(1, &hold)).await;
@@ -322,7 +431,7 @@ async fn over_limit_notifications_get_no_response() {
 #[tokio::test]
 async fn browser_exec_is_rejected_at_the_cap() {
     let fx = boot(1).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
 
     conn.send(sleep_request(1, &slot_hold_seconds())).await;
     conn.send(Message::Text(
@@ -349,7 +458,7 @@ async fn browser_exec_is_rejected_at_the_cap() {
 #[tokio::test]
 async fn invalid_frames_keep_their_error_codes_at_the_cap() {
     let fx = boot(1).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
 
     // Saturate the single slot.
     conn.send(sleep_request(1, &slot_hold_seconds())).await;
@@ -384,7 +493,7 @@ async fn invalid_frames_keep_their_error_codes_at_the_cap() {
 #[tokio::test]
 async fn unlimited_cap_never_rejects() {
     let fx = boot(0).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
 
     let ids: Vec<i64> = (1..=8).collect();
     for id in &ids {
@@ -403,7 +512,7 @@ async fn unlimited_cap_never_rejects() {
 #[tokio::test]
 async fn traffic_under_the_limit_is_unaffected() {
     let fx = boot(8).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
 
     let ids: Vec<i64> = (1..=4).collect();
     for id in &ids {
@@ -423,7 +532,7 @@ async fn traffic_under_the_limit_is_unaffected() {
 #[tokio::test]
 async fn the_cap_is_shared_across_uds_and_wss() {
     let fx = boot(1).await;
-    let mut conn = Conn::connect(fx.port).await;
+    let mut conn = Conn::connect(&fx).await;
 
     // Occupy the single shared slot over WSS.
     conn.send(sleep_request(1, &slot_hold_seconds())).await;

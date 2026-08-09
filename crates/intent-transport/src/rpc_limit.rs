@@ -181,18 +181,27 @@ mod tests {
 
     /// A panicking handler unwinds the spawned task; the permit drops with the
     /// unwind, so a panic can never leak a slot.
+    ///
+    /// The panic hook is process-global, so the swap is serialized with the
+    /// `panic_guard` tests through the shared global-state lock — otherwise
+    /// parallel hook swaps restore each other's hook. The lock is held across
+    /// the `await` on purpose: the quiet hook must stay installed until the
+    /// spawned task has unwound.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn permit_is_released_when_the_spawned_task_panics() {
         let limiter = RpcLimiter::new(1);
         let permit = limiter.try_acquire().expect("slot").expect("permit");
+        let _global = crate::panic_guard::test_support::lock_global_state();
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let task = tokio::spawn(async move {
             let _permit = permit;
             panic!("boom");
         });
-        assert!(task.await.is_err(), "task must have panicked");
+        let panicked = task.await.is_err();
         std::panic::set_hook(prev);
+        assert!(panicked, "task must have panicked");
         assert_eq!(limiter.available_permits(), Some(1));
         assert!(limiter.try_acquire().is_ok());
     }
