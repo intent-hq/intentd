@@ -380,6 +380,30 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
     v
 }
 
+/// The `messageMetadata` payload attached to every PR-monitor wake delivery
+/// (PROTOCOL §5.42): `{ type: "pr_monitor_wake", monitorId, repo, prNumber,
+/// reason, url? }`. `url` is the PR's HTML URL read off the monitor's
+/// persisted baseline snapshot; the key is OMITTED (never null) when the
+/// monitor has no baseline yet.
+fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
+    let mut metadata = json!({
+        "type": "pr_monitor_wake",
+        "monitorId": m.monitor_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+        "reason": reason,
+    });
+    let url = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        .map(|s| s.url);
+    if let Some(url) = url {
+        metadata["url"] = Value::String(url);
+    }
+    metadata
+}
+
 /// The list-surface projection of one monitor: identity + lifecycle plus the
 /// hover/click fields the FE needs — PR title/URL and a compact summary of
 /// the last-refresh snapshot, whether changes are accumulated awaiting the
@@ -678,6 +702,9 @@ impl Services {
         })?;
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
             .await;
+        // A newly persisted active monitor can promote the derived
+        // displayStatus to `in_progress` (§6.5).
+        self.maybe_emit_display_status_changed(workspace_id).await;
         Ok((monitor, snapshot.requirements))
     }
 
@@ -745,6 +772,35 @@ impl Services {
             .into_iter()
             .filter(|m| m.state != PrMonitorState::Cancelled)
             .collect())
+    }
+
+    /// Whether the workspace owns any ACTIVE PR monitor — the `displayStatus`
+    /// promotion signal (§6.5): an idle agent still watching a PR via a
+    /// monitor reads as active work. SQL-filtered to active rows so the hot
+    /// list/get enrichment cost is O(active monitors), never O(all monitor
+    /// history in the workspace). Best-effort: a store read failure is
+    /// logged and fails open to `false` (mirrors
+    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// never wedged and activity is never fabricated.
+    pub(crate) async fn workspace_has_active_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => !monitors.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-pr-monitors displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
     }
 
     /// Cancel an active monitor. `caller` is the cancelling agent
@@ -816,6 +872,9 @@ impl Services {
             self.resettle_owner_after_pr_monitor_terminal(&monitor)
                 .await;
         }
+        // The last active monitor settling can demote the derived
+        // displayStatus (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(workspace_id).await;
         Ok(monitor)
     }
 
@@ -1208,6 +1267,10 @@ impl Services {
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
+        // The last active monitor settling can demote the derived
+        // displayStatus (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(&completed.workspace_id)
+            .await;
         Ok(())
     }
 
@@ -1265,6 +1328,10 @@ impl Services {
                 monitor.updated_at = now;
                 self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
                     .await;
+                // The last active monitor settling can demote the derived
+                // displayStatus (§6.5).
+                self.maybe_emit_display_status_changed(&monitor.workspace_id)
+                    .await;
                 continue;
             }
             self.pr_monitor_catch_up
@@ -1306,13 +1373,7 @@ impl Services {
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
-        let metadata = json!({
-            "type": "pr_monitor_wake",
-            "monitorId": monitor.monitor_id,
-            "repo": format!("{}/{}", monitor.repo_owner, monitor.repo_name),
-            "prNumber": monitor.pr_number,
-            "reason": reason,
-        });
+        let metadata = pr_monitor_wake_metadata(monitor, reason);
         if let Err(e) = self
             .deliver_wake_message(
                 &monitor.workspace_id,
@@ -2439,6 +2500,12 @@ mod tests {
         let text = owner_messages(&svc, &owner).await;
         assert!(text.contains("was MERGED"), "{text}");
         assert!(text.contains("Monitoring has STOPPED"), "{text}");
+        // The wake's messageMetadata carries the PR url from the baseline.
+        assert!(text.contains("pr_monitor_wake"), "{text}");
+        assert!(
+            text.contains(r#""url":"https://github.com/o/r/pull/42""#),
+            "{text}"
+        );
         // Completed rows stay visible; the loop no longer polls them.
         assert_eq!(svc.pr_monitors_for_agent(&owner).await.unwrap().len(), 1);
         assert!(svc
@@ -2447,6 +2514,41 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn wake_metadata_carries_the_pr_url_and_omits_it_without_a_baseline() {
+        let now = now_iso();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&snapshot(|_| {})).unwrap()),
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let metadata = pr_monitor_wake_metadata(&m, "changed");
+        assert_eq!(metadata["type"], json!("pr_monitor_wake"));
+        assert_eq!(metadata["repo"], json!("o/r"));
+        assert_eq!(metadata["prNumber"], json!(42));
+        assert_eq!(metadata["reason"], json!("changed"));
+        assert_eq!(metadata["url"], json!("https://github.com/o/r/pull/42"));
+
+        // No baseline yet: the key is ABSENT, never null.
+        m.last_snapshot = None;
+        let metadata = pr_monitor_wake_metadata(&m, "cancelled");
+        assert!(metadata.get("url").is_none(), "{metadata}");
+        assert_eq!(metadata["reason"], json!("cancelled"));
     }
 
     #[tokio::test]
@@ -3060,6 +3162,182 @@ mod tests {
                 .expect("object")
                 .contains_key("prMonitors"),
             "cancelled monitor leaves the snapshot: {after}"
+        );
+    }
+
+    /// Direct child task note of the spec, so it counts into `taskStats`.
+    fn task_note(ws: &WorkspaceId, id: &str, status: intent_core::TaskStatus) -> intent_core::Note {
+        let ts = now_iso();
+        intent_core::Note {
+            id: intent_core::NoteId::from(id),
+            workspace_id: ws.clone(),
+            title: format!("Task {id}"),
+            content: String::new(),
+            content_type: intent_core::ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(intent_core::NoteId::from("spec")),
+            visibility: intent_core::NoteVisibility::Workspace,
+            metadata: intent_core::NoteMetadata {
+                task: Some(intent_core::TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Regression for intent-hq/monorepo#1814: an ACTIVE PR monitor promotes
+    /// the derived `displayStatus` to `in_progress` on the list/get
+    /// enrichment path even with the owner idle and every task complete —
+    /// mirroring `active_hook_promotes_display_status_to_in_progress` in
+    /// `hook_manager.rs`. The promotion lapses once the monitor settles.
+    #[tokio::test]
+    async fn active_pr_monitor_promotes_display_status_to_in_progress() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        svc.store()
+            .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
+            .await
+            .expect("insert task");
+        let monitor = register(&svc, &ws, &owner).await;
+
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::InProgress),
+            "idle owner with an active PR monitor must read in_progress"
+        );
+
+        // Settle the monitor: the promotion lapses and the base rollup runs.
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete),
+            "terminal monitors never promote"
+        );
+    }
+
+    /// `workspace_has_active_pr_monitors` is the promotion signal: true only
+    /// while a monitor is ACTIVE, false with no monitors and false again once
+    /// every monitor is terminal (cancelled/completed).
+    #[tokio::test]
+    async fn workspace_has_active_pr_monitors_tracks_active_rows_only() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        assert!(!svc.workspace_has_active_pr_monitors(&ws).await);
+
+        let monitor = register(&svc, &ws, &owner).await;
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert!(
+            !svc.workspace_has_active_pr_monitors(&ws).await,
+            "cancelled monitors never promote"
+        );
+
+        // A completed monitor (merged PR) is terminal too.
+        register(&svc, &ws, &owner).await;
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        assert!(
+            !svc.workspace_has_active_pr_monitors(&ws).await,
+            "completed monitors never promote"
+        );
+    }
+
+    /// Persisted `workspace:displayStatus-changed` payload statuses for a
+    /// workspace, oldest-first.
+    async fn display_status_events(svc: &Services, ws: &WorkspaceId) -> Vec<String> {
+        let mut evs =
+            svc.store()
+                .query_events(&intent_store::EventQuery {
+                    workspace_id: Some(ws.clone()),
+                    event_types: vec![
+                        intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED.to_string()
+                    ],
+                    ..Default::default()
+                })
+                .await
+                .expect("query displayStatus events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data["displayStatus"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Monitor lifecycle transitions emit `workspace:displayStatus-changed`
+    /// exactly once per transition: register promotes (idle → in_progress),
+    /// cancel demotes (in_progress → idle) — mirroring
+    /// `hook_transitions_emit_display_status_changed_once` in
+    /// `hook_manager.rs`.
+    #[tokio::test]
+    async fn monitor_transitions_emit_display_status_changed_once() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        // Re-running the recompute without a transition emits nothing.
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle"]
+        );
+    }
+
+    /// The poll loop's terminal completion (merged PR) demotes and emits,
+    /// and so does a rehydration cancel of an owner-gone monitor.
+    #[tokio::test]
+    async fn completion_and_rehydration_cancel_emit_the_demotion() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        svc.maybe_emit_display_status_changed(&ws).await;
+
+        register(&svc, &ws, &owner).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle"]
+        );
+
+        // Rehydration cancel (owner gone) demotes too.
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress"]
+        );
+        svc.store()
+            .set_agent_session_status(&ws, &owner, AgentStatus::Deleted, false, &now_iso(), None)
+            .await
+            .expect("delete owner");
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress", "idle"]
         );
     }
 
