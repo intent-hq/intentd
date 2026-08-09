@@ -1418,12 +1418,12 @@ impl Services {
     /// messageMetadata (`true` only for the re-armed perpetual branch) so
     /// consumers can tell the two apart without parsing the note text.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
-        // A perpetual dispatch that also lands at/after `expiresAt` is
-        // terminalized (Expired), not re-armed — the caller sends a
-        // separate `finish_expiry` wake for that, so this wake must NOT
-        // claim the hook remains active (it would contradict the
-        // immediately-following expiry notice).
-        let still_active = hook.perpetual && hook.state != HookState::Expired;
+        // Only meaningful for `dispatched` wakes: a perpetual dispatch that
+        // also lands at/after `expiresAt` is terminalized (Expired), not
+        // re-armed — the caller sends a separate `finish_expiry` wake for
+        // that, so this wake must NOT claim the hook remains active (it
+        // would contradict the immediately-following expiry notice).
+        let dispatch_still_active = hook.perpetual && hook.state != HookState::Expired;
         let mut metadata = json!({
             "type": "hook_wake",
             "hookId": hook.hook_id,
@@ -1431,10 +1431,10 @@ impl Services {
             "reason": reason,
         });
         if reason == "dispatched" {
-            metadata["hookStillActive"] = json!(still_active);
+            metadata["hookStillActive"] = json!(dispatch_still_active);
         }
         let state_note = match reason {
-            "dispatched" if still_active => Some(format!(
+            "dispatched" if dispatch_still_active => Some(format!(
                 "[This hook remains active until {} — cancel via ws.hook.cancel \
                  when no longer needed.]",
                 hook.expires_at.as_deref().unwrap_or("its TTL elapses")
