@@ -837,6 +837,28 @@ async function dispatch(msg) {
           },
         });
       }
+      // Idle-timeout tail-bleed regression (monorepo#1599): with the opt-in
+      // `tailAfterCancel` marker set, stream one trailing `agent_message_chunk`
+      // carrying the marker BEFORE resolving the parked prompt — modelling a
+      // child that emits late `session/update`s for the cancelled turn on its
+      // ordered stdout ahead of the cancel response. Because stdout is ordered,
+      // the straggler always precedes the resolving `result(...)` line — the
+      // deterministic boundary the daemon's watermark drain relies on. Strictly
+      // gated on the new key so every existing cancel behavior is unaffected.
+      if (
+        typeof behavior.tailAfterCancel === 'string' &&
+        behavior.tailAfterCancel.length > 0 &&
+        pendingPromptIds.length > 0
+      ) {
+        log(`emitting tail-after-cancel chunk: ${behavior.tailAfterCancel}`);
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: behavior.tailAfterCancel },
+          },
+        });
+      }
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
       // reason and stay alive for a follow-up (resume) prompt — the observable
       // keep-alive interrupt. Notification itself gets no reply.

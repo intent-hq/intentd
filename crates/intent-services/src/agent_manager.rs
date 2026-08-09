@@ -6472,19 +6472,63 @@ async fn run_message_worker(
                                     .unwrap()
                                     .get(&agent_id)
                                     .map(|h| h.connection.clone());
-                                let settled = match conn {
-                                    Some(conn) => {
-                                        cancel_and_settle_idle_prompt(
-                                            conn.as_ref(),
-                                            &agent_id,
-                                            &acp_session_id,
-                                        )
-                                        .await
+                                // Response watermark BEFORE `session/cancel`:
+                                // the idle timeout dropped `req_fut`, so the
+                                // hung prompt's pending-map entry is already
+                                // gone (drop guard) — the watermark is the
+                                // only way to observe its late response.
+                                let since = conn.as_ref().map(|c| c.response_seq());
+                                let settled = match conn.as_deref() {
+                                    Some(c) => {
+                                        cancel_and_settle_idle_prompt(c, &agent_id, &acp_session_id)
+                                            .await
                                     }
                                     None => false,
                                 };
                                 if !settled {
                                     mgr.kill_child_only(&agent_id).await;
+                                } else {
+                                    // STAB-124 for the idle-timeout path:
+                                    // attribution on the turn-less
+                                    // `session/update` channel is positional,
+                                    // so the cancelled turn's stragglers
+                                    // (tool_call_update echoes, tail chunks)
+                                    // must be discarded before the warning
+                                    // turn's transcript starts consuming the
+                                    // channel. The cancelled prompt's RESPONSE
+                                    // is the deterministic end-of-turn boundary
+                                    // on the child's ordered stdout — once it
+                                    // lands, every straggler is already
+                                    // buffered, so the `try_recv` sweep below
+                                    // is complete, not racy. Bounded, cannot
+                                    // deadlock: the timed-out worker released
+                                    // the receiver lock when `run_prompt_turn`
+                                    // returned, and the await is
+                                    // timeout-bounded.
+                                    if let (Some(conn), Some(since)) = (conn.as_ref(), since) {
+                                        if !conn
+                                            .await_response_after(since, Duration::from_secs(2))
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                agent = %agent_id,
+                                                "idle-timeout settle: cancelled prompt's response did not land within the watermark window; sweeping buffered notifications anyway"
+                                            );
+                                        }
+                                    }
+                                    // Hold the notifications lock across the
+                                    // drain so the warning turn cannot start
+                                    // consuming the channel mid-sweep.
+                                    let notes = mgr
+                                        .handles
+                                        .lock()
+                                        .unwrap()
+                                        .get(&agent_id)
+                                        .map(|h| h.notifications.clone());
+                                    if let Some(notes) = notes {
+                                        let mut guard = notes.lock().await;
+                                        Services::drain_replay_notifications(&mut guard).await;
+                                    }
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,
