@@ -1646,6 +1646,7 @@ mod tests {
         threads: Vec<ReviewThread>,
         checks: Vec<RollupCheck>,
         fail_get_pr: bool,
+        fail_list_comments: bool,
     }
 
     impl Default for ForgeState {
@@ -1666,6 +1667,7 @@ mod tests {
                     url: None,
                 }],
                 fail_get_pr: false,
+                fail_list_comments: false,
             }
         }
     }
@@ -1875,7 +1877,15 @@ mod tests {
             _: &RepoRef,
             _: u64,
         ) -> intent_sourcecontrol::Result<Vec<Comment>> {
-            let n = self.state.lock().unwrap().conversation_comments;
+            let (n, fail) = {
+                let s = self.state.lock().unwrap();
+                (s.conversation_comments, s.fail_list_comments)
+            };
+            if fail {
+                return Err(intent_sourcecontrol::Error::Unsupported(
+                    "comments down".into(),
+                ));
+            }
             Ok((0..n)
                 .map(|i| Comment {
                     id: i.to_string(),
@@ -2600,6 +2610,70 @@ mod tests {
             assert_eq!(row.state, PrMonitorState::Active);
             assert!(row.last_error.is_some(), "error recorded on {}", id.0);
         }
+    }
+
+    /// The property `SharedPrSnapshot` exists for: when the comment read
+    /// degrades, each sibling materializes the shared snapshot against ITS
+    /// OWN previous count. Siblings register around a comment bump so their
+    /// baselines DIVERGE (0 vs 2); an implementation that materialized once
+    /// with the first sibling's baseline and reused the result would
+    /// fabricate a "comments removed" change on the other.
+    #[tokio::test]
+    async fn a_degraded_comment_read_keeps_each_siblings_own_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let first = register(&svc, &ws, &owner).await;
+        // Comments move BETWEEN the registrations: first's baseline stays at
+        // 0 comments, the sibling's registration fetch stamps 2.
+        forge.edit(|s| s.conversation_comments = 2);
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+
+        // The shared comment read degrades: each sibling keeps its own
+        // previous count, so neither fabricates a comment change (first
+        // does NOT see the +2 through the degraded read either).
+        forge.edit(|s| s.fail_list_comments = true);
+        svc.poll_pr_monitors().await;
+        for id in [&first.monitor_id, &second.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert!(
+                !row.pending_changes.iter().any(|c| c.contains("comment")),
+                "no fabricated comment change on {}: {:?}",
+                id.0,
+                row.pending_changes
+            );
+        }
+
+        // Recovery diffs each monitor against ITS OWN kept count: the first
+        // sees the +2 it never observed, the sibling sees nothing.
+        forge.edit(|s| s.fail_list_comments = false);
+        svc.poll_pr_monitors().await;
+        let first_row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert!(
+            first_row
+                .pending_changes
+                .iter()
+                .any(|c| c.contains("+2 conversation comment")),
+            "first monitor catches up from its own baseline: {:?}",
+            first_row.pending_changes
+        );
+        let second_row = svc
+            .store()
+            .get_pr_monitor(&second.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            !second_row
+                .pending_changes
+                .iter()
+                .any(|c| c.contains("comment")),
+            "the sibling already had the comments in its baseline: {:?}",
+            second_row.pending_changes
+        );
     }
 
     #[tokio::test]
