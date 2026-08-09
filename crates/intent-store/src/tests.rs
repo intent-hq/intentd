@@ -415,6 +415,92 @@ async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
     ));
 }
 
+/// Regression (monorepo#1585): `update_workspace` — the full-row replace —
+/// routes `last_activity` through the same monotonic guard as
+/// `bump_workspace_last_activity`, so a get → mutate → write flow whose read
+/// predated a concurrent bump can no longer silently revert (or clear) the
+/// column. A newer candidate still advances it through the same write.
+#[tokio::test]
+async fn workspace_full_row_update_cannot_regress_last_activity() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut seed = sample_workspace(&id, "Clobber WS", false);
+    seed.last_activity = None;
+    store.insert_workspace(&seed).await.expect("insert");
+
+    // Stale snapshot read BEFORE a concurrent bump lands (the monorepo#1585
+    // interleaving: debounce bump vs. get → mutate → update_workspace).
+    let stale = store.get_workspace(&id).await.expect("stale read");
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump"));
+
+    // Full-row write off the stale snapshot (`last_activity: None`): every
+    // other column replaces, the bumped column holds.
+    let mut renamed = stale.clone();
+    renamed.title = "Renamed".to_string();
+    store
+        .update_workspace(&renamed)
+        .await
+        .expect("update stale");
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.title, "Renamed", "other columns still full-row replace");
+    assert_eq!(
+        got.last_activity.as_deref(),
+        Some("2026-01-01T00:00:00Z"),
+        "a None candidate must not clear the bumped column"
+    );
+
+    // An older candidate is declined, leaving the stored value intact.
+    let mut older = got.clone();
+    older.last_activity = Some("2020-01-01T00:00:00Z".to_string());
+    store.update_workspace(&older).await.expect("update older");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z"),
+        "a stale candidate must not walk last_activity backwards"
+    );
+
+    // A malformed candidate never writes.
+    let mut malformed = got.clone();
+    malformed.last_activity = Some("not-a-timestamp".to_string());
+    store
+        .update_workspace(&malformed)
+        .await
+        .expect("update malformed");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z")
+    );
+
+    // A newer candidate advances the column through the same write.
+    let mut newer = got.clone();
+    newer.last_activity = Some("2027-01-01T00:00:00Z".to_string());
+    store.update_workspace(&newer).await.expect("update newer");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2027-01-01T00:00:00Z")
+    );
+}
+
 #[tokio::test]
 async fn workspace_get_update_delete() {
     let tmp = TempDb::new();

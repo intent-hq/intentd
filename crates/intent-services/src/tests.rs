@@ -21081,6 +21081,113 @@ mod last_activity_events {
         );
     }
 
+    /// Regression (monorepo#1585): `workspace.update` persists the
+    /// `lastActivity` it derives for the response, so the stored column
+    /// matches what the caller was told — the cheap read paths that never
+    /// derive (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+    /// snapshot) and a daemon restart serve the same fresh value instead of
+    /// a stale one that waits on the next debounce.
+    #[tokio::test]
+    async fn update_workspace_persists_derived_last_activity() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // Seeded row: nothing stored yet.
+        assert!(h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("seed reload")
+            .last_activity
+            .is_none());
+
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        let derived = updated
+            .last_activity
+            .clone()
+            .expect("response carries derived lastActivity");
+
+        // The stored column matches the response (persisted, not just derived).
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity;
+        assert_eq!(
+            persisted.as_deref(),
+            Some(derived.as_str()),
+            "derived lastActivity must be persisted, not response-only"
+        );
+
+        // The lite list (seq-0 snapshot source) serves it without deriving.
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(derived.as_str()));
+    }
+
+    /// Regression (monorepo#1585): the full-row `update_workspace` store write
+    /// can no longer clobber a concurrently bumped `lastActivity`. The
+    /// monorepo#1585 interleaving — services read the row, a debounce bump
+    /// landed, the mutation wrote the stale snapshot back — now holds the
+    /// bumped value, because the store routes `last_activity` through the
+    /// monotonic guard instead of replacing it.
+    #[tokio::test]
+    async fn update_workspace_does_not_clobber_concurrent_bump() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // A bump lands (the debounce persist path).
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("bump"));
+
+        // A mutation flows through the get → mutate → full-row-write path.
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+
+        // The bumped value holds — neither the full-row write nor the
+        // post-derive persist walked it backwards.
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "update_workspace must not clobber a newer persisted lastActivity"
+        );
+    }
+
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]

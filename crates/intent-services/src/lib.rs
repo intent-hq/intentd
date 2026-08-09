@@ -11771,6 +11771,23 @@ impl WorkspaceApi for Services {
                 // without a follow-up `workspace.get`. Chief is skipped: its
                 // timestamps are pinned above.
                 this.derive_last_activity(&mut ws).await;
+                // Persist the derived value through the scoped, monotonic
+                // column write (monorepo#1585): without this the caller gets a
+                // fresh derived value while the stored column stays stale, so
+                // the cheap read paths that never derive (`list_workspaces_lite`,
+                // the `workspace.subscribe` seq-0 snapshot) — or a daemon
+                // restart — serve the old timestamp until the next debounce
+                // fires. Best-effort: a store failure only logs, the update
+                // itself already committed.
+                if let Some(derived) = ws.last_activity.as_deref() {
+                    if let Err(e) = store.bump_workspace_last_activity(&ws.id, derived).await {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "workspace.update: persisting derived lastActivity failed"
+                        );
+                    }
+                }
                 // Derive `activity` from live agent state (§9.9) so the mutation
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
