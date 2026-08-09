@@ -1459,6 +1459,100 @@ async fn host_provider_discovery_over_wss() {
         ),
         "claude-code npxPackage must be the pinned spec: {cc}"
     );
+    // The pi row carries the `pi` CLI verdict fields (monorepo#1662); only
+    // the pi row does. The verdict itself is host-dependent — assert the
+    // field shape, not the values.
+    let pi = providers
+        .iter()
+        .find(|p| p["id"] == "pi")
+        .expect("pi must be in the discovery payload");
+    assert!(pi["cliCommand"].is_string(), "{pi}");
+    assert!(pi["cliResolved"].is_boolean(), "{pi}");
+    assert!(pi["cliVersionOk"].is_boolean(), "{pi}");
+    assert_eq!(
+        pi["cliRequirement"],
+        intent_providers::PI_CLI_REQUIREMENT,
+        "{pi}"
+    );
+    for p in providers.iter().filter(|p| p["id"] != "pi") {
+        assert!(
+            p.get("cliCommand").is_none() && p.get("cliRequirement").is_none(),
+            "only the pi row carries CLI verdict fields: {p}"
+        );
+    }
+
+    drop(daemon);
+}
+
+/// WSS e2e for the pi CLI version gate on host.providerDiscovery
+/// (monorepo#1662): a daemon whose `PI_ACP_PI_COMMAND` points at a fake old
+/// `pi` must report the pi row uninstallable with an actionable reason and
+/// the found version, over the real wire.
+#[cfg(unix)]
+#[tokio::test]
+async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
+    let data_dir = temp_data_dir();
+
+    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    let fake_pi = data_dir.join("fake-pi");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake pi");
+    }
+
+    let fake_pi_str = fake_pi.to_str().unwrap();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("PI_ACP_PI_COMMAND", fake_pi_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
+    let pi = result["providers"]
+        .as_array()
+        .expect("providers array")
+        .iter()
+        .find(|p| p["id"] == "pi")
+        .expect("pi must be in the discovery payload")
+        .clone();
+
+    assert_eq!(pi["installed"], false, "old pi CLI must gate pi off: {pi}");
+    assert_eq!(pi["cliCommand"], fake_pi_str, "{pi}");
+    assert_eq!(pi["cliResolved"], true, "{pi}");
+    assert_eq!(pi["cliResolvedPath"], fake_pi_str, "{pi}");
+    assert_eq!(pi["cliVersion"], "0.79.0", "{pi}");
+    assert_eq!(pi["cliVersionOk"], false, "{pi}");
+    assert_eq!(
+        pi["cliRequirement"],
+        intent_providers::PI_CLI_REQUIREMENT,
+        "{pi}"
+    );
+    let reason = pi["unavailableReason"]
+        .as_str()
+        .expect("gated pi must carry unavailableReason");
+    assert!(reason.contains("0.79.0"), "{pi}");
+    assert!(
+        reason.contains(intent_providers::PI_CLI_REQUIREMENT),
+        "{pi}"
+    );
 
     drop(daemon);
 }

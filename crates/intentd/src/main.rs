@@ -3254,12 +3254,34 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code) never resolve a local binary; report
-        // npx availability instead (the auth probe would need a package
+        // npx-only providers (claude-code, pi) never resolve a local binary;
+        // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         if let Some(pkg) = provider.npx_only_package {
             match &provider.resolved_path {
-                Some(npx) => println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display()),
+                Some(npx) => {
+                    // pi additionally requires the `pi` CLI (which the pi-acp
+                    // adapter spawns) at PI_CLI_MIN_VERSION+ (monorepo#1662);
+                    // append its verdict to the doctor line.
+                    let pi_cli = if provider.id == "pi" {
+                        Some(report_pi_cli_verdict().await)
+                    } else {
+                        None
+                    };
+                    match pi_cli {
+                        Some((true, verdict)) => println!(
+                            "  [ok] {} via npx: {} -y {pkg}{verdict}",
+                            provider.id,
+                            npx.display()
+                        ),
+                        Some((false, verdict)) => {
+                            println!("  [--] {} unavailable{verdict}", provider.id)
+                        }
+                        None => {
+                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display())
+                        }
+                    }
+                }
                 None => println!(
                     "  [--] {} unavailable (npx not found — {} is required)",
                     provider.id,
@@ -3301,6 +3323,39 @@ async fn report_provider_availability(config: &Config) {
             .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Probe the `pi` CLI (the binary the pi-acp adapter spawns) and render the
+/// doctor verdict fragment (monorepo#1662): `(ok, fragment)` where `ok` is
+/// whether pi stays available. Missing/too-old CLI names
+/// `PI_CLI_REQUIREMENT` (like the Node requirement line for npx); an
+/// inconclusive probe is permissive with a warning fragment. The probe is
+/// blocking (subprocess, ≤3s), so it runs off the async runtime.
+async fn report_pi_cli_verdict() -> (bool, String) {
+    use intent_providers::PiCliGate;
+    let status = tokio::task::spawn_blocking(intent_services::pi_cli::probe_pi_cli)
+        .await
+        .expect("pi CLI probe task");
+    match &status.gate {
+        PiCliGate::Ok => {
+            let path = status
+                .resolved_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| status.command.clone());
+            let version = status.version_output.as_deref().unwrap_or("unknown");
+            (true, format!(" (pi CLI {version}: {path})"))
+        }
+        PiCliGate::Unknown => (
+            true,
+            " (pi CLI version unknown — probe inconclusive)".to_string(),
+        ),
+        gate => {
+            let reason = intent_providers::pi_gate_reason(gate)
+                .unwrap_or_else(|| intent_providers::PI_CLI_REQUIREMENT.to_string());
+            (false, format!(" ({reason})"))
+        }
     }
 }
 
