@@ -911,9 +911,9 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
 
     // The blocker request is still PENDING on the session (nothing retired
     // it), yet the workspace never surfaces it: the read path settles at
-    // `unread` (the completed turns' blue dot over the idle base) without
-    // ever serving needs_attention — or blocked (child/background blockers
-    // never count).
+    // `idle` — a background delegate's completed turn does not raise the
+    // turn-end blue dot (monorepo#1781) — without ever serving
+    // needs_attention — or blocked (child/background blockers never count).
     let got = wss_rpc(
         &mut rpc,
         "agent.getSession",
@@ -925,11 +925,15 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
         "the delegate's blocker request is still pending: {}",
         got["session"]["attentionRequestKind"]
     );
-    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
+    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
     let status = get_display_status(&mut rpc, &ws_id).await;
     assert_ne!(
         status, "blocked",
         "a delegated/background blocker never promotes the workspace"
+    );
+    assert_ne!(
+        status, "unread",
+        "a background delegate's turn end never raises the workspace blue dot"
     );
 }
 
