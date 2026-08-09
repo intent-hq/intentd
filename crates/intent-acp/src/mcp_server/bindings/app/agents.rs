@@ -530,6 +530,7 @@ mod tests {
             last_agent_response: None,
             last_user_message: None,
             last_message_role: None,
+            last_message_id: None,
             context_references: None,
             image_blocks: None,
             stop_reason: None,
