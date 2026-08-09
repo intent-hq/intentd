@@ -23,7 +23,7 @@
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -145,9 +145,10 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
 /// the `origin/HEAD` symref recorded at clone time, so a remote that changed
 /// its default branch would otherwise pin the cache to the obsolete one),
 /// then hard-reset that branch, sync every submodule work tree to its
-/// recorded gitlink, and drop untracked files so the work tree exactly
+/// recorded gitlink, drop untracked files so the work tree exactly
 /// mirrors the remote — a diverged, dirty, or polluted cache is clobbered,
-/// never merged. Every failure here is an anomaly the caller self-heals by
+/// never merged — and prune module git dirs the current `.gitmodules` no
+/// longer names. Every failure here is an anomaly the caller self-heals by
 /// re-cloning.
 fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     run_git(
@@ -224,6 +225,14 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
             CACHE_FETCH_TIMEOUT,
         )?;
     }
+    // Stale module git dirs: when upstream removes (or renames) a submodule,
+    // its `.git/modules/<name>` dir — created by an earlier clone/refresh —
+    // survives the reset and the cleans (which never enter `.git`) and would
+    // be byte-copied into every direct-hydrated checkout. Prune module dirs
+    // the current `.gitmodules` no longer names, after the cleans so the
+    // orphaned work tree's gitfile never dangles mid-refresh. An error here
+    // is a refresh anomaly like any other (the caller wipes and re-clones).
+    prune_stale_modules(cache_path)?;
     Ok(())
 }
 
@@ -364,6 +373,13 @@ pub fn provision_direct_checkout(
 /// resolution, so no config value references the cache and deleting the cache
 /// never breaks the checkout. Skipped entirely (no subprocess) when the
 /// checkout has no `.gitmodules`.
+///
+/// The copy is filtered to **live** modules only (the same liveness rule as
+/// the refresh prune, seeded from the checkout's `.gitmodules` with nested
+/// liveness read from the cache's populated work trees), so even a cache
+/// still carrying a dead module dir — e.g. one refreshed before pruning
+/// existed — never leaks it into the checkout. A liveness/copy failure
+/// follows the caller's existing degrade-with-warning path.
 fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Result<()> {
     if !crate::submodule::has_submodules(checkout_path) {
         return Ok(());
@@ -371,7 +387,13 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
     let src = cache_path.join(".git").join("modules");
     let dst = checkout_path.join(".git").join("modules");
     if src.is_dir() && !dst.exists() {
-        copy_dir_recursive(&src, &dst).map_err(|e| {
+        let copied = match collect_module_liveness(checkout_path, cache_path)? {
+            Some(live) => copy_modules_subdir(&src, &dst, Path::new(""), &live),
+            // A module name/path we cannot map conservatively: copy
+            // everything rather than risk dropping a live module.
+            None => copy_dir_recursive(&src, &dst),
+        };
+        copied.map_err(|e| {
             Error::Internal(format!(
                 "cannot copy submodule git dirs from the cache: {e}"
             ))
@@ -428,15 +450,207 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
-        } else if ty.is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &to)?;
-            #[cfg(not(unix))]
-            {
-                std::fs::copy(entry.path(), &to)?;
-            }
         } else {
-            std::fs::copy(entry.path(), &to)?;
+            copy_dir_entry(&entry, &ty, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy one non-directory dir entry (file or symlink) to `to`.
+fn copy_dir_entry(
+    entry: &std::fs::DirEntry,
+    ty: &std::fs::FileType,
+    to: &Path,
+) -> std::io::Result<()> {
+    if ty.is_symlink() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, to)?;
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(entry.path(), to)?;
+        }
+    } else {
+        std::fs::copy(entry.path(), to)?;
+    }
+    Ok(())
+}
+
+/// Live submodules at one `.git/modules` nesting level: each module's git
+/// dir path relative to that level's `modules/` dir (the `.gitmodules`
+/// module *name*, one directory component per `/`-separated segment) mapped
+/// to the liveness of the module's own nested `modules/` subtree. `None`
+/// marks a live module whose nesting is opaque — its work tree could not be
+/// read — so its subtree is kept (or copied) wholesale rather than guessed
+/// at.
+#[derive(Default)]
+struct ModuleLiveness {
+    modules: BTreeMap<PathBuf, Option<ModuleLiveness>>,
+}
+
+/// Read the live module set from `config_root/.gitmodules`, resolving each
+/// module's work tree against `worktrees_root` to recurse into nested
+/// submodules (during a refresh both roots are the cache work tree; during
+/// hydration the top-level `.gitmodules` is the checkout's but the nested
+/// work trees are the cache's — the only populated ones at copy time).
+///
+/// Returns `Ok(None)` when a module name or path cannot be mapped to a
+/// module dir safely (non-UTF-8, absolute, `..`, …): the caller must then
+/// treat the whole level as opaque and keep every dir — a kept dead dir is
+/// harmless, a wrongly-pruned live one is not. A missing `.gitmodules`
+/// yields an empty (all-dead) set; an unreadable one is an error.
+fn collect_module_liveness(
+    config_root: &Path,
+    worktrees_root: &Path,
+) -> Result<Option<ModuleLiveness>> {
+    let gitmodules = config_root.join(".gitmodules");
+    if !gitmodules.exists() {
+        return Ok(Some(ModuleLiveness::default()));
+    }
+    let cfg = git2::Config::open(&gitmodules).map_err(map_git_err)?;
+    let mut modules = BTreeMap::new();
+    let mut entries = cfg.entries(None).map_err(map_git_err)?;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(map_git_err)?;
+        let Ok(name) = entry.name() else {
+            return Ok(None);
+        };
+        let Some(module) = name
+            .strip_prefix("submodule.")
+            .and_then(|n| n.strip_suffix(".path"))
+        else {
+            continue;
+        };
+        let Ok(worktree_rel) = entry.value() else {
+            return Ok(None);
+        };
+        let (Some(module_dir), Some(worktree_rel)) =
+            (safe_rel_path(module), safe_rel_path(worktree_rel))
+        else {
+            return Ok(None);
+        };
+        let worktree = worktrees_root.join(worktree_rel);
+        let nested = if worktree.is_dir() {
+            collect_module_liveness(&worktree, &worktree)?
+        } else {
+            None
+        };
+        modules.insert(module_dir, nested);
+    }
+    Ok(Some(ModuleLiveness { modules }))
+}
+
+/// `s` as a relative path of plain (`Normal`) components only, or `None`
+/// when it is empty or carries anything (`..`, a root, a leading `./`) that
+/// could make it name something outside — or alias something inside — the
+/// modules dir.
+fn safe_rel_path(s: &str) -> Option<PathBuf> {
+    let p = Path::new(s);
+    p.components().next()?;
+    p.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+        .then(|| p.components().collect())
+}
+
+/// Prune dead module git dirs from the cache's `.git/modules` tree: every
+/// dir the current `.gitmodules` chain no longer names as a module (or an
+/// ancestor component of one) is removed. A liveness set that cannot be
+/// mapped safely keeps everything — never guess a live module away.
+fn prune_stale_modules(cache_path: &Path) -> Result<()> {
+    let modules_dir = cache_path.join(".git").join("modules");
+    if !modules_dir.is_dir() {
+        return Ok(());
+    }
+    match collect_module_liveness(cache_path, cache_path)? {
+        Some(live) => prune_modules_subdir(&modules_dir, Path::new(""), &live),
+        None => Ok(()),
+    }
+}
+
+/// Depth-first prune of one `modules/` level: a dir naming a live module is
+/// kept (recursing into its nested `modules/` subtree when its liveness is
+/// known), a dir that is an ancestor component of a live multi-segment
+/// module name is descended into, and anything else is a dead module's git
+/// dir — removed. Non-directory entries are left alone.
+fn prune_modules_subdir(fs_dir: &Path, rel: &Path, live: &ModuleLiveness) -> Result<()> {
+    let io_err =
+        |e: std::io::Error| Error::Internal(format!("cannot prune stale module dirs: {e}"));
+    for entry in std::fs::read_dir(fs_dir).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        if !entry.file_type().map_err(io_err)?.is_dir() {
+            continue;
+        }
+        let child_rel = rel.join(entry.file_name());
+        match live.modules.get(&child_rel) {
+            Some(Some(nested)) => {
+                let nested_modules = entry.path().join("modules");
+                if nested_modules.is_dir() {
+                    prune_modules_subdir(&nested_modules, Path::new(""), nested)?;
+                }
+            }
+            // Live but opaque nesting: keep the subtree wholesale.
+            Some(None) => {}
+            None => {
+                if live.modules.keys().any(|m| m.starts_with(&child_rel)) {
+                    prune_modules_subdir(&entry.path(), &child_rel, live)?;
+                } else {
+                    std::fs::remove_dir_all(entry.path()).map_err(io_err)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filtered counterpart of [`copy_dir_recursive`] for one `modules/` level:
+/// live module dirs are copied (their nested `modules/` subtree filtered in
+/// turn when its liveness is known), ancestor components of live
+/// multi-segment module names are descended into, dead module dirs are
+/// skipped. Non-directory entries copy as-is.
+fn copy_modules_subdir(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    live: &ModuleLiveness,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if !ty.is_dir() {
+            copy_dir_entry(&entry, &ty, &to)?;
+            continue;
+        }
+        let child_rel = rel.join(entry.file_name());
+        match live.modules.get(&child_rel) {
+            Some(Some(nested)) => copy_module_dir(&entry.path(), &to, nested)?,
+            Some(None) => copy_dir_recursive(&entry.path(), &to)?,
+            None => {
+                if live.modules.keys().any(|m| m.starts_with(&child_rel)) {
+                    copy_modules_subdir(&entry.path(), &to, &child_rel, live)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy one live module's git dir, filtering only its nested `modules/`
+/// subtree through `nested` — everything else (objects, refs, config, …)
+/// copies verbatim.
+fn copy_module_dir(src: &Path, dst: &Path, nested: &ModuleLiveness) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() && entry.file_name() == "modules" {
+            copy_modules_subdir(&entry.path(), &to, Path::new(""), nested)?;
+        } else if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            copy_dir_entry(&entry, &ty, &to)?;
         }
     }
     Ok(())
@@ -674,6 +888,46 @@ mod tests {
         index.remove_path(Path::new(".gitmodules")).unwrap();
         index.write().unwrap();
         commit_super_index(super_path, "remove submodule");
+    }
+
+    /// Remove ONE submodule at `sub_rel` (gitlink + its `.gitmodules` entry)
+    /// and commit, keeping every other submodule registered — how an
+    /// upstream deletes one of several submodules.
+    fn commit_one_submodule_removal(super_path: &Path, sub_rel: &str) {
+        let repo = Repository::open(super_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(sub_rel)).unwrap();
+        {
+            let mut cfg = git2::Config::open(&super_path.join(".gitmodules")).unwrap();
+            cfg.remove(&format!("submodule.{sub_rel}.path")).unwrap();
+            cfg.remove(&format!("submodule.{sub_rel}.url")).unwrap();
+        }
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        index.write().unwrap();
+        commit_super_index(super_path, "remove one submodule");
+    }
+
+    /// Fixture with a nested submodule chain: superproject → `sub` (child)
+    /// → `inner` (grandchild). Returns `(superproject, child, grandchild)`.
+    fn nested_submodule_fixture(tag: &str) -> (TempDir, TempDir, TempDir) {
+        let grandchild = init_repo(&format!("{tag}-grand"));
+        commit_file(grandchild.path(), "g.txt", "deep one\n");
+        let child = init_repo(&format!("{tag}-child"));
+        commit_file(child.path(), "c.txt", "sub one\n");
+        add_submodule(child.path(), grandchild.path(), "inner");
+        let superproject = init_repo(&format!("{tag}-super"));
+        commit_file(superproject.path(), "a.txt", "one\n");
+        add_submodule(superproject.path(), child.path(), "sub");
+        (superproject, child, grandchild)
+    }
+
+    /// Plant a fake (stale) module git dir with a file inside, as a removed
+    /// submodule's leftover would look.
+    fn plant_dead_module_dir(modules_dir: &Path, rel: &str) -> PathBuf {
+        let dir = modules_dir.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        dir
     }
 
     /// Self-cleaning scratch dir for a cache root (testutil's TempDir is tied
@@ -1547,5 +1801,155 @@ mod tests {
             !checkout.join("sub").join("c.txt").exists(),
             "submodule is left unpopulated"
         );
+    }
+
+    /// Upstream removes one of two submodules: the refresh prunes the dead
+    /// module's `.git/modules` dir from the cache while the surviving
+    /// module's dir stays intact and functional — no re-clone.
+    #[tokio::test]
+    async fn refresh_prunes_dead_module_dir_keeps_live_one() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-prune");
+        let doomed = init_repo("repocache-prune-doomed");
+        commit_file(doomed.path(), "d.txt", "doomed one\n");
+        add_submodule(origin.path(), doomed.path(), "doomedsub");
+        let root = CacheRoot::new("prune");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let modules = path.join(".git").join("modules");
+        assert!(modules.join("sub").is_dir());
+        assert!(modules.join("doomedsub").is_dir());
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        commit_one_submodule_removal(origin.path(), "doomedsub");
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "prune happens in-place, no re-clone");
+        assert!(
+            !modules.join("doomedsub").exists(),
+            "dead module git dir is pruned"
+        );
+        assert!(
+            modules.join("sub").is_dir(),
+            "live module git dir survives the prune"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "live submodule work tree still functional"
+        );
+        // A subsequent refresh with the pruned cache still succeeds in-place.
+        let path3 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        assert_eq!(path, path3);
+        assert!(marker.exists(), "pruned cache refreshes cleanly");
+    }
+
+    /// A live nested submodule's module dir (`.git/modules/sub/modules/inner`)
+    /// survives the prune, while a planted dead dir at both nesting levels is
+    /// removed.
+    #[tokio::test]
+    async fn refresh_prune_preserves_live_nested_module() {
+        allow_file_submodules();
+        let (origin, _child, grandchild) = nested_submodule_fixture("repocache-prunenest");
+        let root = CacheRoot::new("prunenest");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let modules = path.join(".git").join("modules");
+        let inner_module = modules.join("sub").join("modules").join("inner");
+        assert!(inner_module.is_dir(), "nested module dir exists");
+        let dead_top = plant_dead_module_dir(&modules, "deadtop");
+        let dead_nested = plant_dead_module_dir(&modules.join("sub").join("modules"), "deadinner");
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "prune happens in-place, no re-clone");
+        assert!(!dead_top.exists(), "dead top-level module dir is pruned");
+        assert!(!dead_nested.exists(), "dead nested module dir is pruned");
+        assert!(inner_module.is_dir(), "live nested module dir survives");
+        assert_eq!(
+            std::fs::read_to_string(path.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "nested submodule work tree still functional"
+        );
+        assert_eq!(
+            head_sha(&path.join("sub").join("inner")),
+            head_sha(grandchild.path())
+        );
+    }
+
+    /// Direct hydration from a cache still carrying dead module dirs (a cache
+    /// refreshed before pruning existed): the checkout's `.git/modules` gets
+    /// only the live modules, at both nesting levels, and the live ones stay
+    /// functional.
+    #[tokio::test]
+    async fn direct_checkout_filters_dead_module_dirs() {
+        allow_file_submodules();
+        let (origin, _child, grandchild) = nested_submodule_fixture("repocache-hydratefilter");
+        let root = CacheRoot::new("hydratefilter");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let cache_modules = cache.join(".git").join("modules");
+        plant_dead_module_dir(&cache_modules, "deadtop");
+        plant_dead_module_dir(&cache_modules.join("sub").join("modules"), "deadinner");
+
+        let checkout_root = CacheRoot::new("hydratefilter-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        let modules = checkout.join(".git").join("modules");
+        assert!(
+            !modules.join("deadtop").exists(),
+            "dead top-level module dir is not copied into the checkout"
+        );
+        assert!(
+            !modules
+                .join("sub")
+                .join("modules")
+                .join("deadinner")
+                .exists(),
+            "dead nested module dir is not copied into the checkout"
+        );
+        assert!(modules.join("sub").is_dir(), "live module dir is copied");
+        assert!(
+            modules.join("sub").join("modules").join("inner").is_dir(),
+            "live nested module dir is copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "live submodule work tree is populated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "live nested submodule work tree is populated"
+        );
+        assert_eq!(
+            head_sha(&checkout.join("sub").join("inner")),
+            head_sha(grandchild.path())
+        );
+        // The cache keeps its dead dirs — hydration filters, never mutates
+        // the cache.
+        assert!(cache_modules.join("deadtop").is_dir());
     }
 }
