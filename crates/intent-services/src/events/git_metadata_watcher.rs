@@ -292,10 +292,10 @@ impl GitCommonDirWatches {
         }
     }
 
-    /// Number of live shared common-dir watches — the dedup invariant under
-    /// test.
+    /// Number of live shared common-dir watches — the dedup/refcount
+    /// invariant under test (here and in the registry lifecycle tests).
     #[cfg(test)]
-    fn watch_count(&self) -> usize {
+    pub(super) fn watch_count(&self) -> usize {
         lock(&self.state).len()
     }
 }
