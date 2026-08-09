@@ -553,7 +553,10 @@ pub(crate) fn enhanced_path_dirs_with(
     }
 
     // 3. Enriched tool directories (node, nvm, homebrew, volta, asdf, etc.)
-    for dir in path_utils::enriched_tool_dirs() {
+    let enriched_dirs = home.map_or_else(path_utils::enriched_tool_dirs, |home| {
+        path_utils::enriched_tool_dirs_with_home(Some(home))
+    });
+    for dir in enriched_dirs {
         path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
 

@@ -443,6 +443,31 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));
 }
 
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_finds_non_default_nvm_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_temp_dir("nvm-multi-version-home");
+    let v20_bin = home.path().join(".nvm/versions/node/v20.19.0/bin");
+    let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+    std::fs::create_dir_all(&v20_bin).unwrap();
+    std::fs::create_dir_all(&v24_bin).unwrap();
+    std::fs::write(v20_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
+
+    let name = format!(
+        "intent-nvm-binary-{}",
+        home.path().file_name().unwrap().to_string_lossy()
+    );
+    let binary = v24_bin.join(&name);
+    std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let resolved = resolve_binary_path_with_home(&name, &[], home.path());
+
+    assert_eq!(resolved.as_deref(), Some(binary.as_path()));
+}
+
 /// `find_binary_op` caches a POSITIVE resolution: removing the resolved
 /// binary after the first call must not flip a second, cached call to
 /// unavailable within the TTL.
