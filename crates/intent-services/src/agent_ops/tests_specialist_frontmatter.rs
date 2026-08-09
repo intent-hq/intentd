@@ -182,14 +182,11 @@ async fn missing_frontmatter_falls_through_to_settings() {
     // Create a specialist WITHOUT a frontmatter model
     create_specialist_without_model(specialists_dir.path(), "test-specialist");
 
-    // Set a background default in settings (via the wired registry)
+    // Set a global default in settings (via the wired registry)
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[(
-            "backgroundAgents.defaultModel".to_string(),
-            json!("auggie:haiku"),
-        )])
-        .expect("set background");
+        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .expect("set default model");
 
     // Create agent with specialist but no explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("test-specialist".into())).await;
@@ -224,11 +221,8 @@ async fn retired_model_tier_falls_through_to_settings() {
 
     svc.settings_registry()
         .expect("registry wired")
-        .apply(&[(
-            "backgroundAgents.defaultModel".to_string(),
-            json!("auggie:haiku"),
-        )])
-        .expect("set background");
+        .apply(&[("model.default".to_string(), json!("auggie:haiku"))])
+        .expect("set default model");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("tiered".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
@@ -257,6 +251,97 @@ async fn retired_model_tier_ignored_on_delegate_path() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let got = svc.agent_get_op(child.clone(), None).await.expect("get");
     assert_eq!(got.model, None, "retired modelTier must not pin a model");
+}
+
+/// monorepo#1729 (issue repro): a delegated specialist with no frontmatter
+/// model resolves `model.providerDefaults`, NOT the quick-action default —
+/// the quick-action model settings never apply to a delegated session.
+#[tokio::test]
+async fn delegate_ignores_quick_action_default_model() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_without_model(specialists_dir.path(), "implementor-test");
+
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[
+            (
+                "model.providerDefaults".to_string(),
+                json!({ "auggie": "fable-5" }),
+            ),
+            (
+                "quickActions.defaultModel".to_string(),
+                json!("auggie:sonnet5-high"),
+            ),
+        ])
+        .expect("set provider default + quick-action default");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("implementor-test".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(child.clone(), None).await.expect("get");
+    assert_eq!(
+        got.model.as_deref(),
+        Some("fable-5"),
+        "delegated specialist must resolve the provider default, not the \
+         quick-action model"
+    );
+}
+
+/// monorepo#1729: a `quickActions.typeOverrides` entry keyed on the
+/// specialist id must not leak into delegation either — the specialist id is
+/// no longer an agent-type key for the settings chain.
+///
+/// Seeded through `model.providerDefaults` rather than `model.default`: a
+/// compound `model.default` makes `resolve_delegate_provider` derive that
+/// provider and assert it is installed, which no CI runner guarantees.
+#[tokio::test]
+async fn delegate_ignores_quick_action_type_override() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_without_model(specialists_dir.path(), "implementor-test");
+
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[
+            (
+                "model.providerDefaults".to_string(),
+                json!({ "auggie": "fable-5" }),
+            ),
+            (
+                "quickActions.typeOverrides".to_string(),
+                json!({ "implementor-test": "auggie:sonnet5-high" }),
+            ),
+        ])
+        .expect("set provider default + quick-action type override");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                specialist: Some("implementor-test".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let got = svc.agent_get_op(child.clone(), None).await.expect("get");
+    assert_eq!(
+        got.model.as_deref(),
+        Some("fable-5"),
+        "a quick-action type override keyed on the specialist id must not apply"
+    );
 }
 
 /// A specialist frontmatter model owned by another provider is ignored

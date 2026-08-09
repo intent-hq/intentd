@@ -147,46 +147,23 @@ mod tests_settings_default_effort;
 
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
-/// was removed in monorepo#1000):
-/// 1. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
-/// 2. `model.providerDefaults[resolved provider]`
-/// 3. `model.default`
-/// 4. None → CLI default (current behavior, last resort)
+/// was removed in monorepo#1000; the background-agent tier was removed in
+/// monorepo#1729 — the renamed `quickActions.*` keys scope to single-shot
+/// quick actions and never to agent sessions, delegated ones included):
+/// 1. `model.providerDefaults[resolved provider]`
+/// 2. `model.default`
+/// 3. None → CLI default (current behavior, last resort)
 ///
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
 fn resolve_default_model_from_settings(
     services: &Services,
-    is_background: bool,
-    agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. For background/delegated agents, check type-specific override, then default
-    if is_background {
-        // 1a. Check agent type override
-        if let Some(typ) = agent_type {
-            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
-                if !model.is_empty() {
-                    return Some(model.clone());
-                }
-            }
-        }
-
-        // 1b. Check background agents default
-        if let Some(model) = settings
-            .background_agents
-            .default_model
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            return Some(model.to_string());
-        }
-    }
-
-    // 2. Check provider defaults. With no explicit provider, key the lookup
+    // 1. Check provider defaults. With no explicit provider, key the lookup
     // by the settings-derived default (model.default prefix, else
     // providers.active), bottoming out at the first registered provider.
     let derived;
@@ -204,12 +181,12 @@ fn resolve_default_model_from_settings(
         }
     }
 
-    // 3. Check global default
+    // 2. Check global default
     if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
         return Some(model.to_string());
     }
 
-    // 4. None → CLI default (session.model stays None)
+    // 3. None → CLI default (session.model stays None)
     None
 }
 
@@ -243,29 +220,21 @@ pub(crate) enum DefaultModelSource {
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
-/// 3. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+/// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
 /// 4. `None` → provider CLI default (`session.model` stays unset).
 ///
-/// The `specialist` id doubles as the `agent_type` for the settings chain's
-/// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
-/// when `None`, that tier is skipped and the chain falls through to
-/// `backgroundAgents.defaultModel` / `model.default`.
+/// The chain is background-agnostic (monorepo#1729): the quick-action model
+/// settings apply to single-shot quick actions only, so a delegated
+/// specialist resolves the provider default exactly like an interactive
+/// session does.
 pub(crate) fn resolve_agent_default_model(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
     provider: Option<&str>,
-    is_background: bool,
 ) -> Option<String> {
-    resolve_agent_default_model_with_source(
-        services,
-        specialist,
-        workspace_path,
-        provider,
-        is_background,
-    )
-    .0
+    resolve_agent_default_model_with_source(services, specialist, workspace_path, provider).0
 }
 
 /// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
@@ -276,7 +245,6 @@ pub(crate) fn resolve_agent_default_model_with_source(
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
     provider: Option<&str>,
-    is_background: bool,
 ) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
@@ -317,9 +285,7 @@ pub(crate) fn resolve_agent_default_model_with_source(
     // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
-    let Some(m) =
-        resolve_default_model_from_settings(services, is_background, specialist, provider)
-    else {
+    let Some(m) = resolve_default_model_from_settings(services, provider) else {
         return (None, DefaultModelSource::CliDefault);
     };
     if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
@@ -401,7 +367,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   default-provider aliases persisted on old sessions (`default`/`acp`/
 ///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
 ///   spawn would actually run, not as the raw alias string.
-fn ensure_bare_model_matches_provider(
+pub(crate) fn ensure_bare_model_matches_provider(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogCache,
     provider_id: &str,
@@ -1778,13 +1744,20 @@ impl Services {
         // (`waitingOnHooks`, omitted when empty) from one workspace-wide
         // hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty) from one
+        // workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         Ok(sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
+                let waiting_on_pr_monitors =
+                    pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
+                lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
                 lite
             })
             .collect())
@@ -1824,8 +1797,17 @@ impl Services {
         // Idle-visibility: overlay the agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty).
         let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty).
+        let waiting_on_pr_monitors = self
+            .active_pr_monitors_for_agent(&agent_id)
+            .await
+            .iter()
+            .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
+            .collect();
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
+        lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
         Ok(lite)
     }
 
@@ -1921,6 +1903,10 @@ impl Services {
     ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
     /// - `isWaitingForOtherAgents` — the agent parents one or more pending
     ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    ///   `report_delivered` watches are excluded via the shared
+    ///   [`Services::waiting_watches_for_parent`] filter (issue
+    ///   intent-hq/monorepo#1649), so the projection agrees with the
+    ///   settlement predicate ([`Services::agent_is_waiting_on_agents`]).
     /// - `waitingForAgentIds` — the distinct `child_agent_id`s of those pending
     ///   watches, in registration order. Always returned (defaults to empty);
     ///   non-empty iff `isWaitingForOtherAgents` is `true`, so clients can render
@@ -1942,7 +1928,7 @@ impl Services {
         }
         let is_responding = self.agent_is_busy(session.id.clone());
         let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
-        let watches = self.list_watches_for_parent(&session.id);
+        let watches = self.waiting_watches_for_parent(&session.id);
         // Distinct child ids in registration order — a parent can register
         // multiple watches against the same child (e.g. successive `immediate`
         // delegates), but the FE only wants each waiting-on agent once.
@@ -2166,7 +2152,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
     ) {
-        let watches = self.list_watches_for_parent(parent_agent_id);
+        let watches = self.waiting_watches_for_parent(parent_agent_id);
         let mut waiting: Vec<AgentId> = Vec::with_capacity(watches.len());
         for w in &watches {
             if !waiting.contains(&w.child_agent_id) {
@@ -2360,7 +2346,6 @@ impl Services {
                 specialist.as_deref(),
                 spec_wp.as_deref(),
                 provider.as_deref(),
-                is_background,
             ),
         };
 
@@ -4757,11 +4742,20 @@ impl Services {
             // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
             // completion wake and should not receive the report wake.
             let watches = self.find_watches_for_child(&caller);
+            let mut marked = false;
             for watch in watches
                 .iter()
                 .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
             {
-                self.mark_watch_report_delivered(&watch.id);
+                marked |= self.mark_watch_report_delivered(&watch.id);
+            }
+            // Marking flips the parent's waiting projection (report_delivered
+            // watches are excluded), so publish the refreshed flags in the
+            // parent's HOME workspace — the watch anchor — to keep connected
+            // clients from serving a stale `isWaitingForOtherAgents: true`.
+            if marked {
+                self.publish_subscriptions_changed(&parent_home_ws, &parent)
+                    .await;
             }
         }
 
@@ -5374,8 +5368,6 @@ impl Services {
                 input.specialist.as_deref(),
                 workspace_path.as_deref(),
                 delegate_provider.as_deref(),
-                // Delegated children are always background agents.
-                true,
             )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
@@ -6698,7 +6690,6 @@ impl Services {
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
         let session_by_id: std::collections::HashMap<String, &AgentSession> =
             sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
-        let watch_ids: HashSet<String> = watches.iter().map(|w| w.id.clone()).collect();
 
         let mut matching: HashSet<String> = HashSet::new();
         for s in &sessions {
@@ -6802,6 +6793,21 @@ impl Services {
         }
 
         // delegationGroups, filtered to scope.
+        // The group-level `subscription_id` is a TS-parity legacy field the
+        // daemon never populates; the real linkage is the per-child grouped
+        // completion watches (each carries its group's id). Index them once
+        // (group id → [(child id, watch id)]) so the per-group derivation
+        // below stays O(rows returned) rather than rescanning the watch
+        // table per group and per pending child (monorepo#1694).
+        let mut group_watches: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for w in &watches {
+            if let Some(gid) = w.group_id.as_deref() {
+                group_watches
+                    .entry(gid)
+                    .or_default()
+                    .push((w.child_agent_id.0.as_str(), w.id.as_str()));
+            }
+        }
         let delegation_groups: Vec<Value> = groups
             .iter()
             .filter(|g| {
@@ -6829,10 +6835,20 @@ impl Services {
                     && g.expected_agent_ids.iter().all(|id| {
                         g.completed_agent_ids.contains(id) || g.deleted_agent_ids.contains(id)
                     });
-                let subscription_missing = match &g.subscription_id {
-                    Some(sid) => !watch_ids.contains(sid),
-                    None => true,
-                };
+                // Derive linkage from the grouped-watch index (monorepo#1694):
+                // linkage is missing only when some still-pending child has
+                // no grouped watch observing it.
+                let watches_for_group = group_watches
+                    .get(g.group_id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let subscription_ids: Vec<&str> =
+                    watches_for_group.iter().map(|(_, wid)| *wid).collect();
+                let subscription_missing = pending.iter().any(|id| {
+                    !watches_for_group
+                        .iter()
+                        .any(|(child, _)| *child == id.as_str())
+                });
                 json!({
                     "groupId": g.group_id,
                     "parentAgentId": g.parent_agent_id,
@@ -6841,7 +6857,7 @@ impl Services {
                     "completedAgentIds": g.completed_agent_ids,
                     "deletedAgentIds": g.deleted_agent_ids,
                     "pendingAgentIds": pending,
-                    "subscriptionId": g.subscription_id.clone().unwrap_or_default(),
+                    "subscriptionIds": subscription_ids,
                     "subscriptionMissing": subscription_missing,
                     "delivered": g.delivered,
                     "complete": complete,
@@ -6855,6 +6871,10 @@ impl Services {
         // Idle-visibility: per-agent active-hook metadata (`waitingOnHooks`,
         // omitted when empty) from one workspace-wide hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): per-agent active PR
+        // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
+        // one workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -6922,6 +6942,11 @@ impl Services {
             if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
                 if !hooks.is_empty() {
                     row.insert("waitingOnHooks".into(), Value::Array(hooks));
+                }
+            }
+            if let Some(monitors) = pr_monitors_by_agent.remove(id.as_str()) {
+                if !monitors.is_empty() {
+                    row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
             }
             agent_rows.push(Value::Object(row));
@@ -7016,9 +7041,28 @@ impl Services {
             let delivered = g["delivered"].as_bool() == Some(true);
             if !complete && !delivered {
                 let gid = g["groupId"].as_str().unwrap_or_default();
-                let pending = g["pendingAgentIds"].as_array().map_or(0, Vec::len);
+                let pending_ids: Vec<&str> = g["pendingAgentIds"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let pending = pending_ids.len();
+                // Severity ladder (monorepo#1694): missing subscription
+                // linkage means the group can never observe a pending
+                // child's completion — critical. Otherwise a group whose
+                // pending children are all actively responding (non-stale)
+                // is normal in-progress fan-in — informational; anything
+                // else (idle/stale/missing pending child) is worth a look.
+                let all_pending_active = !pending_ids.is_empty()
+                    && pending_ids.iter().all(|id| {
+                        session_by_id.get(*id).is_some_and(|s| {
+                            agent_status_wire(s.status) == Some("responding")
+                                && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                        })
+                    });
                 let severity = if g["subscriptionMissing"].as_bool() == Some(true) {
                     "critical"
+                } else if all_pending_active {
+                    "info"
                 } else {
                     "warning"
                 };
@@ -7586,21 +7630,13 @@ impl Services {
         // Same effective-model rule as `agent.delegate`: fall through to the
         // full default-model resolution (specialist pin, then the settings
         // chain) so a `modelOptions` entry keyed on the settings default
-        // model is still matched. `is_background` mirrors what
-        // `build_create_metadata` will persist (default `true`).
+        // model is still matched.
         let effort_model = model.clone().or_else(|| {
-            let is_background = create_opts
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("isBackground"))
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
             resolve_agent_default_model(
                 self,
                 specialist.as_deref(),
                 workspace_path.as_deref(),
                 provider.as_deref(),
-                is_background,
             )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(

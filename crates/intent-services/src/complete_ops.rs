@@ -39,6 +39,85 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
     json!({ "available": false, "reason": reason.to_string() })
 }
 
+/// Resolve the quick-action model for a one-shot completion the caller sent no
+/// `model` for (monorepo#1734): `quickActions.typeOverrides[type]`, then
+/// `quickActions.defaultModel`, then `None` — the provider CLI default.
+/// `quick_action_type` is the caller's optional `type` hint (`commit`, `pr`,
+/// `review`, `fast`); the override map is FE-owned, so an unknown key simply
+/// misses and falls through to the default.
+///
+/// `quickActions.providerSettings` is deliberately NOT a rung: it is the FE's
+/// opaque per-provider snapshot cache (restored into the two keys above on a
+/// provider switch), not an additional precedence tier.
+///
+/// The result is provider-guarded and returned BARE — the settings value is
+/// user-authored and easily outlives a provider switch, so the CLI must never
+/// be fed a foreign model id. A compound `{provider}:{model}` id is dropped
+/// with a warn log unless its prefix names the effective provider, and the
+/// prefix is stripped from an owned one because the one-shot launch takes a
+/// raw model id. A value whose prefix is not a registered provider id
+/// (including a malformed `:model`) counts as foreign and is dropped too —
+/// `derived_default_provider`'s `contains(':')` convention already reserves the
+/// colon for compound ids. A bare id reuses `agent.create`'s asymmetric
+/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): it is
+/// dropped only when the effective provider's own cached catalog affirmatively
+/// disproves ownership, so a cold start still passes it through.
+///
+/// Every drop falls to the next rung rather than erroring: a `-32602` here
+/// would reject a model the caller never sent.
+///
+/// This chain is scoped to one-shot quick actions only — agent sessions,
+/// delegated ones included, keep the background-agnostic creation-time chain
+/// (monorepo#1729).
+fn resolve_quick_action_model(
+    settings: &intent_core::settings_file::SettingsFile,
+    catalog: &crate::model_catalog::ModelCatalogCache,
+    quick_action_type: Option<&str>,
+    effective_provider: &str,
+) -> Option<String> {
+    let quick = &settings.quick_actions;
+    let configured = quick_action_type
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| quick.type_overrides.get(t))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            quick
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+        })?;
+
+    let owned_bare = if configured.contains(':') {
+        let (prefix, bare) = intent_providers::parse_compound_model_id(configured);
+        (intent_providers::find_provider(&prefix).map(|p| p.id) == Some(effective_provider)
+            && !bare.is_empty())
+        .then_some(bare)
+    } else {
+        crate::agent_ops::ensure_bare_model_matches_provider(
+            "agent.completeOnce",
+            catalog,
+            effective_provider,
+            configured,
+        )
+        .ok()
+        .map(|()| configured.to_string())
+    };
+
+    if owned_bare.is_none() {
+        tracing::warn!(
+            model = configured,
+            provider = effective_provider,
+            "configured quick-action model does not belong to the effective \
+             provider; falling back to the CLI default"
+        );
+    }
+    owned_bare
+}
+
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
 /// precedent (`provider_models`): an `npx_only_package` provider always runs
 /// the pinned package via `npx -y`, otherwise the `resolved_bin` wins with the
@@ -111,16 +190,23 @@ impl Services {
     /// registered provider would always be auggie and functionally reinstate
     /// the removed hardcoded default (matches FE #759, where unset resolves
     /// disabled).
+    ///
+    /// With no explicit `model`, the daemon resolves the user's quick-action
+    /// settings itself ([`resolve_quick_action_model`], monorepo#1734) so any
+    /// client — not just the FE — gets `quickActions.typeOverrides[type]` /
+    /// `quickActions.defaultModel` for free; `quick_action_type` is the
+    /// caller's optional `type` hint keying the override map.
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
         system_prompt: Option<String>,
         model: Option<String>,
+        quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
-        let effective_provider =
-            crate::agent_session::derived_default_provider(&self.effective_settings());
+        let settings = self.effective_settings();
+        let effective_provider = crate::agent_session::derived_default_provider(&settings);
         let effective_provider = match effective_provider.as_deref() {
             Some(p) => p.to_string(),
             None => {
@@ -128,6 +214,18 @@ impl Services {
                     "completeOnce requires a decidable effective default provider",
                 ))
             }
+        };
+
+        // An explicit client model always wins; only a caller that sent none
+        // falls through to the quick-action settings chain.
+        let model = match model.filter(|m| !m.trim().is_empty()) {
+            Some(m) => Some(m),
+            None => resolve_quick_action_model(
+                &settings,
+                &self.models_catalog,
+                quick_action_type.as_deref(),
+                &effective_provider,
+            ),
         };
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
@@ -169,7 +267,6 @@ impl Services {
             None => {
                 // Check context.auggiePath first; when set and non-empty, use it
                 // EXCLUSIVELY (fail hard if invalid rather than falling through).
-                let settings = self.effective_settings();
                 match settings
                     .context
                     .auggie_path
@@ -354,7 +451,7 @@ mod tests {
         let (_tmp, services) =
             services_with_bin(PathBuf::from("/nonexistent/intentd-test/auggie")).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
@@ -373,7 +470,7 @@ mod tests {
         let services =
             Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -467,7 +564,7 @@ rl.on('line', (line) => {{
         ])
         .await;
         let v = services
-            .agent_complete_once_op("make a slug".into(), None, None, None, None)
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -483,7 +580,7 @@ rl.on('line', (line) => {{
         let (_tmp, services) =
             services_with_settings(&[("providers.active", serde_json::json!("opencode"))]).await;
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -508,7 +605,7 @@ rl.on('line', (line) => {{
             services_with_settings(&[("providers.active", serde_json::json!("claude-code"))]).await;
         let services = services.with_one_shot_npx(None);
         let v = services
-            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -573,7 +670,7 @@ rl.on('line', (line) => {
         ])
         .await;
         let v = services
-            .agent_complete_once_op("echo home".into(), None, None, None, None)
+            .agent_complete_once_op("echo home".into(), None, None, None, None, None)
             .await
             .unwrap();
         let child_home = v["text"].as_str().expect("adapter echoed CODEX_HOME");
@@ -630,7 +727,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("ok", "printf '🤖\\nslug-goes-here\\n'");
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
-            .agent_complete_once_op("make a slug".into(), None, None, None, None)
+            .agent_complete_once_op("make a slug".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(v["text"], "slug-goes-here");
@@ -642,7 +739,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("slow", "sleep 30");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, Some(200))
+            .agent_complete_once_op("hi".into(), None, None, None, None, Some(200))
             .await
             .unwrap_err();
         assert!(
@@ -657,7 +754,7 @@ rl.on('line', (line) => {
         let (_bin_dir, bin) = fake_auggie("fail", "exit 3");
         let (_tmp, services) = services_with_bin(bin).await;
         let err = services
-            .agent_complete_once_op("hi".into(), None, None, None, None)
+            .agent_complete_once_op("hi".into(), None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -694,7 +791,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let result = services
-            .agent_complete_once_op("test".into(), None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(result["text"], "from-setting");
@@ -708,7 +805,7 @@ rl.on('line', (line) => {
             .expect("set setting");
         let services = Services::new(store.clone()).with_settings_registry(registry.clone());
         let err = services
-            .agent_complete_once_op("test".into(), None, None, None, None)
+            .agent_complete_once_op("test".into(), None, None, None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -728,6 +825,7 @@ rl.on('line', (line) => {
         let err = services
             .agent_complete_once_op(
                 "hi".into(),
+                None,
                 None,
                 None,
                 Some(WorkspaceId::from("ws-missing")),
@@ -750,9 +848,242 @@ rl.on('line', (line) => {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (_tmp, services) = services_with_bin(bin).await;
         let v = services
-            .agent_complete_once_op("why?".into(), Some("be terse".into()), None, None, None)
+            .agent_complete_once_op(
+                "why?".into(),
+                Some("be terse".into()),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(v["text"], "System: be terse\n\nwhy?");
+    }
+
+    /// A `SettingsFile` carrying only the quick-action model keys.
+    fn quick_action_settings(
+        default_model: Option<&str>,
+        type_overrides: &[(&str, &str)],
+    ) -> intent_core::settings_file::SettingsFile {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.quick_actions.default_model = default_model.map(str::to_string);
+        settings.quick_actions.type_overrides = type_overrides
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        settings
+    }
+
+    /// Empty catalog cache: no cached entry for any provider, so bare ids pass
+    /// the asymmetric evidence guard (absence of evidence is not a mismatch).
+    fn empty_catalog() -> crate::model_catalog::ModelCatalogCache {
+        crate::model_catalog::ModelCatalogCache::new(None)
+    }
+
+    #[test]
+    fn quick_action_model_precedence() {
+        // typeOverrides[type] outranks defaultModel; an absent/blank override
+        // (and an unknown type key) falls through to the default; nothing
+        // configured resolves to the CLI default.
+        let catalog = empty_catalog();
+        let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
+            Some("haiku4.5".to_string())
+        );
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("pr"), "auggie"),
+            Some("sonnet4.5".to_string())
+        );
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), "auggie"),
+            Some("sonnet4.5".to_string())
+        );
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            Some("sonnet4.5".to_string())
+        );
+
+        let blank = quick_action_settings(Some("  "), &[("commit", "")]);
+        assert_eq!(
+            resolve_quick_action_model(&blank, &catalog, Some("commit"), "auggie"),
+            None,
+            "blank values read as unset, not as an empty model id"
+        );
+        assert_eq!(
+            resolve_quick_action_model(
+                &intent_core::settings_file::SettingsFile::default(),
+                &catalog,
+                Some("commit"),
+                "auggie"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn quick_action_model_is_provider_guarded_and_returned_bare() {
+        // An owned compound id loses its `{provider}:` prefix — the one-shot
+        // launch takes a raw model id — and one owned by another provider is
+        // dropped rather than fed to the resolved provider's CLI. A prefix
+        // that is not a registered provider id (including a malformed
+        // `:model`) counts as foreign: the colon is reserved for compound ids.
+        let catalog = empty_catalog();
+        let owned = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
+            Some("sonnet4.5".to_string())
+        );
+        let foreign = quick_action_settings(Some("codex:gpt-5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
+            None
+        );
+        for malformed in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
+            let settings = quick_action_settings(Some(malformed), &[]);
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+                None,
+                "{malformed} must fall through to the CLI default"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_action_bare_model_is_dropped_only_on_disproven_ownership() {
+        // Bare ids reuse agent.create's asymmetric evidence rule: with no
+        // cached catalog for the effective provider the id passes, and it is
+        // dropped only when that provider's own catalog disproves ownership
+        // while another provider claims it.
+        let settings = quick_action_settings(Some("grok-4"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &empty_catalog(), None, "auggie"),
+            Some("grok-4".to_string()),
+            "no cached evidence must not drop a bare id"
+        );
+
+        // auggie and grok are both version-pin-free, so a "" version key
+        // makes each entry current evidence.
+        let catalog = empty_catalog();
+        catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "sonnet4.5", "provider": "auggie" })],
+        );
+        catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
+        );
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            None,
+            "a bare id the effective provider's catalog disproves is dropped"
+        );
+        let owned = quick_action_settings(Some("sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
+            Some("sonnet4.5".to_string())
+        );
+    }
+
+    /// Fake auggie echoing its own argv so a test can assert the resolved
+    /// `--model` reached the CLI.
+    #[cfg(unix)]
+    fn fake_auggie_echoing_args(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        fake_auggie(tag, "printf '🤖\\n%s\\n' \"$*\"")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_applies_quick_action_settings_when_model_omitted() {
+        // monorepo#1734: with no explicit `model`, the daemon resolves the
+        // user's quick-action settings itself — the `type` override first,
+        // then the default — so any client gets the setting for free.
+        let (_bin_dir, bin) = fake_auggie_echoing_args("quick-actions");
+        let (tmp, services) = services_with_bin(bin).await;
+        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            .expect("load registry");
+        registry
+            .apply(&[
+                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "quickActions.defaultModel".to_string(),
+                    serde_json::json!("sonnet4.5"),
+                ),
+                (
+                    "quickActions.typeOverrides".to_string(),
+                    serde_json::json!({ "commit": "haiku4.5" }),
+                ),
+            ])
+            .expect("apply quick-action settings");
+        let services = services.with_settings_registry(std::sync::Arc::new(registry));
+
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .await
+            .unwrap();
+        assert!(
+            v["text"].as_str().unwrap().contains("--model haiku4.5"),
+            "the commit override must reach the CLI, got {v:?}"
+        );
+
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, Some("pr".into()), None, None)
+            .await
+            .unwrap();
+        assert!(
+            v["text"].as_str().unwrap().contains("--model sonnet4.5"),
+            "an unset override falls through to the quick-action default, got {v:?}"
+        );
+
+        // An explicit client model always wins over the settings chain.
+        let v = services
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                Some("opus4.7".into()),
+                Some("commit".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            v["text"].as_str().unwrap().contains("--model opus4.7"),
+            "an explicit model outranks quickActions.*, got {v:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_ignores_quick_action_provider_settings() {
+        // `quickActions.providerSettings` is the FE's opaque per-provider
+        // snapshot cache, not a precedence rung: with it as the only
+        // quick-action key set, the CLI still runs with no `--model`.
+        let (_bin_dir, bin) = fake_auggie_echoing_args("provider-settings");
+        let (tmp, services) = services_with_bin(bin).await;
+        let registry = crate::SettingsRegistry::load(tmp._dir.path().join("config.toml"))
+            .expect("load registry");
+        registry
+            .apply(&[
+                ("providers.active".to_string(), serde_json::json!("auggie")),
+                (
+                    "quickActions.providerSettings".to_string(),
+                    serde_json::json!({ "auggie": { "defaultModel": "from-provider-settings" } }),
+                ),
+            ])
+            .expect("apply quick-action settings");
+        let services = services.with_settings_registry(std::sync::Arc::new(registry));
+
+        let v = services
+            .agent_complete_once_op("hi".into(), None, None, Some("commit".into()), None, None)
+            .await
+            .unwrap();
+        assert!(
+            !v["text"].as_str().unwrap().contains("--model"),
+            "providerSettings must not resolve a model, got {v:?}"
+        );
     }
 }

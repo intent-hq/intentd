@@ -396,12 +396,15 @@ impl Services {
             &intent_core::settings_file::AgentFeaturesSettings::default(),
         );
 
-        // Call agent_complete_once_op.
+        // Call agent_complete_once_op. With no explicit model, the `commit`
+        // quick-action type lets the op apply the user's
+        // `quickActions.typeOverrides["commit"]` (monorepo#1734).
         let result = self
             .agent_complete_once_op(
                 prompt,
                 Some(system_prompt),
                 None,
+                Some("commit".to_string()),
                 Some(session.workspace_id.clone()),
                 Some(self.auto_commit_timeout_ms.unwrap_or(GENERATION_TIMEOUT_MS)),
             )

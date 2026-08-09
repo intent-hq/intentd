@@ -40,6 +40,7 @@ use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
+use crate::rpc_limit::RpcLimiter;
 use crate::tls::TlsCertificate;
 
 /// Maximum bytes accepted for an HTTP request head before `\r\n\r\n`.
@@ -62,6 +63,11 @@ pub struct WsOptions {
     pub locality_override: Option<bool>,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
+    /// Daemon-wide cap on outstanding slow-path RPCs
+    /// (`server.maxOutstandingRpcs`). The composition root builds ONE limiter
+    /// and hands the same clone to every listener, so the cap spans UDS + WSS;
+    /// the default is unlimited for standalone / test wiring.
+    pub rpc_limiter: RpcLimiter,
 }
 
 impl Default for WsOptions {
@@ -74,6 +80,7 @@ impl Default for WsOptions {
             locality_override: None,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
+            rpc_limiter: RpcLimiter::unlimited(),
         }
     }
 }
@@ -138,6 +145,10 @@ pub(crate) struct WsInner {
     /// loop. Shared with the UDS listener; `None` in test harnesses that don't
     /// wire a daemon control surface.
     pub control: Option<Arc<dyn crate::control::SystemControl>>,
+    /// Daemon-wide outstanding-slow-path-RPC cap shared with the UDS listener
+    /// (`server.maxOutstandingRpcs`); unlimited unless the composition root
+    /// wires one through [`WsOptions::rpc_limiter`].
+    pub rpc_limiter: RpcLimiter,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -182,6 +193,7 @@ impl WsApiServer {
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
+            rpc_limiter: options.rpc_limiter,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -218,6 +230,7 @@ impl WsApiServer {
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
             control,
+            rpc_limiter: options.rpc_limiter,
         };
         Self {
             inner: Arc::new(inner),
@@ -571,7 +584,7 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2).
                         let frame_ok = crate::context::with_connection_context(true, async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local, &self.rpc_limiter).await
                         }).await;
                         if !frame_ok {
                             break;

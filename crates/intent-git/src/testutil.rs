@@ -92,3 +92,90 @@ pub fn write_blob(worktree: &Path, bytes: &[u8]) -> String {
     let repo = Repository::open(worktree).unwrap();
     repo.blob(bytes).unwrap().to_string()
 }
+
+/// Commit the superproject's current index with `msg` (HEAD advances).
+pub fn commit_super_index(super_path: &Path, msg: &str) {
+    let repo = Repository::open(super_path).unwrap();
+    let mut index = repo.index().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = Signature::now("Test", "test@example.com").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&parent])
+        .unwrap();
+}
+
+/// Point the gitlink at `sub_rel` to `sha` and commit — how an upstream
+/// bumps a submodule pin (the gitlink target need not exist in the
+/// superproject's odb, exactly like the real thing).
+pub fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
+    let repo = Repository::open(super_path).unwrap();
+    let mut index = repo.index().unwrap();
+    let entry = git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: 0o160000,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id: git2::Oid::from_str(sha).unwrap(),
+        flags: 0,
+        flags_extended: 0,
+        path: sub_rel.as_bytes().to_vec(),
+    };
+    index.add(&entry).unwrap();
+    index.write().unwrap();
+    commit_super_index(super_path, "bump gitlink");
+}
+
+/// Allow local-path/`file://` submodule clones for this test process:
+/// git ≥ 2.38 blocks the `file` transport for *submodule* operations by
+/// default (CVE-2022-39253), which would fail a recursive clone /
+/// `submodule update --init` of local fixtures. Production caches GitHub
+/// repos over https and never hits this override.
+pub fn allow_file_submodules() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'");
+    });
+}
+
+/// Register `child_worktree` (an existing repo with at least one commit) as a
+/// submodule of `worktree` at the worktree-relative path `sub_rel`, then
+/// commit the resulting gitlink + `.gitmodules` — a real submodule fixture
+/// for testing the gitlink guard. `worktree` must already have a commit
+/// (parent commit for the gitlink-add commit).
+pub fn add_submodule(worktree: &Path, child_worktree: &Path, sub_rel: &str) {
+    let repo = Repository::open(worktree).unwrap();
+    let url = child_worktree.to_string_lossy().to_string();
+    let sub_path = worktree.join(sub_rel);
+    // `submodule()` (git_submodule_add_setup) creates the target directory;
+    // remove it so the local clone below can populate a clean directory.
+    let mut sm = repo.submodule(&url, Path::new(sub_rel), true).unwrap();
+    let _ = std::fs::remove_dir_all(&sub_path);
+    Repository::clone(&url, &sub_path).unwrap();
+    sm.add_to_index(true).unwrap();
+    sm.add_finalize().unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = Signature::now("Test", "test@example.com").unwrap();
+    let parents = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => vec![repo.find_commit(oid).unwrap()],
+        None => Vec::new(),
+    };
+    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "add submodule",
+        &tree,
+        &parent_refs,
+    )
+    .unwrap();
+}

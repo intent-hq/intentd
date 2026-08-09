@@ -1,10 +1,12 @@
 //! Regression tests for STAB-115: settings-based default model resolution.
 //!
 //! Covers Bug B: model resolution precedence at creation time:
-//! - background type override > background default > provider defaults > global default
+//! - provider defaults > global default
 //!
 //! (The per-workspace override tier was removed in monorepo#1000; a stale
-//! `model.workspaceOverrides` SQLite row must be ignored.)
+//! `model.workspaceOverrides` SQLite row must be ignored. The background-agent
+//! tier was removed in monorepo#1729 — the renamed `quickActions.*` keys scope
+//! to single-shot quick actions and never to agent sessions.)
 //!
 //! Bug A (agent.setModel respawn) is covered by the WSS e2e test in
 //! `crates/intentd/tests/e2e_wss_agent_set_model.rs`, which exercises the full
@@ -108,15 +110,17 @@ async fn agent_create_ignores_stale_workspace_override_row() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
-/// Bug B: Background agents check backgroundAgents.defaultModel before global default.
+/// monorepo#1729: the quick-action default is scoped to single-shot quick
+/// actions and must never pin a background agent's model — the global default
+/// wins.
 #[tokio::test]
-async fn agent_create_background_agent_uses_background_default() {
+async fn agent_create_background_agent_ignores_quick_action_default() {
     let (_t, svc, ws, _cfg) = setup().await;
 
-    // Set both global default and background default
+    // Set both global default and quick-action default
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
-    set(&svc, "backgroundAgents.defaultModel", json!("auggie:haiku"));
+    set(&svc, "quickActions.defaultModel", json!("auggie:haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -138,9 +142,9 @@ async fn agent_create_background_agent_uses_background_default() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    // Verify the background default won
+    // Verify the global default won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
 /// Bug B: Explicit model at creation time overrides all settings.
@@ -210,16 +214,18 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
     assert_eq!(got.model.as_deref(), Some("kimi-k3"));
 }
 
-/// STAB-117 extension: background default beats providerDefaults.
+/// monorepo#1729 (issue repro): with a quick-action default set, a background
+/// agent still resolves `model.providerDefaults` — the quick-action model
+/// never sits above the provider default for a session.
 #[tokio::test]
-async fn agent_create_background_default_beats_provider_defaults() {
+async fn agent_create_background_resolves_provider_defaults_over_quick_action() {
     let (_t, svc, ws, _cfg) = setup().await;
 
-    // Set both providerDefaults and background default
+    // Set both providerDefaults and quick-action default
     let provider_defaults = json!({ "auggie": "fable-5" });
     set(&svc, "model.providerDefaults", provider_defaults);
 
-    set(&svc, "backgroundAgents.defaultModel", json!("auggie:haiku"));
+    set(&svc, "quickActions.defaultModel", json!("auggie:haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -241,9 +247,9 @@ async fn agent_create_background_default_beats_provider_defaults() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    // Verify the background default won
+    // Verify the provider default won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:haiku"));
+    assert_eq!(got.model.as_deref(), Some("fable-5"));
 }
 
 /// STAB-117 extension: providerDefaults beats global default.
