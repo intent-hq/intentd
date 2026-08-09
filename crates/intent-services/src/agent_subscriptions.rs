@@ -488,7 +488,11 @@ impl Services {
     /// one active completion watch (ungrouped or grouped) — the third
     /// `displayStatus` in-progress promotion signal alongside a running
     /// agent and active hooks: an idle parent still waiting on delegated
-    /// children reads as active work. Watches anchor in the parent's HOME
+    /// children reads as active work. `report_delivered` watches are
+    /// excluded, matching the agent-waiting projection and settlement
+    /// predicate ([`Services::waiting_watches_for_parent`]): a watch whose
+    /// report-time wake already fired no longer reads as pending work.
+    /// Watches anchor in the parent's HOME
     /// workspace (`parent_workspace_id`) — where the wake will be delivered
     /// — never the child's. The top-level filter matches
     /// [`Services::workspace_attention_signals`] (no `parent_agent_id`, not
@@ -511,7 +515,7 @@ impl Services {
             guard
                 .subscriptions
                 .iter()
-                .filter(|s| &s.parent_workspace_id == workspace_id)
+                .filter(|s| &s.parent_workspace_id == workspace_id && !s.report_delivered)
                 .map(|s| s.parent_agent_id.clone())
                 .collect()
         };
@@ -2219,6 +2223,33 @@ mod tests {
             enriched_display_status(&svc, &ws).await,
             WorkspaceDisplayStatus::Idle,
             "retired watches never promote"
+        );
+    }
+
+    /// A `report_delivered` watch stops promoting `displayStatus`: once the
+    /// report-time wake fired, the parent no longer reads as pending work —
+    /// matching the agent-waiting projection and settlement predicate
+    /// (monorepo#1649).
+    #[tokio::test]
+    async fn report_delivered_watch_does_not_promote_display_status() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "agent-parent".to_string(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .expect("register");
+        assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert!(svc.mark_watch_report_delivered(&id));
+        assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle,
+            "report_delivered watches must not promote"
         );
     }
 

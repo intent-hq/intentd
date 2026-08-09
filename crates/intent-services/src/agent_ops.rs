@@ -4742,11 +4742,20 @@ impl Services {
             // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
             // completion wake and should not receive the report wake.
             let watches = self.find_watches_for_child(&caller);
+            let mut marked = false;
             for watch in watches
                 .iter()
                 .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
             {
-                self.mark_watch_report_delivered(&watch.id);
+                marked |= self.mark_watch_report_delivered(&watch.id);
+            }
+            // Marking flips the parent's waiting projection (report_delivered
+            // watches are excluded), so publish the refreshed flags in the
+            // parent's HOME workspace — the watch anchor — to keep connected
+            // clients from serving a stale `isWaitingForOtherAgents: true`.
+            if marked {
+                self.publish_subscriptions_changed(&parent_home_ws, &parent)
+                    .await;
             }
         }
 
