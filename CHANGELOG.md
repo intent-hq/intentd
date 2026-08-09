@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-08-09
+
+### 🚀 Features
+
+- *(store)* Drop preview self-heal fallback, refuse newer-schema databases ([#1001](https://github.com/intent-hq/intentd/pull/1001))
+- *(agents)* Unify PR-monitor waiting into external-wait classification ([#1002](https://github.com/intent-hq/intentd/pull/1002))
+- *(intent-services)* Single-flight the full accept-changes.getStatus build ([#1008](https://github.com/intent-hq/intentd/pull/1008))
+- Surface waitingOnPrMonitors on the wire (mirrors waitingOnHooks) ([#1007](https://github.com/intent-hq/intentd/pull/1007))
+- Resolve quickActions.* daemon-side for agent.completeOnce ([#1012](https://github.com/intent-hq/intentd/pull/1012))
+- Cap outstanding slow-path RPCs with -32011 overload rejection ([#1013](https://github.com/intent-hq/intentd/pull/1013))
+
+### 🐛 Bug Fixes
+
+- Tier rpc_profile duration budget for network-bound methods ([#1004](https://github.com/intent-hq/intentd/pull/1004))
+- Never stage submodule-internal paths in the superproject (commit/stage guards) ([#1009](https://github.com/intent-hq/intentd/pull/1009))
+- Rename backgroundAgents.* to quickActions.* and scope to quick actions ([#1010](https://github.com/intent-hq/intentd/pull/1010))
+- Refuse submodule-internal paths in git.discard ([#1011](https://github.com/intent-hq/intentd/pull/1011))
+- Remove RpcLimiter Default impl and warn when the overload cap is disabled ([#1014](https://github.com/intent-hq/intentd/pull/1014))
+
+### 🔧 Refactor
+
+- *(transport)* Share envelope-validity rules between router and dispatch pre-check ([#1015](https://github.com/intent-hq/intentd/pull/1015))
+
+
 ## [0.6.1] - 2026-08-08
 
 ### 🚀 Features
