@@ -2524,6 +2524,7 @@ impl Services {
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
             runs: run_completed as u64,
             longest_run_ms: if run_completed {
                 turn_duration.as_millis() as u64

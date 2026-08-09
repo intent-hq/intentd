@@ -107,13 +107,17 @@ fn local_parts(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) ->
     (local.year(), u8::from(local.month()), local.hour())
 }
 
-/// The 4 separate token counters (D6) for one aggregation cell.
+/// The separate token counters (D6) for one aggregation cell: the four
+/// always-present counters plus reasoning ("thought") tokens, which follow
+/// the §5.23 TokenUsageTotals convention — omitted from the wire when zero,
+/// never `0`, never `null`.
 #[derive(Debug, Default, Clone, Copy)]
 struct TokenCell {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_creation: u64,
+    thought: u64,
 }
 
 impl TokenCell {
@@ -122,19 +126,24 @@ impl TokenCell {
         self.output += r.output_tokens;
         self.cache_read += r.cache_read_tokens;
         self.cache_creation += r.cache_creation_tokens;
+        self.thought += r.thought_tokens;
     }
 
     fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_creation
+        self.input + self.output + self.cache_read + self.cache_creation + self.thought
     }
 
     fn json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "inputTokens": self.input,
             "outputTokens": self.output,
             "cacheReadTokens": self.cache_read,
             "cacheCreationTokens": self.cache_creation,
-        })
+        });
+        if self.thought > 0 {
+            v["thoughtTokens"] = json!(self.thought);
+        }
+        v
     }
 }
 
@@ -154,8 +163,9 @@ fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
 /// buckets; `now_utc` anchors the 24h rolling window (injected for
 /// testability). Rows with malformed bucket keys are skipped.
 ///
-/// Result shape (all periods): `totals` (4 counters), `runs`, `sessions`,
-/// `longestRunMs`, `linesAdded`, `linesDeleted`, `byModel` (sorted desc by
+/// Result shape (all periods): `totals` (4 counters plus `thoughtTokens`
+/// when non-zero), `runs`, `sessions`, `longestRunMs`, `linesAdded`,
+/// `linesDeleted`, `byModel` (sorted desc by
 /// total tokens), `byProvider` (raw provider ids, same sorting), `byHourOfDay`
 /// (24 entries), `byMonth` (12 entries, the period's local year; zeroed for
 /// 24h), and `availablePeriods` computed over ALL rows regardless of the
@@ -706,6 +716,99 @@ mod tests {
             "garbage date ignored"
         );
         assert_eq!(v["availablePeriods"]["months"], json!(["2026-07"]));
+    }
+
+    #[test]
+    fn thought_tokens_surface_on_totals_and_every_rollup() {
+        let now = parse("2026-07-25T15:37:12Z");
+        let mut with_thought = row("2026-07-25T14:00:00Z", "Opus 4.8", 100, 40);
+        with_thought.thought_tokens = 25;
+        let without_thought = row("2026-07-25T13:00:00Z", "Sonnet 5", 30, 5);
+        let rows = vec![with_thought, without_thought];
+        let july = UsagePeriod::Month {
+            year: 2026,
+            month: 7,
+        };
+        let v = aggregate_usage(&rows, july, 0, now).unwrap();
+        assert_eq!(v["totals"]["thoughtTokens"], 25);
+        assert_eq!(v["byMonth"][6]["thoughtTokens"], 25);
+        assert_eq!(v["byHourOfDay"][14]["thoughtTokens"], 25);
+        assert!(
+            v["byHourOfDay"][13].get("thoughtTokens").is_none(),
+            "zero-thought cell must omit the field: {v}"
+        );
+        let by_model = v["byModel"].as_array().unwrap();
+        let opus = by_model.iter().find(|m| m["model"] == "Opus 4.8").unwrap();
+        assert_eq!(opus["thoughtTokens"], 25);
+        let sonnet = by_model.iter().find(|m| m["model"] == "Sonnet 5").unwrap();
+        assert!(
+            sonnet.get("thoughtTokens").is_none(),
+            "zero-thought model must omit the field: {v}"
+        );
+        assert_eq!(v["byProvider"][0]["thoughtTokens"], 25);
+
+        // 24h window carries it too.
+        let v = aggregate_usage(&rows, UsagePeriod::Last24h, 0, now).unwrap();
+        assert_eq!(v["totals"]["thoughtTokens"], 25);
+    }
+
+    #[test]
+    fn thought_tokens_count_toward_by_model_and_by_provider_ranking() {
+        let now = parse("2026-07-25T10:00:00Z");
+        // thinker: 40 input + 30 thought = 70; plain: 60 input. The thought
+        // counter must count toward the "total tokens" ranking, putting
+        // thinker first.
+        let mut thinker = prow("2026-07-10T14:00:00Z", "Opus 4.8", "claude-code", 40, 0);
+        thinker.thought_tokens = 30;
+        let plain = prow("2026-07-11T14:00:00Z", "GPT-6", "codex", 60, 0);
+        let rows = vec![thinker, plain];
+        let v = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(v["byModel"][0]["model"], "Opus 4.8");
+        assert_eq!(v["byModel"][1]["model"], "GPT-6");
+        assert_eq!(v["byProvider"][0]["provider"], "claude-code");
+        assert_eq!(v["byProvider"][1]["provider"], "codex");
+    }
+
+    #[test]
+    fn zero_thought_rows_serialize_byte_identical_to_pre_change_shape() {
+        // No thought tokens anywhere → every cell serializes without the
+        // field, byte-compatible with the pre-0087 response shape.
+        let now = parse("2026-07-25T10:00:00Z");
+        let rows = vec![row("2026-07-25T09:00:00Z", "Opus 4.8", 100, 40)];
+        let v = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&v["totals"]).unwrap(),
+            serde_json::to_string(&json!({
+                "inputTokens": 100,
+                "outputTokens": 40,
+                "cacheReadTokens": 0,
+                "cacheCreationTokens": 0,
+            }))
+            .unwrap()
+        );
+        let rendered = serde_json::to_string(&v).unwrap();
+        assert!(
+            !rendered.contains("thoughtTokens"),
+            "zero-thought response must not mention the field: {rendered}"
+        );
     }
 
     #[test]
