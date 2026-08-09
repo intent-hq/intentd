@@ -20,7 +20,7 @@ use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token,
     serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
-    SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -1101,6 +1101,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // over persisted settings for the port.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
+    // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
+    // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
+    // not per-connection or per-transport.
+    let rpc_limiter = RpcLimiter::new(config.server_max_outstanding_rpcs);
+    ws_options.rpc_limiter = rpc_limiter.clone();
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
@@ -1379,6 +1384,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Some(system_control),
         pairing_info,
         reverse_registry.clone(),
+        rpc_limiter,
         shutdown,
     )
     .await?;
@@ -3458,6 +3464,7 @@ mod tests {
             idle_reap_minutes: 30,
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            server_max_outstanding_rpcs: intent_core::config::DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
             wake_resume_enabled: intent_core::config::DEFAULT_WAKE_RESUME_ENABLED,
             wake_resume_threshold_seconds:
                 intent_core::config::DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,

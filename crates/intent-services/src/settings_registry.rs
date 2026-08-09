@@ -69,6 +69,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "server.bindAddress",
     "server.port",
     "server.originAllowList",
+    "server.maxOutstandingRpcs",
     "server.wsApi.enabled",
     "server.wsApi.port",
     "server.tls.enabled",

@@ -27,6 +27,7 @@ use crate::host;
 use crate::panic_guard;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
+use crate::rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
@@ -106,6 +107,12 @@ impl ConnSubs {
 /// frame through a cloned `out_tx`, so a long-running request (e.g.
 /// `host.exec`) cannot delay responses to other requests on the same connection.
 /// Out-of-order responses are fine: JSON-RPC correlates by `id`.
+///
+/// Every detached spawn claims a slot from the daemon-wide `limiter`
+/// (`server.maxOutstandingRpcs`) first; when the cap is reached the request is
+/// rejected immediately with `-32011 "Server overloaded"` (notifications are
+/// dropped silently) rather than queued. The permit is moved into the spawned
+/// task, so the slot is released when the task ends — panic unwinds included.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
@@ -119,6 +126,7 @@ pub(crate) async fn process_frame(
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
     is_local: bool,
+    limiter: &RpcLimiter,
 ) -> bool {
     let parsed = serde_json::from_str::<Value>(raw).ok();
     if let Some(value) = &parsed {
@@ -197,6 +205,9 @@ pub(crate) async fn process_frame(
             // it inline would deadlock frame reads until the reverse timeout.
             // Response is delivered through the cloned outbound sender; if the
             // connection has since closed the send is dropped silently.
+            let Ok(permit) = limiter.try_acquire() else {
+                return reject_overloaded(&method, rpc_id, out_tx).await;
+            };
             let api = Arc::clone(api);
             let bus = bus.clone();
             let out = out_tx.clone();
@@ -204,6 +215,9 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                // Held for the whole task, so the slot is released when it
+                // ends — including a panic unwind through `guard_frame`.
+                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
                     if let Some(frame) = panic_guard::guard_frame(
                         &method,
@@ -224,11 +238,15 @@ pub(crate) async fn process_frame(
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
             // the reverse timeout.
+            let Ok(permit) = limiter.try_acquire() else {
+                return reject_overloaded(&method, rpc_id, out_tx).await;
+            };
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
                     if let Some(frame) =
                         panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
@@ -315,11 +333,15 @@ pub(crate) async fn process_frame(
         .as_ref()
         .map(panic_guard::request_identity)
         .unwrap_or_else(|| (Some(Value::Null), String::new()));
+    let Ok(permit) = limiter.try_acquire() else {
+        return reject_overloaded(&method, rpc_id, out_tx).await;
+    };
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
+        let _permit = permit;
         crate::context::with_connection_context(is_tcp, async {
             if let Some(response) =
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
@@ -330,6 +352,32 @@ pub(crate) async fn process_frame(
         .await
     });
     true
+}
+
+/// Reject one over-limit slow-path frame (`server.maxOutstandingRpcs`): a
+/// request echoes `-32011 "Server overloaded"` with its `id`, a notification
+/// (no `id`) is dropped without a response per PROTOCOL §9. Returns `false`
+/// only when the outbound channel is closed.
+async fn reject_overloaded(
+    method: &str,
+    rpc_id: Option<Value>,
+    out_tx: &mpsc::Sender<String>,
+) -> bool {
+    tracing::warn!(
+        method,
+        "rejecting RPC: outstanding slow-path RPC limit reached"
+    );
+    match rpc_id {
+        Some(id) => out_tx
+            .send(events::error_frame(
+                id,
+                OVERLOAD_ERROR_CODE,
+                OVERLOAD_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
 }
 
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
@@ -782,5 +830,44 @@ async fn forward_channel_subscription(
                 seq += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request rejected at the outstanding-RPC cap answers `-32011 "Server
+    /// overloaded"` echoing its id, and the connection stays open.
+    #[tokio::test]
+    async fn overload_rejection_echoes_the_request_id() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let open = reject_overloaded("agent.list", Some(json!("req-7")), &tx).await;
+        assert!(open, "the connection must stay open");
+        let frame = rx.try_recv().expect("frame queued");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], json!("req-7"));
+        assert_eq!(v["error"]["code"], json!(OVERLOAD_ERROR_CODE));
+        assert_eq!(v["error"]["message"], OVERLOAD_ERROR_MESSAGE);
+    }
+
+    /// A notification (no `id`) is dropped silently at the cap — JSON-RPC
+    /// notifications never get a response (PROTOCOL §9).
+    #[tokio::test]
+    async fn overload_rejection_drops_notifications_without_a_frame() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let open = reject_overloaded("agent.list", None, &tx).await;
+        assert!(open, "the connection must stay open");
+        assert!(rx.try_recv().is_err(), "notifications get no response");
+    }
+
+    /// A closed outbound channel is reported so the read loop can end.
+    #[tokio::test]
+    async fn overload_rejection_reports_a_closed_channel() {
+        let (tx, rx) = mpsc::channel::<String>(4);
+        drop(rx);
+        assert!(!reject_overloaded("agent.list", Some(json!(1)), &tx).await);
+        assert!(!reject_overloaded("agent.list", None, &tx).await);
     }
 }

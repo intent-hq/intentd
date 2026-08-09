@@ -984,6 +984,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             None,
         ),
+        number(
+            "server.maxOutstandingRpcs",
+            "Max outstanding RPCs",
+            "Daemon-wide cap on outstanding slow-path RPCs across every connection; over-limit requests are rejected with -32011 \"Server overloaded\" (0 = unlimited)",
+            "server",
+            Some(0.0),
+            Some(100000.0),
+            256.0,
+        ),
         // --- Group B: source control ----------------------------------------
         enumerated(
             "sourceControl.activeProvider",
