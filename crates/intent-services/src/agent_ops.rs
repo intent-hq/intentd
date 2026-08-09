@@ -6780,6 +6780,21 @@ impl Services {
         }
 
         // delegationGroups, filtered to scope.
+        // The group-level `subscription_id` is a TS-parity legacy field the
+        // daemon never populates; the real linkage is the per-child grouped
+        // completion watches (each carries its group's id). Index them once
+        // (group id → [(child id, watch id)]) so the per-group derivation
+        // below stays O(rows returned) rather than rescanning the watch
+        // table per group and per pending child (monorepo#1694).
+        let mut group_watches: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for w in &watches {
+            if let Some(gid) = w.group_id.as_deref() {
+                group_watches
+                    .entry(gid)
+                    .or_default()
+                    .push((w.child_agent_id.0.as_str(), w.id.as_str()));
+            }
+        }
         let delegation_groups: Vec<Value> = groups
             .iter()
             .filter(|g| {
@@ -6807,24 +6822,20 @@ impl Services {
                     && g.expected_agent_ids.iter().all(|id| {
                         g.completed_agent_ids.contains(id) || g.deleted_agent_ids.contains(id)
                     });
-                // The group-level `subscription_id` is a TS-parity legacy
-                // field the daemon never populates; the real linkage is the
-                // per-child grouped completion watches (each carries this
-                // group's id). Derive the missing-check from the watches
-                // table (monorepo#1694): linkage is missing only when some
-                // still-pending child has no grouped watch observing it.
-                let grouped_watch = |id: &str| {
-                    watches.iter().any(|w| {
-                        w.group_id.as_deref() == Some(g.group_id.as_str())
-                            && w.child_agent_id.0 == id
-                    })
-                };
-                let subscription_ids: Vec<String> = watches
-                    .iter()
-                    .filter(|w| w.group_id.as_deref() == Some(g.group_id.as_str()))
-                    .map(|w| w.id.clone())
-                    .collect();
-                let subscription_missing = pending.iter().any(|id| !grouped_watch(id));
+                // Derive linkage from the grouped-watch index (monorepo#1694):
+                // linkage is missing only when some still-pending child has
+                // no grouped watch observing it.
+                let watches_for_group = group_watches
+                    .get(g.group_id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let subscription_ids: Vec<&str> =
+                    watches_for_group.iter().map(|(_, wid)| *wid).collect();
+                let subscription_missing = pending.iter().any(|id| {
+                    !watches_for_group
+                        .iter()
+                        .any(|(child, _)| *child == id.as_str())
+                });
                 json!({
                     "groupId": g.group_id,
                     "parentAgentId": g.parent_agent_id,
