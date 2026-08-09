@@ -3986,7 +3986,7 @@ async fn session_open_persists_effort_levels_and_emits_on_change_only() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(stored.effort_levels.as_deref(), Some(expected.as_slice()));
     // The wire projection carries the camelCase field.
-    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
     assert_eq!(
         serde_json::to_value(&lite).unwrap()["effortLevels"],
         json!(["low", "medium", "high", "max"])
@@ -4062,7 +4062,7 @@ async fn session_open_without_selector_clears_persisted_effort_levels() {
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
     assert_eq!(stored.effort_levels, None, "cleared on none advertised");
     // The wire projection omits the field entirely.
-    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
     assert!(
         serde_json::to_value(&lite)
             .unwrap()
