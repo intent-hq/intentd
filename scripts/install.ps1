@@ -128,8 +128,20 @@ if ($serviceMode -eq 'yes') {
     # Per-user Scheduled Task at logon: no admin rights needed, and -Force
     # makes re-runs update the existing task instead of duplicating it.
     $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
-    $action = New-ScheduledTaskAction -Execute $dest -Argument 'serve --resume-all'
+    # Carry a custom data dir into the task so it serves the same data dir the
+    # install-time CLI used. A task action cannot set environment variables, so
+    # wrap through cmd (the quotes survive & and spaces in the path).
+    $action = if ($env:INTENTD_DATA_DIR) {
+        New-ScheduledTaskAction -Execute $env:ComSpec `
+            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve --resume-all')
+    } else {
+        New-ScheduledTaskAction -Execute $dest -Argument 'serve --resume-all'
+    }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    # S4U logon: the task runs as this user with the profile loaded but outside
+    # the interactive session, so no console window pops up at every logon. The
+    # daemon needs no interactive-session resources (the trade-off S4U makes).
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U
     # The daemon is long-running: disable the 72h execution limit and the
     # battery cutoffs, and restart it if it crashes.
     $settings = New-ScheduledTaskSettingsSet `
@@ -137,8 +149,15 @@ if ($serviceMode -eq 'yes') {
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
         -StartWhenAvailable
+    # A re-run replaces the on-disk binary; stop any running instance so the
+    # restart below picks the new one up (Start-ScheduledTask is a no-op while
+    # an instance is running under the default multiple-instances policy).
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    }
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Settings $settings -Description 'Intent backend daemon (intentd)' -Force | Out-Null
+        -Principal $principal -Settings $settings `
+        -Description 'Intent backend daemon (intentd)' -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
     Write-Host "install.ps1: scheduled task '$taskName' registered (runs at logon) and started"
 

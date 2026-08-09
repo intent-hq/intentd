@@ -41,6 +41,13 @@ info() { printf '%s\n' "install.sh: $*"; }
 warn() { printf '%s\n' "install.sh: warning: $*" >&2; }
 fail() { printf '%s\n' "install.sh: error: $*" >&2; exit 1; }
 
+# Escape a value for a double-quoted word in a systemd unit: backslash-escape
+# \ and ", and double % (systemd specifier syntax).
+systemd_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
+
+# Escape a value for XML text content (launchd plist).
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 tmpdir=""
 staged=""
 cleanup() {
@@ -69,11 +76,6 @@ setup_service_linux() {
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
     return 0
   fi
-  if ! systemctl --user show-environment >/dev/null 2>&1; then
-    warn "cannot talk to the systemd user manager for this session — set the service up later from a login session with:
-  systemctl --user enable --now intentd"
-    return 0
-  fi
 
   unit_name=${INTENTD_SERVICE_NAME:-intentd}
   unit_dir="$HOME/.config/systemd/user"
@@ -82,11 +84,12 @@ setup_service_linux() {
   # the install-time CLI used.
   env_line=""
   if [ -n "${INTENTD_DATA_DIR:-}" ]; then
-    env_line="Environment=\"INTENTD_DATA_DIR=$INTENTD_DATA_DIR\""
+    env_line="Environment=\"INTENTD_DATA_DIR=$(systemd_escape "$INTENTD_DATA_DIR")\""
   fi
   # Same unit the .deb ships (packaging/deb/intentd.service), pointed at the
   # installed binary. ExecStart/ExecStop are quoted: install dirs can contain
-  # spaces, and systemd honors quoted words.
+  # spaces, and systemd honors quoted words; systemd_escape handles \ " %.
+  exec_path=$(systemd_escape "$install_dir/intentd")
   cat >"$unit_dir/$unit_name.service" <<EOF
 [Unit]
 Description=Intent backend daemon (intentd)
@@ -94,14 +97,22 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart="$install_dir/intentd" serve --resume-all
-ExecStop="$install_dir/intentd" stop
+ExecStart="$exec_path" serve --resume-all
+ExecStop="$exec_path" stop
 Restart=on-failure
 $env_line
 
 [Install]
 WantedBy=default.target
 EOF
+
+  # Written before this check so the hint below is actionable: from an
+  # SSH/headless session without a user manager the unit still lands on disk.
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    warn "unit written to $unit_dir/$unit_name.service, but cannot talk to the systemd user manager for this session — enable it later from a login session with:
+  systemctl --user enable --now $unit_name"
+    return 0
+  fi
 
   systemctl --user daemon-reload
   systemctl --user enable "$unit_name.service" 2>/dev/null \
@@ -129,6 +140,10 @@ setup_service_macos() {
   label=${INTENTD_SERVICE_NAME:-com.intenthq.intentd}
   plist="$HOME/Library/LaunchAgents/$label.plist"
   mkdir -p "$HOME/Library/LaunchAgents" || fail "cannot create ~/Library/LaunchAgents"
+  # Interpolated values are XML-escaped: a path with & or < would otherwise
+  # produce an invalid plist and an opaque bootstrap failure.
+  xml_bin=$(xml_escape "$install_dir/intentd")
+  xml_home=$(xml_escape "$HOME")
   # Carry a custom data dir into the service so it serves the same data dir
   # the install-time CLI used.
   env_block=""
@@ -136,7 +151,7 @@ setup_service_macos() {
     env_block="	<key>EnvironmentVariables</key>
 	<dict>
 		<key>INTENTD_DATA_DIR</key>
-		<string>$INTENTD_DATA_DIR</string>
+		<string>$(xml_escape "$INTENTD_DATA_DIR")</string>
 	</dict>
 "
   fi
@@ -152,7 +167,7 @@ setup_service_macos() {
 	<string>$label</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$install_dir/intentd</string>
+		<string>$xml_bin</string>
 		<string>serve</string>
 		<string>--resume-all</string>
 	</array>
@@ -166,9 +181,9 @@ $env_block	<key>RunAtLoad</key>
 		<false/>
 	</dict>
 	<key>StandardOutPath</key>
-	<string>$HOME/Library/Logs/intentd.log</string>
+	<string>$xml_home/Library/Logs/intentd.log</string>
 	<key>StandardErrorPath</key>
-	<string>$HOME/Library/Logs/intentd.err.log</string>
+	<string>$xml_home/Library/Logs/intentd.err.log</string>
 </dict>
 </plist>
 EOF
@@ -318,9 +333,10 @@ main() {
   # default there is to skip with a hint.
   service_mode="$service_arg"
   if [ -z "$service_mode" ]; then
+    # Case-insensitive to match install.ps1 (FALSE/No must also mean skip).
     case "${INTENTD_INSTALL_SERVICE:-}" in
       '') ;;
-      0 | false | no) service_mode="no" ;;
+      0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo]) service_mode="no" ;;
       *) service_mode="yes" ;;
     esac
   fi
