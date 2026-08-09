@@ -1090,6 +1090,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     let grace = super::PROCESS_GROUP_TERM_GRACE;
     let (_tmp, mgr) = manager().await;
     let mut ids = Vec::with_capacity(N);
+    let mut pids = Vec::with_capacity(N);
     for i in 0..N {
         let id = AgentId::from(format!("a-batch-{i}").as_str());
         let mut cmd = tokio::process::Command::new("sh");
@@ -1106,6 +1107,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
         mgr.handles.lock().unwrap().insert(id.clone(), handle);
         mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
         ids.push(id);
+        pids.push(pid);
     }
     // Let each sh install its trap before SIGTERM arrives.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1129,6 +1131,21 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");
     assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
+    // The kill itself, not just the elapsed window: every child must be
+    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
+    // a zombie until its wait task reaps it (stragglers past
+    // KILL_SWEEP_REAP_GRACE reap in the background).
+    for &pid in &pids {
+        let mut dead = !pid_alive(pid);
+        for _ in 0..100 {
+            if dead {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            dead = !pid_alive(pid);
+        }
+        assert!(dead, "child {pid} killed by the batch sweep");
+    }
     // The returned fence keeps every swept agent blocked from the
     // lazy-spawn paths until dropped, then re-opens them.
     for id in &ids {

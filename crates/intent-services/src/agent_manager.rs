@@ -2832,6 +2832,13 @@ impl AgentManager {
     /// the `workspace.delete` sweep (same detach-many → kill_child_trees
     /// pattern as `shutdown()`, minus the interrupted-session capture).
     ///
+    /// NOTE: with exactly one agent this is NEARLY but not exactly
+    /// [`AgentManager::stop`]: `kill_child_trees` adds a bounded
+    /// [`KILL_SWEEP_REAP_GRACE`] post-SIGKILL reap window that
+    /// `kill_child_tree` does not (a SIGTERM-ignoring single child pays up
+    /// to ~grace + reap-grace and is properly `wait()`ed), and descendants
+    /// are snapshotted via one batched `ps` (`descendant_pids_many`).
+    ///
     /// Returns a [`TeardownFence`] that keeps the swept agents fenced off
     /// from the lazy-spawn paths until dropped: the caller must hold it
     /// across the store cascade that deletes the session rows, so a
