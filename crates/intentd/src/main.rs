@@ -1105,6 +1105,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
     // not per-connection or per-transport.
     let rpc_limiter = RpcLimiter::new(config.server_max_outstanding_rpcs);
+    if config.server_max_outstanding_rpcs == 0 {
+        tracing::warn!(
+            "outstanding-RPC overload cap disabled (server.maxOutstandingRpcs = 0): \
+             slow-path RPC concurrency is unlimited"
+        );
+    }
     ws_options.rpc_limiter = rpc_limiter.clone();
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build

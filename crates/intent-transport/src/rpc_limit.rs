@@ -33,11 +33,13 @@ pub const OVERLOAD_ERROR_MESSAGE: &str = "Server overloaded";
 /// `Arc` inside); [`RpcLimiter::unlimited`] disables the cap entirely by
 /// carrying no semaphore at all.
 ///
-/// Note that `Default` is *unlimited*, not the shipped `256`: a listener whose
-/// composition root forgets to wire the limiter silently opts out of the cap
-/// with no compile error. Only the `intentd` composition root decides the cap;
-/// test wrappers such as `serve_uds` intentionally take the unlimited default.
-#[derive(Clone, Default)]
+/// There is deliberately no `Default` impl: an implicit default would be
+/// *unlimited*, letting a composition root that forgets to wire the limiter
+/// silently opt out of the cap with no compile error. Callers must choose
+/// [`RpcLimiter::new`] or [`RpcLimiter::unlimited`] explicitly; only the
+/// `intentd` composition root decides the cap, and test wrappers such as
+/// `serve_uds` intentionally pass `unlimited()`.
+#[derive(Clone)]
 pub struct RpcLimiter {
     semaphore: Option<Arc<Semaphore>>,
     /// Whether the cap is currently saturated, so sustained overload logs one
@@ -58,8 +60,8 @@ impl RpcLimiter {
         }
     }
 
-    /// A limiter that never rejects (the default posture for listeners whose
-    /// composition root did not wire a cap).
+    /// A limiter that never rejects — the explicit opt-out for lightweight
+    /// wrappers (e.g. `serve_uds`) that deliberately run without a cap.
     pub fn unlimited() -> Self {
         Self {
             semaphore: None,
