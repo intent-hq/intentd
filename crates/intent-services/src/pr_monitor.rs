@@ -161,6 +161,12 @@ pub(crate) async fn fetch_snapshot(
 /// stable order (lifecycle → review → comments → checks → mergeability). An
 /// empty result means "nothing moved" and the monitor stays quiet.
 ///
+/// Per-check success transitions are NOT reported individually (see
+/// [`diff_checks`]); instead, the moment the suite finishes — the old
+/// snapshot still had pending checks and the new one has none — ONE
+/// aggregate completion line summarizes the outcome. A poll whose only
+/// movement is intermediate successes therefore produces an empty diff.
+///
 /// Per-check `required` flags only participate when BOTH snapshots report
 /// `requiredKnown` — a degraded probe flips every flag to `false`, and
 /// reporting that as "no longer required" would be a lie about the branch
@@ -250,6 +256,19 @@ pub(crate) fn diff_snapshots(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -
 
     changes.extend(diff_checks(old, new));
 
+    // Suite completion: the last pending check finishing is reported as ONE
+    // aggregate line (individual success lines are suppressed above).
+    if o.checks.pending > 0 && n.checks.pending == 0 && n.checks.total > 0 {
+        changes.push(if n.checks.failed == 0 {
+            format!("all checks passed ({})", n.checks.total)
+        } else {
+            format!(
+                "all checks completed: {} passed, {} failed",
+                n.checks.passed, n.checks.failed
+            )
+        });
+    }
+
     // Mergeability + residual signals.
     if o.has_conflicts != n.has_conflicts {
         changes.push(if n.has_conflicts {
@@ -291,6 +310,12 @@ pub(crate) fn diff_snapshots(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -
 /// Per-check state transitions between two snapshots: added, removed, and
 /// state-changed checks, plus a required-flag flip when both sides report
 /// trustworthy `requiredKnown` flags.
+///
+/// Normal success transitions are suppressed: a check going `pending` →
+/// `passed`, or appearing already green, is expected progress rather than a
+/// reportable change — the suite-completion summary in [`diff_snapshots`]
+/// covers the "everything finished" moment. A `failed` → `passed` recovery
+/// IS reported, since it resolves a previously reported failure.
 fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
     let (o, n) = (&old.requirements.checks, &new.requirements.checks);
     let required_known = o.required_known && n.required_known;
@@ -304,9 +329,15 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
     let mut changes = Vec::new();
     for check in &n.items {
         match before.get(&check.name) {
-            None => changes.push(format!("check started: {} ({})", check.name, check.status)),
+            None => {
+                if check.status != "passed" {
+                    changes.push(format!("check started: {} ({})", check.name, check.status));
+                }
+            }
             Some(prev) => {
-                if prev.status != check.status {
+                if prev.status != check.status
+                    && !(check.status == "passed" && prev.status == "pending")
+                {
                     changes.push(format!(
                         "check {}: {} → {}",
                         check.name, prev.status, check.status
@@ -2310,12 +2341,30 @@ mod tests {
     #[test]
     fn diff_detects_check_transitions_additions_and_removals() {
         let base = snapshot(|_| {});
-        let passed = snapshot(|s| {
-            s.requirements.checks.items[0].status = "passed".into();
+        let failed = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.items[0].status = "failed".into();
+            c.pending = 0;
+            c.failed = 1;
+            c.failing_required = vec!["build".into()];
+            c.pending_required.clear();
         });
-        assert!(diff_snapshots(&base, &passed)
+        assert!(diff_snapshots(&base, &failed)
             .iter()
-            .any(|c| c == "check build: pending → passed"));
+            .any(|c| c == "check build: pending → failed"));
+
+        // A failed → passed recovery resolves a previously reported failure
+        // and IS reported (unlike a normal pending → passed success).
+        let recovered = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.items[0].status = "passed".into();
+            c.pending = 0;
+            c.passed = 1;
+            c.pending_required.clear();
+        });
+        assert!(diff_snapshots(&failed, &recovered)
+            .iter()
+            .any(|c| c == "check build: failed → passed"));
 
         let added = snapshot(|s| {
             s.requirements
@@ -2334,6 +2383,108 @@ mod tests {
         assert!(diff_snapshots(&added, &base)
             .iter()
             .any(|c| c == "check removed: lint"));
+    }
+
+    #[test]
+    fn intermediate_check_successes_are_suppressed() {
+        let pending_lint = pr_ops::MergeRequirementCheck {
+            name: "lint".into(),
+            status: "pending".into(),
+            required: false,
+            url: None,
+        };
+        let two_pending = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.total = 2;
+            c.pending = 2;
+            c.items.push(pending_lint.clone());
+        });
+        let one_done = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.total = 2;
+            c.pending = 1;
+            c.passed = 1;
+            c.items[0].status = "passed".into();
+            c.items.push(pending_lint.clone());
+            c.pending_required.clear();
+        });
+        assert!(
+            diff_snapshots(&two_pending, &one_done).is_empty(),
+            "an intermediate pending → passed transition must stay quiet"
+        );
+    }
+
+    #[test]
+    fn a_check_appearing_already_green_is_suppressed() {
+        let base = snapshot(|_| {});
+        let added_green = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.total = 2;
+            c.passed = 1;
+            c.items.push(pr_ops::MergeRequirementCheck {
+                name: "lint".into(),
+                status: "passed".into(),
+                required: false,
+                url: None,
+            });
+        });
+        assert!(
+            diff_snapshots(&base, &added_green).is_empty(),
+            "a check that appears already passed must stay quiet"
+        );
+    }
+
+    #[test]
+    fn suite_completion_reports_one_aggregate_line() {
+        // Everything green: the last pending check finishing produces exactly
+        // one aggregate line and no per-check success line.
+        let base = snapshot(|_| {});
+        let all_passed = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.items[0].status = "passed".into();
+            c.pending = 0;
+            c.passed = 1;
+            c.pending_required.clear();
+        });
+        assert_eq!(
+            diff_snapshots(&base, &all_passed),
+            vec!["all checks passed (1)".to_string()]
+        );
+
+        // Mixed outcome: the failure line still reports, plus the completion
+        // summary — but no line for the check that merely passed.
+        let two_pending = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.total = 2;
+            c.pending = 2;
+            c.items.push(pr_ops::MergeRequirementCheck {
+                name: "lint".into(),
+                status: "pending".into(),
+                required: false,
+                url: None,
+            });
+        });
+        let mixed = snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            c.total = 2;
+            c.pending = 0;
+            c.passed = 1;
+            c.failed = 1;
+            c.items[0].status = "passed".into();
+            c.items.push(pr_ops::MergeRequirementCheck {
+                name: "lint".into(),
+                status: "failed".into(),
+                required: false,
+                url: None,
+            });
+            c.pending_required.clear();
+        });
+        let changes = diff_snapshots(&two_pending, &mixed);
+        assert!(changes.iter().any(|c| c == "check lint: pending → failed"));
+        assert!(changes
+            .iter()
+            .any(|c| c == "all checks completed: 1 passed, 1 failed"));
+        assert!(!changes.iter().any(|c| c.contains("check build")));
     }
 
     #[test]

@@ -146,12 +146,25 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 /// Mutable forge state the tests advance between polls.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ForgeState {
     merged: bool,
     conversation_comments: usize,
     /// `get_pr` call count — one per PR snapshot fetch (dedup assertions).
     get_pr_calls: usize,
+    /// `(name, state, required)` triples served as the check rollup.
+    checks: Vec<(String, CheckState, bool)>,
+}
+
+impl Default for ForgeState {
+    fn default() -> Self {
+        Self {
+            merged: false,
+            conversation_comments: 0,
+            get_pr_calls: 0,
+            checks: vec![("build".into(), CheckState::Pending, true)],
+        }
+    }
 }
 
 /// Stub forge serving one open PR (#42, one pending required check) whose
@@ -288,20 +301,28 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
+        let checks = self.state.lock().unwrap().checks.clone();
         Ok(MergeRequirementSignals {
             merge_state_status: Some("CLEAN".into()),
             review_decision: Some(ReviewDecision::ReviewRequired),
-            checks: vec![RollupCheck {
-                name: "build".into(),
-                state: CheckState::Pending,
-                is_required: true,
-                url: None,
-            }],
+            checks: checks
+                .iter()
+                .map(|(name, state, required)| RollupCheck {
+                    name: name.clone(),
+                    state: *state,
+                    is_required: *required,
+                    url: None,
+                })
+                .collect(),
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),
-                required_status_checks: vec!["build".into()],
+                required_status_checks: checks
+                    .iter()
+                    .filter(|(_, _, required)| *required)
+                    .map(|(name, _, _)| name.clone())
+                    .collect(),
             }),
         })
     }
@@ -1189,4 +1210,91 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
             "sibling pending state independent: {row}"
         );
     }
+}
+
+/// Intermediate check successes stay quiet over the production transport: a
+/// `pending → passed` transition accumulates NO pending change and emits NO
+/// `prMonitor:changed`; the suite completing produces exactly ONE aggregate
+/// line, and the consolidated wake carries it.
+#[tokio::test]
+async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_over_wss() {
+    let fx = boot().await;
+    // Two pending checks so one can pass while the suite is still running.
+    fx.forge.edit(|s| {
+        s.checks = vec![
+            ("build".into(), CheckState::Pending, true),
+            ("lint".into(), CheckState::Pending, false),
+        ]
+    });
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Intermediate success: `build` passes while `lint` is still pending —
+    // the diff is empty, so nothing accumulates on the row.
+    fx.forge.edit(|s| s.checks[0].1 = CheckState::Success);
+    fx.services.poll_pr_monitors().await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["hasPendingChanges"], false,
+        "an intermediate success must not accumulate a pending change: {row}"
+    );
+    assert_eq!(row["pendingChanges"], json!([]));
+    assert_eq!(row["lastSnapshot"]["checks"]["pending"], 1);
+
+    // The suite completes: the LAST pending check passing produces exactly
+    // one aggregate line. The first `prMonitor:changed` seen on the wire is
+    // this completion — proving the intermediate success never emitted.
+    fx.forge.edit(|s| s.checks[1].1 = CheckState::Success);
+    fx.services.poll_pr_monitors().await;
+
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(
+        evt["data"]["changes"],
+        json!(["all checks passed (2)"]),
+        "the completion emit carries ONLY the aggregate line: {evt}"
+    );
+
+    // The consolidated wake delivers the aggregate line, with no per-check
+    // success lines.
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    let text = owner_messages(&fx).await;
+    assert!(
+        text.contains("all checks passed (2)"),
+        "the wake carries the aggregate line: {text}"
+    );
+    assert!(
+        !text.contains("check build") && !text.contains("check lint"),
+        "no per-check success lines in the wake: {text}"
+    );
 }
