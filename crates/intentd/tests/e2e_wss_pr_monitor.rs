@@ -32,7 +32,7 @@ use intent_sourcecontrol::{
     Result as ScResult, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict,
     RollupCheck, ScCapabilities, SourceControl, UserIdentity,
 };
-use intent_store::Store;
+use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
 };
@@ -146,12 +146,25 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 /// Mutable forge state the tests advance between polls.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ForgeState {
     merged: bool,
     conversation_comments: usize,
     /// `get_pr` call count — one per PR snapshot fetch (dedup assertions).
     get_pr_calls: usize,
+    /// `(name, state, required)` triples served as the check rollup.
+    checks: Vec<(String, CheckState, bool)>,
+}
+
+impl Default for ForgeState {
+    fn default() -> Self {
+        Self {
+            merged: false,
+            conversation_comments: 0,
+            get_pr_calls: 0,
+            checks: vec![("build".into(), CheckState::Pending, true)],
+        }
+    }
 }
 
 /// Stub forge serving one open PR (#42, one pending required check) whose
@@ -288,20 +301,28 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
+        let checks = self.state.lock().unwrap().checks.clone();
         Ok(MergeRequirementSignals {
             merge_state_status: Some("CLEAN".into()),
             review_decision: Some(ReviewDecision::ReviewRequired),
-            checks: vec![RollupCheck {
-                name: "build".into(),
-                state: CheckState::Pending,
-                is_required: true,
-                url: None,
-            }],
+            checks: checks
+                .iter()
+                .map(|(name, state, required)| RollupCheck {
+                    name: name.clone(),
+                    state: *state,
+                    is_required: *required,
+                    url: None,
+                })
+                .collect(),
             checks_known: true,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),
-                required_status_checks: vec!["build".into()],
+                required_status_checks: checks
+                    .iter()
+                    .filter(|(_, _, required)| *required)
+                    .map(|(name, _, _)| name.clone())
+                    .collect(),
             }),
         })
     }
@@ -811,7 +832,11 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
 
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
 /// owner is woken immediately, and the `completed` row STAYS visible in
-/// `prMonitor.list` so merged PRs remain in the UI's list.
+/// `prMonitor.list` so merged PRs remain in the UI's list. The wake's
+/// persisted user row carries the PROTOCOL §5.42 `messageMetadata`
+/// (`type`/`monitorId`/`repo`/`prNumber`/`reason` + the baseline-sourced
+/// `url`), asserted through `agent.getConversation` over the wire — the
+/// client-visible read path.
 #[tokio::test]
 async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     let fx = boot().await;
@@ -856,6 +881,147 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(rows.len(), 1, "completed rows stay visible: {listed}");
     assert_eq!(rows[0]["state"], "completed");
     assert_eq!(rows[0]["lastSnapshot"]["state"], "merged");
+
+    // The client-visible transcript row carries the wake's messageMetadata,
+    // including the baseline-sourced `url` (PROTOCOL §5.42).
+    let convo = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.getConversation",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let wake = messages
+        .iter()
+        .find(|m| m["metadata"]["type"] == json!("pr_monitor_wake"))
+        .unwrap_or_else(|| panic!("wake row carries pr_monitor_wake metadata: {convo}"));
+    let metadata = &wake["metadata"];
+    assert_eq!(metadata["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(metadata["repo"], "o/r");
+    assert_eq!(metadata["prNumber"], 42);
+    assert_eq!(metadata["reason"], "completed");
+    assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
+}
+
+/// Active-monitor `displayStatus` promotion over the wire (PROTOCOL §6.5,
+/// mirrors the hook e2e in `e2e_wss_display_status_hooks.rs`): registering a
+/// monitor emits the `workspace:displayStatus-changed` promotion, both
+/// `workspace.get` and `workspace.list` serve `in_progress` while the
+/// monitor is ACTIVE, and cancelling it over the wire (`prMonitor.cancel`)
+/// emits the demotion and settles both read paths off `in_progress`.
+#[tokio::test]
+async fn active_monitor_promotes_display_status_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    // Baseline read: the seeded workspace (no tasks, no hooks, no running
+    // agents) serves `idle` — and seeds the last-observed cache, so the
+    // promotion below is a real transition that emits.
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle", "baseline: {got}");
+
+    // Subscriber registered BEFORE the transitions so we miss nothing.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Registration (via the service surface the `ws.pr.monitor` binding
+    // calls) promotes: the transition event fires with a self-sufficient
+    // payload and both read paths serve `in_progress`.
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "in_progress" }),
+        "self-sufficient promotion payload (PROTOCOL §6.5): {evt}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        got["workspace"]["displayStatus"], "in_progress",
+        "workspace.get serves in_progress while the monitor is active: {got}"
+    );
+    let listed = wss_rpc(&mut rpc, 4, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(fx.ws_id.as_str()))
+        .cloned()
+        .expect("seeded workspace listed");
+    assert_eq!(
+        row["displayStatus"], "in_progress",
+        "workspace.list serves in_progress while the monitor is active: {row}"
+    );
+
+    // Cancelling over the wire (the FE path) demotes: the transition event
+    // fires and both read paths settle off `in_progress`. The demoted status
+    // is the true base — never `needs_attention`.
+    let cancelled = wss_rpc(
+        &mut rpc,
+        5,
+        "prMonitor.cancel",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(cancelled["ok"], true, "{cancelled}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    let demoted = evt["data"]["displayStatus"].as_str().expect("status");
+    assert!(
+        demoted != "in_progress" && demoted != "needs_attention",
+        "cancel demotes without raising attention: {evt}"
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        got["workspace"]["displayStatus"],
+        json!(demoted),
+        "workspace.get settles at the demoted status: {got}"
+    );
+    let listed = wss_rpc(&mut rpc, 7, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(fx.ws_id.as_str()))
+        .cloned()
+        .expect("seeded workspace listed");
+    assert_eq!(
+        row["displayStatus"],
+        json!(demoted),
+        "workspace.list settles at the demoted status: {row}"
+    );
 }
 
 /// Idle-visibility (unified external-wait, mirrors the hook-lifecycle
@@ -967,14 +1133,17 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
             .store()
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                row.last_snapshot.as_deref(),
-                &row.pending_changes,
-                row.pending_since.as_deref(),
-                row.last_change_at.as_deref(),
-                Some("2020-01-01T00:00:00Z"),
-                None,
-                &now_iso(),
-                &row.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.baseline_snapshot.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: Some("2020-01-01T00:00:00Z"),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
             )
             .await
             .expect("backdate lastPolledAt"));
@@ -1044,4 +1213,220 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
             "sibling pending state independent: {row}"
         );
     }
+}
+
+/// Intermediate check successes stay quiet over the production transport: a
+/// `pending → passed` transition accumulates NO pending change and emits NO
+/// `prMonitor:changed`; the suite completing produces exactly ONE aggregate
+/// line, and the consolidated wake carries it.
+#[tokio::test]
+async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_over_wss() {
+    let fx = boot().await;
+    // Two pending checks so one can pass while the suite is still running.
+    fx.forge.edit(|s| {
+        s.checks = vec![
+            ("build".into(), CheckState::Pending, true),
+            ("lint".into(), CheckState::Pending, false),
+        ]
+    });
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Intermediate success: `build` passes while `lint` is still pending —
+    // the diff is empty, so nothing accumulates on the row.
+    fx.forge.edit(|s| s.checks[0].1 = CheckState::Success);
+    fx.services.poll_pr_monitors().await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["hasPendingChanges"], false,
+        "an intermediate success must not accumulate a pending change: {row}"
+    );
+    assert_eq!(row["pendingChanges"], json!([]));
+    assert_eq!(row["lastSnapshot"]["checks"]["pending"], 1);
+
+    // The suite completes: the LAST pending check passing produces exactly
+    // one aggregate line. The first `prMonitor:changed` seen on the wire is
+    // this completion — proving the intermediate success never emitted.
+    fx.forge.edit(|s| s.checks[1].1 = CheckState::Success);
+    fx.services.poll_pr_monitors().await;
+
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(
+        evt["data"]["changes"],
+        json!(["all checks passed (2)"]),
+        "the completion emit carries ONLY the aggregate line: {evt}"
+    );
+
+    // The consolidated wake delivers the aggregate line, with no per-check
+    // success lines.
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    let text = owner_messages(&fx).await;
+    assert!(
+        text.contains("all checks passed (2)"),
+        "the wake carries the aggregate line: {text}"
+    );
+    assert!(
+        !text.contains("check build") && !text.contains("check lint"),
+        "no per-check success lines in the wake: {text}"
+    );
+}
+
+/// Coalesced-diff semantics end-to-end: `pendingChanges` over the wire is the
+/// NET diff against the emit baseline — A→B→C renders one initial→final line,
+/// and a full revert (C→A) empties the pending set, resets the debounce
+/// anchors, and produces NO owner wake even though the debounce window had
+/// already elapsed (the pre-coalescing accumulated-log behavior would have
+/// delivered the whole journey here).
+#[tokio::test]
+async fn full_revert_coalesces_to_empty_and_produces_no_owner_wake_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    // A→B: one new comment; the coalesced set carries the single net line.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        listed["monitors"][0]["pendingChanges"],
+        json!(["+1 conversation comment (1 total)"]),
+        "first poll: {listed}"
+    );
+
+    // B→C: a second comment; the set is RECOMPUTED against the emit baseline
+    // on every poll — a single net 0→2 line, never a two-line journey.
+    fx.forge.edit(|s| s.conversation_comments = 2);
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        listed["monitors"][0]["pendingChanges"],
+        json!(["+2 conversation comments (2 total)"]),
+        "coalesced net line, not the journey: {listed}"
+    );
+
+    // Backdate the debounce anchors so the NEXT poll would deliver the wake
+    // if anything stayed pending — the revert below must suppress it.
+    let row = fx
+        .services
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .expect("load row");
+    assert!(fx
+        .services
+        .store()
+        .update_pr_monitor_poll(
+            &monitor.monitor_id,
+            PrMonitorPollUpdate {
+                last_snapshot: row.last_snapshot.as_deref(),
+                baseline_snapshot: row.baseline_snapshot.as_deref(),
+                pending_changes: &row.pending_changes,
+                pending_since: Some("2020-01-01T00:00:00Z"),
+                last_change_at: Some("2020-01-01T00:00:00Z"),
+                last_polled_at: row.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &row.updated_at,
+            },
+        )
+        .await
+        .expect("backdate debounce anchors"));
+
+    // C→A: both comments deleted — the PR is back at the emit baseline. The
+    // FE-facing `prMonitor:changed` fires with the set shrinking to empty.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    fx.forge.edit(|s| s.conversation_comments = 0);
+    fx.services.poll_pr_monitors().await;
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(
+        evt["data"]["changes"],
+        json!([]),
+        "the revert shrinks the net set to empty: {evt}"
+    );
+
+    // Nothing pending, anchors reset, and — despite the elapsed debounce —
+    // the owner was never woken.
+    let listed = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["pendingChanges"], json!([]), "empty net set: {row}");
+    assert_eq!(row["hasPendingChanges"], false);
+    assert!(row["pendingSince"].is_null(), "anchor reset: {row}");
+    assert!(row["lastChangeAt"].is_null(), "anchor reset: {row}");
+    assert!(
+        !owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "a full revert must produce no owner wake"
+    );
+
+    // A flush finds nothing pending either — an explicit no-op.
+    let flushed = wss_rpc(
+        &mut rpc,
+        5,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": false }));
 }

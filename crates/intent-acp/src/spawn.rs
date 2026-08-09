@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use intent_providers::{
-    apply_codex_config_args, build_provider_args, build_provider_env_with_unsloth, enhanced_path,
+    apply_codex_config_args, build_provider_args, build_provider_env_for_spawn, enhanced_path,
     ArgInputs, ProviderConfig, UnslothEndpoint,
 };
 use tokio::io::AsyncRead;
@@ -66,6 +66,16 @@ pub struct SpawnOptions<'a> {
 }
 
 impl<'a> SpawnOptions<'a> {
+    /// True when this spawn will run via npx: no resolved provider binary and
+    /// both npx fields set. Single source of truth for the program selection,
+    /// the `-y <pkg>` arg prepend, and the Node-child env decisions (heap cap,
+    /// #555 codex env scrub).
+    pub fn via_npx(&self) -> bool {
+        self.provider_binary.is_none()
+            && self.npx_fallback_binary.is_some()
+            && self.npx_fallback_package.is_some()
+    }
+
     /// Construct options for a provider with all optional inputs unset.
     pub fn new(provider: &'a ProviderConfig) -> Self {
         Self {
@@ -95,8 +105,8 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 
     // When using npx fallback (provider_binary not set AND both npx fields are set),
     // prepend the npx-specific args before the provider's args
-    if opts.provider_binary.is_none() {
-        if let (Some(_), Some(pkg)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+    if opts.via_npx() {
+        if let Some(pkg) = opts.npx_fallback_package {
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -135,12 +145,43 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 /// spawns npx; otherwise falls back to the bare `opts.provider.command`
 /// and relies on the enriched `PATH`.
 pub fn build_command(opts: &SpawnOptions) -> Command {
+    build_command_with_captured_env(opts, captured_credential_env())
+}
+
+/// The login-shell credential capture merged by [`build_command`]. In this
+/// crate's unit tests this compiles to an empty map, so env assertions are
+/// deterministic and real captured credentials never enter a test-built
+/// `Command`. The seam does NOT prevent the login-shell spawn itself
+/// ([`build_command`]'s `enhanced_path` still triggers the shared PATH
+/// capture), and `#[cfg(test)]` is crate-local — a cross-crate test calling
+/// [`build_command`] gets the production capture, so such tests must not
+/// assert on the command's env. The merge logic itself is covered by driving
+/// [`build_command_with_captured_env`] directly.
+fn captured_credential_env() -> &'static BTreeMap<String, String> {
+    #[cfg(not(test))]
+    {
+        intent_core::path_utils::login_shell_credential_env()
+    }
+    #[cfg(test)]
+    {
+        static EMPTY: BTreeMap<String, String> = BTreeMap::new();
+        &EMPTY
+    }
+}
+
+/// [`build_command`] with an injectable captured credential-env map (the
+/// cached login-shell capture in production). Captured vars are gap-fill
+/// only — see the precedence comment at the merge site below.
+fn build_command_with_captured_env(
+    opts: &SpawnOptions,
+    captured: &BTreeMap<String, String>,
+) -> Command {
     let args = build_args(opts);
 
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
     let command = if let Some(p) = opts.provider_binary {
         p.as_os_str()
-    } else if let (Some(npx), Some(_)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+    } else if let (true, Some(npx)) = (opts.via_npx(), opts.npx_fallback_binary) {
         npx.as_os_str()
     } else {
         std::ffi::OsStr::new(opts.provider.command)
@@ -151,29 +192,48 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in build_provider_env_with_unsloth(
+    // An npx spawn (fallback or npx-only) always runs a Node child, so env
+    // assembly applies the V8 heap cap even when the provider's declared
+    // runtime is Native (codex's npx fallback, intent-hq/monorepo#1661).
+    let via_npx = opts.via_npx();
+    let provider_env = build_provider_env_for_spawn(
         opts.provider,
         opts.model,
         opts.rules_file,
         opts.env_mcp_config,
         opts.unsloth_endpoint,
-    ) {
+        via_npx,
+    );
+    for (key, value) in &provider_env {
         cmd.env(key, value);
     }
     for (key, value) in &opts.extra_env {
         cmd.env(key, value);
     }
 
+    // Gap-fill the login-shell-captured credential vars (monorepo#1671).
+    // Precedence: provider env / extra_env win, then the daemon's own process
+    // env (the child inherits it; a var already set there is never
+    // overridden), then captured vars fill the remaining gaps — the
+    // Dock/auto-update launch case where the daemon env is stripped.
+    // SECURITY: values are secrets — never log, trace, or return them.
+    for (key, value) in captured {
+        if provider_env.contains_key(key)
+            || opts.extra_env.contains_key(key)
+            || std::env::var_os(key).is_some()
+        {
+            continue;
+        }
+        cmd.env(key, value);
+    }
+
     // The pinned codex-acp npx fallback is daemon-managed (not a user escape
     // hatch), so remove CODEX_PATH / CODEX_CONFIG from its inherited env — a
     // stray or hostile value could redirect the adapter away from the vendored
-    // binary (#555). Resolved binaries (providers.paths / PATH scan) keep the
-    // daemon env untouched.
-    if opts.provider.id == "codex"
-        && opts.provider_binary.is_none()
-        && opts.npx_fallback_binary.is_some()
-        && opts.npx_fallback_package.is_some()
-    {
+    // binary (#555). Applies after the captured-env merge above, so a captured
+    // login-shell value is stripped too. Resolved binaries (providers.paths /
+    // PATH scan) keep the daemon env untouched.
+    if opts.provider.id == "codex" && via_npx {
         cmd.env_remove("CODEX_PATH");
         cmd.env_remove("CODEX_CONFIG");
     }
@@ -716,6 +776,58 @@ mod build_command_tests {
             .any(|(k, v)| k == key && v.is_none())
     }
 
+    /// The explicitly-set value of `key` on `cmd`, if any.
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn build_command_applies_heap_cap_on_codex_npx_fallback() {
+        // codex is declared Native (Rust binary), but the npx-fallback child
+        // is Node — the STAB-50 heap cap must apply (intent-hq/monorepo#1661).
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        let node_options = env_value(&cmd, "NODE_OPTIONS");
+        if std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size")) {
+            // An inherited cap wins: injection is (correctly) skipped.
+            assert!(
+                node_options.is_none(),
+                "inherited --max-old-space-size must suppress injection"
+            );
+        } else {
+            let v = node_options.expect("npx-fallback codex spawn must set NODE_OPTIONS");
+            assert!(
+                v.contains("--max-old-space-size="),
+                "NODE_OPTIONS must carry the heap cap, got: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_command_no_heap_cap_on_codex_resolved_binary() {
+        // The resolved native codex-acp binary is not V8: no NODE_OPTIONS.
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.provider_binary = Some(&provider_binary);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        assert!(
+            env_value(&cmd, "NODE_OPTIONS").is_none(),
+            "resolved-binary codex spawn must not inject NODE_OPTIONS"
+        );
+    }
+
     #[test]
     fn build_command_strips_codex_env_on_npx_fallback_spawn() {
         // The pinned npx fallback is daemon-managed: a stray CODEX_PATH /
@@ -774,5 +886,135 @@ mod build_command_tests {
             !touched,
             "non-codex npx spawns must not touch CODEX_PATH/CODEX_CONFIG"
         );
+    }
+}
+
+#[cfg(test)]
+mod captured_env_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The explicit env entry for `key` on `cmd`, if any (`None` also when the
+    /// entry is an `env_remove` marker).
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    /// A var name guaranteed absent from this process's env.
+    fn absent_var_name() -> String {
+        let name = format!(
+            "INTENT_TEST_CAPTURED_{}",
+            uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+        );
+        assert!(std::env::var_os(&name).is_none());
+        name
+    }
+
+    #[test]
+    fn captured_var_gap_fills_when_absent_everywhere() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let opts = SpawnOptions::new(provider);
+        let name = absent_var_name();
+        let mut captured = BTreeMap::new();
+        captured.insert(name.clone(), "captured-value".to_string());
+        let cmd = build_command_with_captured_env(&opts, &captured);
+        assert_eq!(env_value(&cmd, &name).as_deref(), Some("captured-value"));
+    }
+
+    #[test]
+    fn captured_var_never_overrides_daemon_process_env() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let opts = SpawnOptions::new(provider);
+        // Pick a var actually present in the daemon (test process) env that
+        // the command does not already set explicitly (provider env / PATH).
+        // Restricted to stable well-known names: scanning all of
+        // `std::env::vars()` can race sibling tests that mutate process env
+        // (e.g. session.rs's INTENTD_PROMPT_IDLE_TIMEOUT_MS guard).
+        let baseline = build_command_with_captured_env(&opts, &BTreeMap::new());
+        let preset: std::collections::HashSet<String> = baseline
+            .as_std()
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        let present = ["HOME", "USER", "TMPDIR", "SHELL", "PWD", "LOGNAME"]
+            .into_iter()
+            .find(|k| std::env::var_os(k).is_some() && !preset.contains(*k))
+            .expect("process env has at least one stable var the command leaves alone")
+            .to_string();
+        let mut captured = BTreeMap::new();
+        captured.insert(present.clone(), "captured-must-lose".to_string());
+        let cmd = build_command_with_captured_env(&opts, &captured);
+        assert!(
+            !cmd.as_std()
+                .get_envs()
+                .any(|(k, _)| k.to_string_lossy() == present),
+            "a var already in the daemon's process env must be inherited, not set from the capture"
+        );
+    }
+
+    #[test]
+    fn provider_env_wins_over_captured() {
+        // OPENCODE_CONFIG_CONTENT is both provider-built (opencode always
+        // emits it) and on the capture allow-list (OPENCODE_ prefix) — the
+        // provider-built value must win.
+        let provider = intent_providers::find_provider("opencode").unwrap();
+        let opts = SpawnOptions::new(provider);
+        let mut captured = BTreeMap::new();
+        captured.insert(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "captured-must-lose".to_string(),
+        );
+        let cmd = build_command_with_captured_env(&opts, &captured);
+        let value = env_value(&cmd, "OPENCODE_CONFIG_CONTENT")
+            .expect("opencode provider env sets OPENCODE_CONFIG_CONTENT");
+        assert_ne!(value, "captured-must-lose");
+        serde_json::from_str::<serde_json::Value>(&value)
+            .expect("provider-built config must win and stay valid JSON");
+    }
+
+    #[test]
+    fn extra_env_wins_over_captured() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.extra_env
+            .insert("ANTHROPIC_API_KEY".to_string(), "from-extra".to_string());
+        let mut captured = BTreeMap::new();
+        captured.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "captured-must-lose".to_string(),
+        );
+        let cmd = build_command_with_captured_env(&opts, &captured);
+        assert_eq!(
+            env_value(&cmd, "ANTHROPIC_API_KEY").as_deref(),
+            Some("from-extra")
+        );
+    }
+
+    #[test]
+    fn codex_env_remove_strips_captured_values_on_npx_fallback() {
+        // The #555 hatch runs after the captured-env merge: even a captured
+        // login-shell CODEX_PATH / CODEX_CONFIG must be removed from the
+        // daemon-managed npx fallback spawn.
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let mut captured = BTreeMap::new();
+        captured.insert("CODEX_PATH".to_string(), "/tmp/evil".to_string());
+        captured.insert("CODEX_CONFIG".to_string(), "/tmp/evil.toml".to_string());
+        let cmd = build_command_with_captured_env(&opts, &captured);
+        for key in ["CODEX_PATH", "CODEX_CONFIG"] {
+            assert!(
+                cmd.as_std()
+                    .get_envs()
+                    .any(|(k, v)| k == key && v.is_none()),
+                "{key} must be env_remove'd from the npx-fallback codex spawn even when captured"
+            );
+        }
     }
 }

@@ -10843,6 +10843,7 @@ async fn seed_active_pr_monitor(
         pr_number,
         state: intent_core::PrMonitorState::Active,
         last_snapshot: None,
+        baseline_snapshot: None,
         pending_changes: Vec::new(),
         pending_since: None,
         last_change_at: None,
@@ -19385,6 +19386,105 @@ async fn agent_lite_last_message_role_follows_newest_message() {
     assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
 }
 
+/// `lastMessageId` derivation across both projection paths (monorepo#1597):
+/// omitted on an empty transcript, tracks the newest user/assistant message
+/// id (system tails are transparent), recomputed by `agent.replaceMessages`,
+/// and — unlike `lastMessageRole` — never overlaid mid-turn: while a turn is
+/// streaming it stays on the last persisted user/assistant row.
+#[tokio::test]
+async fn agent_lite_last_message_id_follows_newest_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "IdTracker").await;
+
+    // Empty transcript: field omitted on the wire.
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id, None);
+    let v = serde_json::to_value(&got).unwrap();
+    assert!(
+        v.get("lastMessageId").is_none(),
+        "field omitted when absent: {v}"
+    );
+
+    let append = |role: &'static str, text: &'static str| {
+        let svc = &svc;
+        let id = id.clone();
+        async move {
+            svc.store()
+                .append_agent_message(
+                    &id,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append")
+        }
+    };
+    let user_msg = append("user", "first ask").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(user_msg.id.as_str()));
+
+    let reply = append("assistant", "reply").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(reply.id.as_str()));
+
+    let follow_up = append("user", "follow-up").await;
+    append("system", "system tail").await;
+    svc.invalidate_agent_list_cache(&ws);
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_message_id.as_deref(),
+        Some(follow_up.id.as_str()),
+        "system tail is transparent"
+    );
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(
+        listed.last_message_id.as_deref(),
+        Some(follow_up.id.as_str())
+    );
+
+    // No live-turn overlay: mid-turn with derivable streamed text, the role
+    // flips to "assistant" but the id stays on the last persisted
+    // user/assistant row until the assistant row persists.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "First line done\npartial tail",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
+    assert_eq!(
+        got.last_message_id.as_deref(),
+        Some(follow_up.id.as_str()),
+        "mid-turn the id stays on the persisted row"
+    );
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+
+    // replaceMessages recomputes: the id lands on the replacement batch's
+    // newest user/assistant row.
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "user", "content": [{ "type": "text", "text": "first ask" }] },
+            { "role": "assistant", "content": [{ "type": "text", "text": "reply" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let newest = session.messages.last().expect("replaced rows");
+    assert_eq!(newest.role, "assistant");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(newest.id.as_str()));
+}
+
 /// Live-turn overlay flip (intentd#786/#792): mid-turn, `lastMessageRole`
 /// stays on the persisted value ("user") until the in-flight turn has
 /// derivable streamed text — the same gate as the live `lastAgentResponse`
@@ -20269,7 +20369,7 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         session.dismissed_questions_message_id(),
         Some(asked.id.as_str())
     );
-    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
         lite.metadata.dismissed_questions_message_id.as_deref(),
         Some(asked.id.as_str())
@@ -20739,7 +20839,7 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
     // the AgentLite metadata projection.
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
-    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
         lite.metadata.last_seen_message_id.as_deref(),
         Some(seen.id.as_str())

@@ -9,9 +9,15 @@
 //! is not (yet) bit-for-bit identical.
 //! Reuses the process-group leader + `kill_on_drop` discipline (`mcp_servers` /
 //! `intent-acp::spawn`) so a `timeoutMs` reaps the whole tree (no orphaned
-//! grandchildren). PATH is enriched via `intent_providers::enhanced_path` and
-//! user-supplied `env` merges on top. Secret-safe: no env values are logged or
-//! returned; only stdout/stderr/exitCode/timedOut cross the wire.
+//! grandchildren). The child env is assembled with a strict precedence:
+//! caller-supplied `env` wins, then the daemon's own process env (a var
+//! already set in `std::env` is never overridden), and allow-listed
+//! credential vars captured from the login shell
+//! (`intent_core::path_utils::login_shell_credential_env`) fill gaps only.
+//! PATH is enriched via `intent_providers::enhanced_path` (caller `env["PATH"]`
+//! still wins). Secret-safe: no env values — captured or otherwise — are ever
+//! logged, traced, or returned; only stdout/stderr/exitCode/timedOut cross
+//! the wire.
 //!
 //! This is a one-shot primitive: long-lived / streaming processes stay on the
 //! `script.*` / `terminal.*` surface (§5.8, §12).
@@ -283,14 +289,37 @@ fn cwd_within_root(root: &Path, full: &Path) -> bool {
 
 /// Assemble the tokio `Command` for a validated exec request. Pipes stdio,
 /// sets `kill_on_drop`, puts the child in its own process group (unix), and
-/// merges the caller's `env` on top of an enhanced PATH. Exposed for tests.
+/// assembles the child env per the precedence contract in the module doc
+/// (caller `env` > daemon process env > captured login-shell credential vars;
+/// enhanced PATH with caller `env["PATH"]` winning). Exposed for tests.
 pub fn build_command(args: &HostExecArgs, cwd_resolved: Option<&Path>) -> Command {
+    build_command_with_captured(
+        args,
+        cwd_resolved,
+        intent_core::path_utils::login_shell_credential_env(),
+    )
+}
+
+/// Injectable core of [`build_command`]: `captured` is the login-shell
+/// credential env map. Production passes the process-global cached capture;
+/// tests inject a fake map so they never spawn a real shell.
+fn build_command_with_captured(
+    args: &HostExecArgs,
+    cwd_resolved: Option<&Path>,
+    captured: &BTreeMap<String, String>,
+) -> Command {
     let mut cmd = Command::new(&args.command);
     cmd.args(&args.args);
     if let Some(dir) = cwd_resolved {
         cmd.current_dir(dir);
     }
-    // Enrich PATH first so a user-supplied `env["PATH"]` still wins if provided.
+    // Captured login-shell credential vars fill gaps only: a var already in
+    // the daemon's own process env is inherited untouched, and the caller's
+    // `env` (applied last, below) still wins.
+    for (k, v) in captured_env_to_apply(captured, &args.env, |k| std::env::var_os(k).is_some()) {
+        cmd.env(k, v);
+    }
+    // Enrich PATH so a user-supplied `env["PATH"]` still wins if provided.
     cmd.env("PATH", enhanced_path(None));
     for (k, v) in &args.env {
         cmd.env(k, v);
@@ -302,6 +331,23 @@ pub fn build_command(args: &HostExecArgs, cwd_resolved: Option<&Path>) -> Comman
     #[cfg(unix)]
     cmd.process_group(0);
     cmd
+}
+
+/// Select which captured login-shell credential vars to apply to a spawn:
+/// only those absent from BOTH the caller's `env` map and the daemon's own
+/// process env (probed via `daemon_env_has`). Pure so tests can drive the
+/// precedence contract without a real shell or process-env mutation.
+/// SECRET SAFETY: values are credentials — never log or serialize them.
+fn captured_env_to_apply<'a>(
+    captured: &'a BTreeMap<String, String>,
+    caller_env: &BTreeMap<String, String>,
+    daemon_env_has: impl Fn(&str) -> bool,
+) -> Vec<(&'a str, &'a str)> {
+    captured
+        .iter()
+        .filter(|(k, _)| !caller_env.contains_key(k.as_str()) && !daemon_env_has(k))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect()
 }
 
 /// Signal a whole process group by its leader pid (pgid == pid via
@@ -555,5 +601,105 @@ mod tests {
     fn node_resolve_absolute_rel_wins() {
         let full = node_resolve("/tmp/ws", "/other/abs").unwrap();
         assert_eq!(full, PathBuf::from("/other/abs"));
+    }
+
+    fn btree(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn captured_env_fills_gap_when_absent_everywhere() {
+        let captured = btree(&[("CODEX_TEST_FAKE", "from-shell")]);
+        let caller = BTreeMap::new();
+        let applied = captured_env_to_apply(&captured, &caller, |_| false);
+        assert_eq!(applied, vec![("CODEX_TEST_FAKE", "from-shell")]);
+    }
+
+    #[test]
+    fn captured_env_never_overrides_daemon_env() {
+        let captured = btree(&[
+            ("CODEX_TEST_FAKE", "from-shell"),
+            ("CODEX_TEST_OTHER", "fills-gap"),
+        ]);
+        let caller = BTreeMap::new();
+        let applied = captured_env_to_apply(&captured, &caller, |k| k == "CODEX_TEST_FAKE");
+        assert_eq!(applied, vec![("CODEX_TEST_OTHER", "fills-gap")]);
+    }
+
+    #[test]
+    fn caller_env_suppresses_captured_var() {
+        let captured = btree(&[("CODEX_TEST_FAKE", "from-shell")]);
+        let caller = btree(&[("CODEX_TEST_FAKE", "caller-wins")]);
+        let applied = captured_env_to_apply(&captured, &caller, |_| false);
+        assert!(applied.is_empty(), "caller env suppresses captured var");
+    }
+
+    /// Collect the explicitly-set env of a built command for assertions.
+    fn cmd_envs(cmd: &Command) -> BTreeMap<String, String> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_str()?.to_string(),
+                    v?.to_str().unwrap_or_default().to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_command_applies_captured_under_caller_env() {
+        // Var names chosen to be absent from any real process env so the
+        // std::env probe inside the builder sees a genuine gap.
+        let args = HostExecArgs {
+            command: "echo".to_string(),
+            args: vec![],
+            cwd: None,
+            env: btree(&[("INTENT_TEST_OVERRIDDEN", "caller-wins")]),
+            timeout_ms: None,
+            workspace_id: None,
+        };
+        let captured = btree(&[
+            ("INTENT_TEST_CAPTURED", "from-shell"),
+            ("INTENT_TEST_OVERRIDDEN", "from-shell"),
+        ]);
+        let cmd = build_command_with_captured(&args, None, &captured);
+        let envs = cmd_envs(&cmd);
+        assert_eq!(
+            envs.get("INTENT_TEST_CAPTURED").map(String::as_str),
+            Some("from-shell")
+        );
+        assert_eq!(
+            envs.get("INTENT_TEST_OVERRIDDEN").map(String::as_str),
+            Some("caller-wins"),
+            "caller env wins over captured"
+        );
+    }
+
+    #[test]
+    fn build_command_captured_path_never_clobbers_enhanced_path() {
+        // PATH is always present in the daemon's process env (and cargo
+        // test's), so a captured PATH is filtered out and the enhanced PATH
+        // set by the builder survives.
+        assert!(std::env::var_os("PATH").is_some(), "test env has PATH");
+        let args = HostExecArgs {
+            command: "echo".to_string(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            workspace_id: None,
+        };
+        let captured = btree(&[("PATH", "/captured/only")]);
+        let cmd = build_command_with_captured(&args, None, &captured);
+        let envs = cmd_envs(&cmd);
+        assert_ne!(
+            envs.get("PATH").map(String::as_str),
+            Some("/captured/only"),
+            "captured PATH must not clobber the enhanced PATH"
+        );
     }
 }

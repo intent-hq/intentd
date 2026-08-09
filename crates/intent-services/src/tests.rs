@@ -22892,6 +22892,123 @@ mod provider_discovery_payload {
             "invalid overrides must behave exactly like no overrides"
         );
     }
+
+    /// monorepo#1662: the pi row carries the `pi` CLI verdict fields, and
+    /// only the pi row does. Field-consistency assertions run against a
+    /// single payload snapshot (the live host's CLI state varies).
+    #[test]
+    fn pi_row_carries_cli_verdict_fields() {
+        let payload = crate::discover_providers_with_npx();
+        let entries = payload["providers"].as_array().expect("providers array");
+        for entry in entries {
+            if entry["id"] != "pi" || entry.get("gatedOff").is_some() {
+                assert!(
+                    entry.get("cliCommand").is_none()
+                        && entry.get("cliResolved").is_none()
+                        && entry.get("cliResolvedPath").is_none()
+                        && entry.get("cliVersion").is_none()
+                        && entry.get("cliVersionOk").is_none()
+                        && entry.get("cliRequirement").is_none()
+                        && entry.get("unavailableReason").is_none(),
+                    "only the probed pi row carries CLI fields: {entry}"
+                );
+                continue;
+            }
+            assert!(entry["cliCommand"].is_string(), "{entry}");
+            assert!(entry["cliResolved"].is_boolean(), "{entry}");
+            assert!(entry["cliVersionOk"].is_boolean(), "{entry}");
+            assert_eq!(
+                entry["cliRequirement"],
+                intent_providers::PI_CLI_REQUIREMENT,
+                "{entry}"
+            );
+            if entry["cliResolved"] == false {
+                assert!(
+                    entry.get("cliResolvedPath").is_none() && entry.get("cliVersion").is_none(),
+                    "unresolved CLI must omit path/version: {entry}"
+                );
+            }
+            // A gating verdict forces installed=false and names the reason.
+            if entry.get("unavailableReason").is_some() {
+                assert_eq!(entry["installed"], false, "{entry}");
+                assert_eq!(entry["cliVersionOk"], false, "{entry}");
+            }
+        }
+    }
+
+    /// The pure gate-to-fields mapping (`apply_pi_cli_fields`): Missing and
+    /// TooOld gate the row off with an actionable reason; Ok and Unknown are
+    /// permissive (Unknown logs a WARN instead of gating).
+    #[test]
+    fn pi_cli_fields_mapping_covers_all_gates() {
+        use crate::pi_cli::PiCliStatus;
+        use intent_providers::PiCliGate;
+
+        let apply = |status: &PiCliStatus| {
+            let mut obj = serde_json::Map::new();
+            let mut installed = true;
+            crate::apply_pi_cli_fields(&mut obj, &mut installed, status);
+            (serde_json::Value::Object(obj), installed)
+        };
+
+        let missing = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: None,
+            version_output: None,
+            gate: PiCliGate::Missing,
+        };
+        let (obj, installed) = apply(&missing);
+        assert!(!installed, "{obj}");
+        assert_eq!(obj["cliResolved"], false, "{obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        let reason = obj["unavailableReason"].as_str().unwrap();
+        assert!(
+            reason.contains(intent_providers::PI_CLI_REQUIREMENT),
+            "{obj}"
+        );
+
+        let too_old = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("0.79.0".into()),
+            gate: PiCliGate::TooOld("0.79.0".into()),
+        };
+        let (obj, installed) = apply(&too_old);
+        assert!(!installed, "{obj}");
+        assert_eq!(obj["cliResolved"], true, "{obj}");
+        assert_eq!(obj["cliResolvedPath"], "/usr/local/bin/pi", "{obj}");
+        assert_eq!(obj["cliVersion"], "0.79.0", "{obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        assert!(
+            obj["unavailableReason"]
+                .as_str()
+                .unwrap()
+                .contains("0.79.0"),
+            "{obj}"
+        );
+
+        let ok = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("0.80.4".into()),
+            gate: PiCliGate::Ok,
+        };
+        let (obj, installed) = apply(&ok);
+        assert!(installed, "{obj}");
+        assert_eq!(obj["cliVersionOk"], true, "{obj}");
+        assert!(obj.get("unavailableReason").is_none(), "{obj}");
+
+        let unknown = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("garbage".into()),
+            gate: PiCliGate::Unknown,
+        };
+        let (obj, installed) = apply(&unknown);
+        assert!(installed, "Unknown must stay permissive: {obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        assert!(obj.get("unavailableReason").is_none(), "{obj}");
+    }
 }
 
 /// `workspace.create` parent-dir resolution: startup pin > non-empty

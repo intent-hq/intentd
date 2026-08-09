@@ -754,6 +754,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         last_agent_response: None,
         last_user_message: None,
         last_message_role: None,
+        last_message_id: None,
         digest: None,
         context_references: None,
         image_blocks: None,

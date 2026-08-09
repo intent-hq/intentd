@@ -50,13 +50,16 @@ async fn mints_client_id_when_omitted() {
     );
     assert_eq!(
         resp["result"]["protocolVersion"],
-        json!("6.1"),
+        json!(crate::protocol::PROTOCOL_VERSION),
         "explicit top-level protocolVersion in the hello result"
     );
     let server = &resp["result"]["server"];
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(server["version"], json!(env!("CARGO_PKG_VERSION")));
-    assert_eq!(server["protocolVersion"], json!("6.1"));
+    assert_eq!(
+        server["protocolVersion"],
+        json!(crate::protocol::PROTOCOL_VERSION)
+    );
     assert!(
         server["osArch"].as_str().unwrap().contains('/'),
         "osArch is os/arch"
@@ -83,7 +86,10 @@ async fn re_presents_persisted_id_and_is_idempotent() {
     let r1 = parsed(handle(req(1), &api, &mut binding, false).await);
     assert_eq!(r1["result"]["clientId"], json!("cli-7f3a"));
     assert_eq!(binding.as_ref().unwrap().0, "cli-7f3a");
-    assert_eq!(r1["result"]["protocolVersion"], json!("6.1"));
+    assert_eq!(
+        r1["result"]["protocolVersion"],
+        json!(crate::protocol::PROTOCOL_VERSION)
+    );
     assert_eq!(r1["result"]["server"]["locality"], json!("remote"));
     // Re-sending updates name/capabilities and re-returns the same server block.
     let r2 = parsed(handle(req(2), &api, &mut binding, false).await);

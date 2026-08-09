@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
-use super::git_metadata_watcher::GitMetadataWatcher;
+use super::git_metadata_watcher::{GitCommonDirWatches, GitMetadataWatcher};
 use super::git_status_refresher::GitStatusRefresher;
 use super::shared_watch::SharedWatchHub;
 use super::skills_watcher::SkillsWatcher;
@@ -48,6 +48,10 @@ pub struct WatcherRegistry {
     /// owns the hub for production purposes.
     #[cfg(test)]
     hub: Arc<SharedWatchHub>,
+    /// Retained only so tests can assert the shared common-dir refcount; the
+    /// lifecycle task owns the registry for production purposes.
+    #[cfg(test)]
+    git_common: Arc<GitCommonDirWatches>,
 }
 
 impl Drop for WatcherRegistry {
@@ -103,6 +107,9 @@ impl WatcherRegistry {
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
         let hub = SharedWatchHub::new();
+        // Shared common-dir watches for linked-worktree workspaces: one watch
+        // per repo, fanned out to every worktree workspace (monorepo#1663).
+        let git_common = GitCommonDirWatches::new();
 
         let mut file_watchers: HashMap<WorkspaceId, FileWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
@@ -116,9 +123,14 @@ impl WatcherRegistry {
 
         let mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
-            if let Some(w) =
-                start_git_metadata_watch(&hub, &refresher, ws_id.clone(), path.clone(), "")
-            {
+            if let Some(w) = start_git_metadata_watch(
+                &hub,
+                &git_common,
+                &refresher,
+                ws_id.clone(),
+                path.clone(),
+                "",
+            ) {
                 git_watchers.insert(ws_id.clone(), w);
             }
         }
@@ -131,6 +143,7 @@ impl WatcherRegistry {
 
         let task = tokio::spawn(lifecycle_loop(
             Arc::clone(&hub),
+            Arc::clone(&git_common),
             bus,
             services,
             refresher,
@@ -144,6 +157,8 @@ impl WatcherRegistry {
             task,
             #[cfg(test)]
             hub,
+            #[cfg(test)]
+            git_common,
         }
     }
 
@@ -170,18 +185,32 @@ impl WatcherRegistry {
     fn stream_count(&self) -> usize {
         self.hub.stream_count()
     }
+
+    /// Live shared common-dir watch count — the linked-worktree refcount
+    /// metric.
+    #[cfg(test)]
+    fn common_dir_watch_count(&self) -> usize {
+        self.git_common.watch_count()
+    }
 }
 
 /// Start the `.git` metadata watch for one workspace, logging the outcome.
 /// `None` covers the quiet non-git case.
 fn start_git_metadata_watch(
     hub: &Arc<SharedWatchHub>,
+    common_watches: &Arc<GitCommonDirWatches>,
     refresher: &Arc<GitStatusRefresher>,
     ws_id: WorkspaceId,
     path: PathBuf,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
-    match GitMetadataWatcher::start(hub, Arc::clone(refresher), ws_id.clone(), path.clone()) {
+    match GitMetadataWatcher::start(
+        hub,
+        common_watches,
+        Arc::clone(refresher),
+        ws_id.clone(),
+        path.clone(),
+    ) {
         Some(w) => {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
             Some(w)
@@ -198,6 +227,7 @@ fn start_git_metadata_watch(
 #[allow(clippy::too_many_arguments)]
 fn start_watches(
     hub: &Arc<SharedWatchHub>,
+    common_watches: &Arc<GitCommonDirWatches>,
     bus: &EventBus,
     refresher: &Arc<GitStatusRefresher>,
     file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
@@ -211,9 +241,14 @@ fn start_watches(
         ws_id.clone(),
         FileWatcher::start(hub, bus.clone(), ws_id.clone(), path.to_path_buf()),
     );
-    if let Some(w) =
-        start_git_metadata_watch(hub, refresher, ws_id.clone(), path.to_path_buf(), suffix)
-    {
+    if let Some(w) = start_git_metadata_watch(
+        hub,
+        common_watches,
+        refresher,
+        ws_id.clone(),
+        path.to_path_buf(),
+        suffix,
+    ) {
         git_watchers.insert(ws_id.clone(), w);
     }
 }
@@ -248,6 +283,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_loop(
     hub: Arc<SharedWatchHub>,
+    common_watches: Arc<GitCommonDirWatches>,
     bus: EventBus,
     services: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
@@ -268,6 +304,7 @@ async fn lifecycle_loop(
                     };
                     start_watches(
                         &hub,
+                        &common_watches,
                         &bus,
                         &refresher,
                         &mut file_watchers,
@@ -319,6 +356,7 @@ async fn lifecycle_loop(
                         };
                         start_watches(
                             &hub,
+                            &common_watches,
                             &bus,
                             &refresher,
                             &mut file_watchers,
@@ -908,6 +946,233 @@ mod tests {
         assert!(
             ev.is_some(),
             "unarchived workspace must resume emitting file events"
+        );
+    }
+
+    /// Poll the registry's shared common-dir watch count until it reaches
+    /// `want` (the guard drop runs inside the lifecycle task, so the count
+    /// changes shortly after — not synchronously with — the archive event).
+    async fn wait_for_common_dir_watch_count(registry: &WatcherRegistry, want: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while registry.common_dir_watch_count() != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry.common_dir_watch_count(),
+            want,
+            "shared common-dir watch count must reach {want}"
+        );
+    }
+
+    /// Archive/unarchive lifecycle against the refcounted common-dir registry
+    /// (monorepo#1663): archiving a linked-worktree workspace deregisters it
+    /// from the shared common-dir watch (last one out tears the watch down)
+    /// and common-dir ref changes stop triggering it; unarchiving re-registers
+    /// it and triggers resume.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn archived_worktree_workspace_releases_common_dir_watch_and_unarchive_rearms_it() {
+        use git2::{Repository, Signature};
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, _file_sub) = bus_and_sub().await;
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+
+        // Main repo with a seed commit, plus a linked worktree — the
+        // workspace root is the worktree, so its `.git` is a gitdir pointer.
+        let main_root = TempDir::new("wt-arch-main");
+        let repo = Repository::init(&main_root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(main_root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        let wt_parent = TempDir::new("wt-arch-linked");
+        let wt_path = wt_parent.path.join("wt");
+        repo.worktree("wt", &wt_path, None).unwrap();
+
+        let mut ws = test_workspace("ws-wt-archived", &wt_path);
+        ws.worktree_path = ws.path.clone();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &wt_path, true).await;
+        assert_eq!(
+            registry.common_dir_watch_count(),
+            1,
+            "worktree workspace must register on the shared common-dir watch"
+        );
+
+        // Confirm the common-dir watch actually delivers BEFORE archiving —
+        // the while-archived absence assertion below would otherwise pass
+        // vacuously against a watch that never worked. Retried for the same
+        // delivery-start race as the other real-watcher tests.
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ev = None;
+        for i in 0..20 {
+            repo.branch(&format!("pre-archive-{i}"), &head_commit, true)
+                .unwrap();
+            ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        assert!(
+            ev.is_some(),
+            "common-dir ref change must refresh the worktree workspace before archiving"
+        );
+        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
+            .await
+            .is_some()
+        {}
+
+        // Archive: the watcher drop must deregister the workspace — it was
+        // the only rider, so the shared watch tears down entirely.
+        bus.publish(&archive_event(&ws, true))
+            .await
+            .expect("publish archived");
+        wait_for_root(&registry, &wt_path, false).await;
+        wait_for_common_dir_watch_count(&registry, 0).await;
+
+        // A common-dir ref change while archived must not trigger anything.
+        // Drain whatever the archive transition itself had in flight first.
+        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
+            .await
+            .is_some()
+        {}
+        repo.branch("while-archived", &head_commit, true).unwrap();
+        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2)).await;
+        assert!(
+            ev.is_none(),
+            "archived worktree workspace must not refresh on common-dir ref changes, got {ev:?}"
+        );
+
+        // Unarchive: the watcher restart must re-register the workspace.
+        bus.publish(&archive_event(&ws, false))
+            .await
+            .expect("publish unarchived");
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+        // Drain the unarchive catch-up refresh so it cannot masquerade as the
+        // watch-driven event asserted below.
+        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
+            .await
+            .is_some()
+        {}
+
+        // Common-dir ref changes trigger again. Retried for the same
+        // delivery-start race as the other real-watcher tests.
+        let mut ev = None;
+        for i in 0..20 {
+            repo.branch(&format!("after-unarchive-{i}"), &head_commit, true)
+                .unwrap();
+            ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        assert!(
+            ev.is_some(),
+            "unarchived worktree workspace must resume refreshing on common-dir ref changes"
+        );
+    }
+
+    /// Watcher replacement must not orphan the common-dir registration
+    /// (PR #1048 review): a repeated `workspace:created` (e.g. a buffered
+    /// event replaying the startup snapshot) makes `start_watches` register a
+    /// NEW watcher and then drop the OLD one for the same workspace — whose
+    /// guard drop must not remove the successor's registration (per-guard
+    /// identity token). Ref changes must keep triggering after replacement.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn replacing_worktree_watcher_keeps_common_dir_registration_alive() {
+        use git2::{Repository, Signature};
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, _file_sub) = bus_and_sub().await;
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+
+        // Main repo with a seed commit, plus a linked worktree.
+        let main_root = TempDir::new("wt-replace-main");
+        let repo = Repository::init(&main_root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(main_root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        let wt_parent = TempDir::new("wt-replace-linked");
+        let wt_path = wt_parent.path.join("wt");
+        repo.worktree("wt", &wt_path, None).unwrap();
+
+        let mut ws = test_workspace("ws-wt-replaced", &wt_path);
+        ws.worktree_path = ws.path.clone();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+
+        // Replace the watcher: a buffered `workspace:created` repeating the
+        // startup snapshot. The new watcher registers on the shared entry
+        // first; HashMap::insert then drops the old watcher, whose guard drop
+        // must NOT deregister the fresh registration.
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish repeated created");
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+        // Drain any refresh in flight from the transition itself.
+        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
+            .await
+            .is_some()
+        {}
+
+        // Common-dir ref changes must still trigger for the workspace.
+        // Retried for the same delivery-start race as the other real-watcher
+        // tests.
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ev = None;
+        for i in 0..20 {
+            repo.branch(&format!("post-replace-{i}"), &head_commit, true)
+                .unwrap();
+            ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        assert!(
+            ev.is_some(),
+            "common-dir ref change must still refresh the workspace after watcher replacement"
         );
     }
 

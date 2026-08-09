@@ -202,6 +202,12 @@ pub struct SessionMessageProjection {
     /// `None` when the session has no user/assistant message — the wire
     /// field is omitted.
     pub last_message_role: Option<String>,
+    /// Row id of the session's newest user/assistant message, served from
+    /// the persisted `agent_session.last_message_id` column (0088)
+    /// maintained at message-write time alongside `last_message_role`.
+    /// Other roles (system/tool) are transparent. `None` when the session
+    /// has no user/assistant message — the wire field is omitted.
+    pub last_message_id: Option<String>,
 }
 
 /// Per-block character cap applied inside SQLite when extracting projection
@@ -282,7 +288,10 @@ fn decode_preview_col(raw: Option<String>) -> Option<Vec<String>> {
 /// stores `"[]"`, the projection form), `None` when the batch has no message
 /// of that role — matching the newest-row window query.
 /// `last_message_role` is the role of the batch's LAST user/assistant
-/// message (0070); other roles are transparent.
+/// message (0070); other roles are transparent. The batch insert loops track
+/// `last_message_id` (0088) inline with the same newest-user/assistant
+/// definition (ids are minted in-loop) — keep the two in sync if the
+/// transparent-role set ever changes.
 type OwnedBatchMessage = (String, serde_json::Value, Option<serde_json::Value>, String);
 fn batch_preview_col_values(
     messages: &[OwnedBatchMessage],
@@ -436,7 +445,8 @@ impl Store {
     /// `seq` values in slice order. Built for the legacy-transcript importer,
     /// whose idempotency check is session-id presence — a partially-persisted
     /// transcript would otherwise be skipped forever on re-runs. The session's
-    /// last-message preview columns (0066) are computed from the batch inside
+    /// last-message preview columns (0066), `last_message_role` (0070), and
+    /// `last_message_id` (0088) are computed from the batch inside
     /// the same transaction. Uses
     /// whole-transaction retry to absorb SQLITE_BUSY (code 5) during lock
     /// upgrade (STAB-7).
@@ -473,6 +483,7 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
             let insert_sql =
                 format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+            let mut last_message_id: Option<String> = None;
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let content_json = serde_json::to_string(content)
                     .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
@@ -482,8 +493,12 @@ impl Store {
                     })?),
                     None => None,
                 };
+                let id = Uuid::now_v7().to_string();
+                if role == "user" || role == "assistant" {
+                    last_message_id = Some(id.clone());
+                }
                 sqlx::query(&insert_sql)
-                    .bind(Uuid::now_v7().to_string())
+                    .bind(&id)
                     .bind(&s.id.0)
                     .bind(idx as i64)
                     .bind(role)
@@ -498,11 +513,12 @@ impl Store {
                 batch_preview_col_values(&owned_messages)?;
             sqlx::query(
                 "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
-                 last_message_role = ? WHERE id = ?",
+                 last_message_role = ?, last_message_id = ? WHERE id = ?",
             )
             .bind(assistant_preview.as_deref())
             .bind(user_preview.as_deref())
             .bind(last_message_role.as_deref())
+            .bind(last_message_id.as_deref())
             .bind(&s.id.0)
             .execute(&mut *tx)
             .await
@@ -685,7 +701,8 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
         let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
-            s.last_assistant_preview, s.last_user_preview, s.last_message_role \
+            s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
+            s.last_message_id \
             FROM agent_session s \
             LEFT JOIN agent_message m ON m.agent_id = s.id \
             WHERE s.workspace_id = ? \
@@ -708,6 +725,7 @@ impl Store {
                     ),
                     last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
                     last_message_role: row.get("last_message_role"),
+                    last_message_id: row.get("last_message_id"),
                 },
             );
         }
@@ -725,6 +743,7 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<SessionMessageProjection> {
         let sql = "SELECT s.last_assistant_preview, s.last_user_preview, s.last_message_role, \
+            s.last_message_id, \
             (SELECT COUNT(*) FROM agent_message m WHERE m.agent_id = s.id) AS message_count \
             FROM agent_session s WHERE s.id = ?";
         let Some(row) = sqlx::query(sql)
@@ -741,6 +760,7 @@ impl Store {
             last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview")),
             last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
             last_message_role: row.get("last_message_role"),
+            last_message_id: row.get("last_message_id"),
         })
     }
 
@@ -2068,9 +2088,11 @@ impl Store {
     ///
     /// The next-seq SELECT runs first in autocommit mode; the message INSERT
     /// then commits together with the matching `agent_session` last-message
-    /// preview column update (0066) in one write transaction — `user` and
+    /// preview column update (0066) — plus `last_message_role` (0070) and
+    /// `last_message_id` (0088) for user/assistant appends — in one write
+    /// transaction — `user` and
     /// `assistant` appends are by construction the session's newest message of
-    /// their role, so the column is overwritten unconditionally (other roles
+    /// their role, so the columns are overwritten unconditionally (other roles
     /// keep the bare INSERT). The schema enforces `UNIQUE(agent_id, seq)`, so
     /// concurrent appends racing on the SELECT phase will cause one INSERT to
     /// fail with a constraint violation.
@@ -2137,9 +2159,11 @@ impl Store {
                 let pool = self.write_pool();
                 // A user/assistant append is by construction the session's
                 // newest message of any role, so `last_message_role` (0070)
-                // is overwritten unconditionally alongside the preview.
+                // and `last_message_id` (0088) are overwritten unconditionally
+                // alongside the preview.
                 let update_sql = format!(
-                    "UPDATE agent_session SET {column} = ?, last_message_role = ? WHERE id = ?"
+                    "UPDATE agent_session SET {column} = ?, last_message_role = ?, \
+                     last_message_id = ? WHERE id = ?"
                 );
                 crate::with_write_txn_retry(|| async {
                     let mut tx = pool.begin().await.map_err(|e| {
@@ -2161,6 +2185,7 @@ impl Store {
                     sqlx::query(&update_sql)
                         .bind(value.as_str())
                         .bind(role)
+                        .bind(id)
                         .bind(&agent_id.0)
                         .execute(&mut *tx)
                         .await
@@ -2363,10 +2388,11 @@ impl Store {
     /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
     /// PROTOCOL §5.5). Callers are expected to reject busy sessions before
     /// invoking this (message-log mutations must not race an in-flight turn).
-    /// Both `agent_session` last-message preview columns (0066) and
-    /// `last_message_role` (0070) are recomputed from the replacement batch
-    /// inside the same transaction (NULL when the batch has no message of
-    /// that role / no user/assistant message).
+    /// Both `agent_session` last-message preview columns (0066),
+    /// `last_message_role` (0070), and `last_message_id` (0088) are
+    /// recomputed from the replacement batch inside the same transaction
+    /// (NULL when the batch has no message of that role / no user/assistant
+    /// message).
     /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_agent_messages(
@@ -2404,11 +2430,15 @@ impl Store {
                     Error::Internal(format!("replace agent messages clear failed: {e}"))
                 })?;
             let mut inserted = Vec::with_capacity(owned_messages.len());
+            let mut last_message_id: Option<String> = None;
             let insert_sql =
                 format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
             for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
                 let seq = idx as i64;
                 let id = Uuid::now_v7().to_string();
+                if role == "user" || role == "assistant" {
+                    last_message_id = Some(id.clone());
+                }
                 let content_json = serde_json::to_string(content).map_err(|e| {
                     Error::Internal(format!("encode replaced message content failed: {e}"))
                 })?;
@@ -2444,11 +2474,12 @@ impl Store {
             }
             sqlx::query(
                 "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ?, \
-                 last_message_role = ? WHERE id = ?",
+                 last_message_role = ?, last_message_id = ? WHERE id = ?",
             )
             .bind(assistant_preview.as_deref())
             .bind(user_preview.as_deref())
             .bind(last_message_role.as_deref())
+            .bind(last_message_id.as_deref())
             .bind(&agent_id.0)
             .execute(&mut *tx)
             .await
@@ -6699,6 +6730,317 @@ mod tests {
         assert_eq!(
             read_role_column(&store, &system_tail).await,
             Some("assistant".to_string()),
+            "column converges on next append"
+        );
+    }
+
+    /// Raw `last_message_id` column value for a session (0088).
+    async fn read_id_column(store: &Store, agent_id: &AgentId) -> Option<String> {
+        sqlx::query("SELECT last_message_id FROM agent_session WHERE id = ?")
+            .bind(&agent_id.0)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("read id column")
+            .get("last_message_id")
+    }
+
+    /// `last_message_id` (0088) is maintained at message-write time:
+    /// user/assistant appends stamp the appended row's id, other roles
+    /// (system/tool) are transparent, `replace_agent_messages` recomputes it
+    /// from the batch (NULL when the batch has no user/assistant message),
+    /// and the session-with-messages insert stamps the batch's newest
+    /// user/assistant row.
+    #[tokio::test]
+    async fn last_message_id_maintained_on_writes() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-id-writes".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-id-writes".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            None,
+            "fresh session has NULL id"
+        );
+
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        let user_msg = store
+            .append_agent_message(&agent_id, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            Some(user_msg.id.clone())
+        );
+
+        let assistant_msg = store
+            .append_agent_message(&agent_id, "assistant", &text("a1"), &ts)
+            .await
+            .expect("append assistant");
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            Some(assistant_msg.id.clone())
+        );
+
+        // System/tool appends are transparent: the id stays on the assistant
+        // row.
+        for role in ["system", "tool"] {
+            store
+                .append_agent_message(&agent_id, role, &text("noise"), &ts)
+                .await
+                .expect("append transparent role");
+        }
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            Some(assistant_msg.id.clone()),
+            "system/tool appends leave the id untouched"
+        );
+
+        // Replace recomputes from the batch: newest user/assistant row wins
+        // even with a trailing system row.
+        let batch = [
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("system", "tail"),
+        ]
+        .map(|(role, t)| (role, text(t)));
+        let replace: Vec<ReplaceMessage<'_>> = batch
+            .iter()
+            .map(|(role, content)| ReplaceMessage {
+                role,
+                content,
+                metadata: None,
+                created_at: &ts,
+            })
+            .collect();
+        let inserted = store
+            .replace_agent_messages(&agent_id, &replace)
+            .await
+            .expect("replace");
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            Some(inserted[2].id.clone()),
+            "replace stamps the batch's newest user/assistant row id"
+        );
+
+        store
+            .replace_agent_messages(&agent_id, &[])
+            .await
+            .expect("replace with empty batch");
+        assert_eq!(
+            read_id_column(&store, &agent_id).await,
+            None,
+            "empty batch clears the id"
+        );
+
+        // Both projection read paths serve the column.
+        let again = store
+            .append_agent_message(&agent_id, "user", &text("again"), &ts)
+            .await
+            .expect("append user again");
+        let per_session = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("per-session projection");
+        assert_eq!(per_session.last_message_id, Some(again.id.clone()));
+        let workspace = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("workspace projections");
+        assert_eq!(
+            workspace
+                .get(&agent_id.0)
+                .and_then(|p| p.last_message_id.clone()),
+            Some(again.id.clone())
+        );
+
+        // The session-with-messages insert stamps the batch's newest
+        // user/assistant row (the trailing system row is transparent). Ids
+        // are minted by the store, so assert against the reloaded rows.
+        let seeded = AgentId("agent-id-seeded".to_string());
+        let session = baseline_test_session(&seeded, &ws_id, &ts, None);
+        let seed_batch = [("user", "q1"), ("assistant", "a1"), ("system", "tail")]
+            .map(|(role, t)| (role, text(t)));
+        let seed_messages: Vec<ReplaceMessage<'_>> = seed_batch
+            .iter()
+            .map(|(role, content)| ReplaceMessage {
+                role,
+                content,
+                metadata: None,
+                created_at: &ts,
+            })
+            .collect();
+        store
+            .insert_agent_session_with_messages(&session, &seed_messages)
+            .await
+            .expect("insert seeded session");
+        let stamped = read_id_column(&store, &seeded).await;
+        let persisted = store
+            .get_agent_session(&seeded)
+            .await
+            .expect("reload seeded session");
+        assert_eq!(persisted.messages.len(), 3);
+        assert_eq!(
+            stamped.as_deref(),
+            Some(persisted.messages[1].id.as_str()),
+            "seeded insert stamps the newest user/assistant row id"
+        );
+    }
+
+    /// The 0088 migration backfill stamps `last_message_id` from the newest
+    /// user/assistant row (system tails are transparent), leaving NULL for
+    /// sessions with no such message; a NULL column left by a pre-0088
+    /// daemon (or any other cause) degrades to `None` on read without
+    /// repair — both projection paths never write to `agent_session`, and
+    /// the column converges only on the next user/assistant append.
+    #[tokio::test]
+    async fn last_message_id_backfill_and_degrades_without_repair() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-id-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let user_newest = AgentId("agent-id-user-newest".to_string());
+        let system_tail = AgentId("agent-id-system-tail".to_string());
+        let empty = AgentId("agent-id-empty".to_string());
+        let system_only = AgentId("agent-id-system-only".to_string());
+        for id in [&user_newest, &system_tail, &empty, &system_only] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        store
+            .append_agent_message(&user_newest, "assistant", &text("a"), &ts)
+            .await
+            .expect("append assistant");
+        let un_user = store
+            .append_agent_message(&user_newest, "user", &text("q"), &ts)
+            .await
+            .expect("append user");
+        store
+            .append_agent_message(&system_tail, "user", &text("q"), &ts)
+            .await
+            .expect("append user");
+        let st_assistant = store
+            .append_agent_message(&system_tail, "assistant", &text("a"), &ts)
+            .await
+            .expect("append assistant");
+        store
+            .append_agent_message(&system_tail, "system", &text("s"), &ts)
+            .await
+            .expect("append system");
+        store
+            .append_agent_message(&system_only, "system", &text("s"), &ts)
+            .await
+            .expect("append system");
+
+        // Recreate the pre-0088 shape and re-run the migration file
+        // verbatim: the backfill stamps from the newest user/assistant row.
+        sqlx::query("ALTER TABLE agent_session DROP COLUMN last_message_id")
+            .execute(store.write_pool())
+            .await
+            .expect("drop id column");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0088_agent_session_last_message_id.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0088 migration");
+
+        assert_eq!(
+            read_id_column(&store, &user_newest).await,
+            Some(un_user.id.clone())
+        );
+        assert_eq!(
+            read_id_column(&store, &system_tail).await,
+            Some(st_assistant.id.clone()),
+            "system tail is transparent to the backfill"
+        );
+        assert_eq!(read_id_column(&store, &empty).await, None);
+        assert_eq!(
+            read_id_column(&store, &system_only).await,
+            None,
+            "system-only transcript backfills to NULL"
+        );
+
+        // Wipe the column and read through both projection paths: a NULL
+        // column degrades to `None` without repair, even for a session with
+        // a qualifying (transparently-tailed) message, and neither read
+        // writes to `agent_session`.
+        sqlx::query("UPDATE agent_session SET last_message_id = NULL")
+            .execute(store.write_pool())
+            .await
+            .expect("wipe id column");
+        let per_session = store
+            .get_agent_session_message_projection(&system_tail)
+            .await
+            .expect("per-session read");
+        assert_eq!(
+            per_session.last_message_id, None,
+            "NULL column degrades to None without repair"
+        );
+        assert_eq!(
+            read_id_column(&store, &system_tail).await,
+            None,
+            "per-session read never writes to agent_session"
+        );
+        let workspace = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("workspace read");
+        assert_eq!(
+            workspace
+                .get(&user_newest.0)
+                .and_then(|p| p.last_message_id.clone()),
+            None,
+            "NULL column degrades to None for the workspace path too"
+        );
+        assert_eq!(
+            workspace
+                .get(&system_only.0)
+                .and_then(|p| p.last_message_id.clone()),
+            None,
+            "system-only session stays None"
+        );
+        assert_eq!(
+            read_id_column(&store, &user_newest).await,
+            None,
+            "workspace read never writes to agent_session"
+        );
+
+        // Convergence: a new user/assistant append stamps the column.
+        let converge = store
+            .append_agent_message(
+                &system_tail,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": "converge"}]),
+                &ts,
+            )
+            .await
+            .expect("append converging message");
+        assert_eq!(
+            read_id_column(&store, &system_tail).await,
+            Some(converge.id),
             "column converges on next append"
         );
     }

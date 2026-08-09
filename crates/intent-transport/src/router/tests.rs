@@ -938,6 +938,20 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn github_branches_list_cached(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "cached": true,
+                "branches": [owner, repo],
+                "defaultBranch": "main",
+            }))
+        })
+    }
+
     fn github_auth_status(&self) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async {
             Ok(serde_json::json!({
@@ -3710,6 +3724,25 @@ async fn github_branches_list_requires_owner_and_repo() {
     .unwrap();
     assert_eq!(ok["result"]["branches"], serde_json::json!(["o", "r"]));
     assert_eq!(ok["result"]["nextToken"], Value::Null);
+}
+
+#[tokio::test]
+async fn github_branches_list_cached_requires_owner_and_repo() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.listCached","params":{"owner":"o"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.listCached","params":{"owner":"o","repo":"r"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["result"]["cached"], serde_json::json!(true));
+    assert_eq!(ok["result"]["branches"], serde_json::json!(["o", "r"]));
+    assert_eq!(ok["result"]["defaultBranch"], serde_json::json!("main"));
 }
 
 #[tokio::test]

@@ -928,10 +928,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.33) reads to override the `pi` binary it spawns
-/// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
-/// `create_agent` points it at the generated wrapper script.
-const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
+use crate::pi_cli::{resolve_real_pi_command, PI_ACP_PI_COMMAND_ENV};
 
 /// Env var the bundled pi extension reads for the per-agent MCP bridge's
 /// loopback TCP address (`host:port`, see [`McpBridge::connect_addr`]).
@@ -1029,16 +1026,6 @@ fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
-/// daemon env (the value pi-acp itself would have used, which the wrapper
-/// override shadows) or `pi` from the child's PATH — pi-acp's own fallback.
-fn resolve_real_pi_command() -> String {
-    std::env::var(PI_ACP_PI_COMMAND_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "pi".to_string())
-}
-
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
 /// request loop, the owned child (its process group is killed on teardown via
@@ -1121,6 +1108,29 @@ const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(200);
 const HARNESS_WAKE_POLL: Duration = Duration::from_millis(50);
 
 type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
+
+/// RAII guard returned by [`AgentManager::stop_many`]: while alive, the swept
+/// agents stay in the manager's `stopping` set, fencing them off from the
+/// lazy-spawn paths (`ensure_started` / `create_agent`). The caller holds it
+/// across the store cascade that deletes the swept session rows, then drops
+/// it — after which the rows are gone and a spawn attempt fails `NotFound`
+/// on its own store read.
+#[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
+pub struct TeardownFence {
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
+    ids: Vec<AgentId>,
+}
+
+impl Drop for TeardownFence {
+    fn drop(&mut self) {
+        // Poison recovery mirrors the delete-path sweeps: unfencing is the
+        // last chance to keep the set from leaking these ids forever.
+        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            stopping.remove(id);
+        }
+    }
+}
 
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
@@ -1209,6 +1219,19 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents fenced off from the lazy-spawn paths because a batch teardown
+    /// ([`AgentManager::stop_many`]) is in flight and their session rows are
+    /// about to be cascade-deleted (`workspace.delete`). While an agent is in
+    /// this set, [`AgentManager::ensure_started`] refuses to (re)spawn it and
+    /// [`AgentManager::create_agent`] refuses to install a fresh handle —
+    /// otherwise a concurrent `agent.sendMessage` that passed its store check
+    /// before the sweep could lazily spawn a replacement child during the
+    /// shared grace wait, and that child would outlive its deleted session as
+    /// a ghost process no sweep ever kills. Armed by `stop_many` BEFORE the
+    /// first detach; cleared when the returned [`TeardownFence`] drops (after
+    /// the caller's store cascade, at which point the session row is gone and
+    /// the spawn path fails `NotFound` on its own).
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
     /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
     /// monorepo#878): started on demand when an `unsloth`-provider agent
     /// spawns, reused while the served model matches, restarted on model
@@ -1277,6 +1300,7 @@ impl AgentManager {
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
         }
     }
@@ -1486,6 +1510,17 @@ impl AgentManager {
         // pi process, so the spawn env routes pi-acp's pi spawn through a
         // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
+        //
+        // Fail fast before spawning when the `pi` CLI the wrapper would exec
+        // is missing or known-too-old for the pinned pi-acp adapter
+        // (monorepo#1662) — a clear error instead of a silent hang. The probe
+        // is blocking (subprocess, ≤3s budget), so it runs off the runtime.
+        if opts.provider.mcp_via_pi_extension {
+            let status = tokio::task::spawn_blocking(crate::pi_cli::probe_pi_cli)
+                .await
+                .map_err(|e| Error::Internal(format!("pi CLI probe task failed: {e}")))?;
+            crate::pi_cli::check_pi_cli_for_spawn(&status)?;
+        }
         let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup
@@ -1681,10 +1716,37 @@ impl AgentManager {
                 kill_child_tree(child, stale_pid).await;
             }
         }
-        self.handles
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), handle);
+        // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
+        // (`stop_many`) may have swept this agent AFTER the caller's session
+        // checks passed — installing the fresh handle now would leave a live
+        // child no sweep ever kills once the store cascade drops the session
+        // row. Check-and-insert under the `stopping` lock so the install is
+        // atomic against `stop_many` arming the fence: fence armed first →
+        // the install is refused here (fresh child killed below); handle
+        // installed first → `stop_many`'s detach finds it and kills it with
+        // the batch. Either interleaving leaves no orphaned process.
+        let fenced = {
+            let stopping = self.stopping.lock().unwrap();
+            if stopping.contains(&agent_id) {
+                Some(handle)
+            } else {
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), handle);
+                None
+            }
+        };
+        if let Some(mut handle) = fenced {
+            self.registry.deregister(&agent_id);
+            let spawn_pid = handle.child_pid;
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child, spawn_pid).await;
+            }
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // Proactive dead-child detection (monorepo#764): watch the installed
         // child for an unexpected exit so an idle agent's death is reaped
         // (handle + registry) as it happens, not just at the next prompt.
@@ -2756,6 +2818,55 @@ impl AgentManager {
             kill_child_tree(child, spawn_pid).await;
         }
         removed
+    }
+
+    /// Stop MANY agents under ONE shared grace window: detach each agent with
+    /// the exact [`AgentManager::stop`] per-agent semantics (partial-turn
+    /// flush, recreate/prepend flag cleanup, live-turn slot release, handle
+    /// removal, deregistration), collect the detached children, and kill all
+    /// process groups concurrently via [`kill_child_trees`] — total teardown
+    /// stays ~one [`PROCESS_GROUP_TERM_GRACE`] period regardless of agent
+    /// count, instead of N sequential SIGTERM→grace→SIGKILL cycles. This is
+    /// the `workspace.delete` sweep (same detach-many → kill_child_trees
+    /// pattern as `shutdown()`, minus the interrupted-session capture).
+    ///
+    /// NOTE: with exactly one agent this is NEARLY but not exactly
+    /// [`AgentManager::stop`]: `kill_child_trees` adds a bounded
+    /// [`KILL_SWEEP_REAP_GRACE`] post-SIGKILL reap window that
+    /// `kill_child_tree` does not (a SIGTERM-ignoring single child pays up
+    /// to ~grace + reap-grace and is properly `wait()`ed), and descendants
+    /// are snapshotted via one batched `ps` (`descendant_pids_many`).
+    ///
+    /// Returns a [`TeardownFence`] that keeps the swept agents fenced off
+    /// from the lazy-spawn paths until dropped: the caller must hold it
+    /// across the store cascade that deletes the session rows, so a
+    /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
+    /// child that would outlive its deleted session as a ghost process.
+    #[must_use = "hold the fence until the swept agents' session rows are deleted"]
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+        // Arm the fence BEFORE the first detach: from here on, every lazy
+        // spawn for a swept agent is refused (`ensure_started` fast-fail +
+        // the `create_agent` install fence), so no replacement child can
+        // slip in during the shared grace wait below.
+        self.stopping
+            .lock()
+            .unwrap()
+            .extend(agent_ids.iter().cloned());
+        let fence = TeardownFence {
+            stopping: Arc::clone(&self.stopping),
+            ids: agent_ids.to_vec(),
+        };
+        let mut children = Vec::new();
+        for id in agent_ids {
+            let (_, child) = self.detach(id).await;
+            if let Some(child) = child {
+                children.push(child);
+            }
+        }
+        if !children.is_empty() {
+            kill_child_trees(children).await;
+        }
+        fence
     }
 
     /// Shared teardown body of [`AgentManager::stop`]: abort the worker, drop
@@ -5048,6 +5159,19 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
+        // `workspace.delete` batch stop (`stop_many`) is tearing down — its
+        // session row is about to be cascade-deleted, so a lazy spawn here
+        // would create a child that outlives the row. NotFound is
+        // non-retryable for `retry_spawn`, so the turn fails fast instead of
+        // burning spawn attempts against a fence that will not lift. The
+        // install-time fence in `create_agent` closes the interleaving where
+        // this check passes just before the fence arms.
+        if self.stopping.lock().unwrap().contains(agent_id) {
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // A delegate with CoW isolation provisions the sandbox in a background
         // task, off the delegate critical path (monorepo#871). Await
         // settlement BEFORE reading the session so the child never spawns
@@ -8121,7 +8245,7 @@ mod role_reminder_tests {
         dir
     }
 
-    fn workspace(id: &WorkspaceId) -> Workspace {
+    pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         let ts = now_iso();
         Workspace {
             id: id.clone(),

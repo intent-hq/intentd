@@ -47,10 +47,13 @@
 //! Version 6.1 adds the PR-monitor FE surface (additive; §5.42):
 //! `prMonitor.list`, `prMonitor.cancel` and `prMonitor.flush` router methods
 //! backing the agent-side `ws.pr.monitor` engine, plus the `prMonitor:*`
-//! event category — 270 router methods, 307 total.
+//! event category — 270 router methods, 307 total. Version 6.2 adds
+//! `github.branches.listCached` (additive; §5.27): branch names read from
+//! the daemon's local repo cache with no network I/O — 271 router methods,
+//! 308 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.1";
+pub const PROTOCOL_VERSION: &str = "6.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
