@@ -14573,6 +14573,54 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
     assert_eq!(risk["severity"], json!("info"), "risk: {risk}");
 }
 
+/// monorepo#1694: a responding-but-STALE pending child (updated_at beyond the
+/// stale threshold) does not qualify for the `info` downgrade — the
+/// stuck-risk stays at the `warning` default.
+#[tokio::test]
+async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Active;
+    // Backdate well past DEFAULT_STALE_RESPONDING_AFTER_MS (10 min).
+    s.updated_at = "2020-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child responding but stale");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+}
+
 /// monorepo#1694: a pending child with NO grouped watch is the real failure
 /// the missing-check exists for — `subscriptionMissing: true` and a
 /// `critical` stuck-risk.
