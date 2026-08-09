@@ -6268,13 +6268,15 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
+    let mut newest_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
         } else {
             ("assistant", format!("reply {i}"))
         };
-        srv.store
+        newest_message_id = srv
+            .store
             .append_agent_message(
                 &agent,
                 role,
@@ -6282,7 +6284,8 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
                 &now_iso(),
             )
             .await
-            .expect("append message");
+            .expect("append message")
+            .id;
     }
 
     // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
@@ -6309,14 +6312,20 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         Some("assistant"),
         "newest seeded message is the assistant reply: {lite}"
     );
+    assert_eq!(
+        lite["lastMessageId"].as_str(),
+        Some(newest_message_id.as_str()),
+        "lastMessageId is the newest seeded row's id: {lite}"
+    );
     assert!(
         lite.get("messages").is_none(),
         "AgentLite carries no transcript: {lite}"
     );
 
-    // lastMessageRole on the wire for the awaiting-reply shape: a second
-    // agent whose only message is the user's serves "user"; a fresh agent
-    // with no messages omits the field entirely.
+    // lastMessageRole/lastMessageId on the wire for the awaiting-reply
+    // shape: a second agent whose only message is the user's serves "user"
+    // and that message's id; a fresh agent with no messages omits both
+    // fields entirely.
     let created2 = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6333,7 +6342,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         created2["result"]["agent"].get("lastMessageRole").is_none(),
         "no messages yet: field omitted: {created2}"
     );
-    srv.store
+    assert!(
+        created2["result"]["agent"].get("lastMessageId").is_none(),
+        "no messages yet: lastMessageId omitted: {created2}"
+    );
+    let user_only_msg = srv
+        .store
         .append_agent_message(
             &AgentId::from(agent2_id.as_str()),
             "user",
@@ -6355,6 +6369,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         lite2["lastMessageRole"].as_str(),
         Some("user"),
         "user message with no assistant reply serves \"user\": {lite2}"
+    );
+    assert_eq!(
+        lite2["lastMessageId"].as_str(),
+        Some(user_only_msg.id.as_str()),
+        "lastMessageId is the sole user message's id: {lite2}"
     );
     assert!(
         lite2.get("lastAgentResponse").is_none(),

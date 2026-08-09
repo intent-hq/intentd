@@ -1535,22 +1535,32 @@ fn is_delegated_background_task_session(session: &AgentSession) -> bool {
 fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
-    let last_role = last_message_role(&session.messages);
+    let (last_role, last_id) = last_message_role_and_id(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(session, count, last_response, last_user, digest, last_role)
+    AgentLite::from_session(
+        session,
+        count,
+        last_response,
+        last_user,
+        digest,
+        last_role,
+        last_id,
+    )
 }
 
-/// Derive `lastMessageRole` from a loaded transcript: the role of the newest
-/// `user`/`assistant` message — system (and any other) rows are transparent.
-/// `None` when no such message exists (the wire field is omitted). The
-/// projection paths serve the same value from the persisted
-/// `agent_session.last_message_role` column (0070).
-fn last_message_role(messages: &[AgentMessage]) -> Option<String> {
+/// Derive `lastMessageRole`/`lastMessageId` from a loaded transcript: the
+/// role and row id of the newest `user`/`assistant` message — system (and
+/// any other) rows are transparent. `(None, None)` when no such message
+/// exists (both wire fields are omitted). The projection paths serve the
+/// same values from the persisted `agent_session.last_message_role` (0070)
+/// and `last_message_id` (0088) columns.
+fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Option<String>) {
     messages
         .iter()
         .rev()
         .find(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| m.role.clone())
+        .map(|m| (Some(m.role.clone()), Some(m.id.clone())))
+        .unwrap_or((None, None))
 }
 
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
@@ -1581,6 +1591,7 @@ fn project_lite_from_projection(
         last_user,
         digest,
         projection.last_message_role.clone(),
+        projection.last_message_id.clone(),
     )
 }
 
@@ -2552,7 +2563,7 @@ impl Services {
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
         // at their `AgentLite::from_session` defaults (no live runtime state).
-        let lite = AgentLite::from_session(session, 0, None, None, None, None);
+        let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
         Ok(json!({ "agent": lite }))
     }
 
