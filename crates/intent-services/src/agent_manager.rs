@@ -6485,37 +6485,51 @@ async fn run_message_worker(
                                     }
                                     None => false,
                                 };
-                                if !settled {
+                                // STAB-124 for the idle-timeout path:
+                                // attribution on the turn-less
+                                // `session/update` channel is positional,
+                                // so the cancelled turn's stragglers
+                                // (tool_call_update echoes, tail chunks)
+                                // must be discarded before the warning
+                                // turn's transcript starts consuming the
+                                // channel. The cancelled prompt's RESPONSE
+                                // is the deterministic end-of-turn boundary
+                                // on the child's ordered stdout — once it
+                                // lands, every straggler is already
+                                // buffered, so the `try_recv` sweep below
+                                // is complete, not racy. Bounded, cannot
+                                // deadlock: the timed-out worker released
+                                // the receiver lock when `run_prompt_turn`
+                                // returned, and the await is
+                                // timeout-bounded. A boundary that never
+                                // lands means the child may keep streaming
+                                // stragglers indefinitely — treated as NOT
+                                // settled below, so the child is torn down
+                                // and the warning turn spawns fresh (fresh
+                                // channel + reset watermark: bleed
+                                // impossible).
+                                let boundary_landed = if settled {
+                                    match (conn.as_ref(), since) {
+                                        (Some(conn), Some(since)) => {
+                                            let landed = conn
+                                                .await_response_after(since, Duration::from_secs(2))
+                                                .await;
+                                            if !landed {
+                                                tracing::warn!(
+                                                    agent = %agent_id,
+                                                    "idle-timeout settle: cancelled prompt's response did not land within the watermark window; tearing the child down so the warning turn starts on a fresh channel"
+                                                );
+                                            }
+                                            landed
+                                        }
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !boundary_landed {
                                     mgr.kill_child_only(&agent_id).await;
                                 } else {
-                                    // STAB-124 for the idle-timeout path:
-                                    // attribution on the turn-less
-                                    // `session/update` channel is positional,
-                                    // so the cancelled turn's stragglers
-                                    // (tool_call_update echoes, tail chunks)
-                                    // must be discarded before the warning
-                                    // turn's transcript starts consuming the
-                                    // channel. The cancelled prompt's RESPONSE
-                                    // is the deterministic end-of-turn boundary
-                                    // on the child's ordered stdout — once it
-                                    // lands, every straggler is already
-                                    // buffered, so the `try_recv` sweep below
-                                    // is complete, not racy. Bounded, cannot
-                                    // deadlock: the timed-out worker released
-                                    // the receiver lock when `run_prompt_turn`
-                                    // returned, and the await is
-                                    // timeout-bounded.
-                                    if let (Some(conn), Some(since)) = (conn.as_ref(), since) {
-                                        if !conn
-                                            .await_response_after(since, Duration::from_secs(2))
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                agent = %agent_id,
-                                                "idle-timeout settle: cancelled prompt's response did not land within the watermark window; sweeping buffered notifications anyway"
-                                            );
-                                        }
-                                    }
                                     // Hold the notifications lock across the
                                     // drain so the warning turn cannot start
                                     // consuming the channel mid-sweep.
