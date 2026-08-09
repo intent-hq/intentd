@@ -2199,6 +2199,15 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.branches.listCached" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let r = api
+                .github_branches_list_cached(owner, repo)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.list" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
