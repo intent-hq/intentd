@@ -217,7 +217,10 @@ pub fn provision_cow_checkout_timed(
         // Best-effort — a broken submodule degrades with a warning instead
         // of failing the whole provisioning.
         let has_submodules = crate::submodule::has_submodules(checkout_path);
-        if has_submodules || !pre_reset_submodules.is_empty() {
+        if has_submodules
+            || !pre_reset_submodules.is_empty()
+            || checkout_path.join(".git").join("modules").is_dir()
+        {
             let submodule_started = Instant::now();
             if has_submodules {
                 if let Err(e) = crate::repo_cache::update_checkout_submodules(checkout_path) {
@@ -308,7 +311,11 @@ fn remove_orphaned_submodules(
     pre_reset: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
     if pre_reset.is_empty() {
-        return Ok(());
+        // No submodule was registered pre-reset, but the byte copy can
+        // still carry dead `.git/modules` dirs from the source (e.g. a
+        // cache refreshed before pruning existed whose upstream removed
+        // its last submodule) — same parity prune as the non-empty path.
+        return crate::repo_cache::prune_stale_modules(checkout_path);
     }
     let post_reset = crate::submodule::recursive_submodule_paths(checkout_path)?;
     for orphan in pre_reset.difference(&post_reset) {
