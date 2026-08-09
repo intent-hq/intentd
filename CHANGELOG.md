@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-08-09
+
+### 🚀 Features
+
+- *(services)* Batch agent teardown in workspace.delete for fast ack ([#1038](https://github.com/intent-hq/intentd/pull/1038))
+- *(git)* Submodule-aware repo cache and hydration ([#1024](https://github.com/intent-hq/intentd/pull/1024))
+- *(git)* Parallelize background workspace file removal ([#1046](https://github.com/intent-hq/intentd/pull/1046))
+- *(hooks)* Shorten dispatch wake state notes, add hookStillActive metadata ([#1027](https://github.com/intent-hq/intentd/pull/1027))
+- *(intentd)* Make 'intentd pair' enable the WSS listener on demand ([#1034](https://github.com/intent-hq/intentd/pull/1034))
+- *(services)* Include url in pr_monitor_wake metadata ([#1033](https://github.com/intent-hq/intentd/pull/1033))
+- Persist and serve thoughtTokens on stats.getUsage ([#1041](https://github.com/intent-hq/intentd/pull/1041))
+- Project lastMessageId onto AgentLite ([#1039](https://github.com/intent-hq/intentd/pull/1039))
+- *(github)* Add github.branches.listCached read-only RPC
+- Gate the pi provider on the pi CLI version (>= 0.80.4) ([#1044](https://github.com/intent-hq/intentd/pull/1044))
+- Gap-fill provider and host.exec spawn env with captured login-shell credential vars ([#1047](https://github.com/intent-hq/intentd/pull/1047))
+- Coalesce PR monitor wakes into net baseline diffs ([#1049](https://github.com/intent-hq/intentd/pull/1049))
+
+### 🐛 Bug Fixes
+
+- *(services)* Apply report_delivered filter to waiting projections ([#1017](https://github.com/intent-hq/intentd/pull/1017))
+- *(store,services)* Guard last_activity against full-row clobber and persist derived value ([#1018](https://github.com/intent-hq/intentd/pull/1018))
+- Recognize any recent self-write in the config-watcher guard ([#999](https://github.com/intent-hq/intentd/pull/999))
+- *(services)* Watch git metadata for gitfile linked-worktree workspaces ([#1048](https://github.com/intent-hq/intentd/pull/1048))
+- *(git)* Prune stale submodule modules and clean CoW orphan work trees ([#1028](https://github.com/intent-hq/intentd/pull/1028))
+- Discover CLIs across nvm node versions ([#1045](https://github.com/intent-hq/intentd/pull/1045))
+- *(providers)* Apply Node heap cap on npx-fallback spawns ([#1042](https://github.com/intent-hq/intentd/pull/1042))
+- *(services)* Derive delegation-group subscription linkage from grouped watches in diagnostics ([#1016](https://github.com/intent-hq/intentd/pull/1016))
+- *(services)* Gate turn-end unread raise on top-level foreground agents ([#1021](https://github.com/intent-hq/intentd/pull/1021))
+- Drain timed-out turn's late session/update tail before the idle-timeout warning turn ([#1032](https://github.com/intent-hq/intentd/pull/1032))
+- *(services)* Fold active PR monitors into workspace displayStatus ([#1036](https://github.com/intent-hq/intentd/pull/1036))
+- *(services)* Suppress per-check success lines in the PR monitor diff ([#1000](https://github.com/intent-hq/intentd/pull/1000))
+
+### ⚡ Performance
+
+- *(services)* Dedup pr.monitor forge fetches per (repo, pr) within a sweep ([#1020](https://github.com/intent-hq/intentd/pull/1020))
+
+### 🧪 Testing
+
+- *(events)* Use pure-liveness deadline for positive watcher-test waits ([#1030](https://github.com/intent-hq/intentd/pull/1030))
+- *(script_ops)* Use pure-liveness run timeouts for output-capture tests ([#1043](https://github.com/intent-hq/intentd/pull/1043))
+- *(intentd)* Deflake workspace lifecycle watcher e2e via retry-until-observed ([#997](https://github.com/intent-hq/intentd/pull/997))
+
+
 ## [0.6.2] - 2026-08-09
 
 ### 🚀 Features
