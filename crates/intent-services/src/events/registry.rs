@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
-use super::git_metadata_watcher::GitMetadataWatcher;
+use super::git_metadata_watcher::{GitCommonDirWatches, GitMetadataWatcher};
 use super::git_status_refresher::GitStatusRefresher;
 use super::shared_watch::SharedWatchHub;
 use super::skills_watcher::SkillsWatcher;
@@ -103,6 +103,9 @@ impl WatcherRegistry {
         // directories the workspace roots live under, not the workspace count
         // times the number of watch roots each one used to register.
         let hub = SharedWatchHub::new();
+        // Shared common-dir watches for linked-worktree workspaces: one watch
+        // per repo, fanned out to every worktree workspace (monorepo#1663).
+        let git_common = GitCommonDirWatches::new();
 
         let mut file_watchers: HashMap<WorkspaceId, FileWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
@@ -116,9 +119,14 @@ impl WatcherRegistry {
 
         let mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
-            if let Some(w) =
-                start_git_metadata_watch(&hub, &refresher, ws_id.clone(), path.clone(), "")
-            {
+            if let Some(w) = start_git_metadata_watch(
+                &hub,
+                &git_common,
+                &refresher,
+                ws_id.clone(),
+                path.clone(),
+                "",
+            ) {
                 git_watchers.insert(ws_id.clone(), w);
             }
         }
@@ -131,6 +139,7 @@ impl WatcherRegistry {
 
         let task = tokio::spawn(lifecycle_loop(
             Arc::clone(&hub),
+            git_common,
             bus,
             services,
             refresher,
@@ -176,12 +185,19 @@ impl WatcherRegistry {
 /// `None` covers the quiet non-git case.
 fn start_git_metadata_watch(
     hub: &Arc<SharedWatchHub>,
+    common_watches: &Arc<GitCommonDirWatches>,
     refresher: &Arc<GitStatusRefresher>,
     ws_id: WorkspaceId,
     path: PathBuf,
     suffix: &str,
 ) -> Option<GitMetadataWatcher> {
-    match GitMetadataWatcher::start(hub, Arc::clone(refresher), ws_id.clone(), path.clone()) {
+    match GitMetadataWatcher::start(
+        hub,
+        common_watches,
+        Arc::clone(refresher),
+        ws_id.clone(),
+        path.clone(),
+    ) {
         Some(w) => {
             tracing::info!(workspace = %ws_id, path = %path.display(), "watching workspace .git metadata{suffix}");
             Some(w)
@@ -198,6 +214,7 @@ fn start_git_metadata_watch(
 #[allow(clippy::too_many_arguments)]
 fn start_watches(
     hub: &Arc<SharedWatchHub>,
+    common_watches: &Arc<GitCommonDirWatches>,
     bus: &EventBus,
     refresher: &Arc<GitStatusRefresher>,
     file_watchers: &mut HashMap<WorkspaceId, FileWatcher>,
@@ -211,9 +228,14 @@ fn start_watches(
         ws_id.clone(),
         FileWatcher::start(hub, bus.clone(), ws_id.clone(), path.to_path_buf()),
     );
-    if let Some(w) =
-        start_git_metadata_watch(hub, refresher, ws_id.clone(), path.to_path_buf(), suffix)
-    {
+    if let Some(w) = start_git_metadata_watch(
+        hub,
+        common_watches,
+        refresher,
+        ws_id.clone(),
+        path.to_path_buf(),
+        suffix,
+    ) {
         git_watchers.insert(ws_id.clone(), w);
     }
 }
@@ -248,6 +270,7 @@ fn archived_delta(ev: &Event) -> Option<bool> {
 #[allow(clippy::too_many_arguments)]
 async fn lifecycle_loop(
     hub: Arc<SharedWatchHub>,
+    common_watches: Arc<GitCommonDirWatches>,
     bus: EventBus,
     services: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
@@ -268,6 +291,7 @@ async fn lifecycle_loop(
                     };
                     start_watches(
                         &hub,
+                        &common_watches,
                         &bus,
                         &refresher,
                         &mut file_watchers,
@@ -319,6 +343,7 @@ async fn lifecycle_loop(
                         };
                         start_watches(
                             &hub,
+                            &common_watches,
                             &bus,
                             &refresher,
                             &mut file_watchers,
