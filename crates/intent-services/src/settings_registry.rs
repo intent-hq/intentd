@@ -17,9 +17,11 @@
 //!   text (the live-reload watcher feeds this),
 //! - a `tokio::sync::watch` channel notifying subscribers of changed key
 //!   sets, and
-//! - a self-write guard (generation counter + content hash of the last
-//!   self-written file) so the watcher can distinguish self-writes from
-//!   external edits.
+//! - a self-write guard (generation counter + a time-bounded history of
+//!   content hashes of recently self-written files) so the watcher can
+//!   distinguish self-writes from external edits — keeping a *history*
+//!   (not just the last write) means a stale or coalesced watcher read that
+//!   observes an earlier self-write is still recognized and skipped.
 //!
 //! Keys are addressed by their dotted **wire path** (e.g.
 //! `server.wsApi.enabled`), which maps one-to-one onto the camelCase nested
@@ -27,10 +29,11 @@
 //! registry's concern: they are absent from [`KNOWN_PATHS`] and read as
 //! `None`/unknown.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use intent_core::settings_file::{LegacySettings, SettingsFile};
 use intent_core::{Error, Result};
@@ -142,13 +145,26 @@ pub struct SettingsChanged {
     pub changed: BTreeSet<String>,
 }
 
-/// Identity of the last file content the registry itself wrote — the future
-/// file watcher compares against this to suppress self-write events.
+/// How many recent self-write stamps the guard keeps. Under rapid successive
+/// writes a debounced watcher read can observe the file at any of the last
+/// few self-writes (stale read across the atomic rename, or a coalesced
+/// event burst processed after later writes), so one stamp is not enough.
+const SELF_WRITE_HISTORY: usize = 8;
+
+/// How long a self-write stamp counts as "recent" for the guard. Watcher
+/// reads land within the debounce window (milliseconds); anything older is
+/// a human-timescale edit that should reload normally even if it happens to
+/// byte-match an old self-write.
+const SELF_WRITE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Identity of one file content the registry itself wrote — the file watcher
+/// compares against the recent history of these to suppress self-write
+/// events (see [`SettingsRegistry::is_self_write`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteStamp {
     /// Monotonic counter, incremented on every successful self-write.
     pub generation: u64,
-    /// Hash of the exact file content last written (see
+    /// Hash of the exact file content written (see
     /// [`SettingsRegistry::is_self_write`]).
     pub content_hash: u64,
 }
@@ -176,8 +192,28 @@ struct Inner {
     pins: BTreeMap<String, Pin>,
     /// Self-write generation counter.
     generation: u64,
-    /// Identity of the last self-written file content.
-    last_write: Option<WriteStamp>,
+    /// Recent self-written file contents (oldest first, newest last), capped
+    /// at [`SELF_WRITE_HISTORY`] entries; each stamp carries the write time
+    /// so only writes within [`SELF_WRITE_WINDOW`] count as self-writes.
+    recent_writes: VecDeque<(WriteStamp, Instant)>,
+}
+
+impl Inner {
+    /// Record a successful self-write of `text`: bump the generation and
+    /// push its stamp onto the bounded history.
+    fn record_write(&mut self, text: &str) {
+        self.generation += 1;
+        if self.recent_writes.len() == SELF_WRITE_HISTORY {
+            self.recent_writes.pop_front();
+        }
+        self.recent_writes.push_back((
+            WriteStamp {
+                generation: self.generation,
+                content_hash: content_hash(text),
+            },
+            Instant::now(),
+        ));
+    }
 }
 
 /// Immutable view of the effective settings, cheap to clone via `Arc`.
@@ -245,7 +281,7 @@ impl SettingsRegistry {
             legacy,
             pins: BTreeMap::new(),
             generation: 0,
-            last_write: None,
+            recent_writes: VecDeque::new(),
         };
         let snapshot = Arc::new(build_snapshot(&inner)?);
         let (tx, _rx) = watch::channel(SettingsChanged::default());
@@ -291,11 +327,7 @@ impl SettingsRegistry {
         let text = doc.to_string();
         atomic_write(&self.path, &text)?;
         inner.doc = doc;
-        inner.generation += 1;
-        inner.last_write = Some(WriteStamp {
-            generation: inner.generation,
-            content_hash: content_hash(&text),
-        });
+        inner.record_write(&text);
         inner.legacy.clear();
         Ok(stripped)
     }
@@ -335,12 +367,14 @@ impl SettingsRegistry {
         self.tx.subscribe()
     }
 
-    /// Identity of the last self-written file content, if any.
+    /// Identity of the most recent self-written file content, if any.
     pub fn write_stamp(&self) -> Option<WriteStamp> {
         self.inner
             .lock()
             .expect("settings registry lock poisoned")
-            .last_write
+            .recent_writes
+            .back()
+            .map(|(stamp, _)| *stamp)
     }
 
     /// Current self-write generation (0 until the first `apply` write).
@@ -351,11 +385,18 @@ impl SettingsRegistry {
             .generation
     }
 
-    /// Whether `text` is byte-identical to the registry's last self-write —
-    /// the file watcher uses this to suppress events for its own writes.
+    /// Whether `text` is byte-identical to any *recent* self-write (within
+    /// [`SELF_WRITE_WINDOW`], across the last [`SELF_WRITE_HISTORY`] writes)
+    /// — the file watcher uses this to suppress events for the daemon's own
+    /// writes, including stale/coalesced reads of an earlier write-back.
     pub fn is_self_write(&self, text: &str) -> bool {
-        self.write_stamp()
-            .is_some_and(|w| w.content_hash == content_hash(text))
+        let hash = content_hash(text);
+        self.inner
+            .lock()
+            .expect("settings registry lock poisoned")
+            .recent_writes
+            .iter()
+            .any(|(stamp, at)| stamp.content_hash == hash && at.elapsed() <= SELF_WRITE_WINDOW)
     }
 
     /// Pin a key to `value` at boot (env/CLI precedence layer). `flag` names
@@ -432,11 +473,7 @@ impl SettingsRegistry {
 
         let text = inner.doc.to_string();
         atomic_write(&self.path, &text)?;
-        inner.generation += 1;
-        inner.last_write = Some(WriteStamp {
-            generation: inner.generation,
-            content_hash: content_hash(&text),
-        });
+        inner.record_write(&text);
 
         self.publish(&inner)
     }
@@ -455,11 +492,11 @@ impl SettingsRegistry {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         inner.file = file;
         inner.doc = doc;
-        // The accepted external edit supersedes the last self-write: clear the
-        // stamp so a later external edit that happens to match those earlier
-        // self-written bytes (e.g. a manual revert) is not misclassified as a
-        // self-write and skipped by the watcher.
-        inner.last_write = None;
+        // The accepted external edit supersedes every earlier self-write:
+        // clear the history so a later external edit that happens to match
+        // earlier self-written bytes (e.g. a manual revert) is not
+        // misclassified as a self-write and skipped by the watcher.
+        inner.recent_writes.clear();
         self.publish(&inner)
     }
 
@@ -1089,6 +1126,58 @@ mod tests {
             .expect("apply again");
         assert_eq!(reg.generation(), 2);
         assert_ne!(reg.write_stamp(), Some(stamp));
+    }
+
+    #[test]
+    fn recent_self_writes_all_match_the_guard() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        reg.apply(&set("rtk.enabled", json!(true)))
+            .expect("apply A");
+        let write_a = std::fs::read_to_string(&path).expect("read A");
+        reg.apply(&set("rtk.enabled", json!(false)))
+            .expect("apply B");
+        let write_b = std::fs::read_to_string(&path).expect("read B");
+        // A stale/coalesced watcher read can observe the file at any *recent*
+        // self-write, not just the last one — both must be classified as
+        // self-writes so the watcher never adopts them as external edits.
+        assert!(reg.is_self_write(&write_b), "latest write must match");
+        assert!(
+            reg.is_self_write(&write_a),
+            "earlier recent write must match"
+        );
+    }
+
+    #[test]
+    fn self_write_history_is_bounded() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        reg.apply(&set("agents.maxConcurrent", json!(1)))
+            .expect("apply first");
+        let first = std::fs::read_to_string(&path).expect("read first");
+        for i in 2..=(SELF_WRITE_HISTORY as i64 + 1) {
+            reg.apply(&set("agents.maxConcurrent", json!(i)))
+                .expect("apply");
+        }
+        // The first write has been evicted from the bounded history; the
+        // most recent writes still match.
+        assert!(!reg.is_self_write(&first));
+        let latest = std::fs::read_to_string(&path).expect("read latest");
+        assert!(reg.is_self_write(&latest));
+    }
+
+    #[test]
+    fn reload_clears_the_self_write_history() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        reg.apply(&set("rtk.enabled", json!(true))).expect("apply");
+        let self_written = std::fs::read_to_string(&path).expect("read");
+        assert!(reg.is_self_write(&self_written));
+        // Adopting an external edit supersedes every earlier self-write: a
+        // later manual revert to those bytes must be treated as external.
+        reg.reload("[git]\nautoCommit = false\n").expect("reload");
+        assert!(!reg.is_self_write(&self_written));
+        assert_eq!(reg.write_stamp(), None);
     }
 
     #[test]
