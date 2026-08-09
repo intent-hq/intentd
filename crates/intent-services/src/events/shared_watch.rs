@@ -595,6 +595,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory.
     struct TempDir {
@@ -668,11 +669,14 @@ mod tests {
         // rebuilds the group's stream, so the second `watch` restarts what the
         // first established. The negative assertion below would pass vacuously
         // against an unestablished watch.
-        hub.wait_all_established(2, Duration::from_secs(10)).await;
+        hub.wait_all_established(2, LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Probe until delivery is actually flowing, then assert isolation.
-        for attempt in 0..40 {
+        // Attempt count sized so the total probe budget (attempts x 500ms)
+        // reaches `LIVENESS` — a pure-liveness bound (monorepo#1630).
+        let attempts = LIVENESS.as_millis() / 500;
+        for attempt in 0..attempts {
             std::fs::write(a.join(".probe"), format!("{attempt}")).expect("write probe");
             if next_for(&mut rx_a, &root_a, ".probe", Duration::from_millis(500))
                 .await
@@ -680,7 +684,10 @@ mod tests {
             {
                 break;
             }
-            assert!(attempt < 39, "shared stream never began delivering");
+            assert!(
+                attempt < attempts - 1,
+                "shared stream never began delivering"
+            );
         }
         std::fs::remove_file(a.join(".probe")).expect("rm probe");
         while next_for(&mut rx_a, &root_a, ".probe", Duration::from_millis(300))
@@ -694,7 +701,7 @@ mod tests {
         // the negative assertion vacuously.
         std::fs::write(b.join("only-b.txt"), "x").expect("write in b");
         assert!(
-            next_for(&mut rx_b, &root_b, "only-b.txt", Duration::from_secs(10))
+            next_for(&mut rx_b, &root_b, "only-b.txt", LIVENESS)
                 .await
                 .is_some(),
             "b's own change must reach its sink"
@@ -702,7 +709,7 @@ mod tests {
 
         std::fs::write(a.join("only-a.txt"), "x").expect("write in a");
         assert!(
-            next_for(&mut rx_a, &root_a, "only-a.txt", Duration::from_secs(10))
+            next_for(&mut rx_a, &root_a, "only-a.txt", LIVENESS)
                 .await
                 .is_some(),
             "a root's own change must reach its sink"
