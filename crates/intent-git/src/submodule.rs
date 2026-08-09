@@ -146,6 +146,59 @@ pub fn submodule_paths(repo: &Repository) -> Result<std::collections::BTreeSet<S
     Ok(paths)
 }
 
+/// Ceiling on nested-submodule recursion depth: real nesting is shallow
+/// (two or three levels), and the bound keeps a pathological or
+/// self-referencing layout from recursing without end.
+const MAX_SUBMODULE_NESTING: u32 = 10;
+
+/// The registered submodule paths of the repository at `worktree_path` and,
+/// recursively, of every openable submodule work tree beneath it — one flat
+/// set, every path relative to `worktree_path` with forward-slash
+/// separators (`sub`, `sub/inner`, …). [`submodule_paths`] reads a single
+/// repository, so a nested submodule is invisible to a caller holding only
+/// the superproject; the CoW orphan cleanup needs the full set to see a
+/// nested work tree orphaned by a reset that moved its parent off the
+/// revision registering it. A submodule that is unpopulated (or otherwise
+/// cannot be opened) still contributes its own path, just nothing beneath
+/// it; a path that cannot be joined safely (`..`, absolute, …) is never
+/// descended into.
+pub fn recursive_submodule_paths(
+    worktree_path: &Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let mut all = std::collections::BTreeSet::new();
+    collect_nested_paths(worktree_path, &repo, "", 0, &mut all)?;
+    Ok(all)
+}
+
+/// One level of [`recursive_submodule_paths`]: insert this repository's own
+/// submodule paths under `prefix` and descend into each openable work tree.
+fn collect_nested_paths(
+    worktree: &Path,
+    repo: &Repository,
+    prefix: &str,
+    depth: u32,
+    all: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    for path in submodule_paths(repo)? {
+        let full = if prefix.is_empty() {
+            path.clone()
+        } else {
+            format!("{prefix}/{path}")
+        };
+        if depth < MAX_SUBMODULE_NESTING {
+            if let Some(rel) = crate::repo_cache::safe_rel_path(&path) {
+                let child = worktree.join(rel);
+                if let Ok(child_repo) = Repository::open(&child) {
+                    collect_nested_paths(&child, &child_repo, &full, depth + 1, all)?;
+                }
+            }
+        }
+        all.insert(full);
+    }
+    Ok(())
+}
+
 /// Whether `repo` treats paths case-insensitively (`core.ignorecase`, set by
 /// `git init` on macOS/Windows filesystems). Callers pass the result to
 /// [`submodule_containing`]/[`to_repo_relative`] so the gitlink guard compares
@@ -520,6 +573,32 @@ mod tests {
         assert_eq!(
             to_repo_relative(Some(Path::new("/repo/Work")), "/repo/WORK/sub/a.txt", false),
             "/repo/WORK/sub/a.txt"
+        );
+    }
+
+    /// `recursive_submodule_paths` reports nested submodules as one flat
+    /// set of superproject-relative paths — a nested gitlink is listed even
+    /// when its own work tree is unpopulated.
+    #[test]
+    fn recursive_submodule_paths_includes_nested() {
+        crate::testutil::allow_file_submodules();
+        let grandchild = init_repo("recpaths-grand");
+        commit_file(grandchild.path(), "g.txt", "deep\n");
+        let child = init_repo("recpaths-child");
+        commit_file(child.path(), "c.txt", "one\n");
+        crate::testutil::add_submodule(child.path(), grandchild.path(), "inner");
+        let superproject = init_repo("recpaths-super");
+        commit_file(superproject.path(), "a.txt", "one\n");
+        crate::testutil::add_submodule(superproject.path(), child.path(), "sub");
+
+        let paths = recursive_submodule_paths(superproject.path()).unwrap();
+        assert!(
+            paths.contains("sub"),
+            "top-level submodule listed: {paths:?}"
+        );
+        assert!(
+            paths.contains("sub/inner"),
+            "nested submodule listed under its full path: {paths:?}"
         );
     }
 
