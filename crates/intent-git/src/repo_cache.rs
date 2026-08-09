@@ -400,6 +400,17 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
         })?;
     }
     update_checkout_submodules(checkout_path)?;
+    sync_submodule_urls(checkout_path)
+}
+
+/// Re-point recorded submodule URLs (`submodule.<name>.url` in the
+/// checkout's config and each submodule's own `remote.origin.url`) at what
+/// `.gitmodules` currently says (`git submodule sync --recursive`). The
+/// shared closing step of both hydration paths
+/// ([`hydrate_submodules_from_cache`] and
+/// [`crate::cow_checkout::provision_cow_checkout`]) so no checkout keeps a
+/// URL copied from its source. No token: this rewrites local config only.
+pub(crate) fn sync_submodule_urls(checkout_path: &Path) -> Result<()> {
     run_git(
         checkout_path,
         &["submodule", "sync", "--recursive"],
@@ -543,8 +554,9 @@ fn collect_module_liveness(
 /// `s` as a relative path of plain (`Normal`) components only, or `None`
 /// when it is empty or carries anything (`..`, a root, a leading `./`) that
 /// could make it name something outside — or alias something inside — the
-/// modules dir.
-fn safe_rel_path(s: &str) -> Option<PathBuf> {
+/// modules dir (or, for [`crate::cow_checkout`]'s orphan cleanup, the
+/// checkout work tree).
+pub(crate) fn safe_rel_path(s: &str) -> Option<PathBuf> {
     let p = Path::new(s);
     p.components().next()?;
     p.components()
@@ -552,11 +564,14 @@ fn safe_rel_path(s: &str) -> Option<PathBuf> {
         .then(|| p.components().collect())
 }
 
-/// Prune dead module git dirs from the cache's `.git/modules` tree: every
+/// Prune dead module git dirs from a work tree's `.git/modules` tree: every
 /// dir the current `.gitmodules` chain no longer names as a module (or an
 /// ancestor component of one) is removed. A liveness set that cannot be
-/// mapped safely keeps everything — never guess a live module away.
-fn prune_stale_modules(cache_path: &Path) -> Result<()> {
+/// mapped safely keeps everything — never guess a live module away. Used on
+/// the cache after a refresh and shared with [`crate::cow_checkout`], whose
+/// byte copy carries the source's module dirs even when the checked-out ref
+/// no longer registers them.
+pub(crate) fn prune_stale_modules(cache_path: &Path) -> Result<()> {
     let modules_dir = cache_path.join(".git").join("modules");
     if !modules_dir.is_dir() {
         return Ok(());

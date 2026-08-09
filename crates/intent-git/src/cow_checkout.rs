@@ -46,8 +46,9 @@ pub struct CowProvisionTimings {
     pub strip_registrations: Duration,
     /// Duration of branch creation + checkout + hard reset in the clone.
     pub checkout: Duration,
-    /// Duration of the post-reset submodule force-update (zero when the
-    /// clone has no `.gitmodules`).
+    /// Duration of the post-reset submodule work: force-update, orphaned
+    /// work-tree cleanup, and closing URL sync (zero when neither the
+    /// source tip nor the checked-out ref involves submodules).
     pub submodule_update: Duration,
 }
 
@@ -79,8 +80,15 @@ impl CowProvisionTimings {
 /// the byte-copied submodule work trees at the wrong commit. The clone
 /// carries the source's `.git/modules` git dirs, so the update resolves from
 /// local objects — no network when the source (e.g. a fresh repo cache)
-/// already holds the gitlink commits. A submodule failure degrades to a
-/// warning; it never fails provisioning.
+/// already holds the gitlink commits. Submodule work trees copied from the
+/// source tip that the checked-out ref no longer registers (a `base_ref`
+/// predating the submodule, or one where it was removed) are orphans —
+/// nested repositories the hard reset and a plain clean both skip — so they
+/// are removed along with their dead `.git/modules` entries
+/// ([`remove_orphaned_submodules`]). A closing `git submodule sync
+/// --recursive` then re-points `submodule.<name>.url` config at what
+/// `.gitmodules` says (parity with the direct hydration path). Every
+/// submodule step degrades to a warning on failure; none fails provisioning.
 ///
 /// The clone inherits the source's `origin` remote verbatim (fetch URL and
 /// any `remote.origin.pushurl` alike), so both are resolved the same way as
@@ -178,6 +186,29 @@ pub fn provision_cow_checkout_timed(
         let strip_started = Instant::now();
         strip_worktree_registrations(checkout_path)?;
         timings.strip_registrations = strip_started.elapsed();
+        // Submodule paths as byte-copied from the source tip, captured
+        // before the branch switch/hard reset below moves HEAD: any of
+        // them the checked-out ref no longer registers is an orphaned work
+        // tree to remove after the reset. Gated on a cheap probe so
+        // no-submodule repos never pay the read; unreadable state degrades
+        // to no orphan cleanup.
+        let pre_reset_submodules = if crate::submodule::has_submodules(checkout_path)
+            || checkout_path.join(".git").join("modules").is_dir()
+        {
+            Repository::open(checkout_path)
+                .map_err(map_git_err)
+                .and_then(|repo| crate::submodule::submodule_paths(&repo))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        checkout = %checkout_path.display(),
+                        error = %e,
+                        "provision_cow_checkout: cannot read pre-reset submodule paths; skipping orphan cleanup"
+                    );
+                    Default::default()
+                })
+        } else {
+            Default::default()
+        };
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;
         timings.checkout = checkout_started.elapsed();
@@ -186,14 +217,40 @@ pub fn provision_cow_checkout_timed(
         // records (local: the clone carries the source's `.git/modules`).
         // Best-effort — a broken submodule degrades with a warning instead
         // of failing the whole provisioning.
-        if crate::submodule::has_submodules(checkout_path) {
+        let has_submodules = crate::submodule::has_submodules(checkout_path);
+        if has_submodules || !pre_reset_submodules.is_empty() {
             let submodule_started = Instant::now();
-            if let Err(e) = crate::repo_cache::update_checkout_submodules(checkout_path) {
+            if has_submodules {
+                if let Err(e) = crate::repo_cache::update_checkout_submodules(checkout_path) {
+                    tracing::warn!(
+                        checkout = %checkout_path.display(),
+                        error = %e,
+                        "provision_cow_checkout: submodule sync failed; checkout provisioned with submodules as copied"
+                    );
+                }
+            }
+            // Work trees copied from the source tip that the checked-out
+            // ref no longer registers are orphans: untracked nested repos
+            // plus dead `.git/modules` entries. Same best-effort posture.
+            if let Err(e) = remove_orphaned_submodules(checkout_path, &pre_reset_submodules) {
                 tracing::warn!(
                     checkout = %checkout_path.display(),
                     error = %e,
-                    "provision_cow_checkout: submodule sync failed; checkout provisioned with submodules as copied"
+                    "provision_cow_checkout: orphaned submodule cleanup failed; stale submodule leftovers may remain"
                 );
+            }
+            // Closing sync (parity with the direct path's
+            // `hydrate_submodules_from_cache`): re-point recorded submodule
+            // URLs at what `.gitmodules` says, so a divergent configured
+            // URL copied from the source never sticks.
+            if has_submodules {
+                if let Err(e) = crate::repo_cache::sync_submodule_urls(checkout_path) {
+                    tracing::warn!(
+                        checkout = %checkout_path.display(),
+                        error = %e,
+                        "provision_cow_checkout: submodule URL sync failed; checkout may keep the source's submodule URLs"
+                    );
+                }
             }
             timings.submodule_update = submodule_started.elapsed();
         }
@@ -230,6 +287,63 @@ fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Remove submodule work trees the byte copy carried from the source tip
+/// that the checked-out ref no longer registers, plus their now-dead
+/// `.git/modules` entries. `pre_reset` is the submodule path set captured
+/// before the branch switch/hard reset; orphans are that set minus the
+/// post-reset set. Each orphan is a nested repository, which both the hard
+/// reset and a plain superproject clean skip — the identified paths are
+/// removed explicitly instead of via a blanket `clean -ffdx`, which would
+/// also delete the legitimate untracked files the CoW copy intentionally
+/// preserves. A path the checked-out ref still tracks as ordinary content
+/// (a submodule turned plain directory/file) is left alone: removing it
+/// would delete tracked files the reset just wrote.
+fn remove_orphaned_submodules(
+    checkout_path: &Path,
+    pre_reset: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if pre_reset.is_empty() {
+        return Ok(());
+    }
+    let repo = Repository::open(checkout_path).map_err(map_git_err)?;
+    let post_reset = crate::submodule::submodule_paths(&repo)?;
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    for orphan in pre_reset.difference(&post_reset) {
+        let Some(rel) = crate::repo_cache::safe_rel_path(orphan) else {
+            continue;
+        };
+        if head_tree
+            .as_ref()
+            .is_some_and(|tree| tree.get_path(&rel).is_ok())
+        {
+            continue;
+        }
+        let target = checkout_path.join(&rel);
+        let Ok(meta) = std::fs::symlink_metadata(&target) else {
+            continue;
+        };
+        let removed = if meta.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        removed.map_err(|e| {
+            Error::Internal(format!(
+                "cannot remove orphaned submodule work tree {orphan}: {e}"
+            ))
+        })?;
+        tracing::debug!(
+            checkout = %checkout_path.display(),
+            submodule = %orphan,
+            "provision_cow_checkout: removed orphaned submodule work tree"
+        );
+    }
+    // The orphans' module git dirs under `.git/modules` are dead now that
+    // the checked-out ref no longer names them; prune with the same
+    // liveness rule as the cache refresh.
+    crate::repo_cache::prune_stale_modules(checkout_path)
 }
 
 /// The CoW clone is a byte-for-byte copy, so it inherits the source's
@@ -797,6 +911,11 @@ mod tests {
         assert!(timings.total >= timings.cow_clone);
         assert!(timings.total >= timings.checkout);
         assert!(timings.total > std::time::Duration::ZERO);
+        assert_eq!(
+            timings.submodule_update,
+            Duration::ZERO,
+            "a repo without submodules skips the submodule phase entirely"
+        );
         // The display helper renders one entry per recorded subtree.
         assert_eq!(
             timings.slowest_subtrees_display().is_empty(),
@@ -1381,6 +1500,102 @@ mod tests {
             std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
             "one\n",
             "superproject content is intact"
+        );
+    }
+
+    /// A `base_ref` predating the submodule: the byte-copied work tree and
+    /// its module git dir are orphans on the checked-out ref — both are
+    /// removed and the superproject reports a clean status. The source keeps
+    /// its populated submodule.
+    #[test]
+    fn cow_checkout_removes_orphaned_submodule_at_pre_submodule_base_ref() {
+        crate::testutil::allow_file_submodules();
+        let child = init_repo("cowchk-orph-child");
+        commit_file(child.path(), "c.txt", "sub one\n");
+        let origin = init_repo("cowchk-orph-origin");
+        commit_file(origin.path(), "a.txt", "one\n");
+        // Pin `base` before the submodule exists, then add it on the tip.
+        crate::testutil::create_branch(origin.path(), "base");
+        crate::testutil::add_submodule(origin.path(), child.path(), "sub");
+
+        let source = recursive_clone(origin.path(), "cowchk-orph-src");
+        let _cleanup_src = Cleanup(source.clone());
+        if !cow_available(&source) {
+            return;
+        }
+
+        let checkout = unique_checkout("cowchk-orph-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+
+        assert!(
+            !checkout.join("sub").exists(),
+            "orphaned submodule work tree is removed"
+        );
+        assert!(
+            !checkout.join(".git").join("modules").join("sub").exists(),
+            "dead module git dir is pruned"
+        );
+        let clone = Repository::open(&checkout).unwrap();
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let statuses = clone.statuses(Some(&mut opts)).unwrap();
+        let dirty: Vec<String> = statuses
+            .iter()
+            .filter_map(|s| s.path().map(str::to_owned).ok())
+            .collect();
+        assert!(dirty.is_empty(), "superproject status is clean: {dirty:?}");
+        // The source keeps its populated submodule and module git dir.
+        assert_eq!(
+            std::fs::read_to_string(source.join("sub").join("c.txt")).unwrap(),
+            "sub one\n"
+        );
+        assert!(source.join(".git").join("modules").join("sub").exists());
+    }
+
+    /// After CoW hydration the checkout's `submodule.<name>.url` config
+    /// matches `.gitmodules` even when the source carried a divergent
+    /// configured URL — the closing `submodule sync` gives the CoW path the
+    /// same URL parity as direct hydration.
+    #[test]
+    fn cow_checkout_syncs_divergent_submodule_url_to_gitmodules() {
+        crate::testutil::allow_file_submodules();
+        let child = init_repo("cowchk-url-child");
+        commit_file(child.path(), "c.txt", "sub one\n");
+        let origin = init_repo("cowchk-url-origin");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::add_submodule(origin.path(), child.path(), "sub");
+
+        let source = recursive_clone(origin.path(), "cowchk-url-src");
+        let _cleanup_src = Cleanup(source.clone());
+        if !cow_available(&source) {
+            return;
+        }
+        // Diverge the source's configured URL from what `.gitmodules` says.
+        Repository::open(&source)
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_str("submodule.sub.url", "/nonexistent/divergent")
+            .unwrap();
+
+        let checkout = unique_checkout("cowchk-url-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        let gitmodules_url = git2::Config::open(&checkout.join(".gitmodules"))
+            .unwrap()
+            .get_string("submodule.sub.url")
+            .unwrap();
+        let configured_url = Repository::open(&checkout)
+            .unwrap()
+            .config()
+            .unwrap()
+            .get_string("submodule.sub.url")
+            .unwrap();
+        assert_eq!(
+            configured_url, gitmodules_url,
+            "configured URL is re-pointed at the .gitmodules value"
         );
     }
 }
