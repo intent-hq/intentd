@@ -251,16 +251,12 @@ pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<
 }
 
 /// Phase 2 of worktree removal — the expensive recursive delete of a
-/// directory detached by [`detach_worktree`]. Run this outside any per-repo
-/// lock. Idempotent: an already-missing path is `Ok`.
+/// directory detached by [`detach_worktree`], parallelized via
+/// [`crate::fs_remove::remove_dir_all_parallel`]. Run this outside any
+/// per-repo lock. Idempotent: an already-missing path is `Ok`.
 pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(trash_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Internal(format!(
-            "cannot remove detached worktree dir: {e}"
-        ))),
-    }
+    crate::fs_remove::remove_dir_all_parallel(trash_path)
+        .map_err(|e| Error::Internal(format!("cannot remove detached worktree dir: {e}")))
 }
 
 /// CoW counterpart of [`detach_worktree`] for standalone checkouts
