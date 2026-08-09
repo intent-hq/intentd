@@ -2790,6 +2790,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         output_tokens: 40,
         cache_read_tokens: 20,
         cache_creation_tokens: 10,
+        thought_tokens: 15,
         runs: 2,
         sessions_started: 1,
         longest_run_ms: 5_000,
@@ -2833,6 +2834,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(r["totals"]["outputTokens"], 40);
     assert_eq!(r["totals"]["cacheReadTokens"], 20);
     assert_eq!(r["totals"]["cacheCreationTokens"], 10);
+    assert_eq!(r["totals"]["thoughtTokens"], 15);
     assert_eq!(r["runs"], 2);
     assert_eq!(r["sessions"], 1);
     assert_eq!(r["longestRunMs"], 5_000);
@@ -2852,6 +2854,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(by_provider[0]["outputTokens"], 40);
     assert_eq!(by_provider[0]["cacheReadTokens"], 20);
     assert_eq!(by_provider[0]["cacheCreationTokens"], 10);
+    assert_eq!(by_provider[0]["thoughtTokens"], 15);
     let by_hour = r["byHourOfDay"].as_array().expect("byHourOfDay");
     assert_eq!(by_hour.len(), 24);
     // The seeded bucket occupies exactly one trailing-window slot (the newest
@@ -2883,6 +2886,12 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .expect("Opus row in current month");
     assert_eq!(opus["inputTokens"], 100);
     assert_eq!(opus["runs"], 2);
+    assert_eq!(opus["thoughtTokens"], 15);
+    // Zero-thought rollups omit the field entirely (§5.23 convention) —
+    // byte-compatible with the pre-thought_tokens response shape.
+    if let Some(sonnet) = by_model.iter().find(|m| m["model"] == "Sonnet 5") {
+        assert!(sonnet.get("thoughtTokens").is_none(), "{resp}");
+    }
     let by_provider = resp["result"]["byProvider"].as_array().expect("byProvider");
     let claude = by_provider
         .iter()
