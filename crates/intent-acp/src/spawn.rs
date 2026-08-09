@@ -66,6 +66,16 @@ pub struct SpawnOptions<'a> {
 }
 
 impl<'a> SpawnOptions<'a> {
+    /// True when this spawn will run via npx: no resolved provider binary and
+    /// both npx fields set. Single source of truth for the program selection,
+    /// the `-y <pkg>` arg prepend, and the Node-child env decisions (heap cap,
+    /// #555 codex env scrub).
+    pub fn via_npx(&self) -> bool {
+        self.provider_binary.is_none()
+            && self.npx_fallback_binary.is_some()
+            && self.npx_fallback_package.is_some()
+    }
+
     /// Construct options for a provider with all optional inputs unset.
     pub fn new(provider: &'a ProviderConfig) -> Self {
         Self {
@@ -95,8 +105,8 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
 
     // When using npx fallback (provider_binary not set AND both npx fields are set),
     // prepend the npx-specific args before the provider's args
-    if opts.provider_binary.is_none() {
-        if let (Some(_), Some(pkg)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+    if opts.via_npx() {
+        if let Some(pkg) = opts.npx_fallback_package {
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -140,7 +150,7 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     // Decide which binary to spawn: provider_binary > npx_fallback (both fields) > provider.command
     let command = if let Some(p) = opts.provider_binary {
         p.as_os_str()
-    } else if let (Some(npx), Some(_)) = (opts.npx_fallback_binary, opts.npx_fallback_package) {
+    } else if let (true, Some(npx)) = (opts.via_npx(), opts.npx_fallback_binary) {
         npx.as_os_str()
     } else {
         std::ffi::OsStr::new(opts.provider.command)
@@ -154,9 +164,7 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     // An npx spawn (fallback or npx-only) always runs a Node child, so env
     // assembly applies the V8 heap cap even when the provider's declared
     // runtime is Native (codex's npx fallback, intent-hq/monorepo#1661).
-    let via_npx = opts.provider_binary.is_none()
-        && opts.npx_fallback_binary.is_some()
-        && opts.npx_fallback_package.is_some();
+    let via_npx = opts.via_npx();
     for (key, value) in build_provider_env_for_spawn(
         opts.provider,
         opts.model,
