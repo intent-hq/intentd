@@ -581,15 +581,22 @@ pub fn find_npx() -> Option<PathBuf> {
 /// Resolve the real `pi` CLI — the binary pi-acp spawns (and the generated
 /// wrapper script execs) — to an absolute path. A command carrying a path
 /// separator (the `PI_ACP_PI_COMMAND` override shape) is validated directly
-/// as an executable file; a bare name scans the same enhanced PATH
-/// directories as provider binaries (inherited PATH + enriched tool dirs +
-/// login-shell capture), matching what the spawned child would resolve.
+/// as an executable file; a bare name scans the SPAWN-TIME enhanced PATH
+/// ([`crate::args::enhanced_path`] over the resolved npx binary — pi is
+/// npx-only, so the pi-acp child's PATH prepends npx's parent dir and
+/// `~/.augment/bin` ahead of the enriched/inherited dirs), so the probe
+/// resolves the same `pi` the wrapper will actually exec, not merely one
+/// visible to the daemon.
 pub fn find_pi_cli(command: &str) -> Option<PathBuf> {
     let as_path = PathBuf::from(command);
     if as_path.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {
         return is_executable_file(&as_path).then_some(as_path);
     }
-    find_in_enhanced_dirs(command)
+    let npx = find_npx();
+    find_in_dirs(
+        &crate::args::enhanced_path_spawn_dirs(npx.as_deref()),
+        command,
+    )
 }
 
 #[cfg(test)]

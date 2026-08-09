@@ -737,6 +737,28 @@ fn enhanced_path_prepends_bin_and_augment() {
 }
 
 #[test]
+fn enhanced_path_dirs_mirror_the_joined_spawn_path() {
+    // `enhanced_path_dirs_with` is the directory-list view of the exact PATH
+    // the spawned child gets (`enhanced_path_with`): same entries, same
+    // precedence order. `find_pi_cli` scans this list so its probe resolves
+    // the same binary the pi-acp child would.
+    let home = std::path::Path::new("/home/tester");
+    let inherited = std::ffi::OsStr::new("/usr/bin:/bin");
+    let bin = std::path::PathBuf::from("/opt/node/npx");
+    let joined = args::enhanced_path_with(Some(&bin), Some(home), Some(inherited));
+    let dirs = args::enhanced_path_dirs_with(Some(&bin), Some(home), Some(inherited));
+    let joined_parts: Vec<String> = joined.split([':', ';']).map(str::to_string).collect();
+    let dir_parts: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dir_parts, joined_parts, "dirs and joined PATH must agree");
+    // Spawn precedence: npx parent dir first, so a `pi` co-located with npx
+    // shadows one later on the inherited PATH — for probe and child alike.
+    assert_eq!(dirs[0], std::path::PathBuf::from("/opt/node"));
+}
+
+#[test]
 fn compound_model_id_round_trip() {
     assert_eq!(
         parse_compound_model_id("opencode:claude-sonnet-4"),

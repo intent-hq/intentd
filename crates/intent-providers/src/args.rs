@@ -500,6 +500,18 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     )
 }
 
+/// The ordered, de-duplicated directory list behind [`enhanced_path`] — the
+/// exact PATH the spawned provider child sees, as directories. Exposed so
+/// pre-spawn probes (the pi CLI version gate) can resolve binaries against
+/// the same directories, in the same order, as the child would.
+pub fn enhanced_path_spawn_dirs(provider_binary: Option<&Path>) -> Vec<PathBuf> {
+    enhanced_path_dirs_with(
+        provider_binary,
+        home_dir().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
 /// [`enhanced_path`] with an explicit `home` and inherited `path` (test seam —
 /// avoids mutating the process-global `HOME` / `PATH` in parallel tests).
 pub(crate) fn enhanced_path_with(
@@ -507,6 +519,22 @@ pub(crate) fn enhanced_path_with(
     home: Option<&Path>,
     inherited_path: Option<&std::ffi::OsStr>,
 ) -> String {
+    // Join with platform-specific separator
+    enhanced_path_dirs_with(provider_binary, home, inherited_path)
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(&PATH_SEP.to_string())
+}
+
+/// The directory list [`enhanced_path_with`] joins — the single source of the
+/// spawn-time PATH precedence (provider-binary dir → `~/.augment/bin` →
+/// enriched tool dirs → inherited PATH).
+pub(crate) fn enhanced_path_dirs_with(
+    provider_binary: Option<&Path>,
+    home: Option<&Path>,
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -536,11 +564,7 @@ pub(crate) fn enhanced_path_with(
         }
     }
 
-    // Join with platform-specific separator
-    dirs.iter()
-        .map(|d| d.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(&PATH_SEP.to_string())
+    dirs
 }
 
 /// Resolve the user's home directory from environment, cross-platform.

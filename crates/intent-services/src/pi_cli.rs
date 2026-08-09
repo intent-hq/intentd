@@ -43,9 +43,10 @@ pub struct PiCliStatus {
 }
 
 /// Resolve and probe the `pi` CLI: resolve [`resolve_real_pi_command`]'s
-/// result via [`intent_providers::find_pi_cli`] (enhanced-PATH scan, or
-/// direct validation for explicit paths), then run `--version` with a short
-/// timeout. Blocking (subprocess wait) — call from a blocking context.
+/// result via [`intent_providers::find_pi_cli`] (spawn-time enhanced-PATH
+/// scan mirroring the pi-acp child's PATH, or direct validation for explicit
+/// paths), then run `--version` with a short timeout. Blocking (subprocess
+/// wait) — call from a blocking context.
 pub fn probe_pi_cli() -> PiCliStatus {
     let command = resolve_real_pi_command();
     let resolved_path = intent_providers::find_pi_cli(&command);
