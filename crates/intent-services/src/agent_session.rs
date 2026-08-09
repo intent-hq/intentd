@@ -1983,7 +1983,7 @@ impl Services {
                 // alerts snapshot-consistently — a follow-up `agent.list`
                 // read can race the child's completion consuming the watch.
                 data["isWaitingForOtherAgents"] =
-                    Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+                    Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
                 // Idle-visibility: an idle agent still owning active
                 // (scheduled/running) background hooks is waiting, not
                 // stalled — stamp `waitingOnHooks` (omitted when none) so
@@ -2363,7 +2363,7 @@ impl Services {
         // Same emit-time waiting flag as the prompt-turn idle (see
         // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
         data["isWaitingForOtherAgents"] =
-            Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+            Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
         // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
         // idle (omitted when the agent owns no active hook).
         self.annotate_waiting_on_hooks(agent_id, &mut data).await;
