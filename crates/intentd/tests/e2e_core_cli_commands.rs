@@ -334,13 +334,14 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
 }
 
 #[tokio::test]
-async fn pair_fails_without_tcp_listener() {
+async fn pair_without_listener_non_tty_requires_yes_flag() {
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let socket = data_dir.join("intentd.sock");
 
-    // UDS-only daemon: pairing is impossible without a TCP port.
+    // UDS-only daemon: the WSS listener is down. Without --yes and with a
+    // non-TTY stdin, pair must refuse (it cannot prompt) and point at --yes.
     let child = spawn_daemon(&data_dir);
     let mut daemon = Daemon {
         child,
@@ -351,17 +352,116 @@ async fn pair_fails_without_tcp_listener() {
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")
         .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
         .output()
         .expect("run intentd pair");
 
     assert!(
         !output.status.success(),
-        "pair should fail without a TCP listener"
+        "pair should fail without a TCP listener when it cannot prompt"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("TCP listener is not running"),
-        "should explain the TCP listener is required: {stderr}"
+        stderr.contains("re-run with --yes"),
+        "should point at --yes for unattended enabling: {stderr}"
+    );
+    // The setting must NOT have been flipped behind the user's back. The
+    // config template ships a commented-out `# enabled = true` example, so
+    // only uncommented lines count.
+    let config = std::fs::read_to_string(data_dir.join("config.toml")).unwrap_or_default();
+    assert!(
+        !has_uncommented_enabled_true(&config),
+        "server.wsApi.enabled must stay off without consent: {config}"
+    );
+}
+
+/// True when config.toml has an active (uncommented) `enabled = true` line
+/// inside the `[server.wsApi]` table — the persisted form of
+/// `server.wsApi.enabled = true`. Commented template examples
+/// (`# enabled = true`) and other tables' `enabled` keys do not count.
+fn has_uncommented_enabled_true(config: &str) -> bool {
+    let mut in_ws_api = false;
+    for line in config.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_ws_api = t.starts_with("[server.wsApi]");
+            continue;
+        }
+        if in_ws_api
+            && !t.starts_with('#')
+            && t.starts_with("enabled")
+            && t.replace(' ', "").starts_with("enabled=true")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn pair_with_yes_enables_wss_and_prints_payload() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // UDS-only daemon: the WSS listener is down. `pair --yes` must enable it
+    // via settings.update (persisting server.wsApi.enabled = true), then
+    // succeed end-to-end. INTENTD_TCP_PORT=0 makes the started listener bind
+    // an OS-assigned ephemeral port, so parallel suites cannot collide.
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .arg("--yes")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair --yes");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pair --yes should enable the listener and succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("WSS listener started"),
+        "should report the listener was enabled: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("intent://pair?v=1&host="),
+        "pair output should include the payload URI: {stdout}"
+    );
+
+    // The enable must be persisted to config.toml, not just in-memory.
+    let config = std::fs::read_to_string(data_dir.join("config.toml"))
+        .expect("config.toml written by settings.update");
+    assert!(
+        has_uncommented_enabled_true(&config),
+        "server.wsApi.enabled = true should be persisted: {config}"
+    );
+
+    // A second run finds the listener already up — no prompt, no re-enable.
+    let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair (second)");
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    assert!(
+        output2.status.success(),
+        "pair should succeed with the listener already up: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("WSS listener started"),
+        "second run must not re-enable: {stderr2}"
     );
 }
 
