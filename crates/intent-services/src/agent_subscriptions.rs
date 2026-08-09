@@ -466,6 +466,24 @@ impl Services {
             .collect()
     }
 
+    /// The subset of [`Self::list_watches_for_parent`] that still counts as a
+    /// "waiting on agents" reason: `report_delivered` watches are excluded
+    /// (issues intent-hq/monorepo#1643 + #1649) — such a watch has already
+    /// delivered its report-time wake and retires inline without waking the
+    /// holder, so it is not something the holder is waiting FOR. Shared by the
+    /// settlement predicate ([`crate::Services::agent_is_waiting_on_agents`])
+    /// and the `isWaitingForOtherAgents` / `waitingForAgentIds` projections so
+    /// display and settlement use one definition of "waiting on agents".
+    pub(crate) fn waiting_watches_for_parent(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Vec<CompletionWatch> {
+        self.list_watches_for_parent(parent_agent_id)
+            .into_iter()
+            .filter(|w| !w.report_delivered)
+            .collect()
+    }
+
     /// Whether any TOP-LEVEL agent homed in `workspace_id` holds at least
     /// one active completion watch (ungrouped or grouped) — the third
     /// `displayStatus` in-progress promotion signal alongside a running
@@ -1408,14 +1426,15 @@ impl Services {
         // Idle-visibility: a synthesized idle carries the same
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
         // `agent:idle` emit (each omitted when the child owns none) and the
-        // same emit-time `isWaitingForOtherAgents` flag (raw pending-watch
-        // derivation, no 2-cycle guard — matching the live emit sites).
+        // same emit-time `isWaitingForOtherAgents` flag (pending-watch
+        // derivation with the shared `report_delivered` filter, no 2-cycle
+        // guard — matching the live emit sites).
         if event_type == intent_core::events::AGENT_IDLE {
             self.annotate_waiting_on_hooks(child_id, &mut data).await;
             self.annotate_waiting_on_pr_monitors(child_id, &mut data)
                 .await;
             data["isWaitingForOtherAgents"] =
-                serde_json::json!(!self.list_watches_for_parent(child_id).is_empty());
+                serde_json::json!(!self.waiting_watches_for_parent(child_id).is_empty());
         }
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1654,13 +1673,14 @@ impl Services {
                         // the live idle emits. Usually false here (a waiting
                         // child was skipped above), but not always: the skip
                         // uses the durable classification WITH the 2-cycle
-                        // guard, while this stamp is the raw in-memory watch
-                        // derivation — a child whose only outgoing watch was
+                        // guard, while this stamp is the in-memory watch
+                        // derivation (report_delivered-filtered, no 2-cycle
+                        // guard) — a child whose only outgoing watch was
                         // declassified as a mutual-idle 2-cycle reaches this
                         // line and stamps `true`.
                         if event_type == intent_core::events::AGENT_IDLE {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
-                                .list_watches_for_parent(&child_id)
+                                .waiting_watches_for_parent(&child_id)
                                 .is_empty());
                         }
                         let report = session.completion_report;

@@ -1903,6 +1903,10 @@ impl Services {
     ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
     /// - `isWaitingForOtherAgents` — the agent parents one or more pending
     ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    ///   `report_delivered` watches are excluded via the shared
+    ///   [`Services::waiting_watches_for_parent`] filter (issue
+    ///   intent-hq/monorepo#1649), so the projection agrees with the
+    ///   settlement predicate ([`Services::agent_is_waiting_on_agents`]).
     /// - `waitingForAgentIds` — the distinct `child_agent_id`s of those pending
     ///   watches, in registration order. Always returned (defaults to empty);
     ///   non-empty iff `isWaitingForOtherAgents` is `true`, so clients can render
@@ -1924,7 +1928,7 @@ impl Services {
         }
         let is_responding = self.agent_is_busy(session.id.clone());
         let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
-        let watches = self.list_watches_for_parent(&session.id);
+        let watches = self.waiting_watches_for_parent(&session.id);
         // Distinct child ids in registration order — a parent can register
         // multiple watches against the same child (e.g. successive `immediate`
         // delegates), but the FE only wants each waiting-on agent once.
@@ -2148,7 +2152,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
     ) {
-        let watches = self.list_watches_for_parent(parent_agent_id);
+        let watches = self.waiting_watches_for_parent(parent_agent_id);
         let mut waiting: Vec<AgentId> = Vec::with_capacity(watches.len());
         for w in &watches {
             if !waiting.contains(&w.child_agent_id) {
