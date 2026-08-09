@@ -80,7 +80,12 @@ fn remove_subtrees_parallel(root: &Path) {
     let queue = Mutex::new(subdirs);
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
+            // Builder::spawn_scoped (unlike Scope::spawn) reports OS
+            // thread-spawn failure as an Err instead of panicking; under
+            // resource exhaustion we degrade gracefully — whatever workers
+            // did spawn (possibly none) drain the queue, and the serial
+            // pass removes the rest.
+            let spawned = std::thread::Builder::new().spawn_scoped(scope, || loop {
                 let Some(dir) = queue.lock().expect("removal queue lock poisoned").pop() else {
                     return;
                 };
@@ -88,6 +93,9 @@ fn remove_subtrees_parallel(root: &Path) {
                 // reported by the authoritative serial pass.
                 let _ = std::fs::remove_dir_all(&dir);
             });
+            if spawned.is_err() {
+                break;
+            }
         }
     });
 }

@@ -6369,8 +6369,15 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
                 }
             }
             let trash = child.path();
-            // Shared parallel removal helper; `NotFound` (a concurrent
-            // removal won the race) is already folded into `Ok` there.
+            // The parallel helper folds `NotFound` into `Ok`; skip silently
+            // here (like the serial original) so a dir a concurrent removal
+            // already won doesn't log or count as a phantom removal.
+            if matches!(
+                std::fs::symlink_metadata(&trash),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
             match intent_git::fs_remove::remove_dir_all_parallel(&trash) {
                 Ok(()) => {
                     tracing::info!(
