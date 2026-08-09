@@ -148,10 +148,15 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     build_command_with_captured_env(opts, captured_credential_env())
 }
 
-/// The login-shell credential capture merged by [`build_command`]. Unit tests
-/// compile against an empty map so `cargo test` never spawns the user's login
-/// shell and the env assertions stay hermetic; the merge logic itself is
-/// covered by driving [`build_command_with_captured_env`] directly.
+/// The login-shell credential capture merged by [`build_command`]. In this
+/// crate's unit tests this compiles to an empty map, so env assertions are
+/// deterministic and real captured credentials never enter a test-built
+/// `Command`. The seam does NOT prevent the login-shell spawn itself
+/// ([`build_command`]'s `enhanced_path` still triggers the shared PATH
+/// capture), and `#[cfg(test)]` is crate-local — a cross-crate test calling
+/// [`build_command`] gets the production capture, so such tests must not
+/// assert on the command's env. The merge logic itself is covered by driving
+/// [`build_command_with_captured_env`] directly.
 fn captured_credential_env() -> &'static BTreeMap<String, String> {
     #[cfg(not(test))]
     {

@@ -54,10 +54,18 @@ const ENV_START_SENTINEL: &str = "__INTENT_ENV_S__";
 const ENV_END_SENTINEL: &str = "__INTENT_ENV_E__";
 
 /// Credential env vars captured by exact name.
+///
+/// Inclusion criterion (both lists): a var is listed when a shipped provider
+/// CLI (or its backing SDK) reads it for authentication/configuration —
+/// exact names for cross-provider credentials (Anthropic/OpenAI/xAI keys,
+/// AWS credentials for Bedrock, Hugging Face tokens), one prefix per
+/// provider CLI's own env namespace. Keep both in sync with the provider
+/// catalog (`intent-providers`) as providers are added or removed.
 #[cfg(unix)]
 const CREDENTIAL_ENV_EXACT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "XAI_API_KEY",
     "AWS_PROFILE",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -67,7 +75,8 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
     "HUGGING_FACE_HUB_TOKEN",
 ];
 
-/// Credential env vars captured by name prefix.
+/// Credential env vars captured by name prefix. See the inclusion criterion
+/// on [`CREDENTIAL_ENV_EXACT`].
 #[cfg(unix)]
 const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
     "AUGGIE_",
@@ -76,6 +85,8 @@ const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
     "OPENCODE_",
     "DROID_",
     "CORTEX_",
+    "GROK_",
+    "PI_",
 ];
 
 /// Whether an env var name is on the credential allow-list.
@@ -287,8 +298,19 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCaptu
     let output = output_buffer.lock().unwrap();
     let output_str = String::from_utf8_lossy(&output);
 
-    // Extract PATH between sentinels (last complete pair wins if sentinels appear multiple times)
-    let path_str = extract_between_sentinels(&output_str, PATH_START_SENTINEL, PATH_END_SENTINEL)?;
+    // Extract PATH between sentinels (last complete pair wins if sentinels
+    // appear multiple times — rc-file noise prints before our payload).
+    // Search only the prefix before the env payload: the env dump prints
+    // after the PATH pair, so an env *value* containing a literal PATH
+    // sentinel must not re-anchor the extraction.
+    let path_region_end = output_str
+        .rfind(ENV_START_SENTINEL)
+        .unwrap_or(output_str.len());
+    let path_str = extract_between_sentinels(
+        &output_str[..path_region_end],
+        PATH_START_SENTINEL,
+        PATH_END_SENTINEL,
+    )?;
 
     // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
     let dirs = std::env::split_paths(path_str)
@@ -858,12 +880,16 @@ mod tests {
     fn credential_env_allow_list_matches_exact_and_prefix_names() {
         assert!(is_credential_env_allow_listed("ANTHROPIC_API_KEY"));
         assert!(is_credential_env_allow_listed("HUGGING_FACE_HUB_TOKEN"));
+        assert!(is_credential_env_allow_listed("XAI_API_KEY"));
         assert!(is_credential_env_allow_listed("AUGGIE_API_TOKEN"));
         assert!(is_credential_env_allow_listed("CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(is_credential_env_allow_listed("CORTEX_ANY_SUFFIX"));
+        assert!(is_credential_env_allow_listed("GROK_API_KEY"));
+        assert!(is_credential_env_allow_listed("PI_API_KEY"));
         // Prefix requires the trailing underscore
         assert!(!is_credential_env_allow_listed("CLAUDEX_TOKEN"));
         assert!(!is_credential_env_allow_listed("AUGGIE"));
+        assert!(!is_credential_env_allow_listed("PIN"));
         assert!(!is_credential_env_allow_listed("HOME"));
         assert!(!is_credential_env_allow_listed("PATH"));
     }
@@ -930,6 +956,36 @@ mod tests {
             Some("test-prefix")
         );
         assert!(!capture.credential_env.contains_key("NOT_ALLOWED"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_env_value_containing_path_sentinel_does_not_corrupt_path() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_env_sentinel_{pid}_{nanos}.sh"));
+
+        // An env *value* containing the literal PATH end sentinel must not
+        // re-anchor the PATH extraction into the env payload.
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+        );
+
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
+        assert_eq!(
+            capture.credential_env.get("CODEX_EVIL").map(String::as_str),
+            Some("/fake/bin__INTENT_PATH_E__")
+        );
     }
 
     #[test]
