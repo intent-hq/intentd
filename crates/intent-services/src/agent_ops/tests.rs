@@ -14465,6 +14465,146 @@ async fn diagnostics_flags_orphaned_subscription() {
         .any(|r| r["type"] == json!("orphaned-subscription") && r["agentId"] == json!(ghost.0)));
 }
 
+/// monorepo#1694: a healthy `after_all` group — every pending child covered
+/// by a grouped completion watch — reports its real subscription linkage
+/// (`subscriptionIds`, `subscriptionMissing: false`) instead of the legacy
+/// always-empty group-level field, and its incomplete-group stuck-risk is
+/// not `critical`.
+#[tokio::test]
+async fn diagnostics_healthy_after_all_group_reports_subscription_linkage() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &a);
+    svc.enroll_child_in_group(&gid, &b);
+    let mut watch_ids = Vec::new();
+    for child in [&a, &b] {
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                parent.clone(),
+                "Parent".into(),
+                child.clone(),
+                Some(gid.clone()),
+            )
+            .expect("grouped watch");
+        watch_ids.push(id);
+    }
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let groups = diag["delegationGroups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group["groupId"], json!(gid));
+    assert_eq!(group["subscriptionMissing"], json!(false), "group: {group}");
+    let sub_ids: Vec<&str> = group["subscriptionIds"]
+        .as_array()
+        .expect("subscriptionIds")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for id in &watch_ids {
+        assert!(sub_ids.contains(&id.as_str()), "linkage lists watch {id}");
+    }
+
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    // Idle pending children: worth a look, but never critical when the
+    // subscription linkage is intact.
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+}
+
+/// monorepo#1694: an incomplete group whose pending children are ALL
+/// actively responding (non-stale) is normal in-progress fan-in — the
+/// stuck-risk downgrades to `info`.
+#[tokio::test]
+async fn diagnostics_after_all_group_with_responding_children_is_info() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Active;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child responding");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("info"), "risk: {risk}");
+}
+
+/// monorepo#1694: a pending child with NO grouped watch is the real failure
+/// the missing-check exists for — `subscriptionMissing: true` and a
+/// `critical` stuck-risk.
+#[tokio::test]
+async fn diagnostics_after_all_group_without_watch_is_critical() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let groups = diag["delegationGroups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["subscriptionMissing"], json!(true));
+    assert_eq!(groups[0]["subscriptionIds"], json!([]));
+
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("critical"), "risk: {risk}");
+}
+
 /// The auggie `session stats --json` parser maps the camelCase CLI shape onto
 /// [`SessionStats`]: `creditsUsed` flows through, counts default to 0 when
 /// absent, and a non-object payload degrades to `None` (PROTOCOL §5.24).

@@ -6677,7 +6677,6 @@ impl Services {
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
         let session_by_id: std::collections::HashMap<String, &AgentSession> =
             sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
-        let watch_ids: HashSet<String> = watches.iter().map(|w| w.id.clone()).collect();
 
         let mut matching: HashSet<String> = HashSet::new();
         for s in &sessions {
@@ -6808,10 +6807,24 @@ impl Services {
                     && g.expected_agent_ids.iter().all(|id| {
                         g.completed_agent_ids.contains(id) || g.deleted_agent_ids.contains(id)
                     });
-                let subscription_missing = match &g.subscription_id {
-                    Some(sid) => !watch_ids.contains(sid),
-                    None => true,
+                // The group-level `subscription_id` is a TS-parity legacy
+                // field the daemon never populates; the real linkage is the
+                // per-child grouped completion watches (each carries this
+                // group's id). Derive the missing-check from the watches
+                // table (monorepo#1694): linkage is missing only when some
+                // still-pending child has no grouped watch observing it.
+                let grouped_watch = |id: &str| {
+                    watches.iter().any(|w| {
+                        w.group_id.as_deref() == Some(g.group_id.as_str())
+                            && w.child_agent_id.0 == id
+                    })
                 };
+                let subscription_ids: Vec<String> = watches
+                    .iter()
+                    .filter(|w| w.group_id.as_deref() == Some(g.group_id.as_str()))
+                    .map(|w| w.id.clone())
+                    .collect();
+                let subscription_missing = pending.iter().any(|id| !grouped_watch(id));
                 json!({
                     "groupId": g.group_id,
                     "parentAgentId": g.parent_agent_id,
@@ -6820,7 +6833,7 @@ impl Services {
                     "completedAgentIds": g.completed_agent_ids,
                     "deletedAgentIds": g.deleted_agent_ids,
                     "pendingAgentIds": pending,
-                    "subscriptionId": g.subscription_id.clone().unwrap_or_default(),
+                    "subscriptionIds": subscription_ids,
                     "subscriptionMissing": subscription_missing,
                     "delivered": g.delivered,
                     "complete": complete,
@@ -7004,9 +7017,28 @@ impl Services {
             let delivered = g["delivered"].as_bool() == Some(true);
             if !complete && !delivered {
                 let gid = g["groupId"].as_str().unwrap_or_default();
-                let pending = g["pendingAgentIds"].as_array().map_or(0, Vec::len);
+                let pending_ids: Vec<&str> = g["pendingAgentIds"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let pending = pending_ids.len();
+                // Severity ladder (monorepo#1694): missing subscription
+                // linkage means the group can never observe a pending
+                // child's completion — critical. Otherwise a group whose
+                // pending children are all actively responding (non-stale)
+                // is normal in-progress fan-in — informational; anything
+                // else (idle/stale/missing pending child) is worth a look.
+                let all_pending_active = !pending_ids.is_empty()
+                    && pending_ids.iter().all(|id| {
+                        session_by_id.get(*id).is_some_and(|s| {
+                            agent_status_wire(s.status) == Some("responding")
+                                && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                        })
+                    });
                 let severity = if g["subscriptionMissing"].as_bool() == Some(true) {
                     "critical"
+                } else if all_pending_active {
+                    "info"
                 } else {
                     "warning"
                 };
