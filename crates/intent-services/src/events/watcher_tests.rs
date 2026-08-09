@@ -15,6 +15,7 @@ use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::shared_watch::SharedWatchHub;
 use super::watcher::{flush_due, Action, FileWatcher};
+use super::LIVENESS;
 
 /// Self-cleaning temp directory (db file + watched workspace root).
 struct TempDir {
@@ -106,13 +107,13 @@ async fn create_and_delete_emit_distinct_file_events() {
     );
 
     // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("foo.txt");
     std::fs::write(&file, b"hello").expect("write file");
 
-    let ev = next_for(&mut sub, "foo.txt", None, Duration::from_secs(5))
+    let ev = next_for(&mut sub, "foo.txt", None, LIVENESS)
         .await
         .expect("create/modify event for foo.txt");
     assert_eq!(ev.data["path"], "foo.txt");
@@ -131,7 +132,7 @@ async fn create_and_delete_emit_distinct_file_events() {
     assert_eq!(ev.event_type, expected_type);
 
     std::fs::remove_file(&file).expect("remove file");
-    let ev = next_for(&mut sub, "foo.txt", Some("delete"), Duration::from_secs(5))
+    let ev = next_for(&mut sub, "foo.txt", Some("delete"), LIVENESS)
         .await
         .expect("delete event for foo.txt");
     assert_eq!(ev.event_type, "file:deleted");
@@ -154,7 +155,7 @@ async fn ignored_paths_emit_nothing() {
         WorkspaceId::from("ws-1"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("node_modules/dep.js"), b"x").expect("write ignored");
@@ -190,11 +191,11 @@ async fn modifying_pre_existing_file_emits_changed_event() {
         WorkspaceId::from("ws-1"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     std::fs::write(&file, b"v2 longer content").expect("write v2");
-    let ev = next_for(&mut sub, "bar.txt", None, Duration::from_secs(5))
+    let ev = next_for(&mut sub, "bar.txt", None, LIVENESS)
         .await
         .expect("event for bar.txt after modify");
     // FSEvents/inotify normalize a write to an existing path differently per
@@ -228,7 +229,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         ws.clone(),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Create 150 files rapidly (all within a few ms) so they accumulate in the
@@ -240,13 +241,13 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         std::fs::write(file, b"burst").expect("write file");
     }
 
-    // Drain all file:* events from the subscription. Poll for up to 15 seconds
+    // Drain all file:* events from the subscription. Poll for up to `LIVENESS`
     // to allow the watcher to process all events, even under slow coverage
     // instrumentation. Exit when we see a burst event followed by 1s of silence,
     // or when we hit the overall deadline.
     let mut events = Vec::new();
     let start = Instant::now();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + LIVENESS;
     let mut seen_burst = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -308,7 +309,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // extreme load that the FS watcher never delivered the burst, fail explicitly.
     assert!(
         seen_burst,
-        "FS watcher did not deliver a burst event within 15s; \
+        "FS watcher did not deliver a burst event within {LIVENESS:?}; \
          got {} events total (system may be under extreme load, but the test cannot pass)",
         events.len()
     );
@@ -358,13 +359,13 @@ async fn normal_single_file_edit_still_emits_individual_event() {
         ws.clone(),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("single.txt");
     std::fs::write(&file, b"content").expect("write file");
 
-    let ev = next_for(&mut sub, "single.txt", None, Duration::from_secs(5))
+    let ev = next_for(&mut sub, "single.txt", None, LIVENESS)
         .await
         .expect("single-file event");
     // Should be a normal individual event, not a burst summary.
@@ -605,7 +606,7 @@ async fn dedupe_within_window_emits_one_event_per_path() {
         ws.clone(),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let file = dir.path.join("dedupe.txt");
@@ -685,12 +686,12 @@ fn git_init(root: &Path) {
     run(&["config", "user.name", "Watcher Test"]);
 }
 
-/// Wait until the control path's event arrives (up to 10s), asserting no
-/// `file:*` event for any suppressed path shows up — then keep draining until
-/// an 800 ms quiet window passes to catch stragglers flushed after the
+/// Wait until the control path's event arrives (up to `LIVENESS`), asserting
+/// no `file:*` event for any suppressed path shows up — then keep draining
+/// until an 800 ms quiet window passes to catch stragglers flushed after the
 /// control.
 async fn expect_suppressed(sub: &mut super::bus::Subscription, suppressed: &[&str], control: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + LIVENESS;
     let mut seen_control = false;
     loop {
         let wait = if seen_control {
@@ -746,7 +747,7 @@ async fn gitignored_generated_dir_is_suppressed() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join(".svelte-kit/output/x.d.ts"), b"x").expect("write ignored");
@@ -782,7 +783,7 @@ async fn user_ignored_path_suppressed_across_create_modify_delete() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let scratch = dir.path.join("scratch.txt");
@@ -814,7 +815,7 @@ async fn nested_gitignore_applies_only_under_its_directory() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("sub/data.secret"), b"x").expect("write ignored");
@@ -844,7 +845,7 @@ async fn git_info_exclude_is_honored() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("excluded-local.txt"), b"x").expect("write ignored");
@@ -872,7 +873,7 @@ async fn negation_reincludes_file_in_ignored_dir() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist2/other.txt"), b"x").expect("write ignored");
@@ -899,19 +900,14 @@ async fn gitignore_edit_takes_effect_without_restart() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Not ignored yet: must emit.
     std::fs::write(dir.path.join("runtime-ignored.txt"), b"v1").expect("write pre-rule");
-    next_for(
-        &mut sub,
-        "runtime-ignored.txt",
-        None,
-        Duration::from_secs(5),
-    )
-    .await
-    .expect("event before the ignore rule exists");
+    next_for(&mut sub, "runtime-ignored.txt", None, LIVENESS)
+        .await
+        .expect("event before the ignore rule exists");
 
     // Add the rule at runtime; the `.gitignore` event itself marks the matcher
     // dirty and it rebuilds on next use — no daemon restart.
@@ -920,7 +916,7 @@ async fn gitignore_edit_takes_effect_without_restart() {
         "initial-ignored.txt\nruntime-ignored.txt\n",
     )
     .expect("edit .gitignore");
-    next_for(&mut sub, ".gitignore", None, Duration::from_secs(5))
+    next_for(&mut sub, ".gitignore", None, LIVENESS)
         .await
         .expect("event for the .gitignore edit");
 
@@ -949,7 +945,7 @@ async fn default_patterns_apply_without_gitignore_rule() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("app.log"), b"x").expect("write log");
@@ -984,7 +980,7 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Edit info/exclude at runtime: the raw event for this path is the ONLY
@@ -994,7 +990,7 @@ async fn runtime_info_exclude_negation_rescues_prefiltered_path() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, Duration::from_secs(5))
+    let ev = next_for(&mut sub, "dist/bundle.js", None, LIVENESS)
         .await
         .expect("runtime exclude negation must rescue the prefiltered path");
     assert_eq!(ev.data["relativePath"], "dist/bundle.js");
@@ -1019,11 +1015,11 @@ async fn user_negation_overrides_default_pattern() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join("dist/bundle.js"), b"js").expect("write negated");
-    let ev = next_for(&mut sub, "dist/bundle.js", None, Duration::from_secs(5))
+    let ev = next_for(&mut sub, "dist/bundle.js", None, LIVENESS)
         .await
         .expect("negated default must emit");
     assert_eq!(ev.data["relativePath"], "dist/bundle.js");
@@ -1045,7 +1041,7 @@ async fn non_git_root_still_applies_default_patterns() {
         WorkspaceId::from("ws-gi"),
         dir.path.clone(),
     );
-    _watcher.wait_established(Duration::from_secs(10)).await;
+    _watcher.wait_established(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     std::fs::write(dir.path.join(".svelte-kit/x.js"), b"x").expect("write ignored");
