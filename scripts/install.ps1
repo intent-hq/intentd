@@ -47,7 +47,18 @@ try {
     if (-not (Test-Path $binary)) {
         throw 'install.ps1: archive did not contain intentd.exe'
     }
-    Copy-Item $binary (Join-Path $installDir 'intentd.exe') -Force
+    # Windows locks a running executable's file against writes and deletes but
+    # allows renaming it, so move any existing binary aside before copying the
+    # new one — keeps re-runs working while `intentd serve` is running. Stale
+    # .old files from earlier updates are swept opportunistically (a locked one
+    # is skipped and picked up next time).
+    $dest = Join-Path $installDir 'intentd.exe'
+    Get-ChildItem -Path $installDir -Filter 'intentd.exe.*.old' -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    if (Test-Path $dest) {
+        Move-Item $dest "$dest.$PID.$(Get-Random).old" -Force
+    }
+    Copy-Item $binary $dest -Force
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
