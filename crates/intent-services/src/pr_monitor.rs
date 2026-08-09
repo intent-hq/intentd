@@ -1,9 +1,13 @@
 //! Centralized PR monitoring (`ws.pr.monitor`). An agent registers a watch on
 //! one pull request and the daemon polls it from a SINGLE loop, diffing each
-//! refreshed merge-requirements checklist against the persisted baseline.
+//! refreshed merge-requirements checklist against the persisted EMIT baseline
+//! — the PR state as of the last delivered wake (or registration).
 //!
-//! Detected changes accumulate on the monitor row (`pendingChanges`, so the
-//! UI can surface "changes awaiting emit") and are delivered as ONE
+//! The pending set (`pendingChanges`, so the UI can surface "changes awaiting
+//! emit") is RECOMPUTED each poll as `diff(baseline, fresh)` — a coalesced
+//! net diff, never an accumulated log: a field that reverts to its baseline
+//! value drops out of the set (a full revert goes silent, no wake at all)
+//! and A→B→C renders as a single A→C line. The set is delivered as ONE
 //! consolidated wake once the PR has been quiet for the debounce window —
 //! via the automatic-delivery `agent.sendMessage` path, so a wake queues
 //! behind an in-flight turn and never interrupts. A merged/closed PR is
@@ -31,7 +35,7 @@ use intent_core::{
     Result, WorkspaceId,
 };
 use intent_sourcecontrol::{RepoRef, SourceControl};
-use intent_store::NewEvent;
+use intent_store::{NewEvent, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
 use crate::pr_ops::{self, MergeRequirements};
@@ -360,6 +364,25 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
         }
     }
     changes
+}
+
+/// Whether a row's persisted pending set is what the coalescing poll would
+/// recompute anyway — `diff(baseline, last_snapshot)`. A set that does NOT
+/// survive is a legacy accumulated log (pre-coalescing rows whose upgrade
+/// migration backfilled `baseline_snapshot = last_snapshot`, making their
+/// recomputed diff empty): boot rehydration delivers those as-is instead of
+/// letting the first poll silently discard them.
+fn pending_survives_recompute(m: &PrMonitor) -> bool {
+    let parse = |s: &Option<String>| -> Option<PrMonitorSnapshot> {
+        s.as_deref().and_then(|s| serde_json::from_str(s).ok())
+    };
+    let (Some(baseline), Some(last)) = (parse(&m.baseline_snapshot), parse(&m.last_snapshot))
+    else {
+        // No baseline/snapshot to recompute from: the poll preserves the
+        // set until it can, so nothing is at risk.
+        return true;
+    };
+    diff_snapshots(&baseline, &last) == m.pending_changes
 }
 
 fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
@@ -705,6 +728,7 @@ impl Services {
                 pr_number: pr_number as i64,
                 state: PrMonitorState::Active,
                 last_snapshot: baseline.clone(),
+                baseline_snapshot: baseline.clone(),
                 pending_changes: Vec::new(),
                 pending_since: None,
                 last_change_at: None,
@@ -754,20 +778,22 @@ impl Services {
             .store
             .update_pr_monitor_poll(
                 &m.monitor_id,
-                baseline.as_deref(),
-                &[],
-                None,
-                None,
-                Some(now),
-                None,
-                now,
-                &m.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: baseline.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: Some(now),
+                    updated_at: now,
+                    expected_updated_at: &m.updated_at,
+                    ..Default::default()
+                },
             )
             .await?;
         if !updated {
             return Ok(None);
         }
-        m.last_snapshot = baseline;
+        m.last_snapshot = baseline.clone();
+        m.baseline_snapshot = baseline;
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
@@ -1061,8 +1087,8 @@ impl Services {
         time::OffsetDateTime::now_utc() - at < interval
     }
 
-    /// Poll one monitor against the sweep's shared snapshot: diff it against
-    /// the persisted baseline, accumulate any changes, and either
+    /// Poll one monitor against the sweep's shared snapshot: RECOMPUTE the
+    /// coalesced pending set against the persisted emit baseline, and either
     /// terminalize (PR merged/closed → immediate final wake) or evaluate the
     /// debounce window.
     async fn poll_one_pr_monitor(
@@ -1076,10 +1102,32 @@ impl Services {
             .and_then(|s| serde_json::from_str(s).ok());
         let fresh = shared.materialize(previous.as_ref());
 
-        let changes = previous
+        // Per-poll activity (fresh vs the LAST POLL's snapshot) anchors the
+        // debounce quiet-window; the pending set below is computed against
+        // the EMIT baseline instead, so the two diffs serve distinct roles.
+        let poll_activity = previous
             .as_ref()
-            .map(|prev| diff_snapshots(prev, &fresh))
+            .map(|prev| !diff_snapshots(prev, &fresh).is_empty())
+            .unwrap_or(false);
+
+        // The emit baseline: the PR state as of the last delivered wake (or
+        // registration). A row missing one (unparseable column) anchors on
+        // the last poll's snapshot; a row with neither adopts the fresh
+        // snapshot below, with nothing pending.
+        let baseline: Option<PrMonitorSnapshot> = monitor
+            .baseline_snapshot
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .or(previous);
+
+        // The coalesced net set: REPLACED (never accumulated) each poll, so
+        // a field that reverted to its baseline value drops out and A→B→C
+        // renders as a single A→C line.
+        let pending = baseline
+            .as_ref()
+            .map(|base| diff_snapshots(base, &fresh))
             .unwrap_or_default();
+
         // The catch-up marker is set by boot rehydration; the first poll
         // after a restart skips the debounce window. The marker is only
         // PEEKED here and consumed after the write-back/emit succeed, so a
@@ -1090,34 +1138,42 @@ impl Services {
             .unwrap()
             .contains(&monitor.monitor_id);
 
-        let mut pending = monitor.pending_changes.clone();
-        pending.extend(changes.iter().cloned());
         let now = now_iso();
-        let pending_since = if monitor.pending_since.is_some() {
-            monitor.pending_since.clone()
-        } else if !pending.is_empty() {
-            Some(now.clone())
+        // Anchors: `pending_since` marks when the coalesced set first became
+        // non-empty; both anchors reset when it empties (a full revert
+        // leaves nothing pending — and nothing to wake about).
+        let (pending_since, last_change_at) = if pending.is_empty() {
+            (None, None)
         } else {
-            None
+            (
+                monitor.pending_since.clone().or_else(|| Some(now.clone())),
+                if poll_activity {
+                    Some(now.clone())
+                } else {
+                    monitor.last_change_at.clone()
+                },
+            )
         };
-        let last_change_at = if changes.is_empty() {
-            monitor.last_change_at.clone()
-        } else {
-            Some(now.clone())
+        let fresh_json = serde_json::to_string(&fresh).ok();
+        let baseline_json = match &baseline {
+            Some(base) => serde_json::to_string(base).ok(),
+            None => fresh_json.clone(),
         };
-        let baseline = serde_json::to_string(&fresh).ok();
         if !self
             .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                baseline.as_deref(),
-                &pending,
-                pending_since.as_deref(),
-                last_change_at.as_deref(),
-                Some(&now),
-                None,
-                &now,
-                &monitor.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: fresh_json.as_deref(),
+                    baseline_snapshot: baseline_json.as_deref(),
+                    pending_changes: &pending,
+                    pending_since: pending_since.as_deref(),
+                    last_change_at: last_change_at.as_deref(),
+                    last_polled_at: Some(&now),
+                    last_error: None,
+                    updated_at: &now,
+                    expected_updated_at: &monitor.updated_at,
+                },
             )
             .await?
         {
@@ -1127,7 +1183,8 @@ impl Services {
             return Ok(());
         }
         let mut updated = monitor.clone();
-        updated.last_snapshot = baseline;
+        updated.last_snapshot = fresh_json;
+        updated.baseline_snapshot = baseline_json;
         updated.pending_changes = pending;
         updated.pending_since = pending_since;
         updated.last_change_at = last_change_at;
@@ -1135,7 +1192,9 @@ impl Services {
         updated.last_error = None;
         updated.updated_at = now;
 
-        if !changes.is_empty() {
+        // The FE's `pendingChanges` tracks the NET set: fire on any change
+        // to it, including shrinking to empty on a revert.
+        if updated.pending_changes != monitor.pending_changes {
             self.emit_pr_monitor_event(
                 PR_MONITOR_CHANGED,
                 &updated,
@@ -1177,9 +1236,14 @@ impl Services {
     /// been quiet for the configured debounce window since its most recent
     /// change, OR the oldest un-emitted change has waited out the max-latency
     /// bound ([`PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR`] debounce windows since
-    /// `pending_since`) — a busy PR that never goes quiet still gets its
-    /// consolidated wake, late but never starved. An unparseable/absent
-    /// anchor emits immediately rather than stranding a pending wake forever.
+    /// `pending_since`) — a busy PR whose coalesced set stays CONTINUOUSLY
+    /// non-empty still gets its consolidated wake, late but never starved.
+    /// (Coalescing weakens the bound: a full revert empties the set and
+    /// resets `pending_since`, so churn that keeps netting out to nothing
+    /// re-arms the clock rather than accruing toward the max-latency bound —
+    /// by design, since a PR back at its baseline has nothing to report.)
+    /// An unparseable/absent anchor emits immediately rather than stranding
+    /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
         let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs() as i64);
         let now = time::OffsetDateTime::now_utc();
@@ -1199,43 +1263,53 @@ impl Services {
         now - anchor >= window
     }
 
-    /// Deliver the consolidated wake for a monitor's pending changes and
-    /// reset the debounce state (pending cleared, anchors dropped). Returns
-    /// `false` without waking when the guarded clear loses — the row moved
-    /// (a concurrent poll appended more lines, or a flush/cancel/re-register
+    /// Deliver the consolidated wake for a monitor's coalesced pending set,
+    /// advance the emit baseline to the delivered snapshot, and reset the
+    /// debounce state (pending cleared, anchors dropped). Returns `false`
+    /// without waking when the guarded clear loses — the row moved (a
+    /// concurrent poll recomputed the set, or a flush/cancel/re-register
     /// landed) between the caller's read and the clear — so no change line is
     /// ever cleared without having been rendered into a delivered wake; the
-    /// surviving pending state re-emits on a later tick.
+    /// surviving pending state re-emits on a later tick. An EMPTY coalesced
+    /// set (a PR that fully reverted to its baseline) also returns `false`:
+    /// there is nothing to report, so no wake is sent.
     async fn emit_pending_changes(&self, monitor: &PrMonitor) -> Result<bool> {
+        if monitor.pending_changes.is_empty() {
+            return Ok(false);
+        }
         let snapshot: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
         let Some(snapshot) = snapshot else {
-            // No baseline to describe: keep the pending changes rather than
-            // dropping them; the next poll writes a baseline and emits.
+            // No snapshot to describe: keep the pending changes rather than
+            // dropping them; the next poll writes a snapshot and emits.
             return Ok(false);
         };
         let message = render_change_wake(monitor, &monitor.pending_changes, &snapshot);
         let now = now_iso();
+        // The delivered snapshot becomes the new emit baseline: the next
+        // wake reports only what moves from here.
         if !self
             .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                monitor.last_snapshot.as_deref(),
-                &[],
-                None,
-                None,
-                monitor.last_polled_at.as_deref(),
-                None,
-                &now,
-                &monitor.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: monitor.last_snapshot.as_deref(),
+                    baseline_snapshot: monitor.last_snapshot.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: monitor.last_polled_at.as_deref(),
+                    updated_at: &now,
+                    expected_updated_at: &monitor.updated_at,
+                    ..Default::default()
+                },
             )
             .await?
         {
             return Ok(false);
         }
         let mut emitted = monitor.clone();
+        emitted.baseline_snapshot = monitor.last_snapshot.clone();
         emitted.pending_changes = Vec::new();
         emitted.pending_since = None;
         emitted.last_change_at = None;
@@ -1249,26 +1323,36 @@ impl Services {
 
     /// Terminalize a monitor whose PR merged or closed: persist `completed`
     /// (the row is RETAINED so merged PRs stay visible), clear the pending
-    /// state, and deliver the immediate final wake.
+    /// state, and deliver the immediate final wake. Its "Changes since the
+    /// last report" section coalesces the same way as a change wake —
+    /// `diff(baseline, final)` — so the journey to terminal never replays
+    /// intermediate transitions.
     async fn complete_pr_monitor(
         &self,
         monitor: &PrMonitor,
         snapshot: &PrMonitorSnapshot,
     ) -> Result<()> {
-        let message = render_terminal_wake(monitor, &monitor.pending_changes, snapshot);
+        let changes = monitor
+            .baseline_snapshot
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+            .map(|base| diff_snapshots(&base, snapshot))
+            .unwrap_or_else(|| monitor.pending_changes.clone());
+        let message = render_terminal_wake(monitor, &changes, snapshot);
         let now = now_iso();
         if !self
             .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                monitor.last_snapshot.as_deref(),
-                &[],
-                None,
-                None,
-                monitor.last_polled_at.as_deref(),
-                None,
-                &now,
-                &monitor.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: monitor.last_snapshot.as_deref(),
+                    baseline_snapshot: monitor.baseline_snapshot.as_deref(),
+                    pending_changes: &[],
+                    last_polled_at: monitor.last_polled_at.as_deref(),
+                    updated_at: &now,
+                    expected_updated_at: &monitor.updated_at,
+                    ..Default::default()
+                },
             )
             .await?
         {
@@ -1314,14 +1398,17 @@ impl Services {
             .store
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                monitor.last_snapshot.as_deref(),
-                &monitor.pending_changes,
-                monitor.pending_since.as_deref(),
-                monitor.last_change_at.as_deref(),
-                Some(&now),
-                Some(error),
-                &now,
-                &monitor.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: monitor.last_snapshot.as_deref(),
+                    baseline_snapshot: monitor.baseline_snapshot.as_deref(),
+                    pending_changes: &monitor.pending_changes,
+                    pending_since: monitor.pending_since.as_deref(),
+                    last_change_at: monitor.last_change_at.as_deref(),
+                    last_polled_at: Some(&now),
+                    last_error: Some(error),
+                    updated_at: &now,
+                    expected_updated_at: &monitor.updated_at,
+                },
             )
             .await
         {
@@ -1337,8 +1424,12 @@ impl Services {
     /// agent is gone are cancelled instead. Each resumed monitor is marked
     /// for catch-up so its first poll delivers immediately — a baseline that
     /// moved during downtime, or a pending emit persisted but never
-    /// delivered, must not wait out another debounce window. Returns the
-    /// number of resumed monitors.
+    /// delivered, must not wait out another debounce window. A pending set
+    /// the recomputing poll could not reproduce (a pre-coalescing
+    /// accumulated log left intact by the upgrade migration, which
+    /// backfilled the baseline to the last poll's snapshot) is delivered
+    /// as-is BEFORE that first poll — a wake awaiting delivery at upgrade
+    /// time is never dropped. Returns the number of resumed monitors.
     pub async fn rehydrate_pr_monitors(&self) -> Result<usize> {
         let monitors = self.store.load_active_pr_monitors().await?;
         let mut resumed = 0;
@@ -1364,6 +1455,13 @@ impl Services {
                 self.maybe_emit_display_status_changed(&monitor.workspace_id)
                     .await;
                 continue;
+            }
+            // Upgrade path: deliver a pending set the recompute would lose.
+            // Coalesced-era rows are a fixed point of the recompute and stay
+            // on the normal catch-up poll, which folds downtime changes into
+            // one consolidated wake.
+            if !monitor.pending_changes.is_empty() && !pending_survives_recompute(&monitor) {
+                self.emit_pending_changes(&monitor).await?;
             }
             self.pr_monitor_catch_up
                 .lock()
@@ -2561,7 +2659,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_changes_coalesce_into_one_debounced_wake() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        // A long window so the first two polls only accumulate.
+        // A long window so the first two polls only recompute the net set.
         let svc = svc.with_pr_monitor_debounce_seconds(3600);
         let monitor = register(&svc, &ws, &owner).await;
 
@@ -2580,7 +2678,7 @@ mod tests {
             .unwrap();
         assert!(
             held.pending_changes.len() >= 3,
-            "changes accumulate while the window is open: {:?}",
+            "the coalesced set covers both polls' changes: {:?}",
             held.pending_changes
         );
         assert!(held.pending_since.is_some());
@@ -2596,14 +2694,17 @@ mod tests {
             .store()
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                held.last_snapshot.as_deref(),
-                &held.pending_changes,
-                Some("2020-01-01T00:00:00Z"),
-                Some("2020-01-01T00:00:00Z"),
-                Some(&stale),
-                None,
-                &stale,
-                &held.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: held.last_snapshot.as_deref(),
+                    baseline_snapshot: held.baseline_snapshot.as_deref(),
+                    pending_changes: &held.pending_changes,
+                    pending_since: Some("2020-01-01T00:00:00Z"),
+                    last_change_at: Some("2020-01-01T00:00:00Z"),
+                    last_polled_at: Some(&stale),
+                    last_error: None,
+                    updated_at: &stale,
+                    expected_updated_at: &held.updated_at,
+                },
             )
             .await
             .unwrap());
@@ -2625,6 +2726,251 @@ mod tests {
             .unwrap();
         assert!(drained.pending_changes.is_empty(), "debounce state reset");
         assert!(drained.pending_since.is_none());
+        assert_eq!(
+            drained.baseline_snapshot, drained.last_snapshot,
+            "emit advanced the baseline to the delivered snapshot"
+        );
+    }
+
+    /// The coalescing property itself: a PR that churns A→B→A within one
+    /// debounce window nets to an EMPTY pending set — no wake, anchors reset
+    /// — and the FE's `PR_MONITOR_CHANGED` stream reflects the shrink to
+    /// empty. Covers comment-count fluctuations that net to zero and a check
+    /// removed then re-added with the same status.
+    #[tokio::test]
+    async fn a_full_revert_within_the_window_nets_to_no_wake() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // B: comments +2 and the only check removed.
+        forge.edit(|s| {
+            s.conversation_comments = 2;
+            s.checks.clear();
+        });
+        svc.poll_pr_monitors().await;
+        let held = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(!held.pending_changes.is_empty(), "changes pending after B");
+        assert!(held.pending_since.is_some());
+
+        // Back to A: comments deleted, check re-added with the same status.
+        forge.edit(|s| {
+            s.conversation_comments = 0;
+            s.checks = ForgeState::default().checks;
+        });
+        svc.poll_pr_monitors().await;
+        let reverted = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            reverted.pending_changes.is_empty(),
+            "a full revert empties the coalesced set: {:?}",
+            reverted.pending_changes
+        );
+        assert!(reverted.pending_since.is_none(), "anchors reset");
+        assert!(reverted.last_change_at.is_none(), "anchors reset");
+
+        // Even with the window elapsed nothing emits — there is no pending
+        // state left by construction.
+        svc.clone()
+            .with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+            .poll_pr_monitors()
+            .await;
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "no wake for a PR that ended up back where it started"
+        );
+
+        // The changed-event stream tracked the net set, including the final
+        // shrink to empty.
+        let events = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![PR_MONITOR_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2, "one event per net-set change");
+        assert_eq!(
+            events[0].data["changes"],
+            json!([]),
+            "the newest event reports the shrink to empty"
+        );
+    }
+
+    /// A field that moves A→B→C within one window reports a single
+    /// `A → C` line — never the intermediate transitions. The intermediate
+    /// state here is a (suppressed) success plus its completion aggregate;
+    /// the recompute against the baseline drops both once the check fails.
+    #[tokio::test]
+    async fn a_field_that_moves_twice_reports_a_single_net_line() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.checks[0].state = CheckState::Failure);
+        svc.poll_pr_monitors().await;
+
+        let held = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let check_lines: Vec<_> = held
+            .pending_changes
+            .iter()
+            .filter(|c| c.starts_with("check build"))
+            .collect();
+        assert_eq!(
+            check_lines,
+            vec!["check build: pending → failed"],
+            "single net line, no intermediate transitions: {:?}",
+            held.pending_changes
+        );
+        assert!(
+            !held
+                .pending_changes
+                .iter()
+                .any(|c| c.contains("all checks passed")),
+            "the intermediate all-green aggregate is dropped on recompute: {:?}",
+            held.pending_changes
+        );
+
+        // The delivered wake renders the same net line.
+        let stale = now_iso();
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: held.last_snapshot.as_deref(),
+                    baseline_snapshot: held.baseline_snapshot.as_deref(),
+                    pending_changes: &held.pending_changes,
+                    pending_since: Some("2020-01-01T00:00:00Z"),
+                    last_change_at: Some("2020-01-01T00:00:00Z"),
+                    last_polled_at: Some(&stale),
+                    last_error: None,
+                    updated_at: &stale,
+                    expected_updated_at: &held.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+        svc.poll_pr_monitors().await;
+        let text = owner_messages(&svc, &owner).await;
+        assert!(text.contains("check build: pending → failed"), "{text}");
+        assert!(!text.contains("pending → passed"), "{text}");
+        assert!(!text.contains("passed → failed"), "{text}");
+        assert!(!text.contains("all checks passed"), "{text}");
+    }
+
+    /// Suppression composed with coalescing: a suppressed intermediate
+    /// success contributes only the completion aggregate to the net set,
+    /// and that aggregate survives recomputation when a later poll adds
+    /// an unrelated change.
+    #[tokio::test]
+    async fn completion_aggregate_survives_recompute_alongside_later_changes() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.checks[0].state = CheckState::Success);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.conversation_comments = 1);
+        svc.poll_pr_monitors().await;
+
+        let held = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            held.pending_changes
+                .iter()
+                .any(|c| c == "all checks passed (1)"),
+            "the aggregate line persists across recomputes: {:?}",
+            held.pending_changes
+        );
+        assert!(
+            held.pending_changes
+                .iter()
+                .any(|c| c.contains("conversation comment")),
+            "the later change joins the same net set: {:?}",
+            held.pending_changes
+        );
+        assert!(
+            !held.pending_changes.iter().any(|c| c.starts_with("check ")),
+            "no per-check success line anywhere in the set: {:?}",
+            held.pending_changes
+        );
+    }
+
+    /// A flush racing a revert: the coalesced set already emptied, so the
+    /// flush is a no-op (`Ok(false)`) and no wake is sent.
+    #[tokio::test]
+    async fn flush_with_an_empty_coalesced_set_is_a_noop() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.conversation_comments = 0);
+        svc.poll_pr_monitors().await;
+
+        assert!(
+            !svc.pr_monitor_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "nothing pending after the revert"
+        );
+        assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
+    }
+
+    /// The terminal wake's "Changes since the last report" section coalesces
+    /// against the emit baseline: churn that reverted before the merge does
+    /// not replay in the final wake.
+    #[tokio::test]
+    async fn terminal_wake_coalesces_changes_since_the_last_report() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        register(&svc, &ws, &owner).await;
+
+        // Churn that fully reverts, then the check flips twice and the PR
+        // merges: the final wake nets to the completion aggregate (the
+        // per-check success is suppressed) and never mentions the reverted
+        // comments or the intermediate failure.
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| {
+            s.conversation_comments = 0;
+            s.checks[0].state = CheckState::Failure;
+        });
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| {
+            s.checks[0].state = CheckState::Success;
+            s.pr_state = PrState::Merged;
+        });
+        svc.poll_pr_monitors().await;
+
+        let text = owner_messages(&svc, &owner).await;
+        assert!(text.contains("was MERGED"), "{text}");
+        assert!(text.contains("Changes since the last report"), "{text}");
+        assert!(text.contains("state: open → merged"), "{text}");
+        assert!(text.contains("all checks passed (1)"), "{text}");
+        assert!(!text.contains("check build"), "{text}");
+        assert!(!text.contains("conversation comment"), "{text}");
+        assert!(!text.contains("pending → failed"), "{text}");
     }
 
     #[tokio::test]
@@ -2679,6 +3025,7 @@ mod tests {
             pr_number: 42,
             state: PrMonitorState::Active,
             last_snapshot: Some(serde_json::to_string(&snapshot(|_| {})).unwrap()),
+            baseline_snapshot: None,
             pending_changes: Vec::new(),
             pending_since: None,
             last_change_at: None,
@@ -2954,14 +3301,17 @@ mod tests {
             .store()
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                row.last_snapshot.as_deref(),
-                &row.pending_changes,
-                row.pending_since.as_deref(),
-                row.last_change_at.as_deref(),
-                Some("2020-01-01T00:00:00Z"),
-                None,
-                &stale,
-                &row.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.baseline_snapshot.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: Some("2020-01-01T00:00:00Z"),
+                    last_error: None,
+                    updated_at: &stale,
+                    expected_updated_at: &row.updated_at,
+                },
             )
             .await
             .unwrap());
@@ -3050,6 +3400,104 @@ mod tests {
                 .count(),
             1,
             "no second wake yet"
+        );
+    }
+
+    /// Restart catch-up only fires on a NON-EMPTY net diff: downtime churn
+    /// that reverted before the daemon came back nets to nothing pending,
+    /// so the first post-restart poll stays silent.
+    #[tokio::test]
+    async fn rehydration_catch_up_stays_silent_when_the_net_diff_is_empty() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // Churn lands and reverts across two polls, then the daemon
+        // "restarts": the net diff against the emit baseline is empty.
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        forge.edit(|s| s.conversation_comments = 0);
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        svc.poll_pr_monitors().await;
+
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("PR monitor"),
+            "no catch-up wake for a net-empty diff"
+        );
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty());
+        assert!(row.pending_since.is_none());
+    }
+
+    /// The upgrade path: a pre-coalescing row carries an accumulated
+    /// pending log, and the migration backfills `baseline_snapshot =
+    /// last_snapshot` — so the first recomputing poll would find an empty
+    /// net diff and silently discard the wake awaiting delivery. Boot
+    /// rehydration must deliver that legacy set as-is instead.
+    #[tokio::test]
+    async fn rehydration_delivers_a_legacy_pending_set_the_recompute_would_drop() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // Forge a post-migration legacy row: an accumulated log that the
+        // (baseline == last_snapshot) recompute cannot reproduce.
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let legacy = vec![
+            "check build: pending → failed".to_string(),
+            "check build: failed → passed".to_string(),
+        ];
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.last_snapshot.as_deref(),
+                    pending_changes: &legacy,
+                    pending_since: Some(&now_iso()),
+                    last_change_at: Some(&now_iso()),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+
+        // Boot: the legacy set is delivered by rehydration itself, before
+        // any poll gets a chance to recompute it away.
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains("check build: failed → passed"),
+            "the legacy accumulated lines are delivered, not dropped: {text}"
+        );
+
+        // The first poll then finds nothing pending and stays silent.
+        svc.poll_pr_monitors().await;
+        let drained = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(drained.pending_changes.is_empty());
+        assert_eq!(
+            owner_messages(&svc, &owner)
+                .await
+                .matches("[PR monitor o/r#42]")
+                .count(),
+            1,
+            "exactly one wake: the legacy delivery"
         );
     }
 

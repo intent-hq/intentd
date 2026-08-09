@@ -32,7 +32,7 @@ use intent_sourcecontrol::{
     Result as ScResult, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict,
     RollupCheck, ScCapabilities, SourceControl, UserIdentity,
 };
-use intent_store::Store;
+use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
     ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
 };
@@ -1133,14 +1133,17 @@ async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
             .store()
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
-                row.last_snapshot.as_deref(),
-                &row.pending_changes,
-                row.pending_since.as_deref(),
-                row.last_change_at.as_deref(),
-                Some("2020-01-01T00:00:00Z"),
-                None,
-                &now_iso(),
-                &row.updated_at,
+                PrMonitorPollUpdate {
+                    last_snapshot: row.last_snapshot.as_deref(),
+                    baseline_snapshot: row.baseline_snapshot.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: Some("2020-01-01T00:00:00Z"),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
             )
             .await
             .expect("backdate lastPolledAt"));
@@ -1297,4 +1300,133 @@ async fn intermediate_check_successes_stay_quiet_until_the_completion_aggregate_
         !text.contains("check build") && !text.contains("check lint"),
         "no per-check success lines in the wake: {text}"
     );
+}
+
+/// Coalesced-diff semantics end-to-end: `pendingChanges` over the wire is the
+/// NET diff against the emit baseline — A→B→C renders one initial→final line,
+/// and a full revert (C→A) empties the pending set, resets the debounce
+/// anchors, and produces NO owner wake even though the debounce window had
+/// already elapsed (the pre-coalescing accumulated-log behavior would have
+/// delivered the whole journey here).
+#[tokio::test]
+async fn full_revert_coalesces_to_empty_and_produces_no_owner_wake_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    // A→B: one new comment; the coalesced set carries the single net line.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        listed["monitors"][0]["pendingChanges"],
+        json!(["+1 conversation comment (1 total)"]),
+        "first poll: {listed}"
+    );
+
+    // B→C: a second comment; the set is RECOMPUTED against the emit baseline
+    // on every poll — a single net 0→2 line, never a two-line journey.
+    fx.forge.edit(|s| s.conversation_comments = 2);
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        listed["monitors"][0]["pendingChanges"],
+        json!(["+2 conversation comments (2 total)"]),
+        "coalesced net line, not the journey: {listed}"
+    );
+
+    // Backdate the debounce anchors so the NEXT poll would deliver the wake
+    // if anything stayed pending — the revert below must suppress it.
+    let row = fx
+        .services
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .expect("load row");
+    assert!(fx
+        .services
+        .store()
+        .update_pr_monitor_poll(
+            &monitor.monitor_id,
+            PrMonitorPollUpdate {
+                last_snapshot: row.last_snapshot.as_deref(),
+                baseline_snapshot: row.baseline_snapshot.as_deref(),
+                pending_changes: &row.pending_changes,
+                pending_since: Some("2020-01-01T00:00:00Z"),
+                last_change_at: Some("2020-01-01T00:00:00Z"),
+                last_polled_at: row.last_polled_at.as_deref(),
+                last_error: None,
+                updated_at: &now_iso(),
+                expected_updated_at: &row.updated_at,
+            },
+        )
+        .await
+        .expect("backdate debounce anchors"));
+
+    // C→A: both comments deleted — the PR is back at the emit baseline. The
+    // FE-facing `prMonitor:changed` fires with the set shrinking to empty.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    fx.forge.edit(|s| s.conversation_comments = 0);
+    fx.services.poll_pr_monitors().await;
+    let evt = next_event(&mut sub, "prMonitor:changed").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(
+        evt["data"]["changes"],
+        json!([]),
+        "the revert shrinks the net set to empty: {evt}"
+    );
+
+    // Nothing pending, anchors reset, and — despite the elapsed debounce —
+    // the owner was never woken.
+    let listed = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["pendingChanges"], json!([]), "empty net set: {row}");
+    assert_eq!(row["hasPendingChanges"], false);
+    assert!(row["pendingSince"].is_null(), "anchor reset: {row}");
+    assert!(row["lastChangeAt"].is_null(), "anchor reset: {row}");
+    assert!(
+        !owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "a full revert must produce no owner wake"
+    );
+
+    // A flush finds nothing pending either — an explicit no-op.
+    let flushed = wss_rpc(
+        &mut rpc,
+        5,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": false }));
 }

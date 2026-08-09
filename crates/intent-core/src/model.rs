@@ -3060,6 +3060,11 @@ pub struct PrMonitor {
     /// against. `None` until the first successful poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_snapshot: Option<String>,
+    /// JSON-serialized snapshot as of the last delivered wake (or
+    /// registration) — the emit baseline pending changes are coalesced
+    /// against. Backfilled from `last_snapshot` for pre-existing rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_snapshot: Option<String>,
     /// Change lines accumulated since the last emit, awaiting the debounce
     /// window to close. Empty when nothing is pending.
     #[serde(default)]
