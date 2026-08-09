@@ -26,7 +26,7 @@ use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
 use crate::reverse::ReverseChannel;
-use crate::router::handle_message;
+use crate::router::{check_envelope, handle_message, EnvelopeCheck};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
@@ -382,21 +382,13 @@ pub(crate) async fn process_frame(
 /// (§9: `-32700` for unparseable JSON, `-32600` for a bad envelope). Only
 /// dispatchable frames are gated by the outstanding-RPC limiter; everything
 /// else is answered inline so the error matrix is unchanged under load.
+/// Delegates to the router's [`check_envelope`] so both paths share one
+/// implementation of the envelope-validity rules.
 fn is_dispatchable(parsed: Option<&Value>) -> bool {
-    let Some(obj) = parsed.and_then(Value::as_object) else {
-        return false;
-    };
-    let jsonrpc_ok = obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-    let method_ok = obj
-        .get("method")
-        .and_then(Value::as_str)
-        .map(|m| !m.is_empty())
-        .unwrap_or(false);
-    let id_type_ok = match obj.get("id") {
-        None => true,
-        Some(v) => v.is_string() || v.is_number() || v.is_null(),
-    };
-    jsonrpc_ok && method_ok && id_type_ok
+    matches!(
+        parsed.map(check_envelope),
+        Some(EnvelopeCheck::Valid { .. })
+    )
 }
 
 /// Reject one over-limit slow-path frame (`server.maxOutstandingRpcs`): a
@@ -960,6 +952,61 @@ mod tests {
             assert!(
                 !is_dispatchable(parse(invalid).as_ref()),
                 "must not be limiter-gated: {invalid}"
+            );
+        }
+    }
+
+    /// Pins the pre-check ↔ router equivalence: for every frame,
+    /// `is_dispatchable` returns true iff `handle_message` does NOT answer
+    /// with the parse/envelope errors (`-32700`/`-32600`) it owns.
+    #[tokio::test]
+    async fn is_dispatchable_matches_handle_message_envelope_errors() {
+        struct NoopApi;
+        impl WorkspaceApi for NoopApi {}
+
+        for (raw, dispatchable) in [
+            // Valid request (unknown method still dispatches: -32601, not -32600).
+            (r#"{"jsonrpc":"2.0","id":1,"method":"agent.list"}"#, true),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"nope.method"}"#, true),
+            // Valid notification (dispatched; no response frame at all).
+            (r#"{"jsonrpc":"2.0","method":"agent.list"}"#, true),
+            // id: null present is a valid request id.
+            (r#"{"jsonrpc":"2.0","id":null,"method":"agent.list"}"#, true),
+            ("not json", false),
+            ("[1,2,3]", false),
+            (r#""just a string""#, false),
+            (r#"{"jsonrpc":"1.0","id":1,"method":"agent.list"}"#, false),
+            // Invalid notification-shaped frame: still answered with -32600.
+            (r#"{"jsonrpc":"1.0","method":"agent.list"}"#, false),
+            (r#"{"id":1,"method":"agent.list"}"#, false),
+            (r#"{"jsonrpc":"2.0","id":1}"#, false),
+            (r#"{"jsonrpc":"2.0","id":1,"method":""}"#, false),
+            (r#"{"jsonrpc":"2.0","id":1,"method":7}"#, false),
+            (
+                r#"{"jsonrpc":"2.0","id":{"a":1},"method":"agent.list"}"#,
+                false,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"method":"agent.list"}"#,
+                false,
+            ),
+        ] {
+            let parsed = serde_json::from_str::<Value>(raw).ok();
+            assert_eq!(
+                is_dispatchable(parsed.as_ref()),
+                dispatchable,
+                "is_dispatchable: {raw}"
+            );
+            let envelope_error = match handle_message(&NoopApi, raw).await {
+                None => false,
+                Some(frame) => {
+                    let v: Value = serde_json::from_str(&frame).expect("valid json response");
+                    matches!(v["error"]["code"].as_i64(), Some(-32700) | Some(-32600))
+                }
+            };
+            assert_eq!(
+                dispatchable, !envelope_error,
+                "handle_message envelope-error mismatch: {raw}"
             );
         }
     }

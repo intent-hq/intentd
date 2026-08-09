@@ -128,6 +128,69 @@ fn domain_to_rpc(e: Error) -> RpcErr {
     }
 }
 
+/// Classification of one parsed JSON-RPC envelope — the single implementation
+/// of the §3/§9 envelope-validity rules. Consumed by [`handle_message`], which
+/// maps each failure to its exact `-32600` message, and by the dispatch
+/// pre-check in `conn.rs`, which only needs valid-vs-not.
+pub(crate) enum EnvelopeCheck<'a> {
+    /// The frame is JSON but not an object (answered with id `null`).
+    NotObject,
+    /// `jsonrpc` is missing or not exactly `"2.0"`. The request id is echoed
+    /// only when its type is valid, else `null`.
+    BadJsonRpc { echo_id: Value },
+    /// `method` is missing, not a string, or empty (same id-echo rule as
+    /// [`EnvelopeCheck::BadJsonRpc`]).
+    BadMethod { echo_id: Value },
+    /// `id` is present but not a string, number, or null — an invalid id is
+    /// never echoed, so the response id is `null`.
+    BadId,
+    /// The envelope is valid and may be dispatched. `is_notification` is true
+    /// when the `id` member is absent entirely (`id: null` is a request).
+    Valid {
+        echo_id: Value,
+        method: &'a str,
+        is_notification: bool,
+    },
+}
+
+/// Classify a parsed frame against the envelope-validity rules (§3, §9):
+/// `jsonrpc` must be exactly `"2.0"`, `method` a non-empty string, and `id` —
+/// when present — a string, number, or null. Failures are reported in
+/// jsonrpc → method → id order, matching the message precedence in
+/// [`handle_message`].
+pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
+    let Some(obj) = value.as_object() else {
+        return EnvelopeCheck::NotObject;
+    };
+    let id_member = obj.get("id");
+    let id_type_ok = match id_member {
+        None => true,
+        Some(v) => v.is_string() || v.is_number() || v.is_null(),
+    };
+    let echo_id = match id_member {
+        Some(v) if id_type_ok => v.clone(),
+        _ => Value::Null,
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return EnvelopeCheck::BadJsonRpc { echo_id };
+    }
+    let method = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty());
+    let Some(method) = method else {
+        return EnvelopeCheck::BadMethod { echo_id };
+    };
+    if !id_type_ok {
+        return EnvelopeCheck::BadId;
+    }
+    EnvelopeCheck::Valid {
+        echo_id,
+        method,
+        is_notification: id_member.is_none(),
+    }
+}
+
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
@@ -138,9 +201,10 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         Err(_) => return Some(error_string(Value::Null, PARSE_ERROR, "Parse error", None)),
     };
 
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => {
+    // Envelope validation (-32600). Answered even for notification-shaped
+    // frames: notification status is not trusted until the envelope is valid.
+    let (echo_id, method, is_notification) = match check_envelope(&value) {
+        EnvelopeCheck::NotObject => {
             return Some(error_string(
                 Value::Null,
                 INVALID_REQUEST,
@@ -148,40 +212,40 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
                 None,
             ))
         }
+        EnvelopeCheck::BadJsonRpc { echo_id } => {
+            return Some(error_string(
+                echo_id,
+                INVALID_REQUEST,
+                "Invalid Request: jsonrpc must be \"2.0\"",
+                None,
+            ))
+        }
+        EnvelopeCheck::BadMethod { echo_id } => {
+            return Some(error_string(
+                echo_id,
+                INVALID_REQUEST,
+                "Invalid Request: method must be a non-empty string",
+                None,
+            ))
+        }
+        EnvelopeCheck::BadId => {
+            return Some(error_string(
+                Value::Null,
+                INVALID_REQUEST,
+                "Invalid Request: id must be a string, number, or null",
+                None,
+            ))
+        }
+        EnvelopeCheck::Valid {
+            echo_id,
+            method,
+            is_notification,
+        } => (echo_id, method, is_notification),
     };
-
-    let id_member = obj.get("id");
-    let has_id = id_member.is_some();
-    let id_type_ok = match id_member {
-        None => true,
-        Some(v) => v.is_string() || v.is_number() || v.is_null(),
-    };
-    let echo_id = match id_member {
-        Some(v) if id_type_ok => v.clone(),
-        _ => Value::Null,
-    };
-
-    // Envelope validation (-32600). Answered even for notification-shaped
-    // frames: notification status is not trusted until the envelope is valid.
-    let jsonrpc_ok = obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-    let method = obj.get("method").and_then(Value::as_str);
-    let method_ok = method.map(|m| !m.is_empty()).unwrap_or(false);
-    if !jsonrpc_ok || !method_ok || !id_type_ok {
-        let msg = if !jsonrpc_ok {
-            "Invalid Request: jsonrpc must be \"2.0\""
-        } else if !method_ok {
-            "Invalid Request: method must be a non-empty string"
-        } else {
-            "Invalid Request: id must be a string, number, or null"
-        };
-        return Some(error_string(echo_id, INVALID_REQUEST, msg, None));
-    }
-    let method = method.unwrap();
-    let is_notification = !has_id;
 
     // params: object kept as-is; positional array coerced to {}; absent/null
     // treated as empty; any other scalar is invalid (§3.1).
-    let params: Map<String, Value> = match obj.get("params") {
+    let params: Map<String, Value> = match value.get("params") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(m)) => m.clone(),
         Some(Value::Array(_)) => Map::new(),
