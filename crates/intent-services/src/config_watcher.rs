@@ -27,8 +27,13 @@
 //! lands inside the debounce window after an external hand-edit, the
 //! registry's write-back (built from its in-memory document, which predates
 //! the hand-edit) overwrites the file and the follow-up watcher read matches
-//! the self-write hash — the hand-edit is lost silently. This is an accepted
-//! trade-off for a human-timescale file; the next external edit wins again.
+//! the self-write hash — the hand-edit is lost silently. Relatedly, an
+//! external edit that byte-matches a recent (<10s-old) self-write — e.g. a
+//! manual revert to bytes the daemon just wrote — is indistinguishable from
+//! a stale read of that write and is skipped; before the guard kept a
+//! history it was skipped indefinitely (the last write's hash never
+//! expired), so the window strictly narrows this. Both are accepted
+//! trade-offs for a human-timescale file; the next external edit wins again.
 
 use std::future::Future;
 use std::sync::Arc;
