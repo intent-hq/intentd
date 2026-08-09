@@ -21668,6 +21668,174 @@ mod last_activity_events {
     }
 }
 
+/// Regression tests for the turn-end unread gate (monorepo#1781): the
+/// drain-worker's end-of-queue `raise_attention(Unread)` (§9.9) must only
+/// fire for TOP-LEVEL FOREGROUND agents. A delegated child
+/// (`parent_agent_id` set) or background agent's completion is surfaced to
+/// its parent/coordinator, not the user, so it must not mark the workspace
+/// unread. On a session-load error the gate FAILS OPEN (raise anyway).
+#[cfg(test)]
+mod turn_end_unread_gate {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::agent_manager::should_raise_turn_end_unread;
+    use crate::Services;
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let services = Services::new(store.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            ws,
+        }
+    }
+
+    fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some("test-model".into()),
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// A top-level foreground agent (no parent, not background) keeps the
+    /// existing behavior: the turn-end raise fires.
+    #[tokio::test]
+    async fn top_level_foreground_raises() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "top-level foreground agents raise the turn-end blue dot"
+        );
+    }
+
+    /// A delegated child (`parent_agent_id` set) finishing its drain must
+    /// NOT raise the workspace blue dot.
+    #[tokio::test]
+    async fn delegated_child_skips_raise() {
+        let h = harness().await;
+        let parent_id = AgentId::new();
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.parent_agent_id = Some(parent_id);
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a delegated child must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A background agent (`is_background`) finishing its drain must NOT
+    /// raise the workspace blue dot.
+    #[tokio::test]
+    async fn background_agent_skips_raise() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.is_background = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a background agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A session that no longer exists (`NotFound` — the agent was deleted
+    /// while its drain finished) has nothing to surface: skip the raise.
+    #[tokio::test]
+    async fn deleted_agent_skips_raise() {
+        let h = harness().await;
+        let missing = AgentId::new();
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &missing).await,
+            "a deleted agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A genuine store failure FAILS OPEN: a missed blue dot for a real
+    /// top-level turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn store_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("DROP TABLE agent_session")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the gate fails open on a genuine store error"
+        );
+    }
+}
+
 /// Tests for the end-of-turn live token-usage update (§5.23):
 /// `persist_turn_token_usage` REPLACES the session's cumulative snapshot and
 /// re-aggregates the workspace `TokenUsage`, emitting
