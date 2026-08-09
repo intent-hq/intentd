@@ -1408,38 +1408,40 @@ impl Services {
     /// no-op — the queued/running wake turn owns the settlement).
     ///
     /// `dispatched` / `evicted` wakes additionally end with a state note
-    /// (after any `[hook logs]` section) telling the owner the hook is
-    /// retired and will not run again, with a reschedule pointer — the
-    /// expiry notice states this explicitly in its own wording, and
-    /// cancellation implies it. A PERPETUAL dispatch is the one non-terminal
-    /// wake: its note states both facts — the hook fired, and it stays active
-    /// on its cadence until `expiresAt` — with a `ws.hook.cancel` pointer.
+    /// (after any `[hook logs]` section): a one-shot dispatch and any
+    /// eviction tell the owner the hook is retired and will not run again,
+    /// with a reschedule pointer — the expiry notice states this explicitly
+    /// in its own wording, and cancellation implies it. A re-armed PERPETUAL
+    /// dispatch is the one non-terminal wake: its note says the hook remains
+    /// active until `expiresAt`, with a `ws.hook.cancel` pointer.
+    /// `dispatched` wakes also carry `hookStillActive` in the `hook_wake`
+    /// messageMetadata (`true` only for the re-armed perpetual branch) so
+    /// consumers can tell the two apart without parsing the note text.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
-        let metadata = json!({
+        // Only meaningful for `dispatched` wakes: a perpetual dispatch that
+        // also lands at/after `expiresAt` is terminalized (Expired), not
+        // re-armed — the caller sends a separate `finish_expiry` wake for
+        // that, so this wake must NOT claim the hook remains active (it
+        // would contradict the immediately-following expiry notice).
+        let dispatch_still_active = hook.perpetual && hook.state != HookState::Expired;
+        let mut metadata = json!({
             "type": "hook_wake",
             "hookId": hook.hook_id,
             "hookName": hook.name,
             "reason": reason,
         });
+        if reason == "dispatched" {
+            metadata["hookStillActive"] = json!(dispatch_still_active);
+        }
         let state_note = match reason {
-            // A perpetual dispatch that also lands at/after `expiresAt` is
-            // terminalized (Expired), not re-armed — the caller sends a
-            // separate `finish_expiry` wake for that, so this note must NOT
-            // claim the hook "remains active" (it would contradict the
-            // immediately-following expiry notice).
-            "dispatched" if hook.perpetual && hook.state != HookState::Expired => Some(format!(
-                "[This hook has now fired, and it is PERPETUAL — it remains active and \
-                 will keep running on its cadence until its TTL{}. Cancel it via \
-                 ws.hook.cancel if you no longer need this watch.]",
-                hook.expires_at
-                    .as_deref()
-                    .map(|e| format!(" (expiresAt {e})"))
-                    .unwrap_or_default()
+            "dispatched" if dispatch_still_active => Some(format!(
+                "[This hook remains active until {} — cancel via ws.hook.cancel \
+                 when no longer needed.]",
+                hook.expires_at.as_deref().unwrap_or("its TTL elapses")
             )),
             "dispatched" => Some(
-                "[This hook has now fired and is retired — it will not run again. \
-                 Schedule a new hook via ws.hook.schedule if you still need to watch \
-                 this condition.]"
+                "[This hook is now retired and will not run again — reschedule via \
+                 ws.hook.schedule if still needed.]"
                     .to_string(),
             ),
             "evicted" => Some(
@@ -1984,9 +1986,14 @@ mod tests {
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("done already"), "{text}");
-        // The validation-run dispatch wake ends with the terminal note.
-        assert!(text.contains("retired — it will not run again"), "{text}");
+        // The validation-run dispatch wake ends with the terminal note, and
+        // its metadata marks the hook as no longer active.
+        assert!(
+            text.contains("now retired and will not run again"),
+            "{text}"
+        );
         assert!(text.contains("ws.hook.schedule"), "{text}");
+        assert!(text.contains(r#""hookStillActive":false"#), "{text}");
         let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
     }
@@ -2017,18 +2024,21 @@ mod tests {
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.state, HookState::Scheduled);
         assert_eq!(stored.dispatch_count, 1);
-        // The wake states BOTH facts: it fired, and it stays active to TTL.
+        // The wake note says the hook stays active to TTL, and the metadata
+        // marks it still active.
         let session = svc.store().get_agent_session(&owner).await.unwrap();
         let last = session.messages.last().expect("wake message persisted");
         let text = serde_json::to_string(&last.content).unwrap();
         assert!(text.contains("fired at once"), "{text}");
-        assert!(text.contains("has now fired"), "{text}");
-        assert!(text.contains("PERPETUAL"), "{text}");
-        assert!(text.contains("remains active"), "{text}");
-        assert!(text.contains("expiresAt"), "{text}");
+        assert!(text.contains("remains active until"), "{text}");
+        assert!(
+            text.contains(hook.expires_at.as_deref().expect("expiresAt set")),
+            "{text}"
+        );
         assert!(text.contains("ws.hook.cancel"), "{text}");
+        assert!(text.contains(r#""hookStillActive":true"#), "{text}");
         // Never the one-shot retirement wording.
-        assert!(!text.contains("is retired"), "{text}");
+        assert!(!text.contains("retired"), "{text}");
         let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_SCHEDULED]).await;
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_SCHEDULED.to_string()), "{types:?}");
@@ -2072,9 +2082,14 @@ mod tests {
         assert!(!svc.hook_task_alive(&hook.hook_id), "no task spawned");
         let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
         assert_eq!(stored.state, HookState::Expired);
-        // The dispatch wake must not contradict the expiry notice.
+        // The dispatch wake must not contradict the expiry notice: the
+        // terminalized fire uses the one-shot note and stillActive=false.
         let dispatch_wake = wait_for_wake(&svc, &owner, "last gasp at schedule").await;
         assert!(!dispatch_wake.contains("remains active"), "{dispatch_wake}");
+        assert!(
+            dispatch_wake.contains(r#""hookStillActive":false"#),
+            "{dispatch_wake}"
+        );
         let expiry_wake = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
         assert!(expiry_wake.contains("1 run, 1 dispatch"), "{expiry_wake}");
         let types = hook_event_types(&svc, &ws, &[HOOK_DISPATCHED, HOOK_EXPIRED]).await;
@@ -2127,8 +2142,9 @@ mod tests {
             assert!(svc.hook_task_alive(&hook.hook_id), "task alive after fire");
         }
         let text = wait_for_wake(&svc, &owner, "still green").await;
-        assert!(text.contains("remains active"), "{text}");
-        assert!(!text.contains("is retired"), "{text}");
+        assert!(text.contains("remains active until"), "{text}");
+        assert!(text.contains(r#""hookStillActive":true"#), "{text}");
+        assert!(!text.contains("retired"), "{text}");
     }
 
     #[tokio::test]
@@ -2182,9 +2198,18 @@ mod tests {
         // The dispatch wake landed, then the expiry notice. A perpetual fire
         // that lands at/after expiry is terminalized, not re-armed, so its
         // own wake must NOT claim "remains active" (that would contradict
-        // the immediately-following expiry notice).
+        // the immediately-following expiry notice) and must carry
+        // stillActive=false.
         let dispatch_wake = wait_for_wake(&svc, &owner, "last gasp").await;
         assert!(!dispatch_wake.contains("remains active"), "{dispatch_wake}");
+        assert!(
+            dispatch_wake.contains(r#""hookStillActive":false"#),
+            "{dispatch_wake}"
+        );
+        assert!(
+            !dispatch_wake.contains(r#""hookStillActive":true"#),
+            "{dispatch_wake}"
+        );
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
         // Perpetual expiry reports runs AND dispatches.
         assert!(text.contains("1 run, 1 dispatch"), "{text}");
@@ -2292,8 +2317,13 @@ mod tests {
         // nit): `dispatchCount` means "fires so far" for every hook.
         assert_eq!(hook.dispatch_count, 1);
         let text = wait_for_wake(&svc, &owner, "CI is green").await;
-        // The scheduler-run dispatch wake ends with the terminal note.
-        assert!(text.contains("retired — it will not run again"), "{text}");
+        // The scheduler-run dispatch wake ends with the terminal note, and
+        // its metadata marks the hook as no longer active.
+        assert!(
+            text.contains("now retired and will not run again"),
+            "{text}"
+        );
+        assert!(text.contains(r#""hookStillActive":false"#), "{text}");
         // Task deregistered after the terminal outcome.
         let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {
@@ -2337,9 +2367,11 @@ mod tests {
         assert!(types.contains(&HOOK_EVICTED.to_string()), "{types:?}");
         let text = wait_for_wake(&svc, &owner, "evicted").await;
         assert!(text.contains("kaput"), "{text}");
-        // The eviction wake ends with the will-not-run-again note.
+        // The eviction wake ends with the will-not-run-again note; only
+        // dispatched wakes carry the hookStillActive metadata flag.
         assert!(text.contains("will not run again"), "{text}");
         assert!(text.contains("ws.hook.schedule"), "{text}");
+        assert!(!text.contains("hookStillActive"), "{text}");
     }
 
     #[tokio::test]
@@ -2416,9 +2448,11 @@ mod tests {
         let session = svc.store().get_agent_session(&owner).await.unwrap();
         let text = serde_json::to_string(&session.messages).unwrap();
         assert!(text.contains("cancelled from the app"), "{text}");
-        // Cancellation keeps its own wording — no dispatch/eviction terminal note.
+        // Cancellation keeps its own wording — no dispatch/eviction terminal
+        // note, no hookStillActive metadata flag.
         assert!(!text.contains("will not run again"), "{text}");
         assert!(!text.contains("retired"), "{text}");
+        assert!(!text.contains("hookStillActive"), "{text}");
         // A second cancel fails: the hook is no longer active.
         let err = svc
             .hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
@@ -3042,7 +3076,7 @@ mod tests {
         // The terminal note is the final line — after the [hook logs] section.
         let logs_at = text.find("[hook logs]").expect("logs section");
         let note_at = text
-            .find("retired — it will not run again")
+            .find("now retired and will not run again")
             .expect("terminal note");
         assert!(note_at > logs_at, "{text}");
     }
@@ -3552,9 +3586,11 @@ mod tests {
         let text = wait_for_wake(&svc, &owner, "expired after reaching its TTL").await;
         assert!(text.contains("2 runs completed"), "{text}");
         assert!(text.contains("ws.hook.schedule"), "{text}");
-        // Expiry keeps its own wording — no dispatch/eviction terminal note.
+        // Expiry keeps its own wording — no dispatch/eviction terminal note,
+        // no hookStillActive metadata flag.
         assert!(!text.contains("will not run again"), "{text}");
         assert!(!text.contains("retired"), "{text}");
+        assert!(!text.contains("hookStillActive"), "{text}");
         // Task deregistered after the terminal outcome.
         let deadline = std::time::Instant::now() + POLL_DEADLINE;
         while svc.hook_task_alive(&hook.hook_id) {

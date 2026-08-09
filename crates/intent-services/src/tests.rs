@@ -9351,6 +9351,43 @@ mod file_tracking {
             .unwrap();
     }
 
+    /// Register `child` as a submodule of `parent` at `sub_rel`, mirroring
+    /// `intent_git::testutil::add_submodule` (private to that crate) for the
+    /// submodule-guard regression tests below: a real gitlink + `.gitmodules`
+    /// fixture rather than a synthetic path.
+    fn add_submodule(parent: &std::path::Path, child: &std::path::Path, sub_rel: &str) {
+        let repo = Repository::open(parent).unwrap();
+        let url = child.to_string_lossy().to_string();
+        let sub_path = parent.join(sub_rel);
+        let mut sm = repo
+            .submodule(&url, std::path::Path::new(sub_rel), true)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&sub_path);
+        Repository::clone(&url, &sub_path).unwrap();
+        sm.add_to_index(true).unwrap();
+        sm.add_finalize().unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parents = match repo.head().ok().and_then(|h| h.target()) {
+            Some(oid) => vec![repo.find_commit(oid).unwrap()],
+            None => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "add submodule",
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
     fn tracked(ws: &WorkspaceId, path: &str, stage: &str, agent: Option<&str>) -> NewTrackedChange {
         NewTrackedChange {
             workspace_id: ws.clone(),
@@ -9958,6 +9995,94 @@ mod file_tracking {
             .unwrap();
         assert_eq!(r.files, vec!["dirty.txt".to_string()]);
         assert_eq!(r.file_count, 1);
+    }
+
+    /// Attribution-filtered branch (monorepo#1714 follow-up): a
+    /// `tracked_changes` row attributes a path strictly inside a registered
+    /// submodule to the committing agent, and the submodule's worktree is
+    /// dirty. `git_agent_commit` must drop that path from the commit set —
+    /// nothing from inside the submodule is committed, and since it was the
+    /// only attributed change the call degenerates to the benign "no
+    /// uncommitted changes" skip (auto-commit treats this as silent). The
+    /// parent's gitlink entry for the submodule survives unchanged.
+    #[tokio::test]
+    async fn agent_commit_drops_submodule_internal_attributed_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        // Dirty a file strictly inside the submodule's own worktree.
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "sub/inner.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "agent sub edit".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("No uncommitted changes found for this agent"),
+            "got: {err}"
+        );
+        // No new commit landed, and the submodule gitlink in the parent's
+        // status is unaffected (still just the worktree-modified marker, not
+        // staged/committed).
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "seed + add-submodule commits only");
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let sub_entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "sub")
+            .expect("submodule gitlink still reported dirty");
+        assert!(!sub_entry.staged, "gitlink must not have been staged");
+    }
+
+    /// Explicit `files` branch (monorepo#1714 follow-up): naming a path
+    /// strictly inside a registered submodule fails with a clear error naming
+    /// the offending path and its containing submodule, advising the caller
+    /// to commit from within the submodule repo instead — no commit lands.
+    #[tokio::test]
+    async fn agent_commit_explicit_files_rejects_submodule_internal_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "explicit sub".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["sub/inner.txt".to_string()]),
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sub/inner.txt"), "names the path: {msg}");
+        assert!(
+            msg.contains("submodule 'sub'"),
+            "names the containing submodule: {msg}"
+        );
+        assert!(
+            msg.contains("Commit these changes from within the submodule repo"),
+            "advises committing in the submodule: {msg}"
+        );
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "no new commit must have landed");
     }
 
     /// A `userRequested` no-files checkpoint still commits only the
@@ -10736,6 +10861,69 @@ mod file_tracking {
         // §5.18 counts.
         assert_eq!(value["uncommittedCount"], 1);
         assert_eq!(value["stagedCount"], 0);
+    }
+
+    /// Regression (monorepo#1693 Finding B): concurrent `accept-changes.getStatus`
+    /// calls for the same workspace coalesce onto ONE full build — not just the
+    /// shared working-tree scan. The scan probe parks the leader mid-scan; while
+    /// parked, three more calls join and must register as followers of the
+    /// *ac-status* flight (not merely as independent followers of the scan), so
+    /// each of them skips the scan entirely and shares the leader's full result.
+    #[tokio::test]
+    async fn accept_changes_get_status_concurrent_calls_coalesce_into_one_build() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.accept_changes_get_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let followers: Vec<_> = (0..3)
+            .map(|_| {
+                let svc = svc.clone();
+                let ws = ws_id.clone();
+                tokio::spawn(async move { svc.accept_changes_get_status(ws).await })
+            })
+            .collect();
+        wait_until("followers to join the in-flight ac-status build", || {
+            svc.ac_status_waiters(&ws_id) == 3
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let first = leader.await.unwrap().unwrap();
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap(), first, "shared result");
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "one underlying scan — followers never re-entered the scan"
+        );
+        assert_eq!(first["uncommittedCount"], 1);
     }
 
     /// Concurrent status scans for *different* worktrees never coalesce — they
@@ -20893,6 +21081,179 @@ mod last_activity_events {
         );
     }
 
+    /// Regression (monorepo#1585): `workspace.update` persists the
+    /// `lastActivity` it derives for the response, so the stored column
+    /// matches what the caller was told — the cheap read paths that never
+    /// derive (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+    /// snapshot) and a daemon restart serve the same fresh value instead of
+    /// a stale one that waits on the next debounce.
+    #[tokio::test]
+    async fn update_workspace_persists_derived_last_activity() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // Seeded row: nothing stored yet.
+        assert!(h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("seed reload")
+            .last_activity
+            .is_none());
+
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        let derived = updated
+            .last_activity
+            .clone()
+            .expect("response carries derived lastActivity");
+
+        // The stored column matches the response (persisted, not just derived).
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity;
+        assert_eq!(
+            persisted.as_deref(),
+            Some(derived.as_str()),
+            "derived lastActivity must be persisted, not response-only"
+        );
+
+        // The lite list (seq-0 snapshot source) serves it without deriving.
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(derived.as_str()));
+    }
+
+    /// Regression (monorepo#1585): the full-row `update_workspace` store write
+    /// can no longer clobber a concurrently bumped `lastActivity`. This
+    /// exercises the exact interleaving from the issue at the service layer:
+    /// the stale snapshot is read BEFORE the bump lands, then written back
+    /// through the same full-row `store.update_workspace` call every
+    /// `workspace.*` mutation path (update/archive/unarchive) uses — pre-fix
+    /// this silently reverted the bump.
+    #[tokio::test]
+    async fn update_workspace_does_not_clobber_concurrent_bump() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // 1. A mutation path reads its row snapshot (services do this first).
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+
+        // 2. A debounce bump lands after the read.
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("bump"));
+
+        // 3. The mutation writes its stale snapshot back full-row.
+        stale.title = "Renamed via stale snapshot".to_string();
+        stale.updated_at = now_iso();
+        h.store.update_workspace(&stale).await.expect("stale write");
+
+        // The bumped value holds; the rest of the row replaced.
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some(future),
+            "full-row write of a stale snapshot must not revert a newer lastActivity"
+        );
+        assert_eq!(reloaded.title, "Renamed via stale snapshot");
+
+        // And end-to-end: a subsequent `workspace.update` RPC (reload →
+        // mutate → full-row write → derive → monotonic persist) also leaves
+        // the bump intact.
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "workspace.update must not clobber a newer persisted lastActivity"
+        );
+    }
+
+    /// Regression (monorepo#1585 review): archive and unarchive persist the
+    /// `lastActivity` they derive for the response, so the lite list / seq-0
+    /// snapshot serves the same value without deriving.
+    #[tokio::test]
+    async fn archive_unarchive_persist_derived_last_activity() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let derived = archived
+            .last_activity
+            .clone()
+            .expect("archive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "archive must persist the derived lastActivity"
+        );
+
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let derived = unarchived
+            .last_activity
+            .clone()
+            .expect("unarchive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "unarchive must persist the derived lastActivity"
+        );
+    }
+
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]
@@ -21303,6 +21664,174 @@ mod last_activity_events {
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle,
             "workspace_activity() returns Idle after grace window"
+        );
+    }
+}
+
+/// Regression tests for the turn-end unread gate (monorepo#1781): the
+/// drain-worker's end-of-queue `raise_attention(Unread)` (§9.9) must only
+/// fire for TOP-LEVEL FOREGROUND agents. A delegated child
+/// (`parent_agent_id` set) or background agent's completion is surfaced to
+/// its parent/coordinator, not the user, so it must not mark the workspace
+/// unread. On a session-load error the gate FAILS OPEN (raise anyway).
+#[cfg(test)]
+mod turn_end_unread_gate {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::agent_manager::should_raise_turn_end_unread;
+    use crate::Services;
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let services = Services::new(store.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            ws,
+        }
+    }
+
+    fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some("test-model".into()),
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// A top-level foreground agent (no parent, not background) keeps the
+    /// existing behavior: the turn-end raise fires.
+    #[tokio::test]
+    async fn top_level_foreground_raises() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "top-level foreground agents raise the turn-end blue dot"
+        );
+    }
+
+    /// A delegated child (`parent_agent_id` set) finishing its drain must
+    /// NOT raise the workspace blue dot.
+    #[tokio::test]
+    async fn delegated_child_skips_raise() {
+        let h = harness().await;
+        let parent_id = AgentId::new();
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.parent_agent_id = Some(parent_id);
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a delegated child must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A background agent (`is_background`) finishing its drain must NOT
+    /// raise the workspace blue dot.
+    #[tokio::test]
+    async fn background_agent_skips_raise() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.is_background = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a background agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A session that no longer exists (`NotFound` — the agent was deleted
+    /// while its drain finished) has nothing to surface: skip the raise.
+    #[tokio::test]
+    async fn deleted_agent_skips_raise() {
+        let h = harness().await;
+        let missing = AgentId::new();
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &missing).await,
+            "a deleted agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A genuine store failure FAILS OPEN: a missed blue dot for a real
+    /// top-level turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn store_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("DROP TABLE agent_session")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the gate fails open on a genuine store error"
         );
     }
 }

@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod discovery_cache;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -118,7 +119,7 @@ pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
     cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
-    migrate_default_vocabulary, InMemorySecretStore, SecretStore,
+    migrate_default_vocabulary, migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -590,6 +591,14 @@ pub struct Services {
     /// coalescing tests). Production wiring keeps `None`; tests inject via the
     /// `#[cfg(test)]`-only `with_git_status_scan_probe`.
     git_status_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Single-flight registry for the full `accept-changes.getStatus` build
+    /// (monorepo#1693 Finding B), keyed by workspace id: concurrent callers
+    /// for one workspace coalesce onto a single blocking-pool
+    /// `build_git_status_value_with` run and share its result, on top of the
+    /// working-tree scan coalescing `git_status_cache` already provides.
+    /// Coalescing only — no cache/TTL, so a call after the flight settles
+    /// always runs a fresh build. Shared across clones.
+    ac_status_inflight: Arc<ac_status_singleflight::AcStatusSingleFlight>,
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
@@ -717,6 +726,7 @@ impl Services {
             git_diffs_walk_probe: None,
             git_status_cache: Arc::new(git_status_cache::GitStatusCache::new()),
             git_status_scan_probe: None,
+            ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
             hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
@@ -940,8 +950,6 @@ impl Services {
     /// settings-derived provider shared across every specialist, so a
     /// specialist pinned to another provider (frontmatter `codingAgent` or a
     /// compound `model` prefix) still shows the default it actually pins.
-    /// `is_background = true` matches `agent.delegate` always marking its
-    /// children background, so `backgroundAgents.*` settings apply here too.
     /// Specialists without options (the default) are omitted; resolution
     /// failure yields an empty list — spawning never fails on this.
     pub(crate) fn specialist_model_options(
@@ -992,7 +1000,6 @@ impl Services {
                         Some(id),
                         workspace_path,
                         Some(&provider),
-                        true,
                     ),
                     options,
                 })
@@ -1227,6 +1234,13 @@ impl Services {
         self.git_status_cache.waiters(worktree)
     }
 
+    /// Test seam: number of followers currently awaiting the in-flight full
+    /// `accept-changes.getStatus` build for `workspace_id`.
+    #[cfg(test)]
+    pub(crate) fn ac_status_waiters(&self, workspace_id: &WorkspaceId) -> usize {
+        self.ac_status_inflight.waiters(workspace_id)
+    }
+
     /// Test-only: rebuild the status cache with a compressed fallback TTL so
     /// expiry coverage completes in milliseconds.
     #[cfg(test)]
@@ -1338,6 +1352,34 @@ impl Services {
         }
         if activity_max.is_some() {
             ws.last_activity = activity_max;
+        }
+    }
+
+    /// [`Self::derive_last_activity`] plus persistence of the result through
+    /// the scoped, monotonic column write (monorepo#1585). The mutation paths
+    /// that derive `lastActivity` for their response (update/archive/
+    /// unarchive) must all persist it too: without the write the caller gets
+    /// a fresh derived value while the stored column stays stale, so the
+    /// cheap read paths that never derive (`list_workspaces_lite`, the
+    /// `workspace.subscribe` seq-0 snapshot) — or a daemon restart — serve
+    /// the old timestamp until the next debounce fires. Best-effort: a store
+    /// failure only logs (`ctx` names the calling RPC), the primary mutation
+    /// already committed.
+    pub(crate) async fn derive_and_persist_last_activity(&self, ws: &mut Workspace, ctx: &str) {
+        self.derive_last_activity(ws).await;
+        if let Some(derived) = ws.last_activity.as_deref() {
+            if let Err(e) = self
+                .store
+                .bump_workspace_last_activity(&ws.id, derived)
+                .await
+            {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    context = ctx,
+                    error = %e,
+                    "persisting derived lastActivity failed"
+                );
+            }
         }
     }
 
@@ -2939,17 +2981,18 @@ impl Services {
         //
         // monorepo#1483: the seal gates on the QUEUE/BUSY classification
         // alone. A hook-waiting idle (the agent owns active background
-        // hooks, monorepo#1336) defers only the agent's own settlement AS A
+        // hooks, monorepo#1336) or a pr-monitor-waiting idle (the agent owns
+        // active PR monitors) defers only the agent's own settlement AS A
         // CHILD — watch delivery and grouped recording — but its delegating
-        // turn is still over (a hook wake redrives a NEW turn). Gating the
-        // seal on `hook_waiting` too would starve a hook-chaining
-        // coordinator's group forever.
+        // turn is still over (a hook/monitor wake redrives a NEW turn).
+        // Gating the seal on `hook_waiting` or `pr_monitor_waiting` too would
+        // starve a hook- or PR-monitor-chaining coordinator's group forever.
         if event.event_type == AGENT_IDLE && !classification.queue_interim {
             if let Some(gid) = self.seal_group_for_parent(&child).await {
-                if classification.hook_waiting {
-                    // On the canonical hook-waiting-only idle the group was
-                    // already sealed by the inline redelivery's hook guard
-                    // (delivery's tail re-check runs it first), so this
+                if classification.hook_waiting || classification.pr_monitor_waiting {
+                    // On the canonical hook-/pr-monitor-waiting-only idle the
+                    // group was already sealed by the inline redelivery's
+                    // guard (delivery's tail re-check runs it first), so this
                     // branch is the backstop for the races where that
                     // redelivery early-returns without sealing (e.g. an
                     // enqueue drained into a busy turn between the entry
@@ -2957,7 +3000,7 @@ impl Services {
                     tracing::debug!(
                         parent = %child.0,
                         group = %gid,
-                        "sealed after_all group at a hook-waiting queue-idle (monorepo#1483)"
+                        "sealed after_all group at a hook-/pr-monitor-waiting queue-idle (monorepo#1483)"
                     );
                 }
                 self.try_fire_group(&gid).await;
@@ -3189,7 +3232,10 @@ impl Services {
     /// retires it inline without waking the holder — it can only ever deliver
     /// an `agent:failed` / `agent:deleted` signal, which is not something the
     /// holder is waiting FOR. Counting it deferred the holder's own completion
-    /// with no future trigger, stranding its `after_all` group forever.
+    /// with no future trigger, stranding its `after_all` group forever. The
+    /// filter lives in [`Services::waiting_watches_for_parent`], shared with
+    /// the `isWaitingForOtherAgents` / `waitingForAgentIds` projections so
+    /// display and settlement cannot drift (issue intent-hq/monorepo#1649).
     ///
     /// This does not weaken the "grouped watches count too" rule above:
     /// `report_delivered` is only ever set on UNGROUPED watches, because
@@ -3200,9 +3246,8 @@ impl Services {
     /// reconciliation paths can share it with the live delivery path.
     pub(crate) fn agent_is_waiting_on_agents(&self, agent_id: &AgentId) -> bool {
         let outgoing: Vec<AgentId> = self
-            .list_watches_for_parent(agent_id)
+            .waiting_watches_for_parent(agent_id)
             .into_iter()
-            .filter(|w| !w.report_delivered)
             .map(|w| w.child_agent_id)
             .collect();
         let incoming: Vec<AgentId> = self
@@ -3303,19 +3348,22 @@ impl Services {
             return;
         }
         // Idle-visibility deferral: an idle agent still owning active
-        // background hooks has not settled — leave the marker in place (like
-        // the busy guard) so the hook's own terminal transition (dispatch /
-        // eviction / expiry wake → turn-end idle, or the external-cancel
-        // call into this function) synthesizes the completion later.
+        // background hooks OR active PR monitors has not settled — leave the
+        // marker in place (like the busy guard) so the hook's own terminal
+        // transition (dispatch / eviction / expiry wake → turn-end idle, or
+        // the external-cancel call into this function) — or the PR monitor's
+        // own poll loop wake — synthesizes the completion later.
         //
-        // monorepo#1483: hook deferral is scoped to the agent's settlement
-        // AS A CHILD (the synthesized watch delivery below); the agent is
-        // queue-idle here (empty queue, no worker in flight), so its
-        // delegating turn is over — seal its open after_all group NOW
-        // rather than starving the seal until the hooks resolve. Box::pin
+        // monorepo#1483: hook/pr-monitor deferral is scoped to the agent's
+        // settlement AS A CHILD (the synthesized watch delivery below); the
+        // agent is queue-idle here (empty queue, no worker in flight), so its
+        // delegating turn is over — seal its open after_all group NOW rather
+        // than starving the seal until the hooks/monitors resolve. Box::pin
         // mirrors the seal below (try_fire_group → deliver_parent_wake →
         // send_message → try_drain_queue → this function).
-        if !self.active_hooks_for_agent(child_id).await.is_empty() {
+        if !self.active_hooks_for_agent(child_id).await.is_empty()
+            || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        {
             if let Some(gid) = self.seal_group_for_parent(child_id).await {
                 Box::pin(self.try_fire_group(&gid)).await;
             }
@@ -3360,6 +3408,12 @@ impl Services {
         // any hook was still active; kept for shape parity with the live
         // emit sites should a hook be scheduled in the window.
         self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
+        // shape-parity stamp — always empty (omitted) here, since the
+        // active-pr-monitors guard above deferred when any monitor was still
+        // active.
+        self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+            .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: session.workspace_id,
@@ -3383,8 +3437,9 @@ impl Services {
         // Real completion: seal the agent's open after_all group and try to
         // fire it, mirroring `handle_completion_event`'s non-queue-interim
         // idle path (monorepo#1281). Gated on the delivery pass's own
-        // QUEUE/BUSY classification (monorepo#1483: `hook_waiting` never
-        // gates the seal): an enqueue landing between this function's
+        // QUEUE/BUSY classification (monorepo#1483: neither `hook_waiting`
+        // nor `pr_monitor_waiting` gates the seal): an enqueue landing
+        // between this function's
         // `has_ready_to_send` guard and the delivery re-classifies the
         // synthesized idle as interim (marker re-recorded, so a later
         // mutation/drain retries), and the seal must agree with that
@@ -3440,6 +3495,17 @@ impl Services {
     /// idling agent's own parent-side after_all seal gates on the
     /// queue/busy classification alone (monorepo#1483 — see the callers).
     ///
+    /// Idle-visibility deferral (unified external-wait classification): an
+    /// `agent:idle` for a child that owns ACTIVE PR monitors is deferred the
+    /// same way and for the same reason as hook-waiting — a monitored PR's
+    /// own centralized poll loop (`pr_monitor.rs`) is what will wake the
+    /// agent next, so the idle is not the child's genuine settlement.
+    /// Classified live via [`Services::active_pr_monitors_for_agent`]
+    /// (fail-open on a probe error, same as the hook probe); a monitor that
+    /// completed or was cancelled between emit and delivery never defers.
+    /// PR-monitor deferral is likewise scoped to the agent's settlement AS A
+    /// CHILD — it does not gate the child's own after_all seal either.
+    ///
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
     /// same-workspace delegation and `__chief__` for chief parents.
@@ -3479,9 +3545,9 @@ impl Services {
     /// group-seal decisions (`handle_completion_event`,
     /// `redeliver_completion_after_queue_mutation`) share it instead of
     /// re-probing the queue (monorepo#1281) — and gate on `queue_interim`
-    /// alone, because neither `hook_waiting` (monorepo#1483) nor
-    /// agent-waiting (not in the snapshot at all) may block the parent-side
-    /// seal.
+    /// alone, because neither `hook_waiting` nor `pr_monitor_waiting`
+    /// (monorepo#1483) nor agent-waiting (not in the snapshot at all) may
+    /// block the parent-side seal.
     pub(crate) async fn deliver_completion_to_watches(
         &self,
         child_id: &AgentId,
@@ -3512,6 +3578,14 @@ impl Services {
         // for groups; a hook-waiting one must not).
         let hook_waiting = event.event_type == AGENT_IDLE
             && !self.active_hooks_for_agent(child_id).await.is_empty();
+        // Idle-visibility deferral (unified external-wait, mirrors
+        // `hook_waiting` exactly): an `agent:idle` for a child that owns
+        // active PR monitors is not its real completion — a monitored PR's
+        // own poll loop will wake the agent when it changes or settles.
+        // Probed live, same as the hook probe, and independently of
+        // `hook_waiting` so the GROUPED branch below can defer on either.
+        let pr_monitor_waiting = event.event_type == AGENT_IDLE
+            && !self.active_pr_monitors_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
@@ -3526,14 +3600,15 @@ impl Services {
         let agent_waiting =
             event.event_type == AGENT_IDLE && self.agent_is_waiting_on_agents(child_id);
         // Two interim notions:
-        // - `seal_interim` (queue/busy/hook): the child may run ANOTHER turn
-        //   that delegates more children, so its open after_all group is not
-        //   final — the caller must not seal. Agent-waiting is excluded: the
-        //   post-wait turn reopens a FRESH group, so the current one seals now.
+        // - `seal_interim` (queue/busy/hook/pr-monitor): the child may run
+        //   ANOTHER turn that delegates more children, so its open after_all
+        //   group is not final — the caller must not seal. Agent-waiting is
+        //   excluded: the post-wait turn reopens a FRESH group, so the
+        //   current one seals now.
         // - `interim_idle`: seal-interim OR agent-waiting — the child has not
         //   settled, so its ungrouped watchers neither deliver nor retire and
         //   its grouped memberships skip the settlement record.
-        let seal_interim = queue_interim || hook_waiting;
+        let seal_interim = queue_interim || hook_waiting || pr_monitor_waiting;
         let interim_idle = seal_interim || agent_waiting;
         // Test seam: park in the classify→mark window so a test can land a
         // concurrent watch removal between the `agent_waiting` probe above
@@ -3618,12 +3693,14 @@ impl Services {
                 // ITS parent's group; the child's OWN after_all group seal is
                 // gated separately on `seal_interim` (which excludes
                 // agent-waiting) so an after_all coordinator never deadlocks.
-                if (hook_waiting || agent_waiting) && event.event_type == AGENT_IDLE {
+                if (hook_waiting || pr_monitor_waiting || agent_waiting)
+                    && event.event_type == AGENT_IDLE
+                {
                     tracing::debug!(
                         child = %child_id.0,
                         parent = %watch.parent_agent_id.0,
                         group = %gid,
-                        "deferring grouped agent:idle settlement — child owns active background hooks or outgoing agent watches"
+                        "deferring grouped agent:idle settlement — child owns active background hooks, active PR monitors, or outgoing agent watches"
                     );
                     continue;
                 }
@@ -3696,20 +3773,21 @@ impl Services {
                 self.try_fire_group(&gid).await;
                 continue;
             }
-            // Interim idle (queue-/busy-/hook-/agent-waiting completion): the
-            // child still has ready-to-send queued messages, a turn already
-            // in flight, active background hooks, or outgoing watches on
-            // unsettled agents it is waiting on, so this idle is not its real
-            // completion — deliver nothing and leave the watch (including a
-            // report_delivered one, which retires at the real completion)
-            // armed for the settlement that follows the queue drain / running
-            // turn / hook resolution / watched-target completion. The
+            // Interim idle (queue-/busy-/hook-/pr-monitor-/agent-waiting
+            // completion): the child still has ready-to-send queued messages,
+            // a turn already in flight, active background hooks, active PR
+            // monitors, or outgoing watches on unsettled agents it is waiting
+            // on, so this idle is not its real completion — deliver nothing
+            // and leave the watch (including a report_delivered one, which
+            // retires at the real completion) armed for the settlement that
+            // follows the queue drain / running turn / hook resolution / PR
+            // monitor resolution / watched-target completion. The
             // interim-skip marker was recorded up front (monorepo#1280).
             if interim_idle {
                 tracing::debug!(
                     child = %child_id.0,
                     parent = %watch.parent_agent_id.0,
-                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, active background hooks, or outgoing agent watches (interim idle)"
+                    "skipping agent:idle wake — child has pending queued messages, a busy in-flight turn, active background hooks, active PR monitors, or outgoing agent watches (interim idle)"
                 );
                 continue;
             }
@@ -3852,6 +3930,7 @@ impl Services {
         CompletionIdleClassification {
             queue_interim,
             hook_waiting,
+            pr_monitor_waiting,
         }
     }
 
@@ -5276,9 +5355,7 @@ fn specialist_preview_provider(services: &Services, provider: Option<String>) ->
 /// steps 2–5 — a preview has no client-picked model, so step 1 never applies)
 /// so the preview matches what a no-model create would actually pin. Both
 /// fields are omitted when resolution yields the provider CLI default
-/// (clients render "Provider default"). Previews are context-free
-/// (`is_background = false`), so the background-only `backgroundAgents.*`
-/// settings steps do not apply.
+/// (clients render "Provider default").
 fn decorate_specialist_resolved(
     services: &Services,
     def: &mut serde_json::Value,
@@ -5292,13 +5369,9 @@ fn decorate_specialist_resolved(
     else {
         return;
     };
-    let Some(model) = agent_ops::resolve_agent_default_model(
-        services,
-        Some(&id),
-        workspace_path,
-        Some(provider),
-        false,
-    ) else {
+    let Some(model) =
+        agent_ops::resolve_agent_default_model(services, Some(&id), workspace_path, Some(provider))
+    else {
         return;
     };
     if let Some(obj) = def.as_object_mut() {
@@ -7648,6 +7721,12 @@ pub(crate) struct CompletionIdleClassification {
     /// recording) defers until the hooks resolve, but this alone must NOT
     /// gate the parent-side after_all seal (monorepo#1483).
     pub(crate) hook_waiting: bool,
+    /// PR-monitor-waiting: the agent owns active PR monitors — mirrors
+    /// `hook_waiting` exactly (same settlement-as-a-child deferral, same
+    /// monorepo#1483 seal exemption): a monitored PR's own poll loop is what
+    /// eventually wakes the agent, so this alone must NOT gate the
+    /// parent-side after_all seal either.
+    pub(crate) pr_monitor_waiting: bool,
 }
 
 /// STAB-129: the group members whose recorded terminal event was
@@ -11719,9 +11798,11 @@ impl WorkspaceApi for Services {
                 store.update_workspace(&ws).await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
                 // `workspace.update` callers get the authoritative wire shape
-                // without a follow-up `workspace.get`. Chief is skipped: its
-                // timestamps are pinned above.
-                this.derive_last_activity(&mut ws).await;
+                // without a follow-up `workspace.get`, and persist it through
+                // the scoped monotonic write (monorepo#1585). Chief is
+                // skipped: its timestamps are pinned above.
+                this.derive_and_persist_last_activity(&mut ws, "workspace.update")
+                    .await;
                 // Derive `activity` from live agent state (§9.9) so the mutation
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
@@ -12271,8 +12352,11 @@ impl WorkspaceApi for Services {
                 // runs post-persist.
                 this.cancel_workspace_hooks(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
-                // authoritative wire shape without a follow-up `workspace.get`.
-                this.derive_last_activity(&mut ws).await;
+                // authoritative wire shape without a follow-up `workspace.get`,
+                // and persist it through the scoped monotonic write
+                // (monorepo#1585).
+                this.derive_and_persist_last_activity(&mut ws, "workspace.archive")
+                    .await;
                 // Derive `activity` from live agent state (§9.9) so the mutation
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
@@ -12360,7 +12444,10 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
-            this.derive_last_activity(&mut ws).await;
+            // Derive `lastActivity` (§9.1) and persist it through the scoped
+            // monotonic write (monorepo#1585).
+            this.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
+                .await;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
@@ -16741,7 +16828,10 @@ impl WorkspaceApi for Services {
             // file. Without an `agent_id` attribution is impossible, so the
             // commit is refused rather than sweeping the whole worktree.
             let (to_commit, needs_stage, attribution_filtered) = match files {
-                Some(f) if !f.is_empty() => (f, true, false),
+                Some(f) if !f.is_empty() => {
+                    git_ops::reject_submodule_internal_files(&worktree, &f)?;
+                    (f, true, false)
+                }
                 _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
                 _ => {
                     let Some(agent) = agent_id.as_ref() else {
@@ -16767,6 +16857,21 @@ impl WorkspaceApi for Services {
                         .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
                         .cloned()
                         .collect();
+                    // Drop submodule-internal paths before the emptiness
+                    // check (monorepo#1714 follow-up): auto-commit must never
+                    // flatten a submodule's gitlink into the superproject.
+                    let (filtered, dropped_by_submodule) =
+                        git_ops::drop_submodule_internal_paths(&worktree, filtered);
+                    for (submodule, dropped) in &dropped_by_submodule {
+                        tracing::debug!(
+                            workspace = %workspace_id.0,
+                            agent = %agent.as_str(),
+                            submodule = %submodule,
+                            dropped,
+                            "agentCommit: dropped submodule-internal paths from \
+                             attribution-filtered commit set"
+                        );
+                    }
                     if filtered.is_empty() && !changed.is_empty() {
                         // Diagnosable skip (monorepo#939 trade-off): agent
                         // work not visible to the attribution pipeline (e.g.
@@ -17938,12 +18043,20 @@ impl WorkspaceApi for Services {
         prompt: String,
         system_prompt: Option<String>,
         model: Option<String>,
+        quick_action_type: Option<String>,
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_complete_once_op(prompt, system_prompt, model, workspace_id, timeout_ms)
-                .await
+            self.agent_complete_once_op(
+                prompt,
+                system_prompt,
+                model,
+                quick_action_type,
+                workspace_id,
+                timeout_ms,
+            )
+            .await
         })
     }
 
@@ -20485,28 +20598,80 @@ impl Services {
         if ws.is_remote {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
-        match git_ops::worktree_path(&ws) {
-            Some(worktree) => {
-                // The working-tree scan is the cost `git.status` also pays, so
-                // take it through the shared per-worktree single-flight
-                // (monorepo#1648) and hand the result to the builder. The
-                // remaining libgit2 work (remote/trunk resolve, ahead/behind,
-                // bounded history walk) still runs per call, on the blocking
-                // pool so a slow repo cannot stall other RPCs.
-                let scanned = if worktree.join(".git").exists() {
-                    Some(self.scan_git_status(&worktree).await?)
-                } else {
-                    None
-                };
-                tokio::task::spawn_blocking(move || {
-                    accept_changes::build_git_status_value_with(&worktree, &ws, scanned)
-                })
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
-                })?
+        let Some(worktree) = git_ops::worktree_path(&ws) else {
+            return Ok(accept_changes::minimal_status_value(&ws, &trunk));
+        };
+        // Concurrent `accept-changes.getStatus` calls for the same workspace
+        // coalesce onto one full build (monorepo#1693 Finding B): the
+        // working-tree scan already single-flights per worktree
+        // (monorepo#1648), but the remaining per-call work — remote/trunk
+        // resolve, ahead/behind, bounded history walk — used to still run
+        // once per concurrent caller. The leader runs scan + build; followers
+        // await the shared result over the workspace-keyed flight.
+        let inflight = Arc::clone(&self.ac_status_inflight);
+        loop {
+            match inflight.join(&workspace_id) {
+                ac_status_singleflight::Join::Leader(guard) => {
+                    let scanned = if worktree.join(".git").exists() {
+                        match self.scan_git_status(&worktree).await {
+                            Ok(scanned) => Some(scanned),
+                            Err(e) => {
+                                guard.finish(Err(match &e {
+                                    Error::Internal(msg) => msg.clone(),
+                                    other => other.to_string(),
+                                }));
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let build_worktree = worktree.clone();
+                    let build_ws = ws.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        accept_changes::build_git_status_value_with(
+                            &build_worktree,
+                            &build_ws,
+                            scanned,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("accept-changes.getStatus task failed: {e}"))
+                    })?;
+                    return match result {
+                        Ok(value) => {
+                            guard.finish(Ok(Arc::new(value.clone())));
+                            Ok(value)
+                        }
+                        Err(e) => {
+                            guard.finish(Err(match &e {
+                                Error::Internal(msg) => msg.clone(),
+                                other => other.to_string(),
+                            }));
+                            Err(e)
+                        }
+                    };
+                }
+                ac_status_singleflight::Join::Follower(mut rx) => {
+                    tracing::debug!(
+                        workspace_id = %workspace_id.as_str(),
+                        "accept-changes.getStatus: coalesced into identical in-flight build"
+                    );
+                    match rx.wait_for(|slot| slot.is_some()).await {
+                        Ok(slot) => {
+                            return match slot.clone().expect("wait_for guarantees Some") {
+                                Ok(shared) => Ok((*shared).clone()),
+                                Err(msg) => Err(Error::Internal(msg)),
+                            };
+                        }
+                        // The leader vanished without publishing (cancelled
+                        // RPC / panicked build): retry — the next join elects
+                        // a new leader.
+                        Err(_) => continue,
+                    }
+                }
             }
-            None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }
 
@@ -22128,6 +22293,7 @@ pub mod skills;
 mod specialists;
 
 // Code Changes Review modules (§17).
+mod ac_status_singleflight;
 mod accept_changes;
 pub mod diffs;
 pub mod file_tracking;
@@ -22349,9 +22515,7 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
 pub fn discover_providers_with_npx_overrides(
     provider_paths: &std::collections::HashMap<String, String>,
 ) -> serde_json::Value {
-    let providers = intent_providers::discover_providers_with_overrides(&|key| {
-        provider_paths.get(key).cloned()
-    });
+    let providers = discovery_cache::discover_providers_cached(provider_paths);
     let npx_status = intent_providers::probe_npx();
 
     // Probe npx version if we found the binary

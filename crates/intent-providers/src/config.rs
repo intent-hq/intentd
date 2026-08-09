@@ -303,7 +303,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
-        // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
+        // Declared Native (the `empty()` default) for the Rust `codex-acp`
+        // binary: no V8 heap-cap env on that path. The npx fallback
+        // (`@agentclientprotocol/codex-acp`, pure Node) is detected at spawn
+        // time and DOES get the NODE_OPTIONS heap cap
+        // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
         can_be_disabled: true,
         // The pinned @agentclientprotocol/codex-acp adapter (1.1.14) ignores
         // `_meta.developerInstructions` (verified empirically, #479), so the

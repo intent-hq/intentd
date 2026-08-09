@@ -3034,6 +3034,12 @@ impl AgentManager {
                 self.services
                     .annotate_waiting_on_hooks(agent_id, &mut data)
                     .await;
+                // Idle-visibility (unified external-wait): same
+                // `waitingOnPrMonitors` stamp as the settlement idle
+                // (omitted when the agent owns no active monitor).
+                self.services
+                    .annotate_waiting_on_pr_monitors(agent_id, &mut data)
+                    .await;
                 self.services
                     .publish_agent_event(
                         &workspace_id,
@@ -6466,19 +6472,77 @@ async fn run_message_worker(
                                     .unwrap()
                                     .get(&agent_id)
                                     .map(|h| h.connection.clone());
-                                let settled = match conn {
-                                    Some(conn) => {
-                                        cancel_and_settle_idle_prompt(
-                                            conn.as_ref(),
-                                            &agent_id,
-                                            &acp_session_id,
-                                        )
-                                        .await
+                                // Response watermark BEFORE `session/cancel`:
+                                // the idle timeout dropped `req_fut`, so the
+                                // hung prompt's pending-map entry is already
+                                // gone (drop guard) — the watermark is the
+                                // only way to observe its late response.
+                                let since = conn.as_ref().map(|c| c.response_seq());
+                                let settled = match conn.as_deref() {
+                                    Some(c) => {
+                                        cancel_and_settle_idle_prompt(c, &agent_id, &acp_session_id)
+                                            .await
                                     }
                                     None => false,
                                 };
-                                if !settled {
+                                // STAB-124 for the idle-timeout path:
+                                // attribution on the turn-less
+                                // `session/update` channel is positional,
+                                // so the cancelled turn's stragglers
+                                // (tool_call_update echoes, tail chunks)
+                                // must be discarded before the warning
+                                // turn's transcript starts consuming the
+                                // channel. The cancelled prompt's RESPONSE
+                                // is the deterministic end-of-turn boundary
+                                // on the child's ordered stdout — once it
+                                // lands, every straggler is already
+                                // buffered, so the `try_recv` sweep below
+                                // is complete, not racy. Bounded, cannot
+                                // deadlock: the timed-out worker released
+                                // the receiver lock when `run_prompt_turn`
+                                // returned, and the await is
+                                // timeout-bounded. A boundary that never
+                                // lands means the child may keep streaming
+                                // stragglers indefinitely — treated as NOT
+                                // settled below, so the child is torn down
+                                // and the warning turn spawns fresh (fresh
+                                // channel + reset watermark: bleed
+                                // impossible).
+                                let boundary_landed = if settled {
+                                    match (conn.as_ref(), since) {
+                                        (Some(conn), Some(since)) => {
+                                            let landed = conn
+                                                .await_response_after(since, Duration::from_secs(2))
+                                                .await;
+                                            if !landed {
+                                                tracing::warn!(
+                                                    agent = %agent_id,
+                                                    "idle-timeout settle: cancelled prompt's response did not land within the watermark window; tearing the child down so the warning turn starts on a fresh channel"
+                                                );
+                                            }
+                                            landed
+                                        }
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !boundary_landed {
                                     mgr.kill_child_only(&agent_id).await;
+                                } else {
+                                    // Hold the notifications lock across the
+                                    // drain so the warning turn cannot start
+                                    // consuming the channel mid-sweep.
+                                    let notes = mgr
+                                        .handles
+                                        .lock()
+                                        .unwrap()
+                                        .get(&agent_id)
+                                        .map(|h| h.notifications.clone());
+                                    if let Some(notes) = notes {
+                                        let mut guard = notes.lock().await;
+                                        Services::drain_replay_notifications(&mut guard).await;
+                                    }
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,
@@ -6960,13 +7024,42 @@ async fn run_message_worker(
     }
     mgr.clear_worker(&agent_id);
     // The agent finished its work (queue drained, slot released): raise the
-    // server-owned `attention` blue dot so every client surfaces it (§9.9).
-    if let Err(e) = mgr
-        .services
-        .raise_attention(&workspace_id, WorkspaceAttention::Unread)
-        .await
-    {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    // server-owned `attention` blue dot so every client surfaces it (§9.9) —
+    // but only for TOP-LEVEL FOREGROUND agents (monorepo#1781): a delegated
+    // child or background agent's completion is surfaced to its
+    // parent/coordinator, not the user.
+    if should_raise_turn_end_unread(&mgr.services, &agent_id).await {
+        if let Err(e) = mgr
+            .services
+            .raise_attention(&workspace_id, WorkspaceAttention::Unread)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+        }
+    }
+}
+
+/// Turn-end unread gate (monorepo#1781): the drain-end blue dot is reserved
+/// for TOP-LEVEL FOREGROUND agents — a delegated child (`parent_agent_id`
+/// set) or background agent (`is_background`) is a sub-agent whose
+/// completion is its parent/coordinator's attention surface, not the
+/// user's. Same sub-agent definition as the attention-clear gate above and
+/// rules.rs. `NotFound` means the agent was deleted while its drain
+/// finished — nothing to surface, skip. FAIL OPEN on any other store error
+/// (raise anyway): a missed blue dot for a real top-level turn is worse
+/// than a spurious one on a rare store fault.
+pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: &AgentId) -> bool {
+    match services.store.get_agent_session_summary(agent_id).await {
+        Ok(s) => s.parent_agent_id.is_none() && !s.is_background,
+        Err(Error::NotFound(_)) => false,
+        Err(e) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "turn-end unread gate: session lookup failed; raising anyway"
+            );
+            true
+        }
     }
 }
 

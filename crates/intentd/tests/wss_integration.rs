@@ -2790,6 +2790,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         output_tokens: 40,
         cache_read_tokens: 20,
         cache_creation_tokens: 10,
+        thought_tokens: 15,
         runs: 2,
         sessions_started: 1,
         longest_run_ms: 5_000,
@@ -2833,6 +2834,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(r["totals"]["outputTokens"], 40);
     assert_eq!(r["totals"]["cacheReadTokens"], 20);
     assert_eq!(r["totals"]["cacheCreationTokens"], 10);
+    assert_eq!(r["totals"]["thoughtTokens"], 15);
     assert_eq!(r["runs"], 2);
     assert_eq!(r["sessions"], 1);
     assert_eq!(r["longestRunMs"], 5_000);
@@ -2852,6 +2854,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(by_provider[0]["outputTokens"], 40);
     assert_eq!(by_provider[0]["cacheReadTokens"], 20);
     assert_eq!(by_provider[0]["cacheCreationTokens"], 10);
+    assert_eq!(by_provider[0]["thoughtTokens"], 15);
     let by_hour = r["byHourOfDay"].as_array().expect("byHourOfDay");
     assert_eq!(by_hour.len(), 24);
     // The seeded bucket occupies exactly one trailing-window slot (the newest
@@ -2883,6 +2886,12 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .expect("Opus row in current month");
     assert_eq!(opus["inputTokens"], 100);
     assert_eq!(opus["runs"], 2);
+    assert_eq!(opus["thoughtTokens"], 15);
+    // Zero-thought rollups omit the field entirely (§5.23 convention) —
+    // byte-compatible with the pre-thought_tokens response shape.
+    if let Some(sonnet) = by_model.iter().find(|m| m["model"] == "Sonnet 5") {
+        assert!(sonnet.get("thoughtTokens").is_none(), "{resp}");
+    }
     let by_provider = resp["result"]["byProvider"].as_array().expect("byProvider");
     let claude = by_provider
         .iter()
@@ -3848,6 +3857,63 @@ async fn wss_agent_complete_once_model_default_prefix_outranks_active() {
     assert_eq!(
         resp["result"]["text"], "via-prefix",
         "auggie model.default prefix outranks non-auggie providers.active"
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_resolves_quick_action_settings() {
+    // monorepo#1734: over the wire, a `agent.completeOnce` call with no
+    // explicit `model` picks up the user's quick-action settings —
+    // `quickActions.typeOverrides[type]` first, then
+    // `quickActions.defaultModel` — while an explicit `model` still wins.
+    // The fixture CLI echoes its own argv so the resolved `--model` is
+    // observable in the `{ text }` envelope.
+    let (_auggie_dir, bin) = fake_auggie_script("quick-actions", "printf '🤖\\n%s\\n' \"$*\"");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.set_setting("providers.active", serde_json::json!("auggie"));
+    srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
+    srv.set_setting(
+        "quickActions.typeOverrides",
+        serde_json::json!({ "commit": "haiku4.5" }),
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":49,"method":"agent.completeOnce","params":{"prompt":"msg","type":"commit"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 49);
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model haiku4.5"),
+        "the commit type override must be resolved daemon-side, got {resp}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":50,"method":"agent.completeOnce","params":{"prompt":"msg","type":"pr"}}"#,
+    )
+    .await;
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model sonnet4.5"),
+        "an unset override falls through to quickActions.defaultModel, got {resp}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":51,"method":"agent.completeOnce","params":{"prompt":"msg","type":"commit","model":"opus4.7"}}"#,
+    )
+    .await;
+    let text = resp["result"]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("--model opus4.7"),
+        "an explicit model outranks the quick-action settings, got {resp}"
     );
     srv.ws.stop().await;
 }
@@ -6202,13 +6268,15 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
+    let mut newest_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
         } else {
             ("assistant", format!("reply {i}"))
         };
-        srv.store
+        newest_message_id = srv
+            .store
             .append_agent_message(
                 &agent,
                 role,
@@ -6216,7 +6284,8 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
                 &now_iso(),
             )
             .await
-            .expect("append message");
+            .expect("append message")
+            .id;
     }
 
     // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
@@ -6243,14 +6312,20 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         Some("assistant"),
         "newest seeded message is the assistant reply: {lite}"
     );
+    assert_eq!(
+        lite["lastMessageId"].as_str(),
+        Some(newest_message_id.as_str()),
+        "lastMessageId is the newest seeded row's id: {lite}"
+    );
     assert!(
         lite.get("messages").is_none(),
         "AgentLite carries no transcript: {lite}"
     );
 
-    // lastMessageRole on the wire for the awaiting-reply shape: a second
-    // agent whose only message is the user's serves "user"; a fresh agent
-    // with no messages omits the field entirely.
+    // lastMessageRole/lastMessageId on the wire for the awaiting-reply
+    // shape: a second agent whose only message is the user's serves "user"
+    // and that message's id; a fresh agent with no messages omits both
+    // fields entirely.
     let created2 = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6267,7 +6342,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         created2["result"]["agent"].get("lastMessageRole").is_none(),
         "no messages yet: field omitted: {created2}"
     );
-    srv.store
+    assert!(
+        created2["result"]["agent"].get("lastMessageId").is_none(),
+        "no messages yet: lastMessageId omitted: {created2}"
+    );
+    let user_only_msg = srv
+        .store
         .append_agent_message(
             &AgentId::from(agent2_id.as_str()),
             "user",
@@ -6289,6 +6369,11 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         lite2["lastMessageRole"].as_str(),
         Some("user"),
         "user message with no assistant reply serves \"user\": {lite2}"
+    );
+    assert_eq!(
+        lite2["lastMessageId"].as_str(),
+        Some(user_only_msg.id.as_str()),
+        "lastMessageId is the sole user message's id: {lite2}"
     );
     assert!(
         lite2.get("lastAgentResponse").is_none(),

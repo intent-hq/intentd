@@ -410,6 +410,7 @@ mod tests {
 
     use super::super::filter::SubscriptionFilter;
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory (workspace root).
     struct TempDir {
@@ -516,11 +517,11 @@ mod tests {
         // before the SKILL.md is created, which under nextest's oversubscribed
         // parallelism a 250ms warm-up can lose.
         let watcher = SkillsWatcher::start(&SharedWatchHub::new(), bus.clone(), vec![]);
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // A project-tier SKILL.md created after registration emits for the
@@ -529,12 +530,11 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
         std::fs::write(skill_dir.join("SKILL.md"), skill_md("dyn-skill")).expect("write skill");
 
-        // First-event budget is `quiet` (the loop breaks after one quiet window
-        // of silence), widened 2s -> 8s (with the total deadline to match) to
-        // absorb fsevents detection + forward-task latency under load. The
-        // negative-assertion drain below stays tight — it asserts absence.
-        let events =
-            drain_skills_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20)).await;
+        // The drain waits up to `LIVENESS` for the first event (monorepo#1630),
+        // with a generous quiet window to absorb fsevents detection +
+        // forward-task latency under load. The negative-assertion drain below
+        // stays tight — it asserts absence.
+        let events = drain_skills_events(&mut sub, Duration::from_secs(8), LIVENESS).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),
             "change after runtime registration must emit for the workspace, got {events:?}"
@@ -594,8 +594,7 @@ mod tests {
         crate::skills::discover_skills(&ws.path.to_string_lossy()).await;
 
         watcher.resume_workspace(ws_id.clone(), ws.path.clone());
-        let events =
-            drain_skills_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10)).await;
+        let events = drain_skills_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),
             "resume must emit for an edit made while suspended even though the cache was refreshed, got {events:?}"

@@ -894,6 +894,12 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         idle.get("waitingOnHooks").is_none(),
         "agent:idle omits waitingOnHooks when the agent owns no active hook: {idle}"
     );
+    // Idle-visibility (unified external-wait): same omission rule for
+    // `waitingOnPrMonitors` — this agent owns no active PR monitor.
+    assert!(
+        idle.get("waitingOnPrMonitors").is_none(),
+        "agent:idle omits waitingOnPrMonitors when the agent owns no active monitor: {idle}"
+    );
     assert!(
         transitions.contains(&("active".to_string(), true)),
         "saw active/isActive=true transition (got {transitions:?})"

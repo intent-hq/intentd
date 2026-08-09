@@ -80,30 +80,61 @@ impl PrMonitorSnapshot {
     }
 }
 
-/// Fetch the current snapshot of one PR: the merge-requirements checklist
-/// (which already degrades per-signal) plus the conversation-comment count.
-/// A failing comment read degrades to the previous count rather than
-/// fabricating a "comments removed" change.
-pub(crate) async fn fetch_snapshot(
+/// One PR's freshly fetched state, shared by every monitor watching that
+/// `(repo, pr)` within a single sweep. `conversation_count` is `None` when
+/// the comment read degraded, so each monitor substitutes ITS OWN previous
+/// count at materialization time rather than fabricating a "comments
+/// removed" change from a sibling monitor's baseline.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedPrSnapshot {
+    title: String,
+    url: String,
+    head_sha: Option<String>,
+    conversation_count: Option<i64>,
+    review_comment_count: i64,
+    requirements: MergeRequirements,
+}
+
+impl SharedPrSnapshot {
+    /// Materialize a per-monitor snapshot: a degraded conversation-comment
+    /// read keeps the monitor's previous count rather than fabricating a
+    /// "comments removed" change.
+    pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
+        PrMonitorSnapshot {
+            title: self.title.clone(),
+            url: self.url.clone(),
+            head_sha: self.head_sha.clone(),
+            conversation_count: self
+                .conversation_count
+                .unwrap_or_else(|| previous.map(|p| p.conversation_count).unwrap_or(0)),
+            review_comment_count: self.review_comment_count,
+            requirements: self.requirements.clone(),
+        }
+    }
+}
+
+/// Fetch the current shared state of one PR: the merge-requirements
+/// checklist (which already degrades per-signal) plus the
+/// conversation-comment count (`None` when that read fails).
+pub(crate) async fn fetch_shared_snapshot(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-    previous: Option<&PrMonitorSnapshot>,
-) -> Result<PrMonitorSnapshot> {
+) -> Result<SharedPrSnapshot> {
     let (pr, requirements, review_comment_count) =
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
-        Ok(comments) => comments.len() as i64,
+        Ok(comments) => Some(comments.len() as i64),
         Err(e) => {
             tracing::debug!(
                 error = %e,
                 pr_number = number,
                 "pr monitor: conversation comments unavailable, keeping previous count"
             );
-            previous.map(|p| p.conversation_count).unwrap_or(0)
+            None
         }
     };
-    Ok(PrMonitorSnapshot {
+    Ok(SharedPrSnapshot {
         title: pr.title,
         url: pr.url,
         head_sha: pr.head_sha,
@@ -111,6 +142,19 @@ pub(crate) async fn fetch_snapshot(
         review_comment_count,
         requirements,
     })
+}
+
+/// Fetch + materialize in one step — the registration path, where exactly
+/// one monitor consumes the read.
+pub(crate) async fn fetch_snapshot(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    previous: Option<&PrMonitorSnapshot>,
+) -> Result<PrMonitorSnapshot> {
+    Ok(fetch_shared_snapshot(sc, repo_ref, number)
+        .await?
+        .materialize(previous))
 }
 
 /// One human-readable line per detected change between two snapshots, in a
@@ -311,6 +355,53 @@ fn plural(n: i64) -> &'static str {
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
 fn monitor_label(m: &PrMonitor) -> String {
     format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number)
+}
+
+/// Light metadata for one ACTIVE PR monitor — the idle-visibility
+/// `waitingOnPrMonitors` entry shape: `{ monitorId, repo, prNumber, title? }`.
+/// `title` is read off the persisted baseline snapshot (absent until the
+/// first successful poll) and omitted when unknown; no requirements
+/// hydration otherwise, keeping payloads light (mirrors the hook manager's
+/// `waiting_on_hooks_entry`).
+pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
+    let mut v = json!({
+        "monitorId": m.monitor_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+    });
+    let title = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        .map(|s| s.title);
+    if let Some(title) = title {
+        v["title"] = Value::String(title);
+    }
+    v
+}
+
+/// The `messageMetadata` payload attached to every PR-monitor wake delivery
+/// (PROTOCOL §5.42): `{ type: "pr_monitor_wake", monitorId, repo, prNumber,
+/// reason, url? }`. `url` is the PR's HTML URL read off the monitor's
+/// persisted baseline snapshot; the key is OMITTED (never null) when the
+/// monitor has no baseline yet.
+fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
+    let mut metadata = json!({
+        "type": "pr_monitor_wake",
+        "monitorId": m.monitor_id,
+        "repo": format!("{}/{}", m.repo_owner, m.repo_name),
+        "prNumber": m.pr_number,
+        "reason": reason,
+    });
+    let url = m
+        .last_snapshot
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        .map(|s| s.url);
+    if let Some(url) = url {
+        metadata["url"] = Value::String(url);
+    }
+    metadata
 }
 
 /// The list-surface projection of one monitor: identity + lifecycle plus the
@@ -611,6 +702,9 @@ impl Services {
         })?;
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
             .await;
+        // A newly persisted active monitor can promote the derived
+        // displayStatus to `in_progress` (§6.5).
+        self.maybe_emit_display_status_changed(workspace_id).await;
         Ok((monitor, snapshot.requirements))
     }
 
@@ -680,6 +774,35 @@ impl Services {
             .collect())
     }
 
+    /// Whether the workspace owns any ACTIVE PR monitor — the `displayStatus`
+    /// promotion signal (§6.5): an idle agent still watching a PR via a
+    /// monitor reads as active work. SQL-filtered to active rows so the hot
+    /// list/get enrichment cost is O(active monitors), never O(all monitor
+    /// history in the workspace). Best-effort: a store read failure is
+    /// logged and fails open to `false` (mirrors
+    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// never wedged and activity is never fabricated.
+    pub(crate) async fn workspace_has_active_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => !monitors.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-pr-monitors displayStatus lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
     /// Cancel an active monitor. `caller` is the cancelling agent
     /// (`ws.pr.unmonitor`): a non-owner is rejected and the owner gets no
     /// self-wake. The FE path (`caller = None`, `prMonitor.cancel`) cancels
@@ -730,6 +853,13 @@ impl Services {
         self.pr_monitor_catch_up.lock().unwrap().remove(monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
+        // FE-cancel (no agent caller) wakes the owner with a notice — the
+        // wake runs the deferral backstop itself, inside
+        // `wake_pr_monitor_owner`, after the delivery attempt. Owner-side
+        // cancel (`ws.pr.unmonitor`) delivers no wake, so a deferred
+        // completion watch on the (idle) owner would otherwise never settle
+        // when this was its last active monitor — run the backstop directly,
+        // mirroring `cancel_active_hook`.
         if caller.is_none() {
             let label = monitor_label(&monitor);
             let notice = format!(
@@ -738,7 +868,13 @@ impl Services {
             );
             self.wake_pr_monitor_owner(&monitor, &notice, "cancelled")
                 .await;
+        } else {
+            self.resettle_owner_after_pr_monitor_terminal(&monitor)
+                .await;
         }
+        // The last active monitor settling can demote the derived
+        // displayStatus (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(workspace_id).await;
         Ok(monitor)
     }
 
@@ -764,25 +900,52 @@ impl Services {
     }
 
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
-    /// (re-read each tick), poll every active monitor. Returns the task
+    /// (re-read each tick), poll every DUE active monitor. Returns the task
     /// handle so the composition root can hold/abort it.
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(services.pr_monitor_poll_interval()).await;
-                services.poll_pr_monitors().await;
+                services.poll_due_pr_monitors().await;
             }
         })
     }
 
-    /// One pass over every active monitor. Per-monitor failures are logged
+    /// One pass over every active monitor, regardless of freshness.
+    ///
+    /// `pub` so integration tests can drive a deterministic single sweep
+    /// instead of racing [`Self::spawn_pr_monitor_loop`]'s timer; the loop
+    /// itself goes through [`Self::poll_due_pr_monitors`], which also skips
+    /// monitors polled within the current interval.
+    pub async fn poll_pr_monitors(&self) {
+        self.sweep_pr_monitors(false).await;
+    }
+
+    /// The loop-driven sweep: like [`Self::poll_pr_monitors`] but skips
+    /// monitors whose `lastPolledAt` is fresher than the poll interval —
+    /// typically a monitor that was just registered or re-registered, whose
+    /// registration fetch already stamped a current baseline. Catch-up-marked
+    /// monitors (boot rehydration) are never skipped.
+    ///
+    /// `pub` for the same reason as [`Self::poll_pr_monitors`]: integration
+    /// tests drive one deterministic due-sweep instead of racing the loop's
+    /// timer.
+    pub async fn poll_due_pr_monitors(&self) {
+        self.sweep_pr_monitors(true).await;
+    }
+
+    /// One sweep over the active monitors. Per-monitor failures are logged
     /// and persisted as `lastError` — a forge outage must never kill the
     /// loop or terminalize a monitor.
     ///
-    /// `pub` so integration tests can drive a deterministic single sweep
-    /// instead of racing [`Self::spawn_pr_monitor_loop`]'s timer.
-    pub async fn poll_pr_monitors(&self) {
+    /// Forge fetches are deduplicated per distinct `(repo, pr)` WITHIN the
+    /// sweep: the first monitor on a PR fetches its shared snapshot, every
+    /// sibling monitor reuses it and diffs against its own baseline. A
+    /// failed fetch is cached the same way and recorded on each affected
+    /// monitor, so an unreachable PR costs one fetch attempt per tick, not
+    /// one per monitor.
+    async fn sweep_pr_monitors(&self, skip_fresh: bool) {
         let monitors = match self.store.load_active_pr_monitors().await {
             Ok(monitors) => monitors,
             Err(e) => {
@@ -800,41 +963,87 @@ impl Services {
                 return;
             }
         };
+        let mut shared: HashMap<
+            (String, String, i64),
+            std::result::Result<SharedPrSnapshot, String>,
+        > = HashMap::new();
         for monitor in monitors {
-            if let Err(e) = self.poll_one_pr_monitor(sc.as_ref(), &monitor).await {
-                tracing::warn!(
-                    monitor = %monitor.monitor_id.0,
-                    error = %e,
-                    "pr monitor poll failed; will retry next tick"
-                );
+            if skip_fresh && self.pr_monitor_recently_polled(&monitor) {
+                continue;
+            }
+            let key = (
+                monitor.repo_owner.clone(),
+                monitor.repo_name.clone(),
+                monitor.pr_number,
+            );
+            let fetched = match shared.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+                    let fetched =
+                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64)
+                            .await
+                            .map_err(|e| e.to_string());
+                    entry.insert(fetched).clone()
+                }
+            };
+            match fetched {
+                Ok(snapshot) => {
+                    if let Err(e) = self.poll_one_pr_monitor(&monitor, &snapshot).await {
+                        tracing::warn!(
+                            monitor = %monitor.monitor_id.0,
+                            error = %e,
+                            "pr monitor poll failed; will retry next tick"
+                        );
+                    }
+                }
+                Err(error) => {
+                    // A forge error records `lastError` without touching the
+                    // baseline — the next tick retries against the same
+                    // baseline, so a transient outage never fabricates or
+                    // loses a change (backoff is the poll interval itself).
+                    self.record_pr_monitor_error(&monitor, &error).await;
+                }
             }
             tokio::time::sleep(crate::SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Poll one monitor: refresh the snapshot, diff it against the persisted
-    /// baseline, accumulate any changes, and either terminalize (PR
-    /// merged/closed → immediate final wake) or evaluate the debounce window.
-    ///
-    /// A forge error records `lastError` and returns without touching the
-    /// baseline — the next tick retries against the same baseline, so a
-    /// transient outage never fabricates or loses a change (backoff is the
-    /// poll interval itself).
-    async fn poll_one_pr_monitor(&self, sc: &dyn SourceControl, monitor: &PrMonitor) -> Result<()> {
+    /// Whether a monitor was polled recently enough for the loop-driven
+    /// sweep to skip it this tick: `lastPolledAt` is fresher than the poll
+    /// interval (registration and re-registration fetch their own baseline
+    /// and stamp the field). Catch-up-marked monitors are never fresh —
+    /// their first post-restart poll must deliver promptly.
+    fn pr_monitor_recently_polled(&self, monitor: &PrMonitor) -> bool {
+        if self
+            .pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .contains(&monitor.monitor_id)
+        {
+            return false;
+        }
+        let Some(at) = monitor.last_polled_at.as_deref().and_then(parse_iso) else {
+            return false;
+        };
+        let interval = time::Duration::seconds(self.pr_monitor_poll_interval().as_secs() as i64);
+        time::OffsetDateTime::now_utc() - at < interval
+    }
+
+    /// Poll one monitor against the sweep's shared snapshot: diff it against
+    /// the persisted baseline, accumulate any changes, and either
+    /// terminalize (PR merged/closed → immediate final wake) or evaluate the
+    /// debounce window.
+    async fn poll_one_pr_monitor(
+        &self,
+        monitor: &PrMonitor,
+        shared: &SharedPrSnapshot,
+    ) -> Result<()> {
         let previous: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
-        let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
-        let fresh = match fetch_snapshot(sc, &repo_ref, monitor.pr_number as u64, previous.as_ref())
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                self.record_pr_monitor_error(monitor, &e.to_string()).await;
-                return Ok(());
-            }
-        };
+        let fresh = shared.materialize(previous.as_ref());
 
         let changes = previous
             .as_ref()
@@ -1058,6 +1267,10 @@ impl Services {
             .await;
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
+        // The last active monitor settling can demote the derived
+        // displayStatus (§6.5) — best-effort, transition-only emission.
+        self.maybe_emit_display_status_changed(&completed.workspace_id)
+            .await;
         Ok(())
     }
 
@@ -1115,6 +1328,10 @@ impl Services {
                 monitor.updated_at = now;
                 self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
                     .await;
+                // The last active monitor settling can demote the derived
+                // displayStatus (§6.5).
+                self.maybe_emit_display_status_changed(&monitor.workspace_id)
+                    .await;
                 continue;
             }
             self.pr_monitor_catch_up
@@ -1126,18 +1343,37 @@ impl Services {
         Ok(resumed)
     }
 
+    /// Idle-visibility deferral backstop (mirrors
+    /// [`Services::resettle_owner_after_hook_terminal`](crate::Services::resettle_owner_after_hook_terminal)):
+    /// after a PR monitor reaches a terminal state, re-run the
+    /// deferred-completion redelivery for the owner. A completion watch on
+    /// an idle owner defers while it owns active PR monitors; the
+    /// wake-carrying transitions (changed/completed/FE-cancel) resolve via
+    /// the owner's wake turn ending, but a terminal transition whose wake
+    /// was not delivered (owner-side `ws.pr.unmonitor` of the last monitor,
+    /// or a failed wake delivery) would otherwise strand the deferred watch
+    /// forever. Routes through
+    /// [`Services::redeliver_completion_after_queue_mutation`], whose guards
+    /// make this a no-op in every other situation.
+    async fn resettle_owner_after_pr_monitor_terminal(&self, monitor: &PrMonitor) {
+        self.redeliver_completion_after_queue_mutation(&monitor.agent_id)
+            .await;
+    }
+
     /// Wake a monitor's owning agent via the automatic-delivery
     /// `agent.sendMessage` path (queued behind an in-flight turn, never
     /// interrupts). Best-effort: a delivery failure is logged, never
     /// propagated — the monitor's own state transition already persisted.
+    ///
+    /// Every wake reason (`changed` / `completed` / `cancelled`) marks a
+    /// terminal-or-progressing monitor transition; `cancelled` and
+    /// `completed` are terminal, so the deferral backstop runs after the
+    /// delivery attempt — a FAILED wake on an idle owner whose last monitor
+    /// just terminated must still settle the owner's deferred completion
+    /// watches (a successful wake makes the backstop a no-op — the
+    /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
-        let metadata = json!({
-            "type": "pr_monitor_wake",
-            "monitorId": monitor.monitor_id,
-            "repo": format!("{}/{}", monitor.repo_owner, monitor.repo_name),
-            "prNumber": monitor.pr_number,
-            "reason": reason,
-        });
+        let metadata = pr_monitor_wake_metadata(monitor, reason);
         if let Err(e) = self
             .deliver_wake_message(
                 &monitor.workspace_id,
@@ -1153,6 +1389,9 @@ impl Services {
                 error = %e,
                 "pr monitor owner wake delivery failed"
             );
+        }
+        if reason == "cancelled" || reason == "completed" {
+            self.resettle_owner_after_pr_monitor_terminal(monitor).await;
         }
     }
 
@@ -1261,6 +1500,90 @@ impl Services {
     ) -> Result<Value> {
         let flushed = self.pr_monitor_flush(workspace_id, monitor_id).await?;
         Ok(json!({ "ok": true, "flushed": flushed }))
+    }
+
+    /// Idle-visibility deferral (mirrors
+    /// [`Services::active_hooks_for_agent`](crate::Services::active_hooks_for_agent)):
+    /// the caller's ACTIVE PR monitors, oldest first. Empty when the agent
+    /// owns no active monitor; a store failure is logged and reads as empty
+    /// (visibility is best-effort and must never block an idle emit or wake
+    /// delivery).
+    pub(crate) async fn active_pr_monitors_for_agent(&self, agent_id: &AgentId) -> Vec<PrMonitor> {
+        match self.store.list_active_pr_monitors_by_agent(agent_id).await {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "active-pr-monitors lookup failed; pr-monitor-waiting reads as empty"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Workspace-batched variant of
+    /// [`active_pr_monitors_for_agent`](Self::active_pr_monitors_for_agent)
+    /// for `agent.list`: one store query for the whole workspace, grouped by
+    /// owning agent id as light `waitingOnPrMonitors` entries (agents with no
+    /// active monitor are absent). A store failure is logged and reads as
+    /// empty, mirroring
+    /// [`Services::active_hooks_by_agent`](crate::Services::active_hooks_by_agent).
+    pub(crate) async fn active_pr_monitors_by_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> HashMap<String, Vec<Value>> {
+        let monitors = match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "active-pr-monitors workspace lookup failed; waitingOnPrMonitors reads as empty"
+                );
+                return HashMap::new();
+            }
+        };
+        let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
+        for m in monitors {
+            let agent = m.agent_id.0.clone();
+            by_agent
+                .entry(agent)
+                .or_default()
+                .push(waiting_on_pr_monitors_entry(&m));
+        }
+        by_agent
+    }
+
+    /// Stamp `waitingOnPrMonitors` onto an `agent:idle`-style event `data`
+    /// object when `agent_id` owns at least one active PR monitor (the field
+    /// is omitted — never `[]` — otherwise, and an existing stamp is left
+    /// untouched). Returns the stamped list (empty when nothing was stamped
+    /// and no stamp was present). Mirrors
+    /// [`Services::annotate_waiting_on_hooks`](crate::Services::annotate_waiting_on_hooks).
+    pub(crate) async fn annotate_waiting_on_pr_monitors(
+        &self,
+        agent_id: &AgentId,
+        data: &mut Value,
+    ) -> Vec<Value> {
+        if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
+            return existing.clone();
+        }
+        let monitors = self.active_pr_monitors_for_agent(agent_id).await;
+        let entries: Vec<Value> = monitors.iter().map(waiting_on_pr_monitors_entry).collect();
+        if !entries.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(
+                    "waitingOnPrMonitors".to_string(),
+                    Value::Array(entries.clone()),
+                );
+            }
+        }
+        entries
     }
 
     /// The per-turn snapshot's `prMonitors` field: one
@@ -1384,6 +1707,7 @@ mod tests {
         threads: Vec<ReviewThread>,
         checks: Vec<RollupCheck>,
         fail_get_pr: bool,
+        fail_list_comments: bool,
     }
 
     impl Default for ForgeState {
@@ -1404,6 +1728,7 @@ mod tests {
                     url: None,
                 }],
                 fail_get_pr: false,
+                fail_list_comments: false,
             }
         }
     }
@@ -1411,17 +1736,25 @@ mod tests {
     #[derive(Clone)]
     struct StubForge {
         state: Arc<Mutex<ForgeState>>,
+        get_pr_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StubForge {
         fn new() -> Self {
             Self {
                 state: Arc::new(Mutex::new(ForgeState::default())),
+                get_pr_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
         fn edit(&self, f: impl FnOnce(&mut ForgeState)) {
             f(&mut self.state.lock().unwrap());
+        }
+
+        /// Snapshot-fetch attempts so far: `get_pr` is called exactly once
+        /// per [`fetch_shared_snapshot`] attempt (successful or not).
+        fn fetches(&self) -> usize {
+            self.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1495,6 +1828,8 @@ mod tests {
             _: &RepoRef,
             number: u64,
         ) -> intent_sourcecontrol::Result<PullRequest> {
+            self.get_pr_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let s = self.state.lock().unwrap().clone();
             if s.fail_get_pr {
                 return Err(intent_sourcecontrol::Error::Unsupported(
@@ -1603,7 +1938,15 @@ mod tests {
             _: &RepoRef,
             _: u64,
         ) -> intent_sourcecontrol::Result<Vec<Comment>> {
-            let n = self.state.lock().unwrap().conversation_comments;
+            let (n, fail) = {
+                let s = self.state.lock().unwrap();
+                (s.conversation_comments, s.fail_list_comments)
+            };
+            if fail {
+                return Err(intent_sourcecontrol::Error::Unsupported(
+                    "comments down".into(),
+                ));
+            }
             Ok((0..n)
                 .map(|i| Comment {
                     id: i.to_string(),
@@ -2157,6 +2500,12 @@ mod tests {
         let text = owner_messages(&svc, &owner).await;
         assert!(text.contains("was MERGED"), "{text}");
         assert!(text.contains("Monitoring has STOPPED"), "{text}");
+        // The wake's messageMetadata carries the PR url from the baseline.
+        assert!(text.contains("pr_monitor_wake"), "{text}");
+        assert!(
+            text.contains(r#""url":"https://github.com/o/r/pull/42""#),
+            "{text}"
+        );
         // Completed rows stay visible; the loop no longer polls them.
         assert_eq!(svc.pr_monitors_for_agent(&owner).await.unwrap().len(), 1);
         assert!(svc
@@ -2165,6 +2514,41 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn wake_metadata_carries_the_pr_url_and_omits_it_without_a_baseline() {
+        let now = now_iso();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&snapshot(|_| {})).unwrap()),
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let metadata = pr_monitor_wake_metadata(&m, "changed");
+        assert_eq!(metadata["type"], json!("pr_monitor_wake"));
+        assert_eq!(metadata["repo"], json!("o/r"));
+        assert_eq!(metadata["prNumber"], json!(42));
+        assert_eq!(metadata["reason"], json!("changed"));
+        assert_eq!(metadata["url"], json!("https://github.com/o/r/pull/42"));
+
+        // No baseline yet: the key is ABSENT, never null.
+        m.last_snapshot = None;
+        let metadata = pr_monitor_wake_metadata(&m, "cancelled");
+        assert!(metadata.get("url").is_none(), "{metadata}");
+        assert_eq!(metadata["reason"], json!("cancelled"));
     }
 
     #[tokio::test]
@@ -2253,6 +2637,194 @@ mod tests {
             .expect("app cancel");
         let text = owner_messages(&svc, &owner).await;
         assert!(text.contains("cancelled from the app"), "{text}");
+    }
+
+    /// Insert a second agent in the fixture workspace so a second monitor
+    /// can watch the SAME PR (a monitor is unique per (agent, repo, pr)).
+    async fn second_agent(svc: &Services, ws: &WorkspaceId, id: &str) -> AgentId {
+        svc.store()
+            .insert_agent_session(&agent(ws, id))
+            .await
+            .expect("second agent");
+        AgentId::from(id)
+    }
+
+    #[tokio::test]
+    async fn sweep_fetches_each_pr_once_across_sibling_monitors() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+        // A third monitor on a DIFFERENT PR still gets its own fetch.
+        let other = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("other pr")
+            .0;
+
+        forge.edit(|s| s.conversation_comments = 1);
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            2,
+            "one fetch for o/r#42 shared by both monitors, one for o/r#7"
+        );
+
+        // Both siblings advanced their own baselines from the shared fetch.
+        for id in [&first.monitor_id, &second.monitor_id, &other.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert!(
+                !row.pending_changes.is_empty(),
+                "monitor {} saw the change: {:?}",
+                id.0,
+                row.pending_changes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_dedupes_failed_fetches_and_records_the_error_on_every_sibling() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+
+        forge.edit(|s| s.fail_get_pr = true);
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            1,
+            "an unreachable PR costs ONE fetch attempt per sweep, not one per monitor"
+        );
+        for id in [&first.monitor_id, &second.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert_eq!(row.state, PrMonitorState::Active);
+            assert!(row.last_error.is_some(), "error recorded on {}", id.0);
+        }
+    }
+
+    /// The property `SharedPrSnapshot` exists for: when the comment read
+    /// degrades, each sibling materializes the shared snapshot against ITS
+    /// OWN previous count. Siblings register around a comment bump so their
+    /// baselines DIVERGE (0 vs 2); an implementation that materialized once
+    /// with the first sibling's baseline and reused the result would
+    /// fabricate a "comments removed" change on the other.
+    #[tokio::test]
+    async fn a_degraded_comment_read_keeps_each_siblings_own_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let first = register(&svc, &ws, &owner).await;
+        // Comments move BETWEEN the registrations: first's baseline stays at
+        // 0 comments, the sibling's registration fetch stamps 2.
+        forge.edit(|s| s.conversation_comments = 2);
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+
+        // The shared comment read degrades: each sibling keeps its own
+        // previous count, so neither fabricates a comment change (first
+        // does NOT see the +2 through the degraded read either).
+        forge.edit(|s| s.fail_list_comments = true);
+        svc.poll_pr_monitors().await;
+        for id in [&first.monitor_id, &second.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert!(
+                !row.pending_changes.iter().any(|c| c.contains("comment")),
+                "no fabricated comment change on {}: {:?}",
+                id.0,
+                row.pending_changes
+            );
+        }
+
+        // Recovery diffs each monitor against ITS OWN kept count: the first
+        // sees the +2 it never observed, the sibling sees nothing.
+        forge.edit(|s| s.fail_list_comments = false);
+        svc.poll_pr_monitors().await;
+        let first_row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert!(
+            first_row
+                .pending_changes
+                .iter()
+                .any(|c| c.contains("+2 conversation comment")),
+            "first monitor catches up from its own baseline: {:?}",
+            first_row.pending_changes
+        );
+        let second_row = svc
+            .store()
+            .get_pr_monitor(&second.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            !second_row
+                .pending_changes
+                .iter()
+                .any(|c| c.contains("comment")),
+            "the sibling already had the comments in its baseline: {:?}",
+            second_row.pending_changes
+        );
+    }
+
+    #[tokio::test]
+    async fn due_sweep_skips_freshly_polled_monitors_but_never_catch_up_ones() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // Registration just stamped `lastPolledAt`: the loop-driven sweep
+        // skips the monitor (no fetch), while the explicit test-driven sweep
+        // still polls everything.
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before, "fresh monitor skipped");
+        svc.poll_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "explicit sweep never skips");
+
+        // Backdate `lastPolledAt` beyond the poll interval: due again.
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let stale = now_iso();
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                row.last_snapshot.as_deref(),
+                &row.pending_changes,
+                row.pending_since.as_deref(),
+                row.last_change_at.as_deref(),
+                Some("2020-01-01T00:00:00Z"),
+                None,
+                &stale,
+                &row.updated_at,
+            )
+            .await
+            .unwrap());
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "stale monitor polled");
+
+        // A catch-up-marked monitor (boot rehydration) is never skipped,
+        // however fresh its `lastPolledAt` — downtime changes must deliver
+        // on the first post-restart tick.
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "catch-up monitor polled");
     }
 
     #[tokio::test]
@@ -2434,6 +3006,79 @@ mod tests {
             .contains("cancelled from the app"));
     }
 
+    /// Idle-visibility gating: the `waitingOnPrMonitors` stamp applied by
+    /// every `agent:idle` emit site carries the owner's ACTIVE monitors only
+    /// — light `{ monitorId, repo, prNumber, title? }` metadata, no
+    /// requirements/pendingChanges — and is omitted entirely (never `[]`)
+    /// when the agent owns no active monitor. Mirrors
+    /// `annotate_waiting_on_hooks_stamps_only_when_active_hooks_exist` in
+    /// `hook_manager.rs`.
+    #[tokio::test]
+    async fn annotate_waiting_on_pr_monitors_stamps_only_when_active_monitors_exist() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        // No monitors at all: nothing stamped.
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert!(stamped.is_empty());
+        assert!(
+            data.get("waitingOnPrMonitors").is_none(),
+            "field omitted when no active monitors: {data}"
+        );
+
+        // An active monitor stamps the light entry.
+        let monitor = register(&svc, &ws, &owner).await;
+        let mut data = json!({ "agentId": owner.0 });
+        let stamped = svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert_eq!(stamped.len(), 1);
+        let entry = &data["waitingOnPrMonitors"][0];
+        assert_eq!(entry["monitorId"], json!(monitor.monitor_id));
+        assert_eq!(entry["repo"], json!("o/r"));
+        assert_eq!(entry["prNumber"], json!(42));
+        assert_eq!(entry["title"], json!("Add thing"), "{entry}");
+        // Payloads stay light: no requirements/pendingChanges.
+        assert!(entry.get("lastSnapshot").is_none());
+        assert!(entry.get("pendingChanges").is_none());
+
+        // A cancelled monitor is not active: nothing stamped.
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        let mut data = json!({ "agentId": owner.0 });
+        svc.annotate_waiting_on_pr_monitors(&owner, &mut data).await;
+        assert!(
+            data.get("waitingOnPrMonitors").is_none(),
+            "cancelled monitors never stamp: {data}"
+        );
+
+        // Another agent's idle is unaffected by this owner's monitors.
+        register(&svc, &ws, &owner).await;
+        let other = AgentId::from("agent-other");
+        let mut data = json!({ "agentId": other.0 });
+        svc.annotate_waiting_on_pr_monitors(&other, &mut data).await;
+        assert!(data.get("waitingOnPrMonitors").is_none());
+    }
+
+    /// Workspace-batched variant used by `agent.list`/`agent.diagnostics`:
+    /// one query groups active monitors by owning agent, and an agent with
+    /// none is absent from the map.
+    #[tokio::test]
+    async fn active_pr_monitors_by_agent_groups_by_owner() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        assert!(svc.active_pr_monitors_by_agent(&ws).await.is_empty());
+
+        let monitor = register(&svc, &ws, &owner).await;
+        let by_agent = svc.active_pr_monitors_by_agent(&ws).await;
+        assert_eq!(by_agent.len(), 1);
+        let entries = &by_agent[&owner.0];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["monitorId"], json!(monitor.monitor_id));
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert!(svc.active_pr_monitors_by_agent(&ws).await.is_empty());
+    }
+
     /// The per-turn snapshot's `prMonitors` labels: active monitors only, with
     /// the pending-changes marker while a debounced emit is accumulating.
     #[tokio::test]
@@ -2517,6 +3162,182 @@ mod tests {
                 .expect("object")
                 .contains_key("prMonitors"),
             "cancelled monitor leaves the snapshot: {after}"
+        );
+    }
+
+    /// Direct child task note of the spec, so it counts into `taskStats`.
+    fn task_note(ws: &WorkspaceId, id: &str, status: intent_core::TaskStatus) -> intent_core::Note {
+        let ts = now_iso();
+        intent_core::Note {
+            id: intent_core::NoteId::from(id),
+            workspace_id: ws.clone(),
+            title: format!("Task {id}"),
+            content: String::new(),
+            content_type: intent_core::ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(intent_core::NoteId::from("spec")),
+            visibility: intent_core::NoteVisibility::Workspace,
+            metadata: intent_core::NoteMetadata {
+                task: Some(intent_core::TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Regression for intent-hq/monorepo#1814: an ACTIVE PR monitor promotes
+    /// the derived `displayStatus` to `in_progress` on the list/get
+    /// enrichment path even with the owner idle and every task complete —
+    /// mirroring `active_hook_promotes_display_status_to_in_progress` in
+    /// `hook_manager.rs`. The promotion lapses once the monitor settles.
+    #[tokio::test]
+    async fn active_pr_monitor_promotes_display_status_to_in_progress() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        svc.store()
+            .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
+            .await
+            .expect("insert task");
+        let monitor = register(&svc, &ws, &owner).await;
+
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::InProgress),
+            "idle owner with an active PR monitor must read in_progress"
+        );
+
+        // Settle the monitor: the promotion lapses and the base rollup runs.
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete),
+            "terminal monitors never promote"
+        );
+    }
+
+    /// `workspace_has_active_pr_monitors` is the promotion signal: true only
+    /// while a monitor is ACTIVE, false with no monitors and false again once
+    /// every monitor is terminal (cancelled/completed).
+    #[tokio::test]
+    async fn workspace_has_active_pr_monitors_tracks_active_rows_only() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        assert!(!svc.workspace_has_active_pr_monitors(&ws).await);
+
+        let monitor = register(&svc, &ws, &owner).await;
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert!(
+            !svc.workspace_has_active_pr_monitors(&ws).await,
+            "cancelled monitors never promote"
+        );
+
+        // A completed monitor (merged PR) is terminal too.
+        register(&svc, &ws, &owner).await;
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        assert!(
+            !svc.workspace_has_active_pr_monitors(&ws).await,
+            "completed monitors never promote"
+        );
+    }
+
+    /// Persisted `workspace:displayStatus-changed` payload statuses for a
+    /// workspace, oldest-first.
+    async fn display_status_events(svc: &Services, ws: &WorkspaceId) -> Vec<String> {
+        let mut evs =
+            svc.store()
+                .query_events(&intent_store::EventQuery {
+                    workspace_id: Some(ws.clone()),
+                    event_types: vec![
+                        intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED.to_string()
+                    ],
+                    ..Default::default()
+                })
+                .await
+                .expect("query displayStatus events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data["displayStatus"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Monitor lifecycle transitions emit `workspace:displayStatus-changed`
+    /// exactly once per transition: register promotes (idle → in_progress),
+    /// cancel demotes (in_progress → idle) — mirroring
+    /// `hook_transitions_emit_display_status_changed_once` in
+    /// `hook_manager.rs`.
+    #[tokio::test]
+    async fn monitor_transitions_emit_display_status_changed_once() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        // Re-running the recompute without a transition emits nothing.
+        svc.maybe_emit_display_status_changed(&ws).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle"]
+        );
+    }
+
+    /// The poll loop's terminal completion (merged PR) demotes and emits,
+    /// and so does a rehydration cancel of an owner-gone monitor.
+    #[tokio::test]
+    async fn completion_and_rehydration_cancel_emit_the_demotion() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        svc.maybe_emit_display_status_changed(&ws).await;
+
+        register(&svc, &ws, &owner).await;
+        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle"]
+        );
+
+        // Rehydration cancel (owner gone) demotes too.
+        svc.pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress"]
+        );
+        svc.store()
+            .set_agent_session_status(&ws, &owner, AgentStatus::Deleted, false, &now_iso(), None)
+            .await
+            .expect("delete owner");
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress", "idle"]
         );
     }
 

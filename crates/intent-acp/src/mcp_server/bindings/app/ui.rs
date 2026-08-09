@@ -154,11 +154,11 @@ fn targets() -> Value {
         },
         // Settings targets
         {
-            "id": "backgroundAgents.defaultModel",
+            "id": "quickActions.defaultModel",
             "tab": "agents",
-            "hashAliases": ["default-model", "backgroundAgents.defaultModel"],
+            "hashAliases": ["default-model", "quickActions.defaultModel"],
             "scrollSelector": "#default-model",
-            "highlightSelector": "[data-highlight-id=\"backgroundAgents.defaultModel\"]",
+            "highlightSelector": "[data-highlight-id=\"quickActions.defaultModel\"]",
             "label": "Settings: Default model",
             "route": "/settings?tab=agents#default-model",
             "category": "settings",

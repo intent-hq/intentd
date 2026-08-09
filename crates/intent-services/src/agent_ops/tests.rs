@@ -2346,6 +2346,108 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     assert_eq!(cv["waitingForAgentIds"], json!([]));
 }
 
+/// issue intent-hq/monorepo#1649: the `isWaitingForOtherAgents` /
+/// `waitingForAgentIds` projections must apply the same `report_delivered`
+/// filter as the settlement predicate (`agent_is_waiting_on_agents`), so a
+/// holder whose only outgoing watch has already delivered its report-time
+/// wake no longer displays as waiting while settlement treats it as settled.
+#[tokio::test]
+async fn agent_lite_waiting_projection_excludes_report_delivered_watches() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let watch_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([child.0]));
+
+    // Report-time wake delivered: the watch stops being a waiting reason for
+    // settlement, so the projection must stop counting it too.
+    assert!(svc.mark_watch_report_delivered(&watch_id));
+    let v =
+        serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], false);
+    assert_eq!(v["waitingForAgentIds"], json!([]));
+
+    // Mixed set: a live watch on another child still projects — only the
+    // report_delivered edge is filtered, not the whole watch list.
+    let other = create_agent(&svc, &ws, "Other").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        other.clone(),
+        None,
+    )
+    .expect("register second watch");
+    let v = serde_json::to_value(svc.agent_get_op(parent, None).await.expect("get")).unwrap();
+    assert_eq!(v["isWaitingForOtherAgents"], true);
+    assert_eq!(v["waitingForAgentIds"], json!([other.0]));
+}
+
+/// `agent.reportToParent` marks the parent's ungrouped watches
+/// `report_delivered`, which flips the waiting projection — so it must
+/// publish `agent:subscriptions-changed` with the refreshed flags instead of
+/// leaving clients on a stale `isWaitingForOtherAgents: true` snapshot
+/// (monorepo#1649).
+#[tokio::test]
+async fn report_to_parent_publishes_refreshed_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let child = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped"), Some(child))
+        .await
+        .expect("report");
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after reportToParent")
+        .expect("batch");
+    let last = batch.last().expect("event");
+    assert_eq!(last.data["agentId"], json!(parent.0));
+    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
+    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+}
+
 /// STAB-125: `agent.get` surfaces turn-liveness — `turnInFlight` and
 /// `lastStreamActivityAt` — from the live-turn slot so a poller can tell a
 /// long-but-alive turn from a wedged agent before anything persists.
@@ -10721,6 +10823,41 @@ async fn seed_active_hook(
     hook
 }
 
+/// Seed one ACTIVE PR-monitor row owned by `agent` directly in the store —
+/// the idle-visibility lookups read persisted monitor rows, so no poll loop
+/// is needed. Mirrors [`seed_active_hook`] for the pr-monitor-waiting
+/// classification.
+async fn seed_active_pr_monitor(
+    svc: &Services,
+    ws: &WorkspaceId,
+    agent: &AgentId,
+    pr_number: i64,
+) -> intent_core::PrMonitor {
+    let now = now_iso();
+    let monitor = intent_core::PrMonitor {
+        monitor_id: intent_core::PrMonitorId::new(),
+        workspace_id: ws.clone(),
+        agent_id: agent.clone(),
+        repo_owner: "acme".to_string(),
+        repo_name: "widgets".to_string(),
+        pr_number,
+        state: intent_core::PrMonitorState::Active,
+        last_snapshot: None,
+        pending_changes: Vec::new(),
+        pending_since: None,
+        last_change_at: None,
+        last_polled_at: None,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    svc.store()
+        .insert_pr_monitor(&monitor)
+        .await
+        .expect("insert pr monitor");
+    monitor
+}
+
 /// Idle-visibility deferral (a)+(b): a watched child going idle while owning
 /// an active hook delivers NO wake and the watch STAYS ARMED; the child's
 /// later idle with no active hooks fires the watch exactly once as a normal
@@ -10993,6 +11130,159 @@ async fn immediate_wake_paths_ignore_active_hooks() {
     );
 }
 
+/// Unified external-wait classification: a watched child going idle while
+/// owning an active PR monitor delivers NO wake and the watch STAYS ARMED,
+/// mirroring `hook_waiting_idle_defers_watch_until_hookless_idle` exactly;
+/// once the monitor is cancelled, the child's next idle is its real
+/// completion and the watch fires exactly once.
+#[tokio::test]
+async fn pr_monitor_waiting_idle_defers_watch_until_monitorless_idle() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle while the monitor is active: deferred — no wake, watch armed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "no wake while the child waits on its PR monitor"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed through the deferred idle"
+    );
+
+    // The monitor completes (terminal) and the wake turn ends: the next idle
+    // is the child's real completion — the watch fires once.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Completed,
+            &now_iso(),
+        )
+        .await
+        .expect("complete monitor");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "PR merged" }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("completed"), "{text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retires at the real completion"
+    );
+}
+
+/// Unified external-wait classification in after_all groups: a
+/// pr-monitor-waiting child does NOT count as settled — the sealed group
+/// stays open past its idle — and settles with one aggregated wake once the
+/// monitor resolves, mirroring `after_all_group_waits_for_hook_waiting_child`.
+#[tokio::test]
+async fn after_all_group_waits_for_pr_monitor_waiting_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 7).await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+
+    // Child idles while its PR monitor is active: NOT recorded as settled.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+
+    // Parent idles: the group seals but stays open — the pr-monitor-waiting
+    // child is unsettled, so no aggregated wake fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "sealed group waits for the pr-monitor-waiting child"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The monitor is cancelled and the child's wrap-up idle ends
+    // monitorless: the group records the real completion and fires exactly
+    // one wake.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Cancelled,
+            &now_iso(),
+        )
+        .await
+        .expect("cancel monitor");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "monitor cancelled, wrapped up" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("All 1 delegated child agent(s) settled"),
+        "{text}"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "grouped watches removed at settlement"
+    );
+}
+
 /// Idle-visibility deferral (e): an external (FE) `hook.cancel` on an idle
 /// child whose watch was deferred fires the deferred watch — the cancel was
 /// the last active hook's terminal transition, and its owner wake +
@@ -11099,6 +11389,117 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
         restarted.find_watches_for_child(&child).len(),
         1,
         "rehydrated watch stays armed for the post-hook completion"
+    );
+}
+
+/// Unified external-wait classification: an owner-initiated `pr.unmonitor`
+/// (`caller = Some`) delivers no self-wake, so the resettle backstop must
+/// synthesize the child's deferred completion directly — mirrors
+/// `external_hook_cancel_settles_deferred_watch`'s FE-cancel case but through
+/// the no-wake owner-cancel path instead.
+#[tokio::test]
+async fn owner_pr_unmonitor_settles_deferred_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 55).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    // Idle with the monitor active: deferred (marker recorded, watch armed).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // The owner cancels its own monitor (`ws.pr.unmonitor`, no self-wake):
+    // the terminal-transition backstop synthesizes the child's completion
+    // directly and the deferred watch fires.
+    svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&child))
+        .await
+        .expect("cancel monitor");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "deferred watch fires when the owner cancels its last active monitor"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("completed"),
+        "parent got the completion wake: {text}"
+    );
+}
+
+/// Unified external-wait classification at rehydration: a rehydrated watch on
+/// a child that is idle WITH an active PR monitor must not refire at boot —
+/// reconciliation defers to the child's genuine completion, mirroring
+/// `rehydrated_watch_on_hook_waiting_idle_child_does_not_refire`.
+#[tokio::test]
+async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        seed_active_pr_monitor(&svc, &ws, &child, 99).await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        // The child looks genuinely complete by the STAB-108 predicate
+        // (Completed + report) — only its active PR monitor defers the
+        // refire.
+        let mut s = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::Completed;
+        s.completion_report = Some("waiting on my PR".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+        (parent, child)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &parent).await,
+        0,
+        "no synthetic wake at boot while the child owns an active PR monitor"
+    );
+    assert_eq!(
+        restarted.find_watches_for_child(&child).len(),
+        1,
+        "rehydrated watch stays armed for the post-monitor completion"
     );
 }
 
@@ -12083,6 +12484,80 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     );
 }
 
+/// Idle-visibility on the read surfaces (unified external-wait, mirrors
+/// `status_list_and_diagnostics_surface_waiting_on_hooks`): `agent.get`/
+/// `agent.list` overlay `waitingOnPrMonitors` for monitor-owning agents
+/// (omitted when empty) and `agent.diagnostics` agent rows carry the same
+/// list.
+#[tokio::test]
+async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
+    let (_t, svc, ws) = setup().await;
+    let monitored = create_agent(&svc, &ws, "Monitored").await;
+    let bare = create_agent(&svc, &ws, "Bare").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &monitored, 42).await;
+
+    // agent.get (the projection behind ws.agent.status).
+    let lite = svc
+        .agent_get_op(monitored.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert_eq!(lite.waiting_on_pr_monitors.len(), 1);
+    let entry = &lite.waiting_on_pr_monitors[0];
+    assert_eq!(entry["monitorId"], json!(monitor.monitor_id));
+    assert_eq!(entry["repo"], json!("acme/widgets"));
+    assert_eq!(entry["prNumber"], json!(42));
+    assert!(entry.get("lastSnapshot").is_none(), "payload stays light");
+    // Omitted (not `[]`) on the wire when empty.
+    let wire = serde_json::to_value(&lite).unwrap();
+    assert!(wire.get("waitingOnPrMonitors").is_some());
+    let bare_lite = svc
+        .agent_get_op(bare.clone(), Some(ws.clone()))
+        .await
+        .unwrap();
+    assert!(bare_lite.waiting_on_pr_monitors.is_empty());
+    let bare_wire = serde_json::to_value(&bare_lite).unwrap();
+    assert!(
+        bare_wire.get("waitingOnPrMonitors").is_none(),
+        "field omitted for monitor-less agents: {bare_wire}"
+    );
+
+    // agent.list overlays the same data from the workspace-batched query.
+    let listed = svc.agent_list_op(ws.clone()).await.unwrap();
+    let by_id = |id: &AgentId| {
+        listed
+            .iter()
+            .find(|a| &a.id == id)
+            .expect("agent listed")
+            .clone()
+    };
+    assert_eq!(by_id(&monitored).waiting_on_pr_monitors.len(), 1);
+    assert_eq!(
+        by_id(&monitored).waiting_on_pr_monitors[0]["prNumber"],
+        json!(42)
+    );
+    assert!(by_id(&bare).waiting_on_pr_monitors.is_empty());
+
+    // agent.diagnostics agent rows.
+    let diag = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .unwrap();
+    let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
+    let row = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(
+        row(&monitored)["waitingOnPrMonitors"][0]["prNumber"],
+        json!(42)
+    );
+    assert!(
+        row(&bare).get("waitingOnPrMonitors").is_none(),
+        "diagnostics omits the field for monitor-less agents"
+    );
+}
+
 /// Two after_all delegates from one parent share a single group whose expected
 /// set has both children, with two grouped watches and zero ungrouped watches.
 #[tokio::test]
@@ -12661,6 +13136,132 @@ async fn hook_waiting_child_settlement_still_deferred_after_seal() {
         .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
         .await
         .expect("dispatch hook");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "group settles with exactly one aggregated wake"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1483 regression, PR-monitor variant: a coordinator that owns an
+/// ACTIVE PR monitor still seals its open after_all group when it goes
+/// queue-idle — the pr-monitor-waiting classification defers only the
+/// agent's own settlement as a child, never the parent-side seal. Mirrors
+/// `hook_owning_parent_idle_seals_group_and_wake_delivers`.
+#[tokio::test]
+async fn pr_monitor_owning_parent_idle_seals_group_and_wake_delivers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    seed_active_pr_monitor(&svc, &ws, &parent, 1).await;
+    let c1 = delegate_after_all(&svc, &ws, &parent).await;
+
+    // The monitor-owning parent idles: its delegating turn is over, so the
+    // group seals despite the active monitor.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group awaits its child");
+    assert!(
+        group.sealed,
+        "queue-idle seals the group despite the parent's active PR monitor"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+
+    // The child settles: the sealed + complete group fires exactly one
+    // aggregated wake and is removed.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake delivered despite the parent's active PR monitor"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "delivered group removed"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1483 guard, PR-monitor variant: a grouped CHILD going idle while
+/// owning an active PR monitor is still NOT recorded as settled — the seal
+/// gating change is scoped to the parent's own idle, and the sealed group
+/// keeps waiting for the pr-monitor-waiting child's genuine completion.
+/// Mirrors `hook_waiting_child_settlement_still_deferred_after_seal`.
+#[tokio::test]
+async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 2).await;
+
+    // Parent idles: seals the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert!(
+        svc.delegation_group_for_parent(&parent)
+            .expect("group open")
+            .sealed
+    );
+
+    // Child idles while its PR monitor is active: deferred — not recorded,
+    // no fire.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0 }),
+    ))
+    .await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("sealed group still waits for the pr-monitor-waiting child");
+    assert!(
+        group.completed_agent_ids.is_empty(),
+        "pr-monitor-waiting idle is not recorded as settlement"
+    );
+    assert_eq!(parent_message_count(&svc, &parent).await, 0);
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "grouped watch survives the deferred idle"
+    );
+
+    // The monitor completes; the child's next idle is its real completion —
+    // the group records it and fires exactly one aggregated wake.
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Completed,
+            &now_iso(),
+        )
+        .await
+        .expect("complete monitor");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -13964,6 +14565,194 @@ async fn diagnostics_flags_orphaned_subscription() {
     assert!(risks
         .iter()
         .any(|r| r["type"] == json!("orphaned-subscription") && r["agentId"] == json!(ghost.0)));
+}
+
+/// monorepo#1694: a healthy `after_all` group — every pending child covered
+/// by a grouped completion watch — reports its real subscription linkage
+/// (`subscriptionIds`, `subscriptionMissing: false`) instead of the legacy
+/// always-empty group-level field, and its incomplete-group stuck-risk is
+/// not `critical`.
+#[tokio::test]
+async fn diagnostics_healthy_after_all_group_reports_subscription_linkage() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &a);
+    svc.enroll_child_in_group(&gid, &b);
+    let mut watch_ids = Vec::new();
+    for child in [&a, &b] {
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                parent.clone(),
+                "Parent".into(),
+                child.clone(),
+                Some(gid.clone()),
+            )
+            .expect("grouped watch");
+        watch_ids.push(id);
+    }
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let groups = diag["delegationGroups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group["groupId"], json!(gid));
+    assert_eq!(group["subscriptionMissing"], json!(false), "group: {group}");
+    let sub_ids: Vec<&str> = group["subscriptionIds"]
+        .as_array()
+        .expect("subscriptionIds")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    for id in &watch_ids {
+        assert!(sub_ids.contains(&id.as_str()), "linkage lists watch {id}");
+    }
+
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    // Idle pending children: worth a look, but never critical when the
+    // subscription linkage is intact.
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+}
+
+/// monorepo#1694: an incomplete group whose pending children are ALL
+/// actively responding (non-stale) is normal in-progress fan-in — the
+/// stuck-risk downgrades to `info`.
+#[tokio::test]
+async fn diagnostics_after_all_group_with_responding_children_is_info() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Active;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child responding");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("info"), "risk: {risk}");
+}
+
+/// monorepo#1694: a responding-but-STALE pending child (updated_at beyond the
+/// stale threshold) does not qualify for the `info` downgrade — the
+/// stuck-risk stays at the `warning` default.
+#[tokio::test]
+async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Active;
+    // Backdate well past DEFAULT_STALE_RESPONDING_AFTER_MS (10 min).
+    s.updated_at = "2020-01-01T00:00:00Z".to_string();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child responding but stale");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+}
+
+/// monorepo#1694: a pending child with NO grouped watch is the real failure
+/// the missing-check exists for — `subscriptionMissing: true` and a
+/// `critical` stuck-risk.
+#[tokio::test]
+async fn diagnostics_after_all_group_without_watch_is_critical() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    let groups = diag["delegationGroups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["subscriptionMissing"], json!(true));
+    assert_eq!(groups[0]["subscriptionIds"], json!([]));
+
+    let risk = diag["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("critical"), "risk: {risk}");
 }
 
 /// The auggie `session stats --json` parser maps the camelCase CLI shape onto
@@ -18596,6 +19385,105 @@ async fn agent_lite_last_message_role_follows_newest_message() {
     assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
 }
 
+/// `lastMessageId` derivation across both projection paths (monorepo#1597):
+/// omitted on an empty transcript, tracks the newest user/assistant message
+/// id (system tails are transparent), recomputed by `agent.replaceMessages`,
+/// and — unlike `lastMessageRole` — never overlaid mid-turn: while a turn is
+/// streaming it stays on the last persisted user/assistant row.
+#[tokio::test]
+async fn agent_lite_last_message_id_follows_newest_message() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "IdTracker").await;
+
+    // Empty transcript: field omitted on the wire.
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id, None);
+    let v = serde_json::to_value(&got).unwrap();
+    assert!(
+        v.get("lastMessageId").is_none(),
+        "field omitted when absent: {v}"
+    );
+
+    let append = |role: &'static str, text: &'static str| {
+        let svc = &svc;
+        let id = id.clone();
+        async move {
+            svc.store()
+                .append_agent_message(
+                    &id,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    &now_iso(),
+                )
+                .await
+                .expect("append")
+        }
+    };
+    let user_msg = append("user", "first ask").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(user_msg.id.as_str()));
+
+    let reply = append("assistant", "reply").await;
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(reply.id.as_str()));
+
+    let follow_up = append("user", "follow-up").await;
+    append("system", "system tail").await;
+    svc.invalidate_agent_list_cache(&ws);
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(
+        got.last_message_id.as_deref(),
+        Some(follow_up.id.as_str()),
+        "system tail is transparent"
+    );
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = agents.iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(
+        listed.last_message_id.as_deref(),
+        Some(follow_up.id.as_str())
+    );
+
+    // No live-turn overlay: mid-turn with derivable streamed text, the role
+    // flips to "assistant" but the id stays on the last persisted
+    // user/assistant row until the assistant row persists.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-live",
+        vec![json!({
+            "type": "text",
+            "id": "msg-live:0",
+            "text": "First line done\npartial tail",
+        })],
+    );
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_role.as_deref(), Some("assistant"));
+    assert_eq!(
+        got.last_message_id.as_deref(),
+        Some(follow_up.id.as_str()),
+        "mid-turn the id stays on the persisted row"
+    );
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+
+    // replaceMessages recomputes: the id lands on the replacement batch's
+    // newest user/assistant row.
+    svc.agent_replace_messages_op(
+        id.clone(),
+        json!([
+            { "role": "user", "content": [{ "type": "text", "text": "first ask" }] },
+            { "role": "assistant", "content": [{ "type": "text", "text": "reply" }] },
+        ]),
+    )
+    .await
+    .expect("replace");
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let newest = session.messages.last().expect("replaced rows");
+    assert_eq!(newest.role, "assistant");
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.last_message_id.as_deref(), Some(newest.id.as_str()));
+}
+
 /// Live-turn overlay flip (intentd#786/#792): mid-turn, `lastMessageRole`
 /// stays on the persisted value ("user") until the in-flight turn has
 /// derivable streamed text — the same gate as the live `lastAgentResponse`
@@ -19480,7 +20368,7 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
         session.dismissed_questions_message_id(),
         Some(asked.id.as_str())
     );
-    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
         lite.metadata.dismissed_questions_message_id.as_deref(),
         Some(asked.id.as_str())
@@ -19950,7 +20838,7 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
     // the AgentLite metadata projection.
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
-    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None);
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
         lite.metadata.last_seen_message_id.as_deref(),
         Some(seen.id.as_str())

@@ -184,6 +184,55 @@ impl Store {
         rows.iter().map(monitor_from_row).collect()
     }
 
+    /// List an agent's ACTIVE monitors only, oldest first — the SQL-filtered
+    /// counterpart to [`Store::list_pr_monitors_by_agent`] for read paths
+    /// that only care about active rows (idle-visibility's
+    /// `waitingOnPrMonitors`), so cost is O(active monitors) rather than
+    /// O(all monitor history for the agent).
+    pub async fn list_active_pr_monitors_by_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Vec<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? AND state = 'active' \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "list active pr monitors by agent failed: {e}"
+                ))
+            })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
+    /// List a workspace's ACTIVE monitors only, oldest first — the
+    /// SQL-filtered counterpart to [`Store::list_pr_monitors_by_workspace`]
+    /// for `agent.list`/`agent.diagnostics`, so cost is O(active monitors in
+    /// the workspace) rather than O(all monitor history in the workspace).
+    pub async fn list_active_pr_monitors_by_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<PrMonitor>> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? AND state = 'active' \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!(
+                    "list active pr monitors by workspace failed: {e}"
+                ))
+            })?;
+        rows.iter().map(monitor_from_row).collect()
+    }
+
     /// Every `active` monitor across all workspaces, oldest first — the poll
     /// loop's per-tick read and the boot rehydration read.
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {

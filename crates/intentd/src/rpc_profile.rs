@@ -11,13 +11,20 @@
 //!   (default [`DEFAULT_STATEMENT_WARN_THRESHOLD`]; N+1 / hydrate-then-discard
 //!   regressions), and
 //! - one WARN when the wall-clock duration exceeds the duration threshold
-//!   (default [`DEFAULT_DURATION_WARN_MS`] ms; catches fs walks / git scans
-//!   that never touch SQLite).
+//!   for the method's tier.
 //!
-//! Both thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`] and
-//! [`DURATION_THRESHOLD_ENV`] (read once at layer construction). Logging only
-//! — no wire-contract impact; overhead is one span per dispatch plus a
-//! counter increment per statement.
+//! Duration budgets are tiered: methods that fan out to a network-bound
+//! upstream ([`is_network_tier_method`] — `github.*`, `linear.*`, `sentry.*`,
+//! `pr.refresh`, `pr.state`) get a higher default budget
+//! ([`DEFAULT_NETWORK_DURATION_WARN_MS`]) so normal upstream latency doesn't
+//! drown out the local-regression signal; every other method keeps the
+//! default budget ([`DEFAULT_DURATION_WARN_MS`]; catches fs walks / git scans
+//! that never touch SQLite). The statement-count budget is not tiered.
+//!
+//! All thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
+//! [`DURATION_THRESHOLD_ENV`], and [`NETWORK_DURATION_THRESHOLD_ENV`] (read
+//! once at layer construction). Logging only — no wire-contract impact;
+//! overhead is one span per dispatch plus a counter increment per statement.
 
 use std::time::{Duration, Instant};
 
@@ -33,13 +40,39 @@ use intent_transport::router::{RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET}
 /// Default statement-count threshold: a dispatch executing more than this
 /// many SQL statements draws a WARN.
 pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
-/// Default duration threshold in milliseconds: a dispatch running longer than
-/// this draws a WARN.
+/// Default duration threshold in milliseconds for non-network-tier methods: a
+/// dispatch running longer than this draws a WARN.
 pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
+/// Default duration threshold in milliseconds for network-tier methods (see
+/// [`is_network_tier_method`]): a dispatch running longer than this draws a
+/// WARN. Higher than [`DEFAULT_DURATION_WARN_MS`] so normal upstream latency
+/// doesn't trip the guardrail.
+pub const DEFAULT_NETWORK_DURATION_WARN_MS: u64 = 10_000;
 /// Env override for the statement-count threshold (u64).
 pub const STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_STATEMENT_WARN_THRESHOLD";
-/// Env override for the duration threshold in milliseconds (u64).
+/// Env override for the non-network-tier duration threshold in milliseconds
+/// (u64).
 pub const DURATION_THRESHOLD_ENV: &str = "INTENTD_RPC_DURATION_WARN_MS";
+/// Env override for the network-tier duration threshold in milliseconds
+/// (u64).
+pub const NETWORK_DURATION_THRESHOLD_ENV: &str = "INTENTD_RPC_NETWORK_DURATION_WARN_MS";
+
+/// Method name prefixes that identify a network-bound RPC (see
+/// [`is_network_tier_method`]).
+const NETWORK_TIER_PREFIXES: &[&str] = &["github.", "linear.", "sentry."];
+/// Exact method names (outside the prefix list) that identify a network-bound
+/// RPC (see [`is_network_tier_method`]).
+const NETWORK_TIER_METHODS: &[&str] = &["pr.refresh", "pr.state"];
+
+/// Whether `method` fans out to a network-bound upstream and should use the
+/// network-tier duration budget ([`DEFAULT_NETWORK_DURATION_WARN_MS`] /
+/// [`NETWORK_DURATION_THRESHOLD_ENV`]) instead of the default one.
+fn is_network_tier_method(method: &str) -> bool {
+    NETWORK_TIER_PREFIXES
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+        || NETWORK_TIER_METHODS.contains(&method)
+}
 
 /// Target sqlx logs each executed statement under (`sqlx-core` `QueryLogger`).
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
@@ -60,19 +93,25 @@ pub fn profile_filter() -> Targets {
 pub struct RpcProfileLayer {
     statement_threshold: u64,
     duration_threshold: Duration,
+    network_duration_threshold: Duration,
 }
 
 impl RpcProfileLayer {
-    pub fn new(statement_threshold: u64, duration_threshold: Duration) -> Self {
+    pub fn new(
+        statement_threshold: u64,
+        duration_threshold: Duration,
+        network_duration_threshold: Duration,
+    ) -> Self {
         Self {
             statement_threshold,
             duration_threshold,
+            network_duration_threshold,
         }
     }
 
     /// Build with defaults, honoring the [`STATEMENT_THRESHOLD_ENV`] /
-    /// [`DURATION_THRESHOLD_ENV`] overrides (unparseable values fall back to
-    /// the defaults).
+    /// [`DURATION_THRESHOLD_ENV`] / [`NETWORK_DURATION_THRESHOLD_ENV`]
+    /// overrides (unparseable values fall back to the defaults).
     pub fn from_env() -> Self {
         Self::from_env_with(|var| std::env::var(var).ok())
     }
@@ -89,7 +128,21 @@ impl RpcProfileLayer {
         Self::new(
             parse(STATEMENT_THRESHOLD_ENV, DEFAULT_STATEMENT_WARN_THRESHOLD),
             Duration::from_millis(parse(DURATION_THRESHOLD_ENV, DEFAULT_DURATION_WARN_MS)),
+            Duration::from_millis(parse(
+                NETWORK_DURATION_THRESHOLD_ENV,
+                DEFAULT_NETWORK_DURATION_WARN_MS,
+            )),
         )
+    }
+
+    /// The duration budget that applies to `method`: the network tier for
+    /// [`is_network_tier_method`] matches, the default tier otherwise.
+    fn duration_threshold_for(&self, method: &str) -> Duration {
+        if is_network_tier_method(method) {
+            self.network_duration_threshold
+        } else {
+            self.duration_threshold
+        }
     }
 }
 
@@ -172,12 +225,13 @@ where
                 "rpc dispatch exceeded SQL statement budget"
             );
         }
-        if elapsed > self.duration_threshold {
+        let duration_threshold = self.duration_threshold_for(&profile.method);
+        if elapsed > duration_threshold {
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
                 statements = profile.statements,
-                threshold_ms = self.duration_threshold.as_millis().min(u128::from(u64::MAX)) as u64,
+                threshold_ms = duration_threshold.as_millis().min(u128::from(u64::MAX)) as u64,
                 elapsed_ms,
                 "rpc dispatch exceeded duration budget"
             );
@@ -254,7 +308,7 @@ mod tests {
 
     #[test]
     fn over_threshold_emits_exactly_one_statement_warn() {
-        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600));
+        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600), Duration::from_secs(3600));
         let warns = run_dispatch(layer, "workspace.list", || {
             sqlx_event();
             sqlx_event();
@@ -267,7 +321,7 @@ mod tests {
 
     #[test]
     fn at_threshold_emits_no_warn() {
-        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600));
+        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600), Duration::from_secs(3600));
         let warns = run_dispatch(layer, "workspace.list", || {
             sqlx_event();
             sqlx_event();
@@ -277,7 +331,8 @@ mod tests {
 
     #[test]
     fn slow_dispatch_emits_duration_warn() {
-        let layer = RpcProfileLayer::new(u64::MAX, Duration::from_millis(0));
+        let layer =
+            RpcProfileLayer::new(u64::MAX, Duration::from_millis(0), Duration::from_millis(0));
         let warns = run_dispatch(layer, "git.diffs", || {
             std::thread::sleep(Duration::from_millis(2));
         });
@@ -290,7 +345,11 @@ mod tests {
     fn statements_outside_dispatch_span_are_not_counted() {
         let capture = Capture::default();
         let subscriber = tracing_subscriber::registry()
-            .with(RpcProfileLayer::new(0, Duration::from_secs(3600)))
+            .with(RpcProfileLayer::new(
+                0,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            ))
             .with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
             sqlx_event();
@@ -303,14 +362,63 @@ mod tests {
     }
 
     #[test]
+    fn network_tier_method_under_network_threshold_emits_no_warn() {
+        // Below the network-tier threshold but above the default one: only
+        // the network budget should apply to a network-tier method.
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            Duration::from_millis(0),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "github.listIssues", || {
+            std::thread::sleep(Duration::from_millis(2));
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn network_tier_method_over_network_threshold_warns_with_network_threshold() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_millis(0),
+        );
+        let warns = run_dispatch(layer, "pr.refresh", || {
+            std::thread::sleep(Duration::from_millis(2));
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=pr.refresh"), "{warns:?}");
+        assert!(warns[0].contains("threshold_ms=0"), "{warns:?}");
+    }
+
+    #[test]
+    fn non_network_method_over_default_threshold_still_warns() {
+        // A high network-tier budget must not affect a non-network method:
+        // it should still warn against the default threshold.
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            Duration::from_millis(0),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "workspace.list", || {
+            std::thread::sleep(Duration::from_millis(2));
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=workspace.list"), "{warns:?}");
+        assert!(warns[0].contains("threshold_ms=0"), "{warns:?}");
+    }
+
+    #[test]
     fn from_env_overrides_defaults() {
         let layer = RpcProfileLayer::from_env_with(|var| match var {
             STATEMENT_THRESHOLD_ENV => Some("3".to_string()),
             DURATION_THRESHOLD_ENV => Some("50".to_string()),
+            NETWORK_DURATION_THRESHOLD_ENV => Some("500".to_string()),
             _ => None,
         });
         assert_eq!(layer.statement_threshold, 3);
         assert_eq!(layer.duration_threshold, Duration::from_millis(50));
+        assert_eq!(layer.network_duration_threshold, Duration::from_millis(500));
 
         let defaults = RpcProfileLayer::from_env_with(|_| None);
         assert_eq!(
@@ -320,6 +428,10 @@ mod tests {
         assert_eq!(
             defaults.duration_threshold,
             Duration::from_millis(DEFAULT_DURATION_WARN_MS)
+        );
+        assert_eq!(
+            defaults.network_duration_threshold,
+            Duration::from_millis(DEFAULT_NETWORK_DURATION_WARN_MS)
         );
 
         let unparseable = RpcProfileLayer::from_env_with(|_| Some("nonsense".to_string()));
@@ -331,5 +443,21 @@ mod tests {
             unparseable.duration_threshold,
             Duration::from_millis(DEFAULT_DURATION_WARN_MS)
         );
+        assert_eq!(
+            unparseable.network_duration_threshold,
+            Duration::from_millis(DEFAULT_NETWORK_DURATION_WARN_MS)
+        );
+    }
+
+    #[test]
+    fn is_network_tier_method_matches_prefixes_and_exact_methods() {
+        assert!(is_network_tier_method("github.listIssues"));
+        assert!(is_network_tier_method("linear.listIssues"));
+        assert!(is_network_tier_method("sentry.listIssues"));
+        assert!(is_network_tier_method("pr.refresh"));
+        assert!(is_network_tier_method("pr.state"));
+        assert!(!is_network_tier_method("workspace.list"));
+        assert!(!is_network_tier_method("pr.list"));
+        assert!(!is_network_tier_method("github"));
     }
 }

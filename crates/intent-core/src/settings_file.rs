@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
     DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
     DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
@@ -48,7 +49,7 @@ use crate::error::{Error, Result};
 pub struct SettingsFile {
     pub providers: ProvidersSettings,
     pub model: ModelSettings,
-    pub background_agents: BackgroundAgentsSettings,
+    pub quick_actions: QuickActionsSettings,
     pub specialists: SpecialistsSettings,
     pub workspace: WorkspaceSettings,
     pub git: GitSettings,
@@ -101,15 +102,20 @@ pub struct ModelSettings {
     pub default_reasoning_effort: Option<String>,
 }
 
-/// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
+/// `[quickActions]` — model config for single-shot quick actions
+/// (`quickActions.*`): commit messages, PR descriptions, quick tasks. These
+/// keys never apply to interactive or delegated agent sessions
+/// (monorepo#1729); the group was named `backgroundAgents` before that
+/// rename (see [`LEGACY_SETTINGS_PATHS`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct BackgroundAgentsSettings {
-    /// `backgroundAgents.defaultModel` — model for background agents.
+pub struct QuickActionsSettings {
+    /// `quickActions.defaultModel` — model for quick actions.
     pub default_model: Option<String>,
-    /// `backgroundAgents.typeOverrides` — per-agent-type model overrides.
+    /// `quickActions.typeOverrides` — per-quick-action model overrides
+    /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
-    /// `backgroundAgents.providerSettings` — per-provider background settings
+    /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
 }
@@ -222,6 +228,9 @@ pub struct ServerSettings {
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
     pub origin_allow_list: Option<Vec<String>>,
+    /// `server.maxOutstandingRpcs` — daemon-wide cap on outstanding slow-path
+    /// RPCs across every connection; `0` means unlimited.
+    pub max_outstanding_rpcs: u32,
     /// `[server.wsApi]` — WSS API listener runtime toggle.
     pub ws_api: WsApiSettings,
     /// `[server.tls]` — TLS for the TCP listener.
@@ -237,6 +246,7 @@ impl Default for ServerSettings {
             bind_address: "0.0.0.0".to_string(),
             port: 5181,
             origin_allow_list: None,
+            max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
             ws_api: WsApiSettings::default(),
             tls: TlsSettings::default(),
             auth: AuthSettings::default(),
@@ -775,12 +785,16 @@ where
 /// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
 /// discarded (no catalog entry remains) and stripped from the file.
 /// `workspace.autoFetch` is likewise retired outright (the periodic-fetch
-/// feature was removed) — discarded and stripped.
+/// feature was removed) — discarded and stripped. `backgroundAgents` covers
+/// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
+/// values are migrated into the `quickActions.*` keys at boot and the table is
+/// then stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
     "server.listenMode",
     "workspace.autoFetch",
+    "backgroundAgents",
 ];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
@@ -877,6 +891,17 @@ impl SettingsFile {
                 format!(
                     "must be between 1024 and 65535, got {}",
                     self.server.ws_api.port
+                ),
+            ));
+        }
+        // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
+        // cap the `settings.update` RPC would have rejected (`0` = unlimited).
+        if self.server.max_outstanding_rpcs > 100_000 {
+            return Err(bad(
+                "server.maxOutstandingRpcs",
+                format!(
+                    "must be 0 (unlimited) or between 1 and 100000, got {}",
+                    self.server.max_outstanding_rpcs
                 ),
             ));
         }
@@ -993,12 +1018,13 @@ providerDefaults = {}
 # value is provider-defined and stored as-is, and a blank value means unset.
 # defaultReasoningEffort = "high"
 
-[backgroundAgents]
-# Background default model -- model for background agents.
+[quickActions]
+# Quick action default model -- model for single-shot quick actions (commit
+# messages, PR descriptions, quick tasks); never applied to agent sessions.
 # defaultModel = "claude-sonnet-4-5"
-# Background type overrides -- per-agent-type model overrides.
+# Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
-# Background provider settings -- per-provider background settings.
+# Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 
 [specialists]
@@ -1052,6 +1078,10 @@ bindAddress = "0.0.0.0"
 port = 5181
 # Origin allow-list -- permitted WS origins.
 # originAllowList = ["https://example.com"]
+# Max outstanding RPCs -- daemon-wide cap on outstanding slow-path RPCs across
+# every connection; over-limit requests are rejected with -32011 "Server
+# overloaded" (0 = unlimited; changes apply on daemon restart).
+maxOutstandingRpcs = 256
 
 [server.wsApi]
 # WS API enabled -- enable the TCP/WSS listener at runtime.
@@ -1238,7 +1268,7 @@ mod tests {
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
         assert_eq!(d.model.default_reasoning_effort, None);
-        assert!(d.background_agents.provider_settings.is_empty());
+        assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert!(d.mcp.enable_user_servers);
@@ -1474,7 +1504,7 @@ mod tests {
     #[test]
     fn provider_maps_and_lists_parse() {
         let parsed = SettingsFile::parse_str(
-            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[backgroundAgents.providerSettings.claude-code]\nmode = \"fast\"\n",
+            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[quickActions.providerSettings.claude-code]\nmode = \"fast\"\n",
         )
         .unwrap();
         assert_eq!(parsed.providers.active.as_deref(), Some("claude-code"));
@@ -1491,7 +1521,7 @@ mod tests {
             Some(vec!["https://app.example.com".to_string()])
         );
         assert!(parsed
-            .background_agents
+            .quick_actions
             .provider_settings
             .contains_key("claude-code"));
     }
@@ -1755,6 +1785,50 @@ mod tests {
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert_eq!(templated.pr_monitor, parsed.pr_monitor);
         assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn max_outstanding_rpcs_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.server.max_outstanding_rpcs,
+            DEFAULT_SERVER_MAX_OUTSTANDING_RPCS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("maxOutstandingRpcs"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.server.max_outstanding_rpcs,
+            DEFAULT_SERVER_MAX_OUTSTANDING_RPCS
+        );
+    }
+
+    #[test]
+    fn max_outstanding_rpcs_explicit_override_parses() {
+        let parsed =
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 4\n").expect("override parses");
+        assert_eq!(parsed.server.max_outstanding_rpcs, 4);
+        // `0` is the documented "unlimited" value, not a range error.
+        let unlimited =
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 0\n").expect("zero parses");
+        assert_eq!(unlimited.server.max_outstanding_rpcs, 0);
+    }
+
+    /// The file path enforces the same `0..=100000` bound the catalog does, so
+    /// a hand-edited config.toml cannot boot a cap `settings.update` rejects
+    /// (a huge value would also blow past `Semaphore::MAX_PERMITS` on 32-bit).
+    #[test]
+    fn max_outstanding_rpcs_out_of_range_is_rejected() {
+        let err = SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 500000\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server.maxOutstandingRpcs") && msg.contains("500000"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
     }
 
     #[test]

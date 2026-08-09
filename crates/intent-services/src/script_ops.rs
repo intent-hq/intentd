@@ -2558,7 +2558,10 @@ mod tests {
     #[tokio::test]
     async fn script_run_with_timeout_marks_timed_out() {
         let h = harness().await;
-        let id = create_simple(&h, "long", "sleep 10", ScriptMode::Command).await;
+        // Command lifetime must outlast any load-induced timer lag so the 1s
+        // run timeout always fires first (monorepo#1630); the timeout kill
+        // reaps the PTY.
+        let id = create_simple(&h, "long", "sleep 3600", ScriptMode::Command).await;
         let out = h
             .services
             .script_run(h.ws.clone(), id, None, Some(1))
@@ -3090,9 +3093,12 @@ mod tests {
             ScriptMode::Command,
         )
         .await;
+        // Positive run: the timeout is a pure-liveness bound (monorepo#1630)
+        // — the run returns as soon as the echo loop exits, so the long bound
+        // only has to outlast a login-shell spawn stall under parallel load.
         let out = h
             .services
-            .script_run(h.ws.clone(), id, Some(2), Some(10))
+            .script_run(h.ws.clone(), id, Some(2), Some(LIVENESS.as_secs() as i64))
             .await
             .expect("run");
         let text = out["output"].as_str().unwrap_or("");
@@ -3104,8 +3110,14 @@ mod tests {
     async fn script_output_paginated_returns_items_envelope() {
         let h = harness().await;
         let id = create_simple(&h, "echo", "echo hello-pag", ScriptMode::Command).await;
+        // Pure-liveness run timeout (monorepo#1630): returns on exit.
         h.services
-            .script_run(h.ws.clone(), id.clone(), None, Some(10))
+            .script_run(
+                h.ws.clone(),
+                id.clone(),
+                None,
+                Some(LIVENESS.as_secs() as i64),
+            )
             .await
             .expect("run");
         let out = h
@@ -3126,8 +3138,14 @@ mod tests {
             ScriptMode::Command,
         )
         .await;
+        // Pure-liveness run timeout (monorepo#1630): returns on exit.
         h.services
-            .script_run(h.ws.clone(), id.clone(), None, Some(10))
+            .script_run(
+                h.ws.clone(),
+                id.clone(),
+                None,
+                Some(LIVENESS.as_secs() as i64),
+            )
             .await
             .expect("run");
         let out = h

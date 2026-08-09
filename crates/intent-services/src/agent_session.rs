@@ -1983,12 +1983,17 @@ impl Services {
                 // alerts snapshot-consistently — a follow-up `agent.list`
                 // read can race the child's completion consuming the watch.
                 data["isWaitingForOtherAgents"] =
-                    Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+                    Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
                 // Idle-visibility: an idle agent still owning active
                 // (scheduled/running) background hooks is waiting, not
                 // stalled — stamp `waitingOnHooks` (omitted when none) so
                 // subscribers and the completion-watch wake can surface it.
                 self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+                // Idle-visibility (unified external-wait, mirrors the hook
+                // stamp above): same `waitingOnPrMonitors` stamp for active
+                // PR monitors (omitted when none).
+                self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
+                    .await;
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -2358,10 +2363,15 @@ impl Services {
         // Same emit-time waiting flag as the prompt-turn idle (see
         // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
         data["isWaitingForOtherAgents"] =
-            Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+            Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
         // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
         // idle (omitted when the agent owns no active hook).
         self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+        // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
+        // stamp as the prompt-turn idle (omitted when the agent owns no
+        // active monitor).
+        self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
+            .await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
@@ -2514,6 +2524,7 @@ impl Services {
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
             runs: run_completed as u64,
             longest_run_ms: if run_completed {
                 turn_duration.as_millis() as u64

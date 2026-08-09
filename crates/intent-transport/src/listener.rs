@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::control::SystemControl;
 use crate::reverse::PrimaryReverseRegistry;
+use crate::rpc_limit::RpcLimiter;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -83,9 +84,10 @@ pub fn pipe_name_for_socket_path(socket_path: &Path) -> std::io::Result<String> 
 /// exposes the `system.status`/`system.shutdown` control surface (§5.7) to
 /// local clients (`intentd status`/`stop`).
 ///
-/// This wrapper installs a fresh (empty) [`PrimaryReverseRegistry`] so tests
-/// and other lightweight callers stay one-liner. Composition roots that share
-/// a registry across the UDS + WSS listeners (REV-1) call
+/// This wrapper installs a fresh (empty) [`PrimaryReverseRegistry`] and an
+/// unlimited [`RpcLimiter`] so tests and other lightweight callers stay
+/// one-liner. Composition roots that share a registry across the UDS + WSS
+/// listeners (REV-1) — and the daemon-wide outstanding-RPC cap — call
 /// [`serve_uds_with_reverse`] instead.
 pub async fn serve_uds<F>(
     api: Arc<dyn WorkspaceApi>,
@@ -104,6 +106,7 @@ where
         control,
         None,
         Arc::new(PrimaryReverseRegistry::new()),
+        RpcLimiter::unlimited(),
         shutdown,
     )
     .await
@@ -117,7 +120,10 @@ where
 /// `Services::with_reverse_dispatch` so agent-initiated `browser.exec` calls
 /// see the same live set of clients. `server_pairing_info`, when present,
 /// exposes `server.pairingInfo`/`server.rotateToken` (§5.2) to local clients.
+/// `limiter` is the daemon-wide outstanding-slow-path-RPC cap
+/// (`server.maxOutstandingRpcs`) shared with the WSS listener.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -125,6 +131,7 @@ pub async fn serve_uds_with_reverse<F>(
     control: Option<Arc<dyn SystemControl>>,
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
+    limiter: RpcLimiter,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -153,9 +160,10 @@ where
                         let control = control.clone();
                         let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
+                        let limiter = limiter.clone();
                         tokio::spawn(async move {
                             let (read_half, write_half) = stream.into_split();
-                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry).await {
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter).await {
                                 tracing::debug!(error = %e, "uds connection ended");
                             }
                         });
@@ -177,6 +185,7 @@ where
 /// Generic over the split stream halves so the Unix socket and Windows named
 /// pipe share one frame loop byte-for-byte.
 #[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -185,6 +194,7 @@ async fn handle_connection<R, W>(
     control: Option<Arc<dyn SystemControl>>,
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
+    limiter: RpcLimiter,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -283,6 +293,7 @@ where
                 server_pairing_info.as_ref(),
                 &mut client_id,
                 true,
+                &limiter,
             )
             .await
         })
@@ -378,6 +389,7 @@ where
 /// duplex pipe) — so other non-admin users cannot connect, though this is not
 /// a strict 0600 equivalent.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     api: Arc<dyn WorkspaceApi>,
     bus: EventBus,
@@ -385,6 +397,7 @@ pub async fn serve_uds_with_reverse<F>(
     control: Option<Arc<dyn SystemControl>>,
     server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     reverse_registry: Arc<PrimaryReverseRegistry>,
+    limiter: RpcLimiter,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -411,9 +424,10 @@ where
                         let control = control.clone();
                         let server_pairing_info = server_pairing_info.clone();
                         let reverse_registry = reverse_registry.clone();
+                        let limiter = limiter.clone();
                         tokio::spawn(async move {
                             let (read_half, write_half) = tokio::io::split(stream);
-                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry).await {
+                            if let Err(e) = handle_connection(read_half, write_half, api, bus, control, server_pairing_info, reverse_registry, limiter).await {
                                 tracing::debug!(error = %e, "named-pipe connection ended");
                             }
                         });
@@ -434,6 +448,7 @@ where
 /// crate must expose it on every platform. Any attempt to serve reports an
 /// `Unsupported` error at runtime.
 #[cfg(not(any(unix, windows)))]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_uds_with_reverse<F>(
     _api: Arc<dyn WorkspaceApi>,
     _bus: EventBus,
@@ -441,6 +456,7 @@ pub async fn serve_uds_with_reverse<F>(
     _control: Option<Arc<dyn SystemControl>>,
     _server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
     _reverse_registry: Arc<PrimaryReverseRegistry>,
+    _limiter: RpcLimiter,
     _shutdown: F,
 ) -> std::io::Result<()>
 where

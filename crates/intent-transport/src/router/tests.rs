@@ -3245,6 +3245,15 @@ async fn agent_methods_are_routed_not_method_not_found() {
     .unwrap();
     assert_eq!(err_code(&v), -32603);
 
+    // agent.completeOnce also takes the optional quick-action `type` hint
+    // (monorepo#1734) — free-form, so it must route like any other param.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":10,"method":"agent.completeOnce","params":{"prompt":"pick a slug","type":"commit"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
     // agent.pendingPermissions takes an optional agentId and must route.
     let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.pendingPermissions","params":{}}"#)
         .await

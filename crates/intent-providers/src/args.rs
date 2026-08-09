@@ -222,7 +222,8 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   to raise the V8 heap cap (STAB-50); appends to an inherited
 ///   `NODE_OPTIONS` and skips entirely when the caller already set
 ///   `--max-old-space-size`. [`ProviderRuntime::Native`] binaries are left
-///   untouched.
+///   untouched — unless the spawn goes through npx, which always runs a Node
+///   child ([`build_provider_env_for_spawn`]).
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
 /// - `opencode` / `unsloth`: `OPENCODE_CONFIG_CONTENT` with `model` (when
 ///   set), `instructions` (when a rules file path is provided), and `mcp`
@@ -260,9 +261,44 @@ pub fn build_provider_env_with_unsloth(
     mcp_config_json: Option<&str>,
     unsloth_endpoint: Option<&UnslothEndpoint>,
 ) -> BTreeMap<String, String> {
+    build_provider_env_for_spawn(
+        config,
+        model,
+        rules_file,
+        mcp_config_json,
+        unsloth_endpoint,
+        false,
+    )
+}
+
+/// [`build_provider_env_with_unsloth`] plus the spawn-time npx signal.
+///
+/// `via_npx` reports that the spawn goes through `npx -y <package>` (the
+/// provider binary did not resolve and a `fallback_npx_package` is set, or
+/// the provider is npx-only). npx is Node's package runner, so the child is
+/// a Node process regardless of the provider's declared [`ProviderRuntime`]
+/// — the effective runtime is [`ProviderRuntime::Node`] and the STAB-50 heap
+/// cap applies. Codex is the concrete case today: declared `Native` for the
+/// Rust `codex-acp` binary, but its `@agentclientprotocol/codex-acp` npx
+/// fallback is pure Node (intent-hq/monorepo#1661).
+pub fn build_provider_env_for_spawn(
+    config: &ProviderConfig,
+    model: Option<&str>,
+    rules_file: Option<&str>,
+    mcp_config_json: Option<&str>,
+    unsloth_endpoint: Option<&UnslothEndpoint>,
+    via_npx: bool,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
+    // Effective runtime: an npx spawn always runs a Node child, whatever the
+    // provider's static declaration says.
+    let effective_runtime = if via_npx {
+        ProviderRuntime::Node
+    } else {
+        config.runtime
+    };
     if matches!(
-        config.runtime,
+        effective_runtime,
         ProviderRuntime::Node | ProviderRuntime::Electron
     ) {
         let parent = std::env::var("NODE_OPTIONS").ok();
