@@ -27,7 +27,7 @@ use crate::host;
 use crate::panic_guard;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
-use crate::rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
+use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
@@ -208,8 +208,11 @@ pub(crate) async fn process_frame(
             // it inline would deadlock frame reads until the reverse timeout.
             // Response is delivered through the cloned outbound sender; if the
             // connection has since closed the send is dropped silently.
-            let Ok(permit) = limiter.try_acquire() else {
-                return reject_overloaded(&method, rpc_id, out_tx).await;
+            let permit = match limiter.try_acquire() {
+                Ok(permit) => permit,
+                Err(overloaded) => {
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                }
             };
             let api = Arc::clone(api);
             let bus = bus.clone();
@@ -241,8 +244,11 @@ pub(crate) async fn process_frame(
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
             // the reverse timeout.
-            let Ok(permit) = limiter.try_acquire() else {
-                return reject_overloaded(&method, rpc_id, out_tx).await;
+            let permit = match limiter.try_acquire() {
+                Ok(permit) => permit,
+                Err(overloaded) => {
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                }
             };
             let out = out_tx.clone();
             let reverse = reverse.clone();
@@ -349,8 +355,9 @@ pub(crate) async fn process_frame(
             None => true,
         };
     }
-    let Ok(permit) = limiter.try_acquire() else {
-        return reject_overloaded(&method, rpc_id, out_tx).await;
+    let permit = match limiter.try_acquire() {
+        Ok(permit) => permit,
+        Err(overloaded) => return reject_overloaded(&method, rpc_id, out_tx, overloaded).await,
     };
     let api = api.clone();
     let out_tx = out_tx.clone();
@@ -396,15 +403,27 @@ fn is_dispatchable(parsed: Option<&Value>) -> bool {
 /// request echoes `-32011 "Server overloaded"` with its `id`, a notification
 /// (no `id`) is dropped without a response per PROTOCOL §9. Returns `false`
 /// only when the outbound channel is closed.
+///
+/// Sustained overload rejects a frame per read, so only the transition into
+/// saturation warns; the individual rejections log at `debug` to keep the log
+/// readable exactly when it matters most.
 async fn reject_overloaded(
     method: &str,
     rpc_id: Option<Value>,
     out_tx: &mpsc::Sender<String>,
+    overloaded: Overloaded,
 ) -> bool {
-    tracing::warn!(
-        method,
-        "rejecting RPC: outstanding slow-path RPC limit reached"
-    );
+    if overloaded.newly_saturated {
+        tracing::warn!(
+            method,
+            "outstanding slow-path RPC limit reached; rejecting requests with -32011"
+        );
+    } else {
+        tracing::debug!(
+            method,
+            "rejecting RPC: outstanding slow-path RPC limit reached"
+        );
+    }
     match rpc_id {
         Some(id) => out_tx
             .send(events::error_frame(
@@ -880,7 +899,15 @@ mod tests {
     #[tokio::test]
     async fn overload_rejection_echoes_the_request_id() {
         let (tx, mut rx) = mpsc::channel::<String>(4);
-        let open = reject_overloaded("agent.list", Some(json!("req-7")), &tx).await;
+        let open = reject_overloaded(
+            "agent.list",
+            Some(json!("req-7")),
+            &tx,
+            Overloaded {
+                newly_saturated: true,
+            },
+        )
+        .await;
         assert!(open, "the connection must stay open");
         let frame = rx.try_recv().expect("frame queued");
         let v: Value = serde_json::from_str(&frame).unwrap();
@@ -895,7 +922,15 @@ mod tests {
     #[tokio::test]
     async fn overload_rejection_drops_notifications_without_a_frame() {
         let (tx, mut rx) = mpsc::channel::<String>(4);
-        let open = reject_overloaded("agent.list", None, &tx).await;
+        let open = reject_overloaded(
+            "agent.list",
+            None,
+            &tx,
+            Overloaded {
+                newly_saturated: false,
+            },
+        )
+        .await;
         assert!(open, "the connection must stay open");
         assert!(rx.try_recv().is_err(), "notifications get no response");
     }
@@ -934,7 +969,27 @@ mod tests {
     async fn overload_rejection_reports_a_closed_channel() {
         let (tx, rx) = mpsc::channel::<String>(4);
         drop(rx);
-        assert!(!reject_overloaded("agent.list", Some(json!(1)), &tx).await);
-        assert!(!reject_overloaded("agent.list", None, &tx).await);
+        assert!(
+            !reject_overloaded(
+                "agent.list",
+                Some(json!(1)),
+                &tx,
+                Overloaded {
+                    newly_saturated: true,
+                },
+            )
+            .await
+        );
+        assert!(
+            !reject_overloaded(
+                "agent.list",
+                None,
+                &tx,
+                Overloaded {
+                    newly_saturated: false,
+                },
+            )
+            .await
+        );
     }
 }

@@ -894,6 +894,17 @@ impl SettingsFile {
                 ),
             ));
         }
+        // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
+        // cap the `settings.update` RPC would have rejected (`0` = unlimited).
+        if self.server.max_outstanding_rpcs > 100_000 {
+            return Err(bad(
+                "server.maxOutstandingRpcs",
+                format!(
+                    "must be 0 (unlimited) or between 1 and 100000, got {}",
+                    self.server.max_outstanding_rpcs
+                ),
+            ));
+        }
         if self.agents.max_concurrent > 200 {
             return Err(bad(
                 "agents.maxConcurrent",
@@ -1069,7 +1080,7 @@ port = 5181
 # originAllowList = ["https://example.com"]
 # Max outstanding RPCs -- daemon-wide cap on outstanding slow-path RPCs across
 # every connection; over-limit requests are rejected with -32011 "Server
-# overloaded" (0 = unlimited).
+# overloaded" (0 = unlimited; changes apply on daemon restart).
 maxOutstandingRpcs = 256
 
 [server.wsApi]
@@ -1800,6 +1811,24 @@ mod tests {
         let unlimited =
             SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 0\n").expect("zero parses");
         assert_eq!(unlimited.server.max_outstanding_rpcs, 0);
+    }
+
+    /// The file path enforces the same `0..=100000` bound the catalog does, so
+    /// a hand-edited config.toml cannot boot a cap `settings.update` rejects
+    /// (a huge value would also blow past `Semaphore::MAX_PERMITS` on 32-bit).
+    #[test]
+    fn max_outstanding_rpcs_out_of_range_is_rejected() {
+        let err = SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 500000\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server.maxOutstandingRpcs") && msg.contains("500000"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
     }
 
     #[test]

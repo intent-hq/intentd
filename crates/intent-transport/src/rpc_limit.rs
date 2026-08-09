@@ -11,7 +11,14 @@
 //! Over-limit requests are rejected immediately (never queued): a request with
 //! an `id` gets `-32011 "Server overloaded"` with the echoed id, a notification
 //! is dropped without a response (PROTOCOL §9).
+//!
+//! Fairness tradeoff: the pool is global with no per-connection reservation,
+//! so one flooding client can consume every slot and other connections —
+//! including the FE's own UDS traffic — then see `-32011` until it drains. That
+//! is the intended posture for a resource-exhaustion cap; a per-connection
+//! sub-cap or reserved local headroom is tracked separately.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -25,9 +32,17 @@ pub const OVERLOAD_ERROR_MESSAGE: &str = "Server overloaded";
 /// Shared permit source for the slow-path spawn sites. Cheap to clone (an
 /// `Arc` inside); [`RpcLimiter::unlimited`] disables the cap entirely by
 /// carrying no semaphore at all.
+///
+/// Note that `Default` is *unlimited*, not the shipped `256`: a listener whose
+/// composition root forgets to wire the limiter silently opts out of the cap
+/// with no compile error. Only the `intentd` composition root decides the cap;
+/// test wrappers such as `serve_uds` intentionally take the unlimited default.
 #[derive(Clone, Default)]
 pub struct RpcLimiter {
     semaphore: Option<Arc<Semaphore>>,
+    /// Whether the cap is currently saturated, so sustained overload logs one
+    /// WARN per transition into saturation instead of one per rejected frame.
+    saturated: Arc<AtomicBool>,
 }
 
 impl RpcLimiter {
@@ -39,13 +54,17 @@ impl RpcLimiter {
         }
         Self {
             semaphore: Some(Arc::new(Semaphore::new(max_outstanding as usize))),
+            saturated: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// A limiter that never rejects (the default posture for listeners whose
     /// composition root did not wire a cap).
     pub fn unlimited() -> Self {
-        Self { semaphore: None }
+        Self {
+            semaphore: None,
+            saturated: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Try to claim one slot. `Ok(None)` means the limiter is unlimited;
@@ -57,16 +76,21 @@ impl RpcLimiter {
             return Ok(None);
         };
         match semaphore.try_acquire_owned() {
-            Ok(permit) => Ok(Some(permit)),
+            Ok(permit) => {
+                self.saturated.store(false, Ordering::Relaxed);
+                Ok(Some(permit))
+            }
             // A closed semaphore can only happen if something explicitly
             // closes it (nothing does); treat it as overloaded rather than
             // silently disabling the cap.
-            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => Err(Overloaded),
+            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => Err(Overloaded {
+                newly_saturated: !self.saturated.swap(true, Ordering::Relaxed),
+            }),
         }
     }
 
     /// Slots currently free, or `None` when the limiter is unlimited.
-    pub fn available_permits(&self) -> Option<usize> {
+    pub(crate) fn available_permits(&self) -> Option<usize> {
         self.semaphore.as_ref().map(|s| s.available_permits())
     }
 }
@@ -80,7 +104,12 @@ impl std::fmt::Debug for RpcLimiter {
 }
 
 /// The cap is reached: the request must be rejected, never queued.
-pub(crate) struct Overloaded;
+#[derive(Debug)]
+pub(crate) struct Overloaded {
+    /// First rejection since the limiter last handed out a permit, i.e. the
+    /// transition into saturation — the one worth a WARN.
+    pub(crate) newly_saturated: bool,
+}
 
 #[cfg(test)]
 mod tests {
@@ -92,7 +121,7 @@ mod tests {
         assert_eq!(limiter.available_permits(), None);
         let mut permits = Vec::new();
         for _ in 0..1000 {
-            permits.push(limiter.try_acquire().ok().expect("never rejects"));
+            permits.push(limiter.try_acquire().expect("never rejects"));
         }
     }
 
@@ -100,8 +129,8 @@ mod tests {
     fn permits_are_capped_and_released_on_drop() {
         let limiter = RpcLimiter::new(2);
         assert_eq!(limiter.available_permits(), Some(2));
-        let first = limiter.try_acquire().ok().expect("slot 1").expect("permit");
-        let second = limiter.try_acquire().ok().expect("slot 2").expect("permit");
+        let first = limiter.try_acquire().expect("slot 1").expect("permit");
+        let second = limiter.try_acquire().expect("slot 2").expect("permit");
         assert_eq!(limiter.available_permits(), Some(0));
         assert!(limiter.try_acquire().is_err(), "third must be rejected");
         drop(first);
@@ -110,11 +139,27 @@ mod tests {
         drop(second);
     }
 
+    /// Only the transition into saturation is flagged, so sustained overload
+    /// logs once instead of once per rejected frame; draining re-arms it.
+    #[test]
+    fn only_the_transition_into_saturation_is_flagged() {
+        let limiter = RpcLimiter::new(1);
+        let held = limiter.try_acquire().expect("slot").expect("permit");
+        let first = limiter.try_acquire().expect_err("rejected");
+        assert!(first.newly_saturated, "first rejection is the transition");
+        let second = limiter.try_acquire().expect_err("rejected");
+        assert!(!second.newly_saturated, "sustained overload stays quiet");
+        drop(held);
+        let _regained = limiter.try_acquire().expect("slot").expect("permit");
+        let after = limiter.try_acquire().expect_err("rejected");
+        assert!(after.newly_saturated, "re-saturation is flagged again");
+    }
+
     #[test]
     fn clones_share_one_pool() {
         let limiter = RpcLimiter::new(1);
         let clone = limiter.clone();
-        let held = limiter.try_acquire().ok().expect("slot").expect("permit");
+        let held = limiter.try_acquire().expect("slot").expect("permit");
         assert!(clone.try_acquire().is_err(), "clone shares the pool");
         drop(held);
         assert!(clone.try_acquire().is_ok());
@@ -125,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn permit_is_released_when_the_spawned_task_completes() {
         let limiter = RpcLimiter::new(1);
-        let permit = limiter.try_acquire().ok().expect("slot").expect("permit");
+        let permit = limiter.try_acquire().expect("slot").expect("permit");
         let task = tokio::spawn(async move {
             let _permit = permit;
         });
@@ -139,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn permit_is_released_when_the_spawned_task_panics() {
         let limiter = RpcLimiter::new(1);
-        let permit = limiter.try_acquire().ok().expect("slot").expect("permit");
+        let permit = limiter.try_acquire().expect("slot").expect("permit");
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let task = tokio::spawn(async move {
