@@ -229,6 +229,22 @@ pub fn submodule_containing<'a>(
     None
 }
 
+/// Whether `rel_path` names one of `submodules` exactly (the gitlink path
+/// itself, rather than something inside it). Spelling-insensitive in the same
+/// way as [`submodule_containing`]: `sub/`, `sub/.` and `./sub` all name the
+/// gitlink `sub`, and `ignore_case` folds case where the filesystem does.
+pub fn is_submodule_path(
+    submodules: &std::collections::BTreeSet<String>,
+    rel_path: &str,
+    ignore_case: bool,
+) -> bool {
+    let target = Path::new(rel_path);
+    submodules.iter().any(|sm| {
+        strip_prefix_components(target, Path::new(sm), ignore_case)
+            .is_some_and(|rest| rest.as_os_str().is_empty())
+    })
+}
+
 /// Refuse any of `paths` that lies strictly inside a registered submodule,
 /// with a message naming the offending path and its containing submodule
 /// (parity with real `git add`'s "is in submodule" pathspec error). Callers
@@ -430,6 +446,24 @@ mod tests {
         assert_eq!(submodule_containing(&sms, "./subdir/a.txt", true), None);
         assert_eq!(submodule_containing(&sms, "./SUB/a.txt", true), Some("sub"));
         assert_eq!(submodule_containing(&sms, "./SUB/a.txt", false), None);
+    }
+
+    /// The gitlink path itself is recognized under every spelling that names
+    /// it — trailing separator, trailing `.`, leading `./` — so a caller can
+    /// gate the "allowed no-op" on the same set the guard lets through.
+    #[test]
+    fn is_submodule_path_matches_every_gitlink_spelling() {
+        let sms = submodules(&["sub"]);
+        for spelling in ["sub", "sub/", "sub/.", "./sub", "./sub/", "sub/./"] {
+            assert!(
+                is_submodule_path(&sms, spelling, false),
+                "must recognize {spelling}"
+            );
+        }
+        assert!(!is_submodule_path(&sms, "sub/a.txt", false));
+        assert!(!is_submodule_path(&sms, "subdir", false));
+        assert!(is_submodule_path(&sms, "SUB/", true));
+        assert!(!is_submodule_path(&sms, "SUB/", false));
     }
 
     /// Relative paths pass through; an absolute in-worktree path is stripped
