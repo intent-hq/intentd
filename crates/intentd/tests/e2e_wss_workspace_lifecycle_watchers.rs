@@ -202,20 +202,28 @@ where
     }
 }
 
-/// Wait up to `secs` for the next `events.event` notification whose payload
+/// Wait up to `window` for the next `events.event` notification whose payload
 /// `type` matches one of `types`; ignore other frames. Returns the event
-/// object (the `params.event` sub-object).
-async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -> Value
+/// object (the `params.event` sub-object), or `None` if the window elapses
+/// without a match.
+async fn try_next_event<S>(
+    ws: &mut WebSocketStream<S>,
+    types: &[&str],
+    window: Duration,
+) -> Option<Value>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + window;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
-        let next = timeout(remaining, ws.next())
-            .await
-            .expect("timeout elapsed");
+        if remaining.is_zero() {
+            return None;
+        }
+        let next = match timeout(remaining, ws.next()).await {
+            Ok(next) => next,
+            Err(_) => return None,
+        };
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = match serde_json::from_str(&text) {
@@ -226,7 +234,7 @@ where
                     let evt = &v["params"]["event"];
                     let ty = evt["type"].as_str().unwrap_or("");
                     if types.contains(&ty) {
-                        return evt.clone();
+                        return Some(evt.clone());
                     }
                 }
             }
@@ -339,23 +347,57 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Let the lifecycle event route through the registry and the OS watch
-    // establish before mutating (FSEvents/inotify warm-up).
-    tokio::time::sleep(Duration::from_millis(750)).await;
-
     // Mutate: create a project-tier specialist file. The watch was placed by
     // runtime registration, so this must emit without any daemon restart.
-    std::fs::write(
-        specialists_dir.join("custom.md"),
-        specialist_md("Custom", "project-tier body"),
-    )
-    .expect("write specialist");
-
-    let evt = next_event(&mut sub, &["specialists:changed"], 20).await;
+    //
+    // Retry-until-observed (intent-hq/monorepo#1622): registration is async
+    // (#611) and the OS watch (FSEvents/inotify) can take arbitrarily long to
+    // establish under load, so a fixed warm-up sleep races it — a write that
+    // lands before the watch is live never emits. Instead, write the file and
+    // wait a short window for `specialists:changed`; on a miss, rewrite with
+    // changed content (once the watch is live the next mutation emits) and
+    // retry within one scaled overall budget.
+    let overall = common::test_timeout(Duration::from_secs(30));
+    let deadline = tokio::time::Instant::now() + overall;
+    let attempt_window = common::test_timeout(Duration::from_secs(2));
+    let mut attempt = 0u32;
+    let evt = loop {
+        attempt += 1;
+        std::fs::write(
+            specialists_dir.join("custom.md"),
+            specialist_md("Custom", &format!("project-tier body rev {attempt}")),
+        )
+        .expect("write specialist");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no specialists:changed after {attempt} write attempts within {overall:?}"
+        );
+        if let Some(evt) = try_next_event(
+            &mut sub,
+            &["specialists:changed"],
+            attempt_window.min(remaining),
+        )
+        .await
+        {
+            break evt;
+        }
+    };
     assert_eq!(evt["type"], json!("specialists:changed"));
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(evt["actor"], json!({ "type": "system" }));
     assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
+
+    // Retry writes may have queued further debounced emissions; drain until
+    // the socket stays quiet so leftovers cannot pollute the post-delete
+    // silence assertion (window comfortably beyond the 500ms debounce and
+    // scaled like the other waits, so a load-delayed debounce cannot slip
+    // past the drain).
+    let drain_window_ms = common::test_timeout(Duration::from_millis(1000)).as_millis() as u64;
+    while drain_extra(&mut sub, "specialists:changed", drain_window_ms)
+        .await
+        .is_some()
+    {}
 
     // Delete the workspace: `workspace:deleted` deregisters the watch. The
     // caller-supplied checkout survives (skipWorktree), so writes into the
@@ -368,7 +410,9 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     )
     .await;
     assert_eq!(delete["result"]["success"], json!(true), "delete: {delete}");
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    // Settle window for watch deregistration, scaled so heavy load cannot
+    // race the deregistration itself (intent-hq/monorepo#1622).
+    tokio::time::sleep(common::test_timeout(Duration::from_millis(750))).await;
 
     std::fs::write(
         specialists_dir.join("after-delete.md"),
