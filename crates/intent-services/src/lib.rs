@@ -19263,6 +19263,37 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_branches_list_cached(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let workspaces_root = self.workspaces_root.clone();
+        Box::pin(async move {
+            let cache_root = workspaces_root
+                .unwrap_or_else(default_workspaces_root)
+                .join(".repo-cache");
+            match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
+                Some(cached) => {
+                    let mut result = serde_json::json!({
+                        "cached": true,
+                        "branches": cached.branches,
+                    });
+                    // `defaultBranch` is optional on the wire: omitted (not
+                    // null) when `origin/HEAD` is unresolvable.
+                    if let Some(default) = cached.default_branch {
+                        result["defaultBranch"] = serde_json::Value::String(default);
+                    }
+                    Ok(result)
+                }
+                None => Ok(serde_json::json!({
+                    "cached": false,
+                    "branches": [],
+                })),
+            }
+        })
+    }
+
     fn github_repo_config_get(
         &self,
         owner: String,

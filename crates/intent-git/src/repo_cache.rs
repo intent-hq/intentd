@@ -304,6 +304,72 @@ where
         .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
+/// Branches read from a cached clone by [`list_cached_branches`] — no
+/// network I/O involved.
+#[derive(Debug)]
+pub struct CachedBranches {
+    /// Remote-tracking branch names (`refs/remotes/origin/*` with the `HEAD`
+    /// symref excluded), sorted.
+    pub branches: Vec<String>,
+    /// The remote's default branch per the `origin/HEAD` symref recorded at
+    /// clone time, when resolvable.
+    pub default_branch: Option<String>,
+}
+
+/// List branches from the cached clone at `<cache_root>/<owner>/<repo>`
+/// without touching the network. A cache miss (missing dir or an unopenable
+/// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
+/// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
+/// re-clone is never observed mid-mutation.
+pub async fn list_cached_branches(
+    cache_root: &Path,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<CachedBranches>> {
+    validate_segment("owner", owner)?;
+    validate_segment("repo", repo)?;
+    let cache_path = cache_root.join(owner).join(repo);
+
+    let lock = lock_for(&cache_path);
+    let _guard = lock.lock().await;
+
+    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path))
+        .await
+        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+}
+
+/// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
+/// the cached clone. An unopenable repo counts as a cache miss (the write
+/// path self-heals it on the next ensure).
+fn list_cached_branches_blocking(cache_path: &Path) -> Result<Option<CachedBranches>> {
+    let Ok(repo) = Repository::open(cache_path) else {
+        return Ok(None);
+    };
+    let mut branches = Vec::new();
+    let iter = repo
+        .branches(Some(git2::BranchType::Remote))
+        .map_err(map_git_err)?;
+    for entry in iter {
+        let (branch, _) = entry.map_err(map_git_err)?;
+        let Some(name) = branch.name().map_err(map_git_err)? else {
+            continue;
+        };
+        if let Some(short) = name.strip_prefix("origin/") {
+            if short != "HEAD" {
+                branches.push(short.to_string());
+            }
+        }
+    }
+    branches.sort_unstable();
+    // A vanished / non-symbolic `origin/HEAD` is an anomaly the write path
+    // self-heals; the read path just omits the default branch.
+    let default_branch = default_branch(&repo).ok();
+    Ok(Some(CachedBranches {
+        branches,
+        default_branch,
+    }))
+}
+
 /// Provision a **standalone** plain-clone checkout from a cached repo (the
 /// `direct` fallback of `workspace.create` cache hydration, used when the
 /// filesystem cannot CoW-clone the cache into the workspaces root).
@@ -1430,6 +1496,79 @@ mod tests {
             "got: {err:?}"
         );
         assert!(!checkout.exists(), "partial checkout is removed on failure");
+    }
+
+    /// A warm cache lists its remote-tracking branches (sorted, `HEAD`
+    /// excluded) plus the default branch from `origin/HEAD` — all read-only.
+    #[tokio::test]
+    async fn list_cached_branches_reads_warm_cache() {
+        let origin = init_repo("repocache-listcached-warm");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::create_branch(origin.path(), "feature-x");
+        let root = CacheRoot::new("listcached-warm");
+        let url = file_url(origin.path());
+        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let default = Repository::open(origin.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand()
+            .unwrap()
+            .to_string();
+
+        let cached = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap()
+            .expect("warm cache must be a hit");
+
+        let mut expected = vec![default.clone(), "feature-x".to_string()];
+        expected.sort_unstable();
+        assert_eq!(cached.branches, expected);
+        assert_eq!(cached.default_branch, Some(default));
+    }
+
+    /// A cold cache (no dir, or a dir that is not a repository) is a graceful
+    /// `None`, never an error.
+    #[tokio::test]
+    async fn list_cached_branches_cold_cache_is_none() {
+        let root = CacheRoot::new("listcached-cold");
+
+        // No cache dir at all.
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none());
+
+        // A dir that is not a repository (interrupted prior clone leftovers).
+        let path = root.path().join("acme").join("widget");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("junk.txt"), "leftover").unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none());
+    }
+
+    /// Invalid owner/repo segments are rejected before any filesystem work,
+    /// same as the write path.
+    #[tokio::test]
+    async fn list_cached_branches_rejects_invalid_segments() {
+        let root = CacheRoot::new("listcached-badseg");
+        for (owner, repo) in [
+            ("", "repo"),
+            ("owner", ""),
+            ("..", "repo"),
+            ("owner", ".."),
+            ("a/b", "repo"),
+            ("-owner", "repo"),
+        ] {
+            let err = list_cached_branches(root.path(), owner, repo)
+                .await
+                .expect_err("invalid segment must be rejected");
+            assert!(matches!(err, Error::InvalidParams(_)), "{owner:?}/{repo:?}");
+        }
     }
 
     /// Several concurrent ensures for the same repo all succeed and agree on

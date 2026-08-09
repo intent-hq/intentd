@@ -3329,6 +3329,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.branches.listCached`: branch names from the daemon's local
+    /// repo cache — no network I/O — →
+    /// `{ cached: boolean, branches: string[], defaultBranch?: string }`
+    /// (`cached: false` ⇒ empty branches, no defaultBranch).
+    fn github_branches_list_cached(
+        &self,
+        owner: String,
+        repo: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_branches_list_cached not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.issues.search`: `GET /search/issues` (`is:issue` + free-text
     /// `query`) → `{ issues, nextToken }`.
     #[allow(clippy::too_many_arguments)]
