@@ -6986,12 +6986,14 @@ async fn run_message_worker(
 /// set) or background agent (`is_background`) is a sub-agent whose
 /// completion is its parent/coordinator's attention surface, not the
 /// user's. Same sub-agent definition as the attention-clear gate above and
-/// rules.rs. FAIL OPEN on a session-load error (raise anyway): a missed
-/// blue dot for a real top-level turn is worse than a spurious one on a
-/// rare store error.
+/// rules.rs. `NotFound` means the agent was deleted while its drain
+/// finished — nothing to surface, skip. FAIL OPEN on any other store error
+/// (raise anyway): a missed blue dot for a real top-level turn is worse
+/// than a spurious one on a rare store fault.
 pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: &AgentId) -> bool {
-    match services.store.get_agent_session(agent_id).await {
+    match services.store.get_agent_session_summary(agent_id).await {
         Ok(s) => s.parent_agent_id.is_none() && !s.is_background,
+        Err(Error::NotFound(_)) => false,
         Err(e) => {
             tracing::warn!(
                 agent = %agent_id,

@@ -21803,15 +21803,35 @@ mod turn_end_unread_gate {
         );
     }
 
-    /// Session-load failure FAILS OPEN: a missed blue dot for a real
-    /// top-level turn is worse than a spurious one on a rare store error.
+    /// A session that no longer exists (`NotFound` — the agent was deleted
+    /// while its drain finished) has nothing to surface: skip the raise.
     #[tokio::test]
-    async fn session_load_error_fails_open() {
+    async fn deleted_agent_skips_raise() {
         let h = harness().await;
         let missing = AgentId::new();
         assert!(
-            should_raise_turn_end_unread(&h.services, &missing).await,
-            "the gate fails open when the session cannot be loaded"
+            !should_raise_turn_end_unread(&h.services, &missing).await,
+            "a deleted agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A genuine store failure FAILS OPEN: a missed blue dot for a real
+    /// top-level turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn store_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("DROP TABLE agent_session")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the gate fails open on a genuine store error"
         );
     }
 }
