@@ -140,6 +140,54 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     remote.url().ok() == Some(github_url)
 }
 
+/// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
+/// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
+/// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
+/// `.git` suffix, userinfo, and a port; host, owner, and repo compare
+/// case-insensitively (GitHub slugs are case-insensitive). Anything not on
+/// `github.com` — another host or a local path — is not a GitHub slot.
+fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
+    let trimmed = url.trim().trim_end_matches('/');
+    let (rest, scp_like) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            let known = ["https", "http", "ssh", "git"]
+                .iter()
+                .any(|s| scheme.eq_ignore_ascii_case(s));
+            if !known {
+                return false;
+            }
+            (rest, false)
+        }
+        // No scheme: only the scp-like `user@host:owner/repo` form qualifies.
+        None => (trimmed, true),
+    };
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    let (authority, path) = if scp_like {
+        match rest.split_once(':') {
+            Some(pair) => pair,
+            None => return false,
+        }
+    } else {
+        match rest.split_once('/') {
+            Some(pair) => pair,
+            None => return false,
+        }
+    };
+    let host = authority.split(':').next().unwrap_or(authority);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return false;
+    }
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let (Some(o), Some(r)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    let r = r.strip_suffix(".git").unwrap_or(r);
+    o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+}
+
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
 /// branch (`git remote set-head origin --auto` — a fetch alone never updates
 /// the `origin/HEAD` symref recorded at clone time, so a remote that changed
@@ -321,6 +369,13 @@ pub struct CachedBranches {
 /// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
 /// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
 /// re-clone is never observed mid-mutation.
+///
+/// The cache is keyed by `<owner>/<repo>` segments only, while creation
+/// accepts GitHub-style URLs from any host and treats same-named origins as
+/// distinct (see [`ensure_cached_repo`]'s origin check). This GitHub-scoped
+/// reader therefore verifies the slot's `origin` actually points at
+/// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
+/// a local seed) is a miss, never another repo's branch list.
 pub async fn list_cached_branches(
     cache_root: &Path,
     owner: &str,
@@ -333,18 +388,32 @@ pub async fn list_cached_branches(
     let lock = lock_for(&cache_path);
     let _guard = lock.lock().await;
 
-    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path))
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path, &owner, &repo))
         .await
         .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
 /// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
 /// the cached clone. An unopenable repo counts as a cache miss (the write
-/// path self-heals it on the next ensure).
-fn list_cached_branches_blocking(cache_path: &Path) -> Result<Option<CachedBranches>> {
+/// path self-heals it on the next ensure), as does an `origin` that is not
+/// `github.com/<owner>/<repo>`.
+fn list_cached_branches_blocking(
+    cache_path: &Path,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Option<CachedBranches>> {
     let Ok(repo) = Repository::open(cache_path) else {
         return Ok(None);
     };
+    let origin_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().ok().map(String::from));
+    if !origin_url.is_some_and(|url| origin_is_github_slot(&url, owner, repo_name)) {
+        return Ok(None);
+    }
     let mut branches = Vec::new();
     let iter = repo
         .branches(Some(git2::BranchType::Remote))
@@ -1498,6 +1567,16 @@ mod tests {
         assert!(!checkout.exists(), "partial checkout is removed on failure");
     }
 
+    /// Retarget a cache's `origin` remote at a github.com URL, standing in
+    /// for a cache cloned from GitHub (tests seed over `file://` to stay
+    /// offline; the reader only inspects the recorded URL).
+    fn set_github_origin(cache_path: &Path, owner: &str, repo: &str) {
+        Repository::open(cache_path)
+            .unwrap()
+            .remote_set_url("origin", &format!("https://github.com/{owner}/{repo}.git"))
+            .unwrap();
+    }
+
     /// A warm cache lists its remote-tracking branches (sorted, `HEAD`
     /// excluded) plus the default branch from `origin/HEAD` — all read-only.
     #[tokio::test]
@@ -1507,9 +1586,10 @@ mod tests {
         crate::testutil::create_branch(origin.path(), "feature-x");
         let root = CacheRoot::new("listcached-warm");
         let url = file_url(origin.path());
-        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
             .await
             .unwrap();
+        set_github_origin(&cache, "acme", "widget");
         let default = Repository::open(origin.path())
             .unwrap()
             .head()
@@ -1527,6 +1607,84 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(cached.branches, expected);
         assert_eq!(cached.default_branch, Some(default));
+    }
+
+    /// A slot whose `origin` is not `github.com/<owner>/<repo>` — another
+    /// host's clone or a local seed occupying the same `<owner>/<repo>` key —
+    /// is a miss, never another repo's branch list.
+    #[tokio::test]
+    async fn list_cached_branches_foreign_origin_is_none() {
+        let origin = init_repo("repocache-listcached-foreign");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("listcached-foreign");
+        let cache = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The `file://` seed origin itself is not a GitHub slot.
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "file:// origin must be a miss");
+
+        // Neither is the same owner/repo pair on another host.
+        Repository::open(&cache)
+            .unwrap()
+            .remote_set_url("origin", "https://gitlab.example.com/acme/widget.git")
+            .unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "foreign-host origin must be a miss");
+
+        // A github.com origin for a *different* slug is a miss too.
+        Repository::open(&cache)
+            .unwrap()
+            .remote_set_url("origin", "https://github.com/other/widget.git")
+            .unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "wrong-slug github origin must be a miss");
+    }
+
+    /// [`origin_is_github_slot`] URL-form coverage: HTTPS/SSH/scp-like
+    /// github.com origins for the slug match (case-insensitively, `.git`
+    /// optional); other hosts, schemes, slugs, and path shapes do not.
+    #[test]
+    fn origin_is_github_slot_recognizes_github_urls() {
+        for url in [
+            "https://github.com/acme/widget.git",
+            "https://github.com/acme/widget",
+            "https://github.com/Acme/Widget.git",
+            "https://oauth2:@github.com/acme/widget.git",
+            "https://GITHUB.COM/acme/widget/",
+            "ssh://git@github.com/acme/widget.git",
+            "ssh://git@github.com:22/acme/widget.git",
+            "git@github.com:acme/widget.git",
+        ] {
+            assert!(origin_is_github_slot(url, "acme", "widget"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/acme/widget.git",
+            "https://ghe.example.com/acme/widget.git",
+            "file:///tmp/acme/widget",
+            "/tmp/acme/widget",
+            "https://github.com/other/widget.git",
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/widget/extra",
+            "https://github.com/widget.git",
+            "https://github.com.evil.com/acme/widget.git",
+            "git@gitlab.com:acme/widget.git",
+        ] {
+            assert!(!origin_is_github_slot(url, "acme", "widget"), "{url}");
+        }
     }
 
     /// A cold cache (no dir, or a dir that is not a repository) is a graceful

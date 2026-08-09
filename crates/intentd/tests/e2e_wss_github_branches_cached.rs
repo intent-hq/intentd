@@ -7,8 +7,10 @@
 //! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
 //! self-signed fingerprint (the production transport path). The cache is
 //! seeded through the production `ensure_cached_repo` path from a local
-//! `file://` origin, so the test never touches the network. Gated on `git`
-//! being on PATH; skips cleanly otherwise.
+//! `file://` origin — then its `origin` remote is retargeted at the matching
+//! github.com URL, since the reader only serves slots whose recorded origin
+//! is `github.com/<owner>/<repo>` — so the test never touches the network.
+//! Gated on `git` being on PATH; skips cleanly otherwise.
 
 #![cfg(unix)]
 
@@ -239,13 +241,15 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 }
 
 /// Send a JSON-RPC request and return the full response envelope (success or
-/// error) so tests can assert either arm.
+/// error) so tests can assert either arm. Asserts the JSON-RPC 2.0 envelope
+/// invariants (PROTOCOL §1) on every response: `jsonrpc: "2.0"`, the echoed
+/// `id`, and exactly one of `result` / `error`.
 async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
         .await
         .unwrap();
-    timeout(common::rpc_read_timeout(), async {
+    let v = timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
                 Message::Text(text) => {
@@ -263,7 +267,14 @@ async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) 
         }
     })
     .await
-    .expect("response timeout")
+    .expect("response timeout");
+    assert_eq!(v["jsonrpc"], json!("2.0"), "envelope jsonrpc: {v}");
+    assert_eq!(v["id"], json!(id), "envelope id: {v}");
+    assert!(
+        v.get("result").is_some() ^ v.get("error").is_some(),
+        "envelope must carry exactly one of result/error: {v}"
+    );
+    v
 }
 
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
@@ -283,7 +294,7 @@ async fn list_cached_returns_branches_from_warm_cache() {
     let fx = boot().await;
     let origin = make_origin_repo(&fx.workspaces_root.parent().unwrap().join("seed"));
     let cache_root = fx.workspaces_root.join(".repo-cache");
-    intent_git::repo_cache::ensure_cached_repo(
+    let cache_path = intent_git::repo_cache::ensure_cached_repo(
         &cache_root,
         &file_url(&origin),
         "acme",
@@ -292,6 +303,17 @@ async fn list_cached_returns_branches_from_warm_cache() {
     )
     .await
     .expect("seed cache");
+    // The reader only serves slots whose recorded `origin` is
+    // `github.com/<owner>/<repo>`; retarget the file:// seed's origin.
+    run_git(
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ],
+        &cache_path,
+    );
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
     let r = wss_rpc(

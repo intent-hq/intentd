@@ -19268,11 +19268,16 @@ impl WorkspaceApi for Services {
         owner: String,
         repo: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let workspaces_root = self.workspaces_root.clone();
+        // Mirror `workspace.create`'s parent resolution (worktreesLocation
+        // unless startup-pinned) so a cache warmed by workspace creation under
+        // a custom `workspace.worktreesLocation` is found by this reader too.
+        // Unlike the write path this never creates the directory.
+        let cache_parent = self
+            .configured_worktrees_location()
+            .or_else(|| self.workspaces_root.clone())
+            .unwrap_or_else(default_workspaces_root);
         Box::pin(async move {
-            let cache_root = workspaces_root
-                .unwrap_or_else(default_workspaces_root)
-                .join(".repo-cache");
+            let cache_root = cache_parent.join(".repo-cache");
             match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
                 Some(cached) => {
                     let mut result = serde_json::json!({
