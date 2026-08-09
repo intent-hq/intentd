@@ -99,8 +99,16 @@ curl -fsSL https://github.com/intent-hq/intentd-releases/releases/download/sitte
 Detects OS and architecture, downloads the matching `sitter-latest` archive, verifies
 its `.sha256` sidecar, and installs `intentd` to `/usr/local/bin` when writable, else
 `~/.local/bin` (override with `INTENTD_INSTALL_DIR`). Re-running updates in place.
-Start the daemon with `intentd serve`, or use the Homebrew / `.deb` installs below for
-a managed background service.
+
+After installing, the script offers to register intentd as a per-user service that
+starts at login (systemd user unit on Linux, launchd LaunchAgent on macOS — the same
+definitions the `.deb` and Homebrew installs use) and starts it immediately. The
+prompt reads from the terminal, so it works with `curl … | sh`; non-interactive runs
+skip service setup with a hint. Set `INTENTD_INSTALL_SERVICE=1` (or pass `--service`
+on a direct run) to set it up without prompting, `INTENTD_INSTALL_SERVICE=0` /
+`--no-service` to skip. On headless Linux boxes, user services only start at boot
+once lingering is enabled (`sudo loginctl enable-linger $USER` — the script prints
+this hint).
 
 ### One-line script (Windows)
 
@@ -109,7 +117,11 @@ powershell -c "irm https://github.com/intent-hq/intentd-releases/releases/downlo
 ```
 
 Installs `intentd.exe` to `%LOCALAPPDATA%\intentd\bin` (override with
-`INTENTD_INSTALL_DIR`) and adds that directory to the user `PATH`.
+`INTENTD_INSTALL_DIR`) and adds that directory to the user `PATH`. After installing,
+it offers to register a per-user Scheduled Task that runs `intentd serve --resume-all`
+at logon and starts it now; non-interactive runs skip with a hint. Set
+`$env:INTENTD_INSTALL_SERVICE = '1'` (or `-Service` on a direct run) to set it up
+without prompting, `'0'` / `-NoService` to skip.
 
 ### Homebrew (macOS / Linux)
 

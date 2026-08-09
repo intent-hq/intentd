@@ -8,6 +8,20 @@
 # sitter) to $env:INTENTD_INSTALL_DIR (default: $env:LOCALAPPDATA\intentd\bin),
 # and adds the install dir to the user PATH. Idempotent: re-running replaces
 # the installed binary.
+#
+# After a successful install it offers to register a per-user Scheduled Task
+# ("intentd") that runs `intentd serve --resume-all` at logon, and starts it
+# now. The prompt only appears on an interactive console and never hangs in
+# non-interactive runs (default: skip with a hint). Force either way:
+#
+#   $env:INTENTD_INSTALL_SERVICE = '1'  (or -Service, on direct runs)     set up
+#   $env:INTENTD_INSTALL_SERVICE = '0'  (or -NoService, on direct runs)   skip
+#
+# $env:INTENTD_SERVICE_NAME overrides the task name (testing).
+param(
+    [switch]$Service,
+    [switch]$NoService
+)
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
 # dramatically) and force TLS 1.2, which older .NET defaults omit.
@@ -92,6 +106,62 @@ if (@($env:Path -split ';') -notcontains $installDir) {
 }
 
 Write-Host "install.ps1: installed intentd to $installDir\intentd.exe"
-Write-Host ''
-Write-Host 'Next steps:'
-Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
+
+# Service setup decision: switches beat the env var beat the prompt. Never
+# hang in non-interactive runs — skip with a hint instead.
+$serviceMode = ''
+if ($Service) { $serviceMode = 'yes' }
+elseif ($NoService) { $serviceMode = 'no' }
+elseif ($env:INTENTD_INSTALL_SERVICE) {
+    $serviceMode = if (@('0', 'false', 'no') -contains $env:INTENTD_INSTALL_SERVICE.ToLowerInvariant()) { 'no' } else { 'yes' }
+}
+if (-not $serviceMode) {
+    if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $reply = Read-Host 'Set up intentd to start at logon and start it now? [Y/n]'
+        $serviceMode = if ($reply -match '^[nN]') { 'no' } else { 'yes' }
+    } else {
+        $serviceMode = 'skip'
+    }
+}
+
+if ($serviceMode -eq 'yes') {
+    # Per-user Scheduled Task at logon: no admin rights needed, and -Force
+    # makes re-runs update the existing task instead of duplicating it.
+    $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
+    $action = New-ScheduledTaskAction -Execute $dest -Argument 'serve --resume-all'
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    # The daemon is long-running: disable the 72h execution limit and the
+    # battery cutoffs, and restart it if it crashes.
+    $settings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+        -StartWhenAvailable
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Settings $settings -Description 'Intent backend daemon (intentd)' -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+    Write-Host "install.ps1: scheduled task '$taskName' registered (runs at logon) and started"
+
+    # First service start can be slow: the sitter downloads the real daemon
+    # before serving.
+    Write-Host 'install.ps1: waiting for the daemon to respond (first start downloads the daemon binary)...'
+    $up = $false
+    for ($waited = 0; $waited -lt 60; $waited += 2) {
+        & $dest status *> $null
+        if ($LASTEXITCODE -eq 0) { $up = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if ($up) {
+        Write-Host "install.ps1: daemon is up - 'intentd status' responds"
+    } else {
+        Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+    }
+    Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
+} else {
+    if ($serviceMode -eq 'skip') {
+        Write-Host 'install.ps1: skipping service setup (non-interactive session). To set it up, re-run with $env:INTENTD_INSTALL_SERVICE = ''1'''
+    }
+    Write-Host ''
+    Write-Host 'Next steps:'
+    Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
+}
