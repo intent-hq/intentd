@@ -490,6 +490,61 @@ mod tests {
         );
     }
 
+    /// Regression (`./` bypass): a leading `./` is lexical noise the guard's
+    /// component-wise match used to miss, so the same submodule-internal path
+    /// spelled `./sub/a.txt` slipped through to the tree build.
+    #[test]
+    fn commit_paths_rejects_dot_slash_submodule_internal_path() {
+        use crate::testutil::add_submodule;
+        let child = init_repo("commit-sub-child-dotslash");
+        commit_file(child.path(), "a.txt", "a\n");
+        let dir = init_repo("commit-sub-parent-dotslash");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        add_submodule(dir.path(), child.path(), "sub");
+        let head_before = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+
+        write_file(&dir.path().join("sub"), "a.txt", "changed\n");
+        for spelling in ["./sub/a.txt", "sub/./a.txt", "sub//a.txt"] {
+            let err = commit_paths_with_trailers(
+                dir.path(),
+                "flatten sub via ./ spelling",
+                Some("agent-1"),
+                None,
+                &[spelling.to_string()],
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err}").contains("is in submodule"),
+                "unexpected error for {spelling}: {err}"
+            );
+        }
+
+        let head_after = crate::history::history(dir.path(), 1).unwrap()[0]
+            .hash
+            .clone();
+        assert_eq!(head_before, head_after, "no commit must have been made");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub").join("a.txt")).unwrap(),
+            "changed\n",
+            "submodule working-copy file must survive"
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        let index = repo.index().unwrap();
+        assert!(
+            index
+                .iter()
+                .all(|e| !String::from_utf8_lossy(&e.path).starts_with("sub/")),
+            "no submodule-internal blob may be in the index"
+        );
+        assert_eq!(
+            index.get_path(Path::new("sub"), 0).unwrap().mode,
+            u32::from(git2::FileMode::Commit),
+            "gitlink entry intact"
+        );
+    }
+
     #[test]
     fn commit_paths_gitlink_pin_bump_succeeds() {
         use crate::testutil::add_submodule;

@@ -794,3 +794,74 @@ async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// WSS counterpart of the discard submodule-gitlink guard (monorepo#1733):
+/// over the production TLS/WebSocket envelope, `git.discard` refuses a path
+/// strictly inside a registered submodule with the PROTOCOL.md §9 `-32603`
+/// error naming the path and its containing submodule — instead of treating it
+/// as untracked in the superproject and unlinking it. Both the relative and the
+/// in-worktree absolute spelling are refused, the file survives on disk, and
+/// the gitlink stays a `160000` entry.
+#[tokio::test]
+async fn git_discard_rejects_submodule_internal_path_over_wss() {
+    if !gate() {
+        return;
+    }
+    let root = scratch_dir("root-submodule-discard");
+    let (daemon, port, cfg) = boot(&root).await;
+    let repo = make_source_repo_with_submodule(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    let (ws_id, wt) = create_workspace(&mut ws, &repo, "Git Write E2E — discard guard").await;
+
+    // A linked worktree does not check out submodules, so materialise the
+    // directory and its working-copy edit first — the guard is a pathspec
+    // check, not an on-disk probe.
+    let sub = wt.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let inner = sub.join("inner.txt");
+    std::fs::write(&inner, "uncommitted inside sub\n").unwrap();
+
+    for (id, spelling) in [
+        (40i64, "sub/inner.txt".to_string()),
+        (41, inner.to_string_lossy().to_string()),
+    ] {
+        let resp = wss_rpc(
+            &mut ws,
+            id,
+            "git.discard",
+            json!({ "workspaceId": ws_id, "paths": [spelling] }),
+        )
+        .await;
+        assert_eq!(resp["jsonrpc"], json!("2.0"));
+        assert_eq!(resp["id"], json!(id));
+        assert!(resp.get("result").is_none(), "{spelling}: {resp}");
+        assert_eq!(resp["error"]["code"], json!(-32603), "{spelling}: {resp}");
+        let msg = resp["error"]["data"]
+            .as_str()
+            .or_else(|| resp["error"]["message"].as_str())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("inner.txt"),
+            "{spelling}: names the path: {resp}"
+        );
+        assert!(
+            msg.contains("submodule 'sub'"),
+            "{spelling}: names the containing submodule: {resp}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&inner).unwrap(),
+            "uncommitted inside sub\n",
+            "{spelling}: submodule working-copy file must survive"
+        );
+    }
+
+    let ls = run_git(&["ls-files", "-s", "sub"], &wt);
+    assert!(
+        ls.starts_with("160000"),
+        "gitlink entry intact, got: {ls:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

@@ -156,23 +156,37 @@ pub fn ignores_case(repo: &Repository) -> bool {
         .unwrap_or(false)
 }
 
+/// Lexically meaningful components of `p`: `CurDir` (`.`) entries are dropped
+/// because they are spelling noise that names the same file — `Path::components`
+/// already folds interior `.` and repeated separators, but keeps a *leading*
+/// `./`, which would otherwise make a component-wise prefix match miss
+/// (monorepo#1733: `./sub/a.txt` slipping past the gitlink guard). `ParentDir`
+/// is deliberately **not** resolved here: the guard only compares spellings,
+/// and `..` handling is the callers' own escape check.
+fn meaningful_components(p: &Path) -> impl Iterator<Item = std::path::Component<'_>> {
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+}
+
 /// Strip `prefix` from `target` component-by-component, returning the remainder
 /// (empty when the two are equal) or `None` when `target` is not under
 /// `prefix`. Component-wise (never byte-wise substring) so a sibling directory
 /// sharing a prefix (`subdir/a.txt` vs `sub`) never matches; with `ignore_case`
 /// the components are compared case-insensitively, which is what makes the
 /// guard hold on a case-insensitive filesystem where `SUB/a.txt` and `sub/a.txt`
-/// name the same file on disk.
+/// name the same file on disk. Both sides are read through
+/// [`meaningful_components`], so a `./`-prefixed spelling matches exactly like
+/// its bare form.
 fn strip_prefix_components(
     target: &Path,
     prefix: &Path,
     ignore_case: bool,
 ) -> Option<std::path::PathBuf> {
-    let mut rest = target.components();
-    let mut want = prefix.components();
+    let mut rest = meaningful_components(target).peekable();
+    let mut want = meaningful_components(prefix);
     loop {
-        match (want.next(), rest.clone().next()) {
-            (None, _) => return Some(rest.as_path().to_path_buf()),
+        match (want.next(), rest.peek()) {
+            (None, _) => return Some(rest.map(|c| c.as_os_str()).collect()),
             (Some(_), None) => return None,
             (Some(w), Some(t)) => {
                 let eq = if ignore_case {
@@ -213,6 +227,22 @@ pub fn submodule_containing<'a>(
         }
     }
     None
+}
+
+/// Whether `rel_path` names one of `submodules` exactly (the gitlink path
+/// itself, rather than something inside it). Spelling-insensitive in the same
+/// way as [`submodule_containing`]: `sub/`, `sub/.` and `./sub` all name the
+/// gitlink `sub`, and `ignore_case` folds case where the filesystem does.
+pub fn is_submodule_path(
+    submodules: &std::collections::BTreeSet<String>,
+    rel_path: &str,
+    ignore_case: bool,
+) -> bool {
+    let target = Path::new(rel_path);
+    submodules.iter().any(|sm| {
+        strip_prefix_components(target, Path::new(sm), ignore_case)
+            .is_some_and(|rest| rest.as_os_str().is_empty())
+    })
 }
 
 /// Refuse any of `paths` that lies strictly inside a registered submodule,
@@ -260,6 +290,10 @@ pub fn reject_submodule_internal_paths(repo: &Repository, paths: &[String]) -> R
 /// rejection) matches submodule paths in the same normalized space instead of
 /// duplicating the logic. `ignore_case` (the repo's `core.ignorecase`, see
 /// [`ignores_case`]) folds case in the worktree-prefix comparison.
+///
+/// Lexical noise (`./`, doubled separators) is *not* rewritten here — it is
+/// folded where it matters, in [`submodule_containing`]'s component-wise match
+/// — so the returned string keeps the caller's spelling for error messages.
 pub fn to_repo_relative(workdir: Option<&Path>, raw: &str, ignore_case: bool) -> String {
     let p = Path::new(raw);
     if !p.is_absolute() {
@@ -383,6 +417,53 @@ mod tests {
         // The gitlink itself stays allowed under any spelling.
         assert_eq!(submodule_containing(&sms, "SUB", true), None);
         assert_eq!(submodule_containing(&sms, "SUB/a.txt", false), None);
+    }
+
+    /// Regression (`./` bypass): a `CurDir` component is lexical noise that
+    /// names the same file, so it must not hide a submodule-internal path from
+    /// the guard. Interior `.` and doubled separators are already folded by
+    /// `Path::components`; a *leading* `./` is the spelling that survived.
+    #[test]
+    fn submodule_containing_normalizes_curdir_components() {
+        let sms = submodules(&["sub"]);
+        assert_eq!(
+            submodule_containing(&sms, "./sub/a.txt", false),
+            Some("sub")
+        );
+        assert_eq!(
+            submodule_containing(&sms, "sub/./a.txt", false),
+            Some("sub")
+        );
+        assert_eq!(submodule_containing(&sms, "sub//a.txt", false), Some("sub"));
+        assert_eq!(
+            submodule_containing(&sms, "././sub/deep/a.txt", false),
+            Some("sub")
+        );
+        // The gitlink itself stays allowed under the `./` spelling.
+        assert_eq!(submodule_containing(&sms, "./sub", false), None);
+        // Normalization must not break the sibling-prefix or case-fold cases.
+        assert_eq!(submodule_containing(&sms, "./subdir/a.txt", false), None);
+        assert_eq!(submodule_containing(&sms, "./subdir/a.txt", true), None);
+        assert_eq!(submodule_containing(&sms, "./SUB/a.txt", true), Some("sub"));
+        assert_eq!(submodule_containing(&sms, "./SUB/a.txt", false), None);
+    }
+
+    /// The gitlink path itself is recognized under every spelling that names
+    /// it — trailing separator, trailing `.`, leading `./` — so a caller can
+    /// gate the "allowed no-op" on the same set the guard lets through.
+    #[test]
+    fn is_submodule_path_matches_every_gitlink_spelling() {
+        let sms = submodules(&["sub"]);
+        for spelling in ["sub", "sub/", "sub/.", "./sub", "./sub/", "sub/./"] {
+            assert!(
+                is_submodule_path(&sms, spelling, false),
+                "must recognize {spelling}"
+            );
+        }
+        assert!(!is_submodule_path(&sms, "sub/a.txt", false));
+        assert!(!is_submodule_path(&sms, "subdir", false));
+        assert!(is_submodule_path(&sms, "SUB/", true));
+        assert!(!is_submodule_path(&sms, "SUB/", false));
     }
 
     /// Relative paths pass through; an absolute in-worktree path is stripped
