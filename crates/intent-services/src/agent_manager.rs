@@ -2758,6 +2758,28 @@ impl AgentManager {
         removed
     }
 
+    /// Stop MANY agents under ONE shared grace window: detach each agent with
+    /// the exact [`AgentManager::stop`] per-agent semantics (partial-turn
+    /// flush, recreate/prepend flag cleanup, live-turn slot release, handle
+    /// removal, deregistration), collect the detached children, and kill all
+    /// process groups concurrently via [`kill_child_trees`] — total teardown
+    /// stays ~one [`PROCESS_GROUP_TERM_GRACE`] period regardless of agent
+    /// count, instead of N sequential SIGTERM→grace→SIGKILL cycles. This is
+    /// the `workspace.delete` sweep (same detach-many → kill_child_trees
+    /// pattern as `shutdown()`, minus the interrupted-session capture).
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) {
+        let mut children = Vec::new();
+        for id in agent_ids {
+            let (_, child) = self.detach(id).await;
+            if let Some(child) = child {
+                children.push(child);
+            }
+        }
+        if !children.is_empty() {
+            kill_child_trees(children).await;
+        }
+    }
+
     /// Shared teardown body of [`AgentManager::stop`]: abort the worker, drop
     /// stale flags, settle the turn, remove the handle, deregister — and hand
     /// back the detached child (if any) so the caller decides how to kill it.

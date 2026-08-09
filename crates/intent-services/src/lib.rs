@@ -11870,15 +11870,19 @@ impl WorkspaceApi for Services {
             // watches with no owning workspace — a client can retry the
             // delete, but silent partial success cannot recover.
             let sessions = store.list_agent_sessions(&id).await?;
+            if let Some(manager) = manager.as_ref() {
+                // Batch stop: aborts each worker, drops each handle, clears
+                // busy + agent_ws, and deregisters each process — the
+                // `agent.stop` semantics per agent — then kills all detached
+                // ACP children's process groups under ONE shared grace
+                // window (`kill_child_trees`), so the delete ack pays ~one
+                // grace period total instead of one per live agent.
+                let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
+                manager.stop_many(&ids).await;
+            }
             for session in &sessions {
-                if let Some(manager) = manager.as_ref() {
-                    // Aborts the worker, drops the handle (kill_child_tree on
-                    // the ACP child), clears busy + agent_ws, and
-                    // deregisters the process — the `agent.stop` semantics.
-                    manager.stop(&session.id).await;
-                }
                 // Live-turn slot + pending message queue live in `Services`'
-                // maps (not touched by `manager.stop`); drop them so a
+                // maps (not touched by `manager.stop_many`); drop them so a
                 // same-slug recreate observes no ghost state. Recover through
                 // a poisoned lock via `into_inner` — the delete path is the
                 // last chance to unlink this state, so best-effort teardown
