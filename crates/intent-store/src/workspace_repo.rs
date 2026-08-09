@@ -91,8 +91,17 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id`), or
-    /// `NotFound`. `activity` is derived and never persisted (§9.9).
+    /// Update an existing workspace (full row replace, except `id` and the
+    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
+    /// derived and never persisted (§9.9).
+    ///
+    /// `last_activity` is the one exception to the full-row replace
+    /// (monorepo#1585): it goes through the same monotonic guard as
+    /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
+    /// it parses AND the stored value is NULL, unparseable, or strictly older.
+    /// Otherwise the stored column holds, so a get → mutate → write flow whose
+    /// read predated a concurrent bump can never silently revert it (the
+    /// `attention` clobber shape fixed by #1481).
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
@@ -100,8 +109,11 @@ impl Store {
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
              active_pull_request=?, pull_requests=?, archived=?, archived_at=?, tags=?, \
-             created_at=?, updated_at=?, last_activity=?, token_usage=?, setup_script=?, \
-             checkout_mode=? WHERE id=?",
+             created_at=?, updated_at=?, \
+             last_activity=CASE WHEN julianday(?) IS NOT NULL \
+               AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
+               OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -130,6 +142,8 @@ impl Store {
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
         .bind(&ws.updated_at)
+        .bind(&ws.last_activity)
+        .bind(&ws.last_activity)
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)

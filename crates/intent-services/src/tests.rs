@@ -21081,6 +21081,179 @@ mod last_activity_events {
         );
     }
 
+    /// Regression (monorepo#1585): `workspace.update` persists the
+    /// `lastActivity` it derives for the response, so the stored column
+    /// matches what the caller was told — the cheap read paths that never
+    /// derive (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+    /// snapshot) and a daemon restart serve the same fresh value instead of
+    /// a stale one that waits on the next debounce.
+    #[tokio::test]
+    async fn update_workspace_persists_derived_last_activity() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // Seeded row: nothing stored yet.
+        assert!(h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("seed reload")
+            .last_activity
+            .is_none());
+
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        let derived = updated
+            .last_activity
+            .clone()
+            .expect("response carries derived lastActivity");
+
+        // The stored column matches the response (persisted, not just derived).
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity;
+        assert_eq!(
+            persisted.as_deref(),
+            Some(derived.as_str()),
+            "derived lastActivity must be persisted, not response-only"
+        );
+
+        // The lite list (seq-0 snapshot source) serves it without deriving.
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(derived.as_str()));
+    }
+
+    /// Regression (monorepo#1585): the full-row `update_workspace` store write
+    /// can no longer clobber a concurrently bumped `lastActivity`. This
+    /// exercises the exact interleaving from the issue at the service layer:
+    /// the stale snapshot is read BEFORE the bump lands, then written back
+    /// through the same full-row `store.update_workspace` call every
+    /// `workspace.*` mutation path (update/archive/unarchive) uses — pre-fix
+    /// this silently reverted the bump.
+    #[tokio::test]
+    async fn update_workspace_does_not_clobber_concurrent_bump() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // 1. A mutation path reads its row snapshot (services do this first).
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+
+        // 2. A debounce bump lands after the read.
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("bump"));
+
+        // 3. The mutation writes its stale snapshot back full-row.
+        stale.title = "Renamed via stale snapshot".to_string();
+        stale.updated_at = now_iso();
+        h.store.update_workspace(&stale).await.expect("stale write");
+
+        // The bumped value holds; the rest of the row replaced.
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some(future),
+            "full-row write of a stale snapshot must not revert a newer lastActivity"
+        );
+        assert_eq!(reloaded.title, "Renamed via stale snapshot");
+
+        // And end-to-end: a subsequent `workspace.update` RPC (reload →
+        // mutate → full-row write → derive → monotonic persist) also leaves
+        // the bump intact.
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "workspace.update must not clobber a newer persisted lastActivity"
+        );
+    }
+
+    /// Regression (monorepo#1585 review): archive and unarchive persist the
+    /// `lastActivity` they derive for the response, so the lite list / seq-0
+    /// snapshot serves the same value without deriving.
+    #[tokio::test]
+    async fn archive_unarchive_persist_derived_last_activity() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let derived = archived
+            .last_activity
+            .clone()
+            .expect("archive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "archive must persist the derived lastActivity"
+        );
+
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let derived = unarchived
+            .last_activity
+            .clone()
+            .expect("unarchive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "unarchive must persist the derived lastActivity"
+        );
+    }
+
     /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
     /// when the token tallies actually changed (idempotent re-scan is silent).
     #[tokio::test]
