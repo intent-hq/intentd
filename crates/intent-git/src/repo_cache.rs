@@ -352,9 +352,10 @@ pub fn provision_direct_checkout(
 /// `.git/modules/<name>`, so it reconnects the work tree to it and checks out
 /// the recorded gitlink from local objects instead of cloning over the
 /// network. Nested submodules sit inside the copied tree at their expected
-/// paths, so the recursion stays local too. A gitlink the cache does not hold
-/// (or a submodule with no copied git dir) falls back to the real remote —
-/// best-effort by design.
+/// paths, so the recursion stays local too. The update runs strictly offline
+/// ([`update_checkout_submodules`]): a gitlink the cache does not hold (or a
+/// submodule with no copied git dir) fails the update and degrades to the
+/// caller's warning path instead of silently fetching from the network.
 ///
 /// `submodule init` (the `--init` half) records `submodule.<name>.url` from
 /// `.gitmodules`, resolved against the checkout's `origin` — already
@@ -386,16 +387,30 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
 }
 
 /// Force-sync every submodule work tree in `checkout_path` to its recorded
-/// gitlink (`git submodule update --init --recursive --force`). Local when
-/// the module git dirs already hold the gitlink objects; git falls back to
-/// fetching from the recorded URL otherwise. Shared with
+/// gitlink (`git submodule update --init --recursive --force`). Strictly
+/// offline: `--no-fetch` disables the missing-object fetch fallback and
+/// `protocol.allow=never` refuses every transport a `--init` clone could
+/// use (both propagate to nested submodules via `GIT_CONFIG_PARAMETERS`),
+/// so a gitlink the module git dirs do not hold fails the update — callers
+/// degrade with a warning — instead of silently contacting the recorded
+/// URL. A `protocol.<name>.allow` set in the environment (tests allow
+/// `file`) still overrides the general policy. Shared with
 /// [`crate::cow_checkout::provision_cow_checkout`], whose byte copy carries
 /// the source's module git dirs but whose hard reset never touches submodule
-/// work trees. No token: the local-first paths this serves need no network.
+/// work trees. No token: these paths never touch the network.
 pub(crate) fn update_checkout_submodules(checkout_path: &Path) -> Result<()> {
     run_git(
         checkout_path,
-        &["submodule", "update", "--init", "--recursive", "--force"],
+        &[
+            "-c",
+            "protocol.allow=never",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--force",
+            "--no-fetch",
+        ],
         None,
         CACHE_FETCH_TIMEOUT,
     )
@@ -591,9 +606,7 @@ fn run_git_os(
                 let stderr = crate::redact::redact_credentials(&read_stderr(drain));
                 return Err(Error::Internal(format!(
                     "git {} failed: {}",
-                    args.first()
-                        .map(|a| a.to_string_lossy())
-                        .unwrap_or_default(),
+                    subcommand_name(args),
                     stderr.trim()
                 )));
             }
@@ -603,9 +616,7 @@ fn run_git_os(
                     let _ = child.wait();
                     return Err(Error::Internal(format!(
                         "git {} timed out after {}s",
-                        args.first()
-                            .map(|a| a.to_string_lossy())
-                            .unwrap_or_default(),
+                        subcommand_name(args),
                         timeout.as_secs()
                     )));
                 }
@@ -618,6 +629,20 @@ fn run_git_os(
             }
         }
     }
+}
+
+/// The git subcommand in `args` for error attribution: the first argument
+/// past any leading `-c <key>=<value>` pairs.
+fn subcommand_name(args: &[&std::ffi::OsStr]) -> String {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg.to_str() == Some("-c") {
+            it.next();
+        } else {
+            return arg.to_string_lossy().into_owned();
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -1415,6 +1440,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
             "sub one\n"
+        );
+    }
+
+    /// A gitlink the local module git dirs do not hold is never fetched from
+    /// the real remote: the strictly-offline update errors — callers degrade
+    /// with a warning — even though the recorded URL is alive and reachable
+    /// (the child repo, over the test-allowed `file` protocol).
+    #[tokio::test]
+    async fn update_checkout_submodules_never_touches_the_network() {
+        allow_file_submodules();
+        let (origin, child) = submodule_fixture("repocache-nofetch");
+        let root = CacheRoot::new("nofetch");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let checkout_root = CacheRoot::new("nofetch-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        // Advance the child AFTER hydration and bump the checkout's gitlink
+        // to the new commit: the checkout's module git dir lacks the object,
+        // but the live child repo could serve it over a fetch — the update
+        // must fail instead of asking.
+        commit_file(child.path(), "c.txt", "sub two\n");
+        let new_sub_sha = head_sha(child.path());
+        commit_gitlink_bump(&checkout, "sub", &new_sub_sha);
+
+        update_checkout_submodules(&checkout)
+            .expect_err("update must fail offline instead of fetching the missing gitlink");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "submodule work tree untouched — nothing was fetched from the network"
         );
     }
 
