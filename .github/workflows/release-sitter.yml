@@ -95,7 +95,9 @@ jobs:
           # behind it); the x86_64 target is a cross build, smoke-tested
           # under Rosetta 2. Linux musl targets stay on the self-hosted
           # tinybox runner (cross-built with cargo-zigbuild as before).
-          # Windows uses the GitHub-hosted runner, matching v-release.yml.
+          # Windows uses the org-hosted gh-windows-16x runner (16-core/64GB,
+          # Windows Server 2022 image) for faster release builds
+          # (intent-hq/monorepo#1803).
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-apple-darwin
@@ -107,7 +109,7 @@ jobs:
             os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: x86_64-pc-windows-msvc
-            os: windows-2022
+            os: gh-windows-16x
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
