@@ -5,7 +5,7 @@
 //! enrich PATH with common development tool directories (node, nvm, homebrew,
 //! volta, asdf, etc.) so that tools and their dependencies can be discovered.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -17,8 +17,28 @@ fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 
-/// Cached login-shell PATH directories. Runs at most once, with a 5s timeout.
-static LOGIN_SHELL_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+/// Result of the one-shot login-shell capture: PATH directories plus the
+/// allow-listed credential env vars, collected in the same shell invocation.
+///
+/// Deliberately does NOT derive `Debug`/`Display`: `credential_env` holds
+/// secret values that must never be logged or formatted.
+struct LoginShellCapture {
+    dirs: Vec<PathBuf>,
+    credential_env: BTreeMap<String, String>,
+}
+
+impl LoginShellCapture {
+    fn empty() -> Self {
+        Self {
+            dirs: Vec::new(),
+            credential_env: BTreeMap::new(),
+        }
+    }
+}
+
+/// Cached login-shell capture (PATH dirs + allow-listed credential env).
+/// Runs at most once, with a 5s timeout.
+static LOGIN_SHELL_CAPTURE: OnceLock<LoginShellCapture> = OnceLock::new();
 
 /// Sentinels for extracting PATH from potentially noisy shell output.
 #[cfg(unix)]
@@ -26,30 +46,99 @@ const PATH_START_SENTINEL: &str = "__INTENT_PATH_S__";
 #[cfg(unix)]
 const PATH_END_SENTINEL: &str = "__INTENT_PATH_E__";
 
-/// Capture PATH from the user's login shell (unix only, cached, short timeout).
-/// On failure (timeout, spawn error, no shell, non-unix), returns an empty vec.
+/// Sentinels for extracting the NUL-separated `env -0` payload from the same
+/// shell invocation as the PATH capture.
+#[cfg(unix)]
+const ENV_START_SENTINEL: &str = "__INTENT_ENV_S__";
+#[cfg(unix)]
+const ENV_END_SENTINEL: &str = "__INTENT_ENV_E__";
+
+/// Credential env vars captured by exact name.
+///
+/// Inclusion criterion (both lists): a var is listed when a shipped provider
+/// CLI (or its backing SDK) reads it for authentication/configuration —
+/// exact names for cross-provider credentials (Anthropic/OpenAI/xAI keys,
+/// AWS credentials for Bedrock, Hugging Face tokens), one prefix per
+/// provider CLI's own env namespace. Keep both in sync with the provider
+/// catalog (`intent-providers`) as providers are added or removed.
+#[cfg(unix)]
+const CREDENTIAL_ENV_EXACT: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "XAI_API_KEY",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+];
+
+/// Credential env vars captured by name prefix. See the inclusion criterion
+/// on [`CREDENTIAL_ENV_EXACT`].
+#[cfg(unix)]
+const CREDENTIAL_ENV_PREFIXES: &[&str] = &[
+    "AUGGIE_",
+    "CLAUDE_",
+    "CODEX_",
+    "OPENCODE_",
+    "DROID_",
+    "CORTEX_",
+    "GROK_",
+    "PI_",
+];
+
+/// Whether an env var name is on the credential allow-list.
+#[cfg(unix)]
+fn is_credential_env_allow_listed(name: &str) -> bool {
+    CREDENTIAL_ENV_EXACT.contains(&name)
+        || CREDENTIAL_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Parse a NUL-separated `env -0` payload into the allow-listed credential
+/// vars. NUL separation tolerates values containing newlines. Non-allow-listed
+/// vars are discarded here and never leave this function.
+#[cfg(unix)]
+fn parse_credential_env(payload: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for entry in payload.split('\0') {
+        if let Some((name, value)) = entry.split_once('=') {
+            if is_credential_env_allow_listed(name) {
+                map.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Capture PATH and allow-listed credential env vars from the user's login
+/// shell (unix only, cached, short timeout). On failure (timeout, spawn error,
+/// no shell, non-unix), returns an empty capture.
 /// Exposed for testing via an injectable shell path.
 #[cfg(unix)]
-fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
+fn capture_login_shell_with(shell: Option<&str>) -> LoginShellCapture {
     let shell = match shell {
         Some(explicit) => match (!explicit.is_empty()).then(|| explicit.to_string()) {
             Some(shell) => shell,
-            None => return Vec::new(),
+            None => return LoginShellCapture::empty(),
         },
         None => match login_shell() {
             Some(shell) => shell,
-            None => return Vec::new(),
+            None => return LoginShellCapture::empty(),
         },
     };
 
     // Try interactive login shell first (-ilc), fall back to login shell (-lc)
     // Interactive shells source ~/.zshrc and similar rc files that may add PATH entries
-    if let Some(dirs) = try_capture_with_flags(&shell, &["-ilc"]) {
-        return dirs;
+    if let Some(capture) = try_capture_with_flags(&shell, &["-ilc"]) {
+        return capture;
     }
 
     // Fallback to non-interactive login shell
-    try_capture_with_flags(&shell, &["-lc"]).unwrap_or_default()
+    try_capture_with_flags(&shell, &["-lc"]).unwrap_or_else(LoginShellCapture::empty)
 }
 
 /// Resolve the user's login shell: the `SHELL` env var, else the user
@@ -133,17 +222,25 @@ fn user_db_shell() -> Option<String> {
     None
 }
 
-/// Helper to attempt PATH capture with specific shell flags.
-/// Returns Some(dirs) on success, None on any failure (spawn, timeout, non-zero exit, missing sentinels).
+/// Helper to attempt the login-shell capture with specific shell flags.
+/// Returns Some(capture) on success, None on any failure (spawn, timeout,
+/// non-zero exit, missing PATH sentinels). The env payload is optional: if its
+/// sentinels are missing, the capture still succeeds with an empty env map.
 #[cfg(unix)]
-fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
+fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<LoginShellCapture> {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
 
-    // Build command with sentinel-wrapped printf
+    // Build command with sentinel-wrapped printf for PATH, plus a second
+    // sentinel pair wrapping a NUL-separated env dump in the SAME invocation.
+    // `env -0` is present on GNU coreutils and modern macOS (FreeBSD-derived
+    // env); where it is missing, fall back to POSIX awk's ENVIRON, which
+    // emits the same NUL-separated shape (`%c`, 0). `|| true` keeps an env
+    // dump failure from failing the whole capture — the env payload is
+    // optional and degrades to an empty map.
     let cmd = format!(
-        r#"printf '{}%s{}'  "$PATH""#,
-        PATH_START_SENTINEL, PATH_END_SENTINEL
+        r#"printf '{}%s{}'  "$PATH"; printf '{}'; /usr/bin/env -0 2>/dev/null || /usr/bin/awk 'BEGIN{{for(k in ENVIRON)printf "%s=%s%c",k,ENVIRON[k],0}}' 2>/dev/null || true; printf '{}'"#,
+        PATH_START_SENTINEL, PATH_END_SENTINEL, ENV_START_SENTINEL, ENV_END_SENTINEL
     );
     let mut args = flags.to_vec();
     args.push(&cmd);
@@ -201,38 +298,75 @@ fn try_capture_with_flags(shell: &str, flags: &[&str]) -> Option<Vec<PathBuf>> {
     let output = output_buffer.lock().unwrap();
     let output_str = String::from_utf8_lossy(&output);
 
-    // Extract PATH between sentinels (last complete pair wins if sentinels appear multiple times)
-    let path_str = extract_path_from_sentinels(&output_str)?;
+    // Extract PATH between sentinels (last complete pair wins if sentinels
+    // appear multiple times — rc-file noise prints before our payload).
+    // Search only the prefix before the env payload: the env dump prints
+    // after the PATH pair, so an env *value* containing a literal PATH
+    // sentinel must not re-anchor the extraction.
+    let path_region_end = output_str
+        .rfind(ENV_START_SENTINEL)
+        .unwrap_or(output_str.len());
+    let path_str = extract_between_sentinels(
+        &output_str[..path_region_end],
+        PATH_START_SENTINEL,
+        PATH_END_SENTINEL,
+    )?;
 
     // Filter to absolute paths only to avoid unsafe relative entries like "." or "bin"
-    Some(
-        std::env::split_paths(path_str)
-            .filter(|p| p.is_absolute())
-            .collect::<Vec<_>>(),
-    )
+    let dirs = std::env::split_paths(path_str)
+        .filter(|p| p.is_absolute())
+        .collect::<Vec<_>>();
+
+    // Extract the env payload from the same output; missing env sentinels
+    // degrade to an empty map (PATH capture still succeeds). Only allow-listed
+    // vars survive parsing — the raw payload never leaves this function.
+    let credential_env =
+        extract_between_sentinels(&output_str, ENV_START_SENTINEL, ENV_END_SENTINEL)
+            .map(parse_credential_env)
+            .unwrap_or_default();
+
+    Some(LoginShellCapture {
+        dirs,
+        credential_env,
+    })
 }
 
-/// Extract PATH value from between sentinels in shell output.
-/// Returns Some(path_str) if both sentinels found, None otherwise.
+/// Extract the value between a sentinel pair in shell output.
+/// Returns Some(value) if both sentinels found, None otherwise.
 /// If sentinels appear multiple times, uses the last complete pair (last END, then last START before it).
 #[cfg(unix)]
-fn extract_path_from_sentinels(output: &str) -> Option<&str> {
+fn extract_between_sentinels<'a>(output: &'a str, start: &str, end: &str) -> Option<&'a str> {
     // Find the last END sentinel
-    let end_idx = output.rfind(PATH_END_SENTINEL)?;
+    let end_idx = output.rfind(end)?;
     // Find the last START sentinel before that END
-    let start_pos = output[..end_idx].rfind(PATH_START_SENTINEL)? + PATH_START_SENTINEL.len();
+    let start_pos = output[..end_idx].rfind(start)? + start.len();
     Some(&output[start_pos..end_idx])
 }
 
 #[cfg(not(unix))]
-fn capture_login_shell_path_with(_shell: Option<&str>) -> Vec<PathBuf> {
-    Vec::new()
+fn capture_login_shell_with(_shell: Option<&str>) -> LoginShellCapture {
+    LoginShellCapture::empty()
+}
+
+/// Returns the cached login-shell capture, running the shell at most once.
+fn login_shell_capture() -> &'static LoginShellCapture {
+    LOGIN_SHELL_CAPTURE.get_or_init(|| capture_login_shell_with(None))
 }
 
 /// Returns cached login-shell PATH directories (unix only).
 /// Runs the shell at most once, with a 5s timeout, and degrades silently on failure.
 pub(crate) fn login_shell_dirs() -> &'static [PathBuf] {
-    LOGIN_SHELL_DIRS.get_or_init(|| capture_login_shell_path_with(None))
+    &login_shell_capture().dirs
+}
+
+/// Returns the allow-listed credential env vars captured from the login shell
+/// (unix only, cached, same single shell invocation as [`login_shell_dirs`]).
+/// Empty on any capture failure or on non-unix platforms.
+///
+/// SECURITY: values are secrets — callers must never log, trace, or serialize
+/// them; keys-only if any logging is needed at all.
+pub fn login_shell_credential_env() -> &'static BTreeMap<String, String> {
+    &login_shell_capture().credential_env
 }
 
 /// Force the login-shell PATH capture (`$SHELL -ilc`, falling back to `-lc`;
@@ -446,9 +580,10 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
+        let dirs = capture.dirs;
         assert_eq!(dirs.len(), 2);
         assert_eq!(dirs[0], PathBuf::from("/custom/bin"));
         assert_eq!(dirs[1], PathBuf::from("/other/bin"));
@@ -457,15 +592,17 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn capture_login_shell_path_with_invalid_shell_degrades_silently() {
-        let dirs = capture_login_shell_path_with(Some("/nonexistent/shell"));
-        assert!(dirs.is_empty());
+        let capture = capture_login_shell_with(Some("/nonexistent/shell"));
+        assert!(capture.dirs.is_empty());
+        assert!(capture.credential_env.is_empty());
     }
 
     #[test]
     #[cfg(unix)]
     fn capture_login_shell_path_with_empty_shell_string_degrades_silently() {
-        let dirs = capture_login_shell_path_with(Some(""));
-        assert!(dirs.is_empty());
+        let capture = capture_login_shell_with(Some(""));
+        assert!(capture.dirs.is_empty());
+        assert!(capture.credential_env.is_empty());
     }
 
     #[test]
@@ -573,7 +710,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  echo 'Loading nvm...'\n  echo 'nvm initialized'\n  printf '__INTENT_PATH_S__/noise/bin:/test/bin__INTENT_PATH_E__'\n  echo 'Shell ready'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2);
@@ -601,7 +738,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '/missing/bin:/sentinels/bin'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert!(
@@ -630,7 +767,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  exit 1\nelif [ \"$1\" = \"-lc\" ]; then\n  printf '__INTENT_PATH_S__/fallback/bin:/backup/bin__INTENT_PATH_E__'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should fall back to -lc when -ilc fails");
@@ -658,7 +795,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/first/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__/last/bin:/final/bin__INTENT_PATH_E__'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should use last sentinel occurrence");
@@ -686,7 +823,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/valid/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__'\nfi\n",
         );
 
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -721,7 +858,7 @@ mod tests {
         write_fake_shell(&fake_shell, &script);
 
         let start = std::time::Instant::now();
-        let dirs = capture_login_shell_path_with(Some(fake_shell.to_str().unwrap()));
+        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
         let elapsed = start.elapsed();
         fs::remove_file(&fake_shell).ok();
 
@@ -735,6 +872,183 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "Should complete well within timeout (no deadlock), took {:?}",
             elapsed
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn credential_env_allow_list_matches_exact_and_prefix_names() {
+        assert!(is_credential_env_allow_listed("ANTHROPIC_API_KEY"));
+        assert!(is_credential_env_allow_listed("HUGGING_FACE_HUB_TOKEN"));
+        assert!(is_credential_env_allow_listed("XAI_API_KEY"));
+        assert!(is_credential_env_allow_listed("AUGGIE_API_TOKEN"));
+        assert!(is_credential_env_allow_listed("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(is_credential_env_allow_listed("CORTEX_ANY_SUFFIX"));
+        assert!(is_credential_env_allow_listed("GROK_API_KEY"));
+        assert!(is_credential_env_allow_listed("PI_API_KEY"));
+        // Prefix requires the trailing underscore
+        assert!(!is_credential_env_allow_listed("CLAUDEX_TOKEN"));
+        assert!(!is_credential_env_allow_listed("AUGGIE"));
+        assert!(!is_credential_env_allow_listed("PIN"));
+        assert!(!is_credential_env_allow_listed("HOME"));
+        assert!(!is_credential_env_allow_listed("PATH"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parse_credential_env_filters_and_tolerates_newlines() {
+        let payload = "ANTHROPIC_API_KEY=exact-value\0AUGGIE_SESSION=prefix-value\0RANDOM_SECRET=dropped\0MULTI=a\nb\0CODEX_KEY=line1\nline2\0";
+        let map = parse_credential_env(payload);
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("exact-value")
+        );
+        assert_eq!(
+            map.get("AUGGIE_SESSION").map(String::as_str),
+            Some("prefix-value")
+        );
+        assert_eq!(
+            map.get("CODEX_KEY").map(String::as_str),
+            Some("line1\nline2")
+        );
+        assert!(!map.contains_key("RANDOM_SECRET"));
+        assert!(!map.contains_key("MULTI"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_env_captures_allow_listed_vars_only() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_env_{pid}_{nanos}.sh"));
+
+        // Script emits PATH sentinels plus a NUL-separated env payload with
+        // an exact-name var, a prefix var, and a non-allow-listed var
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'ANTHROPIC_API_KEY=test-exact\\0AUGGIE_TOKEN=test-prefix\\0NOT_ALLOWED=dropped\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+        );
+
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(capture.dirs, vec![PathBuf::from("/env/bin")]);
+        assert_eq!(capture.credential_env.len(), 2);
+        assert_eq!(
+            capture
+                .credential_env
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("test-exact")
+        );
+        assert_eq!(
+            capture
+                .credential_env
+                .get("AUGGIE_TOKEN")
+                .map(String::as_str),
+            Some("test-prefix")
+        );
+        assert!(!capture.credential_env.contains_key("NOT_ALLOWED"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_env_value_containing_path_sentinel_does_not_corrupt_path() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_env_sentinel_{pid}_{nanos}.sh"));
+
+        // An env *value* containing the literal PATH end sentinel must not
+        // re-anchor the PATH extraction into the env payload.
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+        );
+
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
+        assert_eq!(
+            capture.credential_env.get("CODEX_EVIL").map(String::as_str),
+            Some("/fake/bin__INTENT_PATH_E__")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_env_value_with_newline_survives() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_env_nl_{pid}_{nanos}.sh"));
+
+        // Value contains a newline; NUL separation must keep it intact
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_MULTI=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
+        );
+
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(
+            capture
+                .credential_env
+                .get("CODEX_MULTI")
+                .map(String::as_str),
+            Some("line1\nline2")
+        );
+        assert_eq!(
+            capture.credential_env.get("HF_TOKEN").map(String::as_str),
+            Some("test-hf")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_login_shell_env_missing_sentinels_degrades_to_empty_map() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fake_shell = temp_dir.join(format!("fake_shell_env_none_{pid}_{nanos}.sh"));
+
+        // PATH sentinels only — env sentinels absent
+        write_fake_shell(
+            &fake_shell,
+            "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/only/bin__INTENT_PATH_E__'\nfi\n",
+        );
+
+        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
+        fs::remove_file(&fake_shell).ok();
+
+        assert_eq!(capture.dirs, vec![PathBuf::from("/only/bin")]);
+        assert!(
+            capture.credential_env.is_empty(),
+            "Missing env sentinels should degrade to an empty map"
         );
     }
 }

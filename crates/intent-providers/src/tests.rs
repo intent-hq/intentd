@@ -641,6 +641,23 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
 
+    // Spawn-time npx signal: an npx spawn always runs a Node child, so even
+    // a declared-Native provider (codex's npx fallback) gets the cap; the
+    // same provider without the signal (resolved native binary) stays
+    // untouched (intent-hq/monorepo#1661).
+    let codex = find_provider("codex").unwrap();
+    let codex_via_npx = args::build_provider_env_for_spawn(codex, None, None, None, None, true);
+    assert_eq!(
+        codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
+        Some("--max-old-space-size=8192"),
+        "codex npx-fallback spawn must get the heap cap"
+    );
+    let codex_native = args::build_provider_env_for_spawn(codex, None, None, None, None, false);
+    assert!(
+        !codex_native.contains_key("NODE_OPTIONS"),
+        "codex resolved-binary spawn must not get NODE_OPTIONS"
+    );
+
     // Override seam produces the requested cap for all V8 providers.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
     assert_eq!(args::max_old_space_mb(), 4096);
@@ -717,6 +734,28 @@ fn enhanced_path_prepends_bin_and_augment() {
         Some(inherited),
     );
     assert!(!rel.starts_with("auggie"));
+}
+
+#[test]
+fn enhanced_path_dirs_mirror_the_joined_spawn_path() {
+    // `enhanced_path_dirs_with` is the directory-list view of the exact PATH
+    // the spawned child gets (`enhanced_path_with`): same entries, same
+    // precedence order. `find_pi_cli` scans this list so its probe resolves
+    // the same binary the pi-acp child would.
+    let home = std::path::Path::new("/home/tester");
+    let inherited = std::ffi::OsStr::new("/usr/bin:/bin");
+    let bin = std::path::PathBuf::from("/opt/node/npx");
+    let joined = args::enhanced_path_with(Some(&bin), Some(home), Some(inherited));
+    let dirs = args::enhanced_path_dirs_with(Some(&bin), Some(home), Some(inherited));
+    let joined_parts: Vec<String> = joined.split([':', ';']).map(str::to_string).collect();
+    let dir_parts: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dir_parts, joined_parts, "dirs and joined PATH must agree");
+    // Spawn precedence: npx parent dir first, so a `pi` co-located with npx
+    // shadows one later on the inherited PATH — for probe and child alike.
+    assert_eq!(dirs[0], std::path::PathBuf::from("/opt/node"));
 }
 
 #[test]

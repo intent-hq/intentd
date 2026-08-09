@@ -23,7 +23,7 @@
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -140,14 +140,63 @@ fn origin_matches(cache_path: &Path, github_url: &str) -> bool {
     remote.url().ok() == Some(github_url)
 }
 
+/// Whether `url` is a GitHub URL for exactly `owner`/`repo` — the check the
+/// GitHub-scoped [`list_cached_branches`] reader uses to confirm a cached
+/// slot's `origin`. Accepts the HTTPS/SSH URL and scp-like forms, an optional
+/// `.git` suffix, userinfo, and a port; host, owner, and repo compare
+/// case-insensitively (GitHub slugs are case-insensitive). Anything not on
+/// `github.com` — another host or a local path — is not a GitHub slot.
+fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
+    let trimmed = url.trim().trim_end_matches('/');
+    let (rest, scp_like) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            let known = ["https", "http", "ssh", "git"]
+                .iter()
+                .any(|s| scheme.eq_ignore_ascii_case(s));
+            if !known {
+                return false;
+            }
+            (rest, false)
+        }
+        // No scheme: only the scp-like `user@host:owner/repo` form qualifies.
+        None => (trimmed, true),
+    };
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    let (authority, path) = if scp_like {
+        match rest.split_once(':') {
+            Some(pair) => pair,
+            None => return false,
+        }
+    } else {
+        match rest.split_once('/') {
+            Some(pair) => pair,
+            None => return false,
+        }
+    };
+    let host = authority.split(':').next().unwrap_or(authority);
+    if !host.eq_ignore_ascii_case("github.com") {
+        return false;
+    }
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let (Some(o), Some(r)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    let r = r.strip_suffix(".git").unwrap_or(r);
+    o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo)
+}
+
 /// Refresh an existing cache: fetch + prune, re-resolve the remote's default
 /// branch (`git remote set-head origin --auto` — a fetch alone never updates
 /// the `origin/HEAD` symref recorded at clone time, so a remote that changed
 /// its default branch would otherwise pin the cache to the obsolete one),
 /// then hard-reset that branch, sync every submodule work tree to its
-/// recorded gitlink, and drop untracked files so the work tree exactly
+/// recorded gitlink, drop untracked files so the work tree exactly
 /// mirrors the remote — a diverged, dirty, or polluted cache is clobbered,
-/// never merged. Every failure here is an anomaly the caller self-heals by
+/// never merged — and prune module git dirs the current `.gitmodules` no
+/// longer names. Every failure here is an anomaly the caller self-heals by
 /// re-cloning.
 fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     run_git(
@@ -224,6 +273,14 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
             CACHE_FETCH_TIMEOUT,
         )?;
     }
+    // Stale module git dirs: when upstream removes (or renames) a submodule,
+    // its `.git/modules/<name>` dir — created by an earlier clone/refresh —
+    // survives the reset and the cleans (which never enter `.git`) and would
+    // be byte-copied into every direct-hydrated checkout. Prune module dirs
+    // the current `.gitmodules` no longer names, after the cleans so the
+    // orphaned work tree's gitfile never dangles mid-refresh. An error here
+    // is a refresh anomaly like any other (the caller wipes and re-clones).
+    prune_stale_modules(cache_path)?;
     Ok(())
 }
 
@@ -295,6 +352,93 @@ where
         .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
+/// Branches read from a cached clone by [`list_cached_branches`] — no
+/// network I/O involved.
+#[derive(Debug)]
+pub struct CachedBranches {
+    /// Remote-tracking branch names (`refs/remotes/origin/*` with the `HEAD`
+    /// symref excluded), sorted.
+    pub branches: Vec<String>,
+    /// The remote's default branch per the `origin/HEAD` symref recorded at
+    /// clone time, when resolvable.
+    pub default_branch: Option<String>,
+}
+
+/// List branches from the cached clone at `<cache_root>/<owner>/<repo>`
+/// without touching the network. A cache miss (missing dir or an unopenable
+/// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
+/// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
+/// re-clone is never observed mid-mutation.
+///
+/// The cache is keyed by `<owner>/<repo>` segments only, while creation
+/// accepts GitHub-style URLs from any host and treats same-named origins as
+/// distinct (see [`ensure_cached_repo`]'s origin check). This GitHub-scoped
+/// reader therefore verifies the slot's `origin` actually points at
+/// `github.com/<owner>/<repo>`; a slot occupied by another host's clone (or
+/// a local seed) is a miss, never another repo's branch list.
+pub async fn list_cached_branches(
+    cache_root: &Path,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<CachedBranches>> {
+    validate_segment("owner", owner)?;
+    validate_segment("repo", repo)?;
+    let cache_path = cache_root.join(owner).join(repo);
+
+    let lock = lock_for(&cache_path);
+    let _guard = lock.lock().await;
+
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    tokio::task::spawn_blocking(move || list_cached_branches_blocking(&cache_path, &owner, &repo))
+        .await
+        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
+}
+
+/// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
+/// the cached clone. An unopenable repo counts as a cache miss (the write
+/// path self-heals it on the next ensure), as does an `origin` that is not
+/// `github.com/<owner>/<repo>`.
+fn list_cached_branches_blocking(
+    cache_path: &Path,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Option<CachedBranches>> {
+    let Ok(repo) = Repository::open(cache_path) else {
+        return Ok(None);
+    };
+    let origin_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().ok().map(String::from));
+    if !origin_url.is_some_and(|url| origin_is_github_slot(&url, owner, repo_name)) {
+        return Ok(None);
+    }
+    let mut branches = Vec::new();
+    let iter = repo
+        .branches(Some(git2::BranchType::Remote))
+        .map_err(map_git_err)?;
+    for entry in iter {
+        let (branch, _) = entry.map_err(map_git_err)?;
+        let Some(name) = branch.name().map_err(map_git_err)? else {
+            continue;
+        };
+        if let Some(short) = name.strip_prefix("origin/") {
+            if short != "HEAD" {
+                branches.push(short.to_string());
+            }
+        }
+    }
+    branches.sort_unstable();
+    // A vanished / non-symbolic `origin/HEAD` is an anomaly the write path
+    // self-heals; the read path just omits the default branch.
+    let default_branch = default_branch(&repo).ok();
+    Ok(Some(CachedBranches {
+        branches,
+        default_branch,
+    }))
+}
+
 /// Provision a **standalone** plain-clone checkout from a cached repo (the
 /// `direct` fallback of `workspace.create` cache hydration, used when the
 /// filesystem cannot CoW-clone the cache into the workspaces root).
@@ -364,6 +508,18 @@ pub fn provision_direct_checkout(
 /// resolution, so no config value references the cache and deleting the cache
 /// never breaks the checkout. Skipped entirely (no subprocess) when the
 /// checkout has no `.gitmodules`.
+///
+/// The copy is filtered to **live** top-level modules only (the same
+/// liveness rule as the refresh prune, seeded from the checkout's
+/// `.gitmodules`), so a cache still carrying a dead module dir — e.g. one
+/// refreshed before pruning existed — never leaks it into the checkout.
+/// Nested subtrees copy wholesale: the cache work trees sit at the tip,
+/// and a checkout at an older `base_ref` can select a gitlink that still
+/// names a nested module the tip dropped, so nested liveness is only
+/// decidable after the update populates the checkout's own work trees —
+/// the closing [`prune_stale_modules`] then removes the dead nested dirs
+/// the copy kept. A liveness/copy/prune failure follows the caller's
+/// existing degrade-with-warning path.
 fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Result<()> {
     if !crate::submodule::has_submodules(checkout_path) {
         return Ok(());
@@ -371,13 +527,34 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
     let src = cache_path.join(".git").join("modules");
     let dst = checkout_path.join(".git").join("modules");
     if src.is_dir() && !dst.exists() {
-        copy_dir_recursive(&src, &dst).map_err(|e| {
+        let copied = match collect_module_liveness(checkout_path, false)? {
+            Some(live) => copy_modules_subdir(&src, &dst, Path::new(""), &live),
+            // A module name/path we cannot map conservatively: copy
+            // everything rather than risk dropping a live module.
+            None => copy_dir_recursive(&src, &dst),
+        };
+        copied.map_err(|e| {
             Error::Internal(format!(
                 "cannot copy submodule git dirs from the cache: {e}"
             ))
         })?;
     }
     update_checkout_submodules(checkout_path)?;
+    // Only now do the checkout's work trees match its checked-out ref, so
+    // nested liveness is decidable: drop the dead nested module dirs the
+    // wholesale copy above kept.
+    prune_stale_modules(checkout_path)?;
+    sync_submodule_urls(checkout_path)
+}
+
+/// Re-point recorded submodule URLs (`submodule.<name>.url` in the
+/// checkout's config and each submodule's own `remote.origin.url`) at what
+/// `.gitmodules` currently says (`git submodule sync --recursive`). The
+/// shared closing step of both hydration paths
+/// ([`hydrate_submodules_from_cache`] and
+/// [`crate::cow_checkout::provision_cow_checkout`]) so no checkout keeps a
+/// URL copied from its source. No token: this rewrites local config only.
+pub(crate) fn sync_submodule_urls(checkout_path: &Path) -> Result<()> {
     run_git(
         checkout_path,
         &["submodule", "sync", "--recursive"],
@@ -428,15 +605,214 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &to)?;
-        } else if ty.is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &to)?;
-            #[cfg(not(unix))]
-            {
-                std::fs::copy(entry.path(), &to)?;
-            }
         } else {
-            std::fs::copy(entry.path(), &to)?;
+            copy_dir_entry(&entry, &ty, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy one non-directory dir entry (file or symlink) to `to`.
+fn copy_dir_entry(
+    entry: &std::fs::DirEntry,
+    ty: &std::fs::FileType,
+    to: &Path,
+) -> std::io::Result<()> {
+    if ty.is_symlink() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, to)?;
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(entry.path(), to)?;
+        }
+    } else {
+        std::fs::copy(entry.path(), to)?;
+    }
+    Ok(())
+}
+
+/// Live submodules at one `.git/modules` nesting level: each module's git
+/// dir path relative to that level's `modules/` dir (the `.gitmodules`
+/// module *name*, one directory component per `/`-separated segment) mapped
+/// to the liveness of the module's own nested `modules/` subtree. `None`
+/// marks a live module whose nesting is opaque — its work tree could not be
+/// read, or nested liveness was deliberately not judged (the hydration
+/// copy) — so its subtree is kept (or copied) wholesale rather than guessed
+/// at.
+#[derive(Default)]
+struct ModuleLiveness {
+    modules: BTreeMap<PathBuf, Option<ModuleLiveness>>,
+}
+
+/// Read the live module set from `root/.gitmodules`, recursing into nested
+/// submodules through the work trees under `root` when `recurse_nested` is
+/// set — valid only when those work trees sit at the same ref as the
+/// `.gitmodules` chain being read (the refresh prune on the cache, the
+/// post-update prune on a checkout). With `recurse_nested` unset every
+/// module's nesting is opaque: the hydration copy filter uses this because
+/// at copy time the only populated work trees are the cache's, which sit at
+/// the tip — a checkout at an older `base_ref` can select a gitlink that
+/// still names a nested module the tip dropped, so judging nested liveness
+/// from the tip could drop a live module's git dir.
+///
+/// Returns `Ok(None)` when a module name or path cannot be mapped to a
+/// module dir safely (non-UTF-8, absolute, `..`, …): the caller must then
+/// treat the whole level as opaque and keep every dir — a kept dead dir is
+/// harmless, a wrongly-pruned live one is not. A missing `.gitmodules`
+/// yields an empty (all-dead) set; an unreadable one is an error.
+fn collect_module_liveness(root: &Path, recurse_nested: bool) -> Result<Option<ModuleLiveness>> {
+    let gitmodules = root.join(".gitmodules");
+    if !gitmodules.exists() {
+        return Ok(Some(ModuleLiveness::default()));
+    }
+    let cfg = git2::Config::open(&gitmodules).map_err(map_git_err)?;
+    let mut modules = BTreeMap::new();
+    let mut entries = cfg.entries(None).map_err(map_git_err)?;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(map_git_err)?;
+        let Ok(name) = entry.name() else {
+            return Ok(None);
+        };
+        let Some(module) = name
+            .strip_prefix("submodule.")
+            .and_then(|n| n.strip_suffix(".path"))
+        else {
+            continue;
+        };
+        let Ok(worktree_rel) = entry.value() else {
+            return Ok(None);
+        };
+        let (Some(module_dir), Some(worktree_rel)) =
+            (safe_rel_path(module), safe_rel_path(worktree_rel))
+        else {
+            return Ok(None);
+        };
+        let worktree = root.join(worktree_rel);
+        let nested = if recurse_nested && worktree.is_dir() {
+            collect_module_liveness(&worktree, true)?
+        } else {
+            None
+        };
+        modules.insert(module_dir, nested);
+    }
+    Ok(Some(ModuleLiveness { modules }))
+}
+
+/// `s` as a relative path of plain (`Normal`) components only, or `None`
+/// when it is empty or carries anything (`..`, a root, a leading `./`) that
+/// could make it name something outside — or alias something inside — the
+/// modules dir (or, for [`crate::cow_checkout`]'s orphan cleanup, the
+/// checkout work tree).
+pub(crate) fn safe_rel_path(s: &str) -> Option<PathBuf> {
+    let p = Path::new(s);
+    p.components().next()?;
+    p.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+        .then(|| p.components().collect())
+}
+
+/// Prune dead module git dirs from a work tree's `.git/modules` tree: every
+/// dir the current `.gitmodules` chain no longer names as a module (or an
+/// ancestor component of one) is removed. A liveness set that cannot be
+/// mapped safely keeps everything — never guess a live module away. Used on
+/// the cache after a refresh and shared with [`crate::cow_checkout`], whose
+/// byte copy carries the source's module dirs even when the checked-out ref
+/// no longer registers them.
+pub(crate) fn prune_stale_modules(cache_path: &Path) -> Result<()> {
+    let modules_dir = cache_path.join(".git").join("modules");
+    if !modules_dir.is_dir() {
+        return Ok(());
+    }
+    match collect_module_liveness(cache_path, true)? {
+        Some(live) => prune_modules_subdir(&modules_dir, Path::new(""), &live),
+        None => Ok(()),
+    }
+}
+
+/// Depth-first prune of one `modules/` level: a dir naming a live module is
+/// kept (recursing into its nested `modules/` subtree when its liveness is
+/// known), a dir that is an ancestor component of a live multi-segment
+/// module name is descended into, and anything else is a dead module's git
+/// dir — removed. Non-directory entries are left alone.
+fn prune_modules_subdir(fs_dir: &Path, rel: &Path, live: &ModuleLiveness) -> Result<()> {
+    let io_err =
+        |e: std::io::Error| Error::Internal(format!("cannot prune stale module dirs: {e}"));
+    for entry in std::fs::read_dir(fs_dir).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        if !entry.file_type().map_err(io_err)?.is_dir() {
+            continue;
+        }
+        let child_rel = rel.join(entry.file_name());
+        match live.modules.get(&child_rel) {
+            Some(Some(nested)) => {
+                let nested_modules = entry.path().join("modules");
+                if nested_modules.is_dir() {
+                    prune_modules_subdir(&nested_modules, Path::new(""), nested)?;
+                }
+            }
+            // Live but opaque nesting: keep the subtree wholesale.
+            Some(None) => {}
+            None => {
+                if live.modules.keys().any(|m| m.starts_with(&child_rel)) {
+                    prune_modules_subdir(&entry.path(), &child_rel, live)?;
+                } else {
+                    std::fs::remove_dir_all(entry.path()).map_err(io_err)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filtered counterpart of [`copy_dir_recursive`] for one `modules/` level:
+/// live module dirs are copied (their nested `modules/` subtree filtered in
+/// turn when its liveness is known), ancestor components of live
+/// multi-segment module names are descended into, dead module dirs are
+/// skipped. Non-directory entries copy as-is.
+fn copy_modules_subdir(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    live: &ModuleLiveness,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if !ty.is_dir() {
+            copy_dir_entry(&entry, &ty, &to)?;
+            continue;
+        }
+        let child_rel = rel.join(entry.file_name());
+        match live.modules.get(&child_rel) {
+            Some(Some(nested)) => copy_module_dir(&entry.path(), &to, nested)?,
+            Some(None) => copy_dir_recursive(&entry.path(), &to)?,
+            None => {
+                if live.modules.keys().any(|m| m.starts_with(&child_rel)) {
+                    copy_modules_subdir(&entry.path(), &to, &child_rel, live)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy one live module's git dir, filtering only its nested `modules/`
+/// subtree through `nested` — everything else (objects, refs, config, …)
+/// copies verbatim.
+fn copy_module_dir(src: &Path, dst: &Path, nested: &ModuleLiveness) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() && entry.file_name() == "modules" {
+            copy_modules_subdir(&entry.path(), &to, Path::new(""), nested)?;
+        } else if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            copy_dir_entry(&entry, &ty, &to)?;
         }
     }
     Ok(())
@@ -674,6 +1050,46 @@ mod tests {
         index.remove_path(Path::new(".gitmodules")).unwrap();
         index.write().unwrap();
         commit_super_index(super_path, "remove submodule");
+    }
+
+    /// Remove ONE submodule at `sub_rel` (gitlink + its `.gitmodules` entry)
+    /// and commit, keeping every other submodule registered — how an
+    /// upstream deletes one of several submodules.
+    fn commit_one_submodule_removal(super_path: &Path, sub_rel: &str) {
+        let repo = Repository::open(super_path).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(sub_rel)).unwrap();
+        {
+            let mut cfg = git2::Config::open(&super_path.join(".gitmodules")).unwrap();
+            cfg.remove(&format!("submodule.{sub_rel}.path")).unwrap();
+            cfg.remove(&format!("submodule.{sub_rel}.url")).unwrap();
+        }
+        index.add_path(Path::new(".gitmodules")).unwrap();
+        index.write().unwrap();
+        commit_super_index(super_path, "remove one submodule");
+    }
+
+    /// Fixture with a nested submodule chain: superproject → `sub` (child)
+    /// → `inner` (grandchild). Returns `(superproject, child, grandchild)`.
+    fn nested_submodule_fixture(tag: &str) -> (TempDir, TempDir, TempDir) {
+        let grandchild = init_repo(&format!("{tag}-grand"));
+        commit_file(grandchild.path(), "g.txt", "deep one\n");
+        let child = init_repo(&format!("{tag}-child"));
+        commit_file(child.path(), "c.txt", "sub one\n");
+        add_submodule(child.path(), grandchild.path(), "inner");
+        let superproject = init_repo(&format!("{tag}-super"));
+        commit_file(superproject.path(), "a.txt", "one\n");
+        add_submodule(superproject.path(), child.path(), "sub");
+        (superproject, child, grandchild)
+    }
+
+    /// Plant a fake (stale) module git dir with a file inside, as a removed
+    /// submodule's leftover would look.
+    fn plant_dead_module_dir(modules_dir: &Path, rel: &str) -> PathBuf {
+        let dir = modules_dir.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        dir
     }
 
     /// Self-cleaning scratch dir for a cache root (testutil's TempDir is tied
@@ -1151,6 +1567,168 @@ mod tests {
         assert!(!checkout.exists(), "partial checkout is removed on failure");
     }
 
+    /// Retarget a cache's `origin` remote at a github.com URL, standing in
+    /// for a cache cloned from GitHub (tests seed over `file://` to stay
+    /// offline; the reader only inspects the recorded URL).
+    fn set_github_origin(cache_path: &Path, owner: &str, repo: &str) {
+        Repository::open(cache_path)
+            .unwrap()
+            .remote_set_url("origin", &format!("https://github.com/{owner}/{repo}.git"))
+            .unwrap();
+    }
+
+    /// A warm cache lists its remote-tracking branches (sorted, `HEAD`
+    /// excluded) plus the default branch from `origin/HEAD` — all read-only.
+    #[tokio::test]
+    async fn list_cached_branches_reads_warm_cache() {
+        let origin = init_repo("repocache-listcached-warm");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::create_branch(origin.path(), "feature-x");
+        let root = CacheRoot::new("listcached-warm");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        set_github_origin(&cache, "acme", "widget");
+        let default = Repository::open(origin.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand()
+            .unwrap()
+            .to_string();
+
+        let cached = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap()
+            .expect("warm cache must be a hit");
+
+        let mut expected = vec![default.clone(), "feature-x".to_string()];
+        expected.sort_unstable();
+        assert_eq!(cached.branches, expected);
+        assert_eq!(cached.default_branch, Some(default));
+    }
+
+    /// A slot whose `origin` is not `github.com/<owner>/<repo>` — another
+    /// host's clone or a local seed occupying the same `<owner>/<repo>` key —
+    /// is a miss, never another repo's branch list.
+    #[tokio::test]
+    async fn list_cached_branches_foreign_origin_is_none() {
+        let origin = init_repo("repocache-listcached-foreign");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("listcached-foreign");
+        let cache = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The `file://` seed origin itself is not a GitHub slot.
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "file:// origin must be a miss");
+
+        // Neither is the same owner/repo pair on another host.
+        Repository::open(&cache)
+            .unwrap()
+            .remote_set_url("origin", "https://gitlab.example.com/acme/widget.git")
+            .unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "foreign-host origin must be a miss");
+
+        // A github.com origin for a *different* slug is a miss too.
+        Repository::open(&cache)
+            .unwrap()
+            .remote_set_url("origin", "https://github.com/other/widget.git")
+            .unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none(), "wrong-slug github origin must be a miss");
+    }
+
+    /// [`origin_is_github_slot`] URL-form coverage: HTTPS/SSH/scp-like
+    /// github.com origins for the slug match (case-insensitively, `.git`
+    /// optional); other hosts, schemes, slugs, and path shapes do not.
+    #[test]
+    fn origin_is_github_slot_recognizes_github_urls() {
+        for url in [
+            "https://github.com/acme/widget.git",
+            "https://github.com/acme/widget",
+            "https://github.com/Acme/Widget.git",
+            "https://oauth2:@github.com/acme/widget.git",
+            "https://GITHUB.COM/acme/widget/",
+            "ssh://git@github.com/acme/widget.git",
+            "ssh://git@github.com:22/acme/widget.git",
+            "git@github.com:acme/widget.git",
+        ] {
+            assert!(origin_is_github_slot(url, "acme", "widget"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/acme/widget.git",
+            "https://ghe.example.com/acme/widget.git",
+            "file:///tmp/acme/widget",
+            "/tmp/acme/widget",
+            "https://github.com/other/widget.git",
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/widget/extra",
+            "https://github.com/widget.git",
+            "https://github.com.evil.com/acme/widget.git",
+            "git@gitlab.com:acme/widget.git",
+        ] {
+            assert!(!origin_is_github_slot(url, "acme", "widget"), "{url}");
+        }
+    }
+
+    /// A cold cache (no dir, or a dir that is not a repository) is a graceful
+    /// `None`, never an error.
+    #[tokio::test]
+    async fn list_cached_branches_cold_cache_is_none() {
+        let root = CacheRoot::new("listcached-cold");
+
+        // No cache dir at all.
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none());
+
+        // A dir that is not a repository (interrupted prior clone leftovers).
+        let path = root.path().join("acme").join("widget");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("junk.txt"), "leftover").unwrap();
+        let miss = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(miss.is_none());
+    }
+
+    /// Invalid owner/repo segments are rejected before any filesystem work,
+    /// same as the write path.
+    #[tokio::test]
+    async fn list_cached_branches_rejects_invalid_segments() {
+        let root = CacheRoot::new("listcached-badseg");
+        for (owner, repo) in [
+            ("", "repo"),
+            ("owner", ""),
+            ("..", "repo"),
+            ("owner", ".."),
+            ("a/b", "repo"),
+            ("-owner", "repo"),
+        ] {
+            let err = list_cached_branches(root.path(), owner, repo)
+                .await
+                .expect_err("invalid segment must be rejected");
+            assert!(matches!(err, Error::InvalidParams(_)), "{owner:?}/{repo:?}");
+        }
+    }
+
     /// Several concurrent ensures for the same repo all succeed and agree on
     /// the final state (the lock serializes the refresh/clone work).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1546,6 +2124,235 @@ mod tests {
         assert!(
             !checkout.join("sub").join("c.txt").exists(),
             "submodule is left unpopulated"
+        );
+    }
+
+    /// Upstream removes one of two submodules: the refresh prunes the dead
+    /// module's `.git/modules` dir from the cache while the surviving
+    /// module's dir stays intact and functional — no re-clone.
+    #[tokio::test]
+    async fn refresh_prunes_dead_module_dir_keeps_live_one() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-prune");
+        let doomed = init_repo("repocache-prune-doomed");
+        commit_file(doomed.path(), "d.txt", "doomed one\n");
+        add_submodule(origin.path(), doomed.path(), "doomedsub");
+        let root = CacheRoot::new("prune");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let modules = path.join(".git").join("modules");
+        assert!(modules.join("sub").is_dir());
+        assert!(modules.join("doomedsub").is_dir());
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        commit_one_submodule_removal(origin.path(), "doomedsub");
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "prune happens in-place, no re-clone");
+        assert!(
+            !modules.join("doomedsub").exists(),
+            "dead module git dir is pruned"
+        );
+        assert!(
+            modules.join("sub").is_dir(),
+            "live module git dir survives the prune"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "live submodule work tree still functional"
+        );
+        // A subsequent refresh with the pruned cache still succeeds in-place.
+        let path3 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        assert_eq!(path, path3);
+        assert!(marker.exists(), "pruned cache refreshes cleanly");
+    }
+
+    /// A live nested submodule's module dir (`.git/modules/sub/modules/inner`)
+    /// survives the prune, while a planted dead dir at both nesting levels is
+    /// removed.
+    #[tokio::test]
+    async fn refresh_prune_preserves_live_nested_module() {
+        allow_file_submodules();
+        let (origin, _child, grandchild) = nested_submodule_fixture("repocache-prunenest");
+        let root = CacheRoot::new("prunenest");
+        let url = file_url(origin.path());
+
+        let path = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let modules = path.join(".git").join("modules");
+        let inner_module = modules.join("sub").join("modules").join("inner");
+        assert!(inner_module.is_dir(), "nested module dir exists");
+        let dead_top = plant_dead_module_dir(&modules, "deadtop");
+        let dead_nested = plant_dead_module_dir(&modules.join("sub").join("modules"), "deadinner");
+        let marker = path.join(".git").join("intent-cache-marker");
+        std::fs::write(&marker, "keep").unwrap();
+
+        let path2 = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        assert_eq!(path, path2);
+        assert!(marker.exists(), "prune happens in-place, no re-clone");
+        assert!(!dead_top.exists(), "dead top-level module dir is pruned");
+        assert!(!dead_nested.exists(), "dead nested module dir is pruned");
+        assert!(inner_module.is_dir(), "live nested module dir survives");
+        assert_eq!(
+            std::fs::read_to_string(path.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "nested submodule work tree still functional"
+        );
+        assert_eq!(
+            head_sha(&path.join("sub").join("inner")),
+            head_sha(grandchild.path())
+        );
+    }
+
+    /// Direct hydration from a cache still carrying dead module dirs (a cache
+    /// refreshed before pruning existed): the checkout's `.git/modules` gets
+    /// only the live modules, at both nesting levels, and the live ones stay
+    /// functional.
+    #[tokio::test]
+    async fn direct_checkout_filters_dead_module_dirs() {
+        allow_file_submodules();
+        let (origin, _child, grandchild) = nested_submodule_fixture("repocache-hydratefilter");
+        let root = CacheRoot::new("hydratefilter");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let cache_modules = cache.join(".git").join("modules");
+        plant_dead_module_dir(&cache_modules, "deadtop");
+        plant_dead_module_dir(&cache_modules.join("sub").join("modules"), "deadinner");
+
+        let checkout_root = CacheRoot::new("hydratefilter-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        let modules = checkout.join(".git").join("modules");
+        assert!(
+            !modules.join("deadtop").exists(),
+            "dead top-level module dir is not copied into the checkout"
+        );
+        assert!(
+            !modules
+                .join("sub")
+                .join("modules")
+                .join("deadinner")
+                .exists(),
+            "dead nested module dir is not copied into the checkout"
+        );
+        assert!(modules.join("sub").is_dir(), "live module dir is copied");
+        assert!(
+            modules.join("sub").join("modules").join("inner").is_dir(),
+            "live nested module dir is copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "live submodule work tree is populated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "live nested submodule work tree is populated"
+        );
+        assert_eq!(
+            head_sha(&checkout.join("sub").join("inner")),
+            head_sha(grandchild.path())
+        );
+        // The cache keeps its dead dirs — hydration filters, never mutates
+        // the cache.
+        assert!(cache_modules.join("deadtop").is_dir());
+    }
+
+    /// A `base_ref` older than the cache tip can select a `sub` gitlink
+    /// whose own `.gitmodules` still names a nested module the tip dropped.
+    /// The hydration copy must not judge nested liveness from the tip's
+    /// work trees: a nested module gitdir the cache still carries is copied
+    /// wholesale and the offline update populates it (regression: the
+    /// nested filter read the tip's `.gitmodules`, dropping the
+    /// live-at-base gitdir and leaving the nested submodule unpopulated).
+    #[tokio::test]
+    async fn direct_checkout_populates_nested_submodule_dropped_at_tip() {
+        allow_file_submodules();
+        let (origin, child, grandchild) = nested_submodule_fixture("repocache-nestedbase");
+        let root = CacheRoot::new("nestedbase");
+        let url = file_url(origin.path());
+        // Pin `base` while the nested chain is fully live, and seed the
+        // cache there so it holds the nested module gitdir.
+        crate::testutil::create_branch(origin.path(), "base");
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let inner_gitdir = cache
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("modules")
+            .join("inner");
+        assert!(
+            inner_gitdir.is_dir(),
+            "seeded cache holds the nested gitdir"
+        );
+
+        // Upstream drops the nested module and the superproject follows:
+        // the tip no longer names `inner` anywhere.
+        commit_one_submodule_removal(child.path(), "inner");
+        let new_sub_sha = head_sha(child.path());
+        commit_gitlink_bump(origin.path(), "sub", &new_sub_sha);
+
+        // Refresh the cache to the new tip, restoring the nested gitdir the
+        // refresh prune drops — the shape of a cache refreshed before
+        // pruning existed, still carrying a history-only module.
+        let saved = CacheRoot::new("nestedbase-saved");
+        let saved_inner = saved.path().join("inner");
+        copy_dir_recursive(&inner_gitdir, &saved_inner).unwrap();
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        assert!(
+            !inner_gitdir.exists(),
+            "refresh prunes the tip-dead nested gitdir"
+        );
+        copy_dir_recursive(&saved_inner, &inner_gitdir).unwrap();
+
+        let inner_sha = head_sha(grandchild.path());
+        // No network: the nested module's only remote goes away, so its
+        // population must come from the copied gitdir alone.
+        drop(grandchild);
+        drop(child);
+
+        let checkout_root = CacheRoot::new("nestedbase-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", Some("base")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("inner").join("g.txt")).unwrap(),
+            "deep one\n",
+            "nested submodule work tree is populated at the base ref"
+        );
+        assert_eq!(head_sha(&checkout.join("sub").join("inner")), inner_sha);
+        assert!(
+            checkout
+                .join(".git")
+                .join("modules")
+                .join("sub")
+                .join("modules")
+                .join("inner")
+                .is_dir(),
+            "nested module gitdir is copied despite being dead at the tip"
         );
     }
 }

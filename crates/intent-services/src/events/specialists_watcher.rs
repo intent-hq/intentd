@@ -420,6 +420,7 @@ mod tests {
 
     use super::super::filter::SubscriptionFilter;
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory (workspace root / user specialists tier).
     struct TempDir {
@@ -532,16 +533,14 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `rm -rf` of the whole tier directory: possibly only directory-level
         // events surface, which the filter must still forward (#612).
         std::fs::remove_dir_all(&proj).expect("remove tier dir");
 
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),
             1,
@@ -573,22 +572,18 @@ mod tests {
         // establish its parent watch before the tier dir is created below, and
         // under nextest's oversubscribed parallelism a 250ms warm-up can lose
         // that race, so the creation is never observed and the drain returns
-        // empty. The drains' first-event budget is `quiet` (the second arg),
-        // not the total deadline — the loop breaks after one `quiet` window of
-        // silence — so `quiet` is widened 2s -> 8s here (and the total deadline
-        // to match) to tolerate fsevents detection + forward-task latency under
-        // load. Behavior under test is unchanged; only the headroom before the
-        // "no event" verdict.
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        // empty. The drains here wait up to `LIVENESS` for the first event
+        // (monorepo#1630) with a generous quiet window, so only the headroom
+        // before the "no event" verdict widens — behavior under test is
+        // unchanged.
+        _watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(750)).await;
 
         std::fs::create_dir_all(&proj).expect("create tier dir");
         std::fs::write(proj.join("late.md"), specialist_md("Late", "body"))
             .expect("write specialist");
 
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(8), LIVENESS).await;
         assert!(
             !events.is_empty(),
             "root created after start must emit, got {events:?}"
@@ -598,9 +593,7 @@ mod tests {
         // Subsequent changes under the promoted root are detected.
         std::fs::write(proj.join("late.md"), specialist_md("Late", "new body"))
             .expect("modify specialist");
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(6), Duration::from_secs(15))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(6), LIVENESS).await;
         assert!(
             !events.is_empty(),
             "changes under the promoted root must emit, got {events:?}"
@@ -626,7 +619,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(LIVENESS).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
@@ -640,9 +633,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),
             1,
@@ -675,7 +666,7 @@ mod tests {
             ],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         std::fs::write(
@@ -684,9 +675,7 @@ mod tests {
         )
         .expect("write user specialist");
 
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         let mut ws_ids: Vec<&str> = events.iter().map(|e| e.workspace_id.as_str()).collect();
         ws_ids.sort_unstable();
         assert_eq!(
@@ -720,7 +709,7 @@ mod tests {
             vec![(ws_id.clone(), ws.path.clone())],
             Some(user.path.clone()),
         );
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rewrite the identical bytes: the file event fires but the resolved
@@ -741,9 +730,7 @@ mod tests {
         // A real content change afterwards still emits (the watcher is live).
         std::fs::write(&file, specialist_md("Steady", "different body"))
             .expect("write changed content");
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),
             1,
@@ -776,11 +763,11 @@ mod tests {
             vec![],
             Some(user.path.clone()),
         );
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Registration alone must not emit (fingerprint primed at add time).
@@ -798,9 +785,7 @@ mod tests {
         // A project-tier change after registration emits for the new workspace.
         std::fs::write(proj.join("added.md"), specialist_md("Added", "body"))
             .expect("write specialist");
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),
             1,
@@ -886,9 +871,7 @@ mod tests {
         );
 
         watcher.resume_workspace(ws_id.clone(), ws.path.clone());
-        let events =
-            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
-                .await;
+        let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
         assert_eq!(
             events.len(),
             1,

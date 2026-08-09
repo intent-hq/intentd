@@ -42,6 +42,15 @@ pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.14";
 /// model-catalog probe in `intent-services::provider_models`.
 pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
 
+/// Minimum `pi` CLI version the pinned [`PI_ACP_NPX_PACKAGE`] adapter
+/// requires. Feeds the pure version-gate decision in
+/// [`crate::version_gate`]; re-check when bumping the pin.
+pub const PI_CLI_MIN_VERSION: &str = "0.80.4";
+
+/// Pi CLI version requirement for user-facing messages. Must match
+/// [`PI_CLI_MIN_VERSION`]; re-check when bumping the pin.
+pub const PI_CLI_REQUIREMENT: &str = "Pi CLI 0.80.4+";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
@@ -303,7 +312,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
-        // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
+        // Declared Native (the `empty()` default) for the Rust `codex-acp`
+        // binary: no V8 heap-cap env on that path. The npx fallback
+        // (`@agentclientprotocol/codex-acp`, pure Node) is detected at spawn
+        // time and DOES get the NODE_OPTIONS heap cap
+        // (`build_provider_env_for_spawn`, intent-hq/monorepo#1661).
         can_be_disabled: true,
         // The pinned @agentclientprotocol/codex-acp adapter (1.1.14) ignores
         // `_meta.developerInstructions` (verified empirically, #479), so the

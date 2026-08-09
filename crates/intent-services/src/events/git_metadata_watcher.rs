@@ -745,15 +745,18 @@ mod tests {
         )
         .expect("git repo must gain a metadata watch");
         // Let the OS watch settle before mutating.
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
         // (HEAD rewrite; no worktree change). Retried because the shared stream
         // can begin delivering a little after registration lands, and a HEAD
-        // rewrite that predates delivery leaves nothing to observe.
+        // rewrite that predates delivery leaves nothing to observe. Attempt
+        // count sized so the total probe budget (attempts x 1500ms) reaches
+        // `LIVENESS` — a pure-liveness bound (monorepo#1630).
+        let attempts = crate::events::LIVENESS.as_millis() / 1500;
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             let target = if i % 2 == 0 {
                 "refs/heads/other"
             } else {
@@ -979,7 +982,7 @@ mod tests {
             root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
-        _watcher.wait_established(Duration::from_secs(10)).await;
+        _watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.

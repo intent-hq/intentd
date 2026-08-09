@@ -429,6 +429,7 @@ mod tests {
     use tokio::time::{timeout, Instant};
 
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory (workspace roots).
     struct TempDir {
@@ -609,7 +610,7 @@ mod tests {
     /// trailing sleep is the usual FSEvents/inotify settle margin: `watch()` has
     /// returned, but the backend needs a moment before it reports changes.
     async fn wait_for_root(registry: &WatcherRegistry, root: &std::path::Path, want: bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
         loop {
             let ready = match registry.root_established(root) {
                 Some(established) => want && established,
@@ -634,7 +635,10 @@ mod tests {
         root: &std::path::Path,
     ) {
         let probe = root.join(".watch-probe");
-        for attempt in 0..40 {
+        // Attempt count sized so the total probe budget (attempts x 500ms)
+        // reaches `LIVENESS` — a pure-liveness bound (monorepo#1630).
+        let attempts = LIVENESS.as_millis() / 500;
+        for attempt in 0..attempts {
             std::fs::write(&probe, format!("{attempt}")).expect("write probe");
             if next_file_event(sub, ws_id, Duration::from_millis(500))
                 .await
@@ -669,7 +673,7 @@ mod tests {
 
         std::fs::write(root.path.join("hello.txt"), "hi").expect("write file");
 
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(ev.is_some(), "boot-time workspace must emit file events");
     }
 
@@ -695,7 +699,7 @@ mod tests {
         wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-create.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "workspace registered after start must emit file events"
@@ -745,7 +749,7 @@ mod tests {
         wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-open.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "reopened workspace must emit file events (path resolved via services)"
@@ -783,7 +787,7 @@ mod tests {
         confirm_watch_live(&mut sub, &ws_b.id, &root_b).await;
 
         std::fs::write(root_a.join("in-a.txt"), "hi").expect("write in a");
-        let ev = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(10))
+        let ev = next_file_event(&mut sub, &ws_a.id, LIVENESS)
             .await
             .expect("workspace a must emit for its own file");
         assert_eq!(ev.data["relativePath"], "in-a.txt");
@@ -798,7 +802,7 @@ mod tests {
         // The reverse direction too, so the assertion is not just about
         // ordering.
         std::fs::write(root_b.join("in-b.txt"), "hi").expect("write in b");
-        let ev = next_file_event(&mut sub, &ws_b.id, Duration::from_secs(10))
+        let ev = next_file_event(&mut sub, &ws_b.id, LIVENESS)
             .await
             .expect("workspace b must emit for its own file");
         assert_eq!(ev.data["relativePath"], "in-b.txt");
@@ -828,9 +832,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(workspaces.clone()));
 
         let registry = start_registry(&bus, api).await;
-        registry
-            .wait_established(workspaces.len(), Duration::from_secs(10))
-            .await;
+        registry.wait_established(workspaces.len(), LIVENESS).await;
 
         assert_eq!(
             registry.stream_count(),
@@ -892,7 +894,7 @@ mod tests {
         wait_for_root(&_registry, &root_a, true).await;
 
         std::fs::write(root_a.join("after-unarchive.txt"), "hi").expect("write in a");
-        let ev = next_file_event(&mut sub, &ws_a.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws_a.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "unarchived workspace must rejoin the demux and resume emitting"
@@ -940,7 +942,7 @@ mod tests {
         wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-unarchive.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "unarchived workspace must resume emitting file events"
@@ -1199,7 +1201,7 @@ mod tests {
         wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-update.txt"), "hi").expect("write file");
-        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "a non-archive workspace:updated must not stop file watching"
@@ -1263,7 +1265,7 @@ mod tests {
             .await
             .expect("publish unarchived");
 
-        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_status_event(&mut status_sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "unarchive must trigger a catch-up git-status refresh"
@@ -1321,7 +1323,7 @@ mod tests {
 
         // External `git checkout`-style HEAD rewrite → debounced refresh.
         repo.set_head("refs/heads/other").unwrap();
-        let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(10)).await;
+        let ev = next_status_event(&mut status_sub, &ws.id, LIVENESS).await;
         assert!(
             ev.is_some(),
             "git workspace registered after start must refresh git status on .git metadata changes"

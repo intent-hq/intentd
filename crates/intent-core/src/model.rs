@@ -2495,6 +2495,15 @@ pub struct AgentLite {
     /// (the same gate as the live `lastAgentResponse` overlay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_role: Option<String>,
+    /// Row id of the session's newest user/assistant transcript message —
+    /// system (and any other) rows are transparent, matching
+    /// `lastMessageRole`. Additive wire field; omitted when the session has
+    /// no user/assistant message. Serves per-agent unread computation
+    /// against `metadata.lastSeenMessageId` without transcript reads
+    /// (intent-hq/monorepo#1597). No live-turn overlay: mid-turn it stays on
+    /// the last persisted message until the assistant row persists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2531,6 +2540,7 @@ impl AgentLite {
         last_user_message: Option<String>,
         digest: Option<String>,
         last_message_role: Option<String>,
+        last_message_id: Option<String>,
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
@@ -2585,6 +2595,7 @@ impl AgentLite {
             last_agent_response,
             last_user_message,
             last_message_role,
+            last_message_id,
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
@@ -4087,6 +4098,7 @@ mod tests {
             Some("hi".to_string()),
             None,
             Some("user".to_string()),
+            Some("msg-last".to_string()),
         );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
@@ -4109,6 +4121,7 @@ mod tests {
         assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
         assert_eq!(v["lastMessageRole"], "user");
+        assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
     }
 
