@@ -80,30 +80,61 @@ impl PrMonitorSnapshot {
     }
 }
 
-/// Fetch the current snapshot of one PR: the merge-requirements checklist
-/// (which already degrades per-signal) plus the conversation-comment count.
-/// A failing comment read degrades to the previous count rather than
-/// fabricating a "comments removed" change.
-pub(crate) async fn fetch_snapshot(
+/// One PR's freshly fetched state, shared by every monitor watching that
+/// `(repo, pr)` within a single sweep. `conversation_count` is `None` when
+/// the comment read degraded, so each monitor substitutes ITS OWN previous
+/// count at materialization time rather than fabricating a "comments
+/// removed" change from a sibling monitor's baseline.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedPrSnapshot {
+    title: String,
+    url: String,
+    head_sha: Option<String>,
+    conversation_count: Option<i64>,
+    review_comment_count: i64,
+    requirements: MergeRequirements,
+}
+
+impl SharedPrSnapshot {
+    /// Materialize a per-monitor snapshot: a degraded conversation-comment
+    /// read keeps the monitor's previous count rather than fabricating a
+    /// "comments removed" change.
+    pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
+        PrMonitorSnapshot {
+            title: self.title.clone(),
+            url: self.url.clone(),
+            head_sha: self.head_sha.clone(),
+            conversation_count: self
+                .conversation_count
+                .unwrap_or_else(|| previous.map(|p| p.conversation_count).unwrap_or(0)),
+            review_comment_count: self.review_comment_count,
+            requirements: self.requirements.clone(),
+        }
+    }
+}
+
+/// Fetch the current shared state of one PR: the merge-requirements
+/// checklist (which already degrades per-signal) plus the
+/// conversation-comment count (`None` when that read fails).
+pub(crate) async fn fetch_shared_snapshot(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-    previous: Option<&PrMonitorSnapshot>,
-) -> Result<PrMonitorSnapshot> {
+) -> Result<SharedPrSnapshot> {
     let (pr, requirements, review_comment_count) =
         pr_ops::fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
     let conversation_count = match sc.list_comments(repo_ref, number).await {
-        Ok(comments) => comments.len() as i64,
+        Ok(comments) => Some(comments.len() as i64),
         Err(e) => {
             tracing::debug!(
                 error = %e,
                 pr_number = number,
                 "pr monitor: conversation comments unavailable, keeping previous count"
             );
-            previous.map(|p| p.conversation_count).unwrap_or(0)
+            None
         }
     };
-    Ok(PrMonitorSnapshot {
+    Ok(SharedPrSnapshot {
         title: pr.title,
         url: pr.url,
         head_sha: pr.head_sha,
@@ -111,6 +142,19 @@ pub(crate) async fn fetch_snapshot(
         review_comment_count,
         requirements,
     })
+}
+
+/// Fetch + materialize in one step — the registration path, where exactly
+/// one monitor consumes the read.
+pub(crate) async fn fetch_snapshot(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    previous: Option<&PrMonitorSnapshot>,
+) -> Result<PrMonitorSnapshot> {
+    Ok(fetch_shared_snapshot(sc, repo_ref, number)
+        .await?
+        .materialize(previous))
 }
 
 /// One human-readable line per detected change between two snapshots, in a
@@ -797,25 +841,48 @@ impl Services {
     }
 
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
-    /// (re-read each tick), poll every active monitor. Returns the task
+    /// (re-read each tick), poll every DUE active monitor. Returns the task
     /// handle so the composition root can hold/abort it.
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(services.pr_monitor_poll_interval()).await;
-                services.poll_pr_monitors().await;
+                services.poll_due_pr_monitors().await;
             }
         })
     }
 
-    /// One pass over every active monitor. Per-monitor failures are logged
+    /// One pass over every active monitor, regardless of freshness.
+    ///
+    /// `pub` so integration tests can drive a deterministic single sweep
+    /// instead of racing [`Self::spawn_pr_monitor_loop`]'s timer; the loop
+    /// itself goes through [`Self::poll_due_pr_monitors`], which also skips
+    /// monitors polled within the current interval.
+    pub async fn poll_pr_monitors(&self) {
+        self.sweep_pr_monitors(false).await;
+    }
+
+    /// The loop-driven sweep: like [`Self::poll_pr_monitors`] but skips
+    /// monitors whose `lastPolledAt` is fresher than the poll interval —
+    /// typically a monitor that was just registered or re-registered, whose
+    /// registration fetch already stamped a current baseline. Catch-up-marked
+    /// monitors (boot rehydration) are never skipped.
+    pub(crate) async fn poll_due_pr_monitors(&self) {
+        self.sweep_pr_monitors(true).await;
+    }
+
+    /// One sweep over the active monitors. Per-monitor failures are logged
     /// and persisted as `lastError` — a forge outage must never kill the
     /// loop or terminalize a monitor.
     ///
-    /// `pub` so integration tests can drive a deterministic single sweep
-    /// instead of racing [`Self::spawn_pr_monitor_loop`]'s timer.
-    pub async fn poll_pr_monitors(&self) {
+    /// Forge fetches are deduplicated per distinct `(repo, pr)` WITHIN the
+    /// sweep: the first monitor on a PR fetches its shared snapshot, every
+    /// sibling monitor reuses it and diffs against its own baseline. A
+    /// failed fetch is cached the same way and recorded on each affected
+    /// monitor, so an unreachable PR costs one fetch attempt per tick, not
+    /// one per monitor.
+    async fn sweep_pr_monitors(&self, skip_fresh: bool) {
         let monitors = match self.store.load_active_pr_monitors().await {
             Ok(monitors) => monitors,
             Err(e) => {
@@ -833,41 +900,87 @@ impl Services {
                 return;
             }
         };
+        let mut shared: HashMap<
+            (String, String, i64),
+            std::result::Result<SharedPrSnapshot, String>,
+        > = HashMap::new();
         for monitor in monitors {
-            if let Err(e) = self.poll_one_pr_monitor(sc.as_ref(), &monitor).await {
-                tracing::warn!(
-                    monitor = %monitor.monitor_id.0,
-                    error = %e,
-                    "pr monitor poll failed; will retry next tick"
-                );
+            if skip_fresh && self.pr_monitor_recently_polled(&monitor) {
+                continue;
+            }
+            let key = (
+                monitor.repo_owner.clone(),
+                monitor.repo_name.clone(),
+                monitor.pr_number,
+            );
+            let fetched = match shared.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+                    let fetched =
+                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64)
+                            .await
+                            .map_err(|e| e.to_string());
+                    entry.insert(fetched).clone()
+                }
+            };
+            match fetched {
+                Ok(snapshot) => {
+                    if let Err(e) = self.poll_one_pr_monitor(&monitor, &snapshot).await {
+                        tracing::warn!(
+                            monitor = %monitor.monitor_id.0,
+                            error = %e,
+                            "pr monitor poll failed; will retry next tick"
+                        );
+                    }
+                }
+                Err(error) => {
+                    // A forge error records `lastError` without touching the
+                    // baseline — the next tick retries against the same
+                    // baseline, so a transient outage never fabricates or
+                    // loses a change (backoff is the poll interval itself).
+                    self.record_pr_monitor_error(&monitor, &error).await;
+                }
             }
             tokio::time::sleep(crate::SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Poll one monitor: refresh the snapshot, diff it against the persisted
-    /// baseline, accumulate any changes, and either terminalize (PR
-    /// merged/closed → immediate final wake) or evaluate the debounce window.
-    ///
-    /// A forge error records `lastError` and returns without touching the
-    /// baseline — the next tick retries against the same baseline, so a
-    /// transient outage never fabricates or loses a change (backoff is the
-    /// poll interval itself).
-    async fn poll_one_pr_monitor(&self, sc: &dyn SourceControl, monitor: &PrMonitor) -> Result<()> {
+    /// Whether a monitor was polled recently enough for the loop-driven
+    /// sweep to skip it this tick: `lastPolledAt` is fresher than the poll
+    /// interval (registration and re-registration fetch their own baseline
+    /// and stamp the field). Catch-up-marked monitors are never fresh —
+    /// their first post-restart poll must deliver promptly.
+    fn pr_monitor_recently_polled(&self, monitor: &PrMonitor) -> bool {
+        if self
+            .pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .contains(&monitor.monitor_id)
+        {
+            return false;
+        }
+        let Some(at) = monitor.last_polled_at.as_deref().and_then(parse_iso) else {
+            return false;
+        };
+        let interval = time::Duration::seconds(self.pr_monitor_poll_interval().as_secs() as i64);
+        time::OffsetDateTime::now_utc() - at < interval
+    }
+
+    /// Poll one monitor against the sweep's shared snapshot: diff it against
+    /// the persisted baseline, accumulate any changes, and either
+    /// terminalize (PR merged/closed → immediate final wake) or evaluate the
+    /// debounce window.
+    async fn poll_one_pr_monitor(
+        &self,
+        monitor: &PrMonitor,
+        shared: &SharedPrSnapshot,
+    ) -> Result<()> {
         let previous: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
-        let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
-        let fresh = match fetch_snapshot(sc, &repo_ref, monitor.pr_number as u64, previous.as_ref())
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                self.record_pr_monitor_error(monitor, &e.to_string()).await;
-                return Ok(());
-            }
-        };
+        let fresh = shared.materialize(previous.as_ref());
 
         let changes = previous
             .as_ref()
@@ -1556,17 +1669,25 @@ mod tests {
     #[derive(Clone)]
     struct StubForge {
         state: Arc<Mutex<ForgeState>>,
+        get_pr_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl StubForge {
         fn new() -> Self {
             Self {
                 state: Arc::new(Mutex::new(ForgeState::default())),
+                get_pr_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
         fn edit(&self, f: impl FnOnce(&mut ForgeState)) {
             f(&mut self.state.lock().unwrap());
+        }
+
+        /// Snapshot-fetch attempts so far: `get_pr` is called exactly once
+        /// per [`fetch_shared_snapshot`] attempt (successful or not).
+        fn fetches(&self) -> usize {
+            self.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1640,6 +1761,8 @@ mod tests {
             _: &RepoRef,
             number: u64,
         ) -> intent_sourcecontrol::Result<PullRequest> {
+            self.get_pr_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let s = self.state.lock().unwrap().clone();
             if s.fail_get_pr {
                 return Err(intent_sourcecontrol::Error::Unsupported(
@@ -2398,6 +2521,130 @@ mod tests {
             .expect("app cancel");
         let text = owner_messages(&svc, &owner).await;
         assert!(text.contains("cancelled from the app"), "{text}");
+    }
+
+    /// Insert a second agent in the fixture workspace so a second monitor
+    /// can watch the SAME PR (a monitor is unique per (agent, repo, pr)).
+    async fn second_agent(svc: &Services, ws: &WorkspaceId, id: &str) -> AgentId {
+        svc.store()
+            .insert_agent_session(&agent(ws, id))
+            .await
+            .expect("second agent");
+        AgentId::from(id)
+    }
+
+    #[tokio::test]
+    async fn sweep_fetches_each_pr_once_across_sibling_monitors() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+        // A third monitor on a DIFFERENT PR still gets its own fetch.
+        let other = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("other pr")
+            .0;
+
+        forge.edit(|s| s.conversation_comments = 1);
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            2,
+            "one fetch for o/r#42 shared by both monitors, one for o/r#7"
+        );
+
+        // Both siblings advanced their own baselines from the shared fetch.
+        for id in [&first.monitor_id, &second.monitor_id, &other.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert!(
+                !row.pending_changes.is_empty(),
+                "monitor {} saw the change: {:?}",
+                id.0,
+                row.pending_changes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_dedupes_failed_fetches_and_records_the_error_on_every_sibling() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let first = register(&svc, &ws, &owner).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+        let second = svc
+            .pr_monitor_register(&ws, &sibling, "o", "r", 42)
+            .await
+            .expect("sibling register")
+            .0;
+
+        forge.edit(|s| s.fail_get_pr = true);
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            1,
+            "an unreachable PR costs ONE fetch attempt per sweep, not one per monitor"
+        );
+        for id in [&first.monitor_id, &second.monitor_id] {
+            let row = svc.store().get_pr_monitor(id).await.unwrap();
+            assert_eq!(row.state, PrMonitorState::Active);
+            assert!(row.last_error.is_some(), "error recorded on {}", id.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn due_sweep_skips_freshly_polled_monitors_but_never_catch_up_ones() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // Registration just stamped `lastPolledAt`: the loop-driven sweep
+        // skips the monitor (no fetch), while the explicit test-driven sweep
+        // still polls everything.
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before, "fresh monitor skipped");
+        svc.poll_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "explicit sweep never skips");
+
+        // Backdate `lastPolledAt` beyond the poll interval: due again.
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let stale = now_iso();
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                row.last_snapshot.as_deref(),
+                &row.pending_changes,
+                row.pending_since.as_deref(),
+                row.last_change_at.as_deref(),
+                Some("2020-01-01T00:00:00Z"),
+                None,
+                &stale,
+                &row.updated_at,
+            )
+            .await
+            .unwrap());
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "stale monitor polled");
+
+        // A catch-up-marked monitor (boot rehydration) is never skipped,
+        // however fresh its `lastPolledAt` — downtime changes must deliver
+        // on the first post-restart tick.
+        assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 1);
+        let before = forge.fetches();
+        svc.poll_due_pr_monitors().await;
+        assert_eq!(forge.fetches(), before + 1, "catch-up monitor polled");
     }
 
     #[tokio::test]
