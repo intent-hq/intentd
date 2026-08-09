@@ -367,7 +367,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   default-provider aliases persisted on old sessions (`default`/`acp`/
 ///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
 ///   spawn would actually run, not as the raw alias string.
-fn ensure_bare_model_matches_provider(
+pub(crate) fn ensure_bare_model_matches_provider(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogCache,
     provider_id: &str,

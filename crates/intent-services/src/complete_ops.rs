@@ -50,16 +50,28 @@ fn unavailable(reason: impl std::fmt::Display) -> Value {
 /// opaque per-provider snapshot cache (restored into the two keys above on a
 /// provider switch), not an additional precedence tier.
 ///
-/// The result is provider-guarded and returned BARE: a compound id owned by
-/// another provider is dropped with a warn log (the CLI would otherwise be fed
-/// a foreign model id), and the `{provider}:` prefix is stripped from an
-/// owned one because the one-shot launch takes a raw model id.
+/// The result is provider-guarded and returned BARE — the settings value is
+/// user-authored and easily outlives a provider switch, so the CLI must never
+/// be fed a foreign model id. A compound `{provider}:{model}` id is dropped
+/// with a warn log unless its prefix names the effective provider, and the
+/// prefix is stripped from an owned one because the one-shot launch takes a
+/// raw model id. A value whose prefix is not a registered provider id
+/// (including a malformed `:model`) counts as foreign and is dropped too —
+/// `derived_default_provider`'s `contains(':')` convention already reserves the
+/// colon for compound ids. A bare id reuses `agent.create`'s asymmetric
+/// cached-catalog evidence rule ([`ensure_bare_model_matches_provider`]): it is
+/// dropped only when the effective provider's own cached catalog affirmatively
+/// disproves ownership, so a cold start still passes it through.
+///
+/// Every drop falls to the next rung rather than erroring: a `-32602` here
+/// would reject a model the caller never sent.
 ///
 /// This chain is scoped to one-shot quick actions only — agent sessions,
 /// delegated ones included, keep the background-agnostic creation-time chain
 /// (monorepo#1729).
 fn resolve_quick_action_model(
     settings: &intent_core::settings_file::SettingsFile,
+    catalog: &crate::model_catalog::ModelCatalogCache,
     quick_action_type: Option<&str>,
     effective_provider: &str,
 ) -> Option<String> {
@@ -79,20 +91,31 @@ fn resolve_quick_action_model(
                 .filter(|m| !m.is_empty())
         })?;
 
-    if !configured.contains(':') {
-        return Some(configured.to_string());
-    }
-    let (prefix, bare) = intent_providers::parse_compound_model_id(configured);
-    if intent_providers::find_provider(&prefix).map(|p| p.id) != Some(effective_provider) {
+    let owned_bare = if configured.contains(':') {
+        let (prefix, bare) = intent_providers::parse_compound_model_id(configured);
+        (intent_providers::find_provider(&prefix).map(|p| p.id) == Some(effective_provider)
+            && !bare.is_empty())
+        .then_some(bare)
+    } else {
+        crate::agent_ops::ensure_bare_model_matches_provider(
+            "agent.completeOnce",
+            catalog,
+            effective_provider,
+            configured,
+        )
+        .ok()
+        .map(|()| configured.to_string())
+    };
+
+    if owned_bare.is_none() {
         tracing::warn!(
             model = configured,
             provider = effective_provider,
-            "configured quick-action model belongs to another provider; \
-             falling back to the CLI default"
+            "configured quick-action model does not belong to the effective \
+             provider; falling back to the CLI default"
         );
-        return None;
     }
-    (!bare.is_empty()).then_some(bare)
+    owned_bare
 }
 
 /// Pick the one-shot launch for `provider`, mirroring the model probe's
@@ -199,6 +222,7 @@ impl Services {
             Some(m) => Some(m),
             None => resolve_quick_action_model(
                 &settings,
+                &self.models_catalog,
                 quick_action_type.as_deref(),
                 &effective_provider,
             ),
@@ -851,38 +875,46 @@ rl.on('line', (line) => {
         settings
     }
 
+    /// Empty catalog cache: no cached entry for any provider, so bare ids pass
+    /// the asymmetric evidence guard (absence of evidence is not a mismatch).
+    fn empty_catalog() -> crate::model_catalog::ModelCatalogCache {
+        crate::model_catalog::ModelCatalogCache::new(None)
+    }
+
     #[test]
     fn quick_action_model_precedence() {
         // typeOverrides[type] outranks defaultModel; an absent/blank override
         // (and an unknown type key) falls through to the default; nothing
         // configured resolves to the CLI default.
+        let catalog = empty_catalog();
         let settings = quick_action_settings(Some("sonnet4.5"), &[("commit", "haiku4.5")]);
         assert_eq!(
-            resolve_quick_action_model(&settings, Some("commit"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("commit"), "auggie"),
             Some("haiku4.5".to_string())
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, Some("pr"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("pr"), "auggie"),
             Some("sonnet4.5".to_string())
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, Some("not-a-type"), "auggie"),
+            resolve_quick_action_model(&settings, &catalog, Some("not-a-type"), "auggie"),
             Some("sonnet4.5".to_string())
         );
         assert_eq!(
-            resolve_quick_action_model(&settings, None, "auggie"),
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
             Some("sonnet4.5".to_string())
         );
 
         let blank = quick_action_settings(Some("  "), &[("commit", "")]);
         assert_eq!(
-            resolve_quick_action_model(&blank, Some("commit"), "auggie"),
+            resolve_quick_action_model(&blank, &catalog, Some("commit"), "auggie"),
             None,
             "blank values read as unset, not as an empty model id"
         );
         assert_eq!(
             resolve_quick_action_model(
                 &intent_core::settings_file::SettingsFile::default(),
+                &catalog,
                 Some("commit"),
                 "auggie"
             ),
@@ -894,14 +926,66 @@ rl.on('line', (line) => {
     fn quick_action_model_is_provider_guarded_and_returned_bare() {
         // An owned compound id loses its `{provider}:` prefix — the one-shot
         // launch takes a raw model id — and one owned by another provider is
-        // dropped rather than fed to the resolved provider's CLI.
+        // dropped rather than fed to the resolved provider's CLI. A prefix
+        // that is not a registered provider id (including a malformed
+        // `:model`) counts as foreign: the colon is reserved for compound ids.
+        let catalog = empty_catalog();
         let owned = quick_action_settings(Some("auggie:sonnet4.5"), &[]);
         assert_eq!(
-            resolve_quick_action_model(&owned, None, "auggie"),
+            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
             Some("sonnet4.5".to_string())
         );
         let foreign = quick_action_settings(Some("codex:gpt-5"), &[]);
-        assert_eq!(resolve_quick_action_model(&foreign, None, "auggie"), None);
+        assert_eq!(
+            resolve_quick_action_model(&foreign, &catalog, None, "auggie"),
+            None
+        );
+        for malformed in [":sonnet4.5", "not-a-provider:sonnet4.5", "auggie:"] {
+            let settings = quick_action_settings(Some(malformed), &[]);
+            assert_eq!(
+                resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+                None,
+                "{malformed} must fall through to the CLI default"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_action_bare_model_is_dropped_only_on_disproven_ownership() {
+        // Bare ids reuse agent.create's asymmetric evidence rule: with no
+        // cached catalog for the effective provider the id passes, and it is
+        // dropped only when that provider's own catalog disproves ownership
+        // while another provider claims it.
+        let settings = quick_action_settings(Some("grok-4"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&settings, &empty_catalog(), None, "auggie"),
+            Some("grok-4".to_string()),
+            "no cached evidence must not drop a bare id"
+        );
+
+        // auggie and grok are both version-pin-free, so a "" version key
+        // makes each entry current evidence.
+        let catalog = empty_catalog();
+        catalog.store_for_test(
+            "auggie",
+            "",
+            vec![serde_json::json!({ "id": "sonnet4.5", "provider": "auggie" })],
+        );
+        catalog.store_for_test(
+            "grok",
+            "",
+            vec![serde_json::json!({ "id": "grok-4", "provider": "grok" })],
+        );
+        assert_eq!(
+            resolve_quick_action_model(&settings, &catalog, None, "auggie"),
+            None,
+            "a bare id the effective provider's catalog disproves is dropped"
+        );
+        let owned = quick_action_settings(Some("sonnet4.5"), &[]);
+        assert_eq!(
+            resolve_quick_action_model(&owned, &catalog, None, "auggie"),
+            Some("sonnet4.5".to_string())
+        );
     }
 
     /// Fake auggie echoing its own argv so a test can assert the resolved
