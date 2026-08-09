@@ -619,15 +619,23 @@ async fn dedupe_within_window_emits_one_event_per_path() {
     // Wait for debounce to flush.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Collect all file:* events for "dedupe.txt".
+    // Collect all file:* events for "dedupe.txt": wait up to `LIVENESS` for
+    // the FIRST event (positive — delivery may lag under parallel load,
+    // monorepo#1630), then keep draining through a short quiet window to
+    // catch would-be duplicates (negative — stays short).
     let mut count = 0;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + LIVENESS;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match timeout(remaining, sub.recv()).await {
+        let wait = if count > 0 {
+            Duration::from_secs(2)
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            remaining
+        };
+        match timeout(wait, sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type.starts_with("file:") && ev.data["relativePath"] == "dedupe.txt"
