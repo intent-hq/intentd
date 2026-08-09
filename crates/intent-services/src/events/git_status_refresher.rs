@@ -382,7 +382,7 @@ mod tests {
             .await
             .expect("publish file event");
 
-        let ev = next_status_event(&mut sub, &ws.id, Duration::from_secs(10))
+        let ev = next_status_event(&mut sub, &ws.id, crate::events::LIVENESS)
             .await
             .expect("file event must yield a changes:git-status event");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
@@ -409,7 +409,7 @@ mod tests {
                 .expect("publish file event");
         }
 
-        let first = next_status_event(&mut sub, &ws.id, Duration::from_secs(10)).await;
+        let first = next_status_event(&mut sub, &ws.id, crate::events::LIVENESS).await;
         assert!(first.is_some(), "burst must yield a changes:git-status");
         // The whole burst fell inside one debounce window → exactly one
         // recompute; a quiet period after the flush must stay silent.
@@ -455,7 +455,7 @@ mod tests {
             .await
             .expect("publish file event");
 
-        let ev = next_status_event(&mut sub, &ws.id, Duration::from_secs(10))
+        let ev = next_status_event(&mut sub, &ws.id, crate::events::LIVENESS)
             .await
             .expect("hand edit must yield a changes:git-status event");
         assert_eq!(ev.data["status"]["branch"], "main");
