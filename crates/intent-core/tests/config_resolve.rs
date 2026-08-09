@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use intent_core::config::{
-    Config, DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
+    Config, DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
     DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
     MIN_WAKE_RESUME_THRESHOLD_SECONDS,
 };
@@ -68,6 +69,10 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
     assert_eq!(cfg.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
     assert_eq!(cfg.stream_retention_hours, DEFAULT_STREAM_RETENTION_HOURS);
     assert_eq!(cfg.hooks_max_per_agent, DEFAULT_HOOKS_MAX_PER_AGENT);
+    assert_eq!(
+        cfg.server_max_outstanding_rpcs,
+        DEFAULT_SERVER_MAX_OUTSTANDING_RPCS
+    );
     assert_eq!(cfg.wake_resume_enabled, DEFAULT_WAKE_RESUME_ENABLED);
     assert_eq!(
         cfg.wake_resume_threshold_seconds,
@@ -144,7 +149,7 @@ fn resolve_reads_config_file_when_present() {
     let config_path = config_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n\n[wakeResume]\nenabled = false\nthresholdSeconds = 30\n",
+        "[agents]\nidleReapMinutes = 7\n\n[events]\nstreamRetentionHours = 24\n\n[hooks]\nmaxPerAgent = 3\n\n[server]\nmaxOutstandingRpcs = 12\n\n[wakeResume]\nenabled = false\nthresholdSeconds = 30\n",
     )
     .unwrap();
 
@@ -157,6 +162,7 @@ fn resolve_reads_config_file_when_present() {
     assert_eq!(cfg.idle_reap_minutes, 7);
     assert_eq!(cfg.stream_retention_hours, 24);
     assert_eq!(cfg.hooks_max_per_agent, 3);
+    assert_eq!(cfg.server_max_outstanding_rpcs, 12);
     assert!(!cfg.wake_resume_enabled);
     assert_eq!(cfg.wake_resume_threshold_seconds, 30);
 

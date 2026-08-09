@@ -33,6 +33,7 @@ pub use reverse::{
     DEFAULT_REVERSE_TIMEOUT,
 };
 pub use router::handle_message;
+pub use rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 pub use server::{PairingSnapshot, ServerPairingInfo};
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
@@ -68,6 +69,7 @@ mod panic_guard;
 mod protocol;
 pub mod reverse;
 pub mod router;
+pub mod rpc_limit;
 pub mod server;
 mod subscriptions;
 pub mod tls;

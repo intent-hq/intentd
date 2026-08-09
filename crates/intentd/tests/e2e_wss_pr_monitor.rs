@@ -150,6 +150,8 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 struct ForgeState {
     merged: bool,
     conversation_comments: usize,
+    /// `get_pr` call count — one per PR snapshot fetch (dedup assertions).
+    get_pr_calls: usize,
 }
 
 /// Stub forge serving one open PR (#42, one pending required check) whose
@@ -162,6 +164,9 @@ struct StubForge {
 impl StubForge {
     fn edit(&self, f: impl FnOnce(&mut ForgeState)) {
         f(&mut self.state.lock().unwrap());
+    }
+    fn fetches(&self) -> usize {
+        self.state.lock().unwrap().get_pr_calls
     }
 }
 
@@ -223,7 +228,11 @@ impl SourceControl for StubForge {
         unsupported("create_pr")
     }
     async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
-        let merged = self.state.lock().unwrap().merged;
+        let merged = {
+            let mut state = self.state.lock().unwrap();
+            state.get_pr_calls += 1;
+            state.merged
+        };
         Ok(PullRequest {
             number,
             url: format!("https://github.com/o/r/pull/{number}"),
@@ -847,4 +856,192 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(rows.len(), 1, "completed rows stay visible: {listed}");
     assert_eq!(rows[0]["state"], "completed");
     assert_eq!(rows[0]["lastSnapshot"]["state"], "merged");
+}
+
+/// Idle-visibility (unified external-wait, mirrors the hook-lifecycle
+/// `waitingOnHooks` e2e coverage): `agent.get` over the wire overlays the
+/// light `waitingOnPrMonitors` list on the `AgentLite` projection for an
+/// agent owning an ACTIVE monitor, and omits the field entirely for a
+/// monitor-less agent. (Emit-site coverage of the same stamp on the
+/// `agent:idle` event itself lives in `intent-services` unit tests, which
+/// can reach the private `annotate_waiting_on_pr_monitors` helper directly;
+/// this fixture has no ACP provider to drive a real agent turn.)
+#[tokio::test]
+async fn agent_get_surfaces_waiting_on_pr_monitors_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.get",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    let waiting = got["agent"]["waitingOnPrMonitors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent.get serves waitingOnPrMonitors: {got}"));
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(waiting[0]["repo"], "o/r");
+    assert_eq!(waiting[0]["prNumber"], 42);
+    assert_eq!(waiting[0]["title"], "Add thing");
+    assert!(
+        waiting[0].get("lastSnapshot").is_none(),
+        "payload stays light: {got}"
+    );
+
+    // Cancelled: no longer active, field omitted entirely (never `[]`).
+    fx.services
+        .pr_monitor_cancel(&fx.ws_id, &monitor.monitor_id, Some(&fx.agent_id))
+        .await
+        .expect("cancel");
+    let got_after = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.get",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    assert!(
+        got_after["agent"].get("waitingOnPrMonitors").is_none(),
+        "field omitted once the monitor is cancelled: {got_after}"
+    );
+}
+
+/// The production loop's sweep (`poll_due_pr_monitors`) verified end-to-end
+/// over the wire: a just-registered monitor is skipped as fresh (no forge
+/// fetch), a due sweep fetches ONE shared snapshot for two sibling monitors
+/// on the same PR, both siblings' pending changes surface via
+/// `prMonitor.list`, and `prMonitor.flush` delivers each owner's wake and
+/// emits `prMonitor:emitted` — the same behavior FEs observe from the loop.
+#[tokio::test]
+async fn due_sweep_dedups_fetches_and_surfaces_changes_over_wss() {
+    let fx = boot().await;
+    let sibling_id = AgentId::from("agent-prmon-sibling");
+    fx.services
+        .store()
+        .insert_agent_session(&agent_session(&fx.ws_id, sibling_id.as_str()))
+        .await
+        .expect("seed sibling agent");
+
+    // Two monitors on the SAME PR (a monitor is unique per (agent, repo, pr)),
+    // registered via the service surface the `ws.pr.monitor` binding calls.
+    let first = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register first")
+        .0;
+    let second = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &sibling_id, "o", "r", 42)
+        .await
+        .expect("register sibling")
+        .0;
+
+    // Registration just stamped `lastPolledAt`: the loop-driven sweep skips
+    // both monitors as fresh — zero forge fetches.
+    let before = fx.forge.fetches();
+    fx.services.poll_due_pr_monitors().await;
+    assert_eq!(fx.forge.fetches(), before, "fresh monitors are skipped");
+
+    // The PR moves and both monitors go stale (backdated `lastPolledAt`):
+    // the next due sweep fetches ONE shared snapshot for the pair.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    for monitor in [&first, &second] {
+        let row = fx
+            .services
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .expect("load row");
+        assert!(fx
+            .services
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                row.last_snapshot.as_deref(),
+                &row.pending_changes,
+                row.pending_since.as_deref(),
+                row.last_change_at.as_deref(),
+                Some("2020-01-01T00:00:00Z"),
+                None,
+                &now_iso(),
+                &row.updated_at,
+            )
+            .await
+            .expect("backdate lastPolledAt"));
+    }
+    let before = fx.forge.fetches();
+    fx.services.poll_due_pr_monitors().await;
+    assert_eq!(
+        fx.forge.fetches(),
+        before + 1,
+        "one shared fetch serves both sibling monitors"
+    );
+
+    // Both siblings diffed the shared snapshot against their OWN baselines:
+    // `prMonitor.list` over the wire shows both rows pending (the hour-long
+    // debounce holds the wakes).
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 2, "both monitors listed: {listed}");
+    for row in rows {
+        assert_eq!(row["hasPendingChanges"], true, "row pending: {row}");
+    }
+
+    // Flushing the first monitor delivers ITS owner's wake (and emits the
+    // event) without draining the sibling's independent pending state.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:emitted"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": first.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    let evt = next_event(&mut sub, "prMonitor:emitted").await;
+    assert_eq!(evt["data"]["monitorId"], first.monitor_id.as_str());
+    assert!(
+        owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "the flush delivers the owner's consolidated wake"
+    );
+    let listed_after = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    for row in listed_after["monitors"].as_array().expect("monitors array") {
+        let expect_pending = row["monitorId"] != json!(first.monitor_id.as_str());
+        assert_eq!(
+            row["hasPendingChanges"],
+            json!(expect_pending),
+            "sibling pending state independent: {row}"
+        );
+    }
 }

@@ -73,6 +73,7 @@ fn make_config(data_dir: &Path) -> Config {
         idle_reap_minutes: 0,
         stream_retention_hours: 0,
         hooks_max_per_agent: 5,
+        server_max_outstanding_rpcs: 0,
         wake_resume_enabled: true,
         wake_resume_threshold_seconds: 10,
     }

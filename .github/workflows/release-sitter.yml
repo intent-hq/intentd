@@ -93,9 +93,11 @@ jobs:
           # macOS targets build on GitHub-hosted Apple Silicon runners (the
           # self-hosted m1mac went offline and releases queued forever
           # behind it); the x86_64 target is a cross build, smoke-tested
-          # under Rosetta 2. Self-hosted runners: tinybox (Linux x64; musl
-          # targets cross-built with cargo-zigbuild as before), 5090pc
-          # (Windows x64).
+          # under Rosetta 2. Linux musl targets stay on the self-hosted
+          # tinybox runner (cross-built with cargo-zigbuild as before).
+          # Windows uses the org-hosted gh-windows-16x runner (16-core/64GB,
+          # Windows Server 2022 image) for faster release builds
+          # (intent-hq/monorepo#1803).
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-apple-darwin
@@ -107,7 +109,7 @@ jobs:
             os: [self-hosted, Linux, X64]
             zigbuild: true
           - target: x86_64-pc-windows-msvc
-            os: [self-hosted, Windows, X64]
+            os: gh-windows-16x
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -157,8 +159,8 @@ jobs:
           cp "target/$TARGET/release/intentd-sitter" "staging/intentd-$TARGET/intentd"
           chmod +x "staging/intentd-$TARGET/intentd"
           tar -cJf "intentd-$TARGET.tar.xz" -C staging "intentd-$TARGET"
-      # Compress-Archive instead of 7z (not installed on the self-hosted
-      # Windows runner); the zip stays flat like dist zips.
+      # Compress-Archive keeps the zip flat like dist zips (no 7z dependency
+      # needed).
       - name: Package (windows zip)
         if: ${{ runner.os == 'Windows' }}
         shell: powershell

@@ -466,11 +466,33 @@ impl Services {
             .collect()
     }
 
+    /// The subset of [`Self::list_watches_for_parent`] that still counts as a
+    /// "waiting on agents" reason: `report_delivered` watches are excluded
+    /// (issues intent-hq/monorepo#1643 + #1649) — such a watch has already
+    /// delivered its report-time wake and retires inline without waking the
+    /// holder, so it is not something the holder is waiting FOR. Shared by the
+    /// settlement predicate ([`crate::Services::agent_is_waiting_on_agents`])
+    /// and the `isWaitingForOtherAgents` / `waitingForAgentIds` projections so
+    /// display and settlement use one definition of "waiting on agents".
+    pub(crate) fn waiting_watches_for_parent(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Vec<CompletionWatch> {
+        self.list_watches_for_parent(parent_agent_id)
+            .into_iter()
+            .filter(|w| !w.report_delivered)
+            .collect()
+    }
+
     /// Whether any TOP-LEVEL agent homed in `workspace_id` holds at least
     /// one active completion watch (ungrouped or grouped) — the third
     /// `displayStatus` in-progress promotion signal alongside a running
     /// agent and active hooks: an idle parent still waiting on delegated
-    /// children reads as active work. Watches anchor in the parent's HOME
+    /// children reads as active work. `report_delivered` watches are
+    /// excluded, matching the agent-waiting projection and settlement
+    /// predicate ([`Services::waiting_watches_for_parent`]): a watch whose
+    /// report-time wake already fired no longer reads as pending work.
+    /// Watches anchor in the parent's HOME
     /// workspace (`parent_workspace_id`) — where the wake will be delivered
     /// — never the child's. The top-level filter matches
     /// [`Services::workspace_attention_signals`] (no `parent_agent_id`, not
@@ -493,7 +515,7 @@ impl Services {
             guard
                 .subscriptions
                 .iter()
-                .filter(|s| &s.parent_workspace_id == workspace_id)
+                .filter(|s| &s.parent_workspace_id == workspace_id && !s.report_delivered)
                 .map(|s| s.parent_agent_id.clone())
                 .collect()
         };
@@ -1406,14 +1428,17 @@ impl Services {
             "status": status_value,
         });
         // Idle-visibility: a synthesized idle carries the same
-        // `waitingOnHooks` stamp as a live `agent:idle` emit (omitted when
-        // the child owns no active hook) and the same emit-time
-        // `isWaitingForOtherAgents` flag (raw pending-watch derivation, no
-        // 2-cycle guard — matching the live emit sites).
+        // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
+        // `agent:idle` emit (each omitted when the child owns none) and the
+        // same emit-time `isWaitingForOtherAgents` flag (pending-watch
+        // derivation with the shared `report_delivered` filter, no 2-cycle
+        // guard — matching the live emit sites).
         if event_type == intent_core::events::AGENT_IDLE {
             self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+                .await;
             data["isWaitingForOtherAgents"] =
-                serde_json::json!(!self.list_watches_for_parent(child_id).is_empty());
+                serde_json::json!(!self.waiting_watches_for_parent(child_id).is_empty());
         }
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1613,6 +1638,23 @@ impl Services {
                         {
                             continue;
                         }
+                        // Idle-visibility deferral (unified external-wait,
+                        // mirrors the hook check above): an idle child that
+                        // still owns active PR monitors has not settled — do
+                        // NOT record it at rehydration; the monitor's own
+                        // centralized poll loop resumes independently and
+                        // wakes the child on its next change/completion, so
+                        // the child's genuine completion (post-monitor idle /
+                        // failure / deletion) records through the live
+                        // delivery path later.
+                        if event_type == intent_core::events::AGENT_IDLE
+                            && !self
+                                .annotate_waiting_on_pr_monitors(&child_id, &mut data)
+                                .await
+                                .is_empty()
+                        {
+                            continue;
+                        }
                         // Agent-waiting deferral (issue intent-hq/monorepo#1468):
                         // an idle child that itself holds live outgoing
                         // completion watches on other agents has not settled
@@ -1635,13 +1677,14 @@ impl Services {
                         // the live idle emits. Usually false here (a waiting
                         // child was skipped above), but not always: the skip
                         // uses the durable classification WITH the 2-cycle
-                        // guard, while this stamp is the raw in-memory watch
-                        // derivation — a child whose only outgoing watch was
+                        // guard, while this stamp is the in-memory watch
+                        // derivation (report_delivered-filtered, no 2-cycle
+                        // guard) — a child whose only outgoing watch was
                         // declassified as a mutual-idle 2-cycle reaches this
                         // line and stamps `true`.
                         if event_type == intent_core::events::AGENT_IDLE {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
-                                .list_watches_for_parent(&child_id)
+                                .waiting_watches_for_parent(&child_id)
                                 .is_empty());
                         }
                         let report = session.completion_report;
@@ -1743,6 +1786,14 @@ impl Services {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|hooks| !hooks.is_empty())
         {
+            return;
+        }
+        // Idle-visibility deferral (unified external-wait, mirrors the hook
+        // check above): an agent that owns active PR monitors has not
+        // settled — its group completion must not be recorded yet. Not
+        // stamped onto `event_data` (internal classification only), so
+        // probed live here, matching the agent-waiting check below.
+        if !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle
@@ -2172,6 +2223,33 @@ mod tests {
             enriched_display_status(&svc, &ws).await,
             WorkspaceDisplayStatus::Idle,
             "retired watches never promote"
+        );
+    }
+
+    /// A `report_delivered` watch stops promoting `displayStatus`: once the
+    /// report-time wake fired, the parent no longer reads as pending work —
+    /// matching the agent-waiting projection and settlement predicate
+    /// (monorepo#1649).
+    #[tokio::test]
+    async fn report_delivered_watch_does_not_promote_display_status() {
+        let (_tmp, _root, svc, ws) = setup().await;
+        let id = svc
+            .register_completion_watch(
+                &ws,
+                &ws,
+                AgentId::from("agent-parent"),
+                "agent-parent".to_string(),
+                AgentId::from("agent-child"),
+                None,
+            )
+            .expect("register");
+        assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert!(svc.mark_watch_report_delivered(&id));
+        assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
+        assert_eq!(
+            enriched_display_status(&svc, &ws).await,
+            WorkspaceDisplayStatus::Idle,
+            "report_delivered watches must not promote"
         );
     }
 
