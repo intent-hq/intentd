@@ -1090,6 +1090,90 @@ mod tests {
         );
     }
 
+    /// Watcher replacement must not orphan the common-dir registration
+    /// (PR #1048 review): a repeated `workspace:created` (e.g. a buffered
+    /// event replaying the startup snapshot) makes `start_watches` register a
+    /// NEW watcher and then drop the OLD one for the same workspace — whose
+    /// guard drop must not remove the successor's registration (per-guard
+    /// identity token). Ref changes must keep triggering after replacement.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn replacing_worktree_watcher_keeps_common_dir_registration_alive() {
+        use git2::{Repository, Signature};
+        use intent_core::events::CHANGES_GIT_STATUS;
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, _file_sub) = bus_and_sub().await;
+        let mut status_sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+
+        // Main repo with a seed commit, plus a linked worktree.
+        let main_root = TempDir::new("wt-replace-main");
+        let repo = Repository::init(&main_root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(main_root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        let wt_parent = TempDir::new("wt-replace-linked");
+        let wt_path = wt_parent.path.join("wt");
+        repo.worktree("wt", &wt_path, None).unwrap();
+
+        let mut ws = test_workspace("ws-wt-replaced", &wt_path);
+        ws.worktree_path = ws.path.clone();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+
+        let registry = start_registry(&bus, api).await;
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+
+        // Replace the watcher: a buffered `workspace:created` repeating the
+        // startup snapshot. The new watcher registers on the shared entry
+        // first; HashMap::insert then drops the old watcher, whose guard drop
+        // must NOT deregister the fresh registration.
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish repeated created");
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+        // Drain any refresh in flight from the transition itself.
+        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
+            .await
+            .is_some()
+        {}
+
+        // Common-dir ref changes must still trigger for the workspace.
+        // Retried for the same delivery-start race as the other real-watcher
+        // tests.
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ev = None;
+        for i in 0..20 {
+            repo.branch(&format!("post-replace-{i}"), &head_commit, true)
+                .unwrap();
+            ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        assert!(
+            ev.is_some(),
+            "common-dir ref change must still refresh the workspace after watcher replacement"
+        );
+    }
+
     /// A `workspace:updated` with no `archived` key (title rename, status
     /// message, …) must not disturb the watch roots.
     #[tokio::test]

@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use intent_core::WorkspaceId;
@@ -171,17 +172,30 @@ impl GitMetadataWatcher {
 /// hub; dropping it drops every entry, ending the subscriptions and tasks.
 pub(super) struct GitCommonDirWatches {
     state: Mutex<HashMap<PathBuf, CommonDirEntry>>,
+    /// Source of per-registration identity tokens (see [`Registration`]).
+    next_token: AtomicU64,
+}
+
+/// One workspace's slot in a common-dir fan-out set: the refresher it
+/// registered (so heterogeneous refreshers — tests — route correctly) plus the
+/// identity token of the registration that owns the slot. The token is what
+/// makes deregistration replacement-safe: when `start_watches` replaces a
+/// workspace's watcher, the new guard registers (overwriting this slot with a
+/// fresh token) BEFORE `HashMap::insert` drops the old watcher, and the stale
+/// guard's drop must not remove the successor's registration.
+struct Registration {
+    token: u64,
+    refresher: Arc<GitStatusRefresher>,
 }
 
 /// One shared common-dir watch: the subscription + filter task, and the
-/// workspaces registered for fan-out (each with the refresher it registered,
-/// so heterogeneous refreshers — tests — route correctly).
+/// workspaces registered for fan-out.
 struct CommonDirEntry {
     /// Held for RAII (dropping it ends the shared subscription); read only by
     /// tests awaiting establishment.
     _sub: Arc<SubHandle>,
     task: JoinHandle<()>,
-    workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<GitStatusRefresher>>>>,
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>>,
 }
 
 impl Drop for CommonDirEntry {
@@ -197,6 +211,9 @@ struct CommonDirGuard {
     registry: Arc<GitCommonDirWatches>,
     key: PathBuf,
     ws_id: WorkspaceId,
+    /// Identity of THIS registration; deregistration is a no-op unless the
+    /// live slot still carries it (drop-ordering immunity on replacement).
+    token: u64,
     /// Retained so [`GitMetadataWatcher::wait_established`] can await the
     /// shared common-dir subscription too.
     #[cfg(test)]
@@ -205,7 +222,7 @@ struct CommonDirGuard {
 
 impl Drop for CommonDirGuard {
     fn drop(&mut self) {
-        self.registry.deregister(&self.key, &self.ws_id);
+        self.registry.deregister(&self.key, &self.ws_id, self.token);
     }
 }
 
@@ -213,6 +230,7 @@ impl GitCommonDirWatches {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
         })
     }
 
@@ -228,12 +246,18 @@ impl GitCommonDirWatches {
         common_dir: &Path,
     ) -> CommonDirGuard {
         // Canonicalize for the map key so two worktrees of one repo agree on
-        // the entry regardless of the path form their gitfiles carry.
+        // the entry regardless of the path form their gitfiles carry. If
+        // canonicalization fails (repo vanished mid-flight), the raw path is
+        // the key; worktrees carrying different spellings of a vanished
+        // common dir may then key separately — a graceful degradation, not a
+        // correctness issue (each entry still watches and triggers on its
+        // own, and every guard deregisters under the key it registered with).
         let key = std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf());
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut state = lock(&self.state);
         let entry = state.entry(key.clone()).or_insert_with(|| {
             let (sub, mut rx, common_dir) = hub.subscribe(&key);
-            let workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<GitStatusRefresher>>>> =
+            let workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let fan_out = Arc::clone(&workspaces);
             let task = tokio::spawn(async move {
@@ -248,7 +272,7 @@ impl GitCommonDirWatches {
                         // the triggers.
                         let targets: Vec<_> = lock(&fan_out)
                             .iter()
-                            .map(|(id, refresher)| (id.clone(), Arc::clone(refresher)))
+                            .map(|(id, reg)| (id.clone(), Arc::clone(&reg.refresher)))
                             .collect();
                         for (id, refresher) in targets {
                             refresher.trigger(id);
@@ -262,7 +286,7 @@ impl GitCommonDirWatches {
                 workspaces,
             }
         });
-        lock(&entry.workspaces).insert(ws_id.clone(), refresher);
+        lock(&entry.workspaces).insert(ws_id.clone(), Registration { token, refresher });
         #[cfg(test)]
         let sub = Arc::clone(&entry._sub);
         drop(state);
@@ -270,21 +294,27 @@ impl GitCommonDirWatches {
             registry: Arc::clone(self),
             key,
             ws_id,
+            token,
             #[cfg(test)]
             sub,
         }
     }
 
-    /// Remove `ws_id` from the entry for `key`; the last workspace out drops
-    /// the entry, ending the subscription and filter task.
-    fn deregister(&self, key: &Path, ws_id: &WorkspaceId) {
+    /// Remove `ws_id` from the entry for `key` — but only while the live slot
+    /// still carries `token`, so a stale guard (from a watcher replaced via
+    /// the registry's `start_watches`) cannot deregister its successor; the
+    /// last workspace out drops the entry, ending the subscription and filter
+    /// task.
+    fn deregister(&self, key: &Path, ws_id: &WorkspaceId, token: u64) {
         let mut state = lock(&self.state);
         let Some(entry) = state.get_mut(key) else {
             return;
         };
         let empty = {
             let mut workspaces = lock(&entry.workspaces);
-            workspaces.remove(ws_id);
+            if workspaces.get(ws_id).is_some_and(|reg| reg.token == token) {
+                workspaces.remove(ws_id);
+            }
             workspaces.is_empty()
         };
         if empty {
@@ -327,7 +357,10 @@ fn is_git_metadata_path(git_dir: &Path, abs: &Path) -> bool {
 
 /// Whether `abs` is one of the per-worktree metadata paths under the worktree
 /// gitdir (`<main>/.git/worktrees/<name>`): `HEAD` or `index` as direct
-/// children. Refs live in the common dir, watched separately.
+/// children, or anything under the per-worktree ref namespaces `refs/`
+/// (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/` —
+/// gitrepository-layout(5)). Shared refs live in the common dir, watched
+/// separately.
 fn is_worktree_gitdir_metadata_path(gitdir: &Path, abs: &Path) -> bool {
     let Ok(rel) = abs.strip_prefix(gitdir) else {
         return false;
@@ -336,7 +369,11 @@ fn is_worktree_gitdir_metadata_path(gitdir: &Path, abs: &Path) -> bool {
     let Some(std::path::Component::Normal(first)) = components.next() else {
         return false;
     };
-    matches!(first.to_str(), Some("HEAD") | Some("index")) && components.next().is_none()
+    match first.to_str() {
+        Some("refs") => true,
+        Some("HEAD") | Some("index") => components.next().is_none(),
+        _ => false,
+    }
 }
 
 /// Whether `abs` is one of the shared ref paths under the common dir
@@ -568,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_gitdir_path_filter_matches_head_and_index_only() {
+    fn worktree_gitdir_path_filter_matches_head_index_and_per_worktree_refs() {
         let gitdir = Path::new("/main/.git/worktrees/wt");
         assert!(is_worktree_gitdir_metadata_path(
             gitdir,
@@ -578,7 +615,21 @@ mod tests {
             gitdir,
             Path::new("/main/.git/worktrees/wt/index")
         ));
-        // Refs live in the common dir; nothing else in the gitdir matches.
+        // Per-worktree ref namespaces (gitrepository-layout(5)).
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/bisect/bad")
+        ));
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/worktree/x")
+        ));
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/rewritten/y")
+        ));
+        // Shared refs live in the common dir; nothing else in the gitdir
+        // matches.
         assert!(!is_worktree_gitdir_metadata_path(
             gitdir,
             Path::new("/main/.git/worktrees/wt/ORIG_HEAD")
