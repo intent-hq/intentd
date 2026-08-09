@@ -51,6 +51,13 @@ pub fn probe_pi_cli() -> PiCliStatus {
     let command = resolve_real_pi_command();
     let resolved_path = intent_providers::find_pi_cli(&command);
     let (version_output, probe) = match &resolved_path {
+        // A RELATIVE separator-carrying override (e.g. `./bin/pi`) validates
+        // against the daemon's CWD, but the wrapper/child may exec it from a
+        // different one — a child-resolvable override could look unresolvable
+        // here. Missing is the only probe-side verdict that hard-gates, so
+        // degrade that case to Failed (→ Unknown, permissive WARN) and
+        // confine hard-gating to the bare-name PATH scan and absolute paths.
+        None if is_relative_with_separator(&command) => (None, PiCliProbe::Failed),
         None => (None, PiCliProbe::Missing),
         Some(path) => match run_version_probe(path) {
             Some(line) => (Some(line.clone()), PiCliProbe::Output(line)),
@@ -64,6 +71,12 @@ pub fn probe_pi_cli() -> PiCliStatus {
         version_output,
         gate,
     }
+}
+
+/// Whether `command` is a relative path that carries a path separator — the
+/// override shape whose resolution is CWD-dependent (see [`probe_pi_cli`]).
+fn is_relative_with_separator(command: &str) -> bool {
+    !PathBuf::from(command).is_absolute() && command.contains(std::path::MAIN_SEPARATOR)
 }
 
 /// Spawn-time fail-fast decision over a probed [`PiCliStatus`]: a gating
@@ -211,5 +224,19 @@ mod tests {
             pi_cli_gate(&PiCliProbe::Output(line)),
             PiCliGate::TooOld("0.79.0".into())
         );
+    }
+
+    /// An unresolvable RELATIVE separator-carrying override is CWD-dependent
+    /// (the child may resolve it where the daemon cannot), so it must degrade
+    /// to Failed → Unknown (permissive), never the hard-gating Missing. A
+    /// bare name and an absolute path stay Missing (hard-gate shapes).
+    #[test]
+    fn relative_override_shape_is_cwd_dependent() {
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(is_relative_with_separator(&format!(".{sep}bin{sep}pi")));
+        assert!(!is_relative_with_separator("pi"));
+        assert!(!is_relative_with_separator(&format!(
+            "{sep}usr{sep}local{sep}bin{sep}pi"
+        )));
     }
 }
