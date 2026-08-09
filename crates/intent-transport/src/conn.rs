@@ -27,6 +27,7 @@ use crate::host;
 use crate::panic_guard;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
+use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection outbound frame queue (responses + pushed
@@ -106,6 +107,15 @@ impl ConnSubs {
 /// frame through a cloned `out_tx`, so a long-running request (e.g.
 /// `host.exec`) cannot delay responses to other requests on the same connection.
 /// Out-of-order responses are fine: JSON-RPC correlates by `id`.
+///
+/// Every detached spawn claims a slot from the daemon-wide `limiter`
+/// (`server.maxOutstandingRpcs`) first; when the cap is reached the request is
+/// rejected immediately with `-32011 "Server overloaded"` (notifications are
+/// dropped silently) rather than queued. The permit is moved into the spawned
+/// task, so the slot is released when the task ends — panic unwinds included.
+/// Frames that fail parse/envelope validation are exempt: they are answered
+/// inline with the router's `-32700`/`-32600`, so the error matrix does not
+/// change under load.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
@@ -119,6 +129,7 @@ pub(crate) async fn process_frame(
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
     is_local: bool,
+    limiter: &RpcLimiter,
 ) -> bool {
     let parsed = serde_json::from_str::<Value>(raw).ok();
     if let Some(value) = &parsed {
@@ -197,6 +208,12 @@ pub(crate) async fn process_frame(
             // it inline would deadlock frame reads until the reverse timeout.
             // Response is delivered through the cloned outbound sender; if the
             // connection has since closed the send is dropped silently.
+            let permit = match limiter.try_acquire() {
+                Ok(permit) => permit,
+                Err(overloaded) => {
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                }
+            };
             let api = Arc::clone(api);
             let bus = bus.clone();
             let out = out_tx.clone();
@@ -204,6 +221,9 @@ pub(crate) async fn process_frame(
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                // Held for the whole task, so the slot is released when it
+                // ends — including a panic unwind through `guard_frame`.
+                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
                     if let Some(frame) = panic_guard::guard_frame(
                         &method,
@@ -224,11 +244,18 @@ pub(crate) async fn process_frame(
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
             // the reverse timeout.
+            let permit = match limiter.try_acquire() {
+                Ok(permit) => permit,
+                Err(overloaded) => {
+                    return reject_overloaded(&method, rpc_id, out_tx, overloaded).await
+                }
+            };
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
+                let _permit = permit;
                 crate::context::with_connection_context(is_tcp, async {
                     if let Some(frame) =
                         panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
@@ -315,11 +342,29 @@ pub(crate) async fn process_frame(
         .as_ref()
         .map(panic_guard::request_identity)
         .unwrap_or_else(|| (Some(Value::Null), String::new()));
+    // A frame that fails parse/envelope validation never reaches a service:
+    // `handle_message` answers it with `-32700`/`-32600` immediately. Gating it
+    // on the limiter would mask those codes behind `-32011` (and would silently
+    // drop an invalid notification-shaped frame that the router must still
+    // answer), so run it inline — it is pure, instant work on the read loop.
+    if !is_dispatchable(parsed.as_ref()) {
+        let frame =
+            panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), raw)).await;
+        return match frame {
+            Some(frame) => out_tx.send(frame).await.is_ok(),
+            None => true,
+        };
+    }
+    let permit = match limiter.try_acquire() {
+        Ok(permit) => permit,
+        Err(overloaded) => return reject_overloaded(&method, rpc_id, out_tx, overloaded).await,
+    };
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
+        let _permit = permit;
         crate::context::with_connection_context(is_tcp, async {
             if let Some(response) =
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
@@ -330,6 +375,66 @@ pub(crate) async fn process_frame(
         .await
     });
     true
+}
+
+/// Whether a generic frame can actually reach a service handler, i.e. it
+/// passes the envelope validation [`handle_message`] performs before dispatch
+/// (§9: `-32700` for unparseable JSON, `-32600` for a bad envelope). Only
+/// dispatchable frames are gated by the outstanding-RPC limiter; everything
+/// else is answered inline so the error matrix is unchanged under load.
+fn is_dispatchable(parsed: Option<&Value>) -> bool {
+    let Some(obj) = parsed.and_then(Value::as_object) else {
+        return false;
+    };
+    let jsonrpc_ok = obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let method_ok = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    let id_type_ok = match obj.get("id") {
+        None => true,
+        Some(v) => v.is_string() || v.is_number() || v.is_null(),
+    };
+    jsonrpc_ok && method_ok && id_type_ok
+}
+
+/// Reject one over-limit slow-path frame (`server.maxOutstandingRpcs`): a
+/// request echoes `-32011 "Server overloaded"` with its `id`, a notification
+/// (no `id`) is dropped without a response per PROTOCOL §9. Returns `false`
+/// only when the outbound channel is closed.
+///
+/// Sustained overload rejects a frame per read, so only the transition into
+/// saturation warns; the individual rejections log at `debug` to keep the log
+/// readable exactly when it matters most.
+async fn reject_overloaded(
+    method: &str,
+    rpc_id: Option<Value>,
+    out_tx: &mpsc::Sender<String>,
+    overloaded: Overloaded,
+) -> bool {
+    if overloaded.newly_saturated {
+        tracing::warn!(
+            method,
+            "outstanding slow-path RPC limit reached; rejecting requests with -32011"
+        );
+    } else {
+        tracing::debug!(
+            method,
+            "rejecting RPC: outstanding slow-path RPC limit reached"
+        );
+    }
+    match rpc_id {
+        Some(id) => out_tx
+            .send(events::error_frame(
+                id,
+                OVERLOAD_ERROR_CODE,
+                OVERLOAD_ERROR_MESSAGE,
+            ))
+            .await
+            .is_ok(),
+        None => !out_tx.is_closed(),
+    }
 }
 
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
@@ -782,5 +887,109 @@ async fn forward_channel_subscription(
                 seq += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request rejected at the outstanding-RPC cap answers `-32011 "Server
+    /// overloaded"` echoing its id, and the connection stays open.
+    #[tokio::test]
+    async fn overload_rejection_echoes_the_request_id() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let open = reject_overloaded(
+            "agent.list",
+            Some(json!("req-7")),
+            &tx,
+            Overloaded {
+                newly_saturated: true,
+            },
+        )
+        .await;
+        assert!(open, "the connection must stay open");
+        let frame = rx.try_recv().expect("frame queued");
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], json!("req-7"));
+        assert_eq!(v["error"]["code"], json!(OVERLOAD_ERROR_CODE));
+        assert_eq!(v["error"]["message"], OVERLOAD_ERROR_MESSAGE);
+    }
+
+    /// A notification (no `id`) is dropped silently at the cap — JSON-RPC
+    /// notifications never get a response (PROTOCOL §9).
+    #[tokio::test]
+    async fn overload_rejection_drops_notifications_without_a_frame() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let open = reject_overloaded(
+            "agent.list",
+            None,
+            &tx,
+            Overloaded {
+                newly_saturated: false,
+            },
+        )
+        .await;
+        assert!(open, "the connection must stay open");
+        assert!(rx.try_recv().is_err(), "notifications get no response");
+    }
+
+    /// Only frames that survive envelope validation are gated by the limiter;
+    /// unparseable and invalid frames stay on the inline path so the router
+    /// keeps owning `-32700` / `-32600` even at the cap.
+    #[test]
+    fn only_valid_envelopes_are_limiter_gated() {
+        let parse = |raw: &str| serde_json::from_str::<Value>(raw).ok();
+        assert!(is_dispatchable(
+            parse(r#"{"jsonrpc":"2.0","id":1,"method":"agent.list"}"#).as_ref()
+        ));
+        assert!(
+            is_dispatchable(parse(r#"{"jsonrpc":"2.0","method":"agent.list"}"#).as_ref()),
+            "a valid notification still dispatches"
+        );
+        for invalid in [
+            "not json",
+            "[1,2,3]",
+            r#"{"jsonrpc":"1.0","method":"agent.list"}"#,
+            r#"{"id":1,"method":"agent.list"}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":""}"#,
+            r#"{"jsonrpc":"2.0","id":{"a":1},"method":"agent.list"}"#,
+        ] {
+            assert!(
+                !is_dispatchable(parse(invalid).as_ref()),
+                "must not be limiter-gated: {invalid}"
+            );
+        }
+    }
+
+    /// A closed outbound channel is reported so the read loop can end.
+    #[tokio::test]
+    async fn overload_rejection_reports_a_closed_channel() {
+        let (tx, rx) = mpsc::channel::<String>(4);
+        drop(rx);
+        assert!(
+            !reject_overloaded(
+                "agent.list",
+                Some(json!(1)),
+                &tx,
+                Overloaded {
+                    newly_saturated: true,
+                },
+            )
+            .await
+        );
+        assert!(
+            !reject_overloaded(
+                "agent.list",
+                None,
+                &tx,
+                Overloaded {
+                    newly_saturated: false,
+                },
+            )
+            .await
+        );
     }
 }

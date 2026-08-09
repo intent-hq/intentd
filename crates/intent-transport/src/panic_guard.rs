@@ -136,27 +136,44 @@ where
     }
 }
 
+/// Test-only serialization of process-global state. The panic hook is a
+/// process-global, so every test in this crate that swaps it must go through
+/// [`with_quiet_panics`] (or hold [`lock_global_state`] while swapping);
+/// otherwise parallel tests interleave their swaps and restore each other's
+/// hook.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
 
     /// Serializes tests that mutate process-global state (the panic hook and
     /// the `INTENTD_TEST_PANIC_METHOD` env var) so parallel test threads
     /// cannot interleave hook swaps or env mutations.
     static GLOBAL_STATE: Mutex<()> = Mutex::new(());
 
+    /// Hold the global-state lock for a hand-rolled swap (hook + env).
+    pub(crate) fn lock_global_state() -> MutexGuard<'static, ()> {
+        GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Silence the default panic hook's stderr backtrace inside a scope; the
     /// guards rely on `catch_unwind`, not the hook, so behavior is unchanged.
-    /// Holds [`GLOBAL_STATE`] for the duration so hook swaps never interleave.
-    fn with_quiet_panics<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    /// Holds the global-state lock for the duration so hook swaps never
+    /// interleave. `f` must be synchronous (drive async work with
+    /// `block_on`) so the lock is never held across an `await`.
+    pub(crate) fn with_quiet_panics<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_global_state();
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let out = f();
         std::panic::set_hook(prev);
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{lock_global_state, with_quiet_panics};
+    use super::*;
 
     #[tokio::test]
     async fn guard_frame_panic_on_request_yields_internal_error_with_echoed_id() {
@@ -267,7 +284,7 @@ mod tests {
         // Serialize with the other global-state tests: hold the lock across
         // both the env mutation and the hook swap (open-coded here because
         // `with_quiet_panics` takes the same lock).
-        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_global_state();
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let prev_env = std::env::var("INTENTD_TEST_PANIC_METHOD").ok();

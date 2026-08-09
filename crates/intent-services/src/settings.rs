@@ -984,6 +984,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "server",
             None,
         ),
+        number(
+            "server.maxOutstandingRpcs",
+            "Max outstanding RPCs",
+            "Daemon-wide cap on outstanding slow-path RPCs across every connection; over-limit requests are rejected with -32011 \"Server overloaded\" (0 = unlimited; changes apply on daemon restart)",
+            "server",
+            Some(0.0),
+            Some(100000.0),
+            256.0,
+        ),
         // --- Group B: source control ----------------------------------------
         enumerated(
             "sourceControl.activeProvider",
@@ -2240,6 +2249,33 @@ mod tests {
         // Positive integer → Some(cap).
         settings.agents.max_concurrent = 12;
         assert_eq!(max_concurrent_agents(&settings), Some(12));
+    }
+
+    /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
+    /// (0 = unlimited, max 100k, default 256) registered in `KNOWN_PATHS`, and
+    /// its description states the restart requirement (the limiter is built
+    /// once in the composition root).
+    #[test]
+    fn max_outstanding_rpcs_catalog_entry_is_toml_backed() {
+        let def = find_definition("server.maxOutstandingRpcs")
+            .expect("server.maxOutstandingRpcs missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "server");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(100_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(256.0)));
+        assert!(
+            def.description.contains("daemon restart"),
+            "description must state the restart requirement: {}",
+            def.description
+        );
+        assert!(KNOWN_PATHS.contains(&"server.maxOutstandingRpcs"));
     }
 
     /// `workspaceApi.*` are non-secret TOML-backed catalog entries:

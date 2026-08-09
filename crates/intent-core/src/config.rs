@@ -35,6 +35,10 @@ pub const DEFAULT_WORKSPACE_API_TOON_OUTPUT: bool = true;
 /// agent (`hooks.maxPerAgent`).
 pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 
+/// Default daemon-wide cap on outstanding slow-path RPCs
+/// (`server.maxOutstandingRpcs`); `0` means unlimited.
+pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
+
 /// Default for `wakeResume.enabled` — whether the daemon detects host
 /// sleep/wake and resumes work on wake. On by default.
 pub const DEFAULT_WAKE_RESUME_ENABLED: bool = true;
@@ -91,6 +95,9 @@ pub struct Config {
     /// Cap on concurrently active (scheduled/running) background hooks per
     /// agent (`hooks.maxPerAgent`).
     pub hooks_max_per_agent: u32,
+    /// Daemon-wide cap on outstanding slow-path RPCs
+    /// (`server.maxOutstandingRpcs`); `0` means unlimited.
+    pub server_max_outstanding_rpcs: u32,
     /// Whether the daemon detects host sleep/wake and resumes work on wake
     /// (`wakeResume.enabled`); on by default.
     pub wake_resume_enabled: bool,
@@ -132,6 +139,7 @@ impl Config {
         let stream_retention_hours = env_u32("INTENTD_STREAM_RETENTION_HOURS")
             .unwrap_or(settings.events.stream_retention_hours);
         let hooks_max_per_agent = settings.hooks.max_per_agent;
+        let server_max_outstanding_rpcs = settings.server.max_outstanding_rpcs;
         let wake_resume_enabled = settings.wake_resume.enabled;
         // Clamp the configured threshold up to the floor: a `0` (or any
         // sub-minimum) value would make the clock-skew detector flag every
@@ -150,6 +158,7 @@ impl Config {
             idle_reap_minutes,
             stream_retention_hours,
             hooks_max_per_agent,
+            server_max_outstanding_rpcs,
             wake_resume_enabled,
             wake_resume_threshold_seconds,
         })
