@@ -21144,17 +21144,21 @@ mod last_activity_events {
     }
 
     /// Regression (monorepo#1585): the full-row `update_workspace` store write
-    /// can no longer clobber a concurrently bumped `lastActivity`. The
-    /// monorepo#1585 interleaving — services read the row, a debounce bump
-    /// landed, the mutation wrote the stale snapshot back — now holds the
-    /// bumped value, because the store routes `last_activity` through the
-    /// monotonic guard instead of replacing it.
+    /// can no longer clobber a concurrently bumped `lastActivity`. This
+    /// exercises the exact interleaving from the issue at the service layer:
+    /// the stale snapshot is read BEFORE the bump lands, then written back
+    /// through the same full-row `store.update_workspace` call every
+    /// `workspace.*` mutation path (update/archive/unarchive) uses — pre-fix
+    /// this silently reverted the bump.
     #[tokio::test]
     async fn update_workspace_does_not_clobber_concurrent_bump() {
         use intent_core::{WorkspaceApi, WorkspaceUpdate};
         let h = harness().await;
 
-        // A bump lands (the debounce persist path).
+        // 1. A mutation path reads its row snapshot (services do this first).
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+
+        // 2. A debounce bump lands after the read.
         let future = "2999-01-01T00:00:00Z";
         assert!(h
             .store
@@ -21162,7 +21166,23 @@ mod last_activity_events {
             .await
             .expect("bump"));
 
-        // A mutation flows through the get → mutate → full-row-write path.
+        // 3. The mutation writes its stale snapshot back full-row.
+        stale.title = "Renamed via stale snapshot".to_string();
+        stale.updated_at = now_iso();
+        h.store.update_workspace(&stale).await.expect("stale write");
+
+        // The bumped value holds; the rest of the row replaced.
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some(future),
+            "full-row write of a stale snapshot must not revert a newer lastActivity"
+        );
+        assert_eq!(reloaded.title, "Renamed via stale snapshot");
+
+        // And end-to-end: a subsequent `workspace.update` RPC (reload →
+        // mutate → full-row write → derive → monotonic persist) also leaves
+        // the bump intact.
         h.services
             .update_workspace(
                 h.ws.clone(),
@@ -21173,9 +21193,6 @@ mod last_activity_events {
             )
             .await
             .expect("update");
-
-        // The bumped value holds — neither the full-row write nor the
-        // post-derive persist walked it backwards.
         assert_eq!(
             h.store
                 .get_workspace(&h.ws)
@@ -21184,7 +21201,56 @@ mod last_activity_events {
                 .last_activity
                 .as_deref(),
             Some(future),
-            "update_workspace must not clobber a newer persisted lastActivity"
+            "workspace.update must not clobber a newer persisted lastActivity"
+        );
+    }
+
+    /// Regression (monorepo#1585 review): archive and unarchive persist the
+    /// `lastActivity` they derive for the response, so the lite list / seq-0
+    /// snapshot serves the same value without deriving.
+    #[tokio::test]
+    async fn archive_unarchive_persist_derived_last_activity() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let derived = archived
+            .last_activity
+            .clone()
+            .expect("archive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "archive must persist the derived lastActivity"
+        );
+
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let derived = unarchived
+            .last_activity
+            .clone()
+            .expect("unarchive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "unarchive must persist the derived lastActivity"
         );
     }
 

@@ -1355,6 +1355,34 @@ impl Services {
         }
     }
 
+    /// [`Self::derive_last_activity`] plus persistence of the result through
+    /// the scoped, monotonic column write (monorepo#1585). The mutation paths
+    /// that derive `lastActivity` for their response (update/archive/
+    /// unarchive) must all persist it too: without the write the caller gets
+    /// a fresh derived value while the stored column stays stale, so the
+    /// cheap read paths that never derive (`list_workspaces_lite`, the
+    /// `workspace.subscribe` seq-0 snapshot) — or a daemon restart — serve
+    /// the old timestamp until the next debounce fires. Best-effort: a store
+    /// failure only logs (`ctx` names the calling RPC), the primary mutation
+    /// already committed.
+    pub(crate) async fn derive_and_persist_last_activity(&self, ws: &mut Workspace, ctx: &str) {
+        self.derive_last_activity(ws).await;
+        if let Some(derived) = ws.last_activity.as_deref() {
+            if let Err(e) = self
+                .store
+                .bump_workspace_last_activity(&ws.id, derived)
+                .await
+            {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    context = ctx,
+                    error = %e,
+                    "persisting derived lastActivity failed"
+                );
+            }
+        }
+    }
+
     /// Schedule a debounced `workspace:updated { changes: { lastActivity } }` event
     /// emission for the workspace (§10.1). Recomputes the derived `lastActivity` via
     /// the existing aggregation and emits the event only when it differs from the
@@ -11768,26 +11796,11 @@ impl WorkspaceApi for Services {
                 store.update_workspace(&ws).await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
                 // `workspace.update` callers get the authoritative wire shape
-                // without a follow-up `workspace.get`. Chief is skipped: its
-                // timestamps are pinned above.
-                this.derive_last_activity(&mut ws).await;
-                // Persist the derived value through the scoped, monotonic
-                // column write (monorepo#1585): without this the caller gets a
-                // fresh derived value while the stored column stays stale, so
-                // the cheap read paths that never derive (`list_workspaces_lite`,
-                // the `workspace.subscribe` seq-0 snapshot) — or a daemon
-                // restart — serve the old timestamp until the next debounce
-                // fires. Best-effort: a store failure only logs, the update
-                // itself already committed.
-                if let Some(derived) = ws.last_activity.as_deref() {
-                    if let Err(e) = store.bump_workspace_last_activity(&ws.id, derived).await {
-                        tracing::warn!(
-                            workspace = %ws.id.as_str(),
-                            error = %e,
-                            "workspace.update: persisting derived lastActivity failed"
-                        );
-                    }
-                }
+                // without a follow-up `workspace.get`, and persist it through
+                // the scoped monotonic write (monorepo#1585). Chief is
+                // skipped: its timestamps are pinned above.
+                this.derive_and_persist_last_activity(&mut ws, "workspace.update")
+                    .await;
                 // Derive `activity` from live agent state (§9.9) so the mutation
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
@@ -12337,8 +12350,11 @@ impl WorkspaceApi for Services {
                 // runs post-persist.
                 this.cancel_workspace_hooks(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
-                // authoritative wire shape without a follow-up `workspace.get`.
-                this.derive_last_activity(&mut ws).await;
+                // authoritative wire shape without a follow-up `workspace.get`,
+                // and persist it through the scoped monotonic write
+                // (monorepo#1585).
+                this.derive_and_persist_last_activity(&mut ws, "workspace.archive")
+                    .await;
                 // Derive `activity` from live agent state (§9.9) so the mutation
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
@@ -12426,7 +12442,10 @@ impl WorkspaceApi for Services {
                     ),
                 }
             }
-            this.derive_last_activity(&mut ws).await;
+            // Derive `lastActivity` (§9.1) and persist it through the scoped
+            // monotonic write (monorepo#1585).
+            this.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
+                .await;
             // Derive `activity` from live agent state (§9.9) so the mutation
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
