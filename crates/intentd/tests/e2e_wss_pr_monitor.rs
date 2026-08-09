@@ -811,7 +811,11 @@ async fn pr_monitor_cancel_removes_the_row_and_notifies_the_owner_over_wss() {
 
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
 /// owner is woken immediately, and the `completed` row STAYS visible in
-/// `prMonitor.list` so merged PRs remain in the UI's list.
+/// `prMonitor.list` so merged PRs remain in the UI's list. The wake's
+/// persisted user row carries the PROTOCOL §5.42 `messageMetadata`
+/// (`type`/`monitorId`/`repo`/`prNumber`/`reason` + the baseline-sourced
+/// `url`), asserted through `agent.getConversation` over the wire — the
+/// client-visible read path.
 #[tokio::test]
 async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     let fx = boot().await;
@@ -856,6 +860,27 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(rows.len(), 1, "completed rows stay visible: {listed}");
     assert_eq!(rows[0]["state"], "completed");
     assert_eq!(rows[0]["lastSnapshot"]["state"], "merged");
+
+    // The client-visible transcript row carries the wake's messageMetadata,
+    // including the baseline-sourced `url` (PROTOCOL §5.42).
+    let convo = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.getConversation",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": fx.agent_id.as_str() }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let wake = messages
+        .iter()
+        .find(|m| m["metadata"]["type"] == json!("pr_monitor_wake"))
+        .unwrap_or_else(|| panic!("wake row carries pr_monitor_wake metadata: {convo}"));
+    let metadata = &wake["metadata"];
+    assert_eq!(metadata["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(metadata["repo"], "o/r");
+    assert_eq!(metadata["prNumber"], 42);
+    assert_eq!(metadata["reason"], "completed");
+    assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
 }
 
 /// Active-monitor `displayStatus` promotion over the wire (PROTOCOL §6.5,

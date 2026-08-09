@@ -491,6 +491,22 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
+  // Suffix-matched park: like `parkIfPromptContains` but only when the prompt
+  // ENDS with the marker. The daemon's session-recreation history replay
+  // renders every prior row BEFORE the current message, so a marker from an
+  // earlier turn appears mid-prompt on a fresh child's replayed prompt —
+  // suffix matching parks only the turn whose OWN content carries the marker
+  // (needed by the idle-timeout teardown e2e, where the warning turn on the
+  // fresh child must respond normally despite the replayed marker).
+  if (
+    typeof behavior.parkIfPromptEndsWith === 'string' &&
+    behavior.parkIfPromptEndsWith.length > 0 &&
+    promptText.trimEnd().endsWith(behavior.parkIfPromptEndsWith)
+  ) {
+    log('parkIfPromptEndsWith: parking this turn');
+    pendingPromptIds.push(id);
+    return;
+  }
   // Per-prompt exit: die mid-prompt whenever the prompt text carries the
   // configured marker (unconditional — every redrive of the marked prompt
   // dies again, so the silent-redrive budget is spent and the failure goes
@@ -836,6 +852,39 @@ async function dispatch(msg) {
             rawOutput: { error: 'The operation was aborted' },
           },
         });
+      }
+      // Idle-timeout tail-bleed regression (monorepo#1599): with the opt-in
+      // `tailAfterCancel` marker set, stream one trailing `agent_message_chunk`
+      // carrying the marker BEFORE resolving the parked prompt — modelling a
+      // child that emits late `session/update`s for the cancelled turn on its
+      // ordered stdout ahead of the cancel response. Because stdout is ordered,
+      // the straggler always precedes the resolving `result(...)` line — the
+      // deterministic boundary the daemon's watermark drain relies on. Strictly
+      // gated on the new key so every existing cancel behavior is unaffected.
+      if (
+        typeof behavior.tailAfterCancel === 'string' &&
+        behavior.tailAfterCancel.length > 0 &&
+        pendingPromptIds.length > 0
+      ) {
+        log(`emitting tail-after-cancel chunk: ${behavior.tailAfterCancel}`);
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: behavior.tailAfterCancel },
+          },
+        });
+      }
+      // Timeout→teardown regression (monorepo#1599 review): with the opt-in
+      // `neverResolveOnCancel` flag set, leave parked prompts PENDING forever —
+      // modelling a child that acknowledges nothing after `session/cancel` and
+      // may keep streaming stragglers indefinitely. The daemon's watermark
+      // await must time out and tear this child down instead of letting the
+      // warning turn share its notifications channel. Strictly gated so every
+      // existing cancel behavior is unaffected.
+      if (behavior.neverResolveOnCancel) {
+        log('neverResolveOnCancel: leaving parked prompt(s) unresolved');
+        return;
       }
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
       // reason and stay alive for a follow-up (resume) prompt — the observable
