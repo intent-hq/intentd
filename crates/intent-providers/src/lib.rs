@@ -28,7 +28,7 @@ pub mod discover;
 pub mod models;
 
 pub use args::{
-    apply_codex_config_args, build_provider_args, build_provider_env,
+    apply_codex_config_args, build_provider_args, build_provider_env, build_provider_env_for_spawn,
     build_provider_env_with_unsloth, enhanced_path, upsert_codex_config_args, ArgInputs,
     UnslothEndpoint, UnslothModelLimit,
 };

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use intent_providers::{
-    apply_codex_config_args, build_provider_args, build_provider_env_with_unsloth, enhanced_path,
+    apply_codex_config_args, build_provider_args, build_provider_env_for_spawn, enhanced_path,
     ArgInputs, ProviderConfig, UnslothEndpoint,
 };
 use tokio::io::AsyncRead;
@@ -151,12 +151,19 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in build_provider_env_with_unsloth(
+    // An npx spawn (fallback or npx-only) always runs a Node child, so env
+    // assembly applies the V8 heap cap even when the provider's declared
+    // runtime is Native (codex's npx fallback, intent-hq/monorepo#1661).
+    let via_npx = opts.provider_binary.is_none()
+        && opts.npx_fallback_binary.is_some()
+        && opts.npx_fallback_package.is_some();
+    for (key, value) in build_provider_env_for_spawn(
         opts.provider,
         opts.model,
         opts.rules_file,
         opts.env_mcp_config,
         opts.unsloth_endpoint,
+        via_npx,
     ) {
         cmd.env(key, value);
     }
@@ -169,11 +176,7 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     // stray or hostile value could redirect the adapter away from the vendored
     // binary (#555). Resolved binaries (providers.paths / PATH scan) keep the
     // daemon env untouched.
-    if opts.provider.id == "codex"
-        && opts.provider_binary.is_none()
-        && opts.npx_fallback_binary.is_some()
-        && opts.npx_fallback_package.is_some()
-    {
+    if opts.provider.id == "codex" && via_npx {
         cmd.env_remove("CODEX_PATH");
         cmd.env_remove("CODEX_CONFIG");
     }
@@ -714,6 +717,58 @@ mod build_command_tests {
         cmd.as_std()
             .get_envs()
             .any(|(k, v)| k == key && v.is_none())
+    }
+
+    /// The explicitly-set value of `key` on `cmd`, if any.
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn build_command_applies_heap_cap_on_codex_npx_fallback() {
+        // codex is declared Native (Rust binary), but the npx-fallback child
+        // is Node — the STAB-50 heap cap must apply (intent-hq/monorepo#1661).
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        let node_options = env_value(&cmd, "NODE_OPTIONS");
+        if std::env::var("NODE_OPTIONS").is_ok_and(|v| v.contains("--max-old-space-size")) {
+            // An inherited cap wins: injection is (correctly) skipped.
+            assert!(
+                node_options.is_none(),
+                "inherited --max-old-space-size must suppress injection"
+            );
+        } else {
+            let v = node_options.expect("npx-fallback codex spawn must set NODE_OPTIONS");
+            assert!(
+                v.contains("--max-old-space-size="),
+                "NODE_OPTIONS must carry the heap cap, got: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_command_no_heap_cap_on_codex_resolved_binary() {
+        // The resolved native codex-acp binary is not V8: no NODE_OPTIONS.
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.provider_binary = Some(&provider_binary);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        assert!(
+            env_value(&cmd, "NODE_OPTIONS").is_none(),
+            "resolved-binary codex spawn must not inject NODE_OPTIONS"
+        );
     }
 
     #[test]
