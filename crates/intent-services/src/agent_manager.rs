@@ -1122,6 +1122,29 @@ const HARNESS_WAKE_POLL: Duration = Duration::from_millis(50);
 
 type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 
+/// RAII guard returned by [`AgentManager::stop_many`]: while alive, the swept
+/// agents stay in the manager's `stopping` set, fencing them off from the
+/// lazy-spawn paths (`ensure_started` / `create_agent`). The caller holds it
+/// across the store cascade that deletes the swept session rows, then drops
+/// it — after which the rows are gone and a spawn attempt fails `NotFound`
+/// on its own store read.
+#[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
+pub struct TeardownFence {
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
+    ids: Vec<AgentId>,
+}
+
+impl Drop for TeardownFence {
+    fn drop(&mut self) {
+        // Poison recovery mirrors the delete-path sweeps: unfencing is the
+        // last chance to keep the set from leaking these ids forever.
+        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            stopping.remove(id);
+        }
+    }
+}
+
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -1209,6 +1232,19 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents fenced off from the lazy-spawn paths because a batch teardown
+    /// ([`AgentManager::stop_many`]) is in flight and their session rows are
+    /// about to be cascade-deleted (`workspace.delete`). While an agent is in
+    /// this set, [`AgentManager::ensure_started`] refuses to (re)spawn it and
+    /// [`AgentManager::create_agent`] refuses to install a fresh handle —
+    /// otherwise a concurrent `agent.sendMessage` that passed its store check
+    /// before the sweep could lazily spawn a replacement child during the
+    /// shared grace wait, and that child would outlive its deleted session as
+    /// a ghost process no sweep ever kills. Armed by `stop_many` BEFORE the
+    /// first detach; cleared when the returned [`TeardownFence`] drops (after
+    /// the caller's store cascade, at which point the session row is gone and
+    /// the spawn path fails `NotFound` on its own).
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
     /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
     /// monorepo#878): started on demand when an `unsloth`-provider agent
     /// spawns, reused while the served model matches, restarted on model
@@ -1277,6 +1313,7 @@ impl AgentManager {
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
         }
     }
@@ -1681,10 +1718,37 @@ impl AgentManager {
                 kill_child_tree(child, stale_pid).await;
             }
         }
-        self.handles
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), handle);
+        // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
+        // (`stop_many`) may have swept this agent AFTER the caller's session
+        // checks passed — installing the fresh handle now would leave a live
+        // child no sweep ever kills once the store cascade drops the session
+        // row. Check-and-insert under the `stopping` lock so the install is
+        // atomic against `stop_many` arming the fence: fence armed first →
+        // the install is refused here (fresh child killed below); handle
+        // installed first → `stop_many`'s detach finds it and kills it with
+        // the batch. Either interleaving leaves no orphaned process.
+        let fenced = {
+            let stopping = self.stopping.lock().unwrap();
+            if stopping.contains(&agent_id) {
+                Some(handle)
+            } else {
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), handle);
+                None
+            }
+        };
+        if let Some(mut handle) = fenced {
+            self.registry.deregister(&agent_id);
+            let spawn_pid = handle.child_pid;
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child, spawn_pid).await;
+            }
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // Proactive dead-child detection (monorepo#764): watch the installed
         // child for an unexpected exit so an idle agent's death is reaped
         // (handle + registry) as it happens, not just at the next prompt.
@@ -2767,7 +2831,26 @@ impl AgentManager {
     /// count, instead of N sequential SIGTERM→grace→SIGKILL cycles. This is
     /// the `workspace.delete` sweep (same detach-many → kill_child_trees
     /// pattern as `shutdown()`, minus the interrupted-session capture).
-    pub async fn stop_many(&self, agent_ids: &[AgentId]) {
+    ///
+    /// Returns a [`TeardownFence`] that keeps the swept agents fenced off
+    /// from the lazy-spawn paths until dropped: the caller must hold it
+    /// across the store cascade that deletes the session rows, so a
+    /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
+    /// child that would outlive its deleted session as a ghost process.
+    #[must_use = "hold the fence until the swept agents' session rows are deleted"]
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+        // Arm the fence BEFORE the first detach: from here on, every lazy
+        // spawn for a swept agent is refused (`ensure_started` fast-fail +
+        // the `create_agent` install fence), so no replacement child can
+        // slip in during the shared grace wait below.
+        self.stopping
+            .lock()
+            .unwrap()
+            .extend(agent_ids.iter().cloned());
+        let fence = TeardownFence {
+            stopping: Arc::clone(&self.stopping),
+            ids: agent_ids.to_vec(),
+        };
         let mut children = Vec::new();
         for id in agent_ids {
             let (_, child) = self.detach(id).await;
@@ -2778,6 +2861,7 @@ impl AgentManager {
         if !children.is_empty() {
             kill_child_trees(children).await;
         }
+        fence
     }
 
     /// Shared teardown body of [`AgentManager::stop`]: abort the worker, drop
@@ -5070,6 +5154,19 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
+        // `workspace.delete` batch stop (`stop_many`) is tearing down — its
+        // session row is about to be cascade-deleted, so a lazy spawn here
+        // would create a child that outlives the row. NotFound is
+        // non-retryable for `retry_spawn`, so the turn fails fast instead of
+        // burning spawn attempts against a fence that will not lift. The
+        // install-time fence in `create_agent` closes the interleaving where
+        // this check passes just before the fence arms.
+        if self.stopping.lock().unwrap().contains(agent_id) {
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // A delegate with CoW isolation provisions the sandbox in a background
         // task, off the delegate critical path (monorepo#871). Await
         // settlement BEFORE reading the session so the child never spawns
@@ -8085,7 +8182,7 @@ mod role_reminder_tests {
         dir
     }
 
-    fn workspace(id: &WorkspaceId) -> Workspace {
+    pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         let ts = now_iso();
         Workspace {
             id: id.clone(),

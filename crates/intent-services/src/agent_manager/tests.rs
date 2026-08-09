@@ -1111,7 +1111,7 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let start = std::time::Instant::now();
-    mgr.stop_many(&ids).await;
+    let fence = mgr.stop_many(&ids).await;
     let elapsed = start.elapsed();
 
     // Serial teardown would take ~N * grace (8s for 4 children); the shared
@@ -1129,6 +1129,74 @@ async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
     // Per-agent `stop()` semantics applied to every agent in the batch.
     assert!(mgr.is_empty(), "all handles removed");
     assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
+    // The returned fence keeps every swept agent blocked from the
+    // lazy-spawn paths until dropped, then re-opens them.
+    for id in &ids {
+        assert!(
+            mgr.stopping.lock().unwrap().contains(id),
+            "{id} fenced while the TeardownFence is held"
+        );
+    }
+    drop(fence);
+    assert!(
+        mgr.stopping.lock().unwrap().is_empty(),
+        "fence drop clears the stopping set"
+    );
+}
+
+/// Ghost-agent race regression (PR #1038 review): while a `stop_many`
+/// teardown fence is held, the lazy-spawn path (`ensure_started`) must
+/// refuse to spawn a replacement child for a swept agent — otherwise a
+/// concurrent `agent.sendMessage` racing `workspace.delete`'s shared grace
+/// wait could leave a live process whose session row the cascade then
+/// deletes. Once the fence drops, the spawn path is open again.
+#[tokio::test]
+async fn stop_many_fence_blocks_lazy_respawn_until_dropped() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-fence");
+    let agent_id = AgentId::from("a-fence-respawn");
+    mgr.services
+        .store
+        .insert_workspace(&super::role_reminder_tests::workspace(&ws))
+        .await
+        .expect("insert workspace");
+    let session = super::role_reminder_tests::session(&agent_id, &ws, None);
+    mgr.services
+        .store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let fence = mgr.stop_many(std::slice::from_ref(&agent_id)).await;
+    // Session row still present (the delete cascade has not run), yet the
+    // spawn is refused: the fence, not the store check, blocks it.
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("fenced agent must not respawn");
+    assert!(
+        matches!(err, Error::NotFound(_)),
+        "fence surfaces NotFound (non-retryable for retry_spawn), got: {err:?}"
+    );
+    assert!(mgr.is_empty(), "no handle installed for the fenced agent");
+
+    drop(fence);
+    // Fence lifted, session row deleted (as the workspace.delete cascade
+    // does): the spawn path proceeds past the teardown guard and now fails
+    // on its own store read — proving the fence no longer fires.
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &agent_id)
+        .await
+        .expect("delete session");
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("session row gone");
+    assert!(
+        !err.to_string().contains("is being deleted"),
+        "unfenced agent proceeds past the teardown guard, got: {err:?}"
+    );
 }
 
 /// Signal-0 liveness probe used by the process-group teardown test.
