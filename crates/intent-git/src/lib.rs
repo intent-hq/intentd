@@ -25,6 +25,7 @@ pub mod cow;
 pub mod cow_checkout;
 pub mod diff;
 pub mod fetch;
+pub mod fs_remove;
 pub mod history;
 pub mod pull;
 pub mod push;

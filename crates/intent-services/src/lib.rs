@@ -6369,7 +6369,16 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
                 }
             }
             let trash = child.path();
-            match std::fs::remove_dir_all(&trash) {
+            // The parallel helper folds `NotFound` into `Ok`; skip silently
+            // here (like the serial original) so a dir a concurrent removal
+            // already won doesn't log or count as a phantom removal.
+            if matches!(
+                std::fs::symlink_metadata(&trash),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
+            match intent_git::fs_remove::remove_dir_all_parallel(&trash) {
                 Ok(()) => {
                     tracing::info!(
                         path = %trash.display(),
@@ -6378,7 +6387,6 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
                     removed += 1;
                     swept_any = true;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -12243,13 +12251,12 @@ impl WorkspaceApi for Services {
                     if recreated_parent.as_deref() == Some(dir.as_path()) {
                         continue;
                     }
-                    let cleanup =
-                        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => Ok(()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(e) => Err(e),
-                        })
-                        .await;
+                    // Shared parallel removal helper; `NotFound` is already
+                    // folded into `Ok` there.
+                    let cleanup = tokio::task::spawn_blocking(move || {
+                        intent_git::fs_remove::remove_dir_all_parallel(&dir)
+                    })
+                    .await;
                     match cleanup {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => tracing::warn!(
