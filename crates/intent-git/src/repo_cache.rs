@@ -309,6 +309,10 @@ where
 ///    branch-reuse semantics as the CoW checkout path) and hard-reset to it.
 /// 4. Retarget `origin` from the cache path to `origin_url` (the real GitHub
 ///    URL), so pushes/fetches in the checkout never touch the cache.
+/// 5. Populate submodules from the cache's local module git dirs
+///    ([`hydrate_submodules_from_cache`]) — best-effort: a submodule anomaly
+///    degrades to unpopulated submodules with a warning, never a failed
+///    provisioning.
 ///
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
@@ -320,13 +324,107 @@ pub fn provision_direct_checkout(
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {
-    provision_plain_clone_checkout(
+    let sha = provision_plain_clone_checkout(
         cache_path,
         checkout_path,
         OriginTarget::Url(origin_url),
         branch,
         base_ref,
+    )?;
+    if let Err(e) = hydrate_submodules_from_cache(cache_path, checkout_path) {
+        tracing::warn!(
+            checkout = %checkout_path.display(),
+            cache = %cache_path.display(),
+            error = %e,
+            "provision_direct_checkout: submodule population failed; checkout provisioned with unpopulated submodules"
+        );
+    }
+    Ok(sha)
+}
+
+/// Populate the checkout's submodules using only the cache's local objects.
+///
+/// A plain local clone carries the superproject alone: gitlink paths are
+/// empty directories and `.git/modules` does not exist. Copy the cache's
+/// `.git/modules` tree (the submodule git dirs the cache clone/refresh keeps
+/// populated) into the checkout, then run `git submodule update --init
+/// --recursive --force`: for each submodule git already finds
+/// `.git/modules/<name>`, so it reconnects the work tree to it and checks out
+/// the recorded gitlink from local objects instead of cloning over the
+/// network. Nested submodules sit inside the copied tree at their expected
+/// paths, so the recursion stays local too. A gitlink the cache does not hold
+/// (or a submodule with no copied git dir) falls back to the real remote —
+/// best-effort by design.
+///
+/// `submodule init` (the `--init` half) records `submodule.<name>.url` from
+/// `.gitmodules`, resolved against the checkout's `origin` — already
+/// retargeted at the real URL — and the closing `submodule sync --recursive`
+/// re-points every submodule's own `remote.origin.url` at the same
+/// resolution, so no config value references the cache and deleting the cache
+/// never breaks the checkout. Skipped entirely (no subprocess) when the
+/// checkout has no `.gitmodules`.
+fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Result<()> {
+    if !crate::submodule::has_submodules(checkout_path) {
+        return Ok(());
+    }
+    let src = cache_path.join(".git").join("modules");
+    let dst = checkout_path.join(".git").join("modules");
+    if src.is_dir() && !dst.exists() {
+        copy_dir_recursive(&src, &dst).map_err(|e| {
+            Error::Internal(format!(
+                "cannot copy submodule git dirs from the cache: {e}"
+            ))
+        })?;
+    }
+    update_checkout_submodules(checkout_path)?;
+    run_git(
+        checkout_path,
+        &["submodule", "sync", "--recursive"],
+        None,
+        CACHE_FETCH_TIMEOUT,
     )
+}
+
+/// Force-sync every submodule work tree in `checkout_path` to its recorded
+/// gitlink (`git submodule update --init --recursive --force`). Local when
+/// the module git dirs already hold the gitlink objects; git falls back to
+/// fetching from the recorded URL otherwise. Shared with
+/// [`crate::cow_checkout::provision_cow_checkout`], whose byte copy carries
+/// the source's module git dirs but whose hard reset never touches submodule
+/// work trees. No token: the local-first paths this serves need no network.
+pub(crate) fn update_checkout_submodules(checkout_path: &Path) -> Result<()> {
+    run_git(
+        checkout_path,
+        &["submodule", "update", "--init", "--recursive", "--force"],
+        None,
+        CACHE_FETCH_TIMEOUT,
+    )
+}
+
+/// Plain recursive directory copy (dirs, files, symlinks recreated). The
+/// submodule git dirs this copies are not CoW-cloneable as a unit here (the
+/// destination `.git` already exists), and correctness beats sharing for
+/// them.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else if ty.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &to)?;
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(entry.path(), &to)?;
+            }
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// What the provisioned clone's `origin` remote must point at once the local
@@ -525,19 +623,10 @@ fn run_git_os(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{add_submodule, commit_file, init_repo, TempDir};
-
-    /// Allow local-path/`file://` submodule clones for this test process:
-    /// git ≥ 2.38 blocks the `file` transport for *submodule* operations by
-    /// default (CVE-2022-39253), which would fail the recursive clone /
-    /// `submodule update --init` of the local fixtures below. Production
-    /// caches GitHub repos over https and never hits this override.
-    fn allow_file_submodules() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            std::env::set_var("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=always'");
-        });
-    }
+    use crate::testutil::{
+        add_submodule, allow_file_submodules, commit_file, commit_gitlink_bump, commit_super_index,
+        init_repo, TempDir,
+    };
 
     /// Fixture superproject with one submodule at `sub/` (child committed at
     /// `c.txt` = "sub one"). Returns `(superproject, child)`.
@@ -548,43 +637,6 @@ mod tests {
         commit_file(superproject.path(), "a.txt", "one\n");
         add_submodule(superproject.path(), child.path(), "sub");
         (superproject, child)
-    }
-
-    /// Commit the superproject's current index with `msg` (HEAD advances).
-    fn commit_super_index(super_path: &Path, msg: &str) {
-        let repo = Repository::open(super_path).unwrap();
-        let mut index = repo.index().unwrap();
-        let tree_oid = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
-        let parent = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&parent])
-            .unwrap();
-    }
-
-    /// Point the gitlink at `sub_rel` to `sha` and commit — how an upstream
-    /// bumps a submodule pin (the gitlink target need not exist in the
-    /// superproject's odb, exactly like the real thing).
-    fn commit_gitlink_bump(super_path: &Path, sub_rel: &str, sha: &str) {
-        let repo = Repository::open(super_path).unwrap();
-        let mut index = repo.index().unwrap();
-        let entry = git2::IndexEntry {
-            ctime: git2::IndexTime::new(0, 0),
-            mtime: git2::IndexTime::new(0, 0),
-            dev: 0,
-            ino: 0,
-            mode: 0o160000,
-            uid: 0,
-            gid: 0,
-            file_size: 0,
-            id: git2::Oid::from_str(sha).unwrap(),
-            flags: 0,
-            flags_extended: 0,
-            path: sub_rel.as_bytes().to_vec(),
-        };
-        index.add(&entry).unwrap();
-        index.write().unwrap();
-        commit_super_index(super_path, "bump gitlink");
     }
 
     /// Remove the submodule at `sub_rel` from the superproject history
@@ -1258,5 +1310,182 @@ mod tests {
             "sub one\n"
         );
         assert_eq!(head_sha(&path.join("sub")), head_sha(child.path()));
+    }
+
+    /// Every value in the given repo config file, so a test can assert no
+    /// value still references the cache path.
+    fn config_values(config_path: &Path) -> Vec<String> {
+        let cfg = git2::Config::open(config_path).unwrap();
+        let mut values = Vec::new();
+        let mut entries = cfg.entries(None).unwrap();
+        while let Some(entry) = entries.next() {
+            let entry = entry.unwrap();
+            if let Ok(value) = entry.value() {
+                values.push(value.to_string());
+            }
+        }
+        values
+    }
+
+    /// Direct hydration of a repo with a submodule populates the submodule
+    /// work tree from the cache's local module git dirs — no network: the
+    /// child repo (the only remote the submodule could fetch from) is deleted
+    /// before provisioning.
+    #[tokio::test]
+    async fn direct_checkout_populates_submodules_from_cache_without_network() {
+        allow_file_submodules();
+        let (origin, child) = submodule_fixture("repocache-directsub");
+        let root = CacheRoot::new("directsub");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        let sub_sha = head_sha(child.path());
+        let child_url = child.path().to_string_lossy().to_string();
+        // Any fetch/clone from the submodule's real URL now fails: population
+        // must come from the cache's local module git dirs alone.
+        drop(child);
+
+        let checkout_root = CacheRoot::new("directsub-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "submodule work tree is populated"
+        );
+        assert_eq!(head_sha(&checkout.join("sub")), sub_sha);
+        // Final submodule URLs point at the real `.gitmodules` remote, not
+        // the cache: the recorded config for the superproject and the module
+        // both name the child URL, and no config value names the cache path.
+        let repo = Repository::open(&checkout).unwrap();
+        let cfg = repo.config().unwrap();
+        assert_eq!(cfg.get_string("submodule.sub.url").unwrap(), child_url);
+        let cache_str = cache.display().to_string();
+        for config in [
+            checkout.join(".git").join("config"),
+            checkout
+                .join(".git")
+                .join("modules")
+                .join("sub")
+                .join("config"),
+        ] {
+            for value in config_values(&config) {
+                assert!(
+                    !value.contains(&cache_str),
+                    "config value {value:?} still references the cache path"
+                );
+            }
+        }
+        // The cache itself is untouched by the hydration.
+        assert_eq!(
+            std::fs::read_to_string(cache.join("sub").join("c.txt")).unwrap(),
+            "sub one\n"
+        );
+    }
+
+    /// The cache must remain safe to delete: after direct hydration, wiping
+    /// the cache leaves a fully functional checkout, submodule included.
+    #[tokio::test]
+    async fn direct_checkout_survives_cache_deletion() {
+        allow_file_submodules();
+        let (origin, child) = submodule_fixture("repocache-directrm");
+        let root = CacheRoot::new("directrm");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let checkout_root = CacheRoot::new("directrm-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        std::fs::remove_dir_all(&cache).unwrap();
+
+        let repo = Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), "ws-branch");
+        let sub = Repository::open(checkout.join("sub")).unwrap();
+        assert_eq!(
+            sub.head().unwrap().target().unwrap().to_string(),
+            head_sha(child.path())
+        );
+        // A force-resync still works from the checkout's own objects.
+        update_checkout_submodules(&checkout).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n"
+        );
+    }
+
+    /// A `base_ref` pinned at an older gitlink: the checkout's submodule
+    /// lands on that older commit, resolved from the cache's local module
+    /// objects (the cache tip has moved past it).
+    #[tokio::test]
+    async fn direct_checkout_syncs_submodule_to_base_ref_gitlink() {
+        allow_file_submodules();
+        let (origin, child) = submodule_fixture("repocache-directbase");
+        let old_sub_sha = head_sha(child.path());
+        // Pin `base` at the old gitlink, then bump the pin on the default tip.
+        crate::testutil::create_branch(origin.path(), "base");
+        commit_file(child.path(), "c.txt", "sub two\n");
+        let new_sub_sha = head_sha(child.path());
+        commit_gitlink_bump(origin.path(), "sub", &new_sub_sha);
+
+        let root = CacheRoot::new("directbase");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        assert_eq!(head_sha(&cache.join("sub")), new_sub_sha, "cache at tip");
+
+        let checkout_root = CacheRoot::new("directbase-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout(&cache, &checkout, &url, "ws-branch", Some("base")).unwrap();
+
+        assert_eq!(
+            head_sha(&checkout.join("sub")),
+            old_sub_sha,
+            "submodule sits at the base ref's gitlink, not the cache tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n"
+        );
+    }
+
+    /// A submodule anomaly during direct hydration (no local module git dirs
+    /// and an unreachable real URL) degrades to an unpopulated submodule with
+    /// a warning — provisioning still succeeds.
+    #[tokio::test]
+    async fn direct_checkout_submodule_failure_degrades_gracefully() {
+        allow_file_submodules();
+        let (origin, child) = submodule_fixture("repocache-directdeg");
+        let root = CacheRoot::new("directdeg");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+        // No local module git dirs to copy AND no reachable real URL: the
+        // submodule update has nothing to populate from.
+        std::fs::remove_dir_all(cache.join(".git").join("modules")).unwrap();
+        drop(child);
+
+        let checkout_root = CacheRoot::new("directdeg-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        let sha = provision_direct_checkout(&cache, &checkout, &url, "ws-branch", None).unwrap();
+
+        assert!(!sha.is_empty(), "provisioning succeeds despite the anomaly");
+        let repo = Repository::open(&checkout).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), "ws-branch");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n",
+            "superproject content is intact"
+        );
+        assert!(
+            !checkout.join("sub").join("c.txt").exists(),
+            "submodule is left unpopulated"
+        );
     }
 }

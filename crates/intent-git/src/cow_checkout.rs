@@ -46,6 +46,9 @@ pub struct CowProvisionTimings {
     pub strip_registrations: Duration,
     /// Duration of branch creation + checkout + hard reset in the clone.
     pub checkout: Duration,
+    /// Duration of the post-reset submodule force-update (zero when the
+    /// clone has no `.gitmodules`).
+    pub submodule_update: Duration,
 }
 
 impl CowProvisionTimings {
@@ -68,6 +71,16 @@ impl CowProvisionTimings {
 /// branch of the same name is reused rather than recreated. Returns the SHA of
 /// the commit the checkout lands on. On failure after the clone, the partially
 /// provisioned `checkout_path` is removed best-effort.
+///
+/// When the checkout has `.gitmodules`, submodule work trees are force-synced
+/// to their recorded gitlinks after the reset (`git submodule update --init
+/// --recursive --force`): the hard reset moves the superproject alone, so a
+/// `base_ref` whose gitlinks differ from the source tip would otherwise leave
+/// the byte-copied submodule work trees at the wrong commit. The clone
+/// carries the source's `.git/modules` git dirs, so the update resolves from
+/// local objects — no network when the source (e.g. a fresh repo cache)
+/// already holds the gitlink commits. A submodule failure degrades to a
+/// warning; it never fails provisioning.
 ///
 /// The clone inherits the source's `origin` remote verbatim (fetch URL and
 /// any `remote.origin.pushurl` alike), so both are resolved the same way as
@@ -108,6 +121,7 @@ pub fn provision_cow_checkout(
         skipped_excluded = timings.skipped_excluded,
         strip_registrations_ms = timings.strip_registrations.as_millis() as u64,
         checkout_ms = timings.checkout.as_millis() as u64,
+        submodule_update_ms = timings.submodule_update.as_millis() as u64,
         "provision_cow_checkout: provisioning phase timings"
     );
     Ok(sha)
@@ -167,6 +181,22 @@ pub fn provision_cow_checkout_timed(
         let checkout_started = Instant::now();
         let sha = checkout_in_clone(checkout_path, branch, base_ref, remote)?;
         timings.checkout = checkout_started.elapsed();
+        // The hard reset above moved the superproject only; force-sync the
+        // byte-copied submodule work trees to the gitlinks the base commit
+        // records (local: the clone carries the source's `.git/modules`).
+        // Best-effort — a broken submodule degrades with a warning instead
+        // of failing the whole provisioning.
+        if crate::submodule::has_submodules(checkout_path) {
+            let submodule_started = Instant::now();
+            if let Err(e) = crate::repo_cache::update_checkout_submodules(checkout_path) {
+                tracing::warn!(
+                    checkout = %checkout_path.display(),
+                    error = %e,
+                    "provision_cow_checkout: submodule sync failed; checkout provisioned with submodules as copied"
+                );
+            }
+            timings.submodule_update = submodule_started.elapsed();
+        }
         // AFTER checkout: removing a self-referencing origin drops
         // `refs/remotes/origin/*`, which base-ref resolution above tries
         // first — same ordering as `provision_plain_clone_checkout`.
@@ -1235,5 +1265,122 @@ mod tests {
         let err = provision_local_clone_checkout(&source, &checkout, "dup-ws", None).unwrap_err();
         assert!(matches!(err, Error::Internal(_)), "got: {err:?}");
         assert!(!checkout.exists());
+    }
+
+    /// `git clone --recurse-submodules` of `origin` into a fresh temp dir —
+    /// the same shape as a repo cache: submodule work trees populated, module
+    /// git dirs under `.git/modules`.
+    fn recursive_clone(origin: &std::path::Path, tag: &str) -> std::path::PathBuf {
+        let dst = unique_checkout(tag);
+        let status = std::process::Command::new("git")
+            .arg("clone")
+            .arg("--recurse-submodules")
+            .arg("--")
+            .arg(origin)
+            .arg(&dst)
+            .status()
+            .unwrap();
+        assert!(status.success(), "recursive clone of the fixture failed");
+        dst
+    }
+
+    fn sub_head(checkout: &std::path::Path) -> String {
+        Repository::open(checkout.join("sub"))
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string()
+    }
+
+    /// CoW hydration of a cache-shaped source with a submodule: a `base_ref`
+    /// pinned at an older gitlink lands the submodule work tree on that older
+    /// commit, resolved from the copied local module objects — no network
+    /// (the submodule's only remote is deleted before provisioning). The
+    /// source is untouched.
+    #[test]
+    fn cow_checkout_syncs_submodules_to_base_ref_gitlink_without_network() {
+        crate::testutil::allow_file_submodules();
+        let child = init_repo("cowchk-sub-child");
+        commit_file(child.path(), "c.txt", "sub one\n");
+        let old_sub_sha = head_sha(&child);
+        let origin = init_repo("cowchk-sub-origin");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::add_submodule(origin.path(), child.path(), "sub");
+        // Pin `base` at the old gitlink, then bump the pin on the tip.
+        crate::testutil::create_branch(origin.path(), "base");
+        commit_file(child.path(), "c.txt", "sub two\n");
+        let new_sub_sha = head_sha(&child);
+        crate::testutil::commit_gitlink_bump(origin.path(), "sub", &new_sub_sha);
+
+        // Cache-shaped source: recursive clone at the tip (submodule at the
+        // NEW gitlink, module git dir holding the child's full history).
+        let source = recursive_clone(origin.path(), "cowchk-sub-src");
+        let _cleanup_src = Cleanup(source.clone());
+        assert_eq!(sub_head(&source), new_sub_sha, "source sits at the tip");
+        if !cow_available(&source) {
+            return;
+        }
+        // Any fetch from the submodule's real URL now fails: the sync must
+        // resolve from the copied module objects alone.
+        drop(child);
+
+        let checkout = unique_checkout("cowchk-sub-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+
+        assert_eq!(
+            sub_head(&checkout),
+            old_sub_sha,
+            "submodule sits at the base ref's gitlink, not the source tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n"
+        );
+        // The source is untouched (still at the tip).
+        assert_eq!(sub_head(&source), new_sub_sha);
+        assert_eq!(
+            std::fs::read_to_string(source.join("sub").join("c.txt")).unwrap(),
+            "sub two\n"
+        );
+    }
+
+    /// A submodule anomaly during CoW hydration (module git dirs gone AND the
+    /// real URL unreachable) degrades to a warning — provisioning succeeds
+    /// and the superproject checkout is intact.
+    #[test]
+    fn cow_checkout_submodule_failure_degrades_gracefully() {
+        crate::testutil::allow_file_submodules();
+        let child = init_repo("cowchk-subdeg-child");
+        commit_file(child.path(), "c.txt", "sub one\n");
+        let origin = init_repo("cowchk-subdeg-origin");
+        commit_file(origin.path(), "a.txt", "one\n");
+        crate::testutil::add_submodule(origin.path(), child.path(), "sub");
+
+        let source = recursive_clone(origin.path(), "cowchk-subdeg-src");
+        let _cleanup_src = Cleanup(source.clone());
+        if !cow_available(&source) {
+            return;
+        }
+        // Break the source's module git dirs and drop the only remote the
+        // submodule could re-clone from.
+        std::fs::remove_dir_all(source.join(".git").join("modules")).unwrap();
+        drop(child);
+
+        let checkout = unique_checkout("cowchk-subdeg-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        let sha =
+            provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+
+        assert!(!sha.is_empty(), "provisioning succeeds despite the anomaly");
+        let clone = Repository::open(&checkout).unwrap();
+        assert_eq!(clone.head().unwrap().shorthand().unwrap(), "cow-ws");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n",
+            "superproject content is intact"
+        );
     }
 }
