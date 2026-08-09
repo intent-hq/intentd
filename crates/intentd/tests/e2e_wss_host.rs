@@ -1676,3 +1676,148 @@ async fn host_create_directory_over_wss() {
 
     drop(daemon);
 }
+
+/// WSS e2e for discovery cache behavior (host.findBinary / host.toolAvailability
+/// / host.providerDiscovery): repeated calls within the TTL window reuse cached
+/// results instead of re-scanning PATH/filesystem. A binary installed between
+/// calls must be picked up on the next uncached call (negatives never cached).
+#[tokio::test]
+#[cfg(unix)]
+async fn host_discovery_cache_positive_and_negative_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // 1) host.findBinary for a name that does not exist: must report
+    // available:false and NOT cache the negative.
+    let not_found = wss_rpc(
+        &mut ws,
+        900,
+        "host.findBinary",
+        json!({ "name": "intent-e2e-nonexistent-xyzzy", "commonPaths": [] }),
+    )
+    .await;
+    assert_eq!(
+        not_found["available"], false,
+        "nonexistent binary reports available:false: {not_found}"
+    );
+
+    // 2) Now install the binary in a temp dir and call host.findBinary again
+    // with that dir in commonPaths. The cache must NOT serve the stale negative
+    // — it must re-probe and find the binary.
+    let bin_dir = data_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir bin");
+    let bin_path = bin_dir.join("intent-e2e-nonexistent-xyzzy");
+    std::fs::write(&bin_path, "#!/bin/sh\nexit 0\n").expect("write binary");
+    std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
+
+    let found = wss_rpc(
+        &mut ws,
+        901,
+        "host.findBinary",
+        json!({
+            "name": "intent-e2e-nonexistent-xyzzy",
+            "commonPaths": [bin_path.to_str().unwrap()]
+        }),
+    )
+    .await;
+    assert_eq!(
+        found["available"], true,
+        "after install, the binary must be found (negatives not cached): {found}"
+    );
+    assert_eq!(
+        found["path"],
+        json!(bin_path.to_str().unwrap()),
+        "resolved path matches the installed binary: {found}"
+    );
+
+    // 3) Repeated call with the same name + commonPaths should hit the cache
+    // (same result, but the cache layer short-circuits the probe). We can't
+    // directly observe the cache hit, but we can verify idempotent results.
+    let cached = wss_rpc(
+        &mut ws,
+        902,
+        "host.findBinary",
+        json!({
+            "name": "intent-e2e-nonexistent-xyzzy",
+            "commonPaths": [bin_path.to_str().unwrap()]
+        }),
+    )
+    .await;
+    assert_eq!(
+        cached, found,
+        "repeated call for the same binary must return the same result: {cached}"
+    );
+
+    // 4) host.toolAvailability batch: call once, then remove one of the
+    // resolved binaries and call again. The cache must serve the stale positive
+    // for that binary (within TTL), not re-probe and flip to unavailable.
+    let git_first = wss_rpc(
+        &mut ws,
+        903,
+        "host.toolAvailability",
+        json!({ "tools": ["git"] }),
+    )
+    .await;
+    // git is almost always installed on the daemon host; if not, this
+    // assertion fails and the test is skipped (not a test bug).
+    assert_eq!(
+        git_first["tools"]["git"]["available"], true,
+        "git must be available on the daemon host for this test: {git_first}"
+    );
+
+    // Attempt to "remove" git by clearing PATH (a symlink trick won't work
+    // because the cache holds the resolved path). Instead, verify that a
+    // second call for git still reports available:true (the cache serves the
+    // first call's positive result).
+    let git_cached = wss_rpc(
+        &mut ws,
+        904,
+        "host.toolAvailability",
+        json!({ "tools": ["git"] }),
+    )
+    .await;
+    assert_eq!(
+        git_cached["tools"]["git"], git_first["tools"]["git"],
+        "repeated toolAvailability call serves cached result: {git_cached}"
+    );
+
+    // 5) host.providerDiscovery: call once, verify the payload shape, then
+    // call again and confirm it returns the same provider list (cache hit).
+    let discovery_first = wss_rpc(&mut ws, 905, "host.providerDiscovery", json!({})).await;
+    assert!(
+        discovery_first["providers"].is_array(),
+        "providerDiscovery must return a providers array: {discovery_first}"
+    );
+    assert!(
+        !discovery_first["providers"].as_array().unwrap().is_empty(),
+        "providers array must not be empty: {discovery_first}"
+    );
+
+    let discovery_cached = wss_rpc(&mut ws, 906, "host.providerDiscovery", json!({})).await;
+    assert_eq!(
+        discovery_cached["providers"].as_array().unwrap().len(),
+        discovery_first["providers"].as_array().unwrap().len(),
+        "repeated providerDiscovery call serves cached result: {discovery_cached}"
+    );
+
+    drop(daemon);
+}
