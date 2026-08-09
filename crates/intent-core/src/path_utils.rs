@@ -269,6 +269,12 @@ pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathB
 /// then ~/.augment/bin for auggie, then enriched dirs, then inherited PATH) should
 /// use `enriched_tool_dirs()` + split_paths to build the order themselves.
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
+    enhanced_path_dirs_with_home(home_dir().as_deref())
+}
+
+/// Variant of [`enhanced_path_dirs`] with the home directory injected instead
+/// of resolved from the environment. Inherited PATH precedence is unchanged.
+pub fn enhanced_path_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -280,7 +286,7 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     }
 
     // Add enriched tool directories
-    for dir in enriched_tool_dirs() {
+    for dir in enriched_tool_dirs_with_home(home) {
         push_dir(&mut dirs, &mut seen, dir);
     }
 
@@ -551,6 +557,32 @@ mod tests {
         );
         // Should also include the hardcoded dirs
         assert!(!dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn enriched_tool_dirs_scans_every_nvm_node_version() {
+        let unique = format!(
+            "intent-path-utils-nvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let v20_bin = home.join(".nvm/versions/node/v20.19.0/bin");
+        let v24_bin = home.join(".nvm/versions/node/v24.5.0/bin");
+        std::fs::create_dir_all(&v20_bin).unwrap();
+        std::fs::create_dir_all(&v24_bin).unwrap();
+
+        let dirs = enriched_tool_dirs_impl(Some(&home), || &[]);
+
+        assert!(dirs.contains(&v20_bin));
+        assert!(dirs.contains(&v24_bin));
+        assert!(dirs.contains(&home.join(".local/bin")));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

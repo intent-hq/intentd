@@ -204,13 +204,22 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
 pub fn discover_providers_with_overrides(
     override_path: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProviderAvailability> {
+    discover_providers_with_overrides_and_resolver(override_path, &|id, cmd| {
+        find_provider_binary(id, cmd, None)
+    })
+}
+
+fn discover_providers_with_overrides_and_resolver(
+    override_path: &dyn Fn(&str) -> Option<String>,
+    resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
+) -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
         .map(|provider| {
             availability_for(
                 provider,
                 gated_reason(provider),
-                &|id, cmd| find_provider_binary(id, cmd, None),
+                resolve_auto,
                 override_path,
             )
         })
@@ -376,17 +385,40 @@ pub fn find_provider_binary(
     command: &str,
     explicit_path: Option<&str>,
 ) -> Option<PathBuf> {
-    find_provider_binary_with_home(provider_id, command, explicit_path, home_dir().as_deref())
+    let home = home_dir();
+    find_provider_binary_with_home_and_dirs(
+        provider_id,
+        command,
+        explicit_path,
+        home.as_deref(),
+        &intent_core::path_utils::enhanced_path_dirs(),
+    )
 }
 
-/// [`find_provider_binary`] with an explicit `home` for the native-installer
-/// tier (test seam — avoids mutating the process-global `HOME` in parallel
-/// tests).
+/// [`find_provider_binary`] with an explicit `home` for every user-local tier
+/// (test seam — avoids mutating process-global `HOME` in parallel tests).
+#[cfg(test)]
 fn find_provider_binary_with_home(
     provider_id: &str,
     command: &str,
     explicit_path: Option<&str>,
     home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    find_provider_binary_with_home_and_dirs(
+        provider_id,
+        command,
+        explicit_path,
+        home,
+        &intent_core::path_utils::enhanced_path_dirs_with_home(home),
+    )
+}
+
+fn find_provider_binary_with_home_and_dirs(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
+    enhanced_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
@@ -406,14 +438,14 @@ fn find_provider_binary_with_home(
     }
 
     // 3. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
-    if let Some(managed) = managed_binary_path(command) {
+    if let Some(managed) = managed_binary_path_with_home(command, home) {
         if is_executable_file(&managed) {
             return Some(managed);
         }
     }
 
     // 4. Scan enhanced PATH directories
-    find_in_enhanced_dirs(command)
+    find_in_dirs(enhanced_dirs, command)
 }
 
 /// Validate + resolve an explicit `providers.paths` value: trimmed, absolute,
@@ -492,8 +524,14 @@ fn find_provider_native_binary_in(
 
 /// The auggie binary path (`~/.augment/bin/<command>[.exe]`). This is auggie's
 /// own install location, not a generic Intent-managed binary tier.
+#[cfg(test)]
 fn managed_binary_path(command: &str) -> Option<PathBuf> {
-    let home = home_dir()?;
+    let home = home_dir();
+    managed_binary_path_with_home(command, home.as_deref())
+}
+
+fn managed_binary_path_with_home(command: &str, home: Option<&std::path::Path>) -> Option<PathBuf> {
+    let home = home?;
     let name = if cfg!(windows) {
         format!("{command}.exe")
     } else {
@@ -893,6 +931,51 @@ mod find_provider_binary_tests {
         ];
         assert_eq!(find_in_dirs(&dirs, "opencode"), Some(bin));
         assert_eq!(find_in_dirs(&dirs, "intent-test-absent-cmd"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_provider_binary_scans_non_default_nvm_version() {
+        let home = unique_temp_dir("nvm-provider-home");
+        let v20_bin = home.path().join(".nvm/versions/node/v20.19.0/bin");
+        let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+        fs::create_dir_all(&v20_bin).unwrap();
+        fs::create_dir_all(&v24_bin).unwrap();
+        make_executable(&v20_bin.join("node"));
+
+        let command = format!(
+            "intent-nvm-provider-{}",
+            home.path().file_name().unwrap().to_string_lossy()
+        );
+        let binary = v24_bin.join(&command);
+        make_executable(&binary);
+
+        assert_eq!(
+            find_provider_binary_with_home("test", &command, None, Some(home.path())),
+            Some(binary)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_reports_provider_from_non_default_nvm_version() {
+        let home = unique_temp_dir("nvm-discovery-home");
+        let v20_bin = home.path().join(".nvm/versions/node/v20.19.0/bin");
+        let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+        fs::create_dir_all(&v20_bin).unwrap();
+        fs::create_dir_all(&v24_bin).unwrap();
+        make_executable(&v20_bin.join("node"));
+        let codex = v24_bin.join("codex-acp");
+        make_executable(&codex);
+        let dirs = vec![v20_bin, v24_bin];
+
+        let providers = discover_providers_with_overrides_and_resolver(&|_| None, &|_, command| {
+            find_in_dirs(&dirs, command)
+        });
+        let availability = providers.iter().find(|p| p.id == "codex").unwrap();
+
+        assert!(availability.installed);
+        assert_eq!(availability.resolved_path.as_deref(), Some(codex.as_path()));
     }
 
     #[test]
