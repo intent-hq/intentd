@@ -88,6 +88,13 @@ pub struct WorkspaceMcpServer {
     /// docs. Only specialists that carry options appear; empty — the default
     /// — leaves the description byte-identical.
     specialist_model_options: Vec<tools::SpecialistModelOptions>,
+    /// Whether this server front-doors a sub-agent (a session with a
+    /// `parent_agent_id` or `is_background`), captured once at bridge
+    /// creation like `agent_features`. Sub-agents don't own a user-facing
+    /// chat turn, so `ws.app.question.*` is pruned from their description
+    /// and prelude and denied at dispatch with a redirect to the
+    /// attention-request methods. Defaults to `false` (top-level).
+    is_sub_agent: bool,
 }
 
 impl WorkspaceMcpServer {
@@ -106,6 +113,7 @@ impl WorkspaceMcpServer {
             turn_attachments: None,
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
+            is_sub_agent: false,
         }
     }
 
@@ -172,6 +180,16 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Mark this bridge as serving a sub-agent (the spawn-time wiring point —
+    /// derived once at bridge creation from the session:
+    /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
+    /// `ws.app.question.*` from the tool description and JS prelude and deny
+    /// it at dispatch with a redirect to the attention-request methods.
+    pub fn with_sub_agent(mut self, is_sub_agent: bool) -> Self {
+        self.is_sub_agent = is_sub_agent;
+        self
+    }
+
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds.
@@ -183,6 +201,21 @@ impl WorkspaceMcpServer {
     /// Whether `name` is denied for this agent.
     pub fn is_denied(&self, name: &str) -> bool {
         self.denylist.contains(name)
+    }
+
+    /// The `[agentFeatures]` toggles as they apply to THIS bridge: a
+    /// sub-agent bridge sees `structuredQuestions` forced off, so the
+    /// description and prelude layers prune `ws.app.question.*` through the
+    /// exact same machinery as the settings toggle (the surfaces cannot
+    /// drift). The dispatch layer additionally checks `is_sub_agent` FIRST,
+    /// so a raw `host({...})` frame gets the explicit top-level-only
+    /// redirect error rather than a misleading "disabled in settings".
+    fn effective_agent_features(&self) -> AgentFeaturesSettings {
+        let mut features = self.agent_features.clone();
+        if self.is_sub_agent {
+            features.structured_questions = false;
+        }
+        features
     }
 
     /// The tool definitions exposed to this agent (full registry minus denylist).
@@ -227,14 +260,15 @@ impl WorkspaceMcpServer {
             .iter()
             .map(|t| {
                 // `workspace_api` gets its description assembled per-bridge so
-                // `[agentFeatures]` toggles captured at creation prune the
-                // disabled surface and specialist `modelOptions` extend the
-                // delegate docs; with all defaults on (and no options) the
+                // `[agentFeatures]` toggles captured at creation (with the
+                // sub-agent question gate folded in) prune the disabled
+                // surface and specialist `modelOptions` extend the delegate
+                // docs; with all defaults on (and no options, top-level) the
                 // assembled text is the static const unchanged.
                 let description = if t.name == "workspace_api" {
                     tools::workspace_api_description_with_model_options(
                         self.is_chief,
-                        &self.agent_features,
+                        &self.effective_agent_features(),
                         &self.specialist_model_options,
                     )
                     .into_owned()
