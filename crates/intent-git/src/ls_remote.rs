@@ -19,10 +19,14 @@ use std::time::{Duration, Instant};
 use intent_core::{Error, Result};
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
+use crate::repo_cache::GIT_POLL;
 
-/// Deadline for the ls-remote child. Generous for slow links, yet bounded so
-/// a hung remote can never pin a blocking-pool worker.
-const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for the ls-remote child. This backs an interactive picker RPC
+/// (the FE races it against the API-backed listing), so it is deliberately
+/// tighter than the clone/fetch deadlines: enough for a slow link's single
+/// round-trip, short enough that a black-holed network can't pin the awaited
+/// request — or a blocking-pool worker — for long.
+const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Branches read from a remote by [`ls_remote_branches`].
 #[derive(Debug)]
@@ -35,8 +39,8 @@ pub struct RemoteBranches {
 
 /// List `url`'s branches (and default branch) with one `git ls-remote`.
 /// `token` is an optional caller-resolved GitHub token offered to the child
-/// via the environment only (see [`crate::auth::scoped_credential_env`]'s
-/// helper mechanism); it never appears in argv or error text.
+/// via the environment only ([`crate::auth::token_helper_config`] reading
+/// [`TOKEN_ENV`]); it never appears in argv or error text.
 pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
     let url = url.to_string();
     let token = token.map(str::to_owned);
@@ -111,7 +115,7 @@ fn ls_remote_blocking(url: &str, token: Option<&str>) -> Result<RemoteBranches> 
                         LS_REMOTE_TIMEOUT.as_secs()
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(GIT_POLL);
             }
             Err(e) => {
                 let _ = child.kill();
