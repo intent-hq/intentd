@@ -705,6 +705,12 @@ const SUBMODULE_LOCAL_CAP: u32 = 95;
 /// checked out` completions drive an "Updating submodules (N)" counter for
 /// already-cloned modules that print no clone phases (each completion
 /// advances halfway through the remaining distance — the total is unknown).
+///
+/// Known limitation: in streamed cache runs, stdout ("checked out" lines)
+/// and stderr ("Cloning into" boundaries) are drained by independent
+/// threads, so cross-stream ordering into the parser is not guaranteed —
+/// counts in the message can momentarily mis-sequence; percents stay
+/// monotone regardless.
 pub(crate) struct SubmoduleAwareParser {
     /// Every frame is submodule-scoped (no superproject clone in front).
     submodules_only: bool,
