@@ -55,14 +55,15 @@ fn find_binary_cache() -> &'static DiscoveryCache<Value> {
 }
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
-/// so `check_git` is unit-testable without spawning `which`/`where`.
+/// so `check_git`/`check_node`/`check_gh` are unit-testable without spawning
+/// `which`/`where`.
 pub(crate) trait BinaryResolver: Send + Sync {
     fn find(&self, name: &str) -> Option<PathBuf>;
 }
 
 /// Captures the version line from a resolved binary (typically by running
-/// `<path> --version`). Injected so `check_git` is unit-testable without
-/// spawning a real subprocess.
+/// `<path> --version`). Injected so `check_git`/`check_node`/`check_gh` are
+/// unit-testable without spawning a real subprocess.
 pub(crate) trait VersionProbe: Send + Sync {
     fn probe(&self, path: &Path) -> Option<String>;
 }
@@ -89,7 +90,7 @@ impl VersionProbe for OsVersionProbe {
 /// Locate a binary by `name`. Mirrors the FE `findBinary` strategy: ask the OS
 /// (`which` on unix, `where` on Windows), then fall back to OS-common
 /// directories. Returns the first existing absolute path, or `None`. Internal
-/// helper — used by `host.checkGit`.
+/// helper — used by `host.checkGit` / `host.checkNode` / `host.checkGh`.
 pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
     resolve_binary_path(name, &[])
 }
@@ -366,7 +367,8 @@ pub(crate) fn resolve_auggie_path(configured: Option<&str>) -> Option<PathBuf> {
     intent_services::auggie_discovery::find_auggie()
 }
 
-/// `{ available, version?, path? }` body builder for `checkGit`. `path` is
+/// `{ available, version?, path? }` body builder for `checkGit`/`checkNode`/
+/// `checkGh`. `path` is
 /// `None` ⇒ `available:false`. A successful probe includes the trimmed
 /// `version` + resolver `path`.
 fn build_check_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
@@ -394,7 +396,8 @@ pub(crate) fn is_safe_binary_name(name: &str) -> bool {
 }
 
 /// Build the `host.findBinary` result `{ available, path?, version? }`. Unlike
-/// `checkGit`, a binary that resolves but does not answer `--version` is still
+/// the `checkGit`/`checkNode`/`checkGh` probes, a binary that resolves but does
+/// not answer `--version` is still
 /// `available:true` (the `version` is best-effort/optional).
 fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
     let Some(path) = path else {
