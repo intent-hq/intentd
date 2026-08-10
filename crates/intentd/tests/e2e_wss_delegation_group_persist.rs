@@ -616,6 +616,41 @@ async fn baseline_plus_aggregated_wake() {
         "waiting ids are the children, not the parent: {lite}"
     );
 
+    // monorepo#1694: while the group is live with both grouped watches in
+    // place, `agent.diagnostics` over WSS reports the real subscription
+    // linkage (`subscriptionIds` from the watches, `subscriptionMissing`
+    // false) and the incomplete-group stuck-risk is NOT critical.
+    let diag = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let d = &diag["diagnostics"];
+    let groups = d["delegationGroups"].as_array().expect("delegationGroups");
+    assert_eq!(groups.len(), 1, "one live group: {d}");
+    let group = &groups[0];
+    assert_eq!(group["parentAgentId"], json!(parent_id), "group: {group}");
+    assert_eq!(group["subscriptionMissing"], json!(false), "group: {group}");
+    assert_eq!(
+        group["subscriptionIds"].as_array().map(Vec::len),
+        Some(2),
+        "one watch id per child: {group}"
+    );
+    let group_risk = d["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("incomplete-delegation-group"))
+        .expect("incomplete-group risk present")
+        .clone();
+    assert_ne!(
+        group_risk["severity"],
+        json!("critical"),
+        "healthy linkage is never critical: {group_risk}"
+    );
+
     // Increment 1: capture child IDs and subscribe to child1 events
     let child1_id = waiting[0].as_str().unwrap().to_string();
     let child2_id = waiting[1].as_str().unwrap().to_string();

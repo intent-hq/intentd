@@ -722,21 +722,57 @@ impl<'a> McpServersService<'a> {
 
     /// Start every enabled, non-disabled server (daemon boot). Best-effort: a
     /// failed spawn surfaces as an `error` status event, not a hard failure.
+    ///
+    /// The sweep runs in the background off the daemon's bind path, so
+    /// `mcp.servers.*` RPCs can mutate definitions while a handshake is in
+    /// flight. Eligibility is therefore re-read from the live settings/config
+    /// immediately before each start, and re-checked after it, so a server the
+    /// user deleted/disabled/updated mid-sweep is never left running from this
+    /// task's stale snapshot.
     pub(crate) async fn start_enabled(&self) {
-        let settings = self.effective();
-        if !enable_user_servers(&settings) {
+        if !enable_user_servers(&self.effective()) {
             return;
         }
-        let disabled = disabled_servers(&settings);
-        for (id, config) in read_configs(self.secrets).await {
-            let enabled = config
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if enabled && !disabled.iter().any(|d| d == &id) {
-                self.hub.start(config, true).await;
+        let ids: Vec<String> = read_configs(self.secrets)
+            .await
+            .keys()
+            .map(String::from)
+            .collect();
+        for id in ids {
+            let Some(config) = self.eligible_config(&id).await else {
+                continue;
+            };
+            self.hub.start(config.clone(), true).await;
+            // A mutation that landed during the handshake found no hub entry to
+            // stop or restart, so reconcile it here.
+            match self.eligible_config(&id).await {
+                // Deleted or disabled mid-handshake → tear the server back down.
+                None => {
+                    self.hub.stop(&id).await;
+                }
+                // Redefined mid-handshake → replace with the live definition.
+                Some(current) if current != config => {
+                    self.hub.start(current, true).await;
+                }
+                Some(_) => {}
             }
         }
+    }
+
+    /// The current definition for `id` if it is still boot-eligible against the
+    /// **live** settings and stored configs: the gate is on, the definition
+    /// exists with `enabled: true`, and the id is not in `mcp.disabledServers`.
+    async fn eligible_config(&self, id: &str) -> Option<Value> {
+        let settings = self.effective();
+        if !enable_user_servers(&settings) || disabled_servers(&settings).iter().any(|d| d == id) {
+            return None;
+        }
+        let config = read_configs(self.secrets).await.remove(id)?;
+        config
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then_some(config)
     }
 }
 
@@ -1460,6 +1496,89 @@ mod tests {
         // Neither id was started (no error status from a failed spawn either).
         assert_eq!(h.status("blocked"), status_stopped("blocked"));
         assert_eq!(h.status("off"), status_stopped("off"));
+    }
+
+    // The boot sweep runs in the background, so it re-reads eligibility from the
+    // live settings/configs around every start instead of trusting its opening
+    // snapshot. These cover each way a concurrent `mcp.servers.*` mutation makes
+    // an id ineligible (monorepo#1581).
+    #[tokio::test]
+    async fn eligible_config_returns_live_definition_when_startable() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let cfg = json!({"id":"go","command":BOGUS_CMD,"enabled":true});
+        let mut m = Map::new();
+        m.insert("go".into(), cfg.clone());
+        write_configs(&secrets, &m).await.unwrap();
+
+        assert_eq!(
+            svc(Some(&reg), &secrets, &h).eligible_config("go").await,
+            Some(cfg)
+        );
+    }
+
+    #[tokio::test]
+    async fn eligible_config_rejects_deleted_disabled_and_gated_off_ids() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        m.insert(
+            "go".into(),
+            json!({"id":"go","command":BOGUS_CMD,"enabled":true}),
+        );
+        m.insert(
+            "off".into(),
+            json!({"id":"off","command":BOGUS_CMD,"enabled":false}),
+        );
+        write_configs(&secrets, &m).await.unwrap();
+
+        // Deleted definition (the `delete` RPC removed it mid-sweep).
+        assert_eq!(
+            svc(Some(&reg), &secrets, &h).eligible_config("gone").await,
+            None
+        );
+        // `toggle(false)` cleared the config's `enabled` flag.
+        assert_eq!(
+            svc(Some(&reg), &secrets, &h).eligible_config("off").await,
+            None
+        );
+        // `toggle(false)` also adds the id to `mcp.disabledServers`.
+        set_disabled_servers(Some(&reg), &["go".to_string()]).unwrap();
+        assert_eq!(
+            svc(Some(&reg), &secrets, &h).eligible_config("go").await,
+            None
+        );
+        // The global gate flipping off makes every id ineligible.
+        set_disabled_servers(Some(&reg), &[]).unwrap();
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        assert_eq!(
+            svc(Some(&reg), &secrets, &h).eligible_config("go").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn start_enabled_skips_ids_deleted_after_the_snapshot() {
+        // The sweep snapshots ids first, then re-checks each one: an id removed
+        // between the snapshot and its turn must never be started.
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let mut m = Map::new();
+        m.insert(
+            "doomed".into(),
+            json!({"id":"doomed","command":BOGUS_CMD,"enabled":true}),
+        );
+        write_configs(&secrets, &m).await.unwrap();
+        // Stand in for the concurrent `delete`: the definition is gone by the
+        // time the per-id re-check runs.
+        write_configs(&secrets, &Map::new()).await.unwrap();
+
+        svc(Some(&reg), &secrets, &h).start_enabled().await;
+        assert_eq!(h.status("doomed"), status_stopped("doomed"));
     }
 
     #[tokio::test]

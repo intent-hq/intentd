@@ -310,6 +310,7 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
             "not_started".into(),
             vec![],
             None,
+            None,
         )
         .await
         .expect("markAsTask");

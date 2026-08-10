@@ -1,0 +1,11 @@
+-- Tag interrupted_agent rows with the machine-readable interruption reason
+-- (the same `InterruptReason` wire string persisted on the interrupted
+-- assistant message + `agent:stream:end`). The wake-triggered resume
+-- orchestrator (sleep-resume Task D) enumerates ONLY rows tagged
+-- `system_suspend` so a host wake never blanket-resumes rows a user left
+-- pending for other reasons (daemon restart, agent stop, …).
+--
+-- Nullable: pre-existing rows and the daemon-restart / manual heal paths that
+-- do not supply a reason stay NULL, which the orchestrator treats as
+-- "not sleep-induced" (untouched by auto-resume).
+ALTER TABLE interrupted_agent ADD COLUMN reason TEXT;

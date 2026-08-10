@@ -30,10 +30,28 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use intent_core::path_utils;
+use intent_core::{path_utils, DiscoveryCache};
 use serde_json::{json, Map, Value};
+
+/// How long a positive `host.findBinary` resolution is served from cache.
+/// Matches the daemon's other short-TTL discovery caches
+/// (`intent-services::provider_auth::AUTH_CACHE_TTL`,
+/// `intent-services::discovery_cache::DISCOVERY_CACHE_TTL`): long enough to
+/// spare a burst of `host.findBinary` / `host.toolAvailability` calls the
+/// PATH/filesystem walk, short enough that a real install shows up soon.
+const FIND_BINARY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Process-wide cache for [`find_binary_op`], keyed by `name` plus the
+/// caller-supplied `common_paths` (a different hint list is a different
+/// resolution, so it gets its own entry). Only `available: true` results are
+/// cached — see [`find_binary_op`].
+fn find_binary_cache() -> &'static DiscoveryCache<Value> {
+    static CACHE: OnceLock<DiscoveryCache<Value>> = OnceLock::new();
+    CACHE.get_or_init(|| DiscoveryCache::new(FIND_BINARY_CACHE_TTL))
+}
 
 /// Resolves a binary by name to an absolute path on the daemon host. Injected
 /// so `check_git` is unit-testable without spawning `which`/`where`.
@@ -42,8 +60,8 @@ pub(crate) trait BinaryResolver: Send + Sync {
 }
 
 /// Captures the version line from a resolved binary (typically by running
-/// `<path> --version`). Injected so `check_git`/`check_auggie` are unit-testable
-/// without spawning a real subprocess.
+/// `<path> --version`). Injected so `check_git` is unit-testable without
+/// spawning a real subprocess.
 pub(crate) trait VersionProbe: Send + Sync {
     fn probe(&self, path: &Path) -> Option<String>;
 }
@@ -288,19 +306,23 @@ pub(crate) fn check_git() -> Value {
     check_git_with(&OsBinaryResolver, &OsVersionProbe)
 }
 
-/// Build the `host.checkAuggie` result, given a pre-resolved candidate path
-/// (the caller has already applied the user-settings → discovery precedence).
-/// `available:false` when `resolved` is `None` or the version probe fails.
-pub(crate) fn check_auggie_with(resolved: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
-    build_check_result(resolved, probe)
+/// Build the `host.checkAuggie` result `{ available, path? }`, given a
+/// pre-resolved candidate path (the caller has already applied the
+/// user-settings → discovery precedence). Resolution-only: `available` is true
+/// iff the path resolved — no `--version` spawn, no `version` field.
+pub(crate) fn check_auggie_with(resolved: Option<PathBuf>) -> Value {
+    match resolved {
+        Some(path) => json!({ "available": true, "path": path.to_string_lossy() }),
+        None => json!({ "available": false }),
+    }
 }
 
 /// Production `check_auggie` — uses the canonical resolver from
 /// `intent_services::auggie_discovery` (re-export of `intent_context::`
-/// `discovery::find_auggie`) and the real version probe. Settings precedence
-/// is applied by the caller via [`resolve_auggie_path`].
+/// `discovery::find_auggie`). Settings precedence is applied by the caller via
+/// [`resolve_auggie_path`].
 pub(crate) fn check_auggie(configured: Option<&str>) -> Value {
-    check_auggie_with(resolve_auggie_path(configured), &OsVersionProbe)
+    check_auggie_with(resolve_auggie_path(configured))
 }
 
 /// Apply the auggie path precedence: (1) user-configured `configured` path
@@ -317,9 +339,9 @@ pub(crate) fn resolve_auggie_path(configured: Option<&str>) -> Option<PathBuf> {
     intent_services::auggie_discovery::find_auggie()
 }
 
-/// Common `{ available, version?, path? }` body builder shared by `checkGit`
-/// and `checkAuggie`. `path` is `None` ⇒ `available:false`. A successful probe
-/// includes the trimmed `version` + resolver `path`.
+/// `{ available, version?, path? }` body builder for `checkGit`. `path` is
+/// `None` ⇒ `available:false`. A successful probe includes the trimmed
+/// `version` + resolver `path`.
 fn build_check_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
     let Some(path) = path else {
         return json!({ "available": false });
@@ -345,8 +367,8 @@ pub(crate) fn is_safe_binary_name(name: &str) -> bool {
 }
 
 /// Build the `host.findBinary` result `{ available, path?, version? }`. Unlike
-/// `checkGit`/`checkAuggie`, a binary that resolves but does not answer
-/// `--version` is still `available:true` (the `version` is best-effort/optional).
+/// `checkGit`, a binary that resolves but does not answer `--version` is still
+/// `available:true` (the `version` is best-effort/optional).
 fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
     let Some(path) = path else {
         return json!({ "available": false });
@@ -364,11 +386,23 @@ fn build_find_result(path: Option<PathBuf>, probe: &dyn VersionProbe) -> Value {
 /// Production `host.findBinary` — resolve `name` (honouring the optional caller
 /// `common_paths`) and best-effort version-probe it. Rejects unsafe names with
 /// `available:false`.
+///
+/// Cached (TTL, positives only — see [`find_binary_cache`]): a resolved
+/// binary rarely moves within the TTL window, so repeated `findBinary` /
+/// `toolAvailability` calls for the same `(name, common_paths)` skip the
+/// PATH/filesystem walk and the `--version` spawn entirely. An unresolved
+/// name is never cached, so installing the binary is picked up on the very
+/// next call.
 pub(crate) fn find_binary_op(name: &str, common_paths: &[String]) -> Value {
     if !is_safe_binary_name(name) {
         return json!({ "available": false });
     }
-    build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe)
+    let cache_key = format!("{name}\u{1}{common_paths:?}");
+    find_binary_cache().get_or_compute(
+        &cache_key,
+        || build_find_result(resolve_binary_path(name, common_paths), &OsVersionProbe),
+        |result| result["available"] == true,
+    )
 }
 
 /// The default tool set probed by `host.toolAvailability` when the caller does

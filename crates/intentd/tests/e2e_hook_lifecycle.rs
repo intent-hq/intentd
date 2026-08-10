@@ -18,9 +18,11 @@
 //!     `lastError`, and the owner is woken with the eviction notice
 //!     (asserted via `agent.getConversation`).
 //!  4. Agent turn 3 schedules a third hook (with a 50-char human-readable
-//!     name, the maximum); the FE cancels it — the response carries the
-//!     cancelled hook with the name intact, `hook:cancelled` fires, and the
-//!     owner is woken with the cancellation notice.
+//!     name, the maximum); a SECOND agent finds it via `ws.hook.list` and
+//!     tries to cancel it through the MCP route — rejected, hook untouched
+//!     (intent-hq/monorepo#1563) — then the FE cancels it: the response
+//!     carries the cancelled hook with the name intact, `hook:cancelled`
+//!     fires, and the owner is woken with the cancellation notice.
 //!  5. Error arms: unknown `hookId` → -32602 on cancel/runNow; `runNow` on a
 //!     cancelled hook → -32602; missing params → -32602.
 //!  6. State carry-over: agent turn 4 schedules a counter hook that threads
@@ -32,6 +34,13 @@
 //!     (clamped to the 10s floor) — `expiresAt` surfaces in `hook.list`, the
 //!     deadline passes, `hook:expired` fires, the row goes terminal
 //!     (`runNow` → -32602), and the owner is woken with the expiry notice.
+//!  8. Perpetual hooks: agent turn 6 schedules a `perpetual: true` hook whose
+//!     every run dispatches — the validation-run dispatch wakes the owner AND
+//!     persists an ACTIVE schedule (`dispatchCount: 1`), a `hook.runNow` fire
+//!     wakes again and stays `scheduled` (`dispatchCount: 2`), each wake
+//!     says the hook remains active (`hookStillActive: true` in its
+//!     metadata), and the TTL finally expires the hook with a notice
+//!     reporting runs AND dispatches.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -479,6 +488,19 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: '{cancel_hook_name}', code: {}, delayMs: 60000 }});",
         json!("return { dispatch: false };")
     );
+    // Intruder turn (intent-hq/monorepo#1563): a second agent finds the
+    // hook through `ws.hook.list` (workspace-wide) and tries to cancel it.
+    // The MCP route must reject the cross-agent cancel with an error naming
+    // the owning agent.
+    let cancel_others_js = format!(
+        "const hooks = await ws.hook.list(); \
+         const target = hooks.find(h => h.name === '{cancel_hook_name}'); \
+         const out = ['found=' + !!target]; \
+         try {{ await ws.hook.cancel(target.hookId); out.push('cancel=allowed'); }} \
+         catch (e) {{ out.push('cancel=rejected'); \
+                     out.push('ownerNamed=' + e.message.includes(target.agentId)); }} \
+         return out.join(' ');"
+    );
     let counter_inner = "const n = (hookState === null) ? 0 : hookState.n; \
                          if (n >= 2) { return { dispatch: true, message: 'counted ' + n }; } \
                          return { dispatch: false, state: { n: n + 1 } };";
@@ -492,6 +514,18 @@ async fn hook_lifecycle_over_wss() {
     let schedule_ttl_js = format!(
         "return await ws.hook.schedule({{ name: 'shortttl', code: {}, delayMs: 60000, ttlMs: 1 }});",
         json!("return { dispatch: false };")
+    );
+    // Perpetual section: every run dispatches, so the validation run fires and
+    // the hook STILL persists as active. `delayMs: 60000` keeps the cadence out
+    // of the way (fires are driven by `hook.runNow`) while `ttlMs: 20000` makes
+    // the TTL land inside the event-read budget.
+    let perpetual_inner = "const n = (hookState === null) ? 1 : hookState.n + 1; \
+                           return { dispatch: true, message: 'perpetual fire ' + n, \
+                                    state: { n } };";
+    let schedule_perpetual_js = format!(
+        "return await ws.hook.schedule({{ name: 'forever', code: {}, delayMs: 60000, \
+         ttlMs: 20000, perpetual: true }});",
+        json!(perpetual_inner)
     );
     // `firstTurnDelayMs` holds turn 1 open after the schedule tool call so the
     // dispatch wake stays QUEUED behind the in-flight turn long enough for the
@@ -526,6 +560,15 @@ async fn hook_lifecycle_over_wss() {
                 "response": "scheduled cancelme",
             },
             {
+                "ifPromptContains": "CANCEL_OTHERS",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": cancel_others_js, "summary": "cancel someone else's hook" },
+                },
+                "emitToolBlocks": true,
+                "response": "tried to cancel cancelme",
+            },
+            {
                 "ifPromptContains": "SCHEDULE_COUNTER",
                 "toolCall": {
                     "name": "workspace_api",
@@ -540,6 +583,14 @@ async fn hook_lifecycle_over_wss() {
                     "arguments": { "code": schedule_ttl_js, "summary": "schedule shortttl" },
                 },
                 "response": "scheduled shortttl",
+            },
+            {
+                "ifPromptContains": "SCHEDULE_PERPETUAL",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": schedule_perpetual_js, "summary": "schedule forever" },
+                },
+                "response": "scheduled forever",
             },
         ],
     })
@@ -633,6 +684,12 @@ async fn hook_lifecycle_over_wss() {
         .find(|m| m["messageMetadata"]["type"] == json!("hook_wake"))
         .unwrap_or_else(|| panic!("hook_wake entry queued mid-turn: {queue}"));
     assert_eq!(wake["messageMetadata"]["hookName"], "dispatcher");
+    // A one-shot dispatch wake tags its metadata hookStillActive=false.
+    assert_eq!(
+        wake["messageMetadata"]["hookStillActive"],
+        json!(false),
+        "{wake}"
+    );
     assert!(
         wake["content"]
             .as_str()
@@ -644,7 +701,7 @@ async fn hook_lifecycle_over_wss() {
         wake["content"]
             .as_str()
             .unwrap_or("")
-            .contains("has now fired and is retired"),
+            .contains("now retired and will not run again"),
         "dispatch wake carries the terminal-state note: {wake}"
     );
 
@@ -663,7 +720,7 @@ async fn hook_lifecycle_over_wss() {
         101,
         &ws_id,
         &agent_id,
-        "has now fired and is retired",
+        "now retired and will not run again",
     )
     .await;
 
@@ -747,6 +804,9 @@ async fn hook_lifecycle_over_wss() {
         .find(|h| h["name"] == json!("dispatcher"))
         .unwrap_or_else(|| panic!("dispatcher in hook.list: {listed}"));
     assert_eq!(dispatcher["state"], "dispatched");
+    // A one-shot hook's sole fire is still counted: `dispatchCount` means
+    // "fires so far" for every hook, not just perpetual ones.
+    assert_eq!(dispatcher["dispatchCount"], 1, "{dispatcher}");
 
     // FE trigger: hook.runNow drives run-started + run-completed (still
     // scheduled — the note has no EVICT marker yet).
@@ -847,6 +907,57 @@ async fn hook_lifecycle_over_wss() {
         .expect("cancelme hookId")
         .to_string();
 
+    // Ownership scoping (intent-hq/monorepo#1563): a second agent sees the
+    // hook in the workspace-wide `ws.hook.list` but cannot cancel it through
+    // the MCP route — the error names the owning agent and the hook is
+    // untouched (still scheduled, no `hook:cancelled`, owner not woken).
+    let intruder = wss_rpc(
+        &mut rpc,
+        420,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Intruder", "model": "mock:default" }),
+    )
+    .await;
+    let intruder_id = intruder["agent"]["id"]
+        .as_str()
+        .expect("intruder id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        421,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": intruder_id, "content": "CANCEL_OTHERS" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    for (i, needle) in ["found=true", "cancel=rejected", "ownerNamed=true"]
+        .into_iter()
+        .enumerate()
+    {
+        await_conversation_contains(
+            &mut rpc,
+            430 + (i as i64) * 20,
+            &ws_id,
+            &intruder_id,
+            needle,
+        )
+        .await;
+    }
+    // The hook survived the cross-agent attempt.
+    let listed = wss_rpc(&mut rpc, 440, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let survivor = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["hookId"] == json!(cancel_id))
+        .unwrap_or_else(|| panic!("cancelme still listed: {listed}"))
+        .clone();
+    assert_eq!(
+        survivor["state"], "scheduled",
+        "cross-agent cancel left the hook active: {survivor}"
+    );
+    assert_eq!(survivor["agentId"], json!(agent_id));
+
     let cancelled = wss_rpc(
         &mut rpc,
         401,
@@ -864,7 +975,7 @@ async fn hook_lifecycle_over_wss() {
     );
     let ev = next_hook_event(&mut sub, "hook:cancelled", Some(cancel_hook_name)).await;
     assert_eq!(ev["data"]["hookId"], json!(cancel_id));
-    // FE cancel (`by_owner = false`) wakes the owner with the notice.
+    // FE cancel (no agent caller) wakes the owner with the notice.
     await_conversation_contains(
         &mut rpc,
         410,
@@ -1085,6 +1196,133 @@ async fn hook_lifecycle_over_wss() {
         &ws_id,
         &agent_id,
         "expired after reaching its TTL",
+    )
+    .await;
+
+    // ── 8. Perpetual: dispatch re-arms until the TTL expires it ───────────
+    let sent = wss_rpc(
+        &mut rpc,
+        800,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SCHEDULE_PERPETUAL" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Schedule-path event order for a PERPETUAL validation-run dispatch:
+    // run-completed, dispatched, THEN hook:scheduled — unlike one-shot, the
+    // dispatching first run still persists an active schedule.
+    let completed = next_hook_event(&mut sub, "hook:run-completed", Some("forever")).await;
+    assert_eq!(completed["data"]["state"], "scheduled", "{completed}");
+    let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("forever")).await;
+    assert_eq!(dispatched["data"]["state"], "scheduled", "{dispatched}");
+    let scheduled = next_hook_event(&mut sub, "hook:scheduled", Some("forever")).await;
+    let forever_id = scheduled["data"]["hookId"]
+        .as_str()
+        .expect("forever hookId")
+        .to_string();
+
+    let find_forever = |listed: &Value| -> Value {
+        listed["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .find(|h| h["hookId"] == json!(forever_id))
+            .unwrap_or_else(|| panic!("forever in hook.list: {listed}"))
+            .clone()
+    };
+
+    // Still ACTIVE after its own dispatch, with the fire counted.
+    let listed = wss_rpc(&mut rpc, 801, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let forever = find_forever(&listed);
+    assert_eq!(forever["state"], "scheduled", "{forever}");
+    assert_eq!(forever["perpetual"], json!(true), "{forever}");
+    assert_eq!(forever["runCount"], 1, "{forever}");
+    assert_eq!(forever["dispatchCount"], 1, "{forever}");
+    assert!(
+        forever["nextRunAt"].is_string(),
+        "re-armed with a fresh nextRunAt: {forever}"
+    );
+
+    // The perpetual fire's wake says the hook stays active until its TTL —
+    // instead of the one-shot "retired" note — and its metadata tags the
+    // wake hookStillActive=true.
+    await_conversation_contains(
+        &mut rpc,
+        810,
+        &ws_id,
+        &agent_id,
+        "[Background hook \\\"forever\\\"] perpetual fire 1",
+    )
+    .await;
+    await_conversation_contains(&mut rpc, 820, &ws_id, &agent_id, "remains active until").await;
+    await_conversation_contains(&mut rpc, 825, &ws_id, &agent_id, "\"hookStillActive\":true").await;
+
+    // A second fire (FE-triggered) wakes again and re-arms again: the hook is
+    // still `scheduled` and `dispatchCount` advances, so `hook:dispatched` is
+    // non-terminal for a perpetual hook.
+    let ran = wss_rpc(
+        &mut rpc,
+        830,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": forever_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "runNow ok: {ran}");
+    let dispatched = next_hook_event(&mut sub, "hook:dispatched", Some("forever")).await;
+    assert_eq!(dispatched["data"]["hookId"], json!(forever_id));
+    // On the scheduler-loop path the post-dispatch outcome (scheduled vs
+    // expired) is resolved and persisted BEFORE `hook:dispatched` is
+    // emitted, so `state` reflects the real outcome rather than the
+    // transient `running` set at run start — parity with the schedule-time
+    // validation path. The event also carries `perpetual`/`dispatchCount`
+    // for FE/inspection parity with `hook.list`.
+    assert_eq!(dispatched["data"]["state"], "scheduled", "{dispatched}");
+    assert_eq!(dispatched["data"]["perpetual"], json!(true), "{dispatched}");
+    assert_eq!(
+        dispatched["data"]["dispatchCount"],
+        json!(2),
+        "{dispatched}"
+    );
+    let rearmed = next_hook_event(&mut sub, "hook:scheduled", Some("forever")).await;
+    assert!(
+        rearmed["data"]["nextRunAt"].is_string(),
+        "re-armed after the second fire: {rearmed}"
+    );
+    let listed = wss_rpc(&mut rpc, 831, "hook.list", json!({ "workspaceId": ws_id })).await;
+    let forever = find_forever(&listed);
+    assert_eq!(forever["state"], "scheduled", "{forever}");
+    assert_eq!(forever["runCount"], 2, "{forever}");
+    assert_eq!(forever["dispatchCount"], 2, "{forever}");
+    await_conversation_contains(
+        &mut rpc,
+        840,
+        &ws_id,
+        &agent_id,
+        "[Background hook \\\"forever\\\"] perpetual fire 2",
+    )
+    .await;
+
+    // TTL still terminates it (ttlMs: 20000, delayMs: 60000 — no cadence run
+    // intervenes), and the expiry notice reports runs AND dispatches rather
+    // than the one-shot "without a dispatch" wording.
+    let expired = next_hook_event(&mut sub, "hook:expired", Some("forever")).await;
+    assert_eq!(expired["data"]["state"], "expired", "{expired}");
+    assert_eq!(expired["data"]["hookId"], json!(forever_id));
+    let err = wss_rpc_raw(
+        &mut rpc,
+        850,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": forever_id }),
+    )
+    .await;
+    assert_eq!(err["error"]["code"], -32602, "expired hook ⇒ -32602: {err}");
+    await_conversation_contains(
+        &mut rpc,
+        860,
+        &ws_id,
+        &agent_id,
+        "expired after reaching its TTL (2 runs, 2 dispatches)",
     )
     .await;
 }

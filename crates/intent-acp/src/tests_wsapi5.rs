@@ -38,7 +38,9 @@ struct FakeApi {
     file_rename_calls: Mutex<Vec<(String, String)>>,
     update_calls: Mutex<Vec<WorkspaceUpdate>>,
     rename_calls: Mutex<Vec<(String, String, bool)>>,
-    archive_calls: Mutex<Vec<String>>,
+    /// `(workspaceId, callerAgentId)` per `archive_workspace` call — the
+    /// caller must ride along so the service-layer sweep can skip it.
+    archive_calls: Mutex<Vec<(String, Option<String>)>>,
     unarchive_calls: Mutex<Vec<String>>,
     /// Agents returned by `agent_list` — seeds for the archive guardrail.
     agents: Mutex<Vec<AgentLite>>,
@@ -214,11 +216,15 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(agents) })
     }
 
-    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-        self.archive_calls
-            .lock()
-            .unwrap()
-            .push(id.as_str().to_string());
+    fn archive_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        self.archive_calls.lock().unwrap().push((
+            id.as_str().to_string(),
+            caller_agent_id.map(|a| a.as_str().to_string()),
+        ));
         let variant = *self.workspace_variant.lock().unwrap();
         Box::pin(async move {
             if matches!(variant, WorkspaceVariant::NotFound) {
@@ -727,6 +733,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         status,
         is_active: false,
@@ -737,6 +744,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         is_waiting_for_other_agents: false,
         waiting_for_agent_ids: vec![],
         waiting_on_hooks: vec![],
+        waiting_on_pr_monitors: vec![],
         turn_in_flight: false,
         last_stream_activity_at: None,
         stats: None,
@@ -747,6 +755,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         last_agent_response: None,
         last_user_message: None,
         last_message_role: None,
+        last_message_id: None,
         digest: None,
         context_references: None,
         image_blocks: None,
@@ -796,7 +805,11 @@ async fn workspace_archive_happy_path() {
     assert_eq!(v["ok"], json!(true));
     assert_eq!(v["status"], json!("Archived"));
     assert_eq!(v["archivedAt"], json!("2026-02-02T00:00:00Z"));
-    assert_eq!(*api.archive_calls.lock().unwrap(), vec!["ws-1".to_string()]);
+    assert_eq!(
+        *api.archive_calls.lock().unwrap(),
+        vec![("ws-1".to_string(), Some("agent-self".to_string()))],
+        "the calling agent rides along so the sweep does not interrupt it"
+    );
 }
 
 #[tokio::test]

@@ -275,6 +275,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -1347,6 +1348,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             "not_started".into(),
             vec!["criterion one".into()],
             Some("M".into()),
+            None,
         )
         .await
         .expect("markAsTask");
@@ -1380,6 +1382,7 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             id.clone(),
             "Child Step".into(),
             Some("details".into()),
+            None,
             None,
         )
         .await
@@ -1508,9 +1511,16 @@ async fn task_list_and_get_project_workspace_tasks() {
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
-    svc.mark_as_task(ws.clone(), id.clone(), "not_started".into(), vec![], None)
-        .await
-        .expect("markAsTask");
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        vec![],
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
     // Bad agent id → error.
     assert!(svc
         .assign_agent(ws.clone(), id.clone(), "not-an-agent".into(), None)
@@ -1710,6 +1720,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         name_explicitly_set: true,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -3507,6 +3518,12 @@ use intent_core::{ActorType, EventActor};
 use intent_store::NewEvent;
 
 /// Insert a `file:changed` event for `agent` at `ts` (newest inserted last).
+///
+/// Writes straight to the store, bypassing the bus: that keeps these tests
+/// focused on the read-path projections. Note that non-`Agent` actor rows seeded
+/// here can no longer arise through `EventBus::publish`, which downgrades
+/// non-agent `file:*` events to a transient broadcast — they are retained only to
+/// pin the projection's actor handling for rows already in the log.
 async fn insert_file_event(
     svc: &Services,
     ws: &WorkspaceId,
@@ -3542,49 +3559,6 @@ async fn event_setup() -> (TempDb, Services, WorkspaceId) {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     (tmp, Services::new(store), ws)
-}
-
-#[tokio::test]
-async fn recent_files_limits_and_orders_newest_first() {
-    let (_tmp, svc, ws) = event_setup().await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:01Z",
-        "a.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Tool,
-        None,
-        "2026-01-01T00:00:02Z",
-        "b.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::User,
-        Some("u"),
-        "2026-01-01T00:00:03Z",
-        "c.rs",
-    )
-    .await;
-
-    let files = svc
-        .event_recent_files(ws.clone(), Some(2))
-        .await
-        .expect("recent");
-    assert_eq!(files.len(), 2);
-    // Newest first; combined "type:name" actor (absent name → undefined).
-    assert_eq!(files[0].path, "c.rs");
-    assert_eq!(files[0].actor.as_deref(), Some("user:name-u"));
-    assert_eq!(files[1].path, "b.rs");
-    assert_eq!(files[1].actor.as_deref(), Some("tool:undefined"));
 }
 
 #[tokio::test]
@@ -3636,42 +3610,6 @@ async fn workspace_summary_aggregates_recent_window() {
     assert_eq!(summary.active_agents[0].agent_id, "a1");
     assert_eq!(summary.top_changed_files[0].path, "a.rs");
     assert_eq!(summary.top_changed_files[0].change_count, 2);
-}
-
-#[tokio::test]
-async fn directory_changes_filters_by_prefix_and_requires_dir() {
-    let (_tmp, svc, ws) = event_setup().await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:01Z",
-        "src/a.rs",
-    )
-    .await;
-    insert_file_event(
-        &svc,
-        &ws,
-        ActorType::Agent,
-        Some("a"),
-        "2026-01-01T00:00:02Z",
-        "docs/b.md",
-    )
-    .await;
-
-    let changes = svc
-        .event_directory_changes(ws.clone(), "src/".to_string(), None)
-        .await
-        .expect("dir");
-    assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].path, "src/a.rs");
-
-    let err = svc
-        .event_directory_changes(ws.clone(), String::new(), None)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Internal(m) if m == "Directory path is required"));
 }
 
 #[tokio::test]
@@ -3947,6 +3885,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -4291,6 +4230,7 @@ mod change_event_parity {
             name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -4345,6 +4285,367 @@ mod change_event_parity {
             ev["actor"],
             json!({ "type": "agent", "id": "agent-prov", "name": "Prov" })
         );
+    }
+
+    /// Drain every published event until the bus goes quiet, flattening
+    /// batches into one ordered list of wire-JSON envelopes.
+    async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                out.push(serde_json::to_value(&ev).expect("serialize event"));
+            }
+        }
+        out
+    }
+
+    fn of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+        events
+            .iter()
+            .filter(|e| e["type"] == event_type)
+            .collect::<Vec<_>>()
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_emits_task_created_and_note_updated() {
+        let h = harness().await;
+        let n = note(&h.ws, "plain-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+
+        let updated = of_type(&events, "note:updated");
+        assert_eq!(updated.len(), 1, "markAsTask must emit note:updated");
+        assert_eq!(updated[0]["data"]["noteId"], "plain-1");
+
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "exactly one task:created");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], "plain-1");
+        assert_eq!(ev["data"]["noteTitle"], "Title");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+        assert!(ev["data"].get("agentId").is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_emits_status_changed_not_created() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "already-task", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(
+            of_type(&events, "task:created").is_empty(),
+            "re-marking an existing task is a status move, not a creation"
+        );
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        // A status move takes the same pair `task.updateNoteStatus` publishes.
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1, "exactly one task:status-changed");
+        assert_envelope(changed[0], &h.ws.0, "task:status-changed");
+        assert_eq!(changed[0]["data"]["noteId"], "already-task");
+        assert_eq!(changed[0]["data"]["previousStatus"], "not_started");
+        assert_eq!(changed[0]["data"]["newStatus"], "in_progress");
+        assert!(changed[0]["data"].get("agentId").is_none());
+        let ready = of_type(&events, "task:ready-tasks-changed");
+        assert_eq!(ready.len(), 1, "ready-set recompute follows the transition");
+        assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], "already-task");
+    }
+
+    #[tokio::test]
+    async fn mark_as_task_on_existing_task_same_status_emits_no_task_event() {
+        let h = harness().await;
+        let mut n = note(&h.ws, "same-status", "body");
+        n.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            ..Default::default()
+        });
+        h.store.insert_note(&n).await.expect("insert task note");
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                n.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        assert!(of_type(&events, "task:created").is_empty());
+        assert!(of_type(&events, "task:status-changed").is_empty());
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_emits_task_created_per_child() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-1",
+            "intro\n@@@task\n# Build API\nBuild it.\n@@@\ntail",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .convert_task_blocks(h.ws.clone(), n.id.clone(), None)
+            .await
+            .expect("convertBlocks");
+        assert_eq!(r.created_note_ids.len(), 1);
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1, "one task:created per converted block");
+        let ev = created[0];
+        assert_envelope(ev, &h.ws.0, "task:created");
+        assert_eq!(ev["data"]["noteId"], r.created_note_ids[0]);
+        assert_eq!(ev["data"]["noteTitle"], "Build API");
+        assert_eq!(ev["data"]["status"], "not_started");
+        assert!(ev["data"]["createdAt"].is_string());
+    }
+
+    #[tokio::test]
+    async fn convert_blocks_task_created_carries_agent_id() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-agent",
+            "intro\n@@@task\n# Agent Task\nbody\n@@@",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-conv"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Conv".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let mut sub = subscribe(&h);
+        h.services
+            .convert_task_blocks(
+                h.ws.clone(),
+                n.id.clone(),
+                Some(AgentId::from("agent-conv")),
+            )
+            .await
+            .expect("convertBlocks");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-conv");
+        assert_eq!(
+            created[0]["actor"],
+            json!({ "type": "agent", "id": "agent-conv", "name": "Conv" })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_prerequisite_emits_task_created() {
+        let h = harness().await;
+        let n = note(&h.ws, "dependent-1", "body");
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .create_prerequisite(
+                h.ws.clone(),
+                n.id.clone(),
+                "Prereq".to_string(),
+                None,
+                Some("not_started".to_string()),
+                None,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_envelope(created[0], &h.ws.0, "task:created");
+        assert_eq!(created[0]["data"]["noteId"], r.prerequisite_note_id.0);
+        assert_eq!(created[0]["data"]["noteTitle"], "Prereq");
+        assert_eq!(created[0]["data"]["status"], "not_started");
+    }
+
+    /// LC-1 parity for the two `task.*` paths that now thread the caller:
+    /// `markAsTask` and `createPrerequisite` attribute their emissions to the
+    /// invoking agent when the MCP front door supplies one.
+    #[tokio::test]
+    async fn mark_as_task_and_create_prerequisite_carry_agent_id() {
+        let h = harness().await;
+        let plain = note(&h.ws, "plain-agent", "body");
+        h.store.insert_note(&plain).await.expect("insert note");
+        let session = AgentSession {
+            id: AgentId::from("agent-task"),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Tasker".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        };
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let caller = Some(AgentId::from("agent-task"));
+        let agent_actor = json!({ "type": "agent", "id": "agent-task", "name": "Tasker" });
+
+        // markAsTask on a plain note → agent-attributed task:created.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "not_started".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
+
+        // markAsTask on the now-task note → agent-attributed status change.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                plain.id.clone(),
+                "in_progress".to_string(),
+                vec![],
+                None,
+                caller.clone(),
+            )
+            .await
+            .expect("markAsTask");
+        let events = drain_events(&mut sub).await;
+        let changed = of_type(&events, "task:status-changed");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["data"]["agentId"], "agent-task");
+        assert_eq!(changed[0]["actor"], agent_actor);
+
+        // createPrerequisite → the child's task:created is agent-attributed.
+        let mut sub = subscribe(&h);
+        h.services
+            .create_prerequisite(
+                h.ws.clone(),
+                plain.id.clone(),
+                "Prereq".to_string(),
+                None,
+                None,
+                caller,
+            )
+            .await
+            .expect("createPrerequisite");
+        let events = drain_events(&mut sub).await;
+        let created = of_type(&events, "task:created");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0]["data"]["agentId"], "agent-task");
+        assert_eq!(created[0]["actor"], agent_actor);
     }
 
     #[tokio::test]
@@ -4627,7 +4928,7 @@ mod change_event_parity {
         let mut sub = subscribe(&h);
         let ws = h
             .services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive");
         let archived_at = ws.archived_at.expect("archivedAt persisted");
@@ -4960,7 +5261,7 @@ mod change_event_parity {
         // Archive — must return activity=agent_running.
         let archived = h
             .services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive workspace");
         assert_eq!(
@@ -4980,7 +5281,7 @@ mod change_event_parity {
 
         // Archive first.
         h.services
-            .archive_workspace(h.ws.clone())
+            .archive_workspace(h.ws.clone(), None)
             .await
             .expect("archive workspace");
 
@@ -6406,6 +6707,7 @@ mod mcp_callback {
             name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -6800,10 +7102,11 @@ mod pr {
     use async_trait::async_trait;
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
-        AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
-        IssueQuery, MergeMethod, MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page,
-        PageParams, PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult,
-        Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+        AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor,
+        Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
+        MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+        PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment,
+        ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict, RollupCheck,
         ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
@@ -6869,6 +7172,10 @@ mod pr {
         /// When true, `review_decision` fails, exercising the degrade-to-
         /// aggregate path of `pr_state`.
         fail_review_decision: bool,
+        /// What the merge-requirements probe reports. `None` mirrors a host
+        /// without the signals (the trait default `Unsupported`), exercising
+        /// the degraded checklist path.
+        merge_signals: Option<MergeRequirementSignals>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -7128,6 +7435,16 @@ mod pr {
                 },
             ])
         }
+        async fn merge_requirements(
+            &self,
+            _: &RepoRef,
+            _: u64,
+        ) -> ScResult<MergeRequirementSignals> {
+            match &self.merge_signals {
+                Some(signals) => Ok(signals.clone()),
+                None => Err(ScError::Unsupported("merge requirements probe".into())),
+            }
+        }
         async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
             Ok(vec![Comment {
                 id: "1".into(),
@@ -7350,6 +7667,115 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
         let services = Services::new(store).with_source_control(Arc::new(forge));
         (tmp, services, ws_id)
+    }
+
+    // ---- merge-requirements checklist over the stubbed forge -------------
+
+    /// Drive `pr_ops::fetch_merge_requirements` against a stub forge.
+    async fn merge_requirements_of(forge: StubForge) -> crate::MergeRequirements {
+        let sc: Arc<dyn SourceControl> = Arc::new(forge);
+        let repo = RepoRef::new("o", "r");
+        crate::fetch_merge_requirements(sc.as_ref(), &repo, 42)
+            .await
+            .expect("merge requirements")
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_composes_probe_and_snapshot() {
+        // The stub's sample PR is open/clean with one approval (alice) and one
+        // unresolved review thread (RT1).
+        let req = merge_requirements_of(StubForge {
+            merge_signals: Some(MergeRequirementSignals {
+                merge_state_status: Some("BLOCKED".into()),
+                review_decision: Some(ReviewDecision::ReviewRequired),
+                checks: vec![
+                    RollupCheck {
+                        name: "build".into(),
+                        state: CheckState::Success,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "test".into(),
+                        state: CheckState::Failure,
+                        is_required: true,
+                        url: None,
+                    },
+                    RollupCheck {
+                        name: "flaky".into(),
+                        state: CheckState::Failure,
+                        is_required: false,
+                        url: None,
+                    },
+                ],
+                checks_known: true,
+                branch_rules: Some(BranchRules {
+                    required_approving_review_count: Some(2),
+                    required_conversation_resolution: Some(true),
+                    required_status_checks: vec!["build".into(), "test".into()],
+                }),
+            }),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(req.state, "open");
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(req.checks.failing_required, vec!["test".to_string()]);
+        assert!(req.checks.required_known);
+        assert_eq!(req.approvals.decision, "review_required");
+        assert_eq!(req.approvals.have, 1);
+        assert_eq!(req.approvals.needed, Some(2));
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.threads.resolution_required, Some(true));
+        assert_eq!(req.merge_state_status.as_deref(), Some("BLOCKED"));
+        assert!(req.rules_known);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_degrades_when_probe_unsupported() {
+        // No probe (the trait default `Unsupported`): the checklist falls back
+        // to the REST check-runs and reports the rules as unknown.
+        let req = merge_requirements_of(StubForge::default()).await;
+        assert_eq!(req.checks.total, 3);
+        assert_eq!(
+            (req.checks.passed, req.checks.failed, req.checks.pending),
+            (1, 1, 1)
+        );
+        assert!(!req.checks.required_known);
+        assert!(req.checks.failing_required.is_empty());
+        assert!(!req.rules_known);
+        assert_eq!(req.approvals.needed, None);
+        assert_eq!(req.threads.resolution_required, None);
+        // The aggregate still drives the decision (alice approved).
+        assert_eq!(req.approvals.decision, "approved");
+        assert_eq!(req.threads.unresolved, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_survives_a_failing_thread_read() {
+        // A GraphQL thread failure falls back to the flat REST comments
+        // (resolution state unavailable, so each fallback thread counts as
+        // unresolved) rather than failing the whole checklist.
+        let req = merge_requirements_of(StubForge {
+            fail_threads: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(req.threads.unresolved, 1);
+        assert_eq!(req.state, "open");
+    }
+
+    #[tokio::test]
+    async fn merge_requirements_reports_conflicts_on_a_dirty_pr() {
+        let req = merge_requirements_of(StubForge {
+            dirty_pr: true,
+            ..Default::default()
+        })
+        .await;
+        assert!(req.has_conflicts);
+        assert_eq!(req.mergeable, Some(false));
+        assert_eq!(req.merge_blocked_reason.as_deref(), Some("merge conflicts"));
     }
 
     // ---- github.* browse / auth / identity (PROTOCOL §5.27) -------------
@@ -7705,6 +8131,8 @@ mod pr {
         assert_eq!(v["comments"]["reviewCommentCount"], 2);
         assert_eq!(v["comments"]["unresolvedThreadCount"], 1);
         assert_eq!(v["comments"]["totalCount"], 3);
+        // Pin the unified merge-requirements field name on the snapshot shape.
+        assert!(v["requirements"].is_object());
     }
 
     #[tokio::test]
@@ -8924,6 +9352,43 @@ mod file_tracking {
             .unwrap();
     }
 
+    /// Register `child` as a submodule of `parent` at `sub_rel`, mirroring
+    /// `intent_git::testutil::add_submodule` (private to that crate) for the
+    /// submodule-guard regression tests below: a real gitlink + `.gitmodules`
+    /// fixture rather than a synthetic path.
+    fn add_submodule(parent: &std::path::Path, child: &std::path::Path, sub_rel: &str) {
+        let repo = Repository::open(parent).unwrap();
+        let url = child.to_string_lossy().to_string();
+        let sub_path = parent.join(sub_rel);
+        let mut sm = repo
+            .submodule(&url, std::path::Path::new(sub_rel), true)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&sub_path);
+        Repository::clone(&url, &sub_path).unwrap();
+        sm.add_to_index(true).unwrap();
+        sm.add_finalize().unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parents = match repo.head().ok().and_then(|h| h.target()) {
+            Some(oid) => vec![repo.find_commit(oid).unwrap()],
+            None => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "add submodule",
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
+    }
+
     fn tracked(ws: &WorkspaceId, path: &str, stage: &str, agent: Option<&str>) -> NewTrackedChange {
         NewTrackedChange {
             workspace_id: ws.clone(),
@@ -9531,6 +9996,94 @@ mod file_tracking {
             .unwrap();
         assert_eq!(r.files, vec!["dirty.txt".to_string()]);
         assert_eq!(r.file_count, 1);
+    }
+
+    /// Attribution-filtered branch (monorepo#1714 follow-up): a
+    /// `tracked_changes` row attributes a path strictly inside a registered
+    /// submodule to the committing agent, and the submodule's worktree is
+    /// dirty. `git_agent_commit` must drop that path from the commit set —
+    /// nothing from inside the submodule is committed, and since it was the
+    /// only attributed change the call degenerates to the benign "no
+    /// uncommitted changes" skip (auto-commit treats this as silent). The
+    /// parent's gitlink entry for the submodule survives unchanged.
+    #[tokio::test]
+    async fn agent_commit_drops_submodule_internal_attributed_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        // Dirty a file strictly inside the submodule's own worktree.
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "sub/inner.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "agent sub edit".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("No uncommitted changes found for this agent"),
+            "got: {err}"
+        );
+        // No new commit landed, and the submodule gitlink in the parent's
+        // status is unaffected (still just the worktree-modified marker, not
+        // staged/committed).
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "seed + add-submodule commits only");
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let sub_entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "sub")
+            .expect("submodule gitlink still reported dirty");
+        assert!(!sub_entry.staged, "gitlink must not have been staged");
+    }
+
+    /// Explicit `files` branch (monorepo#1714 follow-up): naming a path
+    /// strictly inside a registered submodule fails with a clear error naming
+    /// the offending path and its containing submodule, advising the caller
+    /// to commit from within the submodule repo instead — no commit lands.
+    #[tokio::test]
+    async fn agent_commit_explicit_files_rejects_submodule_internal_path() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("sub").join("inner.txt"), "changed\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "explicit sub".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["sub/inner.txt".to_string()]),
+                false,
+            )
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sub/inner.txt"), "names the path: {msg}");
+        assert!(
+            msg.contains("submodule 'sub'"),
+            "names the containing submodule: {msg}"
+        );
+        assert!(
+            msg.contains("Commit these changes from within the submodule repo"),
+            "advises committing in the submodule: {msg}"
+        );
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 2, "no new commit must have landed");
     }
 
     /// A `userRequested` no-files checkpoint still commits only the
@@ -10191,6 +10744,681 @@ mod file_tracking {
         unstaged.await.unwrap().unwrap();
         staged.await.unwrap().unwrap();
         assert_eq!(walks.load(Ordering::SeqCst), 2, "no coalescing across keys");
+    }
+
+    /// Regression (monorepo#1648): concurrent `git.status` calls for one
+    /// worktree run the underlying libgit2 scan once and every caller gets
+    /// that result. The probe parks the leader's scan on the blocking pool
+    /// until the followers have provably joined, so the overlap is
+    /// deterministic.
+    #[tokio::test]
+    async fn git_status_concurrent_calls_coalesce_into_one_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        // The leader is inside the scan (flight registered, probe parked).
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let followers: Vec<_> = (0..3)
+            .map(|_| {
+                let svc = svc.clone();
+                let ws = ws_id.clone();
+                tokio::spawn(async move { svc.git_status(ws).await })
+            })
+            .collect();
+        wait_until("followers to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 3
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let first = leader.await.unwrap().unwrap();
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap(), first, "shared result");
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        assert!(
+            first.files.iter().any(|f| f.path == "seed.txt"),
+            "shared result carries the real status"
+        );
+    }
+
+    /// `accept-changes.getStatus` shares the working-tree scan with a
+    /// concurrent `git.status` for the same worktree (monorepo#1648): its
+    /// extra history/remote work still runs per call, but the common scan
+    /// happens once.
+    #[tokio::test]
+    async fn accept_changes_get_status_shares_the_scan_with_git_status() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let status = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let accept = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.accept_changes_get_status(ws).await }
+        });
+        wait_until("accept-changes to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        status.await.unwrap().unwrap();
+        let value = accept.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        // Wire shape unchanged: the coalesced scan still feeds the documented
+        // §5.18 counts.
+        assert_eq!(value["uncommittedCount"], 1);
+        assert_eq!(value["stagedCount"], 0);
+    }
+
+    /// Regression (monorepo#1693 Finding B): concurrent `accept-changes.getStatus`
+    /// calls for the same workspace coalesce onto ONE full build — not just the
+    /// shared working-tree scan. The scan probe parks the leader mid-scan; while
+    /// parked, three more calls join and must register as followers of the
+    /// *ac-status* flight (not merely as independent followers of the scan), so
+    /// each of them skips the scan entirely and shares the leader's full result.
+    #[tokio::test]
+    async fn accept_changes_get_status_concurrent_calls_coalesce_into_one_build() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.accept_changes_get_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let followers: Vec<_> = (0..3)
+            .map(|_| {
+                let svc = svc.clone();
+                let ws = ws_id.clone();
+                tokio::spawn(async move { svc.accept_changes_get_status(ws).await })
+            })
+            .collect();
+        wait_until("followers to join the in-flight ac-status build", || {
+            svc.ac_status_waiters(&ws_id) == 3
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let first = leader.await.unwrap().unwrap();
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap(), first, "shared result");
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "one underlying scan — followers never re-entered the scan"
+        );
+        assert_eq!(first["uncommittedCount"], 1);
+    }
+
+    /// Concurrent status scans for *different* worktrees never coalesce — they
+    /// must not serialize against each other.
+    #[tokio::test]
+    async fn git_status_distinct_worktrees_run_their_own_scans() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo_a = init_git_repo();
+        let repo_b = init_git_repo();
+        let (_ta, svc, ws_a) = svc_with_repo(&repo_a).await;
+        let ws_b = WorkspaceId::new();
+        let mut other = workspace(&ws_b);
+        other.worktree_path = Some(repo_b.dir.to_string_lossy().to_string());
+        svc.store().insert_workspace(&other).await.unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let first = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.git_status(ws_a).await }
+        });
+        wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
+        let second = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.git_status(ws_b).await }
+        });
+        // The other worktree must start its own scan while the first is parked.
+        wait_until("second independent scan", || {
+            scans.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 2, "no cross-worktree sharing");
+    }
+
+    /// A failed scan is never cached: after the flight settles, the next call
+    /// runs a fresh scan.
+    #[tokio::test]
+    async fn git_status_failed_scan_is_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        // Keep `.git` present (so the handler reaches the scan) but corrupt it
+        // so `Repository::open` fails.
+        std::fs::remove_file(repo.dir.join(".git").join("HEAD")).unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(svc.git_status(ws_id.clone()).await.is_err());
+        assert!(svc.git_status(ws_id).await.is_err());
+        assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
+    }
+
+    /// `git.changes` runs the same working-tree scan, so it shares the flight
+    /// with a concurrent `git.status` for the same worktree (monorepo#1648)
+    /// while still projecting only the file list.
+    #[tokio::test]
+    async fn git_changes_shares_the_scan_with_git_status() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let status = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let changes = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_changes(ws).await }
+        });
+        wait_until("git.changes to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let full = status.await.unwrap().unwrap();
+        let value = changes.await.unwrap().unwrap();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        // Wire shape unchanged: still the bare `status.files` projection.
+        assert_eq!(value, serde_json::to_value(&full.files).unwrap());
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "seed.txt"));
+    }
+
+    /// A leader that vanishes before publishing (cancelled RPC) wakes its
+    /// followers to elect a new leader rather than hanging them — the
+    /// service-level counterpart of the module's dropped-leader test.
+    #[tokio::test]
+    async fn git_status_aborted_leader_lets_a_follower_retry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let park = Arc::new(AtomicBool::new(true));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let park = Arc::clone(&park);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while park.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        // Cancel the leader: its guard drops without publishing, closing the
+        // channel so the follower re-joins and leads its own scan.
+        leader.abort();
+        park.store(false, Ordering::SeqCst);
+        let retried = follower.await.unwrap().unwrap();
+        assert!(
+            retried.files.iter().any(|f| f.path == "seed.txt"),
+            "follower's retry produced a real status"
+        );
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "follower led its own scan after the leader vanished"
+        );
+    }
+
+    /// A coalesced follower surfaces the *same* error as the leader: the shared
+    /// failure travels as the inner message, so the follower's re-wrap does not
+    /// produce a doubled `internal error:` prefix.
+    #[tokio::test]
+    async fn git_status_failed_scan_reports_the_same_error_to_followers() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+        std::fs::remove_file(repo.dir.join(".git").join("HEAD")).unwrap();
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the in-flight scan", || {
+            svc.git_status_waiters(&repo.dir) == 1
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        let leader_err = leader.await.unwrap().unwrap_err().to_string();
+        let follower_err = follower.await.unwrap().unwrap_err().to_string();
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "one underlying scan");
+        assert_eq!(follower_err, leader_err, "identical error message");
+        assert_eq!(
+            follower_err.matches("internal error:").count(),
+            1,
+            "no doubled prefix: {follower_err}"
+        );
+    }
+
+    /// Regression (monorepo#1648, ladder rung 2): steady-state sequential
+    /// reads cost no working-tree scan at all — the first read scans, the
+    /// rest serve the cached status.
+    #[tokio::test]
+    async fn git_status_repeat_reads_serve_the_cached_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                svc.git_status(ws_id.clone()).await.unwrap(),
+                first,
+                "cached reads return the same status"
+            );
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
+        // The other scan-backed reads serve the same entry.
+        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.accept_changes_get_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "git.changes / accept-changes.getStatus share the cached scan"
+        );
+    }
+
+    /// A daemon-owned git mutation invalidates the cache inline, so the next
+    /// read reflects it rather than serving the pre-mutation snapshot.
+    #[tokio::test]
+    async fn git_mutation_invalidates_the_cached_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        assert!(
+            before.files.iter().any(|f| !f.staged),
+            "the edit starts unstaged"
+        );
+        svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
+            .await
+            .unwrap();
+        let after = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the mutation forced a rescan"
+        );
+        assert!(
+            after.files.iter().all(|f| f.staged),
+            "the post-stage read reflects the mutation: {after:?}"
+        );
+    }
+
+    /// The fallback TTL bounds staleness for changes no daemon signal reports:
+    /// an out-of-band edit is picked up once the cached entry expires.
+    #[tokio::test]
+    async fn git_status_cache_expires_after_its_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let svc = svc
+            .with_git_status_cache_ttl(std::time::Duration::from_millis(50))
+            .with_git_status_scan_probe({
+                let scans = Arc::clone(&scans);
+                Arc::new(move || {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+
+        assert!(svc
+            .git_status(ws_id.clone())
+            .await
+            .unwrap()
+            .files
+            .is_empty());
+        // Out-of-band edit: no `file:*` event, no daemon mutation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        assert!(
+            svc.git_status(ws_id.clone())
+                .await
+                .unwrap()
+                .files
+                .is_empty(),
+            "still inside the TTL: the cached (now stale) status is served"
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let expired = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "TTL expiry re-authorized a scan"
+        );
+        assert!(
+            expired.files.iter().any(|f| f.path == "seed.txt"),
+            "the out-of-band edit surfaces after the TTL"
+        );
+    }
+
+    /// Invalidation landing *during* a scan wins: that scan cannot be trusted
+    /// to describe the post-change tree, so its result must not be cached —
+    /// the next read rescans instead of serving it.
+    #[tokio::test]
+    async fn invalidation_during_a_scan_is_not_overwritten_by_it() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // The change lands mid-scan: whatever the in-flight scan observes, it
+        // started against the pre-change generation.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the stale snapshot was not cached"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the mid-scan change"
+        );
+    }
+
+    /// A reader that joins an in-flight scan *after* an invalidation must not
+    /// publish that scan's (pre-change) result: only the leader caches, and
+    /// only against the generation it snapshotted when it was elected.
+    #[tokio::test]
+    async fn follower_joining_after_invalidation_does_not_cache_the_leaders_scan() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let scans = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let svc = svc.with_git_status_scan_probe({
+            let scans = Arc::clone(&scans);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                scans.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        });
+
+        let leader = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("leader to enter the scan", || {
+            scans.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
+        svc.git_status_cache().invalidate(&repo.dir);
+
+        // Joins after the invalidation, so its generation is the new one — but
+        // the result it receives is the leader's pre-change scan.
+        let follower = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws_id.clone();
+            async move { svc.git_status(ws).await }
+        });
+        wait_until("follower to join the flight", || {
+            svc.git_status_waiters(&repo.dir) > 0
+        })
+        .await;
+
+        release.store(true, Ordering::SeqCst);
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+
+        let next = svc.git_status(ws_id).await.unwrap();
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            2,
+            "the follower must not have cached the leader's stale snapshot"
+        );
+        assert!(
+            next.files.iter().any(|f| f.path == "seed.txt"),
+            "the rescan picks up the change the coalesced scan predated"
+        );
     }
 
     /// The git reads degrade to empty results for a workspace with no worktree
@@ -11554,6 +12782,7 @@ mod search_adapters {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -13419,6 +14648,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13556,6 +14786,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("spec-writer".into()),
@@ -13683,6 +14914,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13806,6 +15038,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -13929,6 +15162,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -14056,6 +15290,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -14184,6 +15419,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("verifier".into()),
@@ -14333,6 +15569,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("spec-writer".into()),
@@ -14586,6 +15823,7 @@ mod rules {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".into()),
@@ -15763,6 +17001,7 @@ mod worktree_provisioning {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -16929,6 +18168,242 @@ mod worktree_provisioning {
         assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
     }
 
+    /// Insert a hydrated standalone source row (monorepo#1560 fixtures): its
+    /// checkout at `worktreePath` IS its repository, exactly as
+    /// cache-hydrated `workspace.create` persists it.
+    async fn insert_standalone_source(
+        store: &Store,
+        id: &str,
+        checkout: &std::path::Path,
+        mode: intent_core::CheckoutMode,
+    ) -> WorkspaceId {
+        let src_id = WorkspaceId::from(id);
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(checkout.to_string_lossy().to_string());
+        src_ws.worktree_path = Some(checkout.to_string_lossy().to_string());
+        src_ws.checkout_mode = Some(mode);
+        store.insert_workspace(&src_ws).await.expect("insert");
+        src_id
+    }
+
+    /// monorepo#1560: a standalone (`cow`/`direct`) source never yields a
+    /// linked worktree, even with `workspace.cowIsolation` OFF — the
+    /// duplicate is a self-contained clone whose `repositoryPath` is its own
+    /// checkout, and the source checkout gains no branch.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_stays_standalone_with_isolation_off() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupstandalone-src");
+        let root = unique_dir("intentd-dupstandalone-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-standalone-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+
+        assert!(
+            matches!(
+                dup.checkout_mode,
+                Some(intent_core::CheckoutMode::Cow) | Some(intent_core::CheckoutMode::Direct)
+            ),
+            "standalone source must never yield a worktree; got {:?}",
+            dup.checkout_mode
+        );
+        let wt = dup.worktree_path.as_deref().expect("checkout provisioned");
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate is a standalone repo");
+        assert_eq!(
+            dup.repository_path.as_deref(),
+            Some(wt),
+            "standalone duplicate's repositoryPath is its own checkout"
+        );
+        let src_repo = git2::Repository::open(&checkout.0).unwrap();
+        assert!(
+            src_repo
+                .find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "standalone duplicate must not create a branch in the source checkout"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(persisted.repository_path.as_deref(), Some(wt));
+        assert_eq!(persisted.checkout_mode, dup.checkout_mode);
+    }
+
+    /// monorepo#1560: when provisioning the standalone duplicate's checkout
+    /// fails, the worktree-less row must not keep the `repositoryPath` copied
+    /// from the source — for a standalone source that is the SOURCE's checkout
+    /// directory, which dangles once the source workspace is deleted.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_clears_repository_path_when_provisioning_fails() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        // A checkout-shaped directory with a `.git` DIRECTORY that is not a
+        // valid repository: it passes the `.git` existence gate and the CoW
+        // probe, but the clone cannot be opened as a repo, so provisioning
+        // fails after the standalone path was chosen.
+        let broken = unique_dir("intentd-dupfail-src");
+        std::fs::create_dir_all(broken.0.join(".git")).expect("create .git dir");
+        std::fs::write(broken.0.join("a.txt"), "one\n").expect("write file");
+        let root = unique_dir("intentd-dupfail-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-fail-src",
+            &broken.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate row is still created");
+
+        assert!(
+            dup.worktree_path.is_none(),
+            "provisioning was expected to fail; got {:?}",
+            dup.worktree_path
+        );
+        assert_eq!(
+            dup.repository_path, None,
+            "a failed standalone duplicate must not reference the source's checkout"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(persisted.repository_path, None);
+    }
+
+    /// monorepo#1560 regression: the duplicate of a standalone source keeps
+    /// working after the source workspace's checkout directory is deleted —
+    /// no live filesystem reference back into it.
+    #[tokio::test]
+    async fn duplicate_of_standalone_source_survives_source_deletion() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupsurvive-src");
+        let root = unique_dir("intentd-dupsurvive-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-survive-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+        let wt = dup
+            .worktree_path
+            .as_deref()
+            .expect("checkout provisioned")
+            .to_string();
+
+        std::fs::remove_dir_all(&checkout.0).expect("delete the source workspace's checkout");
+
+        let clone =
+            git2::Repository::open(&wt).expect("duplicate still opens after source removal");
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            dup.branch.as_str()
+        );
+        clone.statuses(None).expect("git status still works");
+        // Nothing in the duplicate's git config references the source path.
+        let cfg = std::fs::read_to_string(std::path::Path::new(&wt).join(".git/config"))
+            .expect("read clone config");
+        assert!(
+            !cfg.contains(&checkout.0.to_string_lossy().to_string()),
+            "duplicate config must not reference the source checkout: {cfg}"
+        );
+    }
+
+    /// monorepo#1560: an `isNewRepo` `direct` source (no `worktreePath`; the
+    /// user's own folder IS the repository) is duplicated into a standalone
+    /// checkout under the workspaces root, leaving the user's repo free of
+    /// workspace branches and worktree registrations.
+    #[tokio::test]
+    async fn duplicate_of_new_repo_direct_source_leaves_user_repo_clean() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (user_repo, _, _) = seed_repo("intentd-dupnewrepo-src");
+        let root = unique_dir("intentd-dupnewrepo-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = WorkspaceId::from("dup-newrepo-src");
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(user_repo.0.to_string_lossy().to_string());
+        src_ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+        store.insert_workspace(&src_ws).await.expect("insert");
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+
+        let wt = dup.worktree_path.as_deref().expect("checkout provisioned");
+        assert!(
+            std::path::Path::new(wt).starts_with(&root.0),
+            "duplicate checkout lives under the workspaces root"
+        );
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate is a standalone repo");
+        assert_eq!(dup.repository_path.as_deref(), Some(wt));
+        let src_repo = git2::Repository::open(&user_repo.0).unwrap();
+        assert!(
+            src_repo
+                .find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "the user's repo must not gain the duplicate's branch"
+        );
+        assert!(
+            !user_repo.0.join(".git/worktrees").exists(),
+            "the user's repo must not gain a worktree registration"
+        );
+    }
+
+    /// monorepo#1560: with a self-contained `repositoryPath`, duplicating a
+    /// duplicate provisions its own checkout instead of silently producing a
+    /// checkout-less row.
+    #[tokio::test]
+    async fn duplicate_of_a_standalone_duplicate_provisions_its_own_checkout() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (checkout, _, _) = seed_repo("intentd-dupdup-src");
+        let root = unique_dir("intentd-dupdup-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+        let src_id = insert_standalone_source(
+            &store,
+            "dup-dup-src",
+            &checkout.0,
+            intent_core::CheckoutMode::Direct,
+        )
+        .await;
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate");
+        let dup2 = svc
+            .duplicate_workspace(dup.id.clone(), None)
+            .await
+            .expect("duplicate of the duplicate");
+
+        let wt2 = dup2.worktree_path.as_deref().expect("checkout provisioned");
+        assert_ne!(Some(wt2), dup.worktree_path.as_deref());
+        assert_eq!(dup2.repository_path.as_deref(), Some(wt2));
+        let clone = git2::Repository::open(wt2).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "duplicate-of-duplicate is standalone");
+    }
+
     /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
     /// no checkout is provisioned, so there is no mode to record.
     #[tokio::test]
@@ -17805,6 +19280,7 @@ mod file_ops_service {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -18792,6 +20268,7 @@ mod heal_stale_agent_sessions {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -20151,6 +21628,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         name_explicitly_set: false,
         model: Some("sonnet".to_string()),
         reasoning_effort: None,
+        effort_levels: None,
         provider: Some("auggie".to_string()),
         system_prompt: None,
         specialist: None,
@@ -20191,6 +21669,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         name_explicitly_set: false,
         model: Some("gpt4".to_string()),
         reasoning_effort: None,
+        effort_levels: None,
         provider: Some("openai".to_string()),
         system_prompt: None,
         specialist: None,
@@ -20310,6 +21789,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         name_explicitly_set: false,
         model: Some("opus".to_string()),
         reasoning_effort: None,
+        effort_levels: None,
         provider: Some("anthropic".to_string()),
         system_prompt: None,
         specialist: None,
@@ -20587,7 +22067,8 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss: attention-changed only — no updated_at bump, so no
+        // Dismiss: attention-changed (plus the displayStatus demotion for
+        // the retired unread flag, §6.5) — no updated_at bump, so no
         // debounced workspace:updated { lastActivity } follows.
         h.services
             .dismiss_attention(h.ws.clone())
@@ -20598,12 +22079,15 @@ mod last_activity_events {
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
-            "dismiss must not emit a lastActivity workspace:updated"
-        );
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                assert_eq!(
+                    ev["type"], "workspace:displayStatus-changed",
+                    "dismiss must not emit a lastActivity workspace:updated"
+                );
+            }
+        }
 
         // Dismiss again (no-op, no events).
         h.services
@@ -20805,6 +22289,179 @@ mod last_activity_events {
                 .as_deref(),
             Some(future),
             "a stale derivation must not walk lastActivity backwards"
+        );
+    }
+
+    /// Regression (monorepo#1585): `workspace.update` persists the
+    /// `lastActivity` it derives for the response, so the stored column
+    /// matches what the caller was told — the cheap read paths that never
+    /// derive (`list_workspaces_lite`, the `workspace.subscribe` seq-0
+    /// snapshot) and a daemon restart serve the same fresh value instead of
+    /// a stale one that waits on the next debounce.
+    #[tokio::test]
+    async fn update_workspace_persists_derived_last_activity() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // Seeded row: nothing stored yet.
+        assert!(h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("seed reload")
+            .last_activity
+            .is_none());
+
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        let derived = updated
+            .last_activity
+            .clone()
+            .expect("response carries derived lastActivity");
+
+        // The stored column matches the response (persisted, not just derived).
+        let persisted = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .last_activity;
+        assert_eq!(
+            persisted.as_deref(),
+            Some(derived.as_str()),
+            "derived lastActivity must be persisted, not response-only"
+        );
+
+        // The lite list (seq-0 snapshot source) serves it without deriving.
+        let lite = h
+            .services
+            .list_workspaces_lite(true)
+            .await
+            .expect("lite list");
+        let row = lite
+            .iter()
+            .find(|w| w.id == h.ws)
+            .expect("workspace in lite list");
+        assert_eq!(row.last_activity.as_deref(), Some(derived.as_str()));
+    }
+
+    /// Regression (monorepo#1585): the full-row `update_workspace` store write
+    /// can no longer clobber a concurrently bumped `lastActivity`. This
+    /// exercises the exact interleaving from the issue at the service layer:
+    /// the stale snapshot is read BEFORE the bump lands, then written back
+    /// through the same full-row `store.update_workspace` call every
+    /// `workspace.*` mutation path (update/archive/unarchive) uses — pre-fix
+    /// this silently reverted the bump.
+    #[tokio::test]
+    async fn update_workspace_does_not_clobber_concurrent_bump() {
+        use intent_core::{WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+
+        // 1. A mutation path reads its row snapshot (services do this first).
+        let mut stale = h.store.get_workspace(&h.ws).await.expect("snapshot");
+
+        // 2. A debounce bump lands after the read.
+        let future = "2999-01-01T00:00:00Z";
+        assert!(h
+            .store
+            .bump_workspace_last_activity(&h.ws, future)
+            .await
+            .expect("bump"));
+
+        // 3. The mutation writes its stale snapshot back full-row.
+        stale.title = "Renamed via stale snapshot".to_string();
+        stale.updated_at = now_iso();
+        h.store.update_workspace(&stale).await.expect("stale write");
+
+        // The bumped value holds; the rest of the row replaced.
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some(future),
+            "full-row write of a stale snapshot must not revert a newer lastActivity"
+        );
+        assert_eq!(reloaded.title, "Renamed via stale snapshot");
+
+        // And end-to-end: a subsequent `workspace.update` RPC (reload →
+        // mutate → full-row write → derive → monotonic persist) also leaves
+        // the bump intact.
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(future),
+            "workspace.update must not clobber a newer persisted lastActivity"
+        );
+    }
+
+    /// Regression (monorepo#1585 review): archive and unarchive persist the
+    /// `lastActivity` they derive for the response, so the lite list / seq-0
+    /// snapshot serves the same value without deriving.
+    #[tokio::test]
+    async fn archive_unarchive_persist_derived_last_activity() {
+        use intent_core::WorkspaceApi;
+        let h = harness().await;
+
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone(), None)
+            .await
+            .expect("archive");
+        let derived = archived
+            .last_activity
+            .clone()
+            .expect("archive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "archive must persist the derived lastActivity"
+        );
+
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive");
+        let derived = unarchived
+            .last_activity
+            .clone()
+            .expect("unarchive response carries derived lastActivity");
+        assert_eq!(
+            h.store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+                .as_deref(),
+            Some(derived.as_str()),
+            "unarchive must persist the derived lastActivity"
         );
     }
 
@@ -21015,6 +22672,7 @@ mod last_activity_events {
             name_explicitly_set: false,
             model: Some("test-model".into()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("test".into()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -21221,6 +22879,174 @@ mod last_activity_events {
     }
 }
 
+/// Regression tests for the turn-end unread gate (monorepo#1781): the
+/// drain-worker's end-of-queue `raise_attention(Unread)` (§9.9) must only
+/// fire for TOP-LEVEL FOREGROUND agents. A delegated child
+/// (`parent_agent_id` set) or background agent's completion is surfaced to
+/// its parent/coordinator, not the user, so it must not mark the workspace
+/// unread. On a session-load error the gate FAILS OPEN (raise anyway).
+#[cfg(test)]
+mod turn_end_unread_gate {
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb};
+    use crate::agent_manager::should_raise_turn_end_unread;
+    use crate::Services;
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let services = Services::new(store.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            ws,
+        }
+    }
+
+    fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some("test-model".into()),
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+        }
+    }
+
+    /// A top-level foreground agent (no parent, not background) keeps the
+    /// existing behavior: the turn-end raise fires.
+    #[tokio::test]
+    async fn top_level_foreground_raises() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "top-level foreground agents raise the turn-end blue dot"
+        );
+    }
+
+    /// A delegated child (`parent_agent_id` set) finishing its drain must
+    /// NOT raise the workspace blue dot.
+    #[tokio::test]
+    async fn delegated_child_skips_raise() {
+        let h = harness().await;
+        let parent_id = AgentId::new();
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.parent_agent_id = Some(parent_id);
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a delegated child must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A background agent (`is_background`) finishing its drain must NOT
+    /// raise the workspace blue dot.
+    #[tokio::test]
+    async fn background_agent_skips_raise() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.is_background = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a background agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A session that no longer exists (`NotFound` — the agent was deleted
+    /// while its drain finished) has nothing to surface: skip the raise.
+    #[tokio::test]
+    async fn deleted_agent_skips_raise() {
+        let h = harness().await;
+        let missing = AgentId::new();
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &missing).await,
+            "a deleted agent must not raise the turn-end blue dot"
+        );
+    }
+
+    /// A genuine store failure FAILS OPEN: a missed blue dot for a real
+    /// top-level turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn store_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("DROP TABLE agent_session")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop agent_session table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the gate fails open on a genuine store error"
+        );
+    }
+}
+
 /// Tests for the end-of-turn live token-usage update (§5.23):
 /// `persist_turn_token_usage` REPLACES the session's cumulative snapshot and
 /// re-aggregates the workspace `TokenUsage`, emitting
@@ -21303,6 +23129,7 @@ mod turn_token_usage {
             name_explicitly_set: false,
             model: Some(model.into()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("test".into()),
             status: AgentStatus::Idle,
             is_active: false,
@@ -22020,9 +23847,7 @@ mod turn_token_usage {
                     &intent_core::TokenUsageTotals {
                         input_tokens: (i + 1) * 10,
                         output_tokens: i + 1,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        cost: None,
+                        ..Default::default()
                     },
                 )
                 .await
@@ -22277,6 +24102,123 @@ mod provider_discovery_payload {
             pick(&baseline),
             "invalid overrides must behave exactly like no overrides"
         );
+    }
+
+    /// monorepo#1662: the pi row carries the `pi` CLI verdict fields, and
+    /// only the pi row does. Field-consistency assertions run against a
+    /// single payload snapshot (the live host's CLI state varies).
+    #[test]
+    fn pi_row_carries_cli_verdict_fields() {
+        let payload = crate::discover_providers_with_npx();
+        let entries = payload["providers"].as_array().expect("providers array");
+        for entry in entries {
+            if entry["id"] != "pi" || entry.get("gatedOff").is_some() {
+                assert!(
+                    entry.get("cliCommand").is_none()
+                        && entry.get("cliResolved").is_none()
+                        && entry.get("cliResolvedPath").is_none()
+                        && entry.get("cliVersion").is_none()
+                        && entry.get("cliVersionOk").is_none()
+                        && entry.get("cliRequirement").is_none()
+                        && entry.get("unavailableReason").is_none(),
+                    "only the probed pi row carries CLI fields: {entry}"
+                );
+                continue;
+            }
+            assert!(entry["cliCommand"].is_string(), "{entry}");
+            assert!(entry["cliResolved"].is_boolean(), "{entry}");
+            assert!(entry["cliVersionOk"].is_boolean(), "{entry}");
+            assert_eq!(
+                entry["cliRequirement"],
+                intent_providers::PI_CLI_REQUIREMENT,
+                "{entry}"
+            );
+            if entry["cliResolved"] == false {
+                assert!(
+                    entry.get("cliResolvedPath").is_none() && entry.get("cliVersion").is_none(),
+                    "unresolved CLI must omit path/version: {entry}"
+                );
+            }
+            // A gating verdict forces installed=false and names the reason.
+            if entry.get("unavailableReason").is_some() {
+                assert_eq!(entry["installed"], false, "{entry}");
+                assert_eq!(entry["cliVersionOk"], false, "{entry}");
+            }
+        }
+    }
+
+    /// The pure gate-to-fields mapping (`apply_pi_cli_fields`): Missing and
+    /// TooOld gate the row off with an actionable reason; Ok and Unknown are
+    /// permissive (Unknown logs a WARN instead of gating).
+    #[test]
+    fn pi_cli_fields_mapping_covers_all_gates() {
+        use crate::pi_cli::PiCliStatus;
+        use intent_providers::PiCliGate;
+
+        let apply = |status: &PiCliStatus| {
+            let mut obj = serde_json::Map::new();
+            let mut installed = true;
+            crate::apply_pi_cli_fields(&mut obj, &mut installed, status);
+            (serde_json::Value::Object(obj), installed)
+        };
+
+        let missing = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: None,
+            version_output: None,
+            gate: PiCliGate::Missing,
+        };
+        let (obj, installed) = apply(&missing);
+        assert!(!installed, "{obj}");
+        assert_eq!(obj["cliResolved"], false, "{obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        let reason = obj["unavailableReason"].as_str().unwrap();
+        assert!(
+            reason.contains(intent_providers::PI_CLI_REQUIREMENT),
+            "{obj}"
+        );
+
+        let too_old = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("0.79.0".into()),
+            gate: PiCliGate::TooOld("0.79.0".into()),
+        };
+        let (obj, installed) = apply(&too_old);
+        assert!(!installed, "{obj}");
+        assert_eq!(obj["cliResolved"], true, "{obj}");
+        assert_eq!(obj["cliResolvedPath"], "/usr/local/bin/pi", "{obj}");
+        assert_eq!(obj["cliVersion"], "0.79.0", "{obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        assert!(
+            obj["unavailableReason"]
+                .as_str()
+                .unwrap()
+                .contains("0.79.0"),
+            "{obj}"
+        );
+
+        let ok = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("0.80.4".into()),
+            gate: PiCliGate::Ok,
+        };
+        let (obj, installed) = apply(&ok);
+        assert!(installed, "{obj}");
+        assert_eq!(obj["cliVersionOk"], true, "{obj}");
+        assert!(obj.get("unavailableReason").is_none(), "{obj}");
+
+        let unknown = PiCliStatus {
+            command: "pi".into(),
+            resolved_path: Some(std::path::PathBuf::from("/usr/local/bin/pi")),
+            version_output: Some("garbage".into()),
+            gate: PiCliGate::Unknown,
+        };
+        let (obj, installed) = apply(&unknown);
+        assert!(installed, "Unknown must stay permissive: {obj}");
+        assert_eq!(obj["cliVersionOk"], false, "{obj}");
+        assert!(obj.get("unavailableReason").is_none(), "{obj}");
     }
 }
 

@@ -50,6 +50,71 @@ use uuid::Uuid;
 
 use crate::Services;
 
+/// The concise per-agent state digest behind `ws.agent.snapshot()` and the
+/// per-turn prompt injection (`current ws.agent.snapshot() => {...}`).
+/// Serialized as single-line camelCase JSON with zero-count and null fields
+/// omitted to preserve tokens; `time` is always present.
+///
+/// `num_questions_asked` counts this agent's structured questions currently
+/// pending: questions registered via `ws.app.question.ask` in the current
+/// turn that are still waiting for the turn-end drain (turn-attachment
+/// registry), plus questions already presented on the trailing assistant
+/// message and not yet answered or dismissed (the counting form of the
+/// question-hold derivation) — see [`Services::pending_question_count`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSnapshot {
+    /// Current UTC timestamp (whole-second RFC-3339).
+    pub(crate) time: String,
+    /// Active (scheduled/running) background hooks owned by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) hooks: usize,
+    /// Active sub-agent completion watches registered by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) agent_watches: usize,
+    /// Pending messages in this agent's own delivery queue.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) queued_messages: usize,
+    /// Active workspace event subscriptions owned by this agent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) event_subscriptions: usize,
+    /// Delegated child agents not yet settled (non-terminal status).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) running_sub_agents: usize,
+    /// Structured questions still pending presentation/answer.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) num_questions_asked: usize,
+    /// Active PR monitors owned by this agent as `"<owner>/<name>#<number>"`
+    /// labels, suffixed with `" (changes pending)"` while a debounced emit is
+    /// accumulating. Omitted when the agent monitors nothing, so prompts stay
+    /// byte-identical for agents that never use the feature.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pr_monitors: Vec<String>,
+    /// `"blocker"` / `"discussion"` when this agent has raised an attention
+    /// request that is still unresolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_attention: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl AgentSnapshot {
+    /// `true` when every field other than `time` is zero/absent — the
+    /// injection-skip condition (`time` alone never forces an injection).
+    pub(crate) fn is_trivial(&self) -> bool {
+        self.hooks == 0
+            && self.agent_watches == 0
+            && self.queued_messages == 0
+            && self.event_subscriptions == 0
+            && self.running_sub_agents == 0
+            && self.num_questions_asked == 0
+            && self.pr_monitors.is_empty()
+            && self.pending_attention.is_none()
+    }
+}
+
 /// Outcome of [`Services::scan_assigned_agents`]: the newest live/resumable
 /// session (occupancy), the newest known session (inheritance source), plus
 /// the stale (`cleaned_up`) and poisoned assignment ids the wakeOrCreate
@@ -77,48 +142,28 @@ mod tests_specialist_frontmatter;
 #[cfg(test)]
 mod tests_delegate_provider_resolution;
 
+#[cfg(test)]
+mod tests_settings_default_effort;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
-/// was removed in monorepo#1000):
-/// 1. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
-/// 2. `model.providerDefaults[resolved provider]`
-/// 3. `model.default`
-/// 4. None → CLI default (current behavior, last resort)
+/// was removed in monorepo#1000; the background-agent tier was removed in
+/// monorepo#1729 — the renamed `quickActions.*` keys scope to single-shot
+/// quick actions and never to agent sessions, delegated ones included):
+/// 1. `model.providerDefaults[resolved provider]`
+/// 2. `model.default`
+/// 3. None → CLI default (current behavior, last resort)
 ///
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
 fn resolve_default_model_from_settings(
     services: &Services,
-    is_background: bool,
-    agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. For background/delegated agents, check type-specific override, then default
-    if is_background {
-        // 1a. Check agent type override
-        if let Some(typ) = agent_type {
-            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
-                if !model.is_empty() {
-                    return Some(model.clone());
-                }
-            }
-        }
-
-        // 1b. Check background agents default
-        if let Some(model) = settings
-            .background_agents
-            .default_model
-            .as_deref()
-            .filter(|m| !m.is_empty())
-        {
-            return Some(model.to_string());
-        }
-    }
-
-    // 2. Check provider defaults. With no explicit provider, key the lookup
+    // 1. Check provider defaults. With no explicit provider, key the lookup
     // by the settings-derived default (model.default prefix, else
     // providers.active), bottoming out at the first registered provider.
     let derived;
@@ -136,13 +181,32 @@ fn resolve_default_model_from_settings(
         }
     }
 
-    // 3. Check global default
+    // 2. Check global default
     if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
         return Some(model.to_string());
     }
 
-    // 4. None → CLI default (session.model stays None)
+    // 3. None → CLI default (session.model stays None)
     None
+}
+
+/// Which rung of [`resolve_agent_default_model`] produced the resolved model.
+/// Creation-time reasoning-effort resolution needs the provenance: the
+/// settings default effort (`model.defaultReasoningEffort`) is a strict
+/// companion to the settings default *model*, so it applies only when the
+/// model itself came from [`Settings`](DefaultModelSource::Settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefaultModelSource {
+    /// Step 1 — a caller-supplied `model`. Never returned by the resolver
+    /// (which only runs when the caller supplied none); stamped by the create
+    /// seam so the effort resolution can tell a pinned model apart.
+    Explicit,
+    /// Step 2 — specialist frontmatter `model`.
+    Specialist,
+    /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
+    Settings,
+    /// Step 4 — nothing resolved; the provider CLI default applies.
+    CliDefault,
 }
 
 /// Single daemon-side default-model resolver (spec "New resolution policy").
@@ -156,21 +220,32 @@ fn resolve_default_model_from_settings(
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
-/// 3. Settings chain ([`resolve_default_model_from_settings`], unchanged) —
+/// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
 /// 4. `None` → provider CLI default (`session.model` stays unset).
 ///
-/// The `specialist` id doubles as the `agent_type` for the settings chain's
-/// `backgroundAgents.typeOverrides` lookup (e.g. "implementor", "verifier");
-/// when `None`, that tier is skipped and the chain falls through to
-/// `backgroundAgents.defaultModel` / `model.default`.
+/// The chain is background-agnostic (monorepo#1729): the quick-action model
+/// settings apply to single-shot quick actions only, so a delegated
+/// specialist resolves the provider default exactly like an interactive
+/// session does.
 pub(crate) fn resolve_agent_default_model(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
     provider: Option<&str>,
-    is_background: bool,
 ) -> Option<String> {
+    resolve_agent_default_model_with_source(services, specialist, workspace_path, provider).0
+}
+
+/// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
+/// produced the value, for callers that must distinguish a settings-chain
+/// default from a specialist pin (creation-time effort resolution).
+pub(crate) fn resolve_agent_default_model_with_source(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+    provider: Option<&str>,
+) -> (Option<String>, DefaultModelSource) {
     // Normalize through provider_config so legacy default-provider aliases
     // guard as the provider the spawn would actually run. With no explicit
     // provider, guard against the settings-derived default (model.default
@@ -196,7 +271,7 @@ pub(crate) fn resolve_agent_default_model(
         // owned by another provider falls through instead of leaking.
         if let Some(m) = specialists_svc.resolve_model(spec_id, workspace_path) {
             if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-                return Some(m);
+                return (Some(m), DefaultModelSource::Specialist);
             }
             tracing::debug!(
                 model = m,
@@ -210,9 +285,11 @@ pub(crate) fn resolve_agent_default_model(
     // Step 3: settings chain, provider-guarded — a configured default owned
     // by another provider must not be pinned (monorepo#607); drop to the CLI
     // default instead of rejecting a model the caller never sent.
-    let m = resolve_default_model_from_settings(services, is_background, specialist, provider)?;
+    let Some(m) = resolve_default_model_from_settings(services, provider) else {
+        return (None, DefaultModelSource::CliDefault);
+    };
     if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return Some(m);
+        return (Some(m), DefaultModelSource::Settings);
     }
     tracing::warn!(
         model = m,
@@ -221,7 +298,7 @@ pub(crate) fn resolve_agent_default_model(
          falling back to the CLI default"
     );
     // Step 4: None → provider CLI default.
-    None
+    (None, DefaultModelSource::CliDefault)
 }
 
 /// Ownership guard for resolver-derived defaults (never explicit client
@@ -280,7 +357,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 /// Evidence stays asymmetric: a cached-catalog claim by another provider
 /// rejects only when the requested provider's ownership is affirmatively
 /// *disproven* — its own cached catalog exists but lacks the id. With no
-/// cache entry for the requested provider (cold start, expired pin), the
+/// cache entry for the requested provider (cold start, bumped pin), the
 /// bare id passes — absence of evidence is not a mismatch.
 ///
 /// Two spawn-parity carve-outs:
@@ -290,7 +367,7 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   default-provider aliases persisted on old sessions (`default`/`acp`/
 ///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
 ///   spawn would actually run, not as the raw alias string.
-fn ensure_bare_model_matches_provider(
+pub(crate) fn ensure_bare_model_matches_provider(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogCache,
     provider_id: &str,
@@ -310,7 +387,8 @@ fn ensure_bare_model_matches_provider(
     if !cached_owners.is_empty() && requested_cache == Some(false) {
         return Err(Error::InvalidParams(format!(
             "{method}: model {model_id} does not belong to provider {effective} \
-             (providers with this model: {})",
+             (providers with this model: {}); pass providerId to select the \
+             intended provider",
             cached_owners.join(", ")
         )));
     }
@@ -345,11 +423,67 @@ fn ensure_effort_supported_by_model(
     )))
 }
 
+/// Pick the settings default reasoning effort (`model.defaultReasoningEffort`)
+/// for a creation whose effort is still unresolved after the explicit /
+/// model-option / frontmatter rungs.
+///
+/// The setting is a strict companion to the settings *default model*: it
+/// applies only when the session's model itself resolved from the settings
+/// chain ([`DefaultModelSource::Settings`]) — a caller-supplied model, a
+/// specialist pin, or a fall-through to the provider CLI default all leave the
+/// session effort unset.
+///
+/// Settings-chain leniency (mirroring the bare-model settings-chain fallback):
+/// a level the resolved model's cached `effortLevels` provably does not list
+/// is dropped with a warn, never a `-32602` — only caller-supplied efforts
+/// reject. With no cached evidence the level passes through, matching
+/// [`ensure_effort_supported_by_model`].
+fn resolve_settings_default_reasoning_effort(
+    services: &Services,
+    model_source: DefaultModelSource,
+    resolved_model: Option<&str>,
+) -> Option<String> {
+    if model_source != DefaultModelSource::Settings {
+        return None;
+    }
+    let settings = services.effective_settings();
+    let level = settings
+        .model
+        .default_reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())?;
+    match ensure_effort_supported_by_model(
+        "agent.create",
+        &services.models_catalog,
+        resolved_model,
+        level,
+    ) {
+        Ok(()) => Some(level.to_string()),
+        Err(e) => {
+            tracing::warn!(
+                effort = level,
+                model = resolved_model.unwrap_or_default(),
+                error = %e,
+                "configured default reasoning effort is not supported by the \
+                 resolved default model; leaving the session effort unset"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the effective `reasoningEffort` for a delegated/woken child
 /// (PROTOCOL §5.11), in precedence order: the caller's explicit `param`, then
 /// the chosen model option's declared effort, then the specialist's
-/// `reasoningEffort` frontmatter scalar, then unset. Empty/whitespace-only
-/// params collapse to unset without falling through — an explicit clear.
+/// `reasoningEffort` frontmatter scalar, then unset.
+///
+/// An empty/whitespace-only `param` is an explicit clear and is returned
+/// verbatim rather than as `None`: the create seam reads a present-but-blank
+/// value as "the caller decided", so it neither falls through to the
+/// specialist rungs here nor to the settings default
+/// ([`resolve_settings_default_reasoning_effort`]) there. `None` means "no
+/// rung resolved", which is what lets the settings default apply.
 fn resolve_delegate_reasoning_effort(
     services: &Services,
     param: Option<&str>,
@@ -358,7 +492,7 @@ fn resolve_delegate_reasoning_effort(
     workspace_path: Option<&Path>,
 ) -> Option<String> {
     if let Some(param) = param {
-        return (!param.trim().is_empty()).then(|| param.to_string());
+        return Some(param.to_string());
     }
     let spec_id = specialist?;
     let specialists_svc = services.specialists_service();
@@ -421,6 +555,41 @@ fn resolve_delegate_provider(
         }
         None => Ok(None),
     }
+}
+
+/// Preview-only mirror of [`resolve_delegate_provider`]'s resolution order —
+/// the specialist's frontmatter `codingAgent` (or its compound `model`
+/// prefix) when it names a *known* provider, else the settings-derived
+/// default, bottoming out at the first registered provider — but tolerant of
+/// an unknown/unavailable provider instead of erroring, since a preview must
+/// never fail. Used by [`Services::specialist_model_options`] so the
+/// delegate-docs hint names the default each specialist's *own* provider
+/// override would actually pin, instead of assuming every specialist spawns
+/// on the shared settings-derived provider (a specialist pinned to another
+/// provider previously showed that other provider's fallback/`None`).
+pub(crate) fn resolve_delegate_provider_preview(
+    services: &Services,
+    specialist: Option<&str>,
+    workspace_path: Option<&Path>,
+) -> String {
+    if let Some(spec_id) = specialist {
+        let specialists_svc = services.specialists_service();
+        let explicit = specialists_svc
+            .resolve_coding_agent(spec_id, workspace_path)
+            .or_else(|| {
+                specialists_svc
+                    .resolve_model(spec_id, workspace_path)
+                    .filter(|m| m.contains(':'))
+                    .map(|m| intent_providers::parse_compound_model_id(&m).0)
+            });
+        if let Some(provider_id) = explicit {
+            if intent_providers::find_provider(&provider_id).is_some() {
+                return provider_id;
+            }
+        }
+    }
+    crate::agent_session::derived_default_provider(&services.effective_settings())
+        .unwrap_or_else(|| intent_providers::first_provider_id().to_string())
 }
 
 /// Reject a known provider id that the daemon's own provider discovery
@@ -531,11 +700,11 @@ pub(crate) struct QueuedMessage {
     /// `true` when the entry carries a USER-originated `agent.sendMessage`
     /// that was parked by a queue-fallback path (busy race, quarantine,
     /// append-failure). The question hold never blocks user messages
-    /// (PROTOCOL §5.5: a user answer supersedes the pending Q&A), so the
-    /// hold-gated drain paths deliver the first user-origin entry instead
-    /// of suspending — without this marker a user answer parked by the
-    /// turn-end busy race would deadlock against the hold it is supposed
-    /// to release. Persisted so the bypass survives daemon restarts.
+    /// (PROTOCOL §5.5), so the hold-gated drain paths deliver the first
+    /// user-origin entry instead of suspending — without this marker a user
+    /// answer parked by the turn-end busy race would deadlock against the
+    /// hold its answer tag is supposed to release. Persisted so the bypass
+    /// survives daemon restarts.
     #[serde(default)]
     pub user_origin: bool,
 }
@@ -900,10 +1069,6 @@ pub(crate) async fn fetch_auggie_models(
     Ok(Some(models))
 }
 
-/// How long a successful `models.list` CLI fetch stays fresh (PROTOCOL §5.30),
-/// porting the reference app's 5-minute provider-model cache.
-pub(crate) const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
 /// Parse `auggie model list --json` output into rich wire `ModelInfo` rows
 /// (PROTOCOL §5.30), porting the TS `parseModelListJson`: expects
 /// `{ models: [...] }`, maps `id` ← `shortName` and `name` ← `displayName`,
@@ -1205,22 +1370,54 @@ pub(crate) fn user_message_blocks(
 /// hold detection cannot drift from the binding) in a message's content-block
 /// array. Non-array content counts zero.
 pub(crate) fn question_block_count(content: &Value) -> usize {
-    content.as_array().map_or(0, |blocks| {
-        blocks
-            .iter()
-            .filter(|b| {
-                b.get("type").and_then(Value::as_str) == Some("resource")
-                    && b.pointer("/resource/mimeType").and_then(Value::as_str)
-                        == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
-            })
-            .count()
-    })
+    content
+        .as_array()
+        .map_or(0, |blocks| question_block_count_in(blocks))
+}
+
+/// [`question_block_count`] over an already-borrowed block slice, for callers
+/// holding the blocks before they are wrapped into a `Value` (the turn-end
+/// persist).
+pub(crate) fn question_block_count_in(blocks: &[Value]) -> usize {
+    blocks
+        .iter()
+        .filter(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+        .count()
 }
 
 /// `true` iff a message's content-block array carries at least one pending
 /// question resource block.
 pub(crate) fn has_question_blocks(content: &Value) -> bool {
     question_block_count(content) > 0
+}
+
+/// `messageMetadata.type` marker the FE's question wizard stamps on the
+/// flattened Q:/A: answer message (PROTOCOL §5.5, question hold). The daemon
+/// keys the pending-questions marker clear on this structured tag plus
+/// [`ANSWERED_QUESTIONS_MESSAGE_ID_FIELD`] — never on the answer TEXT.
+pub(crate) const QUESTION_ANSWERS_METADATA_TYPE: &str = "question_answers";
+
+/// Field on a `question_answers` `messageMetadata` naming the assistant
+/// message whose questions the row answers.
+pub(crate) const ANSWERED_QUESTIONS_MESSAGE_ID_FIELD: &str = "answeredQuestionsMessageId";
+
+/// The assistant message id a user row's `messageMetadata` claims to answer:
+/// `Some` only for an object tagged `type: "question_answers"` carrying a
+/// non-empty `answeredQuestionsMessageId` string. Pure; the daemon never
+/// inspects the answer text.
+pub(crate) fn answered_questions_message_id(metadata: Option<&Value>) -> Option<&str> {
+    let md = metadata?;
+    if md.get("type").and_then(Value::as_str) != Some(QUESTION_ANSWERS_METADATA_TYPE) {
+        return None;
+    }
+    md.get(ANSWERED_QUESTIONS_MESSAGE_ID_FIELD)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// `messageMetadata.type` marker on the questions-dismissed system notice
@@ -1338,22 +1535,32 @@ fn is_delegated_background_task_session(session: &AgentSession) -> bool {
 fn project_lite(session: AgentSession) -> AgentLite {
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
-    let last_role = last_message_role(&session.messages);
+    let (last_role, last_id) = last_message_role_and_id(&session.messages);
     let count = session.messages.len() as u64;
-    AgentLite::from_session(session, count, last_response, last_user, digest, last_role)
+    AgentLite::from_session(
+        session,
+        count,
+        last_response,
+        last_user,
+        digest,
+        last_role,
+        last_id,
+    )
 }
 
-/// Derive `lastMessageRole` from a loaded transcript: the role of the newest
-/// `user`/`assistant` message — system (and any other) rows are transparent.
-/// `None` when no such message exists (the wire field is omitted). The
-/// projection paths serve the same value from the persisted
-/// `agent_session.last_message_role` column (0070).
-fn last_message_role(messages: &[AgentMessage]) -> Option<String> {
+/// Derive `lastMessageRole`/`lastMessageId` from a loaded transcript: the
+/// role and row id of the newest `user`/`assistant` message — system (and
+/// any other) rows are transparent. `(None, None)` when no such message
+/// exists (both wire fields are omitted). The projection paths serve the
+/// same values from the persisted `agent_session.last_message_role` (0070)
+/// and `last_message_id` (0088) columns.
+fn last_message_role_and_id(messages: &[AgentMessage]) -> (Option<String>, Option<String>) {
     messages
         .iter()
         .rev()
         .find(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| m.role.clone())
+        .map(|m| (Some(m.role.clone()), Some(m.id.clone())))
+        .unwrap_or((None, None))
 }
 
 /// Project a metadata-only [`AgentSession`] summary plus its bounded
@@ -1384,6 +1591,7 @@ fn project_lite_from_projection(
         last_user,
         digest,
         projection.last_message_role.clone(),
+        projection.last_message_id.clone(),
     )
 }
 
@@ -1547,13 +1755,20 @@ impl Services {
         // (`waitingOnHooks`, omitted when empty) from one workspace-wide
         // hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty) from one
+        // workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         Ok(sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
                 let waiting_on_hooks = hooks_by_agent.remove(&s.id.0).unwrap_or_default();
+                let waiting_on_pr_monitors =
+                    pr_monitors_by_agent.remove(&s.id.0).unwrap_or_default();
                 let mut lite = self.project_lite_with_flags_from_projection(s, &projection);
                 lite.waiting_on_hooks = waiting_on_hooks;
+                lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
                 lite
             })
             .collect())
@@ -1593,8 +1808,17 @@ impl Services {
         // Idle-visibility: overlay the agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty).
         let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
+        // Idle-visibility (unified external-wait): same overlay for active
+        // PR monitors (`waitingOnPrMonitors`, omitted when empty).
+        let waiting_on_pr_monitors = self
+            .active_pr_monitors_for_agent(&agent_id)
+            .await
+            .iter()
+            .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
+            .collect();
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
+        lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
         Ok(lite)
     }
 
@@ -1690,6 +1914,10 @@ impl Services {
     ///   (a tool call awaiting its result; the port of FE `hasUnresolvedToolUse`).
     /// - `isWaitingForOtherAgents` — the agent parents one or more pending
     ///   completion watches (the port of FE `isAgentWaitingForOtherAgents`).
+    ///   `report_delivered` watches are excluded via the shared
+    ///   [`Services::waiting_watches_for_parent`] filter (issue
+    ///   intent-hq/monorepo#1649), so the projection agrees with the
+    ///   settlement predicate ([`Services::agent_is_waiting_on_agents`]).
     /// - `waitingForAgentIds` — the distinct `child_agent_id`s of those pending
     ///   watches, in registration order. Always returned (defaults to empty);
     ///   non-empty iff `isWaitingForOtherAgents` is `true`, so clients can render
@@ -1711,7 +1939,7 @@ impl Services {
         }
         let is_responding = self.agent_is_busy(session.id.clone());
         let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
-        let watches = self.list_watches_for_parent(&session.id);
+        let watches = self.waiting_watches_for_parent(&session.id);
         // Distinct child ids in registration order — a parent can register
         // multiple watches against the same child (e.g. successive `immediate`
         // delegates), but the FE only wants each waiting-on agent once.
@@ -1935,7 +2163,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
     ) {
-        let watches = self.list_watches_for_parent(parent_agent_id);
+        let watches = self.waiting_watches_for_parent(parent_agent_id);
         let mut waiting: Vec<AgentId> = Vec::with_capacity(watches.len());
         for w in &watches {
             if !waiting.contains(&w.child_agent_id) {
@@ -2071,9 +2299,13 @@ impl Services {
             is_background,
             name_explicitly_set: _,
         } = extra;
-        // Empty/whitespace collapses to None (an explicit clear); a non-empty
-        // level is validated against the resolved model below, once the model
-        // resolution has settled.
+        // A present value — even blank — means the effort was decided by the
+        // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
+        // so the settings default below must not fill it in. Empty/whitespace
+        // then collapses to None (an explicit clear); a non-empty level is
+        // validated against the resolved model once the model resolution has
+        // settled.
+        let reasoning_effort_decided = reasoning_effort.is_some();
         let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
         // Harvest the persistence-gap fields the FE writer kept under
         // `metadata` (P3-1.2b). Top-level params win over the metadata copy.
@@ -2101,29 +2333,31 @@ impl Services {
         // only affect new agents created afterwards; existing agents change
         // model only via explicit agent.setModel.
         let model_explicit = model.is_some();
-        let mut resolved_model = match model {
+        // SECURITY: derive workspace_path from the stored workspace record
+        // rather than trusting the client-supplied value (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+        // workspacePath and read specialist files from other workspaces.
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (model
+        // resolution and/or the specialist reasoning-effort rungs below).
+        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+            true => self
+                .store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w)),
+            false => None,
+        };
+        let (mut resolved_model, mut model_source) = match model {
             // Step 1: explicit model from the client (user picked it).
-            Some(m) => Some(m),
-            None => {
-                // SECURITY: derive workspace_path from the stored workspace record
-                // rather than trusting the client-supplied value (review thread
-                // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-                // workspacePath and read specialist files from other workspaces.
-                // Use worktree_path if available, otherwise repository_path.
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
-                resolve_agent_default_model(
-                    self,
-                    specialist.as_deref(),
-                    wp.as_deref(),
-                    provider.as_deref(),
-                    is_background,
-                )
-            }
+            Some(m) => (Some(m), DefaultModelSource::Explicit),
+            None => resolve_agent_default_model_with_source(
+                self,
+                specialist.as_deref(),
+                spec_wp.as_deref(),
+                provider.as_deref(),
+            ),
         };
 
         // Initialize provider from the model's compound prefix if not explicitly
@@ -2198,16 +2432,34 @@ impl Services {
                              falling back to the CLI default"
                         );
                         resolved_model = None;
+                        model_source = DefaultModelSource::CliDefault;
                     }
                 }
             }
         }
-        // Reasoning effort (PROTOCOL §5.5): validate the requested level
-        // against the *resolved* model's cached `effortLevels`, with the same
-        // probe-free, evidence-only rule the delegate/wakeOrCreate seams use —
-        // no evidence means the value passes through, since providers own the
-        // vocabulary. Runs before the session is persisted so a `-32602`
-        // rejection is side-effect free.
+        // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
+        // `agent.create` naming a specialist consults the same model-option >
+        // frontmatter order the delegate/wakeOrCreate seams do, keyed on the
+        // model that was actually resolved above. Those seams pre-decide the
+        // effort and pass it down as a param, so this only fires for callers
+        // that did not (`reasoning_effort_decided == false`) — which is also
+        // what keeps the specialist rungs ahead of the settings default below.
+        let reasoning_effort = match reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_delegate_reasoning_effort(
+                self,
+                None,
+                specialist.as_deref(),
+                resolved_model.as_deref(),
+                spec_wp.as_deref(),
+            ),
+        };
+        // Validate the requested level (PROTOCOL §5.5) against the *resolved*
+        // model's cached `effortLevels`, with the same probe-free,
+        // evidence-only rule the delegate/wakeOrCreate seams use — no evidence
+        // means the value passes through, since providers own the vocabulary.
+        // Runs before the session is persisted so a `-32602` rejection is
+        // side-effect free.
         if let Some(effort) = reasoning_effort.as_deref() {
             ensure_effort_supported_by_model(
                 "agent.create",
@@ -2216,6 +2468,17 @@ impl Services {
                 effort,
             )?;
         }
+        // Last rung: the settings default effort, applied only when no rung
+        // above decided the effort AND the model itself came from the settings
+        // default chain (see `resolve_settings_default_reasoning_effort`).
+        let reasoning_effort = match reasoning_effort.is_some() || reasoning_effort_decided {
+            true => reasoning_effort,
+            false => resolve_settings_default_reasoning_effort(
+                self,
+                model_source,
+                resolved_model.as_deref(),
+            ),
+        };
         let session = AgentSession {
             id,
             workspace_id,
@@ -2226,6 +2489,7 @@ impl Services {
             name_explicitly_set,
             model: resolved_model,
             reasoning_effort,
+            effort_levels: None,
             provider,
             system_prompt: None,
             specialist,
@@ -2299,7 +2563,7 @@ impl Services {
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
         // at their `AgentLite::from_session` defaults (no live runtime state).
-        let lite = AgentLite::from_session(session, 0, None, None, None, None);
+        let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
         Ok(json!({ "agent": lite }))
     }
 
@@ -2341,12 +2605,25 @@ impl Services {
     /// When the new model is a compound id (`provider:model`) whose provider
     /// differs from session.provider, this updates session.provider to match,
     /// ensuring the next spawn uses the correct binary.
+    ///
+    /// `provider_id` is the optional explicit provider (additive param,
+    /// monorepo#1657): absent keeps the historical behavior byte-for-byte;
+    /// present it must name a registered provider, a compound `model_id`'s
+    /// prefix must agree with it, and a bare `model_id` is validated against
+    /// — and session.provider reconciled to — the GIVEN provider instead of
+    /// the session's effective one.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
         model_id: String,
+        provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
+        // An explicit providerId must be a registered provider before any
+        // mutation (same misroute vector as the compound prefix below).
+        if let Some(pid) = provider_id.as_deref() {
+            ensure_known_provider("agent.setModel", pid)?;
+        }
         // Parse the compound prefix once: reject unknown providers before any
         // mutation (the same misroute vector as agent.create — persisting one
         // would make the next spawn silently fall back to the default binary,
@@ -2356,7 +2633,32 @@ impl Services {
         let model_provider = if model_id.contains(':') {
             let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
             ensure_known_provider("agent.setModel", &model_provider)?;
+            // An explicit providerId must agree with the compound prefix
+            // (normalized): a conflict is a client bug — reject before any
+            // mutation rather than guessing which provider was meant.
+            if let Some(pid) = provider_id.as_deref() {
+                let prefix = intent_providers::provider_config(&model_provider).id;
+                if prefix != pid {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.setModel: modelId {model_id} names provider {prefix} \
+                         but providerId is {pid}"
+                    )));
+                }
+            }
             Some(model_provider)
+        } else if let Some(pid) = provider_id {
+            // Bare model with an explicit providerId: ownership is validated
+            // against the GIVEN provider (not the session's effective one),
+            // and session.provider is reconciled to it below — same write
+            // path as the compound-prefix case — so the next spawn runs the
+            // intended binary (monorepo#1657).
+            ensure_bare_model_matches_provider(
+                "agent.setModel",
+                &self.models_catalog,
+                &pid,
+                &model_id,
+            )?;
+            Some(pid)
         } else {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
@@ -2382,8 +2684,9 @@ impl Services {
             )?;
             None
         };
-        // Reconcile the provider to the compound prefix (bare ids keep the
-        // session's provider). The write goes through the narrow
+        // Reconcile the provider to the compound prefix or explicit
+        // providerId (bare ids without one keep the session's provider). The
+        // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
         // after `acp_session_id` is persisted would otherwise trip
@@ -2789,13 +3092,45 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
-        // The appended row can move the question-hold derivation — a user
-        // row supersedes a pending question tail (retire), an assistant row
-        // with a trailing question block raises the hold — which flips the
-        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // Stored-on-write question-hold markers (PROTOCOL §5.5), same contract
+        // as the turn-end and user-send persists: an appended assistant row
+        // bearing question blocks arms the pending marker, an appended user
+        // row tagged `question_answers` for the marked message clears it.
+        // Only those two transitions move the hold — a plain user row leaves
+        // it pending — so they also gate the displayStatus recompute below.
+        let hold_moved = if role == "assistant" && has_question_blocks(&content) {
+            self.record_pending_questions_marker(&session.workspace_id, &agent_id, &message.id)
+                .await;
+            true
+        } else if role == "user"
+            && self
+                .resolve_pending_questions_for_answer(
+                    &session.workspace_id,
+                    &agent_id,
+                    metadata.as_ref(),
+                )
+                .await
+        {
+            // This path only persists a row (no turn of its own), so the
+            // released hold needs an explicit drain kick for the entries it
+            // parked — same kick `agent.dismissQuestions` performs.
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .try_drain_queue(agent_id.clone(), session.workspace_id.clone())
+                    .await;
+            }
+            true
+        } else {
+            false
+        };
+        // A moved question-hold derivation — an answered question set retires
+        // the hold, an assistant row with a trailing question block raises it
+        // — flips the workspace's needs_attention displayStatus (§6.5 step 0):
         // recompute-and-compare (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
+        if hold_moved {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
+        }
         Ok(json!({ "success": true, "message": message }))
     }
 
@@ -2891,11 +3226,14 @@ impl Services {
             json!({ "agentId": agent_id.0, "replacedCount": replaced_count }),
         )
         .await;
-        // The swapped transcript can move the question-hold derivation in
-        // either direction, flipping the workspace's needs_attention
-        // displayStatus (§6.5 step 0): recompute-and-compare
-        // (monorepo#1266).
-        self.maybe_emit_display_status_changed(&session.workspace_id)
+        // The swap re-mints row ids, so any surviving pending-questions marker
+        // is dangling: re-derive it from the new transcript (same contract as
+        // the `agent.editAndRegenerate` truncation). The swapped transcript can
+        // move the question-hold derivation in either direction, so the
+        // re-derivation also recomputes the workspace's needs_attention
+        // displayStatus (§6.5 step 0, monorepo#1266) and kicks the queue drain
+        // for entries a now-released hold parked.
+        self.reconcile_pending_questions_marker(&session.workspace_id, &agent_id, &inserted)
             .await;
         Ok(json!({ "success": true, "messages": inserted }))
     }
@@ -2971,6 +3309,18 @@ impl Services {
         let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         let truncated_count = messages.len() - inserted.len();
+        // Question hold (PROTOCOL §5.5): truncation drops the rows the
+        // pending-questions marker may name AND re-mints ids for the kept rows
+        // (`replace_agent_messages`), so a surviving marker would be dangling
+        // — and since the hold derivation never checks that the marked row
+        // still exists, a dangling marker would wedge the hold forever. The
+        // marker is therefore explicitly RE-DERIVED from the post-truncation
+        // transcript (never tolerated as dangling), which also recomputes the
+        // needs_attention displayStatus and kicks the drain when the
+        // truncation released the hold. The dismissal marker keeps its
+        // existing dangling-tolerant laxity.
+        self.reconcile_pending_questions_marker(&session.workspace_id, agent_id, &inserted)
+            .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             agent_id,
@@ -2997,10 +3347,11 @@ impl Services {
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
     /// §5.30). With no `providerId` this is the backward-compatible auggie
-    /// path — auggie CLI (JSON → plain-text fallback) with a 5-minute success
-    /// cache, degrading to an empty list (`source: "static"`) when the CLI is
-    /// unavailable; `forceRefresh` skips the cache read. With a `providerId`
-    /// the request goes through the generic per-provider cache
+    /// path — auggie CLI (JSON → plain-text fallback) with an indefinitely
+    /// served success cache (probe only on miss or `forceRefresh`), degrading
+    /// to an empty list (`source: "static"`) when the CLI is unavailable;
+    /// `forceRefresh` skips the cache read. With a `providerId` the request
+    /// goes through the generic per-provider cache
     /// ([`crate::model_catalog`]): registered sources are probed and cached
     /// per (provider, version key); unknown providers degrade to an empty
     /// list with a `warning` — never an error.
@@ -3069,8 +3420,8 @@ impl Services {
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch and clock
-    /// (the unit-test seam). Delegates all cache policy — TTL, negative
-    /// window, single-flight, last-good fallback — to
+    /// (the unit-test seam). Delegates all cache policy — indefinite serving,
+    /// negative window, single-flight, last-good fallback — to
     /// [`crate::model_catalog::resolve_with_cache`] and only maps the
     /// resolved rows onto the legacy wire shape.
     async fn models_list_auggie_with<F>(
@@ -3418,11 +3769,23 @@ impl Services {
                     agent_message_event_payload(&agent_id, &message, None),
                 )
                 .await;
-                // The user row supersedes a pending question tail, which can
+                // Answer intake (PROTOCOL §5.5, question hold): parity with
+                // the runtime `AgentManager::send_message` persist — a
+                // `question_answers` tag naming the marked assistant message
+                // clears the pending-questions marker, and only that clear can
                 // retire the workspace's needs_attention displayStatus (§6.5
                 // step 0): recompute-and-compare.
-                self.maybe_emit_display_status_changed(&session.workspace_id)
-                    .await;
+                if self
+                    .resolve_pending_questions_for_answer(
+                        &session.workspace_id,
+                        &agent_id,
+                        message_metadata.as_ref(),
+                    )
+                    .await
+                {
+                    self.maybe_emit_display_status_changed(&session.workspace_id)
+                        .await;
+                }
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(append_err) => {
@@ -3440,13 +3803,16 @@ impl Services {
                 // The agent exists but the append failed (e.g. duplicate
                 // client-supplied messageId). STAB-7: preserve image_blocks and
                 // file_blocks when auto-queueing, matching the runtime-manager
-                // path's behavior.
+                // path's behavior. `message_metadata` rides along too: an
+                // answer auto-queued after a failed write must keep its
+                // `question_answers` tag, or the drain persist can no longer
+                // clear the pending-questions marker and the hold wedges.
                 let (queued, position) = self.enqueue_message(
                     &agent_id,
                     content,
                     image_blocks,
                     file_blocks,
-                    None,
+                    message_metadata,
                     None,
                     false,
                 );
@@ -3540,60 +3906,304 @@ impl Services {
             agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
-        // The user row supersedes a pending question tail, which can retire
-        // the workspace's needs_attention displayStatus (§6.5 step 0):
-        // recompute-and-compare.
-        self.maybe_emit_display_status_changed(&session.workspace_id)
-            .await;
+        // Answer intake (PROTOCOL §5.5, question hold): parity with the
+        // runtime `send_queued_message_now` persist — only a matching answer
+        // tag clears the marker, and only that clear can retire the
+        // workspace's needs_attention displayStatus (§6.5 step 0).
+        if self
+            .resolve_pending_questions_for_answer(
+                &session.workspace_id,
+                &agent_id,
+                entry.message_metadata.as_ref(),
+            )
+            .await
+        {
+            self.maybe_emit_display_status_changed(&session.workspace_id)
+                .await;
+        }
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
-    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff,
-    /// walking back from the tail of the transcript past any trailing
-    /// `system` rows (e.g. the resume-interruption marker —
-    /// `resume_interrupted_agent` appends one BEFORE its `Automatic`
-    /// continuation), the first non-system message is an assistant message
-    /// carrying at least one `application/vnd.intent.question+json` resource
-    /// block AND its id differs from the session's persisted dismissal
-    /// marker. `system` rows are transparent to the derivation — same as the
-    /// FE's `derivePendingQuestions`, which only ever resolves on a `user` or
-    /// `assistant` row — so a system marker can neither supersede nor rescue
-    /// a pending Q&A. Derived, not stored: any later user/assistant message
-    /// (a user answer, a typed message, an explicit `sendQueuedMessageNow`)
-    /// supersedes the questions and flips the hold false;
-    /// `agent.dismissQuestions` persists the marker for the same effect.
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// session's persisted pending-questions marker
+    /// ([`intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY`], written at turn end
+    /// when the assistant tail bears `application/vnd.intent.question+json`
+    /// resource blocks) is set AND differs from the dismissal marker
+    /// ([`intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY`]). Stored-on-write,
+    /// so this is a bounded single-row metadata read: pendingness survives
+    /// later user messages, later agent turns, and daemon restarts, and only
+    /// an answer (`messageMetadata.type == "question_answers"` naming the
+    /// marked message), an explicit `agent.dismissQuestions`, or a NEWER
+    /// question-bearing turn resolves it.
+    ///
+    /// Pre-upgrade sessions (marker key absent entirely — the daemon never
+    /// wrote it) fall back to the legacy transcript tail walk so a hold that
+    /// was live across the upgrade is not lost: walk back from the tail past
+    /// any trailing `system` rows (e.g. the resume-interruption marker
+    /// `resume_interrupted_agent` appends BEFORE its `Automatic`
+    /// continuation) and hold when the first non-system row is an
+    /// un-dismissed question-bearing assistant message. A marker written as
+    /// the empty string is authoritative ("nothing pending") and does NOT
+    /// fall back. A hold derived that way is immediately MATERIALIZED as a
+    /// marker so it survives the very next user message: the tail walk stops
+    /// seeing the question once a plain user row lands, which is exactly the
+    /// disappearance this contract exists to prevent.
+    ///
     /// Fails open (`false`) on store errors so a read failure can never wedge
     /// deliveries.
     pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
-        // Page back over the tail, growing the window while every fetched
-        // row is `system`-role, so an arbitrarily long run of trailing
-        // system markers (e.g. repeated interruption notices) can never hide
-        // a still-pending question underneath it. Stops as soon as a
-        // non-system row is found, the fetched page comes back shorter than
-        // requested (the whole transcript was system rows or empty — no
-        // hold), or the safety cap is hit (fails open to `false`).
-        const HOLD_DERIVATION_TAIL_START: i64 = 10;
-        const HOLD_DERIVATION_TAIL_MAX: i64 = 1000;
-        let mut tail = HOLD_DERIVATION_TAIL_START;
-        let last = loop {
-            let Ok(messages) = self.store.get_agent_messages(agent_id, Some(tail)).await else {
-                return false;
-            };
-            if let Some(last) = messages.iter().rev().find(|m| m.role != "system") {
-                break last.clone();
-            }
-            if (messages.len() as i64) < tail || tail >= HOLD_DERIVATION_TAIL_MAX {
-                return false;
-            }
-            tail = (tail * 5).min(HOLD_DERIVATION_TAIL_MAX);
-        };
-        if last.role != "assistant" || !has_question_blocks(&last.content) {
-            return false;
-        }
         let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
-        session.dismissed_questions_message_id() != Some(last.id.as_str())
+        if session.pending_questions_marker_written() {
+            return match session.pending_questions_message_id() {
+                Some(pending) => session.dismissed_questions_message_id() != Some(pending),
+                None => false,
+            };
+        }
+        let Some(pending) = self.question_hold_active_from_tail(agent_id).await else {
+            return false;
+        };
+        self.record_pending_questions_marker(&session.workspace_id, agent_id, &pending)
+            .await;
+        true
+    }
+
+    /// The number of question resource blocks still pending on the marked
+    /// question message — the counting form of the question-hold derivation
+    /// ([`Services::question_hold_active`] holds exactly when this is
+    /// non-zero, both keyed on the persisted pending-questions marker): the
+    /// block count of the marker's message when the marker is set and not
+    /// dismissed, `0` otherwise. Pre-upgrade sessions (marker key never
+    /// written) fall back to the tail derivation and materialize the marker,
+    /// mirroring [`Services::question_hold_active`]. Backs the
+    /// `numQuestionsAsked` snapshot field alongside the turn-attachment
+    /// registry count ([`Services::pending_question_count`]). Bounded: one
+    /// session read plus at most one single-row message read
+    /// ([`Store::get_agent_message_by_id`]) per call — this runs on every
+    /// turn prompt. Store errors fail open to `0`.
+    pub(crate) async fn pending_question_tail_count(&self, agent_id: &AgentId) -> usize {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return 0;
+        };
+        let pending = if session.pending_questions_marker_written() {
+            session.pending_questions_message_id().map(str::to_string)
+        } else {
+            let pending = self.question_hold_active_from_tail(agent_id).await;
+            if let Some(id) = pending.as_deref() {
+                self.record_pending_questions_marker(&session.workspace_id, agent_id, id)
+                    .await;
+            }
+            pending
+        };
+        let Some(pending) = pending else {
+            return 0;
+        };
+        if session.dismissed_questions_message_id() == Some(pending.as_str()) {
+            return 0;
+        }
+        let Ok(Some(msg)) = self.store.get_agent_message_by_id(agent_id, &pending).await else {
+            return 0;
+        };
+        question_block_count(&msg.content)
+    }
+
+    /// This agent's structured questions currently pending — the
+    /// `numQuestionsAsked` snapshot field: questions registered via
+    /// `ws.app.question.ask` earlier in the CURRENT turn that are still
+    /// waiting for the turn-end drain (turn-attachment registry, question
+    /// MIME type), plus questions already presented on the marked question
+    /// message that are still awaiting an answer or dismissal
+    /// ([`Services::pending_question_tail_count`]). The two sources are
+    /// disjoint by construction: the registry drains into the trailing
+    /// message when the turn finalizes.
+    pub(crate) async fn pending_question_count(&self, agent_id: &AgentId) -> usize {
+        let in_turn = self.turn_attachments.pending_count_by_mime(
+            agent_id,
+            intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE,
+        );
+        in_turn + self.pending_question_tail_count(agent_id).await
+    }
+
+    /// Legacy transcript tail-walk hold derivation, retained as the
+    /// pre-upgrade fallback for sessions with no persisted pending-questions
+    /// marker (see [`Services::question_hold_active`]). Returns the id of the
+    /// question-bearing assistant message holding the session, so the caller
+    /// can materialize it as the marker.
+    async fn question_hold_active_from_tail(&self, agent_id: &AgentId) -> Option<String> {
+        // Trailing `system` rows (e.g. repeated interruption notices) are
+        // transparent to the derivation, so the anchor is simply the newest
+        // non-system row — resolved by the store in one index-backed
+        // statement that decodes at most ONE message
+        // ([`Store::get_last_non_system_message`]), never by paging full
+        // rows back through the tail. An empty or all-system transcript has
+        // no hold; store errors fail open.
+        let Ok(Some(last)) = self.store.get_last_non_system_message(agent_id).await else {
+            return None;
+        };
+        if last.role != "assistant" || !has_question_blocks(&last.content) {
+            return None;
+        }
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return None;
+        };
+        (session.dismissed_questions_message_id() != Some(last.id.as_str())).then_some(last.id)
+    }
+
+    /// Persist the pending-questions marker for `message_id` — the assistant
+    /// message whose just-persisted content carries question resource blocks
+    /// (called from the turn-end persist paths). Single-slot: a newer
+    /// question-bearing turn overwrites an older marker, which is exactly the
+    /// spec's "newest set supersedes" rule. Atomic single-key `json_set` so
+    /// sibling metadata keys (`dismissedQuestionsMessageId`,
+    /// `lastSeenMessageId`) are preserved. Best-effort: a failure is logged
+    /// and never fails the turn (the hold simply stays as it was).
+    pub(crate) async fn record_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                message_id,
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist pending-questions marker");
+        }
+    }
+
+    /// Clear the pending-questions marker (written as the empty string, which
+    /// reads back as "no pending questions" while still marking the session as
+    /// marker-aware so the pre-upgrade tail-walk fallback stays off).
+    /// Best-effort: a failure is logged and never fails the caller.
+    pub(crate) async fn clear_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY,
+                "",
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to clear pending-questions marker");
+        }
+    }
+
+    /// Re-derive the pending-questions marker after a transcript swap that
+    /// re-mints row ids (`agent.editAndRegenerate` truncation,
+    /// `agent.replaceMessages`), where any surviving marker is by construction
+    /// dangling. `messages` is the post-swap transcript in order: the marker
+    /// becomes the id of the newest question-bearing assistant row that is not
+    /// followed by a user row answering it, and clears when there is none.
+    ///
+    /// Answer matching cannot be pure id equality the way
+    /// [`Services::resolve_pending_questions_for_answer`] does it: the swap
+    /// re-mints ids, so a carried-over `answeredQuestionsMessageId` names a row
+    /// that no longer exists even when it DOES answer the question directly
+    /// above it. So a `question_answers`-tagged user row resolves the pending
+    /// row unless its tag names a DIFFERENT row that is still present in the
+    /// post-swap transcript — a live reference to another question set, which
+    /// must not release this one (mirroring the exact-match rule wherever ids
+    /// are meaningful). Bounded — the caller already holds the (post-swap)
+    /// rows.
+    ///
+    /// A swap can move the hold in either direction, so this also performs the
+    /// two follow-ups every other hold-transition path performs: recompute the
+    /// workspace's `needs_attention` displayStatus (transition-only, §6.5 step
+    /// 0) and — when the re-derivation leaves no hold — kick the queue drain
+    /// for the automatic entries the hold parked (these paths start no turn of
+    /// their own, so without the kick those entries sit on an idle agent).
+    pub(crate) async fn reconcile_pending_questions_marker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        messages: &[intent_core::AgentMessage],
+    ) {
+        let resolves = |answered: &str, marked: &str| {
+            answered == marked || !messages.iter().any(|m| m.id == answered)
+        };
+        let mut pending: Option<&str> = None;
+        for msg in messages {
+            match msg.role.as_str() {
+                "assistant" if has_question_blocks(&msg.content) => pending = Some(&msg.id),
+                "user" => {
+                    if let (Some(answered), Some(marked)) = (
+                        answered_questions_message_id(msg.metadata.as_ref()),
+                        pending,
+                    ) {
+                        if resolves(answered, marked) {
+                            pending = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        match pending {
+            Some(id) => {
+                let id = id.to_string();
+                self.record_pending_questions_marker(workspace_id, agent_id, &id)
+                    .await;
+            }
+            None => {
+                self.clear_pending_questions_marker(workspace_id, agent_id)
+                    .await;
+                if let Some(manager) = self.agent_manager() {
+                    manager
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
+        }
+        self.maybe_emit_display_status_changed(workspace_id).await;
+    }
+
+    /// Resolve a just-persisted user row against the pending-questions marker:
+    /// when the row's `messageMetadata` is a `question_answers` tag naming
+    /// EXACTLY the marked message, the questions are answered and the marker
+    /// clears (releasing the hold). A missing/foreign/stale
+    /// `answeredQuestionsMessageId` — e.g. an answer for a question set a newer
+    /// turn already superseded — is a no-op, so a late answer can neither
+    /// release a newer hold nor re-arm an old one. The daemon never inspects
+    /// the answer TEXT (spec §Decisions 3).
+    ///
+    /// Returns `true` when the marker was cleared, so callers can recompute
+    /// displayStatus and — on the persist-only paths that start no turn of
+    /// their own — kick the queue drain for the entries the hold parked.
+    pub(crate) async fn resolve_pending_questions_for_answer(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        message_metadata: Option<&Value>,
+    ) -> bool {
+        let Some(answered) = answered_questions_message_id(message_metadata) else {
+            return false;
+        };
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        if session.pending_questions_message_id() != Some(answered) {
+            return false;
+        }
+        self.clear_pending_questions_marker(workspace_id, agent_id)
+            .await;
+        true
     }
 
     /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
@@ -4157,11 +4767,20 @@ impl Services {
             // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
             // completion wake and should not receive the report wake.
             let watches = self.find_watches_for_child(&caller);
+            let mut marked = false;
             for watch in watches
                 .iter()
                 .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
             {
-                self.mark_watch_report_delivered(&watch.id);
+                marked |= self.mark_watch_report_delivered(&watch.id);
+            }
+            // Marking flips the parent's waiting projection (report_delivered
+            // watches are excluded), so publish the refreshed flags in the
+            // parent's HOME workspace — the watch anchor — to keep connected
+            // clients from serving a stale `isWaitingForOtherAgents: true`.
+            if marked {
+                self.publish_subscriptions_changed(&parent_home_ws, &parent)
+                    .await;
             }
         }
 
@@ -4767,14 +5386,20 @@ impl Services {
         };
         // Reasoning effort (PROTOCOL §5.11): param > chosen model option's
         // effort > specialist frontmatter > unset, validated against the
-        // cached catalog's `effortLevels` for the effective model (the
-        // explicit `model`, else the specialist's own pin). Runs BEFORE the
-        // child is created so a `-32602` rejection is side-effect free.
+        // cached catalog's `effortLevels` for the effective model. The
+        // effective model must be the one `agent_create_op` will actually
+        // pin — the explicit `model`, else the full default-model resolution
+        // (specialist frontmatter pin, then the settings chain) — so a
+        // specialist whose `modelOptions` entry keys on the settings default
+        // model still gets its option effort selected. Runs BEFORE the child
+        // is created so a `-32602` rejection is side-effect free.
         let effective_model = input.model.clone().or_else(|| {
-            input.specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            resolve_agent_default_model(
+                self,
+                input.specialist.as_deref(),
+                workspace_path.as_deref(),
+                delegate_provider.as_deref(),
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,
@@ -4783,7 +5408,9 @@ impl Services {
             effective_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.delegate",
                 &self.models_catalog,
@@ -5943,6 +6570,111 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// Build [`AgentSnapshot`] for `agent_id` — the cheap per-turn digest
+    /// behind `ws.agent.snapshot()` and the turn-prompt injection line
+    /// (`ws.agent.diagnostics` stays the deep-dive tool). O(this agent):
+    /// every field reads a per-agent registry length or a bounded per-agent
+    /// count statement — no workspace-wide scans, no transcript or blob
+    /// hydration. `session` is the caller's already-fetched summary row so
+    /// the op path stays at one session read.
+    pub(crate) async fn build_agent_snapshot(
+        &self,
+        session: &AgentSession,
+    ) -> Result<AgentSnapshot> {
+        let agent_id = &session.id;
+        // Count-only aggregate: `active_hooks_for_agent` would hydrate every
+        // hook row the agent ever owned (code + lastState blobs included).
+        let hooks = self
+            .store
+            .count_active_hooks_by_agent(agent_id)
+            .await
+            .unwrap_or(0) as usize;
+        let agent_watches = self.list_watches_for_parent(agent_id).len();
+        // Length-only registry read: `queue_snapshot` materializes each
+        // entry's wire JSON (image/file blocks included) just to be counted.
+        let queued_messages = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .map_or(0, |q| q.len());
+        let event_subscriptions = self.list_event_subscriptions_for_agent(agent_id).len();
+        // Delegated children not yet settled: one aggregate statement over
+        // the `parent_agent_id` index, unscoped by workspace so a Chief
+        // parent's cross-workspace delegates count too — O(this agent's
+        // children), never O(workspace sessions). Fails open to 0.
+        let running_sub_agents = self
+            .store
+            .count_unsettled_child_agents(agent_id)
+            .await
+            .unwrap_or(0) as usize;
+        let num_questions_asked = self.pending_question_count(agent_id).await;
+        // Per-agent indexed read over this agent's monitor rows; labels only,
+        // no snapshot hydration. Fails open to empty.
+        let pr_monitors = self.active_pr_monitor_labels(agent_id).await;
+        // Whole-second UTC timestamp — the snapshot line is injected into
+        // every turn prompt, so sub-second precision only spends tokens.
+        let time = {
+            let iso = now_iso();
+            match iso.split_once('.') {
+                Some((head, _)) => format!("{head}Z"),
+                None => iso,
+            }
+        };
+        Ok(AgentSnapshot {
+            time,
+            hooks,
+            agent_watches,
+            queued_messages,
+            event_subscriptions,
+            running_sub_agents,
+            num_questions_asked,
+            pr_monitors,
+            pending_attention: session.attention_request_kind.clone(),
+        })
+    }
+
+    /// `ws.agent.snapshot()` (MCP-only, PROTOCOL §7.1): the caller's own
+    /// state snapshot as a plain JSON object — zero-count and null fields
+    /// omitted, `time` always present. Never gated by
+    /// `agentFeatures.stateSnapshot` (the toggle governs only the turn-prompt
+    /// injection). Workspace mismatch fails closed as `NotFound`
+    /// (defense-in-depth against bare-id probes, same as `getSessionStats`).
+    pub(crate) async fn agent_snapshot_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        let snapshot = self.build_agent_snapshot(&session).await?;
+        serde_json::to_value(&snapshot)
+            .map_err(|e| Error::Internal(format!("serialize agent snapshot: {e}")))
+    }
+
+    /// The per-turn snapshot injection line for `agent_id`, or `None` when
+    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off
+    /// (read LIVE each turn — a deliberate deviation from the
+    /// captured-at-creation agentFeatures convention, so flipping the toggle
+    /// affects the very next turn of every session), the snapshot is trivial
+    /// (every field other than `time` zero/absent — `time` alone never forces
+    /// an injection), or the snapshot could not be built (fails open to no
+    /// line so a store error never blocks a turn).
+    pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
+        if !self.effective_settings().agent_features.state_snapshot {
+            return None;
+        }
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        let snapshot = self.build_agent_snapshot(&session).await.ok()?;
+        if snapshot.is_trivial() {
+            return None;
+        }
+        let json = serde_json::to_string(&snapshot).ok()?;
+        Some(format!("current ws.agent.snapshot() => {json}"))
+    }
+
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
     /// subscriptions, delegation groups, and stuck-risk signals (PROTOCOL §5.5).
     ///
@@ -6024,7 +6756,6 @@ impl Services {
         let session_ids: HashSet<String> = sessions.iter().map(|s| s.id.0.clone()).collect();
         let session_by_id: std::collections::HashMap<String, &AgentSession> =
             sessions.iter().map(|s| (s.id.0.clone(), s)).collect();
-        let watch_ids: HashSet<String> = watches.iter().map(|w| w.id.clone()).collect();
 
         let mut matching: HashSet<String> = HashSet::new();
         for s in &sessions {
@@ -6128,6 +6859,21 @@ impl Services {
         }
 
         // delegationGroups, filtered to scope.
+        // The group-level `subscription_id` is a TS-parity legacy field the
+        // daemon never populates; the real linkage is the per-child grouped
+        // completion watches (each carries its group's id). Index them once
+        // (group id → [(child id, watch id)]) so the per-group derivation
+        // below stays O(rows returned) rather than rescanning the watch
+        // table per group and per pending child (monorepo#1694).
+        let mut group_watches: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for w in &watches {
+            if let Some(gid) = w.group_id.as_deref() {
+                group_watches
+                    .entry(gid)
+                    .or_default()
+                    .push((w.child_agent_id.0.as_str(), w.id.as_str()));
+            }
+        }
         let delegation_groups: Vec<Value> = groups
             .iter()
             .filter(|g| {
@@ -6155,10 +6901,20 @@ impl Services {
                     && g.expected_agent_ids.iter().all(|id| {
                         g.completed_agent_ids.contains(id) || g.deleted_agent_ids.contains(id)
                     });
-                let subscription_missing = match &g.subscription_id {
-                    Some(sid) => !watch_ids.contains(sid),
-                    None => true,
-                };
+                // Derive linkage from the grouped-watch index (monorepo#1694):
+                // linkage is missing only when some still-pending child has
+                // no grouped watch observing it.
+                let watches_for_group = group_watches
+                    .get(g.group_id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let subscription_ids: Vec<&str> =
+                    watches_for_group.iter().map(|(_, wid)| *wid).collect();
+                let subscription_missing = pending.iter().any(|id| {
+                    !watches_for_group
+                        .iter()
+                        .any(|(child, _)| *child == id.as_str())
+                });
                 json!({
                     "groupId": g.group_id,
                     "parentAgentId": g.parent_agent_id,
@@ -6167,7 +6923,7 @@ impl Services {
                     "completedAgentIds": g.completed_agent_ids,
                     "deletedAgentIds": g.deleted_agent_ids,
                     "pendingAgentIds": pending,
-                    "subscriptionId": g.subscription_id.clone().unwrap_or_default(),
+                    "subscriptionIds": subscription_ids,
                     "subscriptionMissing": subscription_missing,
                     "delivered": g.delivered,
                     "complete": complete,
@@ -6181,6 +6937,10 @@ impl Services {
         // Idle-visibility: per-agent active-hook metadata (`waitingOnHooks`,
         // omitted when empty) from one workspace-wide hook query.
         let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        // Idle-visibility (unified external-wait): per-agent active PR
+        // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
+        // one workspace-wide monitor query.
+        let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -6248,6 +7008,11 @@ impl Services {
             if let Some(hooks) = hooks_by_agent.remove(id.as_str()) {
                 if !hooks.is_empty() {
                     row.insert("waitingOnHooks".into(), Value::Array(hooks));
+                }
+            }
+            if let Some(monitors) = pr_monitors_by_agent.remove(id.as_str()) {
+                if !monitors.is_empty() {
+                    row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
             }
             agent_rows.push(Value::Object(row));
@@ -6342,9 +7107,28 @@ impl Services {
             let delivered = g["delivered"].as_bool() == Some(true);
             if !complete && !delivered {
                 let gid = g["groupId"].as_str().unwrap_or_default();
-                let pending = g["pendingAgentIds"].as_array().map_or(0, Vec::len);
+                let pending_ids: Vec<&str> = g["pendingAgentIds"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let pending = pending_ids.len();
+                // Severity ladder (monorepo#1694): missing subscription
+                // linkage means the group can never observe a pending
+                // child's completion — critical. Otherwise a group whose
+                // pending children are all actively responding (non-stale)
+                // is normal in-progress fan-in — informational; anything
+                // else (idle/stale/missing pending child) is worth a look.
+                let all_pending_active = !pending_ids.is_empty()
+                    && pending_ids.iter().all(|id| {
+                        session_by_id.get(*id).is_some_and(|s| {
+                            agent_status_wire(s.status) == Some("responding")
+                                && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+                        })
+                    });
                 let severity = if g["subscriptionMissing"].as_bool() == Some(true) {
                     "critical"
+                } else if all_pending_active {
+                    "info"
                 } else {
                     "warning"
                 };
@@ -6510,7 +7294,7 @@ impl Services {
                 // deployments with and without a runtime manager. Question
                 // hold (PROTOCOL §5.5): sendToTask is automatic by
                 // definition, so an active hold parks the message instead
-                // of persisting the superseding user row.
+                // of persisting a user row that buries the pending Q&A.
                 if self.question_hold_active(&agent).await {
                     let (queued, position) = self.enqueue_message(
                         &agent,
@@ -6909,11 +7693,17 @@ impl Services {
             .await
             .ok()
             .and_then(|w| crate::git_ops::worktree_path(&w));
+        // Same effective-model rule as `agent.delegate`: fall through to the
+        // full default-model resolution (specialist pin, then the settings
+        // chain) so a `modelOptions` entry keyed on the settings default
+        // model is still matched.
         let effort_model = model.clone().or_else(|| {
-            specialist.as_deref().and_then(|s| {
-                self.specialists_service()
-                    .resolve_model(s, workspace_path.as_deref())
-            })
+            resolve_agent_default_model(
+                self,
+                specialist.as_deref(),
+                workspace_path.as_deref(),
+                provider.as_deref(),
+            )
         });
         let reasoning_effort = resolve_delegate_reasoning_effort(
             self,
@@ -6925,7 +7715,9 @@ impl Services {
             effort_model.as_deref(),
             workspace_path.as_deref(),
         );
-        if let Some(effort) = reasoning_effort.as_deref() {
+        // A blank resolved value is an explicit clear (see
+        // `resolve_delegate_reasoning_effort`); only a real level is validated.
+        if let Some(effort) = reasoning_effort.as_deref().filter(|e| !e.trim().is_empty()) {
             ensure_effort_supported_by_model(
                 "agent.wakeOrCreate",
                 &self.models_catalog,
@@ -7347,7 +8139,7 @@ impl Services {
     {
         // Question hold (PROTOCOL §5.5): same automatic-delivery gate as the
         // runtime path above — the store-only persist would append the user
-        // row that supersedes the pending Q&A, so park the wake in the queue
+        // row whose turn would bury the pending Q&A, so park the wake in the queue
         // instead (hermetic wiring keeps the hold contract testable).
         if self.question_hold_active(agent_id).await {
             let (queued, position) = self.enqueue_message(
@@ -7526,8 +8318,7 @@ impl Services {
     /// `agent.sendMessage` parked by a queue-fallback path (busy race,
     /// quarantine, append-failure). The question-hold drain gates deliver
     /// user-origin entries instead of suspending (PROTOCOL §5.5: a user
-    /// answer supersedes the pending Q&A and must never deadlock against
-    /// the hold it releases).
+    /// answer must never deadlock against the hold its answer tag releases).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enqueue_message_with_origin(
         &self,
@@ -7628,9 +8419,9 @@ impl Services {
     /// Pop the oldest ready-to-send **user-origin** queued message, if any
     /// (question hold, PROTOCOL §5.5). While the hold is active the drain
     /// paths deliver ONLY user-origin entries — a user answer parked by the
-    /// turn-end busy race must supersede the pending Q&A instead of
-    /// deadlocking behind the hold it is supposed to release; automatic
-    /// entries stay parked.
+    /// turn-end busy race must reach the transcript instead of deadlocking
+    /// behind the hold its answer tag releases; automatic entries stay
+    /// parked.
     pub(crate) fn dequeue_user_origin_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
@@ -8399,6 +9190,88 @@ fn validate_message_role(role: &str) -> Result<()> {
 }
 
 impl Services {
+    /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
+    /// daemon's resume orchestrator calls this to resume every turn Task C
+    /// enrolled as `system_suspend`-interrupted. It enumerates ONLY pending
+    /// `interrupted_agent` rows tagged [`InterruptReason::SystemSuspend`] — rows a
+    /// user left pending for any other reason (daemon restart, agent stop, manual
+    /// interrupt) are never touched — and drives each through the existing
+    /// [`Services::resume_interrupted_agent`] path, whose atomic claim dedupes
+    /// against a concurrent `agent.resolveInterrupted` / `--resume-all`.
+    ///
+    /// Guard: an agent whose persisted session has no `acpSessionId` cannot be
+    /// reloaded via `session/load`, so it is skipped and left pending for today's
+    /// manual retry (the cheap static half of the `supports_load_session` gate;
+    /// the capability half is re-checked inside the resume path). A per-agent
+    /// resume failure is logged and never aborts the sweep — the row is reset to
+    /// pending by `resume_interrupted_agent` and retried on the next wake or
+    /// manually.
+    ///
+    /// Returns the number of agents successfully resumed by this sweep.
+    pub async fn resume_suspend_interrupted_agents(&self) -> usize {
+        let rows = match self.store.list_interrupted_agents().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "wake-resume: failed to list interrupted agents");
+                return 0;
+            }
+        };
+        let suspend_reason = crate::agent_session::InterruptReason::SystemSuspend.as_str();
+        let mut resumed = 0usize;
+        for interrupted in rows {
+            // Never blanket-resume rows a user left pending for another reason.
+            if interrupted.reason.as_deref() != Some(suspend_reason) {
+                continue;
+            }
+            let agent_id = interrupted.agent_id.clone();
+            // Guard: `session/load` needs a persisted acpSessionId; without one
+            // the provider cannot reload, so leave the row pending for manual
+            // retry rather than re-running the whole turn unattended.
+            match self.store.get_agent_session(&agent_id).await {
+                Ok(session) if session.acp_session_id.is_none() => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        "wake-resume: no resumable acpSessionId; leaving pending for manual retry"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: session lookup failed; leaving row pending"
+                    );
+                    continue;
+                }
+            }
+            match self.resume_interrupted_agent(&agent_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        workspace = %interrupted.workspace_id,
+                        "wake-resume: resumed suspend-interrupted agent"
+                    );
+                    resumed += 1;
+                }
+                // A concurrent resolveInterrupted / --resume-all may have claimed
+                // the row first (atomic claim → "already resolved"): that is the
+                // expected dedupe outcome, not an error, so log it quietly.
+                Err(e) => {
+                    tracing::debug!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "wake-resume: resume skipped (already resolved or transient failure)"
+                    );
+                }
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "wake-resume: sweep complete");
+        }
+        resumed
+    }
+
     /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
     /// parent completion watch when delegated, then deliver a continuation message.
     ///
@@ -8615,8 +9488,9 @@ impl Services {
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load).
-        // Automatic origin: a resume continuation must not supersede a Q&A
-        // the agent had pending when the harness shut down (question hold).
+        // Automatic origin: a resume continuation must not bury a Q&A the
+        // agent had pending when the harness shut down (question hold — the
+        // marker is persisted, so the hold survives the restart).
         if let Err(e) = self
             .agent_send_message(
                 workspace_id.clone(),

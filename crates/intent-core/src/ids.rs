@@ -111,3 +111,7 @@ id_newtype!(
     /// Identifier for a background hook (an agent-owned scheduled script).
     HookId
 );
+id_newtype!(
+    /// Identifier for a PR monitor (an agent-owned pull-request watch).
+    PrMonitorId
+);

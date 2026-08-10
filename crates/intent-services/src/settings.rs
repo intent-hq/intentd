@@ -49,6 +49,18 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// boot.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
+/// The retired `backgroundAgents.*` paths, renamed to `quickActions.*`
+/// (monorepo#1729). No catalog entry remains: `settings.get`/`settings.reset`
+/// reject them as unknown, but old clients still writing them via
+/// `settings.update` are tolerated-and-ignored rather than failing the whole
+/// batch. A stored `config.toml` `[backgroundAgents]` table is carried over to
+/// the new keys once by [`migrate_quick_action_settings`].
+pub(crate) const RETIRED_BACKGROUND_AGENT_PATHS: &[&str] = &[
+    "backgroundAgents.defaultModel",
+    "backgroundAgents.typeOverrides",
+    "backgroundAgents.providerSettings",
+];
+
 /// Settings path of the user-editable transcription vocabulary (§5.12).
 pub(crate) const VOICE_VOCABULARY_PATH: &str = "voice.vocabulary";
 
@@ -778,23 +790,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(json!({})),
         ),
         string(
-            "backgroundAgents.defaultModel",
-            "Background default model",
-            "Model for background agents",
+            "model.defaultReasoningEffort",
+            "Default reasoning effort",
+            "Fallback reasoning effort for new agents (provider-defined value, stored as-is; blank means unset)",
+            "providers",
+            None,
+        ),
+        string(
+            "quickActions.defaultModel",
+            "Default quick action model",
+            "Model for single-shot quick actions (commit messages, PR descriptions, quick tasks); never applied to agent sessions",
             "providers",
             None,
         ),
         object(
-            "backgroundAgents.typeOverrides",
-            "Background type overrides",
-            "Per-agent-type model overrides",
+            "quickActions.typeOverrides",
+            "Quick action model overrides",
+            "Per-quick-action model overrides (commit, pr, review, fast)",
             "providers",
             Some(json!({})),
         ),
         object(
-            "backgroundAgents.providerSettings",
-            "Background provider settings",
-            "Per-provider background settings",
+            "quickActions.providerSettings",
+            "Per-provider quick action settings",
+            "Per-provider quick-action settings",
             "providers",
             Some(json!({})),
         ),
@@ -1034,6 +1053,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Permitted WS origins",
             "server",
             None,
+        ),
+        number(
+            "server.maxOutstandingRpcs",
+            "Max outstanding RPCs",
+            "Daemon-wide cap on outstanding slow-path RPCs across every connection; over-limit requests are rejected with -32011 \"Server overloaded\" (0 = unlimited; changes apply on daemon restart)",
+            "server",
+            Some(0.0),
+            Some(100000.0),
+            256.0,
         ),
         // --- Group B: source control ----------------------------------------
         enumerated(
@@ -1378,6 +1406,38 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.stateSnapshot",
+            "State snapshot",
+            "Inject the per-turn agent state snapshot line into turn prompts; applies to the next turn of every session (live)",
+            "agentFeatures",
+            true,
+        ),
+        boolean(
+            "agentFeatures.prMonitor",
+            "PR monitor",
+            "Expose centralized PR monitoring (ws.pr.monitor / ws.pr.unmonitor) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        ),
+        number(
+            "prMonitor.debounceSeconds",
+            "PR monitor debounce seconds",
+            "Quiet window (in seconds) a changed PR must observe before its consolidated wake is delivered (minimum 10)",
+            "prMonitor",
+            Some(10.0),
+            Some(86_400.0),
+            60.0,
+        ),
+        number(
+            "prMonitor.pollSeconds",
+            "PR monitor poll seconds",
+            "How often (in seconds) the centralized loop polls each monitored PR (minimum 10)",
+            "prMonitor",
+            Some(10.0),
+            Some(3_600.0),
+            30.0,
+        ),
     ]
 }
 
@@ -1413,9 +1473,11 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// when it matches its catalog definition (overwriting any existing row —
 /// the file value is the user's most recent intent) or discarded with a
 /// warning when it does not (all current legacy keys — `[ai]`,
-/// `server.listenMode`, `model.workspaceOverrides`, `workspace.autoFetch` —
-/// are retired without a catalog entry, so they are discarded), and the keys
-/// are then stripped from the file with a comment-preserving rewrite.
+/// `server.listenMode`, `model.workspaceOverrides`, `workspace.autoFetch`,
+/// `[backgroundAgents]` — are retired without a catalog entry, so they are
+/// discarded; the `[backgroundAgents]` values are carried over into
+/// `quickActions.*` beforehand by [`migrate_quick_action_settings`]), and the
+/// keys are then stripped from the file with a comment-preserving rewrite.
 /// Nothing is stripped when a
 /// SQLite write fails, so the next boot retries the import. The strip itself
 /// is best-effort: once the values are safely in SQLite, a failed file
@@ -1462,6 +1524,65 @@ pub async fn import_legacy_settings(
         tracing::info!(?stripped, "stripped legacy keys from config.toml");
     }
     Ok(stripped)
+}
+
+/// One-time boot carry-over of the renamed `[backgroundAgents]` table into
+/// `quickActions.*` (monorepo#1729). The registry's load captured the whole
+/// legacy table; each of its `defaultModel` / `typeOverrides` /
+/// `providerSettings` members is written to the matching `quickActions.*` key
+/// **only** when that key is still at its schema default, so an already-
+/// migrated (or deliberately re-picked) value is never clobbered. Runs before
+/// [`import_legacy_settings`], which then discards and strips the legacy
+/// table. A file with no `[backgroundAgents]` table is a no-op.
+///
+/// Each member is applied on its own: `apply` validates a batch atomically, so
+/// batching them would let one malformed legacy value (say `defaultModel = 1`)
+/// discard the valid siblings the same boot that strips the legacy table. A
+/// member that fails the typed schema is skipped with a warning and the rest
+/// still carry over.
+pub fn migrate_quick_action_settings(registry: &SettingsRegistry) -> Result<()> {
+    let Some(legacy) = registry.legacy_values().get("backgroundAgents").cloned() else {
+        return Ok(());
+    };
+    let Some(table) = legacy.as_object() else {
+        tracing::warn!("legacy [backgroundAgents] is not a table; discarding");
+        return Ok(());
+    };
+    let mut migrated: Vec<String> = Vec::new();
+    const MEMBERS: [&str; 3] = ["defaultModel", "typeOverrides", "providerSettings"];
+    let unknown: Vec<&str> = table
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !MEMBERS.contains(k))
+        .collect();
+    if !unknown.is_empty() {
+        tracing::warn!(
+            members = ?unknown,
+            "legacy [backgroundAgents] members have no quickActions.* counterpart; dropping"
+        );
+    }
+    for member in MEMBERS {
+        let Some(value) = table.get(member) else {
+            continue;
+        };
+        let path = format!("quickActions.{member}");
+        if registry.origin(&path) != Some(SettingOrigin::Default) {
+            tracing::debug!(path, "quick-action key already set; keeping current value");
+            continue;
+        }
+        if let Err(e) = registry.apply(&[(path.clone(), value.clone())]) {
+            tracing::warn!(path, error = %e, "failed to migrate legacy [backgroundAgents] member; discarding");
+            continue;
+        }
+        migrated.push(path);
+    }
+    if !migrated.is_empty() {
+        tracing::info!(
+            paths = ?migrated,
+            "migrated legacy [backgroundAgents] into quickActions.*"
+        );
+    }
+    Ok(())
 }
 
 /// One-time boot cleanup of stale SQLite rows for retired settings. The
@@ -1733,7 +1854,12 @@ impl<'a> SettingsService<'a> {
             // pick. Tolerate-and-ignore the entry (nothing validated,
             // persisted, echoed, or published) instead of rejecting the whole
             // batch as an unknown path.
-            if path == RETIRED_WORKSPACE_OVERRIDES_PATH {
+            // monorepo#1729 compatibility: pre-rename clients still write the
+            // `backgroundAgents.*` paths. Same tolerate-and-ignore treatment —
+            // the renamed `quickActions.*` keys are the only writable surface.
+            if path == RETIRED_WORKSPACE_OVERRIDES_PATH
+                || RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
+            {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
             }
@@ -2227,6 +2353,33 @@ mod tests {
         assert_eq!(max_concurrent_agents(&settings), Some(12));
     }
 
+    /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
+    /// (0 = unlimited, max 100k, default 256) registered in `KNOWN_PATHS`, and
+    /// its description states the restart requirement (the limiter is built
+    /// once in the composition root).
+    #[test]
+    fn max_outstanding_rpcs_catalog_entry_is_toml_backed() {
+        let def = find_definition("server.maxOutstandingRpcs")
+            .expect("server.maxOutstandingRpcs missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "server");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(100_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(256.0)));
+        assert!(
+            def.description.contains("daemon restart"),
+            "description must state the restart requirement: {}",
+            def.description
+        );
+        assert!(KNOWN_PATHS.contains(&"server.maxOutstandingRpcs"));
+    }
+
     /// `workspaceApi.*` are non-secret TOML-backed catalog entries:
     /// `maxOutputChars` is a bounded number (0 = unlimited, max 10M, default
     /// 100k) and `toonOutput` a boolean defaulting to `true`.
@@ -2559,7 +2712,7 @@ mod tests {
         }
     }
 
-    /// The eight `agentFeatures.*` toggles are TOML-backed booleans, all
+    /// The nine `agentFeatures.*` toggles are TOML-backed booleans, all
     /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
     /// category and a `KNOWN_PATHS` entry, and each round-trips through the
     /// registry-wired service (default origin → file override → reset).
@@ -2574,6 +2727,8 @@ mod tests {
             "agentFeatures.richChatBlocks",
             "agentFeatures.structuredQuestions",
             "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
+            "agentFeatures.prMonitor",
         ];
         for path in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -2628,6 +2783,86 @@ mod tests {
             .await
             .expect_err("string value must reject");
         assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
+    /// `debounceSeconds` (default 60) and `pollSeconds` (default 30, a
+    /// config-file key the Settings UI does not surface). Both round-trip
+    /// through the registry-wired service and reject sub-floor values.
+    #[tokio::test]
+    async fn pr_monitor_intervals_round_trip_via_registry() {
+        for (path, default) in [
+            ("prMonitor.debounceSeconds", 60.0),
+            ("prMonitor.pollSeconds", 30.0),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must not be read-only");
+            assert_eq!(def.category, "prMonitor");
+            assert!(
+                matches!(
+                    def.ty,
+                    SettingType::Number {
+                        min: Some(10.0),
+                        ..
+                    }
+                ),
+                "{path} number with a floor of 10"
+            );
+            assert_eq!(def.default_value, Some(json!(default)), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        for (path, default) in [
+            ("prMonitor.debounceSeconds", 60.0),
+            ("prMonitor.pollSeconds", 30.0),
+        ] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(default), "{path} default");
+            assert_eq!(got["origin"], json!("default"), "{path} origin");
+
+            svc.update(&json!([{ "path": path, "value": 120 }]))
+                .await
+                .expect("update");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["value"], json!(120.0), "{path} updated");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+
+            // Sub-floor values reject before anything is written.
+            let err = svc
+                .update(&json!([{ "path": path, "value": 5 }]))
+                .await
+                .expect_err("sub-floor value must reject");
+            assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+
+            let reset = svc.reset(path).await.expect("reset");
+            assert_eq!(reset["value"], json!(default), "{path} reset");
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
+        }
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -2876,6 +3111,109 @@ mod tests {
         }
     }
 
+    /// `model.defaultReasoningEffort` is a TOML-backed optional string (no
+    /// default — unset means no global effort preference), stored as-is under
+    /// `[model]`; it round-trips through `settings.update` / `settings.reset`
+    /// to config.toml (never SQLite), and a blank string clears it to unset.
+    #[tokio::test]
+    async fn model_default_reasoning_effort_is_a_toml_backed_optional_string() {
+        let path = "model.defaultReasoningEffort";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "providers");
+        assert_eq!(def.default_value, None);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-effort-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-effort-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Unset by default with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        // A stored level persists verbatim to config.toml, never SQLite.
+        svc.update(&json!([{ "path": path, "value": "xhigh" }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!("xhigh"));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("defaultReasoningEffort"), "{text}");
+        assert!(text.contains("xhigh"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // A fresh registry over the same file reads the value back (round-trip).
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(reloaded.get(path), Some(json!("xhigh")));
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .effective
+                .model
+                .default_reasoning_effort
+                .as_deref(),
+            Some("xhigh")
+        );
+
+        // An empty string clears it back to unset: the effective value is
+        // `None` and the wire value reads `null`, so no client (and no future
+        // resolution step) ever observes an explicit empty effort.
+        svc.update(&json!([{ "path": path, "value": "" }]))
+            .await
+            .expect("clear with empty string");
+        let got = svc.get(path).await.expect("get after clear");
+        assert_eq!(
+            got["value"],
+            serde_json::Value::Null,
+            "an empty string must read as unset"
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .effective
+                .model
+                .default_reasoning_effort
+                .as_deref(),
+            None,
+            "an empty string must read as unset"
+        );
+        let reloaded = SettingsRegistry::load(&config_path).expect("reload registry");
+        assert_eq!(
+            reloaded.get(path),
+            Some(serde_json::Value::Null),
+            "a blank value in the file must read as unset"
+        );
+
+        // Reset restores the unset default.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], serde_json::Value::Null);
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], serde_json::Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// `voice.workspaceVocabulary.maxTerms` is a TOML-backed bounded number
     /// (default 50, min 0, max 100 — 0 disables derivation and injection;
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
@@ -3025,6 +3363,181 @@ mod tests {
                 tmp.display()
             )));
         }
+    }
+
+    /// monorepo#1729: the renamed `backgroundAgents.*` paths are tolerated-
+    /// and-ignored by `settings.update` (pre-rename clients keep writing them)
+    /// and rejected as unknown by `settings.get`/`settings.reset`.
+    #[tokio::test]
+    async fn background_agent_paths_update_is_tolerated_and_ignored() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-bgagents-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-bgagents-{tag}.toml"));
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let applied = svc
+            .update(&json!([
+                { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
+                { "path": "backgroundAgents.typeOverrides", "value": { "commit": "m" } },
+                { "path": "backgroundAgents.providerSettings", "value": {} },
+            ]))
+            .await
+            .expect("renamed paths must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        assert_eq!(registry.get("quickActions.defaultModel"), Some(Value::Null));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("backgroundAgents"), "{text}");
+
+        for path in RETIRED_BACKGROUND_AGENT_PATHS {
+            assert!(matches!(svc.get(path).await, Err(Error::InvalidParams(_))));
+            assert!(matches!(
+                svc.reset(path).await,
+                Err(Error::InvalidParams(_))
+            ));
+        }
+
+        // A batch mixing a retired path with a live one still applies the live
+        // entry instead of failing wholesale.
+        let applied = svc
+            .update(&json!([
+                { "path": "backgroundAgents.defaultModel", "value": "auggie:haiku" },
+                { "path": "quickActions.defaultModel", "value": "auggie:opus" },
+            ]))
+            .await
+            .expect("mixed batch must apply its live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "quickActions.defaultModel");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:opus"))
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// monorepo#1729: a `config.toml` still carrying `[backgroundAgents]` has
+    /// its values carried over into the unset `quickActions.*` keys, and the
+    /// legacy table is then stripped by [`import_legacy_settings`].
+    #[tokio::test]
+    async fn quick_action_migration_carries_over_legacy_table() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-qamig-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qamig-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\ntypeOverrides = { commit = \"auggie:fast\" }\nproviderSettings = { claude-code = { mode = \"fast\" } }\n",
+        )
+        .expect("seed legacy config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:haiku"))
+        );
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({ "commit": "auggie:fast" }))
+        );
+        assert_eq!(
+            registry.get("quickActions.providerSettings"),
+            Some(json!({ "claude-code": { "mode": "fast" } })),
+            "the structurally-validated member carries over too"
+        );
+
+        import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("backgroundAgents"), "{text}");
+        assert!(text.contains("quickActions"), "{text}");
+
+        // Second boot: the stripped file reloads, the migration is a no-op and
+        // the carried-over values stay put.
+        let registry2 = SettingsRegistry::load(&config_path).expect("reload registry");
+        migrate_quick_action_settings(&registry2).expect("migrate again");
+        assert_eq!(
+            registry2.get("quickActions.defaultModel"),
+            Some(json!("auggie:haiku"))
+        );
+        assert_eq!(
+            registry2.get("quickActions.providerSettings"),
+            Some(json!({ "claude-code": { "mode": "fast" } }))
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// PR #1010 review: one malformed legacy member must not take its valid
+    /// siblings down with it — members are applied individually, so the bad
+    /// one is skipped and the rest still carry over before the legacy table
+    /// is stripped. A member with no `quickActions.*` counterpart is dropped
+    /// (warned about) rather than failing the carry-over.
+    #[tokio::test]
+    async fn quick_action_migration_skips_only_the_malformed_member() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qabad-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = 1\ntypeOverrides = { commit = \"auggie:fast\" }\nsomethingRetired = true\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.typeOverrides"),
+            Some(json!({ "commit": "auggie:fast" })),
+            "a valid sibling must survive a malformed member"
+        );
+        assert_eq!(
+            registry.origin("quickActions.defaultModel"),
+            Some(SettingOrigin::Default),
+            "the malformed member must be skipped, not persisted"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// The carry-over never clobbers a `quickActions.*` key the user already
+    /// set (a re-run after the first migration, or a deliberate re-pick).
+    #[tokio::test]
+    async fn quick_action_migration_keeps_existing_value() {
+        let tag = uuid::Uuid::new_v4();
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-qakeep-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "[backgroundAgents]\ndefaultModel = \"auggie:haiku\"\n\n[quickActions]\ndefaultModel = \"auggie:opus\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+
+        migrate_quick_action_settings(&registry).expect("migrate");
+        assert_eq!(
+            registry.get("quickActions.defaultModel"),
+            Some(json!("auggie:opus")),
+            "an already-set quick-action key must win over the legacy value"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// [`cleanup_retired_settings`] deletes the stale SQLite row left behind

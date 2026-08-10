@@ -527,7 +527,11 @@ async fn recv_note(rx: &mut mpsc::UnboundedReceiver<IncomingNotification>) -> In
 /// Assert a notification is an agent message chunk and return its text.
 fn chunk_text(note: &IncomingNotification) -> String {
     match session::map_notification(note) {
-        Some(MappedUpdate::Chunk { text: Some(t), .. }) => t,
+        Some(MappedUpdate::Chunk {
+            text: Some(t),
+            thought: false,
+            ..
+        }) => t,
         other => panic!("expected an agent message chunk, got {other:?}"),
     }
 }

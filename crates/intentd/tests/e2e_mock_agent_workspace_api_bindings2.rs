@@ -91,7 +91,7 @@ fn gate() -> Option<String> {
 //
 
 #[tokio::test]
-async fn event_bindings_recent_files_and_query() {
+async fn event_bindings_query_and_subscribe() {
     let Some(script) = gate() else { return };
 
     let db = std::env::temp_dir().join(format!("intentd-e2e-event-{}.db", uuid::Uuid::new_v4()));
@@ -134,11 +134,10 @@ async fn event_bindings_recent_files_and_query() {
     };
 
     let js = r#"
-        const recent = await ws.event.recentFiles(5);
         const events = await ws.event.query({ eventType: 'note:created', limit: 10 });
         const sub = await ws.event.subscribe(['note:*'], { excludeSelf: true });
         await ws.event.unsubscribe(sub.subscriptionId);
-        return { recent: recent, events: events };
+        return { events: events };
     "#;
 
     let behavior = serde_json::json!({
@@ -915,6 +914,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
             None,
         )
         .await

@@ -84,11 +84,44 @@ directly.
 
 > **Note:** although this repository is private, the install commands below work
 > unauthenticated: the daemon's channel manifests and platform archives **and** the
-> sitter installer assets (archives, `.deb` packages, and the archives the Homebrew
-> formula downloads) are all mirrored to the public
-> [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) repo —
-> the temporary public mirror for release assets until this repo is open-sourced. The
-> formula itself lives in the public `intent-hq/homebrew-tap`.
+> sitter installer assets (archives, `.deb` packages, the `install.sh` / `install.ps1`
+> scripts, and the archives the Homebrew formula downloads) are all mirrored to the
+> public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
+> repo — the temporary public mirror for release assets until this repo is
+> open-sourced. The formula itself lives in the public `intent-hq/homebrew-tap`.
+
+### One-line script (macOS / Linux)
+
+```sh
+curl -fsSL https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/install.sh | sh
+```
+
+Detects OS and architecture, downloads the matching `sitter-latest` archive, verifies
+its `.sha256` sidecar, and installs `intentd` to `/usr/local/bin` when writable, else
+`~/.local/bin` (override with `INTENTD_INSTALL_DIR`). Re-running updates in place.
+
+After installing, the script offers to register intentd as a per-user service that
+starts at login (systemd user unit on Linux, launchd LaunchAgent on macOS — the same
+definitions the `.deb` and Homebrew installs use) and starts it immediately. The
+prompt reads from the terminal, so it works with `curl … | sh`; non-interactive runs
+skip service setup with a hint. Set `INTENTD_INSTALL_SERVICE=1` (or pass `--service`
+on a direct run) to set it up without prompting, `INTENTD_INSTALL_SERVICE=0` /
+`--no-service` to skip. On headless Linux boxes, user services only start at boot
+once lingering is enabled (`sudo loginctl enable-linger $USER` — the script prints
+this hint).
+
+### One-line script (Windows)
+
+```powershell
+powershell -c "irm https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/install.ps1 | iex"
+```
+
+Installs `intentd.exe` to `%LOCALAPPDATA%\intentd\bin` (override with
+`INTENTD_INSTALL_DIR`) and adds that directory to the user `PATH`. After installing,
+it offers to register a per-user Scheduled Task that runs `intentd serve --resume-all`
+at logon and starts it now; non-interactive runs skip with a hint. Set
+`$env:INTENTD_INSTALL_SERVICE = '1'` (or `-Service` on a direct run) to set it up
+without prompting, `'0'` / `-NoService` to skip.
 
 ### Homebrew (macOS / Linux)
 
@@ -230,6 +263,25 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Pairing a remote client (WSS)
+
+`intentd pair` renders the `intent://pair?…` QR code / payload URI a LAN client (e.g.
+the iOS app) scans to connect over the WSS/TLS listener. The payload embeds the bearer
+token and TLS fingerprint, so the command is local-only (it queries `pairing.getInfo`
+over the UDS socket).
+
+```bash
+intentd pair                  # QR code + payload URI in the terminal
+intentd pair --png pair.png   # also export the QR code as an image (0600)
+```
+
+If the WSS listener is not running, `pair` offers to enable it on the spot: it persists
+`server.wsApi.enabled = true` to `config.toml` via the daemon's `settings.update`
+pipeline (the same path the settings UI uses), which also starts the listener
+immediately — no restart needed. Interactively this is a `[Y/n]` prompt; unattended
+runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the command fails with
+guidance. `intentd token` prints the same credentials in plaintext.
+
 ## Current status
 
 The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
@@ -260,8 +312,9 @@ in the monorepo's git history.
   / accept-changes pipeline, and ripgrep-backed search.
 - **Terminals & scripts:** a unified `intent-pty` host backing both interactive terminals and
   scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
-- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, and `mcp-bridge`. The daemon
-  does not manage its own service unit: supervision is owned by the platform package manager —
+- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `token`, `pair` (auto-enables the
+  WSS listener on demand), `import`, and `mcp-bridge`. The daemon does not manage its own
+  service unit: supervision is owned by the platform package manager —
   `brew services start intentd` on macOS, and the .deb's systemd user unit on Linux.
 - **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
   (WAL, `foreign_keys`, `busy_timeout`).
@@ -304,10 +357,13 @@ Channels follow a **promotion model** — channel routing does not depend on pre
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
 
 - **Beta**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the beta channel automatically.
+  The GitHub release is published as a **Pre-release** (also on the mirror).
 - **Stable**: a manual **promotion** of an existing release — run the
   [Promote stable](.github/workflows/promote-stable.yml) workflow (Actions → Promote
-  stable) with the version to promote; it validates that the release exists and updates
-  the stable channel manifest to point at it.
+  stable) with the version to promote; it validates that the release exists and is not a
+  draft, updates the stable channel manifest to point at it, and clears the Pre-release
+  flag while marking that release **Latest** on this repo and on the mirror. The Latest
+  badge therefore always tracks the newest stable version.
 
 ### Cutting a release
 

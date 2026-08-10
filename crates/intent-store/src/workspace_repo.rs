@@ -94,8 +94,17 @@ impl Store {
         }
     }
 
-    /// Update an existing workspace (full row replace, except `id`), or
-    /// `NotFound`. `activity` is derived and never persisted (§9.9).
+    /// Update an existing workspace (full row replace, except `id` and the
+    /// guarded `last_activity`, see below), or `NotFound`. `activity` is
+    /// derived and never persisted (§9.9).
+    ///
+    /// `last_activity` is the one exception to the full-row replace
+    /// (monorepo#1585): it goes through the same monotonic guard as
+    /// [`Self::bump_workspace_last_activity`] — the candidate writes only when
+    /// it parses AND the stored value is NULL, unparseable, or strictly older.
+    /// Otherwise the stored column holds, so a get → mutate → write flow whose
+    /// read predated a concurrent bump can never silently revert it (the
+    /// `attention` clobber shape fixed by #1481).
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
@@ -103,8 +112,11 @@ impl Store {
              repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
              is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
              active_pull_request=?, pull_requests=?, archived=?, archived_at=?, tags=?, \
-             created_at=?, updated_at=?, last_activity=?, token_usage=?, setup_script=?, \
-             checkout_mode=?, execution_environment=? WHERE id=?",
+             created_at=?, updated_at=?, \
+             last_activity=CASE WHEN julianday(?) IS NOT NULL \
+               AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
+               OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
+             token_usage=?, setup_script=?, checkout_mode=?, execution_environment=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -133,6 +145,8 @@ impl Store {
         .bind(tags_to_db(&ws.tags)?)
         .bind(&ws.created_at)
         .bind(&ws.updated_at)
+        .bind(&ws.last_activity)
+        .bind(&ws.last_activity)
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
@@ -167,13 +181,15 @@ impl Store {
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
     ///
-    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`)
-    /// hydrates full `agent_message` logs for legacy sessions with neither a
-    /// snapshot nor a baseline, and that work happens while holding the
-    /// daemon's sole write connection and the SQLite write lock. The
-    /// snapshot/baseline hydration skip keeps the common case cheap; a
-    /// workspace of snapshot-less long-history sessions pays the cost on
-    /// every recompute until its sessions report usage once.
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`) reads
+    /// `agent_message` for sessions still on the per-message fallback (no
+    /// snapshot/baseline token report), and that work happens while holding
+    /// the daemon's sole write connection and the SQLite write lock. The
+    /// report-backed skip keeps the common case cheap, and the fallback read
+    /// projects each message's usage object in SQL and filters to
+    /// usage-bearing rows off a partial index instead of materializing message
+    /// bodies (monorepo#1571) — so what a workspace of long-history fallback
+    /// sessions pays for is its usage-bearing rows, not its transcript bytes.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,

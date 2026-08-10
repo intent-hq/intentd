@@ -6,128 +6,28 @@
 //! `session/new` result or in a `session/update`-style notification, so the
 //! probe watches both. Every path is bounded by a hard overall timeout —
 //! the probe never hangs and never panics.
+//!
+//! The launch description, staged npx-aware timeouts, spawn, exit
+//! observation, and process-group reaping are shared with the one-shot
+//! completion runner in [`crate::acp_adapter`]; only the probe's own stage
+//! sequencing lives here.
 
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
-#[cfg(unix)]
-use intent_acp::{descendant_pids, sweep_escaped_descendants};
-use intent_acp::{Connection, ConnectionHooks, JsonRpcError};
-use intent_providers::enhanced_path;
+use intent_acp::{Connection, JsonRpcError};
 use serde_json::{json, Value};
-use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 
-/// Hard cap on the whole probe for resolved binaries (mirrors the FE's 15s
-/// outer timeout). Deliberately smaller than the sum of the per-stage budgets
-/// (4s + 10s + 2s grace), matching the FE: the outer cap is the real bound
-/// and preempts slow-but-not-stuck stages.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
-/// Per-request timeout for `initialize` for resolved binaries (FE: 4s).
-const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(4);
-/// `initialize` budget for npx-run adapters: a cold `npx -y <pkg>@<version>`
-/// downloads and installs the package before the adapter can answer, which
-/// routinely takes tens of seconds. A pinned-version bump must not guarantee
-/// a static-fallback cycle just because the cache is cold.
-const NPX_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
-/// Overall cap for npx-run adapters, kept bounded but sized to cover the full
-/// per-stage sum (45s initialize + 20s session/new + 2s grace) so a cold
-/// install that eats the initialize budget cannot starve `session/new` of its
-/// own window. This is also the worst-case latency of a `forceRefresh`
-/// `models.list` against a hung npx adapter — an accepted trade-off for
-/// surviving cold installs.
-const NPX_OVERALL_TIMEOUT: Duration = Duration::from_secs(70);
-/// Per-request timeout for `session/new` for resolved binaries (FE: 8–10s).
-const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
-/// `session/new` budget for npx-run adapters: claude-agent-acp boots the
-/// underlying CLI while creating the session, which alone takes ~10s even
-/// with a warm npx cache — a flat 10s budget times out right at the wire.
-const NPX_SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(20);
+use crate::acp_adapter::{
+    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter,
+};
+
+/// The probe's launch description (shared with the one-shot runner).
+pub(super) use crate::acp_adapter::AcpAdapterCommand as AcpProbeCommand;
+
 /// Grace window to catch a late model notification after an empty
 /// `session/new` result.
 const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
-
-/// How to launch the adapter for a probe.
-pub(super) struct AcpProbeCommand {
-    program: PathBuf,
-    args: Vec<String>,
-    envs: Vec<(String, OsString)>,
-    envs_removed: Vec<String>,
-    /// npx-run probes get the longer cold-install timeout budget.
-    via_npx: bool,
-}
-
-impl AcpProbeCommand {
-    /// Run a pinned npm package via `npx -y <package>`.
-    pub(super) fn npx(npx: PathBuf, package: &str) -> Self {
-        Self {
-            program: npx,
-            args: vec!["-y".to_string(), package.to_string()],
-            envs: Vec::new(),
-            envs_removed: Vec::new(),
-            via_npx: true,
-        }
-    }
-
-    /// Run a resolved adapter binary with the given args.
-    pub(super) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
-        Self {
-            program: bin,
-            args,
-            envs: Vec::new(),
-            envs_removed: Vec::new(),
-            via_npx: false,
-        }
-    }
-
-    /// Add an environment-variable override for the probe child.
-    pub(super) fn env(mut self, key: impl Into<String>, value: impl Into<OsString>) -> Self {
-        self.envs.push((key.into(), value.into()));
-        self
-    }
-
-    /// Remove an environment variable from the probe child's inherited env.
-    pub(super) fn env_remove(mut self, key: impl Into<String>) -> Self {
-        self.envs_removed.push(key.into());
-        self
-    }
-
-    #[cfg(test)]
-    pub(super) fn env_vars(&self) -> &[(String, OsString)] {
-        &self.envs
-    }
-
-    #[cfg(test)]
-    pub(super) fn removed_env_vars(&self) -> &[String] {
-        &self.envs_removed
-    }
-
-    fn initialize_timeout(&self) -> Duration {
-        if self.via_npx {
-            NPX_INITIALIZE_TIMEOUT
-        } else {
-            INITIALIZE_TIMEOUT
-        }
-    }
-
-    fn session_new_timeout(&self) -> Duration {
-        if self.via_npx {
-            NPX_SESSION_NEW_TIMEOUT
-        } else {
-            SESSION_NEW_TIMEOUT
-        }
-    }
-
-    fn overall_timeout(&self) -> Duration {
-        if self.via_npx {
-            NPX_OVERALL_TIMEOUT
-        } else {
-            OVERALL_TIMEOUT
-        }
-    }
-}
 
 /// Machine-readable probe failure reasons.
 #[derive(Debug)]
@@ -171,52 +71,13 @@ pub(super) async fn run_acp_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    let mut command = tokio::process::Command::new(&cmd.program);
-    command
-        .args(&cmd.args)
-        .current_dir(std::env::temp_dir())
-        .env("PATH", enhanced_path(Some(&cmd.program)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    for (key, value) in &cmd.envs {
-        command.env(key, value);
-    }
-    for key in &cmd.envs_removed {
-        command.env_remove(key);
-    }
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| ProbeError::Spawn(format!("{}: {e}", cmd.program.display())))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ProbeError::Spawn("child stdin not piped".to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ProbeError::Spawn("child stdout not piped".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .map(|s| Box::new(s) as Box<dyn AsyncRead + Unpin + Send>);
-
-    let (note_tx, note_rx) = mpsc::unbounded_channel();
-    let hooks = ConnectionHooks {
-        notifications: Some(note_tx),
-        ..Default::default()
-    };
-    let conn = Connection::new(stdin, stdout, stderr, hooks);
+    let mut adapter = spawn_adapter(&cmd).map_err(ProbeError::Spawn)?;
 
     let result = tokio::time::timeout(
-        cmd.overall_timeout(),
+        cmd.setup_timeout(),
         drive_probe(
-            &conn,
-            note_rx,
+            &adapter.conn,
+            adapter.notifications,
             extract,
             cmd.initialize_timeout(),
             cmd.session_new_timeout(),
@@ -227,23 +88,11 @@ where
 
     let result = match result {
         Ok(models) => Ok(models),
-        Err(err) => Err(attribute_early_exit(err, &mut child, &conn).await),
+        Err(err) => Err(attribute_early_exit(err, &mut adapter.child, &adapter.conn).await),
     };
-    reap_child(&mut child).await;
+    reap_child(&mut adapter.child).await;
     result
 }
-
-/// Bounded window to observe a crashed adapter's exit status and let the
-/// stderr reader drain its final lines before attribution. A crashing child's
-/// stdout close (the transport error that reports the crash) races both the
-/// exit-status reap and the stderr drain, so a bare `try_wait` snapshot can
-/// misattribute a genuine crash as a plain transport failure.
-///
-/// Latency cost: on `ProbeError::Timeout` with a hung (still-running) child,
-/// `child.wait()` burns this full window before falling back to `try_wait`,
-/// so a timed-out probe takes ~500ms beyond `overall_timeout()` in
-/// production. Bounded and error-path-only, so accepted.
-const EXIT_OBSERVE_GRACE: Duration = Duration::from_millis(500);
 
 /// Fold an early adapter exit into the probe error: when the child already
 /// exited before the probe could report models, delegate to
@@ -256,29 +105,9 @@ async fn attribute_early_exit(
     if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
         return err;
     }
-    let status = match tokio::time::timeout(EXIT_OBSERVE_GRACE, child.wait()).await {
-        Ok(Ok(status)) => Some(status),
-        _ => child.try_wait().ok().flatten(),
-    };
-    if status.is_some_and(|s| !s.success()) {
-        // The exited child's final stderr may still be in flight to the
-        // reader task; wait briefly for the first line so the attribution
-        // can carry it.
-        let deadline = tokio::time::Instant::now() + EXIT_OBSERVE_GRACE;
-        while conn.recent_stderr().is_empty() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
+    let status = observe_exit_status(child, conn).await;
     exit_attribution(err, status, &conn.recent_stderr())
 }
-
-/// How many trailing stderr lines to include in an exit attribution. npm's
-/// final line is typically just "A complete log of this run can be found
-/// in: …" with the actual cause a few lines earlier, so a single line is
-/// not enough.
-const STDERR_TAIL_LINES: usize = 3;
-/// Character bound on the joined stderr tail (kept from the end).
-const STDERR_TAIL_MAX_CHARS: usize = 300;
 
 /// Decide whether a probe error should be re-attributed to a dead adapter
 /// (e.g. a corrupt `~/.npm/_npx` entry making node fail with ENOENT):
@@ -295,77 +124,10 @@ pub(super) fn exit_attribution(
     if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
         return err;
     }
-    let Some(status) = status else {
-        return err;
-    };
-    if status.success() {
-        return err;
+    match exited_detail(status, stderr) {
+        Some(detail) => ProbeError::Exited(detail),
+        None => err,
     }
-    let tail = match stderr_tail(stderr) {
-        Some(t) => format!("; stderr: {t}"),
-        None => String::new(),
-    };
-    ProbeError::Exited(format!("{status}{tail}"))
-}
-
-/// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
-/// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
-fn stderr_tail(stderr: &[String]) -> Option<String> {
-    let non_empty: Vec<&str> = stderr
-        .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = non_empty.len().saturating_sub(STDERR_TAIL_LINES);
-    let joined = non_empty[start..].join(" | ");
-    if joined.is_empty() {
-        return None;
-    }
-    let count = joined.chars().count();
-    Some(
-        joined
-            .chars()
-            .skip(count.saturating_sub(STDERR_TAIL_MAX_CHARS))
-            .collect(),
-    )
-}
-
-/// Grace window between SIGTERM and SIGKILL when reaping the probe child
-/// (mirrors `host_exec::TERM_GRACE` / `mcp_servers::reap`).
-const TERM_GRACE: Duration = Duration::from_millis(500);
-
-/// Kill the probe child and reap it. Signals the whole process group (the
-/// child is its own group leader via `process_group(0)`) so grandchildren
-/// (e.g. `npx` → `node`) die too, following the crate's SIGTERM → grace →
-/// SIGKILL pattern, then waits briefly so the child does not linger as a
-/// zombie. `kill_on_drop(true)` back-stops any wait timeout.
-///
-/// Group signalling alone is not enough: adapters can start MCP servers that
-/// move into their OWN process groups, so descendants are snapshotted before
-/// the kill and any survivors swept afterwards regardless of process group —
-/// see `intent_acp::descendant_sweep` for the shared backstop and its
-/// snapshot-before-kill rationale.
-async fn reap_child(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    let descendants = match child.id() {
-        Some(pid) => descendant_pids(pid).await,
-        None => Vec::new(),
-    };
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        use nix::sys::signal::{killpg, Signal};
-        use nix::unistd::Pid;
-        let pgid = Pid::from_raw(pid as i32);
-        let _ = killpg(pgid, Signal::SIGTERM);
-        tokio::time::sleep(TERM_GRACE).await;
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            let _ = killpg(pgid, Signal::SIGKILL);
-        }
-    }
-    let _ = child.kill().await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-    #[cfg(unix)]
-    sweep_escaped_descendants(&descendants).await;
 }
 
 /// `initialize` → `session/new`, watching for model rows in either the
@@ -380,12 +142,7 @@ async fn drive_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    let init_params = json!({
-        "protocolVersion": 1,
-        "clientInfo": { "name": "Intent", "version": env!("CARGO_PKG_VERSION") },
-        "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } },
-    });
-    conn.request_timeout("initialize", init_params, initialize_timeout)
+    conn.request_timeout("initialize", initialize_params(), initialize_timeout)
         .await
         .map_err(map_acp_error)?;
 
@@ -464,86 +221,5 @@ fn map_acp_error(err: intent_acp::AcpError) -> ProbeError {
         }
         intent_acp::AcpError::Rpc(e) => ProbeError::Rpc(e),
         other => ProbeError::Transport(other.to_string()),
-    }
-}
-
-#[cfg(all(test, unix))]
-mod reap_tests {
-    use super::*;
-
-    // Table-walk unit tests for the sweep live with the shared helper in
-    // `intent_acp::descendant_sweep`; this module keeps the probe-level
-    // integration regression.
-
-    /// Regression for the live escape: an MCP-server-style grandchild that
-    /// moves into its OWN process group survives `killpg` on the probe group
-    /// (observed: codex-acp's auggie ran with pgid == its own pid); the
-    /// descendant sweep must still reap it. Mirrors intent-acp's
-    /// `kill_reaps_grandchildren_via_process_group`, except the grandchild
-    /// escapes the group via `set -m` job control (background jobs become
-    /// their own group leaders).
-    #[tokio::test]
-    async fn reap_child_sweeps_grandchild_in_foreign_process_group() {
-        use nix::unistd::{getpgid, Pid};
-
-        let pidfile =
-            std::env::temp_dir().join(format!("intent-probe-sweep-{}.pid", uuid::Uuid::new_v4()));
-        let mut command = tokio::process::Command::new("bash");
-        command
-            .arg("-c")
-            .arg(r#"set -m; sleep 300 & echo $! > "$INTENT_TEST_PIDFILE"; wait"#)
-            .env("INTENT_TEST_PIDFILE", &pidfile)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        command.process_group(0);
-        let mut child = command.spawn().expect("spawn bash child");
-
-        let mut grandchild_pid = None;
-        for _ in 0..250 {
-            if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
-                if let Ok(pid) = s.trim().parse::<i32>() {
-                    grandchild_pid = Some(pid);
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let grandchild_pid = grandchild_pid.expect("grandchild pid written");
-
-        // Prove the grandchild actually escaped the probe's process group —
-        // otherwise killpg would reach it and the test would be vacuous.
-        let child_pgid = getpgid(Some(Pid::from_raw(child.id().expect("child pid") as i32)))
-            .expect("child pgid");
-        let grandchild_pgid =
-            getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
-        assert_ne!(
-            grandchild_pgid, child_pgid,
-            "grandchild must be in a foreign process group for this regression test"
-        );
-
-        // Distinct failure signal for the snapshot path: if `ps` stalls past
-        // its budget on a loaded runner the snapshot comes back empty and the
-        // sweep silently no-ops — fail here, not at the terminal panic below.
-        let snapshot = descendant_pids(child.id().expect("child pid")).await;
-        assert!(
-            snapshot.contains(&grandchild_pid),
-            "descendant snapshot {snapshot:?} must include grandchild {grandchild_pid} \
-             (empty/partial snapshot ⇒ `ps` walk failed, not the sweep)"
-        );
-
-        reap_child(&mut child).await;
-        tokio::fs::remove_file(&pidfile).await.ok();
-
-        // `kill(pid, 0)` returns ESRCH once the pid is gone (the grandchild
-        // is not our direct child, so init reaps it after the sweep's kill).
-        for _ in 0..100 {
-            if nix::sys::signal::kill(Pid::from_raw(grandchild_pid), None).is_err() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("grandchild pid {grandchild_pid} still alive after reap_child sweep");
     }
 }

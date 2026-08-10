@@ -74,6 +74,12 @@ fn registry_field_parity() {
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
     assert!(auggie.can_be_disabled);
     assert_eq!(auggie.login_command_hint, Some("auggie login"));
+    // `auggie token print` exits 0 iff logged in; its output is the auth
+    // session secret, so the probe must ride the generic exit-code arm.
+    assert_eq!(auggie.auth_check_args, Some(&["token", "print"][..]));
+    // Installed-but-logged-out auggie needs a login affordance on the generic
+    // provider row, which reads the catalog's `login_docs_url`.
+    assert!(auggie.login_docs_url.is_some());
 
     let cc = find_provider("claude-code").unwrap();
     assert_eq!(cc.command, "claude-agent-acp");
@@ -129,6 +135,7 @@ fn registry_field_parity() {
     assert_eq!(grok.display_name, "Grok Build");
     assert_eq!(grok.command, "grok");
     assert_eq!(grok.base_args, &["agent", "stdio"]);
+    assert!(grok.terminal_requires_shell);
     // Grok selects models after session creation via session/set_model — no
     // CLI model flag.
     assert!(grok.model_flag.is_none() && grok.supports_set_model);
@@ -225,7 +232,7 @@ fn pi_resolves_in_registry_with_pinned_npx_package() {
     assert_eq!(provider_config("pi").id, "pi");
     let pi = find_provider("pi").expect("pi is registered");
     assert_eq!(pi.command, "pi-acp");
-    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.31");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.33");
     assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
@@ -634,6 +641,23 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
 
+    // Spawn-time npx signal: an npx spawn always runs a Node child, so even
+    // a declared-Native provider (codex's npx fallback) gets the cap; the
+    // same provider without the signal (resolved native binary) stays
+    // untouched (intent-hq/monorepo#1661).
+    let codex = find_provider("codex").unwrap();
+    let codex_via_npx = args::build_provider_env_for_spawn(codex, None, None, None, None, true);
+    assert_eq!(
+        codex_via_npx.get("NODE_OPTIONS").map(String::as_str),
+        Some("--max-old-space-size=8192"),
+        "codex npx-fallback spawn must get the heap cap"
+    );
+    let codex_native = args::build_provider_env_for_spawn(codex, None, None, None, None, false);
+    assert!(
+        !codex_native.contains_key("NODE_OPTIONS"),
+        "codex resolved-binary spawn must not get NODE_OPTIONS"
+    );
+
     // Override seam produces the requested cap for all V8 providers.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
     assert_eq!(args::max_old_space_mb(), 4096);
@@ -710,6 +734,28 @@ fn enhanced_path_prepends_bin_and_augment() {
         Some(inherited),
     );
     assert!(!rel.starts_with("auggie"));
+}
+
+#[test]
+fn enhanced_path_dirs_mirror_the_joined_spawn_path() {
+    // `enhanced_path_dirs_with` is the directory-list view of the exact PATH
+    // the spawned child gets (`enhanced_path_with`): same entries, same
+    // precedence order. `find_pi_cli` scans this list so its probe resolves
+    // the same binary the pi-acp child would.
+    let home = std::path::Path::new("/home/tester");
+    let inherited = std::ffi::OsStr::new("/usr/bin:/bin");
+    let bin = std::path::PathBuf::from("/opt/node/npx");
+    let joined = args::enhanced_path_with(Some(&bin), Some(home), Some(inherited));
+    let dirs = args::enhanced_path_dirs_with(Some(&bin), Some(home), Some(inherited));
+    let joined_parts: Vec<String> = joined.split([':', ';']).map(str::to_string).collect();
+    let dir_parts: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(dir_parts, joined_parts, "dirs and joined PATH must agree");
+    // Spawn precedence: npx parent dir first, so a `pi` co-located with npx
+    // shadows one later on the inherited PATH — for probe and child alike.
+    assert_eq!(dirs[0], std::path::PathBuf::from("/opt/node"));
 }
 
 #[test]
@@ -969,7 +1015,7 @@ fn injection_mechanism_registry() {
         find_provider("claude-code").unwrap().injection_mechanism,
         SessionMeta
     );
-    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.7)
+    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.14)
     // ignores `_meta.developerInstructions` (#479).
     assert_eq!(
         find_provider("codex").unwrap().injection_mechanism,
@@ -1500,5 +1546,23 @@ fn non_env_config_providers_ignore_mcp_json() {
             !env.contains_key("OPENCODE_CONFIG_CONTENT"),
             "{id} unexpectedly emitted OPENCODE_CONFIG_CONTENT"
         );
+    }
+}
+
+#[test]
+fn only_grok_requires_terminal_shell_by_default() {
+    for p in crate::ACP_PROVIDERS {
+        if p.id == "grok" {
+            assert!(
+                p.terminal_requires_shell,
+                "grok must shell-wrap ACP terminals"
+            );
+        } else {
+            assert!(
+                !p.terminal_requires_shell,
+                "{} should not require terminal shell wrap",
+                p.id
+            );
+        }
     }
 }

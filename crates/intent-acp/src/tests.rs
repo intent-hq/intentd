@@ -734,6 +734,7 @@ mod session_tests {
             Some(MappedUpdate::Chunk {
                 content: json!("tok"),
                 text: Some("tok".to_string()),
+                thought: false,
             })
         );
     }
@@ -1448,13 +1449,32 @@ mod session_tests {
         assert_eq!(tc.input, json!({ "arguments": "text", "tool": "x" }));
     }
 
+    /// `agent_thought_chunk` travels the same path as a message chunk with the
+    /// `thought` marker set (Zed's `is_thought`), carrying the extracted text.
     #[test]
-    fn unmapped_variants_return_none() {
+    fn maps_thought_chunk_with_thought_marker() {
         let thought =
             SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::v1::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("thinking")),
             ));
-        assert_eq!(session::map_session_update(&thought), None);
+        assert_eq!(
+            session::map_session_update(&thought),
+            Some(MappedUpdate::Chunk {
+                content: json!("thinking"),
+                text: Some("thinking".to_string()),
+                thought: true,
+            })
+        );
+    }
+
+    #[test]
+    fn unmapped_variants_return_none() {
+        let plan: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "plan",
+            "entries": []
+        }))
+        .expect("plan update deserializes");
+        assert_eq!(session::map_session_update(&plan), None);
     }
 
     #[test]
@@ -1474,6 +1494,7 @@ mod session_tests {
             Some(MappedUpdate::Chunk {
                 content: json!("hi"),
                 text: Some("hi".to_string()),
+                thought: false,
             })
         );
 
@@ -5587,6 +5608,7 @@ mod workspace_api_tool_tests {
             .with_agent_features(no_hooks_features())
             .with_specialist_model_options(vec![SpecialistModelOptions {
                 specialist: "implementor".to_string(),
+                default_model: Some("auggie:claude-opus-5".to_string()),
                 options: vec![SpecialistModelOption {
                     model: "opencode:kimi-k3".to_string(),
                     hint: "cheap".to_string(),
@@ -5599,8 +5621,10 @@ mod workspace_api_tool_tests {
             .unwrap();
         let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
         assert!(
-            desc.contains("implementor: `opencode:kimi-k3` (cheap)"),
-            "delegate docs must list the specialist's model options"
+            desc.contains(
+                "implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"
+            ),
+            "delegate docs must list the specialist's default model and options"
         );
         assert!(
             !desc.contains("ws.hook."),
@@ -6238,6 +6262,7 @@ mod wsapi3_bindings_tests {
             status: String,
             acceptance_criteria: Vec<String>,
             effort: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
             self.mark_as_task_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
@@ -6282,6 +6307,7 @@ mod wsapi3_bindings_tests {
             title: String,
             content: Option<String>,
             status: Option<String>,
+            _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskCreatePrerequisiteResult>> {
             self.create_prereq_calls.lock().unwrap().push((
                 dependent_note_id.as_str().to_string(),
@@ -7599,8 +7625,8 @@ mod wsapi4_bindings_tests {
 
     use intent_core::{
         AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
-        WorkspaceApi, WorkspaceId,
+        EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, Result, WorkspaceApi,
+        WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -7612,7 +7638,6 @@ mod wsapi4_bindings_tests {
     type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
     type DelegateCall = (Option<String>, Option<String>);
     type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
-    type DirCall = (String, Option<i64>);
     type AttentionCall = (String, String, Option<String>);
 
     #[derive(Default)]
@@ -7629,9 +7654,7 @@ mod wsapi4_bindings_tests {
         watch_sender_calls: Mutex<Vec<WatchSenderCall>>,
         report_to_parent_calls: Mutex<Vec<Option<String>>>,
         request_attention_calls: Mutex<Vec<AttentionCall>>,
-        event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
-        event_dir_calls: Mutex<Vec<DirCall>>,
         /// When set, `agent_get` fails with this error (name-lookup failure path).
         agent_get_error: Mutex<Option<String>>,
         /// Raw `agent.getQueue` entries served by `agent_get_queue`.
@@ -7656,6 +7679,7 @@ mod wsapi4_bindings_tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Idle,
             is_active: false,
@@ -7666,6 +7690,7 @@ mod wsapi4_bindings_tests {
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: vec![],
             waiting_on_hooks: vec![],
+            waiting_on_pr_monitors: vec![],
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: None,
@@ -7677,6 +7702,7 @@ mod wsapi4_bindings_tests {
             last_agent_response: None,
             last_user_message: None,
             last_message_role: None,
+            last_message_id: None,
             context_references: None,
             image_blocks: None,
             stop_reason: None,
@@ -7973,25 +7999,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        fn event_recent_files(
-            &self,
-            _ws: WorkspaceId,
-            limit: Option<i64>,
-        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-            self.event_recent_files_calls.lock().unwrap().push(limit);
-            Box::pin(async move {
-                Ok(vec![FileActivity {
-                    path: "/tmp/foo.rs".to_string(),
-                    relative_path: "foo.rs".to_string(),
-                    action: "modified".to_string(),
-                    timestamp: "2026-01-01T00:00:00Z".to_string(),
-                    actor: Some("agent:test".to_string()),
-                    additions: None,
-                    deletions: None,
-                }])
-            })
-        }
-
         fn event_query(
             &self,
             _ws: WorkspaceId,
@@ -7999,16 +8006,6 @@ mod wsapi4_bindings_tests {
         ) -> BoxFuture<'_, Result<Value>> {
             self.event_query_calls.lock().unwrap().push(params);
             Box::pin(async move { Ok(json!([])) })
-        }
-
-        fn event_directory_changes(
-            &self,
-            _ws: WorkspaceId,
-            dir: String,
-            limit: Option<i64>,
-        ) -> BoxFuture<'_, Result<Vec<FileActivity>>> {
-            self.event_dir_calls.lock().unwrap().push((dir, limit));
-            Box::pin(async move { Ok(vec![]) })
         }
 
         fn event_subscribe(
@@ -8729,23 +8726,19 @@ mod wsapi4_bindings_tests {
     // event.*
     // ================================================================
 
+    /// `ws.event.recentFiles` / `ws.event.directoryChanges` were removed
+    /// end-to-end: the prelude no longer defines them, so calling either fails.
     #[tokio::test]
-    async fn event_recent_files_forwards_limit() {
-        let (srv, api) = server();
-        let resp = call(&srv, "return await ws.event.recentFiles(5);").await;
-        assert_eq!(resp["result"]["isError"], json!(false));
-        let v = body(&resp);
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr[0]["relativePath"], json!("foo.rs"));
-        assert_eq!(api.event_recent_files_calls.lock().unwrap()[0], Some(5));
-    }
-
-    #[tokio::test]
-    async fn event_directory_changes_requires_dir() {
+    async fn removed_event_file_bindings_are_absent() {
         let (srv, _api) = server();
-        let resp = call(&srv, "return await ws.event.directoryChanges();").await;
-        assert_eq!(resp["result"]["isError"], json!(true));
-        assert!(text(&resp).contains("Directory path is required"));
+        for js in [
+            "return await ws.event.recentFiles(5);",
+            "return await ws.event.directoryChanges('src/');",
+        ] {
+            let resp = call(&srv, js).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{js}");
+            assert!(text(&resp).contains("not a function"), "{js}");
+        }
     }
 
     #[tokio::test]

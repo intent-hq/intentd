@@ -103,11 +103,13 @@ mod tests {
         assert_eq!(auggie["command"], "auggie");
         assert_eq!(auggie["canBeDisabled"], true);
         assert_eq!(auggie["loginCommandHint"], "auggie login");
+        // The generic provider row's login CTA reads `loginDocsUrl`.
+        assert!(auggie["loginDocsUrl"].is_string());
         assert!(auggie["authErrorPatterns"].is_array());
         // Unset optionals are omitted, never null.
         assert!(auggie.get("requiresEnvVar").is_none());
         assert!(auggie.get("requiresFeatureCode").is_none());
-        assert!(auggie.get("loginDocsUrl").is_none());
+        assert!(auggie.get("npxOnlyPackage").is_none());
         // No per-row default designation.
         assert!(
             auggie.get("isDefault").is_none(),

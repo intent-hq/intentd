@@ -151,6 +151,69 @@ fn domain_to_rpc(e: Error) -> RpcErr {
     }
 }
 
+/// Classification of one parsed JSON-RPC envelope — the single implementation
+/// of the §3/§9 envelope-validity rules. Consumed by [`handle_message`], which
+/// maps each failure to its exact `-32600` message, and by the dispatch
+/// pre-check in `conn.rs`, which only needs valid-vs-not.
+pub(crate) enum EnvelopeCheck<'a> {
+    /// The frame is JSON but not an object (answered with id `null`).
+    NotObject,
+    /// `jsonrpc` is missing or not exactly `"2.0"`. The request id is echoed
+    /// only when its type is valid, else `null`.
+    BadJsonRpc { echo_id: Value },
+    /// `method` is missing, not a string, or empty (same id-echo rule as
+    /// [`EnvelopeCheck::BadJsonRpc`]).
+    BadMethod { echo_id: Value },
+    /// `id` is present but not a string, number, or null — an invalid id is
+    /// never echoed, so the response id is `null`.
+    BadId,
+    /// The envelope is valid and may be dispatched. `is_notification` is true
+    /// when the `id` member is absent entirely (`id: null` is a request).
+    Valid {
+        echo_id: Value,
+        method: &'a str,
+        is_notification: bool,
+    },
+}
+
+/// Classify a parsed frame against the envelope-validity rules (§3, §9):
+/// `jsonrpc` must be exactly `"2.0"`, `method` a non-empty string, and `id` —
+/// when present — a string, number, or null. Failures are reported in
+/// jsonrpc → method → id order, matching the message precedence in
+/// [`handle_message`].
+pub(crate) fn check_envelope(value: &Value) -> EnvelopeCheck<'_> {
+    let Some(obj) = value.as_object() else {
+        return EnvelopeCheck::NotObject;
+    };
+    let id_member = obj.get("id");
+    let id_type_ok = match id_member {
+        None => true,
+        Some(v) => v.is_string() || v.is_number() || v.is_null(),
+    };
+    let echo_id = match id_member {
+        Some(v) if id_type_ok => v.clone(),
+        _ => Value::Null,
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return EnvelopeCheck::BadJsonRpc { echo_id };
+    }
+    let method = obj
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty());
+    let Some(method) = method else {
+        return EnvelopeCheck::BadMethod { echo_id };
+    };
+    if !id_type_ok {
+        return EnvelopeCheck::BadId;
+    }
+    EnvelopeCheck::Valid {
+        echo_id,
+        method,
+        is_notification: id_member.is_none(),
+    }
+}
+
 /// Handle one JSON-RPC frame. Returns `Some(response)` for requests and `None`
 /// for notifications (including unknown / failed ones, per §3.4).
 pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<String> {
@@ -161,9 +224,10 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         Err(_) => return Some(error_string(Value::Null, PARSE_ERROR, "Parse error", None)),
     };
 
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => {
+    // Envelope validation (-32600). Answered even for notification-shaped
+    // frames: notification status is not trusted until the envelope is valid.
+    let (echo_id, method, is_notification) = match check_envelope(&value) {
+        EnvelopeCheck::NotObject => {
             return Some(error_string(
                 Value::Null,
                 INVALID_REQUEST,
@@ -171,40 +235,40 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
                 None,
             ))
         }
+        EnvelopeCheck::BadJsonRpc { echo_id } => {
+            return Some(error_string(
+                echo_id,
+                INVALID_REQUEST,
+                "Invalid Request: jsonrpc must be \"2.0\"",
+                None,
+            ))
+        }
+        EnvelopeCheck::BadMethod { echo_id } => {
+            return Some(error_string(
+                echo_id,
+                INVALID_REQUEST,
+                "Invalid Request: method must be a non-empty string",
+                None,
+            ))
+        }
+        EnvelopeCheck::BadId => {
+            return Some(error_string(
+                Value::Null,
+                INVALID_REQUEST,
+                "Invalid Request: id must be a string, number, or null",
+                None,
+            ))
+        }
+        EnvelopeCheck::Valid {
+            echo_id,
+            method,
+            is_notification,
+        } => (echo_id, method, is_notification),
     };
-
-    let id_member = obj.get("id");
-    let has_id = id_member.is_some();
-    let id_type_ok = match id_member {
-        None => true,
-        Some(v) => v.is_string() || v.is_number() || v.is_null(),
-    };
-    let echo_id = match id_member {
-        Some(v) if id_type_ok => v.clone(),
-        _ => Value::Null,
-    };
-
-    // Envelope validation (-32600). Answered even for notification-shaped
-    // frames: notification status is not trusted until the envelope is valid.
-    let jsonrpc_ok = obj.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-    let method = obj.get("method").and_then(Value::as_str);
-    let method_ok = method.map(|m| !m.is_empty()).unwrap_or(false);
-    if !jsonrpc_ok || !method_ok || !id_type_ok {
-        let msg = if !jsonrpc_ok {
-            "Invalid Request: jsonrpc must be \"2.0\""
-        } else if !method_ok {
-            "Invalid Request: method must be a non-empty string"
-        } else {
-            "Invalid Request: id must be a string, number, or null"
-        };
-        return Some(error_string(echo_id, INVALID_REQUEST, msg, None));
-    }
-    let method = method.unwrap();
-    let is_notification = !has_id;
 
     // params: object kept as-is; positional array coerced to {}; absent/null
     // treated as empty; any other scalar is invalid (§3.1).
-    let params: Map<String, Value> = match obj.get("params") {
+    let params: Map<String, Value> = match value.get("params") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(m)) => m.clone(),
         Some(Value::Array(_)) => Map::new(),
@@ -312,7 +376,10 @@ async fn dispatch(
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
-            let ws = api.archive_workspace(id).await.map_err(workspace_err)?;
+            let ws = api
+                .archive_workspace(id, None)
+                .await
+                .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
         "workspace.unarchive" => {
@@ -764,7 +831,7 @@ async fn dispatch(
             let acceptance_criteria = normalize_acceptance_criteria(params);
             let effort = opt_str(params, "effort");
             let result = api
-                .mark_as_task(ws, note_id, status, acceptance_criteria, effort)
+                .mark_as_task(ws, note_id, status, acceptance_criteria, effort, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -786,7 +853,7 @@ async fn dispatch(
             let content = opt_str(params, "content");
             let status = opt_str(params, "status");
             let result = api
-                .create_prerequisite(ws, dependent_note_id, title, content, status)
+                .create_prerequisite(ws, dependent_note_id, title, content, status, None)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -961,14 +1028,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
-        "event.recentFiles" => {
-            let ws = require_ws_note(params)?;
-            let result = api
-                .event_recent_files(ws, opt_int(params, "limit"))
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
-        }
         "event.agentActivity" => {
             let ws = require_ws_note(params)?;
             let agent_id = opt_str(params, "agentId");
@@ -983,15 +1042,6 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let result = api
                 .event_workspace_summary(ws, opt_int(params, "minutesAgo"))
-                .await
-                .map_err(domain_to_rpc)?;
-            to_result_value(&result)
-        }
-        "event.directoryChanges" => {
-            let ws = require_ws_note(params)?;
-            let dir = require_str_param(params, "dir")?;
-            let result = api
-                .event_directory_changes(ws, dir, opt_int(params, "limit"))
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1138,9 +1188,17 @@ async fn dispatch(
             // rejected rather than silently dropped because a dropped value
             // would flip the persisted flag's default.
             let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
+            // `reasoningEffort` deliberately uses `opt_str`, not
+            // `opt_nonempty_str`: at creation a present-but-blank value is an
+            // explicit clear, and the service seam distinguishes it from an
+            // absent param (absent is what lets the settings default
+            // `model.defaultReasoningEffort` apply). Collapsing `""` here
+            // would silently promote a caller's clear into the settings
+            // default. The blank is dropped downstream, so the persisted
+            // field is still `NULL` either way.
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 agent_type: opt_nonempty_str(params, "agentType"),
                 metadata: opt_value(params, "metadata"),
                 workspace_path: opt_nonempty_str(params, "workspacePath"),
@@ -1216,8 +1274,10 @@ async fn dispatch(
             // UUIDv7 id.
             let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             // Question hold (PROTOCOL §5.5): the FE RPC front door is the
-            // ONLY user-originated entry point — user sends are never held
-            // (they supersede a pending Q&A by design).
+            // ONLY user-originated entry point — user sends are never held.
+            // They do not release the hold either: only an answer-tagged row
+            // (`messageMetadata.type = "question_answers"`) or
+            // `agent.dismissQuestions` retires the pending Q&A.
             let result = api
                 .agent_send_message(
                     ws,
@@ -1337,9 +1397,23 @@ async fn dispatch(
         "agent.setModel" => {
             let agent_id = require_agent_id(params)?;
             let model_id = require_str_param(params, "modelId")?;
+            // Optional explicit provider (additive, PROTOCOL §5.5): empty /
+            // whitespace-only (and JSON null) are treated as absent so older
+            // clients sending a blank field keep the historical behavior; a
+            // present non-string value is a malformed request — reject it
+            // rather than silently falling back to the legacy path.
+            match params.get("providerId") {
+                None | Some(Value::Null) | Some(Value::String(_)) => {}
+                Some(_) => {
+                    return Err(invalid_params(
+                        "agent.setModel: providerId must be a string",
+                    ))
+                }
+            }
+            let provider_id = opt_nonempty_str(params, "providerId").map(|s| s.trim().to_string());
             let ws = require_ws_note(params)?;
             let result = api
-                .agent_set_model(ws, agent_id, model_id)
+                .agent_set_model(ws, agent_id, model_id, provider_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1437,6 +1511,12 @@ async fn dispatch(
             }
             let system_prompt = opt_str(params, "systemPrompt");
             let model = opt_str(params, "model");
+            // Optional quick-action `type` hint (`commit` / `pr` / `review` /
+            // `fast`): keys `quickActions.typeOverrides` in the daemon-side
+            // resolution the op applies when no explicit `model` is sent
+            // (monorepo#1734). Free-form on the wire — an unknown key simply
+            // misses the override map.
+            let quick_action_type = opt_nonempty_str(params, "type");
             let ws = opt_workspace_id(params);
             let timeout_ms = match params.get("timeoutMs") {
                 None | Some(Value::Null) => None,
@@ -1447,7 +1527,14 @@ async fn dispatch(
                 ),
             };
             let result = api
-                .agent_complete_once(prompt, system_prompt, model, ws, timeout_ms)
+                .agent_complete_once(
+                    prompt,
+                    system_prompt,
+                    model,
+                    quick_action_type,
+                    ws,
+                    timeout_ms,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1524,9 +1611,13 @@ async fn dispatch(
                 .map_err(|e| {
                     invalid_params(format!("agent.wakeOrCreate: invalid `create` payload: {e}"))
                 })?;
+            // `reasoningEffort` uses `opt_str` for the same reason as
+            // `agent.create` above: on the create branch a present-but-blank
+            // value is an explicit clear that must not fall through to the
+            // settings default.
             let input = AgentWakeOrCreateInput {
                 model: opt_nonempty_str(params, "model"),
-                reasoning_effort: opt_nonempty_str(params, "reasoningEffort"),
+                reasoning_effort: opt_str(params, "reasoningEffort"),
                 caller_agent_id: opt_nonempty_str(params, "callerAgentId")
                     .map(|s| AgentId::from(s.as_str())),
                 delegation_depth: params.get("delegationDepth").and_then(Value::as_i64),
@@ -2171,6 +2262,15 @@ async fn dispatch(
             let next_token = opt_str(params, "nextToken");
             let r = api
                 .github_branches_list(owner, repo, limit, next_token)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "github.branches.listCached" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let r = api
+                .github_branches_list_cached(owner, repo)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3025,9 +3125,9 @@ async fn dispatch(
         "hook.cancel" => {
             let ws = require_ws_note(params)?;
             let hook_id = require_str_param(params, "hookId")?;
-            // FE cancel (`by_owner = false`): the owning agent is woken with
-            // a cancellation notice.
-            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), false)
+            // FE cancel (no agent caller): any hook can be cancelled and the
+            // owning agent is woken with a cancellation notice.
+            api.hook_cancel(ws, intent_core::HookId::from(hook_id.as_str()), None)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -3035,6 +3135,29 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let hook_id = require_str_param(params, "hookId")?;
             api.hook_run_now(ws, intent_core::HookId::from(hook_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        // Centralized PR monitors (§6.9): the FE reads, cancels and flushes
+        // monitors; there is NO wire registration method — monitors are
+        // agent-owned via the `ws.pr.monitor` MCP binding only.
+        "prMonitor.list" => {
+            let ws = require_ws_note(params)?;
+            api.pr_monitor_list(ws, None).await.map_err(domain_to_rpc)
+        }
+        "prMonitor.cancel" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            // FE cancel: any monitor can be cancelled and the owning agent is
+            // woken with a cancellation notice.
+            api.pr_monitor_cancel_by_id(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "prMonitor.flush" => {
+            let ws = require_ws_note(params)?;
+            let monitor_id = require_str_param(params, "monitorId")?;
+            api.pr_monitor_flush_pending(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
                 .await
                 .map_err(domain_to_rpc)
         }

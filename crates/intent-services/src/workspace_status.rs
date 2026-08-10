@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 use intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED;
 use intent_core::{
-    now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
+    now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
     WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
 };
 use intent_store::NewEvent;
@@ -155,12 +155,14 @@ impl Services {
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
         // `activity: "agent_running"` with `displayStatus: "idle"`.
-        // Active background hooks fold into the promotion (§6.5): an
-        // idle agent still watching via a hook reads as active work.
+        // Active background hooks and PR monitors fold into the promotion
+        // (§6.5): an idle agent still watching via a hook or a PR monitor
+        // reads as active work.
         let display_status = compute_display_status(
-            self.workspace_needs_attention(&ws.id).await,
+            self.workspace_attention_signals(&ws.id, ws.attention).await,
             ws.activity == WorkspaceActivity::AgentRunning
                 || self.workspace_has_active_hooks(&ws.id).await
+                || self.workspace_has_active_pr_monitors(&ws.id).await
                 || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
@@ -202,11 +204,14 @@ impl Services {
             return;
         };
         let task_stats = compute_task_stats(&notes);
-        let needs_attention = self.workspace_needs_attention(workspace_id).await;
+        let signals = self
+            .workspace_attention_signals(workspace_id, ws.attention)
+            .await;
         let status = compute_display_status(
-            needs_attention,
+            signals,
             self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
                 || self.workspace_has_active_hooks(workspace_id).await
+                || self.workspace_has_active_pr_monitors(workspace_id).await
                 || self
                     .workspace_has_waiting_agent_subscriptions(workspace_id)
                     .await,
@@ -258,21 +263,40 @@ impl Services {
         }
     }
 
-    /// Whether any **top-level** agent in the workspace is waiting on the
-    /// user (PROTOCOL §6.5, `needs_attention`): a session with no
-    /// `parent_agent_id`, not background, and not deleted, that either
-    /// carries a pending attention request (`attention_request_kind` —
-    /// `discussion`/`blocker`) or has pending structured questions
-    /// ([`Services::question_hold_active`]). Child/background sessions never
-    /// count — their attention surface is the parent/subscriber (attention
-    /// -retire taxonomy). The cheap metadata check runs over every candidate
-    /// first, so transcript tail reads only happen when no session already
-    /// flagged via an attention request. Best-effort: a store read failure
-    /// fails open to `false` (and `question_hold_active` fails open itself)
-    /// so list/get emission is never wedged.
-    pub(crate) async fn workspace_needs_attention(&self, workspace_id: &WorkspaceId) -> bool {
+    /// Probe the workspace's attention axes over **top-level** agent
+    /// sessions (no `parent_agent_id`, not background, not deleted) plus the
+    /// dismissible workspace `attention` flag (PROTOCOL §6.5):
+    ///
+    /// - `failed` — a top-level session parked in `error` (awaiting
+    ///   `agent.retry`).
+    /// - `blocked` — a top-level pending `blocker` attention request.
+    /// - `needs_attention` — a top-level pending non-blocker attention
+    ///   request (`discussion`), pending structured questions
+    ///   ([`Services::question_hold_active`] — pending until answered or
+    ///   dismissed, so a question the user walked away from keeps the
+    ///   workspace flagged across the agent's later turns and daemon
+    ///   restarts), or the workspace `attention` flag at `review_required`.
+    /// - `unread` — the workspace `attention` flag at `unread`.
+    ///
+    /// Child/background sessions never count — their attention surface is
+    /// the parent/subscriber (attention-retire taxonomy). The cheap metadata
+    /// checks run over every candidate first, so the per-session hold reads
+    /// only happen when `needs_attention` is still undecided. Best-effort: a
+    /// store read failure fails open — session-derived signals read `false`
+    /// (and `question_hold_active` fails open itself) so list/get emission
+    /// is never wedged; the flag-derived signals need no store read.
+    pub(crate) async fn workspace_attention_signals(
+        &self,
+        workspace_id: &WorkspaceId,
+        attention: WorkspaceAttention,
+    ) -> AttentionSignals {
+        let mut signals = AttentionSignals {
+            needs_attention: attention == WorkspaceAttention::ReviewRequired,
+            unread: attention == WorkspaceAttention::Unread,
+            ..AttentionSignals::default()
+        };
         let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
-            return false;
+            return signals;
         };
         let top_level: Vec<_> = sessions
             .iter()
@@ -282,67 +306,121 @@ impl Services {
                     && s.status != intent_core::AgentStatus::Deleted
             })
             .collect();
-        if top_level.iter().any(|s| s.attention_request_kind.is_some()) {
-            return true;
-        }
-        for session in top_level {
-            if self.question_hold_active(&session.id).await {
-                return true;
+        for s in &top_level {
+            if s.status == intent_core::AgentStatus::Error {
+                signals.failed = true;
+            }
+            match s.attention_request_kind.as_deref() {
+                Some("blocker") => signals.blocked = true,
+                Some(_) => signals.needs_attention = true,
+                None => {}
             }
         }
-        false
+        if !signals.needs_attention {
+            for session in top_level {
+                if self.question_hold_active(&session.id).await {
+                    signals.needs_attention = true;
+                    break;
+                }
+            }
+        }
+        signals
     }
 }
 
-/// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
-/// "Proposed representation" / "Decision: BE-owned displayStatus"), folding
-/// in live agent activity (previously a client-side overlay) and the
-/// per-workspace needs-attention signal:
-/// 0. `needs_attention` → `needs_attention` unconditionally: a top-level
-///    agent waiting on the user outranks everything, including a running
-///    agent ([`Services::workspace_needs_attention`]).
-/// 1. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says. Callers fold active-hook
-///    state into this flag ([`Services::workspace_has_active_hooks`]) so an
-///    idle agent still watching via a background hook reads the same.
-/// 2. Active PR — the linked `activePullRequest` when open/draft, else the
+/// Attention-axis inputs to [`compute_display_status`], probed by
+/// [`Services::workspace_attention_signals`]. Each field is one canonical
+/// precedence rung (§6.5): `failed` > `blocked` > `needs_attention` >
+/// (running agent) > `unread` > the PR/task rollup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AttentionSignals {
+    /// A top-level non-background agent is parked in `error`.
+    pub(crate) failed: bool,
+    /// A top-level pending `blocker` attention request.
+    pub(crate) blocked: bool,
+    /// A top-level pending `discussion` request, pending structured
+    /// questions, or the `review_required` workspace attention flag.
+    pub(crate) needs_attention: bool,
+    /// The `unread` workspace attention flag; promotes only over the
+    /// idle/terminal bases (`idle` / `complete` / `pr_merged`).
+    pub(crate) unread: bool,
+}
+
+/// Derive a workspace's `displayStatus` (canonical precedence, spec
+/// "Decision: BE-owned displayStatus"), folding in live agent activity
+/// (previously a client-side overlay) and the attention axes probed by
+/// [`Services::workspace_attention_signals`]:
+/// 0. `failed` → `failed`: a top-level agent parked in `error` outranks
+///    everything — the workspace cannot make progress until `agent.retry`.
+/// 1. `blocked` → `blocked`: a top-level pending `blocker` attention
+///    request (infrastructure/environment problem).
+/// 2. `needs_attention` → `needs_attention`: a top-level agent waiting on
+///    the user (discussion request or pending structured questions) or the
+///    `review_required` workspace attention flag — outranks a running agent.
+/// 3. `agent_running` → `in_progress`: a live agent always reads as active
+///    work, whatever the PR/task rollup says. Callers fold active-hook and
+///    active-PR-monitor state into this flag
+///    ([`Services::workspace_has_active_hooks`] /
+///    [`Services::workspace_has_active_pr_monitors`]) so an idle agent
+///    still watching via a background hook or a PR monitor reads the same.
+/// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
 ///    When neither carries an open/draft entry but the workspace `prStatus`
 ///    column is `Open`/`Draft`, that column is the fallback PR-stage signal
 ///    and yields `pr_open` (never `pr_ready`: the column carries no
 ///    mergeable info).
-/// 3. Open tasks remain (`completed < total`) → `in_progress` when any task
+/// 5. Open tasks remain (`completed < total`) → `in_progress` when any task
 ///    has started, else `not_started`.
-/// 4. Latest PR (linked, else most recently updated entry) merged — or
+/// 6. Latest PR (linked, else most recently updated entry) merged — or
 ///    `prStatus == Merged` — → `pr_merged`.
-/// 5. All tasks complete → `complete`; else `not_started`.
-/// 6. Without a running agent, a task-stage rollup (`in_progress` /
-///    `not_started` from steps 3/5) demotes to `idle`; the PR stages and
+/// 7. All tasks complete → `complete`; else `not_started`.
+/// 8. Without a running agent, a task-stage rollup (`in_progress` /
+///    `not_started` from steps 5/7) demotes to `idle`; the PR stages and
 ///    `complete` pass through unchanged.
+/// 9. `unread` promotes an idle/terminal base — `idle` (including the
+///    demoted task stages), `complete`, or `pr_merged` — to `unread`; it
+///    never masks the active PR stages (`pr_ready`/`pr_open`).
 ///
-/// A merged PR in history never masks an open PR (step 2 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 3 precedes the merged check).
+/// A merged PR in history never masks an open PR (step 4 scans `pullRequests`
+/// for open/draft entries) or open tasks (step 5 precedes the merged check).
 fn compute_display_status(
-    needs_attention: bool,
+    signals: AttentionSignals,
     agent_running: bool,
     active_pr: Option<&PullRequestInfo>,
     pull_requests: &[PullRequestInfo],
     pr_status: Option<PullRequestStatus>,
     task_stats: Option<&WorkspaceTaskStats>,
 ) -> WorkspaceDisplayStatus {
-    if needs_attention {
+    if signals.failed {
+        return WorkspaceDisplayStatus::Failed;
+    }
+    if signals.blocked {
+        return WorkspaceDisplayStatus::Blocked;
+    }
+    if signals.needs_attention {
         return WorkspaceDisplayStatus::NeedsAttention;
     }
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
-    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+    let base = match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
         WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
             WorkspaceDisplayStatus::Idle
         }
         other => other,
+    };
+    if signals.unread
+        && matches!(
+            base,
+            WorkspaceDisplayStatus::Idle
+                | WorkspaceDisplayStatus::Complete
+                | WorkspaceDisplayStatus::PrMerged
+        )
+    {
+        return WorkspaceDisplayStatus::Unread;
     }
+    base
 }
 
 /// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
@@ -430,16 +508,46 @@ fn display_status_changed_event(
     }
 }
 
-/// Unit tests for the pure `compute_display_status` derivation ("current
-/// cycle" precedence): active/latest open PR → open tasks → merged PR →
-/// complete/not_started.
+/// Unit tests for the pure `compute_display_status` derivation (canonical
+/// precedence): failed → blocked → needs_attention → running agent →
+/// (unread over idle/terminal bases) → active/latest open PR → open tasks →
+/// merged PR → complete/not_started.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
         PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceTaskStats,
     };
 
-    use super::compute_display_status;
+    use super::{compute_display_status, AttentionSignals};
+
+    /// Legacy-shaped signal bundle: only the `needs_attention` axis set.
+    fn sig(needs_attention: bool) -> AttentionSignals {
+        AttentionSignals {
+            needs_attention,
+            ..AttentionSignals::default()
+        }
+    }
+
+    fn failed() -> AttentionSignals {
+        AttentionSignals {
+            failed: true,
+            ..AttentionSignals::default()
+        }
+    }
+
+    fn blocked() -> AttentionSignals {
+        AttentionSignals {
+            blocked: true,
+            ..AttentionSignals::default()
+        }
+    }
+
+    fn unread() -> AttentionSignals {
+        AttentionSignals {
+            unread: true,
+            ..AttentionSignals::default()
+        }
+    }
 
     fn pr(status: PullRequestStatus, updated_at: &str) -> PullRequestInfo {
         PullRequestInfo {
@@ -471,11 +579,11 @@ mod display_status {
     #[test]
     fn no_prs_no_tasks_is_idle() {
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, None),
+            compute_display_status(sig(false), false, None, &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(0, 0, 0))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(0, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -485,19 +593,19 @@ mod display_status {
         // The base rollup is in_progress / not_started, but without a
         // running agent the task-stage statuses demote to idle.
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 0))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(3, 0, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(3, 0, 1))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(3, 0, 1))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(3, 1, 0))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(3, 1, 0))),
             WorkspaceDisplayStatus::Idle
         );
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -506,22 +614,22 @@ mod display_status {
     fn running_agent_promotes_to_in_progress_unconditionally() {
         // A live agent wins over every PR/task rollup.
         assert_eq!(
-            compute_display_status(false, true, None, &[], None, None),
+            compute_display_status(sig(false), true, None, &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         assert_eq!(
-            compute_display_status(false, true, None, &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(sig(false), true, None, &[], None, Some(&stats(3, 3, 0))),
             WorkspaceDisplayStatus::InProgress
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, true, Some(&ready), &[], None, None),
+            compute_display_status(sig(false), true, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, true, Some(&merged), &[], None, None),
+            compute_display_status(sig(false), true, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::InProgress
         );
     }
@@ -531,27 +639,34 @@ mod display_status {
         // Step 0: the needs-attention signal outranks a running agent, every
         // PR stage, and every task rollup.
         assert_eq!(
-            compute_display_status(true, false, None, &[], None, None),
+            compute_display_status(sig(true), false, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
         );
         assert_eq!(
-            compute_display_status(true, true, None, &[], None, None),
+            compute_display_status(sig(true), true, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
         );
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(true, false, Some(&ready), &[], None, None),
+            compute_display_status(sig(true), false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(true, true, Some(&merged), &[], None, Some(&stats(3, 3, 0))),
+            compute_display_status(
+                sig(true),
+                true,
+                Some(&merged),
+                &[],
+                None,
+                Some(&stats(3, 3, 0))
+            ),
             WorkspaceDisplayStatus::NeedsAttention
         );
         assert_eq!(
             compute_display_status(
-                true,
+                sig(true),
                 false,
                 None,
                 &[],
@@ -563,22 +678,177 @@ mod display_status {
     }
 
     #[test]
+    fn failed_outranks_blocked() {
+        // Precedence boundary: failed > blocked — with both axes set the
+        // rollup reads failed.
+        let both = AttentionSignals {
+            failed: true,
+            blocked: true,
+            ..AttentionSignals::default()
+        };
+        assert_eq!(
+            compute_display_status(both, false, None, &[], None, None),
+            WorkspaceDisplayStatus::Failed
+        );
+        // Alone, each axis yields its own status.
+        assert_eq!(
+            compute_display_status(failed(), false, None, &[], None, None),
+            WorkspaceDisplayStatus::Failed
+        );
+        assert_eq!(
+            compute_display_status(blocked(), false, None, &[], None, None),
+            WorkspaceDisplayStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn blocked_outranks_needs_attention() {
+        // Precedence boundary: blocked > needs_attention.
+        let both = AttentionSignals {
+            blocked: true,
+            needs_attention: true,
+            ..AttentionSignals::default()
+        };
+        assert_eq!(
+            compute_display_status(both, false, None, &[], None, None),
+            WorkspaceDisplayStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn failed_and_blocked_win_over_everything_below() {
+        // failed/blocked outrank a running agent, every PR stage, every task
+        // rollup, and the unread flag.
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        for (signals, expected) in [
+            (failed(), WorkspaceDisplayStatus::Failed),
+            (blocked(), WorkspaceDisplayStatus::Blocked),
+        ] {
+            assert_eq!(
+                compute_display_status(signals, true, None, &[], None, None),
+                expected
+            );
+            assert_eq!(
+                compute_display_status(signals, false, Some(&ready), &[], None, None),
+                expected
+            );
+            assert_eq!(
+                compute_display_status(signals, false, None, &[], None, Some(&stats(3, 3, 0))),
+                expected
+            );
+            let with_unread = AttentionSignals {
+                unread: true,
+                ..signals
+            };
+            assert_eq!(
+                compute_display_status(with_unread, false, None, &[], None, None),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn needs_attention_outranks_running_agent_and_unread() {
+        // Precedence boundary: needs_attention > in_progress (running agent)
+        // and needs_attention > unread.
+        let both = AttentionSignals {
+            needs_attention: true,
+            unread: true,
+            ..AttentionSignals::default()
+        };
+        assert_eq!(
+            compute_display_status(both, true, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+        assert_eq!(
+            compute_display_status(both, false, None, &[], None, None),
+            WorkspaceDisplayStatus::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn running_agent_outranks_unread() {
+        // Precedence boundary: in_progress > unread — a live agent masks the
+        // unread flag (active work, nothing "unseen" to surface yet).
+        assert_eq!(
+            compute_display_status(unread(), true, None, &[], None, None),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(unread(), true, None, &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn unread_promotes_only_idle_and_terminal_bases() {
+        // unread promotes idle (no PR/tasks), the demoted task stages,
+        // complete, and pr_merged.
+        assert_eq!(
+            compute_display_status(unread(), false, None, &[], None, None),
+            WorkspaceDisplayStatus::Unread
+        );
+        assert_eq!(
+            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 1, 1))),
+            WorkspaceDisplayStatus::Unread
+        );
+        assert_eq!(
+            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::Unread
+        );
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(unread(), false, Some(&merged), &[], None, None),
+            WorkspaceDisplayStatus::Unread
+        );
+    }
+
+    #[test]
+    fn unread_never_masks_active_pr_stages() {
+        // unread does NOT promote over pr_open / pr_ready — an active PR
+        // stage is actionable state that outranks the blue dot.
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(unread(), false, Some(&open), &[], None, None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(unread(), false, Some(&ready), &[], None, None),
+            WorkspaceDisplayStatus::PrReady
+        );
+        assert_eq!(
+            compute_display_status(
+                unread(),
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                None
+            ),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
     fn pr_stages_and_complete_pass_through_without_agent() {
         // The idle demotion only applies to the task-stage rollups; PR
         // stages and complete are untouched.
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, false, Some(&ready), &[], None, None),
+            compute_display_status(sig(false), false, Some(&ready), &[], None, None),
             WorkspaceDisplayStatus::PrReady
         );
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, false, Some(&merged), &[], None, None),
+            compute_display_status(sig(false), false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, false, None, &[], None, Some(&stats(2, 2, 0))),
+            compute_display_status(sig(false), false, None, &[], None, Some(&stats(2, 2, 0))),
             WorkspaceDisplayStatus::Complete
         );
     }
@@ -588,7 +858,14 @@ mod display_status {
         let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         open.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, false, Some(&open), &[], None, Some(&stats(2, 0, 1))),
+            compute_display_status(
+                sig(false),
+                false,
+                Some(&open),
+                &[],
+                None,
+                Some(&stats(2, 0, 1))
+            ),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -597,20 +874,20 @@ mod display_status {
     fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
-            compute_display_status(false, false, Some(&open), &[], None, None),
+            compute_display_status(sig(false), false, Some(&open), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
         draft.mergeable = Some(true);
         assert_eq!(
-            compute_display_status(false, false, Some(&draft), &[], None, None),
+            compute_display_status(sig(false), false, Some(&draft), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
         let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         flagged.mergeable = Some(true);
         flagged.is_draft = Some(true);
         assert_eq!(
-            compute_display_status(false, false, Some(&flagged), &[], None, None),
+            compute_display_status(sig(false), false, Some(&flagged), &[], None, None),
             WorkspaceDisplayStatus::PrOpen
         );
     }
@@ -622,7 +899,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
@@ -633,7 +910,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&merged),
                 std::slice::from_ref(&merged),
@@ -651,7 +928,7 @@ mod display_status {
         let list = vec![merged.clone(), open.clone()];
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&merged),
                 &list,
@@ -665,7 +942,7 @@ mod display_status {
         let list = vec![merged.clone(), ready];
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&merged),
                 &list,
@@ -683,7 +960,7 @@ mod display_status {
         fresh.mergeable = Some(true);
         let list = vec![stale, fresh];
         assert_eq!(
-            compute_display_status(false, false, None, &list, None, None),
+            compute_display_status(sig(false), false, None, &list, None, None),
             WorkspaceDisplayStatus::PrReady
         );
     }
@@ -693,7 +970,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&merged),
                 &[],
@@ -703,7 +980,7 @@ mod display_status {
             WorkspaceDisplayStatus::PrMerged
         );
         assert_eq!(
-            compute_display_status(false, false, Some(&merged), &[], None, None),
+            compute_display_status(sig(false), false, Some(&merged), &[], None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -714,7 +991,7 @@ mod display_status {
         let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
         let list = vec![closed, merged];
         assert_eq!(
-            compute_display_status(false, false, None, &list, None, None),
+            compute_display_status(sig(false), false, None, &list, None, None),
             WorkspaceDisplayStatus::PrMerged
         );
     }
@@ -724,7 +1001,7 @@ mod display_status {
         let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&closed),
                 &[],
@@ -734,7 +1011,7 @@ mod display_status {
             WorkspaceDisplayStatus::Complete
         );
         assert_eq!(
-            compute_display_status(false, false, Some(&closed), &[], None, None),
+            compute_display_status(sig(false), false, Some(&closed), &[], None, None),
             WorkspaceDisplayStatus::Idle
         );
     }
@@ -742,12 +1019,19 @@ mod display_status {
     #[test]
     fn pr_status_open_or_draft_without_pr_objects_is_pr_open() {
         assert_eq!(
-            compute_display_status(false, false, None, &[], Some(PullRequestStatus::Open), None),
+            compute_display_status(
+                sig(false),
+                false,
+                None,
+                &[],
+                Some(PullRequestStatus::Open),
+                None
+            ),
             WorkspaceDisplayStatus::PrOpen
         );
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -764,7 +1048,7 @@ mod display_status {
         // open-tasks check, so in-progress or not-started tasks never mask it.
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -775,7 +1059,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -786,7 +1070,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -801,7 +1085,7 @@ mod display_status {
     fn pr_status_merged_participates_in_merged_check() {
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -812,7 +1096,7 @@ mod display_status {
         );
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -829,7 +1113,7 @@ mod display_status {
         // the task-stage status reads as idle.
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &[],
@@ -846,7 +1130,7 @@ mod display_status {
         ready.mergeable = Some(true);
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 Some(&ready),
                 &[],
@@ -858,7 +1142,7 @@ mod display_status {
         let list = vec![ready];
         assert_eq!(
             compute_display_status(
-                false,
+                sig(false),
                 false,
                 None,
                 &list,
@@ -870,18 +1154,30 @@ mod display_status {
     }
 }
 
-/// Per-workspace needs-attention signal (`Services::workspace_needs_attention`,
-/// PROTOCOL §6.5): true iff a **top-level** session (no parent, not
-/// background, not deleted) carries a pending attention request or pending
-/// structured questions; child/background/deleted sessions never count.
+/// Per-workspace attention-axis probe (`Services::workspace_attention_signals`,
+/// PROTOCOL §6.5): `needs_attention` is true iff a **top-level** session (no
+/// parent, not background, not deleted) carries a pending discussion request
+/// or pending structured questions (or the workspace flag is
+/// `review_required`); `blocked` iff one carries a pending blocker request;
+/// `failed` iff one is parked in `error`; `unread` mirrors the workspace
+/// flag. Child/background/deleted sessions never count.
 #[cfg(test)]
 mod workspace_needs_attention {
-    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, WorkspaceAttention, WorkspaceId,
+    };
     use intent_store::Store;
     use serde_json::json;
 
+    use super::AttentionSignals;
     use crate::tests::{workspace, TempDb};
     use crate::Services;
+
+    /// Probe the session-derived axes with a `None` workspace flag.
+    async fn signals(svc: &Services, ws: &WorkspaceId) -> AttentionSignals {
+        svc.workspace_attention_signals(ws, WorkspaceAttention::None)
+            .await
+    }
 
     pub(super) fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         let ts = now_iso();
@@ -895,6 +1191,7 @@ mod workspace_needs_attention {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -927,7 +1224,7 @@ mod workspace_needs_attention {
     }
 
     /// Assistant content carrying one structured-question resource block
-    /// (the shape `has_question_blocks` matches).
+    /// (the shape `question_block_count` matches).
     pub(super) fn question_content() -> serde_json::Value {
         json!([{
             "type": "resource",
@@ -948,30 +1245,69 @@ mod workspace_needs_attention {
     }
 
     #[tokio::test]
-    async fn no_sessions_is_false() {
+    async fn no_sessions_is_all_false() {
         let (svc, ws, _tmp) = setup().await;
-        assert!(!svc.workspace_needs_attention(&ws).await);
+        assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
     }
 
     #[tokio::test]
-    async fn plain_top_level_session_is_false() {
+    async fn plain_top_level_session_is_all_false() {
         let (svc, ws, _tmp) = setup().await;
         svc.store
             .insert_agent_session(&mk_session(&ws, "agent-plain"))
             .await
             .unwrap();
-        assert!(!svc.workspace_needs_attention(&ws).await);
+        assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
     }
 
     #[tokio::test]
-    async fn top_level_attention_request_is_true() {
+    async fn top_level_attention_requests_split_by_kind() {
+        // A discussion request drives needs_attention; a blocker drives
+        // blocked — the axes are independent.
         let (svc, ws, _tmp) = setup().await;
-        for kind in ["discussion", "blocker"] {
-            let mut s = mk_session(&ws, &format!("agent-{kind}"));
-            s.attention_request_kind = Some(kind.to_string());
-            svc.store.insert_agent_session(&s).await.unwrap();
-        }
-        assert!(svc.workspace_needs_attention(&ws).await);
+        let mut discuss = mk_session(&ws, "agent-discussion");
+        discuss.attention_request_kind = Some("discussion".to_string());
+        svc.store.insert_agent_session(&discuss).await.unwrap();
+        let s = signals(&svc, &ws).await;
+        assert!(s.needs_attention);
+        assert!(!s.blocked);
+
+        let mut blocker = mk_session(&ws, "agent-blocker");
+        blocker.attention_request_kind = Some("blocker".to_string());
+        svc.store.insert_agent_session(&blocker).await.unwrap();
+        let s = signals(&svc, &ws).await;
+        assert!(s.needs_attention);
+        assert!(s.blocked);
+        assert!(!s.failed);
+    }
+
+    #[tokio::test]
+    async fn top_level_error_session_is_failed() {
+        let (svc, ws, _tmp) = setup().await;
+        let mut errored = mk_session(&ws, "agent-error");
+        errored.status = AgentStatus::Error;
+        svc.store.insert_agent_session(&errored).await.unwrap();
+        let s = signals(&svc, &ws).await;
+        assert!(s.failed);
+        assert!(!s.blocked);
+        assert!(!s.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn workspace_attention_flag_maps_to_axes() {
+        // review_required → needs_attention; unread → unread. Both are
+        // flag-only signals: no sessions required.
+        let (svc, ws, _tmp) = setup().await;
+        let s = svc
+            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
+            .await;
+        assert!(s.needs_attention);
+        assert!(!s.unread);
+        let s = svc
+            .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
+            .await;
+        assert!(s.unread);
+        assert!(!s.needs_attention);
     }
 
     #[tokio::test]
@@ -992,11 +1328,22 @@ mod workspace_needs_attention {
         deleted.attention_request_kind = Some("discussion".to_string());
         svc.store.insert_agent_session(&deleted).await.unwrap();
 
-        assert!(!svc.workspace_needs_attention(&ws).await);
+        // A failed child/background session never drives `failed` either.
+        let mut failed_child = mk_session(&ws, "agent-failed-child");
+        failed_child.parent_agent_id = Some(AgentId::from("agent-parent"));
+        failed_child.status = AgentStatus::Error;
+        svc.store.insert_agent_session(&failed_child).await.unwrap();
+
+        let mut failed_bg = mk_session(&ws, "agent-failed-bg");
+        failed_bg.is_background = true;
+        failed_bg.status = AgentStatus::Error;
+        svc.store.insert_agent_session(&failed_bg).await.unwrap();
+
+        assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
     }
 
     #[tokio::test]
-    async fn pending_questions_on_top_level_session_is_true() {
+    async fn pending_questions_on_top_level_session_is_needs_attention() {
         let (svc, ws, _tmp) = setup().await;
         let session = mk_session(&ws, "agent-q");
         svc.store.insert_agent_session(&session).await.unwrap();
@@ -1004,14 +1351,15 @@ mod workspace_needs_attention {
             .append_agent_message(&session.id, "assistant", &question_content(), &now_iso())
             .await
             .unwrap();
-        assert!(svc.workspace_needs_attention(&ws).await);
+        assert!(signals(&svc, &ws).await.needs_attention);
     }
 
     #[tokio::test]
     async fn superseded_or_dismissed_questions_are_false() {
         let (svc, ws, _tmp) = setup().await;
 
-        // A user reply after the question row supersedes the hold.
+        // Pre-upgrade session (no pending-questions marker): the legacy
+        // tail-walk fallback still reads a trailing user reply as resolving.
         let answered = mk_session(&ws, "agent-answered");
         svc.store.insert_agent_session(&answered).await.unwrap();
         svc.store
@@ -1042,25 +1390,30 @@ mod workspace_needs_attention {
         }));
         svc.store.update_agent_session(&ws, &updated).await.unwrap();
 
-        assert!(!svc.workspace_needs_attention(&ws).await);
+        assert!(!signals(&svc, &ws).await.needs_attention);
     }
 
-    /// A store read failure fails open to `false` (list/get emission must
-    /// never be wedged by the attention probe).
+    /// A store read failure fails open (list/get emission must never be
+    /// wedged by the attention probe): session-derived axes read `false`,
+    /// while the flag-derived axes survive (no store read involved).
     #[tokio::test]
-    async fn store_read_failure_fails_open_to_false() {
+    async fn store_read_failure_fails_open() {
         let (svc, ws, _tmp) = setup().await;
         let mut s = mk_session(&ws, "agent-attn");
         s.attention_request_kind = Some("blocker".to_string());
         svc.store.insert_agent_session(&s).await.unwrap();
-        assert!(svc.workspace_needs_attention(&ws).await);
+        assert!(signals(&svc, &ws).await.blocked);
 
         // Force list_agent_session_summaries to fail.
         sqlx::query("DROP TABLE agent_session")
             .execute(svc.store.write_pool())
             .await
             .expect("drop agent_session table");
-        assert!(!svc.workspace_needs_attention(&ws).await);
+        assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
+        let s = svc
+            .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
+            .await;
+        assert!(s.unread, "flag-derived axes survive a store read failure");
     }
 }
 
@@ -1722,6 +2075,7 @@ mod display_status_events {
                 "Fresh prerequisite".to_string(),
                 None,
                 None,
+                None,
             )
             .await
             .expect("create prerequisite");
@@ -1886,7 +2240,12 @@ mod display_status_events {
             Some("discussion"),
             "A's pending request survives B's clear"
         );
-        assert!(h.services.workspace_needs_attention(&h.ws).await);
+        assert!(
+            h.services
+                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None)
+                .await
+                .needs_attention
+        );
 
         // Clearing A's own request retires the hold and emits the demotion.
         manager
@@ -1899,12 +2258,12 @@ mod display_status_events {
         );
     }
 
-    /// An agent run ending must not demote a surviving `needs_attention`:
-    /// the pending request outranks both the running promotion and the
+    /// An agent run ending must not demote a surviving `blocked`: the
+    /// pending blocker request outranks both the running promotion and the
     /// post-debounce idle recompute, so the whole begin→end cycle stays
-    /// silent and the read path keeps serving `needs_attention`.
+    /// silent and the read path keeps serving `blocked`.
     #[tokio::test]
-    async fn agent_end_preserves_surviving_needs_attention() {
+    async fn agent_end_preserves_surviving_blocked() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-hold");
@@ -1916,17 +2275,22 @@ mod display_status_events {
             .set_attention_request(&h.ws, &session.id, "blocker", "stuck", &now_iso())
             .await
             .expect("raise");
-        // Seed: baseline needs_attention.
+        // Seed: baseline blocked.
         h.services.maybe_emit_display_status_changed(&h.ws).await;
 
         let mut sub = subscribe(&h);
         h.services.agent_activity_begin(&h.ws).await;
         h.services.agent_activity_end(&h.ws).await;
-        // Wait out the debounced idle recompute: needs_attention outranks
-        // both transitions, so nothing emits (assert_silent's 300ms watch
+        // Wait out the debounced idle recompute: blocked outranks both
+        // transitions, so nothing emits (assert_silent's 300ms watch
         // covers the 100ms debounce window).
         assert_silent(&mut sub).await;
-        assert!(h.services.workspace_needs_attention(&h.ws).await);
+        assert!(
+            h.services
+                .workspace_attention_signals(&h.ws, intent_core::WorkspaceAttention::None)
+                .await
+                .blocked
+        );
     }
 
     /// Idle-demotion vs activity-begin race: an `agent_activity_begin`
@@ -1959,9 +2323,11 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
-    /// Question-resolution trigger via a user-origin delivery (§6.5 step 0):
-    /// the persisted user row supersedes the pending question tail
-    /// (store-only `agent.sendMessage` path) and emits the demotion.
+    /// Question-resolution trigger (§6.5 step 0): only the ANSWER — a user
+    /// row tagged `question_answers` for the marked question message — clears
+    /// the pending-questions marker and emits the demotion (store-only
+    /// `agent.sendMessage` path). A PLAIN user message leaves the Q&A pending,
+    /// so the workspace stays `needs_attention` and nothing emits.
     #[tokio::test]
     async fn user_answer_retires_question_hold_and_emits() {
         let h = harness().await;
@@ -1970,7 +2336,8 @@ mod display_status_events {
             .insert_agent_session(&session)
             .await
             .expect("session");
-        h.store
+        let asked = h
+            .store
             .append_agent_message(
                 &session.id,
                 "assistant",
@@ -1979,9 +2346,29 @@ mod display_status_events {
             )
             .await
             .expect("append question");
+        h.services
+            .record_pending_questions_marker(&h.ws, &session.id, &asked.id)
+            .await;
         h.services.maybe_emit_display_status_changed(&h.ws).await;
 
         let mut sub = subscribe(&h);
+        h.services
+            .agent_send_message_op(
+                session.id.clone(),
+                "unrelated aside".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("send plain message");
+        assert!(
+            h.services.question_hold_active(&session.id).await,
+            "a plain user message must not resolve the pending Q&A"
+        );
+        assert_silent(&mut sub).await;
+
         h.services
             .agent_send_message_op(
                 session.id.clone(),
@@ -1989,12 +2376,279 @@ mod display_status_events {
                 None,
                 None,
                 None,
-                None,
+                Some(json!({
+                    "type": "question_answers",
+                    "answeredQuestionsMessageId": asked.id,
+                })),
             )
             .await
             .expect("send answer");
         let ev = recv_one(&mut sub).await;
         assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Blocker raise/retire triggers (§6.5 step 1): a top-level
+    /// `agent.requestAttention` blocker promotes the derived rollup to
+    /// `blocked` (not `needs_attention`) and emits; the turn-begin clear
+    /// retires it and emits the demotion.
+    #[tokio::test]
+    async fn blocker_raise_and_retire_transitions_emit() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-blk");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_request_attention_op(
+                h.ws.clone(),
+                "blocker".to_string(),
+                "sandbox broken".to_string(),
+                Some(session.id.clone()),
+            )
+            .await
+            .expect("raise blocker");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "blocked" })
+        );
+
+        // Retire via the runtime's turn-begin clear hook.
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        manager
+            .clear_attention_request_if_present(&session.id, &h.ws)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Failed park/retire triggers (§6.5 step 0): a top-level agent parked
+    /// in `error` drives the derived rollup to `failed`; `agent.retry`
+    /// clears the park and emits the demotion.
+    #[tokio::test]
+    async fn agent_retry_retires_failed_and_emits() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let mut session = super::workspace_needs_attention::mk_session(&h.ws, "agent-err");
+        session.status = intent_core::AgentStatus::Error;
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed: baseline failed.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        let result = manager
+            .agent_retry(session.id.clone(), h.ws.clone())
+            .await
+            .expect("retry");
+        assert_eq!(result["ok"], true);
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// The documented "fresh `agent.sendMessage`" recovery path for an
+    /// errored (non-poisoned) agent: the direct-send emits the visible
+    /// `failed → in_progress` transition. Pins the recompute after the
+    /// user-row persist in `send_message` — the earlier recompute inside
+    /// `try_begin` still reads `status = Error` and is a no-op, so without
+    /// this one the redriven turn would stay `failed` on the event stream.
+    #[tokio::test]
+    async fn send_message_redrive_emits_failed_to_in_progress() {
+        use std::sync::Arc;
+        let h = harness().await;
+        let mut session = super::workspace_needs_attention::mk_session(&h.ws, "agent-redrive");
+        session.status = intent_core::AgentStatus::Error;
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        // Seed: baseline failed.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        let sink: Arc<dyn intent_acp::EventSink> =
+            Arc::new(crate::BusEventSink::new(h.bus.clone()));
+        let manager = Arc::new(crate::agent_manager::AgentManager::new(
+            h.services.clone(),
+            sink,
+            4,
+        ));
+        let result = manager
+            .send_message(
+                session.id.clone(),
+                h.ws.clone(),
+                "try again".to_string(),
+                None,
+                crate::agent_manager::TurnOptions::default(),
+            )
+            .await
+            .expect("send message");
+        assert_eq!(result["queued"], false, "direct send: {result}");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "in_progress" })
+        );
+    }
+
+    /// Unread flag triggers (§6.5 step 9): `raise_attention(Unread)` (the
+    /// turn-end blue dot) promotes an idle base to `unread` and emits;
+    /// `workspace.markSeen` retires the flag and emits the demotion.
+    #[tokio::test]
+    async fn unread_raise_and_mark_seen_transitions_emit() {
+        let h = harness().await;
+        // Seed: idle baseline (no agents, no PR, no tasks).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "unread" })
+        );
+
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// Unread never masks a running agent: raising the flag while the
+    /// workspace is `in_progress` recomputes to the same `in_progress`
+    /// (no transition, no event).
+    #[tokio::test]
+    async fn unread_raise_during_active_run_stays_silent() {
+        let h = harness().await;
+        h.services.agent_activity_begin(&h.ws).await;
+        // Seed: in_progress baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert_silent(&mut sub).await;
+    }
+
+    /// Regression (intentd#945 review): the turn-end `raise_attention(Unread)`
+    /// never downgrades a persistent `review_required` flag — the raise is a
+    /// guarded no-op (no `attention-changed`, no `needs_attention → unread`
+    /// demotion), and a later `workspace.markSeen` (guarded on `unread`)
+    /// leaves the review-required attention in place.
+    #[tokio::test]
+    async fn unread_raise_never_downgrades_review_required() {
+        let h = harness().await;
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    attention: Some(intent_core::WorkspaceAttention::ReviewRequired),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set review_required");
+        // Seed: needs_attention baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert_silent(&mut sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ws.attention,
+            intent_core::WorkspaceAttention::ReviewRequired,
+            "turn-end unread raise must not overwrite review_required"
+        );
+
+        // markSeen only clears `unread`; review_required persists untouched.
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ws.attention,
+            intent_core::WorkspaceAttention::ReviewRequired
+        );
+    }
+
+    /// ReviewRequired flag triggers (§6.5 step 2): a `workspace.update`
+    /// carrying `attention: review_required` promotes the derived rollup to
+    /// `needs_attention` and emits; `workspace.dismissAttention` retires it
+    /// and emits the demotion.
+    #[tokio::test]
+    async fn review_required_flag_transitions_emit() {
+        let h = harness().await;
+        // Seed: idle baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .update_workspace(
+                h.ws.clone(),
+                intent_core::WorkspaceUpdate {
+                    attention: Some(intent_core::WorkspaceAttention::ReviewRequired),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set review_required");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+        let ev = recv_one(&mut sub).await;
         assert_eq!(
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })

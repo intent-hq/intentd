@@ -265,6 +265,30 @@ fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
     vec![stale, chunk]
 }
 
+/// A tool-ONLY prompt turn: three distinct tool calls and not a single
+/// assistant text chunk — the shape an implementor sub-agent spends most of a
+/// turn in (monorepo#1414).
+fn prompt_updates_tools_only() -> Vec<String> {
+    let tool = |id: &str, title: &str, status: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                    "title": title, "kind": "execute", "status": status,
+                    "rawInput": { "cmd": "x" } }
+            }
+        })
+        .to_string()
+    };
+    vec![
+        tool("t1", "bash: cargo test", "in_progress"),
+        tool("t2", "view: src/lib.rs", "in_progress"),
+        tool("t3", "bash: cargo fmt", "in_progress"),
+    ]
+}
+
 /// Shared crate-wide env guard (defined in `agent_manager::tests`): tests
 /// here that pin `INTENTD_PROMPT_IDLE_TIMEOUT_MS` must serialize with the
 /// worker-level tests that pin the same var.
@@ -576,6 +600,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -1689,10 +1714,12 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
 
 /// §6.5 step-0 turn-end trigger: a turn whose persisted assistant tail
 /// carries a question resource block promotes the workspace's derived
-/// `displayStatus` to `needs_attention` (and emits the transition); the next
-/// turn — after the user's answer superseded the questions — persists a
-/// question-free tail and the same turn-end recompute retires it back to
-/// `idle`.
+/// `displayStatus` to `needs_attention` (and emits the transition); once the
+/// user's ANSWER (a row tagged `question_answers` for that message) clears the
+/// pending-questions marker, the next turn's question-free tail lets the same
+/// turn-end recompute retire it back to `idle`. A plain user row and a
+/// question-free turn alone do NOT retire it — pendingness is persisted until
+/// answered or dismissed.
 #[tokio::test]
 async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -1743,16 +1770,28 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         json!({ "workspaceId": workspace_id.0, "displayStatus": "needs_attention" })
     );
 
-    // The user's answer supersedes the questions (appended directly — the
-    // send paths carry their own recompute, exercised elsewhere), then turn
-    // 2 persists a question-free tail: the turn-end recompute retires the
-    // hold and emits the demotion.
-    bus.store()
-        .append_agent_message(
-            &agent_id,
-            "user",
-            &json!([{ "type": "text", "text": "answer" }]),
-            &now_iso(),
+    // The user's ANSWER resolves the questions (appended via the op so the
+    // pending-questions marker clears — the send paths carry the same
+    // resolution, exercised elsewhere), then turn 2 persists a question-free
+    // tail: the turn-end recompute retires the hold and emits the demotion.
+    let asked_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "answer" }]),
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            })),
         )
         .await
         .expect("append answer");
@@ -1780,6 +1819,89 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
     );
 }
 
+/// Stored-on-write pending-questions marker (PROTOCOL §5.5, question hold):
+/// the turn-end persist writes the marker under the turn's message id when the
+/// assistant tail bears question blocks, and a subsequent question-FREE turn
+/// leaves it in place (pendingness survives the agent's own later turns).
+#[tokio::test]
+async fn turn_end_writes_pending_marker_and_question_free_turn_keeps_it() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    services.turn_attachments().register(
+        &agent_id,
+        intent_core::TurnAttachment {
+            id: "tar-q1".to_string(),
+            policy: intent_core::AttachmentPolicy::AtTurnEnd,
+            mime_type: intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE.to_string(),
+            uri: "question://q-1".to_string(),
+            name: "Question".to_string(),
+            text: "{\"questions\":[]}".to_string(),
+        },
+    );
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("ask")],
+            None,
+        )
+        .await
+        .expect("turn 1 completes");
+
+    let asked_id = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("messages")
+        .last()
+        .expect("assistant row")
+        .id
+        .clone();
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "turn end persists the pending-questions marker"
+    );
+    assert!(services.question_hold_active(&agent_id).await);
+
+    // A question-free turn must NOT clear the marker.
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            None,
+        )
+        .await
+        .expect("turn 2 completes");
+    let session = bus
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(
+        session.pending_questions_message_id(),
+        Some(asked_id.as_str()),
+        "a question-free turn end must not clear the marker"
+    );
+    assert!(
+        services.question_hold_active(&agent_id).await,
+        "hold survives the agent's later turn"
+    );
+}
+
 /// Question resource content-block array — the tail shape
 /// `ws.app.question.ask` persists — for the monorepo#1266 regression tests
 /// over the transcript-mutation ops below.
@@ -1804,30 +1926,66 @@ fn display_status_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::even
     })
 }
 
-/// monorepo#1266 regression (retire): a user row appended via
-/// `agent.appendMessage` supersedes a pending question tail, so the op's own
-/// recompute must retire the workspace's `needs_attention` displayStatus —
-/// not leave it stale until the next trigger or snapshot.
+/// monorepo#1266 regression (retire): the ANSWER row appended via
+/// `agent.appendMessage` — tagged `question_answers` for the marked question
+/// message — resolves the pending Q&A, so the op's own recompute must retire
+/// the workspace's `needs_attention` displayStatus rather than leave it stale
+/// until the next trigger or snapshot. A PLAIN user row does not: pendingness
+/// now survives it, so the status stays `needs_attention` and nothing emits.
 #[tokio::test]
-async fn append_message_op_user_row_retires_needs_attention() {
+async fn append_message_op_answer_row_retires_needs_attention() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    // Seed a question-bearing assistant tail, then the last-observed
-    // baseline (needs_attention; a first observation never emits).
-    bus.store()
-        .append_agent_message(&agent_id, "assistant", &question_blocks(), &now_iso())
+    // Seed a question-bearing assistant tail through the op so the
+    // pending-questions marker is armed, then the last-observed baseline
+    // (needs_attention; a first observation never emits).
+    let asked = services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "assistant".to_string(),
+            question_blocks(),
+            None,
+        )
         .await
         .expect("append question tail");
+    let asked_id = asked["message"]["id"]
+        .as_str()
+        .expect("question row id")
+        .to_string();
     services
         .maybe_emit_display_status_changed(&workspace_id)
         .await;
     let mut sub = display_status_sub(&bus, &workspace_id);
+
+    // A plain user row leaves the Q&A pending — no transition, no emit.
+    services
+        .agent_append_message_op(
+            agent_id.clone(),
+            "user".to_string(),
+            json!([{ "type": "text", "text": "unrelated aside" }]),
+            None,
+        )
+        .await
+        .expect("plain appendMessage succeeds");
+    assert!(
+        services.question_hold_active(&agent_id).await,
+        "a plain user row must not resolve the pending Q&A"
+    );
+    assert!(
+        timeout(Duration::from_millis(300), sub.recv())
+            .await
+            .is_err(),
+        "no displayStatus transition for a plain user row"
+    );
 
     services
         .agent_append_message_op(
             agent_id.clone(),
             "user".to_string(),
             json!([{ "type": "text", "text": "answer" }]),
-            None,
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": asked_id,
+            })),
         )
         .await
         .expect("appendMessage succeeds");
@@ -1879,8 +2037,11 @@ async fn append_message_op_question_row_raises_needs_attention() {
 
 /// monorepo#1266 regression: `agent.replaceMessages` swaps the whole
 /// transcript, which can move the question-hold derivation in either
-/// direction — a question-free swap retires `needs_attention`, a swap ending
-/// on a question-bearing assistant row raises it again. Both flips must emit.
+/// direction — a swap whose question row is answered retires
+/// `needs_attention`, a swap ending on an unanswered question-bearing
+/// assistant row raises it again. Both flips must emit. The swap re-mints row
+/// ids, so the pending-questions marker is re-derived from the new transcript
+/// rather than left dangling.
 #[tokio::test]
 async fn replace_messages_op_moves_needs_attention_both_ways() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
@@ -1894,13 +2055,20 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
         .await;
     let mut sub = display_status_sub(&bus, &workspace_id);
 
-    // Retire: the swapped transcript ends on a user row.
+    // Retire: the swapped transcript's question row is answered.
     services
         .agent_replace_messages_op(
             agent_id.clone(),
             json!([
                 { "role": "assistant", "contentBlocks": question_blocks() },
-                { "role": "user", "contentBlocks": [{ "type": "text", "text": "answer" }] },
+                {
+                    "role": "user",
+                    "contentBlocks": [{ "type": "text", "text": "answer" }],
+                    "metadata": {
+                        "type": "question_answers",
+                        "answeredQuestionsMessageId": "pre-swap-id",
+                    },
+                },
             ]),
         )
         .await
@@ -2471,6 +2639,431 @@ async fn post_output_transport_death_keeps_terminal_events() {
     assert_eq!(messages.len(), 1, "partial output persisted");
 }
 
+/// Mock agent whose `session/prompt` streams `updates`, then resolves with a
+/// JSON-RPC ERROR object (rather than a result) carrying `message` — used to
+/// force a deterministic, classifier-shaped `AcpError::Rpc` (e.g. a transient
+/// connection reset vs a terminal 4xx) for the sleep-resume enrollment path.
+fn spawn_mock_agent_with_prompt_rpc_error<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
+/// error carrying `error_message` (after streaming `updates`).
+fn connect_with_prompt_rpc_error(
+    updates: Vec<String>,
+    error_message: &str,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent_with_prompt_rpc_error(
+        c2a_agent,
+        a2c_agent,
+        updates,
+        error_message.to_string(),
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
+/// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the
+/// sleep-resume enrollment tests: reports a fixed overlap answer regardless of
+/// the queried window.
+struct FakeSuspend(Option<Duration>);
+
+impl crate::agent_session::SuspendOverlapQuery for FakeSuspend {
+    fn did_suspend_overlap(
+        &self,
+        _start: std::time::Instant,
+        _end: std::time::Instant,
+    ) -> Option<Duration> {
+        self.0
+    }
+}
+
+/// A `session/update` text chunk for the sleep-resume tests.
+fn suspend_chunk(text: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }
+    })
+    .to_string()
+}
+
+/// Task C happy path: a transient upstream disconnect whose active window
+/// overlapped a detected host suspend is ENROLLED as interrupted, not surfaced
+/// terminally. `run_prompt_turn` returns the suspend-interrupt marker error,
+/// emits the interrupted terminal `agent:stream:end` (`stopReason:
+/// "interrupted"`, `interruptReason: "system_suspend"`) and NO `agent:failed`,
+/// persists the partial turn tagged with the interrupt reason, and writes an
+/// `interrupted_agent` row for the wake orchestrator (Task D).
+#[tokio::test]
+async fn suspend_interrupt_enrolls_transient_failure_and_suppresses_terminal_failure() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+    // Stream a partial chunk, then fail with a connection-reset RPC error.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a suspend-overlapping transient failure still returns Err");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg)
+                if msg.starts_with(crate::agent_session::PROMPT_SUSPEND_INTERRUPT_PREFIX)
+        ),
+        "sleep-induced failure carries the suspend-interrupt marker: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "no agent:failed for a sleep-induced interruption"
+    );
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("interrupted terminal stream:end emitted");
+    assert_eq!(end.data["stopReason"], json!("interrupted"));
+    assert_eq!(end.data["interruptReason"], json!("system_suspend"));
+
+    // The partial turn persisted, tagged with the interrupt reason.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        1,
+        "partial turn persisted on suspend enroll"
+    );
+    assert_eq!(
+        messages[0]
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("interruptReason").and_then(Value::as_str)),
+        Some("system_suspend"),
+        "persisted row tagged suspend-induced"
+    );
+
+    // The interrupted_agent row is written for the wake orchestrator (Task D).
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.iter().any(|ia| ia.agent_id == agent_id),
+        "interrupted_agent row enrolled for wake-resume"
+    );
+}
+
+/// Task C boundary: the SAME transient failure with NO overlapping suspend
+/// (the tracker reports `None`) is NOT enrolled — it keeps today's terminal
+/// behavior (ordinary `session/prompt failed:` wrapper, `agent:failed` emitted,
+/// no `interrupted_agent` row).
+#[tokio::test]
+async fn suspend_interrupt_awake_transient_failure_surfaces_terminally() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(None)));
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("an awake-time transient failure fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")
+        ),
+        "awake-time failure keeps the ordinary wrapper: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:failed"),
+        "awake-time failure surfaces agent:failed"
+    );
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.is_empty(),
+        "no interrupted_agent row for an awake-time failure"
+    );
+}
+
+/// Task C boundary: a NON-transient error (a terminal 4xx) is NOT enrolled even
+/// when a suspend overlapped — the classifier rejects it, so the turn surfaces
+/// terminally with `agent:failed` and no `interrupted_agent` row.
+#[tokio::test]
+async fn suspend_interrupt_ignores_non_transient_error_during_suspend() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(Vec::new(), "HTTP 401 Unauthorized");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a terminal 4xx fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")
+        ),
+        "a non-transient error keeps the ordinary wrapper even during suspend: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:failed"),
+        "a non-transient error surfaces agent:failed even during suspend"
+    );
+    let interrupted = bus.store().list_interrupted_agents().await.unwrap();
+    assert!(
+        interrupted.is_empty(),
+        "no interrupted_agent row for a non-transient error"
+    );
+}
+
+/// Task D end-to-end: a turn ENROLLED by Task C's classifier (a suspend-
+/// overlapping transient disconnect via the real `run_prompt_turn` path) is
+/// resumed by the wake-triggered sweep. The enrolled row is tagged
+/// `system_suspend`, the sweep resumes exactly it, and its atomic claim leaves
+/// the row resolved (no longer pending).
+#[tokio::test]
+async fn wake_resume_resumes_turn_enrolled_by_suspend_classifier() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+
+    // Task C: a transient disconnect overlapping a suspend enrolls the turn.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("suspend-overlapping transient failure returns the interrupt marker");
+
+    // The enrolled row carries the system_suspend reason (only these auto-resume).
+    let row = bus
+        .store()
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // The mid-turn session had an open ACP session id (required to reload).
+    bus.store()
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .expect("mark session resumable");
+
+    // Simulated host wake: the sweep resumes the enrolled row.
+    let resumed = services.resume_suspend_interrupted_agents().await;
+    assert_eq!(resumed, 1, "the enrolled suspend turn is resumed on wake");
+    assert!(
+        bus.store()
+            .get_interrupted_agent(&agent_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the enrolled row is claimed and resolved by the wake sweep"
+    );
+}
+
+/// Finding 2 (late-enrollment self-heal): a row enrolled AFTER the one-shot wake
+/// sweep must not stay stranded until the next host wake. Enrollment fires a
+/// gated, debounced resume directly, so WITHOUT any wake broadcast (the test
+/// never calls `resume_suspend_interrupted_agents`) the enrolled row still
+/// resolves on its own. The `INTENTD_WAKE_RESUME_SELF_HEAL_MS` seam compresses
+/// the debounce so the test need not wait the production window.
+#[tokio::test]
+async fn suspend_enrollment_self_heals_resume_without_wake_broadcast() {
+    // Compress the self-heal debounce for the test (guard restores the env).
+    let _env = EnvGuard::set_all(&[("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "50")]);
+
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let services = services.with_suspend_tracker(std::sync::Arc::new(FakeSuspend(Some(
+        Duration::from_secs(120),
+    ))));
+
+    // The mid-turn session had an open ACP session id (required for the
+    // self-heal sweep to consider the row resumable). Set it BEFORE the turn so
+    // the debounced resume — which may fire moments after enrollment — sees it.
+    bus.store()
+        .set_acp_session_id(&workspace_id, &agent_id, ACP_SID)
+        .await
+        .expect("mark session resumable");
+
+    // A transient disconnect overlapping a suspend enrolls the turn AND schedules
+    // the self-heal resume.
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error(vec![suspend_chunk("partial ")], "Connection reset by peer");
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("suspend-overlapping transient failure returns the interrupt marker");
+
+    // The row is enrolled and (initially) pending — the wake broadcast has NOT run.
+    let row = bus
+        .store()
+        .get_interrupted_agent(&agent_id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // Poll: the enrollment-driven self-heal resumes the row on its own, with no
+    // call to `resume_suspend_interrupted_agents` from the test.
+    let mut resolved = false;
+    for _ in 0..40 {
+        if bus
+            .store()
+            .get_interrupted_agent(&agent_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            resolved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        resolved,
+        "the row enrolled after the sweep still resumes via the enrollment self-heal (no wake broadcast)"
+    );
+}
+
 /// Warn-and-continue (idle timeout, silent turn): a prompt that goes the
 /// whole idle window with zero `session/update` traffic resolves with the
 /// idle-timeout error under the ORDINARY wrapper (no streamed-output suffix),
@@ -2616,25 +3209,24 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
 }
 
 /// Warn-and-continue (idle timeout after an UNMAPPED update): a
-/// `session/update` variant with no canonical turn mapping (here a thought
-/// chunk — same class as plan/mode/usage) still reset the idle timer, so it
+/// `session/update` variant with no canonical turn mapping (here a plan
+/// update — same class as mode/commands) still reset the idle timer, so it
 /// counts as intervening activity: the wrapped error carries the
 /// streamed-output suffix even though nothing was applied to the transcript.
 #[tokio::test]
 async fn idle_timeout_after_unmapped_update_marks_streamed() {
     let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
-    let thought = json!({
+    let plan = json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": {
             "sessionId": ACP_SID,
-            "update": { "sessionUpdate": "agent_thought_chunk",
-                "content": { "type": "text", "text": "thinking" } }
+            "update": { "sessionUpdate": "plan", "entries": [] }
         }
     })
     .to_string();
-    let (conn, mut note_rx, _agent) = connect_silent(vec![thought]);
+    let (conn, mut note_rx, _agent) = connect_silent(vec![plan]);
     let _sub = bus.subscribe(SubscriptionFilter::default());
 
     let err = services
@@ -3323,6 +3915,242 @@ async fn resume_session_discovers_thought_level_option() {
     );
 }
 
+/// A `session/new` result shaped like claude-agent-acp's: the `thought_level`
+/// select lists a `default` sentinel alongside the real levels
+/// (default/low/medium/high/max).
+fn claude_shaped_thought_level_session_result() -> Value {
+    json!({
+        "sessionId": ACP_SID,
+        "configOptions": [
+            { "id": "effort", "name": "Effort", "category": "thought_level",
+              "type": "select", "currentValue": "default",
+              "options": [ { "value": "default", "name": "Default" },
+                           { "value": "low", "name": "Low" },
+                           { "value": "medium", "name": "Medium" },
+                           { "value": "high", "name": "High" },
+                           { "value": "max", "name": "Max" } ] }
+        ]
+    })
+}
+
+/// [`ThoughtLevelOption::surfaced_levels`] drops the case-insensitive
+/// `"default"` sentinel and returns `None` (not `Some(empty)`) when nothing
+/// remains.
+#[test]
+fn surfaced_levels_filters_default_sentinel() {
+    let mut tl = super::ThoughtLevelOption {
+        config_id: "effort".to_string(),
+        initial_value: "Default".to_string(),
+        current_value: "Default".to_string(),
+        values: ["Default", "low", "medium", "high", "max"]
+            .map(String::from)
+            .to_vec(),
+    };
+    assert_eq!(
+        tl.surfaced_levels().as_deref(),
+        Some(
+            ["low", "medium", "high", "max"]
+                .map(String::from)
+                .as_slice()
+        )
+    );
+    tl.values = vec!["DEFAULT".to_string()];
+    assert_eq!(tl.surfaced_levels(), None, "all-sentinel list yields None");
+    tl.values = Vec::new();
+    assert_eq!(tl.surfaced_levels(), None, "empty list yields None");
+}
+
+/// Regression (PROTOCOL §5.5, Option C): a claude-code-shaped `configOptions`
+/// (thought_level select with default/low/medium/high/max) yields
+/// `effortLevels: ["low","medium","high","max"]` on the wire — persisted by
+/// `open_acp_session` itself, carried by the `AgentLite` projection, and
+/// announced by ONE `agent:updated`; the identical re-discovery on the next
+/// session open (a `resume_acp_session` here) emits nothing.
+#[tokio::test]
+async fn session_open_persists_effort_levels_and_emits_on_change_only() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-persist");
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let (conn, _rx, _agent) =
+        connect_with_session_result(claude_shaped_thought_level_session_result());
+    services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+
+    let expected = ["low", "medium", "high", "max"].map(String::from).to_vec();
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.effort_levels.as_deref(), Some(expected.as_slice()));
+    // The wire projection carries the camelCase field.
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
+    assert_eq!(
+        serde_json::to_value(&lite).unwrap()["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+    // One agent:updated announced the change (the open also emits
+    // session-create status hints, so scan batches until it shows up).
+    let updated = 'found: {
+        for _ in 0..5 {
+            let batch = timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("recv timed out")
+                .expect("subscription open");
+            if let Some(e) = batch.iter().find(|e| e.event_type == "agent:updated") {
+                break 'found e.clone();
+            }
+        }
+        panic!("agent:updated on the wire");
+    };
+    assert_eq!(updated.data["agentId"], json!(session.id.0));
+    assert_eq!(
+        updated.data["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+
+    // The next session open discovers the identical set — a no-op: no event.
+    let (conn2, _rx2, _agent2) =
+        connect_with_session_result(claude_shaped_thought_level_session_result());
+    services
+        .resume_acp_session(&conn2, &init_caps(true), &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("resume")
+        .expect("resume yields opened session");
+    services
+        .publish_agent_event(&ws, &session.id, "test:flush", json!({}))
+        .await;
+    let mut saw_flush = false;
+    while !saw_flush {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        assert!(
+            !batch.iter().any(|e| e.event_type == "agent:updated"),
+            "unchanged set must not re-emit agent:updated"
+        );
+        saw_flush = batch.iter().any(|e| e.event_type == "test:flush");
+    }
+}
+
+/// A provider that advertises no `thought_level` selector CLEARS a previously
+/// persisted set (a provider switch must not leave the old provider's levels
+/// on the wire), and the `agent:updated` announcing it carries
+/// `effortLevels: null`.
+#[tokio::test]
+async fn session_open_without_selector_clears_persisted_effort_levels() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-effort-clear");
+    session.effort_levels = Some(vec!["low".to_string(), "high".to_string()]);
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The open discovers no `thought_level` selector (bare `{ sessionId }`
+    // result) and clears the stale set itself.
+    let (conn, _rx, _agent) = connect_with_session_result(json!({ "sessionId": ACP_SID }));
+    services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.effort_levels, None, "cleared on none advertised");
+    // The wire projection omits the field entirely.
+    let lite = intent_core::AgentLite::from_session(stored, 0, None, None, None, None, None);
+    assert!(
+        serde_json::to_value(&lite)
+            .unwrap()
+            .get("effortLevels")
+            .is_none(),
+        "cleared levels must be omitted from the wire"
+    );
+    let updated = 'found: {
+        for _ in 0..5 {
+            let batch = timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("recv timed out")
+                .expect("subscription open");
+            if let Some(e) = batch.iter().find(|e| e.event_type == "agent:updated") {
+                break 'found e.clone();
+            }
+        }
+        panic!("agent:updated on the wire");
+    };
+    assert_eq!(updated.data["effortLevels"], Value::Null);
+}
+
+/// Regression (PR #992 review): a `recreate_acp_session` that LOSES its CAS
+/// (a concurrent recreate already swapped the stored id) must not touch the
+/// persisted `effort_levels` — its `thought_level: None` means "CAS lost /
+/// unknown", not "the provider advertised no selector". The loser leaves the
+/// winner's set intact and emits no `agent:updated`.
+#[tokio::test]
+async fn cas_losing_recreate_leaves_effort_levels_untouched() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    // The canonical session id was already swapped by a concurrent recreate
+    // (the CAS winner), which also persisted the discovered levels.
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, "winner-sid")
+        .await
+        .unwrap();
+    let winner_levels = ["low", "medium", "high", "max"].map(String::from).to_vec();
+    bus.store()
+        .set_agent_effort_levels(&ws, &agent_id, Some(&winner_levels), &now_iso())
+        .await
+        .unwrap();
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The loser recreates with a mismatched expected-old: the CAS declines to
+    // swap, and — even though its own session advertised a selector — the
+    // discovered levels belong to a session we didn't keep.
+    let (conn, _rx, _agent) =
+        connect_with_session_result(claude_shaped_thought_level_session_result());
+    let opened = services
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
+        .await
+        .expect("recreate session");
+    assert_eq!(
+        opened.session_id, "winner-sid",
+        "CAS loss keeps canonical id"
+    );
+    assert!(
+        opened.thought_level.is_none(),
+        "CAS loss surfaces no selector"
+    );
+
+    // The winner's persisted set survives.
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.effort_levels.as_deref(),
+        Some(winner_levels.as_slice()),
+        "CAS loser must not clear the winner's effort levels"
+    );
+
+    // And no agent:updated fired (only the session-create status hint).
+    services
+        .publish_agent_event(&ws, &agent_id, "test:flush", json!({}))
+        .await;
+    let mut saw_flush = false;
+    while !saw_flush {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        assert!(
+            !batch.iter().any(|e| e.event_type == "agent:updated"),
+            "CAS loser must not emit agent:updated"
+        );
+        saw_flush = batch.iter().any(|e| e.event_type == "test:flush");
+    }
+}
+
 /// `agent:stream:activity` leading-edge throttle (PROTOCOL §7): the first
 /// activity of a turn emits immediately, activity inside the 1s window is
 /// suppressed, the window elapsing re-opens the gate, and clearing the
@@ -3384,5 +4212,366 @@ async fn activity_throttle_leading_edge_window_and_reset() {
     assert!(
         services.should_emit_activity(&agent_id),
         "throttle state reset with the slot: next turn leads immediately"
+    );
+}
+
+/// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
+/// tool calls and no assistant text still emits `agent:stream:activity`, each
+/// ping carrying `lastToolUse { name, status }` for the call just recorded.
+/// The throttle still applies — the burst lands inside one 1 s window, so the
+/// leading-edge ping is the only guaranteed one.
+#[tokio::test]
+async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_tools_only());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    let activities: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+        .collect();
+    assert!(
+        !activities.is_empty(),
+        "a turn with no assistant text still emits activity from the tool arm"
+    );
+    // Sanity cap, not throttle verification: the turn has exactly three
+    // potential emitters, so this only guards against a future fixture change
+    // multiplying the emit count. The deterministic window-boundary coverage
+    // lives in `activity_throttle_window_is_shared_between_chunk_and_tool_arms`
+    // below. Deliberately not tightened to `< 3` — the throttle is real-clock
+    // based, so a >1s gap between updates on a loaded machine legitimately
+    // produces up to three emits.
+    assert!(
+        activities.len() <= 3,
+        "at most one ping per tool call: {}",
+        activities.len()
+    );
+    // The leading-edge ping describes the FIRST tool call and carries no
+    // preview text (nothing streamed).
+    let first = activities[0];
+    assert_eq!(first.data["agentId"], json!("agent-1"));
+    assert!(
+        first.data["messageId"].is_string(),
+        "activity carries the turn's messageId"
+    );
+    assert_eq!(
+        first.data["lastToolUse"],
+        json!({ "name": "bash", "status": "started" }),
+        "tool-arm activity carries the just-recorded call's name + status"
+    );
+    assert!(
+        first.data.get("lastAgentResponse").is_none(),
+        "no assistant text streamed → no preview field"
+    );
+    for ev in &activities {
+        assert!(
+            ev.data["lastToolUse"]["name"].is_string(),
+            "every tool-arm ping names the tool"
+        );
+        assert!(
+            ev.data.get("content").is_none(),
+            "activity payload never carries transcript content"
+        );
+    }
+}
+
+/// Both emit arms share ONE per-agent throttle window: a text chunk's ping
+/// suppresses an immediately following tool call's ping (and vice versa),
+/// while the window elapsing re-opens the gate for whichever arm comes next.
+/// Drives `route_notification` directly so the window boundaries are
+/// deterministic. The throttle reads a real `Instant` (tokio paused time cannot
+/// help), so the first two routes are adjacent awaits deliberately: if >1s of
+/// wall clock elapsed between them the `t1` ping would no longer be suppressed
+/// and the count would read 3 — a rare failure here is host scheduling noise,
+/// not a regression.
+#[tokio::test]
+async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let chunk_note = |text: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    };
+    let tool_note = |id: &str, title: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": title, "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+
+    // Leading edge on the chunk arm.
+    services
+        .route_notification(
+            &chunk_note("Hello\n"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Same window → the tool arm is suppressed.
+    services
+        .route_notification(
+            &tool_note("t1", "bash: one"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Window elapses → the tool arm emits.
+    tokio::time::sleep(super::ACTIVITY_THROTTLE + Duration::from_millis(50)).await;
+    services
+        .route_notification(
+            &tool_note("t2", "view: src/lib.rs"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Same window again → the chunk arm is now the suppressed one.
+    services
+        .route_notification(
+            &chunk_note("more\n"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let activities: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+        .collect();
+    assert_eq!(
+        activities.len(),
+        2,
+        "one ping per shared window, regardless of which arm opened it: {:?}",
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        activities[0].data.get("lastToolUse").is_none(),
+        "the chunk-arm ping carries no lastToolUse"
+    );
+    assert_eq!(
+        activities[1].data["lastToolUse"],
+        json!({ "name": "view", "status": "started" }),
+        "the second window's ping came from the tool arm"
+    );
+    assert_eq!(
+        activities[1].data["lastAgentResponse"],
+        json!("Hello"),
+        "tool-arm pings carry the same live preview fields as chunk-arm pings"
+    );
+}
+
+// --- Thinking blocks (streamed reasoning) ---------------------------------
+
+fn thought_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+fn message_note(text: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    }
+}
+
+/// Consecutive thought chunks coalesce into ONE `thinking` block, and a
+/// thought↔text switch (either direction) closes the open block and starts a
+/// new one — so thought → text → thought persists three interleaved blocks in
+/// stream order.
+#[tokio::test]
+async fn thought_chunks_coalesce_and_interleave_with_text() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        thought_note("Let me "),
+        thought_note("think."),
+        message_note("Answer: "),
+        message_note("42."),
+        thought_note("Double-checking."),
+    ] {
+        assert!(
+            services
+                .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+                .await,
+            "every chunk (thought or text) is a turn update"
+        );
+    }
+
+    let blocks = transcript.into_blocks();
+    assert_eq!(
+        blocks,
+        vec![
+            json!({ "type": "thinking", "id": "m1:0", "text": "Let me think." }),
+            json!({ "type": "text", "id": "m1:1", "text": "Answer: 42." }),
+            json!({ "type": "thinking", "id": "m1:2", "text": "Double-checking." }),
+        ],
+        "consecutive thoughts merge; each thought↔text switch opens a new block"
+    );
+}
+
+/// A tool call breaks an open `thinking` block exactly as it breaks a text
+/// block, and the thought resumed after it lands in a fresh block.
+#[tokio::test]
+async fn tool_call_breaks_an_open_thinking_block() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let tool = IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "bash: ls", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "ls" } }
+        }),
+    };
+    for note in [thought_note("Plan it."), tool, thought_note("Read it.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let types: Vec<&str> = blocks
+        .iter()
+        .map(|b| b["type"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(types, vec!["thinking", "tool_use", "thinking"]);
+    assert_eq!(blocks[0]["text"], json!("Plan it."));
+    assert_eq!(blocks[2]["text"], json!("Read it."));
+}
+
+/// Thought chunks stream as `chat:stream:delta` with `blockType: "thinking"`
+/// on their own stable block id, and never leak into the
+/// `agent:stream:activity` live preview (`lastAgentResponse`/`digest`).
+#[tokio::test]
+async fn thought_deltas_carry_thinking_block_type_and_skip_live_previews() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("Reasoning...\n"), thought_note("more\n")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let deltas: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "chat:stream:delta")
+        .collect();
+    assert_eq!(deltas.len(), 2, "one delta per thought chunk");
+    for d in &deltas {
+        assert_eq!(d.data["blockType"], json!("thinking"));
+        assert_eq!(d.data["blockIndex"], json!(0), "coalesced onto one block");
+        assert_eq!(d.data["blockId"], json!("m1:0"));
+    }
+    assert_eq!(deltas[0].data["content"], json!("Reasoning...\n"));
+
+    for a in events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:activity")
+    {
+        assert!(
+            a.data.get("lastAgentResponse").is_none() && a.data.get("digest").is_none(),
+            "thought text never feeds the live preview: {:?}",
+            a.data
+        );
+    }
+}
+
+/// Thought text is excluded from the text-block extraction the agent-list
+/// previews read, while assistant text in the same turn still counts.
+#[tokio::test]
+async fn thought_text_is_absent_from_text_block_extraction() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [thought_note("secret reasoning"), message_note("Done.")] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+    assert_eq!(transcript.text_block_strings(), vec!["Done.".to_string()]);
+
+    // A turn that streamed ONLY reasoning contributes no preview text and
+    // leaves no open final text block.
+    let mut thought_only = super::Transcript::new("m2".to_string());
+    services
+        .route_notification(
+            &thought_note("only reasoning"),
+            &agent_id,
+            &workspace_id,
+            &mut thought_only,
+        )
+        .await;
+    assert!(thought_only.text_block_strings().is_empty());
+    assert!(!thought_only.final_text_block_open());
+    assert_eq!(
+        thought_only.snapshot_blocks(),
+        vec![json!({ "type": "thinking", "id": "m2:0", "text": "only reasoning" })],
+        "the live-turn snapshot carries the in-flight thinking block"
     );
 }

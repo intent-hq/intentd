@@ -2,6 +2,167 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-08-09
+
+### 🚀 Features
+
+- *(services)* Batch agent teardown in workspace.delete for fast ack ([#1038](https://github.com/intent-hq/intentd/pull/1038))
+- *(git)* Submodule-aware repo cache and hydration ([#1024](https://github.com/intent-hq/intentd/pull/1024))
+- *(git)* Parallelize background workspace file removal ([#1046](https://github.com/intent-hq/intentd/pull/1046))
+- *(hooks)* Shorten dispatch wake state notes, add hookStillActive metadata ([#1027](https://github.com/intent-hq/intentd/pull/1027))
+- *(intentd)* Make 'intentd pair' enable the WSS listener on demand ([#1034](https://github.com/intent-hq/intentd/pull/1034))
+- *(services)* Include url in pr_monitor_wake metadata ([#1033](https://github.com/intent-hq/intentd/pull/1033))
+- Persist and serve thoughtTokens on stats.getUsage ([#1041](https://github.com/intent-hq/intentd/pull/1041))
+- Project lastMessageId onto AgentLite ([#1039](https://github.com/intent-hq/intentd/pull/1039))
+- *(github)* Add github.branches.listCached read-only RPC
+- Gate the pi provider on the pi CLI version (>= 0.80.4) ([#1044](https://github.com/intent-hq/intentd/pull/1044))
+- Gap-fill provider and host.exec spawn env with captured login-shell credential vars ([#1047](https://github.com/intent-hq/intentd/pull/1047))
+- Coalesce PR monitor wakes into net baseline diffs ([#1049](https://github.com/intent-hq/intentd/pull/1049))
+
+### 🐛 Bug Fixes
+
+- *(services)* Apply report_delivered filter to waiting projections ([#1017](https://github.com/intent-hq/intentd/pull/1017))
+- *(store,services)* Guard last_activity against full-row clobber and persist derived value ([#1018](https://github.com/intent-hq/intentd/pull/1018))
+- Recognize any recent self-write in the config-watcher guard ([#999](https://github.com/intent-hq/intentd/pull/999))
+- *(services)* Watch git metadata for gitfile linked-worktree workspaces ([#1048](https://github.com/intent-hq/intentd/pull/1048))
+- *(git)* Prune stale submodule modules and clean CoW orphan work trees ([#1028](https://github.com/intent-hq/intentd/pull/1028))
+- Discover CLIs across nvm node versions ([#1045](https://github.com/intent-hq/intentd/pull/1045))
+- *(providers)* Apply Node heap cap on npx-fallback spawns ([#1042](https://github.com/intent-hq/intentd/pull/1042))
+- *(services)* Derive delegation-group subscription linkage from grouped watches in diagnostics ([#1016](https://github.com/intent-hq/intentd/pull/1016))
+- *(services)* Gate turn-end unread raise on top-level foreground agents ([#1021](https://github.com/intent-hq/intentd/pull/1021))
+- Drain timed-out turn's late session/update tail before the idle-timeout warning turn ([#1032](https://github.com/intent-hq/intentd/pull/1032))
+- *(services)* Fold active PR monitors into workspace displayStatus ([#1036](https://github.com/intent-hq/intentd/pull/1036))
+- *(services)* Suppress per-check success lines in the PR monitor diff ([#1000](https://github.com/intent-hq/intentd/pull/1000))
+
+### ⚡ Performance
+
+- *(services)* Dedup pr.monitor forge fetches per (repo, pr) within a sweep ([#1020](https://github.com/intent-hq/intentd/pull/1020))
+
+### 🧪 Testing
+
+- *(events)* Use pure-liveness deadline for positive watcher-test waits ([#1030](https://github.com/intent-hq/intentd/pull/1030))
+- *(script_ops)* Use pure-liveness run timeouts for output-capture tests ([#1043](https://github.com/intent-hq/intentd/pull/1043))
+- *(intentd)* Deflake workspace lifecycle watcher e2e via retry-until-observed ([#997](https://github.com/intent-hq/intentd/pull/997))
+
+
+## [0.6.2] - 2026-08-09
+
+### 🚀 Features
+
+- *(store)* Drop preview self-heal fallback, refuse newer-schema databases ([#1001](https://github.com/intent-hq/intentd/pull/1001))
+- *(agents)* Unify PR-monitor waiting into external-wait classification ([#1002](https://github.com/intent-hq/intentd/pull/1002))
+- *(intent-services)* Single-flight the full accept-changes.getStatus build ([#1008](https://github.com/intent-hq/intentd/pull/1008))
+- Surface waitingOnPrMonitors on the wire (mirrors waitingOnHooks) ([#1007](https://github.com/intent-hq/intentd/pull/1007))
+- Resolve quickActions.* daemon-side for agent.completeOnce ([#1012](https://github.com/intent-hq/intentd/pull/1012))
+- Cap outstanding slow-path RPCs with -32011 overload rejection ([#1013](https://github.com/intent-hq/intentd/pull/1013))
+
+### 🐛 Bug Fixes
+
+- Tier rpc_profile duration budget for network-bound methods ([#1004](https://github.com/intent-hq/intentd/pull/1004))
+- Never stage submodule-internal paths in the superproject (commit/stage guards) ([#1009](https://github.com/intent-hq/intentd/pull/1009))
+- Rename backgroundAgents.* to quickActions.* and scope to quick actions ([#1010](https://github.com/intent-hq/intentd/pull/1010))
+- Refuse submodule-internal paths in git.discard ([#1011](https://github.com/intent-hq/intentd/pull/1011))
+- Remove RpcLimiter Default impl and warn when the overload cap is disabled ([#1014](https://github.com/intent-hq/intentd/pull/1014))
+
+### 🔧 Refactor
+
+- *(transport)* Share envelope-validity rules between router and dispatch pre-check ([#1015](https://github.com/intent-hq/intentd/pull/1015))
+
+
+## [0.6.1] - 2026-08-08
+
+### 🚀 Features
+
+- Ws.pr.monitor — centralized PR monitoring with merge-requirements checklist
+- Provider-neutral agent.completeOnce via ephemeral ACP sessions ([#991](https://github.com/intent-hq/intentd/pull/991))
+- Persist and serve session-discovered reasoning-effort levels ([#992](https://github.com/intent-hq/intentd/pull/992))
+- Cache provider discovery results and prewarm login-shell PATH ([#994](https://github.com/intent-hq/intentd/pull/994))
+
+### 🐛 Bug Fixes
+
+- *(git)* Resolve inherited origin in CoW checkout provisioning ([#996](https://github.com/intent-hq/intentd/pull/996))
+- *(test)* Retry writes in gitignore-suppression e2e under load ([#998](https://github.com/intent-hq/intentd/pull/998))
+
+### 🧪 Testing
+
+- *(services)* Hermetic unit coverage for the unresolvable-adapter unavailable envelope ([#993](https://github.com/intent-hq/intentd/pull/993))
+
+
+## [0.6.0] - 2026-08-07
+
+### 🚀 Features
+
+- Spread a turn's tokens across the minutes it ran ([#969](https://github.com/intent-hq/intentd/pull/969))
+- *(context)* Honor ~/.augment/auggie-path marker in auggie discovery ([#939](https://github.com/intent-hq/intentd/pull/939))
+- *(acp)* Derive tool names from Claude Code mcp__<server>__<tool> titles ([#935](https://github.com/intent-hq/intentd/pull/935))
+- [**breaking**] Remove inert workspace.autoFetch setting ([#924](https://github.com/intent-hq/intentd/pull/924))
+- Raise hook name cap to 50 chars for human-readable names ([#929](https://github.com/intent-hq/intentd/pull/929))
+- *(script)* Persist was-running marker and expose previouslyRunning ([#932](https://github.com/intent-hq/intentd/pull/932))
+- Status-neutral commit policy and clearer auto-commit-disabled rejection ([#926](https://github.com/intent-hq/intentd/pull/926))
+- Kill all daemon-owned PTY sessions on graceful shutdown ([#940](https://github.com/intent-hq/intentd/pull/940))
+- *(usage)* Capture ACP usage_update cost in TokenUsage
+- Repo cache + cache-hydrated workspace creation ([#944](https://github.com/intent-hq/intentd/pull/944))
+- First-class reasoningEffort session field with generic ACP application (protocol 5.2) ([#946](https://github.com/intent-hq/intentd/pull/946))
+- Name specialist default model in delegate model-option hints ([#958](https://github.com/intent-hq/intentd/pull/958))
+- Emit throttled activity pings for tool-call updates ([#957](https://github.com/intent-hq/intentd/pull/957))
+- *(events)* Hybrid file:* persistence; remove event.recentFiles/directoryChanges
+- Extend displayStatus into the BE-owned canonical rollup ([#945](https://github.com/intent-hq/intentd/pull/945))
+- *(transport)* [**breaking**] Bump protocol version to 6.0 for event method removals
+- *(agents)* Persistent question hold across plain user messages ([#965](https://github.com/intent-hq/intentd/pull/965))
+- *(settings)* Add model.defaultReasoningEffort setting ([#970](https://github.com/intent-hq/intentd/pull/970))
+- Surface ACP agent_thought_chunk as thinking blocks and thoughtTokens usage ([#973](https://github.com/intent-hq/intentd/pull/973))
+- Auto-resume agent turns after host sleep ([#972](https://github.com/intent-hq/intentd/pull/972))
+- *(services)* Apply model.defaultReasoningEffort at agent creation ([#974](https://github.com/intent-hq/intentd/pull/974))
+- Carry thoughtTokens in per-minute usage rate history ([#976](https://github.com/intent-hq/intentd/pull/976))
+- Per-turn agent state snapshot — ws.agent.snapshot op, MCP tool, turn-prompt injection, stateSnapshot setting ([#971](https://github.com/intent-hq/intentd/pull/971))
+- *(providers)* Probe auggie auth via token print, drop checkAuggie version ([#977](https://github.com/intent-hq/intentd/pull/977))
+- Perpetual background hooks that re-arm after dispatch until TTL ([#979](https://github.com/intent-hq/intentd/pull/979))
+- *(events)* Emit task:created on every task creation path ([#978](https://github.com/intent-hq/intentd/pull/978))
+- Serve model-catalog cache indefinitely; probe only on miss or forceRefresh ([#987](https://github.com/intent-hq/intentd/pull/987))
+- Optional providerId param on agent.setModel ([#986](https://github.com/intent-hq/intentd/pull/986))
+
+### 🐛 Bug Fixes
+
+- *(store)* Bound the token-usage fallback message read ([#954](https://github.com/intent-hq/intentd/pull/954))
+- *(services)* Reword questions-dismissed notice to informative-only ([#930](https://github.com/intent-hq/intentd/pull/930))
+- *(services)* Persist D13 effective model to resolved_model instead of rewriting session.model ([#941](https://github.com/intent-hq/intentd/pull/941))
+- *(events)* Defer OS watch registration off the caller's thread ([#952](https://github.com/intent-hq/intentd/pull/952))
+- *(events)* Stop workspace watchers on archive, restart on unarchive
+- Settle agent-waiting groups when a report_delivered watch retires ([#980](https://github.com/intent-hq/intentd/pull/980))
+- *(acp)* Shell-wrap terminal/create for Grok-style packed commands
+- Derive pr.snapshot review decision from reviewDecision, not mergeable_state
+- *(sourcecontrol)* Stop double-unwrapping the GraphQL data envelope ([#949](https://github.com/intent-hq/intentd/pull/949))
+- Close workspace displayStatus audit gaps (G1-G9) ([#928](https://github.com/intent-hq/intentd/pull/928))
+- *(acp)* Answer delivered MCP bridge calls with non-retryable outcome-unknown error on TCP drop ([#937](https://github.com/intent-hq/intentd/pull/937))
+- State terminal retirement in hook dispatch/eviction wake messages ([#933](https://github.com/intent-hq/intentd/pull/933))
+- Support subscribe-style eventType globs in event.query ([#938](https://github.com/intent-hq/intentd/pull/938))
+- Persist derived lastActivity in the debounce task ([#959](https://github.com/intent-hq/intentd/pull/959))
+- Duplicate standalone-checkout workspaces as standalone checkouts ([#956](https://github.com/intent-hq/intentd/pull/956))
+- Scope ws.hook.cancel to the owning agent ([#953](https://github.com/intent-hq/intentd/pull/953))
+- *(intentd)* Bind listeners before slow startup initializations
+- Exclude the calling agent from the archive interrupt sweep ([#950](https://github.com/intent-hq/intentd/pull/950))
+- Run the archive post-persist tail detached so a hook-initiated archive still emits ([#968](https://github.com/intent-hq/intentd/pull/968))
+
+### 🔧 Refactor
+
+- *(services)* Extract central workspace_status module ([#925](https://github.com/intent-hq/intentd/pull/925))
+
+### ⚡ Performance
+
+- *(events)* Consolidate FSEvents streams into shared watchers with in-process demux
+- Coalesce concurrent git status scans per worktree ([#982](https://github.com/intent-hq/intentd/pull/982))
+- Event-invalidated per-worktree git.status cache
+
+### 🧪 Testing
+
+- *(services)* Make models.list legacy-path tests hermetic via fetch seam ([#934](https://github.com/intent-hq/intentd/pull/934))
+- Split agent.watch lifecycle e2e and clamp budgets under nextest kill ([#947](https://github.com/intent-hq/intentd/pull/947))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump pinned ACP adapters (claude-agent-acp 0.66.0, codex-acp 1.1.14, pi-acp 0.0.33) ([#983](https://github.com/intent-hq/intentd/pull/983))
+
+
 ## [0.5.0] - 2026-08-06
 
 ### 🚀 Features

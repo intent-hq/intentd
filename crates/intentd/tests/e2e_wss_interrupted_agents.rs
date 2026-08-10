@@ -281,6 +281,7 @@ async fn interrupted_agents_persisted_across_restart() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             status: AgentStatus::Active, // stale in-flight
             is_active: true,

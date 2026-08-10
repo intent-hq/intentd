@@ -35,8 +35,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS,
-    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
+    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
+    DEFAULT_WORKSPACE_API_TOON_OUTPUT,
 };
 use crate::error::{Error, Result};
 
@@ -46,7 +49,7 @@ use crate::error::{Error, Result};
 pub struct SettingsFile {
     pub providers: ProvidersSettings,
     pub model: ModelSettings,
-    pub background_agents: BackgroundAgentsSettings,
+    pub quick_actions: QuickActionsSettings,
     pub specialists: SpecialistsSettings,
     pub workspace: WorkspaceSettings,
     pub git: GitSettings,
@@ -67,6 +70,8 @@ pub struct SettingsFile {
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
+    pub wake_resume: WakeResumeSettings,
+    pub pr_monitor: PrMonitorSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -91,17 +96,27 @@ pub struct ModelSettings {
     pub default: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
+    /// `model.defaultReasoningEffort` — fallback reasoning effort for new
+    /// agents. Stored as-is (providers own the vocabulary); a blank value
+    /// reads as unset.
+    #[serde(deserialize_with = "de_blank_as_none")]
+    pub default_reasoning_effort: Option<String>,
 }
 
-/// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
+/// `[quickActions]` — model config for single-shot quick actions
+/// (`quickActions.*`): commit messages, PR descriptions, quick tasks. These
+/// keys never apply to interactive or delegated agent sessions
+/// (monorepo#1729); the group was named `backgroundAgents` before that
+/// rename (see [`LEGACY_SETTINGS_PATHS`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct BackgroundAgentsSettings {
-    /// `backgroundAgents.defaultModel` — model for background agents.
+pub struct QuickActionsSettings {
+    /// `quickActions.defaultModel` — model for quick actions.
     pub default_model: Option<String>,
-    /// `backgroundAgents.typeOverrides` — per-agent-type model overrides.
+    /// `quickActions.typeOverrides` — per-quick-action model overrides
+    /// (`commit`, `pr`, `review`, `fast`).
     pub type_overrides: BTreeMap<String, String>,
-    /// `backgroundAgents.providerSettings` — per-provider background settings
+    /// `quickActions.providerSettings` — per-provider quick-action settings
     /// (opaque FE-owned bags; validated structurally as a table only).
     pub provider_settings: toml::Table,
 }
@@ -348,6 +363,9 @@ pub struct ServerSettings {
     pub port: u16,
     /// `server.originAllowList` — permitted WS origins.
     pub origin_allow_list: Option<Vec<String>>,
+    /// `server.maxOutstandingRpcs` — daemon-wide cap on outstanding slow-path
+    /// RPCs across every connection; `0` means unlimited.
+    pub max_outstanding_rpcs: u32,
     /// `[server.wsApi]` — WSS API listener runtime toggle.
     pub ws_api: WsApiSettings,
     /// `[server.tls]` — TLS for the TCP listener.
@@ -363,6 +381,7 @@ impl Default for ServerSettings {
             bind_address: "0.0.0.0".to_string(),
             port: 5181,
             origin_allow_list: None,
+            max_outstanding_rpcs: DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
             ws_api: WsApiSettings::default(),
             tls: TlsSettings::default(),
             auth: AuthSettings::default(),
@@ -781,6 +800,16 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.attentionRequests` — expose attention requests
     /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
     pub attention_requests: bool,
+    /// `agentFeatures.stateSnapshot` — inject the per-turn agent state
+    /// snapshot line (`current ws.agent.snapshot() => {...}`) into outbound
+    /// turn prompts. Unlike the other toggles this is read LIVE each turn —
+    /// flipping it affects the very next turn of every session, existing
+    /// ones included. The `ws.agent.snapshot()` MCP tool itself is never
+    /// gated.
+    pub state_snapshot: bool,
+    /// `agentFeatures.prMonitor` — expose centralized PR monitoring
+    /// (`ws.pr.monitor` / `ws.pr.unmonitor`) to agents.
+    pub pr_monitor: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -794,6 +823,51 @@ impl Default for AgentFeaturesSettings {
             rich_chat_blocks: true,
             structured_questions: true,
             attention_requests: true,
+            state_snapshot: true,
+            pr_monitor: true,
+        }
+    }
+}
+
+/// `[wakeResume]` — host sleep/wake detection + resume (`wakeResume.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct WakeResumeSettings {
+    /// `wakeResume.enabled` — detect host sleep/wake and resume work on wake.
+    pub enabled: bool,
+    /// `wakeResume.thresholdSeconds` — minimum suspend duration (seconds) that
+    /// counts as a sleep; also the resume/enrollment gate.
+    pub threshold_seconds: u32,
+}
+
+impl Default for WakeResumeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_WAKE_RESUME_ENABLED,
+            threshold_seconds: DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+        }
+    }
+}
+
+/// `[prMonitor]` — centralized PR-monitor loop knobs (`prMonitor.*`). Both
+/// values are read live by the monitor loop, so a change applies without a
+/// daemon restart; sub-floor values are clamped at read time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrMonitorSettings {
+    /// `prMonitor.debounceSeconds` — quiet window a changed PR must observe
+    /// before its consolidated wake is delivered.
+    pub debounce_seconds: u64,
+    /// `prMonitor.pollSeconds` — poll cadence for the centralized monitor
+    /// loop (config-file key; not exposed in the Settings UI).
+    pub poll_seconds: u64,
+}
+
+impl Default for PrMonitorSettings {
+    fn default() -> Self {
+        Self {
+            debounce_seconds: DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
+            poll_seconds: DEFAULT_PR_MONITOR_POLL_SECONDS,
         }
     }
 }
@@ -823,6 +897,17 @@ where
     deserializer.deserialize_any(V)
 }
 
+/// Normalize a blank optional string to `None`, so a key left as `""` in the
+/// file (or cleared with an empty string over the wire) reads as unset rather
+/// than as an explicit empty value.
+fn de_blank_as_none<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    Ok(raw.filter(|v| !v.trim().is_empty()))
+}
+
 /// Dotted wire paths that older daemons persisted in `config.toml` but that
 /// have since moved back to the SQLite `settings` table or been removed from
 /// the product entirely. A file containing one of these still parses via
@@ -835,12 +920,16 @@ where
 /// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
 /// discarded (no catalog entry remains) and stripped from the file.
 /// `workspace.autoFetch` is likewise retired outright (the periodic-fetch
-/// feature was removed) — discarded and stripped.
+/// feature was removed) — discarded and stripped. `backgroundAgents` covers
+/// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
+/// values are migrated into the `quickActions.*` keys at boot and the table is
+/// then stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
     "server.listenMode",
     "workspace.autoFetch",
+    "backgroundAgents",
 ];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
@@ -937,6 +1026,17 @@ impl SettingsFile {
                 format!(
                     "must be between 1024 and 65535, got {}",
                     self.server.ws_api.port
+                ),
+            ));
+        }
+        // Mirrors the catalog bound so a hand-edited config.toml cannot boot a
+        // cap the `settings.update` RPC would have rejected (`0` = unlimited).
+        if self.server.max_outstanding_rpcs > 100_000 {
+            return Err(bad(
+                "server.maxOutstandingRpcs",
+                format!(
+                    "must be 0 (unlimited) or between 1 and 100000, got {}",
+                    self.server.max_outstanding_rpcs
                 ),
             ));
         }
@@ -1078,13 +1178,17 @@ paths = {}
 # default = "claude-sonnet-4-5"
 # Provider default models -- default model per provider.
 providerDefaults = {}
+# Default reasoning effort -- fallback reasoning effort for new agents; the
+# value is provider-defined and stored as-is, and a blank value means unset.
+# defaultReasoningEffort = "high"
 
-[backgroundAgents]
-# Background default model -- model for background agents.
+[quickActions]
+# Quick action default model -- model for single-shot quick actions (commit
+# messages, PR descriptions, quick tasks); never applied to agent sessions.
 # defaultModel = "claude-sonnet-4-5"
-# Background type overrides -- per-agent-type model overrides.
+# Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
-# Background provider settings -- per-provider background settings.
+# Quick action provider settings -- per-provider quick-action settings.
 providerSettings = {}
 
 [specialists]
@@ -1169,6 +1273,10 @@ bindAddress = "0.0.0.0"
 port = 5181
 # Origin allow-list -- permitted WS origins.
 # originAllowList = ["https://example.com"]
+# Max outstanding RPCs -- daemon-wide cap on outstanding slow-path RPCs across
+# every connection; over-limit requests are rejected with -32011 "Server
+# overloaded" (0 = unlimited; changes apply on daemon restart).
+maxOutstandingRpcs = 256
 
 [server.wsApi]
 # WS API enabled -- enable the TCP/WSS listener at runtime.
@@ -1303,6 +1411,28 @@ structuredQuestions = true
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
+# State snapshot -- inject the per-turn agent state snapshot line into turn
+# prompts; unlike the other toggles this applies to the next turn of every
+# session (live), existing sessions included.
+stateSnapshot = true
+# PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
+# ws.pr.unmonitor) to agents.
+prMonitor = true
+
+[wakeResume]
+# Wake resume enabled -- detect host sleep/wake and resume work on wake.
+enabled = true
+# Wake resume threshold seconds -- minimum suspend duration (in seconds) that
+# counts as a sleep; also the resume/enrollment gate.
+thresholdSeconds = 10
+
+[prMonitor]
+# PR monitor debounce seconds -- quiet window (in seconds) a changed PR must
+# observe before its consolidated wake is delivered (minimum 10).
+debounceSeconds = 60
+# PR monitor poll seconds -- how often (in seconds) the centralized loop polls
+# each monitored PR (minimum 10).
+pollSeconds = 30
 "##;
 
 #[cfg(test)]
@@ -1332,7 +1462,8 @@ mod tests {
         assert_eq!(d.providers.enabled, None);
         assert!(d.providers.paths.is_empty());
         assert_eq!(d.model.default, None);
-        assert!(d.background_agents.provider_settings.is_empty());
+        assert_eq!(d.model.default_reasoning_effort, None);
+        assert!(d.quick_actions.provider_settings.is_empty());
         assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert_eq!(d.sandbox.default_type, SandboxType::Worktree);
@@ -1409,6 +1540,12 @@ mod tests {
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
+        assert!(d.agent_features.state_snapshot);
+        assert_eq!(d.wake_resume.enabled, DEFAULT_WAKE_RESUME_ENABLED);
+        assert_eq!(
+            d.wake_resume.threshold_seconds,
+            DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS
+        );
     }
 
     #[test]
@@ -1438,6 +1575,8 @@ mod tests {
         assert!(parsed.agent_features.browser_automation);
         assert!(parsed.agent_features.structured_questions);
         assert!(parsed.agent_features.attention_requests);
+        assert!(parsed.agent_features.state_snapshot);
+        assert!(parsed.agent_features.pr_monitor);
     }
 
     #[test]
@@ -1632,7 +1771,7 @@ mod tests {
     #[test]
     fn provider_maps_and_lists_parse() {
         let parsed = SettingsFile::parse_str(
-            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[backgroundAgents.providerSettings.claude-code]\nmode = \"fast\"\n",
+            "[providers]\nactive = \"claude-code\"\n\n[providers.enabled]\nclaude-code = true\ncodex = false\n\n[providers.paths]\ncodex = \"/usr/local/bin/codex\"\n\n[mcp]\ndisabledServers = [\"linear\"]\n\n[server]\noriginAllowList = [\"https://app.example.com\"]\n\n[quickActions.providerSettings.claude-code]\nmode = \"fast\"\n",
         )
         .unwrap();
         assert_eq!(parsed.providers.active.as_deref(), Some("claude-code"));
@@ -1649,7 +1788,7 @@ mod tests {
             Some(vec!["https://app.example.com".to_string()])
         );
         assert!(parsed
-            .background_agents
+            .quick_actions
             .provider_settings
             .contains_key("claude-code"));
     }
@@ -1794,6 +1933,41 @@ mod tests {
     }
 
     #[test]
+    fn model_default_reasoning_effort_parses_as_an_optional_string() {
+        let parsed = SettingsFile::parse_str(
+            "[model]\ndefault = \"m0\"\ndefaultReasoningEffort = \"xhigh\"\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.model.default.as_deref(), Some("m0"));
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+
+        // Stored as-is: the daemon never normalizes the provider vocabulary.
+        let parsed = SettingsFile::parse_str("[model]\ndefaultReasoningEffort = \"Medium\"\n")
+            .expect("parse");
+        assert_eq!(
+            parsed.model.default_reasoning_effort.as_deref(),
+            Some("Medium")
+        );
+
+        // Absent from `[model]` leaves it unset.
+        let parsed = SettingsFile::parse_str("[model]\ndefault = \"m0\"\n").expect("parse");
+        assert_eq!(parsed.model.default_reasoning_effort, None);
+
+        // A blank value reads as unset, so no consumer ever observes an
+        // explicit empty effort.
+        for text in [
+            "[model]\ndefaultReasoningEffort = \"\"\n",
+            "[model]\ndefaultReasoningEffort = \"   \"\n",
+        ] {
+            let parsed = SettingsFile::parse_str(text).expect("parse");
+            assert_eq!(parsed.model.default_reasoning_effort, None, "{text}");
+        }
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_workspace_overrides() {
         let text =
             "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\", ws2 = \"m2\" }\n";
@@ -1834,6 +2008,134 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("server.port"), "{err}");
+    }
+
+    #[test]
+    fn sleep_resume_defaults_enabled_with_threshold_ten() {
+        // A file with no [wakeResume] section resolves to the feature-on
+        // defaults (enabled = true, thresholdSeconds = 10).
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 10);
+        // The default template ships the commented [wakeResume] section and
+        // parses back to the same defaults.
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[wakeResume]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(templated.wake_resume.enabled);
+        assert_eq!(templated.wake_resume.threshold_seconds, 10);
+    }
+
+    #[test]
+    fn sleep_resume_explicit_override_parses() {
+        let parsed =
+            SettingsFile::parse_str("[wakeResume]\nenabled = false\nthresholdSeconds = 45\n")
+                .expect("override parses");
+        assert!(!parsed.wake_resume.enabled);
+        assert_eq!(parsed.wake_resume.threshold_seconds, 45);
+    }
+
+    #[test]
+    fn pr_monitor_defaults_and_template_round_trip() {
+        // A file with no [prMonitor] section resolves to the shipped defaults,
+        // and `agentFeatures.prMonitor` defaults on.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(parsed.agent_features.pr_monitor);
+        assert_eq!(
+            parsed.pr_monitor.debounce_seconds,
+            DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS
+        );
+        assert_eq!(
+            parsed.pr_monitor.poll_seconds,
+            DEFAULT_PR_MONITOR_POLL_SECONDS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[prMonitor]"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.pr_monitor, parsed.pr_monitor);
+        assert!(templated.agent_features.pr_monitor);
+    }
+
+    #[test]
+    fn max_outstanding_rpcs_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.server.max_outstanding_rpcs,
+            DEFAULT_SERVER_MAX_OUTSTANDING_RPCS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("maxOutstandingRpcs"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.server.max_outstanding_rpcs,
+            DEFAULT_SERVER_MAX_OUTSTANDING_RPCS
+        );
+    }
+
+    #[test]
+    fn max_outstanding_rpcs_explicit_override_parses() {
+        let parsed =
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 4\n").expect("override parses");
+        assert_eq!(parsed.server.max_outstanding_rpcs, 4);
+        // `0` is the documented "unlimited" value, not a range error.
+        let unlimited =
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 0\n").expect("zero parses");
+        assert_eq!(unlimited.server.max_outstanding_rpcs, 0);
+    }
+
+    /// The file path enforces the same `0..=100000` bound the catalog does, so
+    /// a hand-edited config.toml cannot boot a cap `settings.update` rejects
+    /// (a huge value would also blow past `Semaphore::MAX_PERMITS` on 32-bit).
+    #[test]
+    fn max_outstanding_rpcs_out_of_range_is_rejected() {
+        let err = SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 500000\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server.maxOutstandingRpcs") && msg.contains("500000"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+    }
+
+    #[test]
+    fn pr_monitor_explicit_override_parses() {
+        let parsed = SettingsFile::parse_str(
+            "[agentFeatures]\nprMonitor = false\n\n[prMonitor]\ndebounceSeconds = 15\npollSeconds = 90\n",
+        )
+        .expect("override parses");
+        assert!(!parsed.agent_features.pr_monitor);
+        assert_eq!(parsed.pr_monitor.debounce_seconds, 15);
+        assert_eq!(parsed.pr_monitor.poll_seconds, 90);
+    }
+
+    #[test]
+    fn pr_monitor_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[prMonitor]\ndebounceSecs = 30\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("prMonitor"), "names the table: {msg}");
+        assert!(msg.contains("debounceSecs"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn sleep_resume_unknown_key_is_rejected() {
+        let err = SettingsFile::parse_str("[wakeResume]\nthreshholdSeconds = 20\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wakeResume"), "names the table: {msg}");
+        assert!(
+            msg.contains("threshholdSeconds"),
+            "names the bad key: {msg}"
+        );
+    }
+
+    #[test]
+    fn sleep_resume_wrong_type_is_rejected() {
+        let err =
+            SettingsFile::parse_str("[wakeResume]\nthresholdSeconds = \"soon\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("wakeResume.thresholdSeconds"),
+            "names the key: {err}"
+        );
     }
 
     #[test]

@@ -366,6 +366,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -408,6 +409,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -464,6 +466,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -549,6 +552,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: None,
@@ -1077,6 +1081,144 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
     assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
+/// Timing proof for the batch stop path (the `workspace.delete` sweep): N
+/// tracked agents whose children ignore SIGTERM tear down in ~ONE shared
+/// grace window via `stop_many` — mirroring `kill_sweep_tests` — with the
+/// per-agent `stop()` semantics (handle removal, deregistration) applied to
+/// every agent.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_many_tears_down_slow_children_in_one_shared_grace_window() {
+    const N: usize = 4;
+    let grace = super::PROCESS_GROUP_TERM_GRACE;
+    let (_tmp, mgr) = manager().await;
+    let mut ids = Vec::with_capacity(N);
+    let mut pids = Vec::with_capacity(N);
+    for i in 0..N {
+        let id = AgentId::from(format!("a-batch-{i}").as_str());
+        let mut cmd = tokio::process::Command::new("sh");
+        // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
+        // forcing the full grace window to elapse.
+        cmd.args(["-c", "trap '' TERM; sleep 30"]);
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn slow child");
+        let pid = child.id().expect("live child has a pid");
+        let mut handle = mock_handle();
+        handle._child = Some(child);
+        handle.child_pid = Some(pid);
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        ids.push(id);
+        pids.push(pid);
+    }
+    // Let each sh install its trap before SIGTERM arrives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let start = std::time::Instant::now();
+    let fence = mgr.stop_many(&ids).await;
+    let elapsed = start.elapsed();
+
+    // Serial teardown would take ~N * grace (8s for 4 children); the shared
+    // window must finish in ~one grace period (<4s total).
+    assert!(
+        elapsed < grace * 2,
+        "batch stop took {elapsed:?}, expected ~one {grace:?} grace window"
+    );
+    // The children ignored SIGTERM, so the full shared grace must have
+    // elapsed (proves the window ran once, not that children died early).
+    assert!(
+        elapsed >= grace - Duration::from_millis(500),
+        "batch stop returned after {elapsed:?}, before the shared grace window elapsed"
+    );
+    // Per-agent `stop()` semantics applied to every agent in the batch.
+    assert!(mgr.is_empty(), "all handles removed");
+    assert_eq!(mgr.registry().size(), 0, "all agents deregistered");
+    // The kill itself, not just the elapsed window: every child must be
+    // dead. Short retry loop — a SIGKILLed child stays signal-0-visible as
+    // a zombie until its wait task reaps it (stragglers past
+    // KILL_SWEEP_REAP_GRACE reap in the background).
+    for &pid in &pids {
+        let mut dead = !pid_alive(pid);
+        for _ in 0..100 {
+            if dead {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            dead = !pid_alive(pid);
+        }
+        assert!(dead, "child {pid} killed by the batch sweep");
+    }
+    // The returned fence keeps every swept agent blocked from the
+    // lazy-spawn paths until dropped, then re-opens them.
+    for id in &ids {
+        assert!(
+            mgr.stopping.lock().unwrap().contains(id),
+            "{id} fenced while the TeardownFence is held"
+        );
+    }
+    drop(fence);
+    assert!(
+        mgr.stopping.lock().unwrap().is_empty(),
+        "fence drop clears the stopping set"
+    );
+}
+
+/// Ghost-agent race regression (PR #1038 review): while a `stop_many`
+/// teardown fence is held, the lazy-spawn path (`ensure_started`) must
+/// refuse to spawn a replacement child for a swept agent — otherwise a
+/// concurrent `agent.sendMessage` racing `workspace.delete`'s shared grace
+/// wait could leave a live process whose session row the cascade then
+/// deletes. Once the fence drops, the spawn path is open again.
+#[tokio::test]
+async fn stop_many_fence_blocks_lazy_respawn_until_dropped() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-fence");
+    let agent_id = AgentId::from("a-fence-respawn");
+    mgr.services
+        .store
+        .insert_workspace(&super::role_reminder_tests::workspace(&ws))
+        .await
+        .expect("insert workspace");
+    let session = super::role_reminder_tests::session(&agent_id, &ws, None);
+    mgr.services
+        .store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let fence = mgr.stop_many(std::slice::from_ref(&agent_id)).await;
+    // Session row still present (the delete cascade has not run), yet the
+    // spawn is refused: the fence, not the store check, blocks it.
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("fenced agent must not respawn");
+    assert!(
+        matches!(err, Error::NotFound(_)),
+        "fence surfaces NotFound (non-retryable for retry_spawn), got: {err:?}"
+    );
+    assert!(mgr.is_empty(), "no handle installed for the fenced agent");
+
+    drop(fence);
+    // Fence lifted, session row deleted (as the workspace.delete cascade
+    // does): the spawn path proceeds past the teardown guard and now fails
+    // on its own store read — proving the fence no longer fires.
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &agent_id)
+        .await
+        .expect("delete session");
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("session row gone");
+    assert!(
+        !err.to_string().contains("is being deleted"),
+        "unfenced agent proceeds past the teardown guard, got: {err:?}"
+    );
+}
+
 /// Signal-0 liveness probe used by the process-group teardown test.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
@@ -1427,6 +1569,234 @@ fn track_mock_agent_inner(
     (agent, ())
 }
 
+/// Mock agent that streams one `agent_message_chunk`, then answers
+/// `session/prompt` with a JSON-RPC ERROR carrying `error_message` (a
+/// transient-shaped `-32603`), while answering the lifecycle methods normally.
+/// Drives the suspend-enrollment turn worker path: a suspend-overlapping
+/// transient disconnect that `run_prompt_turn` enrolls for wake-resume.
+fn spawn_mock_agent_erroring_on_prompt<R, W>(
+    read: R,
+    write: W,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                // A pre-failure warning chunk, then the transient error.
+                let note = json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "existing-id",
+                        "update": { "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": "partial " } }
+                    }
+                });
+                write
+                    .write_all(format!("{note}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32603, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": MGR_ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// Track a live handle wired to [`spawn_mock_agent_erroring_on_prompt`]: the
+/// child is alive and reusable, but its `session/prompt` fails transiently.
+fn track_mock_agent_prompt_rpc_error(
+    mgr: &AgentManager,
+    id: &AgentId,
+    error_message: &str,
+) -> JoinHandle<()> {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent =
+        spawn_mock_agent_erroring_on_prompt(c2a_agent, a2c_agent, error_message.to_string());
+    let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+    let connection = Arc::new(Connection::new(
+        c2a_client,
+        a2c_client,
+        None,
+        ConnectionHooks {
+            notifications: Some(note_tx),
+            ..ConnectionHooks::default()
+        },
+    ));
+    mgr.handles.lock().unwrap().insert(
+        id.clone(),
+        AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            _vm: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
+            thought_level: None,
+            wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_listener: None,
+        },
+    );
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    agent
+}
+
+/// Injectable overlap query that reports a fixed suspend overlap for ANY window,
+/// so a transient turn failure is always classified as suspend-induced.
+struct AlwaysSuspended(Duration);
+
+impl crate::agent_session::SuspendOverlapQuery for AlwaysSuspended {
+    fn did_suspend_overlap(
+        &self,
+        _start: std::time::Instant,
+        _end: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(self.0)
+    }
+}
+
+/// Finding 1 (suspend-enrollment tears down the provider child): the suspend
+/// branch of the turn worker must `kill_child_only` on enrollment, exactly like
+/// the adjacent silent-redrive branch. Otherwise the live child + IPC connection
+/// survive the upstream disconnect and the resume routes through
+/// `ensure_started`'s live-child reuse — returning the stale `acpSessionId`
+/// WITHOUT a `session/load`. This drives a real suspend-overlapping turn failure
+/// through the worker and asserts (a) the handle is torn down, and (b) the
+/// resume then issues `session/load` against the persisted id.
+#[tokio::test]
+async fn suspend_enrollment_kills_child_so_resume_issues_session_load() {
+    // Keep the enrollment self-heal (finding 2) from firing mid-test: we observe
+    // the suspend branch's own teardown and drive the resume manually.
+    let _env = EnvGuard::set_all(&[("INTENTD_WAKE_RESUME_SELF_HEAL_MS", "600000")]);
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_suspend_tracker(Arc::new(AlwaysSuspended(Duration::from_secs(120))));
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-suspend-kill"));
+    seed_agent(&mgr, &ws, &id).await;
+    // A persisted ACP session id makes the mid-turn child reusable (the
+    // live-child reuse hazard the fix guards against) and reloadable on resume.
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+
+    // A live child that fails its prompt transiently while a suspend overlaps.
+    let _agent = track_mock_agent_prompt_rpc_error(&mgr, &id, "Connection reset by peer");
+    assert!(
+        mgr.contains(&id),
+        "the child handle is live before the turn"
+    );
+
+    // Drive the turn: the worker reuses the live child, streams, then the prompt
+    // fails → suspend-overlap classifier enrolls it → suspend branch runs.
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "hi".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message starts the turn worker");
+
+    // (a) The suspend branch tore down the provider child — no live handle
+    // survives for the resume to reuse.
+    let mut torn_down = false;
+    for _ in 0..60 {
+        if !mgr.contains(&id) {
+            torn_down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        torn_down,
+        "suspend enrollment must kill_child_only so the resume cannot reuse the live child"
+    );
+
+    // The turn was enrolled as system_suspend (not surfaced terminally).
+    let row = mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .expect("interrupted_agent row enrolled");
+    assert_eq!(row.reason.as_deref(), Some("system_suspend"));
+
+    // (b) Resume: with the child gone, session establishment issues `session/load`
+    // against the persisted id (the recovery the enrollment promises) — proven by
+    // a fresh child's request log, NOT the live-child reuse path.
+    let (_agent2, log) = track_mock_agent_with_log(&mgr, &id, true);
+    let sid = mgr
+        .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume establishes a session");
+    assert_eq!(
+        sid, "existing-id",
+        "resume reloads the persisted session id"
+    );
+    let sent: Vec<String> = log.lock().unwrap().iter().map(|(m, _)| m.clone()).collect();
+    assert!(
+        sent.iter().any(|m| m == "session/load"),
+        "resume goes through session/load (fresh spawn), not live-child reuse: {sent:?}"
+    );
+}
+
 /// A test provider that skips `authenticate` (deterministic handshake).
 fn test_provider() -> intent_providers::ProviderConfig {
     intent_providers::ProviderConfig {
@@ -1489,6 +1859,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -4549,6 +4920,25 @@ async fn services_with_specialists(dir: &TempSpecialistsDir) -> (TempDb, Service
     (tmp, services)
 }
 
+/// Like [`services_with_specialists`] but also wires a writable settings
+/// registry (TOML-backed, temp config dir) so a test can `apply()` provider/
+/// background-agent settings and see them reflected in resolution.
+async fn services_with_specialists_and_registry(
+    dir: &TempSpecialistsDir,
+) -> (TempDb, Services, tempfile::TempDir) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_specialist_dirs(Some(dir.0.clone()), None);
+    (tmp, services, config_dir)
+}
+
 /// An otherwise-empty session carrying just the `specialist` under test.
 fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
     AgentSession {
@@ -4561,6 +4951,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: specialist.map(str::to_string),
@@ -4656,6 +5047,15 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
         "chooser",
         "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"},{\"model\":\"auggie:opus\"}]\n---\n\nbody",
     );
+    // Carries options plus a frontmatter `model` on the default provider →
+    // the resolved default is reported alongside them.
+    let default_provider = intent_providers::first_provider_id();
+    dir.write(
+        "pinned",
+        &format!(
+            "---\nname: \"Pinned\"\ndescription: \"Pinned default\"\nmodel: \"{default_provider}:pinned-model\"\nmodelOptions: [{{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}}]\n---\n\nbody"
+        ),
+    );
     // No options → omitted.
     dir.write(
         "plain",
@@ -4678,6 +5078,17 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
     assert_eq!(chooser.options[0].hint, "cheap");
     assert_eq!(chooser.options[1].model, "auggie:opus");
     assert_eq!(chooser.options[1].hint, "");
+    // No frontmatter model and no configured default → provider CLI default.
+    assert_eq!(chooser.default_model, None);
+    let pinned = listed
+        .iter()
+        .find(|s| s.specialist == "pinned")
+        .expect("pinned listed");
+    assert_eq!(
+        pinned.default_model.as_deref(),
+        Some(format!("{default_provider}:pinned-model").as_str()),
+        "the frontmatter default must be reported as the specialist's default"
+    );
     assert!(
         !listed.iter().any(|s| s.specialist == "plain"),
         "specialists without options are omitted"
@@ -4685,6 +5096,79 @@ async fn specialist_model_options_lists_only_visible_specialists_with_options() 
     assert!(
         !listed.iter().any(|s| s.specialist == "ghost"),
         "hidden specialists are omitted"
+    );
+}
+
+/// A specialist pinned to another provider via frontmatter `codingAgent`
+/// reports the default THAT provider would pin, not the settings-derived
+/// default shared by every other specialist (PR #958 review: `agent.delegate`
+/// resolves the specialist's own provider override before falling back to the
+/// settings-derived provider).
+#[tokio::test]
+async fn specialist_model_options_default_honors_specialist_coding_agent_override() {
+    let dir = TempSpecialistsDir::new();
+    let default_provider = intent_providers::first_provider_id();
+    // Pinned to a DIFFERENT (non-default) known provider than the settings
+    // default, with a provider-default configured for THAT provider only.
+    dir.write(
+        "opencode-pinned",
+        "---\nname: \"OpenCode pinned\"\ndescription: \"Pinned to opencode\"\ncodingAgent: \"opencode\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
+    );
+    let (_tmp, services, _cfg) = services_with_specialists_and_registry(&dir).await;
+    services
+        .settings_registry()
+        .expect("registry wired")
+        .apply(&[(
+            "model.providerDefaults".to_string(),
+            json!({ "opencode": "opencode:default-model" }),
+        )])
+        .expect("set opencode provider default");
+
+    let listed = services.specialist_model_options(None);
+    let pinned = listed
+        .iter()
+        .find(|s| s.specialist == "opencode-pinned")
+        .expect("opencode-pinned listed");
+    assert_eq!(
+        pinned.default_model.as_deref(),
+        Some("opencode:default-model"),
+        "default must be resolved against the specialist's own codingAgent \
+         override ({default_provider} is the settings-derived default, not opencode)"
+    );
+}
+
+/// monorepo#1729: the quick-action model settings are scoped to single-shot
+/// quick actions, so the delegation hint's default must ignore them and show
+/// the settings default a real delegate would actually pin.
+#[tokio::test]
+async fn specialist_model_options_default_ignores_quick_action_settings() {
+    let dir = TempSpecialistsDir::new();
+    dir.write(
+        "chooser",
+        "---\nname: \"Chooser\"\ndescription: \"Has options\"\nmodelOptions: [{\"model\":\"opencode:kimi-k3\",\"hint\":\"cheap\"}]\n---\n\nbody",
+    );
+    let (_tmp, services, _cfg) = services_with_specialists_and_registry(&dir).await;
+    services
+        .settings_registry()
+        .expect("registry wired")
+        .apply(&[
+            (
+                "quickActions.typeOverrides".to_string(),
+                json!({ "chooser": "auggie:quick-action-model" }),
+            ),
+            ("model.default".to_string(), json!("auggie:settings-model")),
+        ])
+        .expect("set quick-action type override + default model");
+
+    let listed = services.specialist_model_options(None);
+    let chooser = listed
+        .iter()
+        .find(|s| s.specialist == "chooser")
+        .expect("chooser listed");
+    assert_eq!(
+        chooser.default_model.as_deref(),
+        Some("auggie:settings-model"),
+        "quick-action type override must not apply to a delegated specialist"
     );
 }
 
@@ -4858,6 +5342,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         name_explicitly_set: false,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -5039,7 +5524,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
     mgr.workers.lock().unwrap().insert(id.clone(), worker);
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    let archived = <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
     assert!(archived.archived, "workspace archived");
@@ -5091,6 +5576,88 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
         .expect("session row preserved");
 }
 
+/// Regression (intent-hq/monorepo#1565): an agent archiving its OWN workspace
+/// via `ws.workspace.archive` must not be interrupted by the sweep. The
+/// caller is mid-turn — blocked awaiting the MCP tool result — so aborting
+/// its worker orphans the tool call and leaks the busy slot (the workspace
+/// stays `agent_running` forever). Every OTHER in-flight turn is still
+/// interrupted keep-alive.
+#[tokio::test]
+async fn archive_workspace_skips_the_calling_agents_turn() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-self");
+    let caller = AgentId::from("a-archive-caller");
+    let other = AgentId::from("a-archive-other");
+    seed_agent(&mgr, &ws, &caller).await;
+    insert_extra_session(&mgr, &ws, &other).await;
+    for id in [&caller, &other] {
+        mgr.services
+            .store
+            .set_acp_session_id(&ws, id, &format!("acp-{}", id.as_str()))
+            .await
+            .unwrap();
+        assert!(mgr.try_begin(id, &ws).await);
+        let worker = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        mgr.workers.lock().unwrap().insert(id.clone(), worker);
+    }
+    let _caller_agent = track_mock_agent(&mgr, &caller, false);
+    let _other_agent = track_mock_agent(&mgr, &other, false);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let archived =
+        <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), Some(caller.clone()))
+            .await
+            .expect("archive workspace");
+    assert!(archived.archived, "workspace archived");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let interrupted: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:end")
+        .filter_map(|e| e.data["agentId"].as_str())
+        .collect();
+    assert_eq!(
+        interrupted,
+        vec![other.as_str()],
+        "only the non-calling agent is interrupted"
+    );
+
+    // The caller's turn is untouched: its slot is still held and its worker
+    // still registered, so the in-flight MCP dispatch can return and the turn
+    // ends normally through its own `end_turn`.
+    assert!(mgr.is_busy(&caller), "caller keeps its in-flight slot");
+    assert!(
+        mgr.workers.lock().unwrap().contains_key(&caller),
+        "caller's turn worker survives the sweep"
+    );
+    assert!(!mgr.is_busy(&other), "other agent's slot released");
+    assert!(
+        !mgr.workers.lock().unwrap().contains_key(&other),
+        "other agent's worker aborted"
+    );
+
+    // The caller settles normally once its turn completes — no phantom
+    // running agent left behind (the delete-time symptom in #1565).
+    mgr.end_turn(&caller).await;
+    assert!(!mgr.is_busy(&caller), "caller settles after its turn ends");
+    assert!(
+        mgr.list_busy().is_empty(),
+        "no busy agents remain in the archived workspace"
+    );
+}
+
 /// Pending queued messages survive `workspace.archive` untouched and are NOT
 /// drained into a new turn while the workspace is archived (the archived gate
 /// in `try_drain_queue`); `workspace.unarchive` itself kicks the drain and
@@ -5123,7 +5690,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
 
-    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
 
@@ -5176,7 +5743,7 @@ async fn archive_workspace_parks_wake_deliveries() {
     seed_agent(&mgr, &ws, &id).await;
     let _agent = track_mock_agent(&mgr, &id, false);
 
-    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone())
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
         .await
         .expect("archive workspace");
 
@@ -9359,8 +9926,7 @@ mod harness_wake_tests {
             method: "session/update".to_string(),
             params: json!({
                 "sessionId": "acp-wake",
-                "update": { "sessionUpdate": "agent_thought_chunk",
-                    "content": { "type": "text", "text": "thinking" } }
+                "update": { "sessionUpdate": "plan", "entries": [] }
             }),
         }
     }
@@ -10187,21 +10753,38 @@ mod question_hold_gates {
         ])
     }
 
-    /// Appends the trailing question-block assistant row that arms the hold
-    /// and returns its message id (for `agent_dismiss_questions_op` calls).
-    async fn arm_hold(mgr: &AgentManager, id: &AgentId) -> String {
+    /// Appends the trailing question-block assistant row AND persists the
+    /// pending-questions marker for it (the stored-on-write contract the
+    /// turn-end persist follows), returning its message id — for
+    /// `agent_dismiss_questions_op` calls and answer-metadata tags.
+    async fn arm_hold(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) -> String {
         let asked = mgr
             .services
             .store
             .append_agent_message(id, "assistant", &question_blocks(), &now_iso())
             .await
             .expect("append question");
+        mgr.services
+            .record_pending_questions_marker(ws, id, &asked.id)
+            .await;
         assert!(mgr.services.question_hold_active(id).await);
         asked.id
     }
 
+    /// The `messageMetadata` tag the wizard's answer carries — the only user
+    /// row shape that resolves a pending Q&A (spec §Decisions 3).
+    fn answer_metadata(asked_id: &str) -> Value {
+        json!({
+            "type": "question_answers",
+            "answeredQuestionsMessageId": asked_id,
+        })
+    }
+
     /// Automatic `send_message` parks in the queue with `heldForQuestions`
-    /// and never claims the in-flight slot; a User send passes through.
+    /// and never claims the in-flight slot; a User send passes through —
+    /// but a PLAIN user send does not RELEASE the hold: the automatic entry
+    /// stays parked across that turn, and only the answer-tagged send drains
+    /// it (the persistent-pendingness contract, spec §Decisions 1-3).
     #[tokio::test]
     async fn automatic_send_held_user_send_not() {
         let script = mock_agent_script();
@@ -10217,7 +10800,7 @@ mod question_hold_gates {
             .update_agent_session(&ws, &session)
             .await
             .expect("set mock provider");
-        arm_hold(&mgr, &id).await;
+        let asked = arm_hold(&mgr, &ws, &id).await;
 
         let r = mgr
             .clone()
@@ -10238,25 +10821,62 @@ mod question_hold_gates {
         // Hold still active (no user row was appended).
         assert!(mgr.services.question_hold_active(&id).await);
 
-        // User-origin send is NOT held: it claims the slot and drives a real
-        // turn (mock provider). The user row supersedes the questions, so
-        // the worker's end-of-turn drain then delivers the parked automatic
-        // message too.
-        let opts = TurnOptions {
+        // A PLAIN user-origin send is NOT held: it claims the slot and drives
+        // a real turn (mock provider). It carries no answer tag, so the
+        // pending-questions marker survives it — the automatic entry is still
+        // parked when the turn (and its end-of-turn drain) finishes.
+        let plain = TurnOptions {
             origin: MessageOrigin::User,
             ..TurnOptions::default()
         };
         let r = mgr
             .clone()
-            .send_message(id.clone(), ws.clone(), "answer".to_string(), None, opts)
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "unrelated aside".to_string(),
+                None,
+                plain,
+            )
             .await
-            .expect("user send");
+            .expect("plain user send");
         assert_eq!(
             r.get("heldForQuestions"),
             None,
             "user sends bypass the hold gate"
         );
         assert_eq!(r["queued"], json!(false), "user send starts a turn");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("plain user turn completes");
+        assert!(
+            mgr.services.question_hold_active(&id).await,
+            "a plain user message does not resolve the pending Q&A"
+        );
+        assert_eq!(
+            mgr.services.queue_snapshot(&id).len(),
+            1,
+            "automatic entry stays parked across the user turn"
+        );
+
+        // The ANSWER releases the hold, and the worker's end-of-turn drain
+        // then delivers the parked automatic message.
+        let answer = TurnOptions {
+            origin: MessageOrigin::User,
+            message_metadata: Some(answer_metadata(&asked)),
+            ..TurnOptions::default()
+        };
+        mgr.clone()
+            .send_message(id.clone(), ws.clone(), "answer".to_string(), None, answer)
+            .await
+            .expect("answer send");
         timeout(Duration::from_secs(10), async {
             loop {
                 if !mgr.is_busy(&id)
@@ -10269,7 +10889,11 @@ mod question_hold_gates {
             }
         })
         .await
-        .expect("user turn + released drain complete");
+        .expect("answer turn + released drain complete");
+        assert!(
+            !mgr.services.question_hold_active(&id).await,
+            "hold cleared"
+        );
     }
 
     /// `try_drain_queue` refuses to drain while the hold is active, and
@@ -10295,13 +10919,7 @@ mod question_hold_gates {
 
         mgr.services
             .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
-        let asked = mgr
-            .services
-            .store
-            .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
-            .await
-            .expect("append question");
-        assert!(mgr.services.question_hold_active(&id).await);
+        let asked = arm_hold(&mgr, &ws, &id).await;
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         assert!(!mgr.is_busy(&id), "hold blocks the drain");
@@ -10311,9 +10929,27 @@ mod question_hold_gates {
             "entry stays parked"
         );
 
+        // A later question-FREE assistant turn does not release the hold —
+        // the entry is still parked (pendingness survives the agent's own
+        // turns until answered or dismissed).
+        mgr.services
+            .store
+            .append_agent_message(
+                &id,
+                "assistant",
+                &json!([{ "type": "text", "text": "still thinking" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append question-free tail");
+        assert!(mgr.services.question_hold_active(&id).await);
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id), "hold survives a question-free turn");
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
         // Dismiss → drain proceeds (mirrors the RPC's dismiss-then-kick).
         mgr.services
-            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+            .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.clone())
             .await
             .expect("dismiss");
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -10340,7 +10976,7 @@ mod question_hold_gates {
         let mgr = Arc::new(mgr);
         let (ws, id) = (WorkspaceId::from("ws-qh-int"), AgentId::from("a-qh-int"));
         seed_agent(&mgr, &ws, &id).await;
-        arm_hold(&mgr, &id).await;
+        arm_hold(&mgr, &ws, &id).await;
 
         mgr.services.enqueue_message(
             &id,
@@ -10396,7 +11032,7 @@ mod question_hold_gates {
             .update_agent_session(&ws, &session)
             .await
             .expect("set mock provider");
-        let asked = arm_hold(&mgr, &id).await;
+        let asked = arm_hold(&mgr, &ws, &id).await;
 
         let r1 = mgr
             .interrupt_send_message(
@@ -10477,7 +11113,7 @@ mod question_hold_gates {
             .update_agent_session(&ws, &session)
             .await
             .expect("set mock provider");
-        let asked = arm_hold(&mgr, &id).await;
+        let asked = arm_hold(&mgr, &ws, &id).await;
 
         // Dismiss BEFORE the send: `question_hold_active` inside
         // `send_message` now observes `false`, so this exercises the
@@ -10535,7 +11171,7 @@ mod question_hold_gates {
         let mgr = Arc::new(mgr);
         let (ws, id) = (WorkspaceId::from("ws-qh-race"), AgentId::from("a-qh-race"));
         seed_agent(&mgr, &ws, &id).await;
-        arm_hold(&mgr, &id).await;
+        arm_hold(&mgr, &ws, &id).await;
 
         // The user answer lost the busy race against the asking turn and
         // parked with the user-origin marker (send_message's busy branch).
@@ -10584,6 +11220,67 @@ mod question_hold_gates {
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         assert!(!mgr.is_busy(&id), "hold still blocks automatic entries");
         assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+    }
+
+    /// Answer-driven release (the persistent-pendingness contract): a parked
+    /// automatic entry survives a plain user turn and only drains once a user
+    /// row tagged `question_answers` for the marked message clears the
+    /// pending-questions marker.
+    #[tokio::test]
+    async fn drain_gated_until_answer_metadata() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-qh-answer"),
+            AgentId::from("a-qh-answer"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+
+        mgr.services
+            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
+        let asked = arm_hold(&mgr, &ws, &id).await;
+
+        // A FOREIGN answer tag (naming a message the marker does not point
+        // at) is a no-op: the hold stays armed and the entry stays parked.
+        mgr.services
+            .resolve_pending_questions_for_answer(&ws, &id, Some(&answer_metadata("other-msg")))
+            .await;
+        assert!(mgr.services.question_hold_active(&id).await);
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        assert!(!mgr.is_busy(&id), "stale answer never releases the hold");
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
+        // The matching answer clears the marker, and the drain proceeds.
+        assert!(
+            mgr.services
+                .resolve_pending_questions_for_answer(&ws, &id, Some(&answer_metadata(&asked)))
+                .await,
+            "matching answer clears the marker"
+        );
+        assert!(!mgr.services.question_hold_active(&id).await);
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("answered queue drains");
     }
 }
 

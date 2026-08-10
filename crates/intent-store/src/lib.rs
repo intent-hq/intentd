@@ -30,6 +30,7 @@ mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;
 mod note_version_repo;
+mod pr_monitor_repo;
 mod sandbox_repo;
 mod script_repo;
 mod settings_repo;
@@ -53,6 +54,7 @@ pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use note_version_repo::MAX_NOTE_VERSIONS;
+pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
@@ -240,10 +242,14 @@ impl Store {
         let write_pool = connect_write(db_path).await?;
         let read_pool = connect_read(db_path).await?;
         // Run migrations on the write pool (migrations are write operations).
-        MIGRATOR
-            .run(&write_pool)
-            .await
-            .map_err(|e| Error::Internal(format!("migrations failed: {e}")))?;
+        MIGRATOR.run(&write_pool).await.map_err(|e| match e {
+            sqlx::migrate::MigrateError::VersionMissing(version) => Error::Internal(format!(
+                "database schema is newer than this intentd build (found applied \
+                 migration {version} not known to this build); downgrades are \
+                 unsupported — upgrade intentd to the version that created this database"
+            )),
+            _ => Error::Internal(format!("migrations failed: {e}")),
+        })?;
         Ok(Self {
             write_pool,
             read_pool,

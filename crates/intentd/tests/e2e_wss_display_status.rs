@@ -23,7 +23,7 @@ use intent_core::{
     now_iso, PullRequestStatus, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
-use intent_services::{EventBus, Services};
+use intent_services::{AgentManager, BusEventSink, EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
     MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
@@ -334,9 +334,11 @@ impl SourceControl for StubForge {
 
 struct Fixture {
     _ws: WsApiServer,
+    _manager: Arc<AgentManager>,
     port: u16,
     cfg: Arc<ClientConfig>,
     ws_id: WorkspaceId,
+    store: Store,
     _dir: TempDir,
 }
 
@@ -405,11 +407,16 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
     store.insert_workspace(&ws).await.expect("seed workspace");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new(store.clone())
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_source_control(Arc::new(forge)),
     );
+    // Runtime manager so `agent.retry` has a live handler (no provider is
+    // ever spawned: the tests only exercise the status-flip path).
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = Arc::new(AgentManager::new((*services).clone(), sink, 4));
+    services.attach_agent_manager(&manager);
     let api: Arc<dyn WorkspaceApi> = services.clone();
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -425,9 +432,11 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
     let port = ws_srv.start().await.expect("start");
     Fixture {
         _ws: ws_srv,
+        _manager: manager,
         port,
         cfg,
         ws_id,
+        store,
         _dir: TempDir(dir),
     }
 }
@@ -715,4 +724,276 @@ async fn persisted_pr_status_only_is_pr_open_over_wss() {
         .find(|w| w["id"] == fx.ws_id.as_str())
         .expect("seeded workspace listed");
     assert_eq!(ws_row["displayStatus"], "pr_open");
+}
+
+/// Minimal top-level (no parent, foreground) agent session for seeding the
+/// attention-axis fixtures directly in the store.
+fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
+    let ts = now_iso();
+    intent_core::AgentSession {
+        id: intent_core::AgentId::from(id),
+        workspace_id: ws.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: id.to_string(),
+        name_explicitly_set: false,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: intent_core::AgentStatus::Waiting,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+    }
+}
+
+/// Failed axis over the wire: a top-level agent parked in `error` reads as
+/// `displayStatus: "failed"` on `workspace.get`; `agent.retry` clears the
+/// park and emits the `failed → idle` demotion with the self-sufficient
+/// payload.
+#[tokio::test]
+async fn failed_agent_and_retry_transition_over_wss() {
+    let fx = boot(StubForge::default(), false, None).await;
+    let mut session = top_level_session(&fx.ws_id, "agent-e2e-err");
+    session.status = intent_core::AgentStatus::Error;
+    fx.store
+        .insert_agent_session(&session)
+        .await
+        .expect("seed errored session");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // Read path serves the new wire value (and seeds the baseline).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "failed");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // agent.retry clears the Error park (empty queue → idle) and emits the
+    // failed → idle demotion.
+    let retried = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.retry",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": session.id.0 }),
+    )
+    .await;
+    assert_eq!(retried["ok"], true, "retry ok: {retried}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
+    );
+}
+
+/// Blocked axis over the wire: a top-level pending blocker attention request
+/// reads as `displayStatus: "blocked"` on `workspace.get` — outranking
+/// `needs_attention` from a sibling discussion request — and `agent.delete`
+/// of the blocker-holding agent emits the demotion.
+#[tokio::test]
+async fn blocked_transition_over_wss() {
+    let fx = boot(StubForge::default(), false, None).await;
+    let blocker = top_level_session(&fx.ws_id, "agent-e2e-blk");
+    fx.store
+        .insert_agent_session(&blocker)
+        .await
+        .expect("seed blocker session");
+    fx.store
+        .set_attention_request(&fx.ws_id, &blocker.id, "blocker", "env broken", &now_iso())
+        .await
+        .expect("raise blocker");
+    let discuss = top_level_session(&fx.ws_id, "agent-e2e-disc");
+    fx.store
+        .insert_agent_session(&discuss)
+        .await
+        .expect("seed discussion session");
+    fx.store
+        .set_attention_request(
+            &fx.ws_id,
+            &discuss.id,
+            "discussion",
+            "need input",
+            &now_iso(),
+        )
+        .await
+        .expect("raise discussion");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // blocked outranks needs_attention on the read path (seeds baseline).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "blocked");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Deleting the blocker-holder demotes to the next rung: the sibling
+    // discussion request keeps the workspace at needs_attention.
+    let deleted = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.delete",
+        json!({ "workspaceId": fx.ws_id.as_str(), "agentId": blocker.id.0 }),
+    )
+    .await;
+    assert_eq!(deleted["success"], true, "delete ok: {deleted}");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "needs_attention" })
+    );
+}
+
+/// Unread axis over the wire: `workspace.update { attention: "unread" }`
+/// promotes the idle base to `displayStatus: "unread"` and emits;
+/// `workspace.markSeen` retires the flag and emits the demotion back to
+/// `idle`. A `review_required` flag reads as `needs_attention` and
+/// `workspace.dismissAttention` retires it.
+#[tokio::test]
+async fn attention_flag_transitions_over_wss() {
+    let fx = boot(StubForge::default(), false, None).await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // Seed the baseline: idle (no PR, no tasks, no agents).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // unread flag → unread (promotes the idle base).
+    wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.update",
+        json!({ "workspaceId": fx.ws_id.as_str(), "attention": "unread" }),
+    )
+    .await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "unread" })
+    );
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "unread");
+
+    // markSeen retires unread → idle.
+    wss_rpc(
+        &mut rpc,
+        4,
+        "workspace.markSeen",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
+    );
+
+    // review_required flag → needs_attention.
+    wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.update",
+        json!({ "workspaceId": fx.ws_id.as_str(), "attention": "review_required" }),
+    )
+    .await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "needs_attention" })
+    );
+
+    // dismissAttention retires review_required → idle.
+    wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.dismissAttention",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
+    );
 }

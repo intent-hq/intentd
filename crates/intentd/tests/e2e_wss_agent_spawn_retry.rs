@@ -891,6 +891,166 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     );
 }
 
+/// Spawn-time pi CLI fail-fast over the wire (monorepo#1662): a daemon whose
+/// `PI_ACP_PI_COMMAND` points at a fake too-old `pi` must fail a pi-provider
+/// turn on the FIRST spawn attempt (`Error::InvalidInput` from
+/// `check_pi_cli_for_spawn` is non-retryable), surfacing the gate's
+/// user-facing reason — found version, requirement, pi-acp pin — in the
+/// terminal `agent:failed` event and the persisted `stopReason`, with no
+/// retry hints and no `agent:stream:activity` (nothing was spawned).
+#[tokio::test]
+async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
+    // The pi provider is npx-only: `resolve_spawn` resolves npx BEFORE the
+    // pi CLI check, so a host without npx would fail on npx instead.
+    if intent_providers::find_npx().is_none() {
+        eprintln!("skipping WSS pi CLI fail-fast E2E: npx not found");
+        return;
+    }
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+
+    // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
+    let fake_pi = data_dir.join("fake-pi");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&fake_pi, "#!/bin/sh\necho 0.79.0\n").expect("write fake pi");
+        std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake pi");
+    }
+    let fake_pi_str = fake_pi.to_string_lossy().into_owned();
+
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("PI_ACP_PI_COMMAND", &fake_pi_str),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-PI-GATE", "provider": "pi" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "trigger pi gate" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Terminal failure on the first attempt: agent:failed carries the gate
+    // reason; no retry hints, no chunks (the child was never spawned).
+    let mut failed_error: Option<String> = None;
+    let mut saw_end = false;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => {
+                failed_error = Some(
+                    event["data"]["error"]
+                        .as_str()
+                        .expect("agent:failed carries the error text")
+                        .to_string(),
+                );
+            }
+            Some("agent:stream:status") => {
+                let msg = event["data"]["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("retrying"),
+                    "pi CLI gate must be non-retryable (fail-fast), saw retry hint: {msg}"
+                );
+            }
+            Some("agent:stream:activity") => {
+                panic!("no chunks expected — the pi child must never spawn: {frame}");
+            }
+            Some("agent:stream:end") => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let error = failed_error.expect("terminal agent:failed observed over WSS");
+    assert!(error.contains("cannot start Pi agent"), "{error}");
+    assert!(
+        error.contains("0.79.0"),
+        "gate names the found version: {error}"
+    );
+    assert!(
+        error.contains(intent_providers::PI_CLI_REQUIREMENT),
+        "gate names the requirement: {error}"
+    );
+    assert!(
+        error.contains(intent_providers::PI_ACP_NPX_PACKAGE),
+        "gate names the pi-acp pin: {error}"
+    );
+    assert!(
+        saw_end,
+        "terminal agent:stream:end emitted after the fail-fast"
+    );
+
+    // The persisted session carries the same gate reason as stopReason.
+    let session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["status"], "error",
+        "session status is error after the pi gate fail-fast"
+    );
+    let stop_reason = session["session"]["stopReason"]
+        .as_str()
+        .expect("stopReason persisted after the pi gate fail-fast");
+    assert!(
+        stop_reason.contains("cannot start Pi agent"),
+        "{stop_reason}"
+    );
+}
+
 /// INIT-TIMEOUT (monorepo#616): a slow-to-initialize agent succeeds on the
 /// FIRST attempt under the default 30s `initialize` timeout. The mock delays
 /// its `initialize` reply by 6s — longer than the old hard-coded 5s

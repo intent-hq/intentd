@@ -98,7 +98,8 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+            91, 92, 93
         ]
     );
     assert_eq!(
@@ -107,8 +108,43 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+            91, 92, 93
         ]
+    );
+}
+
+/// `Store::open` refuses to run against a database whose `_sqlx_migrations`
+/// table records a version not embedded in this build (i.e. the DB was
+/// created by a newer intentd): it must surface a clear "downgrades are
+/// unsupported" error naming the offending version, not the raw sqlx
+/// `VersionMissing` message or a generic migration failure.
+#[tokio::test]
+async fn open_rejects_database_from_newer_build() {
+    let tmp = TempDb::new();
+    {
+        let store = Store::open(&tmp.path).await.expect("initial open");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (999999, 'from the future', CURRENT_TIMESTAMP, 1, x'00', 0)",
+        )
+        .execute(store.write_pool())
+        .await
+        .expect("seed future migration row");
+    }
+
+    let result = Store::open(&tmp.path).await;
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("reopen must refuse a schema from a newer build"),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("downgrades are unsupported"), "got {msg:?}");
+    assert!(msg.contains("999999"), "got {msg:?}");
+    assert!(
+        msg.contains("upgrade intentd to the version that created this database"),
+        "got {msg:?}"
     );
 }
 
@@ -380,6 +416,92 @@ async fn workspace_last_activity_bump_is_scoped_and_monotonic() {
             .await,
         Err(intent_core::Error::NotFound(_))
     ));
+}
+
+/// Regression (monorepo#1585): `update_workspace` — the full-row replace —
+/// routes `last_activity` through the same monotonic guard as
+/// `bump_workspace_last_activity`, so a get → mutate → write flow whose read
+/// predated a concurrent bump can no longer silently revert (or clear) the
+/// column. A newer candidate still advances it through the same write.
+#[tokio::test]
+async fn workspace_full_row_update_cannot_regress_last_activity() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    let mut seed = sample_workspace(&id, "Clobber WS", false);
+    seed.last_activity = None;
+    store.insert_workspace(&seed).await.expect("insert");
+
+    // Stale snapshot read BEFORE a concurrent bump lands (the monorepo#1585
+    // interleaving: debounce bump vs. get → mutate → update_workspace).
+    let stale = store.get_workspace(&id).await.expect("stale read");
+    assert!(store
+        .bump_workspace_last_activity(&id, "2026-01-01T00:00:00Z")
+        .await
+        .expect("bump"));
+
+    // Full-row write off the stale snapshot (`last_activity: None`): every
+    // other column replaces, the bumped column holds.
+    let mut renamed = stale.clone();
+    renamed.title = "Renamed".to_string();
+    store
+        .update_workspace(&renamed)
+        .await
+        .expect("update stale");
+    let got = store.get_workspace(&id).await.expect("get");
+    assert_eq!(got.title, "Renamed", "other columns still full-row replace");
+    assert_eq!(
+        got.last_activity.as_deref(),
+        Some("2026-01-01T00:00:00Z"),
+        "a None candidate must not clear the bumped column"
+    );
+
+    // An older candidate is declined, leaving the stored value intact.
+    let mut older = got.clone();
+    older.last_activity = Some("2020-01-01T00:00:00Z".to_string());
+    store.update_workspace(&older).await.expect("update older");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z"),
+        "a stale candidate must not walk last_activity backwards"
+    );
+
+    // A malformed candidate never writes.
+    let mut malformed = got.clone();
+    malformed.last_activity = Some("not-a-timestamp".to_string());
+    store
+        .update_workspace(&malformed)
+        .await
+        .expect("update malformed");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2026-01-01T00:00:00Z")
+    );
+
+    // A newer candidate advances the column through the same write.
+    let mut newer = got.clone();
+    newer.last_activity = Some("2027-01-01T00:00:00Z".to_string());
+    store.update_workspace(&newer).await.expect("update newer");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .last_activity
+            .as_deref(),
+        Some("2027-01-01T00:00:00Z")
+    );
 }
 
 #[tokio::test]
@@ -1919,12 +2041,6 @@ async fn event_round_trip_and_queries() {
         .await
         .expect("insert other");
 
-    // recent_files: newest first, scoped to workspace, only file:changed.
-    let recent = store.recent_files(&ws, 10).await.expect("recent");
-    assert_eq!(recent.len(), 2);
-    assert_eq!(recent[0].timestamp, "2026-01-01T00:00:02Z");
-    assert_eq!(recent[1].timestamp, "2026-01-01T00:00:01Z");
-
     // events_by_workspace: all three ws events, newest first; no leak.
     let all = store.events_by_workspace(&ws, 10).await.expect("by ws");
     assert_eq!(all.len(), 3);
@@ -1942,9 +2058,14 @@ async fn event_round_trip_and_queries() {
         .expect("by type tool-call");
     assert_eq!(calls.len(), 1);
 
-    // directory_changes: prefix filter on data.path.
+    // path_prefix: prefix filter on data.path.
     let in_src = store
-        .directory_changes(&ws, "src/", 10)
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![events::FILE_CHANGED.to_string()],
+            path_prefix: Some("src/".to_string()),
+            ..Default::default()
+        })
         .await
         .expect("dir changes");
     assert_eq!(in_src.len(), 1);
@@ -3070,6 +3191,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         name_explicitly_set: false,
         model: Some("opus".to_string()),
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: Some("be helpful".to_string()),
         specialist: None,
@@ -5505,6 +5627,8 @@ fn sample_hook(id: &HookId, ws: &WorkspaceId, agent: &AgentId, name: &str) -> Ho
         last_logs: None,
         last_state: None,
         expires_at: Some(now_iso()),
+        perpetual: false,
+        dispatch_count: 0,
     }
 }
 
@@ -5540,6 +5664,46 @@ async fn hook_insert_get_round_trip() {
 
     let missing = HookId("hook-missing".to_string());
     let err = store.get_hook(&missing).await.expect_err("missing hook");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
+/// A perpetual hook round-trips its `perpetual` / `dispatch_count` columns,
+/// and the dispatch-count bump persists.
+#[tokio::test]
+async fn hook_perpetual_and_dispatch_count_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+
+    // Default (one-shot) row reads back as `false` / 0.
+    let one_shot_id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    store
+        .insert_hook(&sample_hook(&one_shot_id, &ws, &agent, "one-shot"))
+        .await
+        .expect("insert one-shot");
+    let one_shot = store.get_hook(&one_shot_id).await.expect("get one-shot");
+    assert!(!one_shot.perpetual);
+    assert_eq!(one_shot.dispatch_count, 0);
+
+    let id = HookId(format!("hook-{}", uuid::Uuid::new_v4()));
+    let mut hook = sample_hook(&id, &ws, &agent, "perpetual");
+    hook.perpetual = true;
+    hook.dispatch_count = 2;
+    store.insert_hook(&hook).await.expect("insert perpetual");
+    assert_eq!(store.get_hook(&id).await.expect("get hook"), hook);
+
+    store
+        .increment_hook_dispatch_count(&id)
+        .await
+        .expect("bump dispatch count");
+    let bumped = store.get_hook(&id).await.expect("get bumped");
+    assert!(bumped.perpetual);
+    assert_eq!(bumped.dispatch_count, 3);
+
+    let err = store
+        .increment_hook_dispatch_count(&HookId("hook-missing".to_string()))
+        .await
+        .expect_err("missing hook");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 }
 
@@ -5584,6 +5748,50 @@ async fn hook_list_filters_by_workspace_and_agent() {
         .await
         .expect("list none");
     assert!(empty.is_empty());
+}
+
+/// `count_active_hooks_by_agent` counts only `scheduled`/`running` rows for
+/// the given agent — terminal rows and other agents' hooks are excluded, and
+/// an unknown agent counts zero.
+#[tokio::test]
+async fn hook_count_active_by_agent() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let (ws, agent) = seed_hook_owner(&store).await;
+    let (ws_other, agent_other) = seed_hook_owner(&store).await;
+
+    let scheduled = sample_hook(&HookId("hook-sched".into()), &ws, &agent, "sched");
+    let mut running = sample_hook(&HookId("hook-run".into()), &ws, &agent, "run");
+    running.state = HookState::Running;
+    let mut done = sample_hook(&HookId("hook-done".into()), &ws, &agent, "done");
+    done.state = HookState::Dispatched;
+    let mut gone = sample_hook(&HookId("hook-gone".into()), &ws, &agent, "gone");
+    gone.state = HookState::Expired;
+    let foreign = sample_hook(
+        &HookId("hook-foreign".into()),
+        &ws_other,
+        &agent_other,
+        "foreign",
+    );
+    for h in [&scheduled, &running, &done, &gone, &foreign] {
+        store.insert_hook(h).await.expect("insert hook");
+    }
+
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&agent)
+            .await
+            .expect("count"),
+        2,
+        "scheduled + running only"
+    );
+    assert_eq!(
+        store
+            .count_active_hooks_by_agent(&AgentId("agent-none".into()))
+            .await
+            .expect("count none"),
+        0
+    );
 }
 
 /// State transitions, run bookkeeping, and last-error updates persist; every

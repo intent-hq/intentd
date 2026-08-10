@@ -21,6 +21,7 @@ pub mod agent_logs;
 pub mod chief_cwd;
 pub mod clock;
 pub mod config;
+pub mod discovery_cache;
 pub mod error;
 pub mod events;
 pub mod ids;
@@ -44,15 +45,17 @@ pub use agent_logs::{
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
+pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
+pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{chief_workspace, is_chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
@@ -72,12 +75,12 @@ pub use model::{
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult, RepoConfig, RepoScript,
-    RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script, ScriptCreateParams, ScriptMode,
-    ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript, SetupScriptGeneratedBy,
-    SuggestionDiff, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
+    PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
+    RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult, Script,
+    ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
+    SetupScriptGeneratedBy, SuggestionDiff, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace, WorkspaceActivity,
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
@@ -85,6 +88,7 @@ pub use model::{
     WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
     WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
+pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use settings_file::{

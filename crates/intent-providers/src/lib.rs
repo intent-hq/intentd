@@ -26,9 +26,10 @@ pub mod args;
 pub mod config;
 pub mod discover;
 pub mod models;
+pub mod version_gate;
 
 pub use args::{
-    apply_codex_config_args, build_provider_args, build_provider_env,
+    apply_codex_config_args, build_provider_args, build_provider_env, build_provider_env_for_spawn,
     build_provider_env_with_unsloth, enhanced_path, upsert_codex_config_args, ArgInputs,
     UnslothEndpoint, UnslothModelLimit,
 };
@@ -37,12 +38,12 @@ pub use config::{
     find_provider, first_provider_config, first_provider_id, is_provider_authentication_error,
     provider_config, InjectionMechanism, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
     CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
-    PI_ACP_NPX_PACKAGE,
+    PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
 };
 pub use discover::{
-    discover_providers, discover_providers_with_overrides, find_npx, find_provider_binary,
-    gated_reason, gated_reason_with_env, not_installed_detail, probe_npx, resolve_on_path,
-    NpxStatus, ProviderAvailability, SecondaryBinary,
+    discover_providers, discover_providers_with_overrides, find_npx, find_pi_cli,
+    find_provider_binary, gated_reason, gated_reason_with_env, not_installed_detail, probe_npx,
+    provider_availability_for, resolve_on_path, NpxStatus, ProviderAvailability, SecondaryBinary,
 };
 pub use models::{
     create_compound_model_id, fuzzy_match_model_in_pool, is_model_valid_for_provider,
@@ -50,6 +51,7 @@ pub use models::{
     parse_grok_initialize_response_from_stdout, parse_grok_models_command_output,
     resolve_preferred_model, GrokModel, GrokModelsCommandOutput, GrokParsedModels,
 };
+pub use version_gate::{pi_cli_gate, pi_gate_reason, PiCliGate, PiCliProbe};
 
 #[cfg(test)]
 mod tests;

@@ -8,9 +8,11 @@
 //! Workspaces can be registered/deregistered at runtime (#611) via
 //! [`SkillsWatcher::add_workspace`] / [`SkillsWatcher::remove_workspace`].
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::{events::SKILLS_CHANGED, now_iso, ActorType, EventActor, WorkspaceId};
@@ -21,14 +23,21 @@ use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
 use super::root_watch::{watch_root, RootWatch};
+use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
+///
+/// The four user tiers keep a [`RootWatch`] each — they are shared once per
+/// daemon, so they do not scale with the workspace count. The three project
+/// tiers per workspace no longer own streams at all: they ride the shared
+/// workspace-root stream via [`watch_tiers`].
 pub struct SkillsWatcher {
+    hub: Arc<SharedWatchHub>,
     _user_watchers: Vec<RootWatch>,
-    workspace_watchers: Mutex<HashMap<WorkspaceId, Vec<RootWatch>>>,
+    workspace_watchers: Mutex<HashMap<WorkspaceId, TierWatch>>,
     raw_tx: mpsc::UnboundedSender<SkillsMsg>,
     task: JoinHandle<()>,
 }
@@ -42,7 +51,11 @@ impl Drop for SkillsWatcher {
 impl SkillsWatcher {
     /// Start watching skills directories for all workspaces.
     /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
-    pub fn start(bus: EventBus, workspaces: Vec<(WorkspaceId, PathBuf)>) -> Self {
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
+        bus: EventBus,
+        workspaces: Vec<(WorkspaceId, PathBuf)>,
+    ) -> Self {
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
@@ -53,17 +66,18 @@ impl SkillsWatcher {
         }
 
         // Start project-tier watchers (per-workspace)
-        let mut workspace_watchers: HashMap<WorkspaceId, Vec<RootWatch>> = HashMap::new();
+        let mut workspace_watchers: HashMap<WorkspaceId, TierWatch> = HashMap::new();
         for (ws_id, ws_path) in &workspaces {
             workspace_watchers.insert(
                 ws_id.clone(),
-                start_project_watchers(ws_id, ws_path, &raw_tx),
+                start_project_watch(hub, ws_id, ws_path, &raw_tx),
             );
         }
 
         let task = tokio::spawn(debounce_loop(bus, workspaces, raw_rx));
 
         Self {
+            hub: Arc::clone(hub),
             _user_watchers: user_watchers,
             workspace_watchers: Mutex::new(workspace_watchers),
             raw_tx,
@@ -79,31 +93,21 @@ impl SkillsWatcher {
         let _ = self
             .raw_tx
             .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
-        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
         if let Ok(mut map) = self.workspace_watchers.lock() {
-            map.insert(workspace_id, watchers);
+            map.insert(workspace_id, watch);
         }
     }
 
-    /// Await every registered root watch actually being established. Watch
+    /// Await every user-tier root watch actually being established. Their
     /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating the watched directories.
+    /// tests must wait for it before mutating those directories. Project tiers
+    /// ride the shared stream and need no separate sync point — subscribing is
+    /// synchronous bookkeeping.
     #[cfg(test)]
     async fn wait_established(&self, timeout: Duration) {
         for watch in &self._user_watchers {
             watch.wait_established(timeout).await;
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let all_up = self
-                .workspace_watchers
-                .lock()
-                .map(|map| map.values().flatten().all(|w| w.watched().is_some()))
-                .unwrap_or(true);
-            if all_up || tokio::time::Instant::now() >= deadline {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -115,23 +119,58 @@ impl SkillsWatcher {
         }
         let _ = self.raw_tx.send(SkillsMsg::Remove(workspace_id.clone()));
     }
+
+    /// Suspend a workspace (archive): tear down its project-tier watches like
+    /// [`Self::remove_workspace`], but first snapshot the skill set into a
+    /// PRIVATE fingerprint. The shared `DISCOVERY_CACHE` cannot serve as the
+    /// baseline here: every `load_skills_payload` caller refreshes it, and
+    /// `unarchive_workspace` kicks agent queue drains (whose prompt build
+    /// calls `format_skills_catalog_for_prompt`) before publishing the delta,
+    /// so the cache can absorb an archive-window edit before the resume flush
+    /// runs and silently swallow the catch-up event.
+    pub fn pause_workspace(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.remove(workspace_id);
+        }
+        let _ = self.raw_tx.send(SkillsMsg::Pause(workspace_id.clone()));
+    }
+
+    /// Resume a suspended workspace (unarchive): re-watch the project tier and
+    /// schedule one catch-up flush compared against the fingerprint retained
+    /// by [`Self::pause_workspace`], so an unchanged tree emits nothing and an
+    /// edit made while suspended emits exactly once.
+    pub fn resume_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self.raw_tx.send(SkillsMsg::Resume(
+            workspace_id.clone(),
+            workspace_path.clone(),
+        ));
+        let watch = start_project_watch(&self.hub, &workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watch);
+        }
+    }
 }
 
-/// Watch the project-tier skill roots of one workspace.
-fn start_project_watchers(
+/// Watch all three project-tier skill roots of one workspace over the shared
+/// workspace-root stream — one subscription, no streams of its own (previously
+/// three [`RootWatch`]es, each its own stream even when the tier was missing).
+fn start_project_watch(
+    hub: &Arc<SharedWatchHub>,
     workspace_id: &WorkspaceId,
     workspace_path: &Path,
     raw_tx: &mpsc::UnboundedSender<SkillsMsg>,
-) -> Vec<RootWatch> {
-    let mut watchers = Vec::new();
-    for root in get_project_skill_roots(workspace_path) {
-        watchers.push(watch_directory(
-            root,
-            Some(workspace_id.clone()),
-            raw_tx.clone(),
-        ));
-    }
-    watchers
+) -> TierWatch {
+    let ws_id = workspace_id.clone();
+    let tx = raw_tx.clone();
+    watch_tiers(
+        hub,
+        workspace_path,
+        PROJECT_SKILL_TIERS,
+        is_skill_md,
+        move || {
+            let _ = tx.send(SkillsMsg::Change(Some(ws_id.clone())));
+        },
+    )
 }
 
 /// Message into the debounce loop: a raw filesystem change, or a runtime
@@ -144,6 +183,25 @@ enum SkillsMsg {
     Add(WorkspaceId, PathBuf),
     /// Workspace deregistered; its pending flush is dropped.
     Remove(WorkspaceId),
+    /// Workspace suspended (archive): stops emitting like `Remove`, but the
+    /// skill set is fingerprinted first so the later `Resume` catch-up has a
+    /// baseline that the shared discovery cache cannot invalidate.
+    Pause(WorkspaceId),
+    /// Workspace re-registered after a suspension (unarchive): like `Add`,
+    /// plus a due-now flush so changes missed while suspended are picked up.
+    Resume(WorkspaceId, PathBuf),
+}
+
+/// Fingerprint the resolved skill set for a workspace: a hash of the
+/// serialized [`crate::skills::SkillMetadata`] list, so a body-only or
+/// description-only edit during a suspension is still detected (the shared
+/// `check_skills_changed` compares names and count only).
+async fn skills_fingerprint(workspace_path: &Path) -> u64 {
+    let skills = crate::skills::discover_skills(&workspace_path.to_string_lossy()).await;
+    let rendered = serde_json::to_string(&skills).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    rendered.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Watch a single root, forwarding `SKILL.md` and directory-level events.
@@ -175,13 +233,8 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn get_project_skill_roots(workspace_path: &Path) -> Vec<PathBuf> {
-    vec![
-        workspace_path.join(".agents").join("skills"),
-        workspace_path.join(".intent").join("skills"),
-        workspace_path.join(".augment").join("skills"),
-    ]
-}
+/// Project-tier skill roots, relative to the workspace root.
+const PROJECT_SKILL_TIERS: &[&str] = &[".agents/skills", ".intent/skills", ".augment/skills"];
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -200,6 +253,10 @@ async fn debounce_loop(
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
     let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
+    // Baselines snapshotted at `Pause`, consumed by the first flush after the
+    // matching `Resume`. Only suspended workspaces have an entry — the normal
+    // watch path keeps using the shared discovery cache.
+    let mut suspend_baselines: HashMap<WorkspaceId, u64> = HashMap::new();
 
     loop {
         let next_deadline = pending.values().copied().min();
@@ -222,20 +279,35 @@ async fn debounce_loop(
                     }
                 }
                 Some(SkillsMsg::Add(ws_id, path)) => {
+                    suspend_baselines.remove(&ws_id);
                     workspace_paths.insert(ws_id, path);
                 }
                 Some(SkillsMsg::Remove(ws_id)) => {
                     workspace_paths.remove(&ws_id);
+                    suspend_baselines.remove(&ws_id);
                     pending.remove(&ws_id);
+                }
+                Some(SkillsMsg::Pause(ws_id)) => {
+                    if let Some(path) = workspace_paths.get(&ws_id) {
+                        suspend_baselines.insert(ws_id.clone(), skills_fingerprint(path).await);
+                    }
+                    workspace_paths.remove(&ws_id);
+                    pending.remove(&ws_id);
+                }
+                Some(SkillsMsg::Resume(ws_id, path)) => {
+                    workspace_paths.insert(ws_id.clone(), path);
+                    // Catch-up: flush after the normal debounce so the
+                    // re-registered watches' own events coalesce into it.
+                    pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
                 }
                 None => {
                     // All senders dropped: flush and exit
-                    flush_all(&bus, &workspace_paths, &mut pending).await;
+                    flush_all(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
                     return;
                 }
             },
             _ = sleep_until(next_deadline), if next_deadline.is_some() => {
-                flush_due(&bus, &workspace_paths, &mut pending).await;
+                flush_due(&bus, &workspace_paths, &mut suspend_baselines, &mut pending).await;
             }
         }
     }
@@ -244,6 +316,7 @@ async fn debounce_loop(
 async fn flush_due(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
+    suspend_baselines: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
     let now = tokio::time::Instant::now();
@@ -256,7 +329,8 @@ async fn flush_due(
     for ws_id in due {
         pending.remove(&ws_id);
         if let Some(path) = workspace_paths.get(&ws_id) {
-            emit_skills_changed(bus, &ws_id, path).await;
+            let baseline = suspend_baselines.remove(&ws_id);
+            emit_skills_changed(bus, &ws_id, path, baseline).await;
         }
     }
 }
@@ -264,18 +338,36 @@ async fn flush_due(
 async fn flush_all(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
+    suspend_baselines: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
     for (ws_id, _) in pending.drain() {
         if let Some(path) = workspace_paths.get(&ws_id) {
-            emit_skills_changed(bus, &ws_id, path).await;
+            let baseline = suspend_baselines.remove(&ws_id);
+            emit_skills_changed(bus, &ws_id, path, baseline).await;
         }
     }
 }
 
-async fn emit_skills_changed(bus: &EventBus, workspace_id: &WorkspaceId, workspace_path: &Path) {
+/// Emit `skills:changed` if the set actually changed. `suspend_baseline` is
+/// `Some` only for the first flush after an unarchive: the shared discovery
+/// cache is unusable as a baseline across that window (any `skills.*` reader
+/// can refresh it mid-suspension), so the retained fingerprint is compared
+/// instead. Without one — e.g. a workspace archived before daemon start — the
+/// normal cache comparison applies and may emit one benign extra event.
+async fn emit_skills_changed(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    workspace_path: &Path,
+    suspend_baseline: Option<u64>,
+) {
     // Re-run discovery to check if the skill set actually changed
-    let (_, changed) = crate::skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+    let (_, cache_changed) =
+        crate::skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+    let changed = match suspend_baseline {
+        Some(baseline) => skills_fingerprint(workspace_path).await != baseline,
+        None => cache_changed,
+    };
 
     if changed {
         let event = NewEvent {
@@ -318,6 +410,7 @@ mod tests {
 
     use super::super::filter::SubscriptionFilter;
     use super::*;
+    use crate::events::LIVENESS;
 
     /// Self-cleaning temp directory (workspace root).
     struct TempDir {
@@ -423,12 +516,12 @@ mod tests {
         // 250ms -> 500ms so the runtime registration + its OS watch establish
         // before the SKILL.md is created, which under nextest's oversubscribed
         // parallelism a 250ms warm-up can lose.
-        let watcher = SkillsWatcher::start(bus.clone(), vec![]);
-        watcher.wait_established(Duration::from_secs(10)).await;
+        let watcher = SkillsWatcher::start(&SharedWatchHub::new(), bus.clone(), vec![]);
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         watcher.add_workspace(ws_id.clone(), ws.path.clone());
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // A project-tier SKILL.md created after registration emits for the
@@ -437,12 +530,11 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
         std::fs::write(skill_dir.join("SKILL.md"), skill_md("dyn-skill")).expect("write skill");
 
-        // First-event budget is `quiet` (the loop breaks after one quiet window
-        // of silence), widened 2s -> 8s (with the total deadline to match) to
-        // absorb fsevents detection + forward-task latency under load. The
-        // negative-assertion drain below stays tight — it asserts absence.
-        let events =
-            drain_skills_events(&mut sub, Duration::from_secs(8), Duration::from_secs(20)).await;
+        // The drain waits up to `LIVENESS` for the first event (monorepo#1630),
+        // with a generous quiet window to absorb fsevents detection +
+        // forward-task latency under load. The negative-assertion drain below
+        // stays tight — it asserts absence.
+        let events = drain_skills_events(&mut sub, Duration::from_secs(8), LIVENESS).await;
         assert!(
             events.iter().any(|e| e.workspace_id == ws_id),
             "change after runtime registration must emit for the workspace, got {events:?}"
@@ -466,6 +558,46 @@ mod tests {
         assert!(
             events.iter().all(|e| e.workspace_id != ws_id),
             "deregistered workspace must stop emitting, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn resume_catch_up_survives_a_discovery_cache_refresh_while_suspended() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let ws = TempDir::new("pause-ws");
+        let ws_id = WorkspaceId::from("ws-skills-pause");
+        let skill_dir = ws.path.join(".intent").join("skills").join("seed-skill");
+        std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md("seed-skill")).expect("seed skill");
+
+        let watcher = SkillsWatcher::start(
+            &SharedWatchHub::new(),
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Suspend, then add a skill and let an unrelated reader refresh the
+        // shared DISCOVERY_CACHE — exactly what `unarchive_workspace`'s queue
+        // drain does before the delta is published. The retained fingerprint,
+        // not the cache, must be what the resume flush compares against.
+        watcher.pause_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let added = ws.path.join(".intent").join("skills").join("added-skill");
+        std::fs::create_dir_all(&added).expect("mk added skill dir");
+        std::fs::write(added.join("SKILL.md"), skill_md("added-skill")).expect("write skill");
+        crate::skills::discover_skills(&ws.path.to_string_lossy()).await;
+
+        watcher.resume_workspace(ws_id.clone(), ws.path.clone());
+        let events = drain_skills_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
+        assert!(
+            events.iter().any(|e| e.workspace_id == ws_id),
+            "resume must emit for an edit made while suspended even though the cache was refreshed, got {events:?}"
         );
     }
 }

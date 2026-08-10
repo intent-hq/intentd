@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 273 canonical methods routed through the main dispatch match in
+/// These are the 275 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -68,9 +68,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "event.agentActivity",
-    "event.directoryChanges",
     "event.query",
-    "event.recentFiles",
     "event.workspaceSummary",
     "file.delete",
     "file.exists",
@@ -111,6 +109,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.unstageHunk",
     "github.authStatus",
     "github.branches.list",
+    "github.branches.listCached",
     "github.cancelAuth",
     "github.connect",
     "github.getReviewThreads",
@@ -182,6 +181,9 @@ pub const ROUTER_METHODS: &[&str] = &[
     "note.updateMetadata",
     "pr.refresh",
     "pr.status",
+    "prMonitor.cancel",
+    "prMonitor.flush",
+    "prMonitor.list",
     "primitive.addAgentAction",
     "primitive.addCli",
     "primitive.addPatch",

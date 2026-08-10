@@ -146,6 +146,7 @@ fn session(
         name_explicitly_set,
         model: None,
         reasoning_effort: None,
+        effort_levels: None,
         provider: None,
         system_prompt: None,
         specialist: None,
@@ -600,6 +601,38 @@ async fn generated_message_replaces_fallback_subject() {
     assert!(
         message.starts_with("feat: implement auto-commit"),
         "got: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generation_uses_commit_quick_action_override() {
+    // monorepo#1734: the auto-commit path calls agent.completeOnce with
+    // `type: "commit"`, so the user's commit quick-action override reaches
+    // the CLI. The fake auggie echoes its argv into the generated subject.
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (_bin_dir, bin) = fake_auggie(
+        "gen-quick-action",
+        "printf '<<<COMMIT_MESSAGE>>>\\nfeat: %s\\n<<</COMMIT_MESSAGE>>>' \"$*\"",
+    );
+    let (_config_dir, registry) = auggie_active_registry();
+    registry
+        .apply(&[(
+            "quickActions.typeOverrides".to_string(),
+            json!({ "commit": "haiku4.5" }),
+        )])
+        .expect("set commit override");
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
+    let agent = session("agent-q1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-q1").await;
+    let event = idle_event(&ws_id, "agent-q1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
+    assert!(
+        message.contains("--model haiku4.5"),
+        "the commit quick-action override must reach the CLI, got: {message}"
     );
 }
 

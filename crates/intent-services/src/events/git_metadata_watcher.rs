@@ -9,77 +9,324 @@
 //! [`GitStatusRefresher::trigger`] (the same debounced recompute path as the
 //! `file:*` bridge). No `file:*` events are ever emitted for `.git` paths.
 //!
-//! Watch roots: the `.git` directory itself and `.git/refs`, both
-//! non-recursive. Watching the directories rather than the `HEAD`/`index`
-//! files directly keeps the watch alive across git's atomic
-//! write-lock-then-rename updates (an inode-level file watch dies with the
-//! replaced inode on inotify). Events are then filtered to the metadata of
-//! interest: `HEAD`, `index`, `packed-refs`, and anything under `refs/`.
+//! Two repository shapes are handled (monorepo#1663):
+//!
+//! - **Regular repository** (`root/.git` is a directory): the detection rides
+//!   the recursive stream [`SharedWatchHub`] already keeps for the workspace
+//!   root (the same stream the main watcher consumes), so no `.git` streams of
+//!   its own are created: it subscribes to that root and keeps only the events
+//!   whose paths are the metadata of interest — `HEAD`, `index`, `packed-refs`,
+//!   and anything under `refs/`.
+//! - **Linked worktree** (`root/.git` is a `gitdir:` pointer file — how intentd
+//!   provisions workspaces by default): the metadata lives outside the root,
+//!   split across two directories. The per-worktree gitdir
+//!   (`<main>/.git/worktrees/<name>`: `HEAD`, `index`) is unique to the
+//!   workspace and gets its own subscription. The repo's common dir
+//!   (`<main>/.git`: `refs/`, `packed-refs`) is shared by every worktree of
+//!   the repo, so it is watched ONCE per canonical common dir via the
+//!   refcounted [`GitCommonDirWatches`] registry, and one ref change fans out
+//!   [`GitStatusRefresher::trigger`] to every registered workspace (a
+//!   fetch/commit in the shared repo changes status for all of its worktrees).
+//!   The common dir's own `HEAD` is deliberately not matched — that is the
+//!   main checkout's HEAD, not this workspace's.
+//!
+//! Path-based filtering (rather than watching the `HEAD`/`index` files
+//! directly) is what keeps detection alive across git's atomic
+//! write-lock-then-rename updates.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use intent_core::WorkspaceId;
 use notify::event::EventKind;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::task::JoinHandle;
 
 use super::git_status_refresher::GitStatusRefresher;
+use super::shared_watch::{SharedWatchHub, SubHandle};
 
-/// A live `.git` metadata watch for one workspace. Holds only the `notify`
-/// watcher — the OS subscription ends when it drops (clean-shutdown contract
-/// shared with the other watchers); debouncing lives in the refresher.
+/// Poison-tolerant lock (one panicking task must not wedge the registry).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A live `.git` metadata watch for one workspace: a subscription to the shared
+/// stream carrying its `.git` metadata (the workspace root for a regular repo,
+/// the per-worktree gitdir for a linked worktree) plus the filtering task, and
+/// — for linked worktrees — a registration on the repo's shared common-dir
+/// watch. All of it ends when the watcher drops (clean-shutdown contract shared
+/// with the other watchers); debouncing lives in the refresher.
 pub struct GitMetadataWatcher {
-    _watcher: RecommendedWatcher,
+    _sub: SubHandle,
+    task: JoinHandle<()>,
+    /// Linked worktrees only: this workspace's registration on the shared
+    /// common-dir watch; dropping it releases the fan-out slot (and the watch
+    /// itself once the last workspace is gone).
+    _common: Option<CommonDirGuard>,
+}
+
+impl Drop for GitMetadataWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl GitMetadataWatcher {
-    /// Start the narrow `.git` metadata watch on `root`, routing detections
-    /// to `refresher` for `workspace_id`. Returns `Ok(None)` when `root` has
-    /// no `.git` directory (not a git repo, or a gitfile worktree) — a
+    /// Start the `.git` metadata detection for `root`, routing detections to
+    /// `refresher` for `workspace_id`. Handles both a `.git` directory
+    /// (regular repository) and a `.git` gitfile (linked worktree, resolved
+    /// via `git2`); returns `None` when `root` is not a git repo — a
     /// legitimate state, not an error.
-    pub fn start(
+    pub(super) fn start(
+        hub: &Arc<SharedWatchHub>,
+        common_watches: &Arc<GitCommonDirWatches>,
         refresher: Arc<GitStatusRefresher>,
         workspace_id: WorkspaceId,
         root: PathBuf,
-    ) -> notify::Result<Option<Self>> {
-        // Canonicalize so the prefix strip works against the paths the OS
-        // reports (macOS FSEvents resolves `/var/...` → `/private/var/...`).
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let git_dir = root.join(".git");
-        if !git_dir.is_dir() {
-            return Ok(None);
-        }
-        let filter_dir = git_dir.clone();
-        // `GitStatusRefresher::trigger` is a synchronous unbounded send, so
-        // the notify callback (off-runtime) can call it directly — no
-        // channel/task of our own is needed.
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(event) => {
+    ) -> Option<Self> {
+        let dot_git = root.join(".git");
+        if dot_git.is_dir() {
+            // Regular repository. `subscribe` returns the canonical root it
+            // demuxes against, so the prefix strip works against the paths the
+            // OS reports (macOS FSEvents resolves `/var/...` →
+            // `/private/var/...`).
+            let (sub, mut rx, root) = hub.subscribe(&root);
+            let git_dir = root.join(".git");
+            let task = tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
                     if is_mutation_kind(&event.kind)
                         && event
                             .paths
                             .iter()
-                            .any(|p| is_git_metadata_path(&filter_dir, p))
+                            .any(|p| is_git_metadata_path(&git_dir, p))
                     {
                         refresher.trigger(workspace_id.clone());
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "git metadata watcher callback error; external git operations may be missed"
-                    );
-                }
-            })?;
-        watcher.watch(&git_dir, RecursiveMode::NonRecursive)?;
-        // `refs` is a subdirectory, invisible to the non-recursive `.git`
-        // watch; a second non-recursive watch covers loose-ref churn there.
-        let refs_dir = git_dir.join("refs");
-        if refs_dir.is_dir() {
-            watcher.watch(&refs_dir, RecursiveMode::NonRecursive)?;
+            });
+            return Some(Self {
+                _sub: sub,
+                task,
+                _common: None,
+            });
         }
-        Ok(Some(Self { _watcher: watcher }))
+        if !dot_git.is_file() {
+            return None;
+        }
+        // Linked worktree: resolve the `gitdir:` pointer and its `commondir`
+        // through git2 rather than parsing the files by hand.
+        let (gitdir, common_dir) = match git2::Repository::open(&root) {
+            Ok(repo) => (repo.path().to_path_buf(), repo.commondir().to_path_buf()),
+            Err(e) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "gitfile present but repository could not be opened; not watching git metadata"
+                );
+                return None;
+            }
+        };
+        let (sub, mut rx, gitdir) = hub.subscribe(&gitdir);
+        let ws_id = workspace_id.clone();
+        let gitdir_refresher = Arc::clone(&refresher);
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if is_mutation_kind(&event.kind)
+                    && event
+                        .paths
+                        .iter()
+                        .any(|p| is_worktree_gitdir_metadata_path(&gitdir, p))
+                {
+                    gitdir_refresher.trigger(ws_id.clone());
+                }
+            }
+        });
+        let common = common_watches.register(hub, refresher, workspace_id, &common_dir);
+        Some(Self {
+            _sub: sub,
+            task,
+            _common: Some(common),
+        })
+    }
+
+    /// Await every shared watch relevant to this workspace actually being
+    /// established (the root/gitdir subscription, plus the common-dir one for
+    /// linked worktrees). Registration is deferred off the caller's thread
+    /// (monorepo#1572), so tests must wait for it before mutating `.git`.
+    #[cfg(test)]
+    async fn wait_established(&self, timeout: std::time::Duration) {
+        self._sub.wait_established(timeout).await;
+        if let Some(common) = &self._common {
+            common.sub.wait_established(timeout).await;
+        }
+    }
+}
+
+/// Refcounted registry of shared common-dir watches, keyed by canonical common
+/// dir. A repo's common dir (`<main>/.git`) is shared by every linked worktree
+/// of that repo, so it gets ONE subscription + filter task regardless of how
+/// many workspaces ride it ([`SharedWatchHub`] dedups the OS stream by root;
+/// this registry dedups the subscription/filter layer and provides the fan-out
+/// mapping). Owned by the [`super::registry::WatcherRegistry`] alongside the
+/// hub; dropping it drops every entry, ending the subscriptions and tasks.
+pub(super) struct GitCommonDirWatches {
+    state: Mutex<HashMap<PathBuf, CommonDirEntry>>,
+    /// Source of per-registration identity tokens (see [`Registration`]).
+    next_token: AtomicU64,
+}
+
+/// One workspace's slot in a common-dir fan-out set: the refresher it
+/// registered (so heterogeneous refreshers — tests — route correctly) plus the
+/// identity token of the registration that owns the slot. The token is what
+/// makes deregistration replacement-safe: when `start_watches` replaces a
+/// workspace's watcher, the new guard registers (overwriting this slot with a
+/// fresh token) BEFORE `HashMap::insert` drops the old watcher, and the stale
+/// guard's drop must not remove the successor's registration.
+struct Registration {
+    token: u64,
+    refresher: Arc<GitStatusRefresher>,
+}
+
+/// One shared common-dir watch: the subscription + filter task, and the
+/// workspaces registered for fan-out.
+struct CommonDirEntry {
+    /// Held for RAII (dropping it ends the shared subscription); read only by
+    /// tests awaiting establishment.
+    _sub: Arc<SubHandle>,
+    task: JoinHandle<()>,
+    workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>>,
+}
+
+impl Drop for CommonDirEntry {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One workspace's registration on a shared common-dir watch. Dropping it
+/// removes the workspace from the fan-out set; the last one out retires the
+/// entry (subscription and task included).
+struct CommonDirGuard {
+    registry: Arc<GitCommonDirWatches>,
+    key: PathBuf,
+    ws_id: WorkspaceId,
+    /// Identity of THIS registration; deregistration is a no-op unless the
+    /// live slot still carries it (drop-ordering immunity on replacement).
+    token: u64,
+    /// Retained so [`GitMetadataWatcher::wait_established`] can await the
+    /// shared common-dir subscription too.
+    #[cfg(test)]
+    sub: Arc<SubHandle>,
+}
+
+impl Drop for CommonDirGuard {
+    fn drop(&mut self) {
+        self.registry.deregister(&self.key, &self.ws_id, self.token);
+    }
+}
+
+impl GitCommonDirWatches {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
+        })
+    }
+
+    /// Register `ws_id` on the shared watch for `common_dir`, starting the
+    /// subscription + filter task if this is the first workspace on it. On a
+    /// `refs/` or `packed-refs` mutation the task fans out
+    /// `refresher.trigger` to EVERY registered workspace.
+    fn register(
+        self: &Arc<Self>,
+        hub: &Arc<SharedWatchHub>,
+        refresher: Arc<GitStatusRefresher>,
+        ws_id: WorkspaceId,
+        common_dir: &Path,
+    ) -> CommonDirGuard {
+        // Canonicalize for the map key so two worktrees of one repo agree on
+        // the entry regardless of the path form their gitfiles carry. If
+        // canonicalization fails (repo vanished mid-flight), the raw path is
+        // the key; worktrees carrying different spellings of a vanished
+        // common dir may then key separately — a graceful degradation, not a
+        // correctness issue (each entry still watches and triggers on its
+        // own, and every guard deregisters under the key it registered with).
+        let key = std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf());
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        let mut state = lock(&self.state);
+        let entry = state.entry(key.clone()).or_insert_with(|| {
+            let (sub, mut rx, common_dir) = hub.subscribe(&key);
+            let workspaces: Arc<Mutex<HashMap<WorkspaceId, Registration>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let fan_out = Arc::clone(&workspaces);
+            let task = tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if is_mutation_kind(&event.kind)
+                        && event
+                            .paths
+                            .iter()
+                            .any(|p| is_common_dir_ref_path(&common_dir, p))
+                    {
+                        // Snapshot the targets so the lock is not held across
+                        // the triggers.
+                        let targets: Vec<_> = lock(&fan_out)
+                            .iter()
+                            .map(|(id, reg)| (id.clone(), Arc::clone(&reg.refresher)))
+                            .collect();
+                        for (id, refresher) in targets {
+                            refresher.trigger(id);
+                        }
+                    }
+                }
+            });
+            CommonDirEntry {
+                _sub: Arc::new(sub),
+                task,
+                workspaces,
+            }
+        });
+        lock(&entry.workspaces).insert(ws_id.clone(), Registration { token, refresher });
+        #[cfg(test)]
+        let sub = Arc::clone(&entry._sub);
+        drop(state);
+        CommonDirGuard {
+            registry: Arc::clone(self),
+            key,
+            ws_id,
+            token,
+            #[cfg(test)]
+            sub,
+        }
+    }
+
+    /// Remove `ws_id` from the entry for `key` — but only while the live slot
+    /// still carries `token`, so a stale guard (from a watcher replaced via
+    /// the registry's `start_watches`) cannot deregister its successor; the
+    /// last workspace out drops the entry, ending the subscription and filter
+    /// task.
+    fn deregister(&self, key: &Path, ws_id: &WorkspaceId, token: u64) {
+        let mut state = lock(&self.state);
+        let Some(entry) = state.get_mut(key) else {
+            return;
+        };
+        let empty = {
+            let mut workspaces = lock(&entry.workspaces);
+            if workspaces.get(ws_id).is_some_and(|reg| reg.token == token) {
+                workspaces.remove(ws_id);
+            }
+            workspaces.is_empty()
+        };
+        if empty {
+            state.remove(key);
+        }
+    }
+
+    /// Number of live shared common-dir watches — the dedup/refcount
+    /// invariant under test (here and in the registry lifecycle tests).
+    #[cfg(test)]
+    pub(super) fn watch_count(&self) -> usize {
+        lock(&self.state).len()
     }
 }
 
@@ -104,6 +351,47 @@ fn is_git_metadata_path(git_dir: &Path, abs: &Path) -> bool {
     match first.to_str() {
         Some("refs") => true,
         Some("HEAD") | Some("index") | Some("packed-refs") => components.next().is_none(),
+        _ => false,
+    }
+}
+
+/// Whether `abs` is one of the per-worktree metadata paths under the worktree
+/// gitdir (`<main>/.git/worktrees/<name>`): `HEAD` or `index` as direct
+/// children, or anything under the per-worktree ref namespaces `refs/`
+/// (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/` —
+/// gitrepository-layout(5)). Shared refs live in the common dir, watched
+/// separately.
+fn is_worktree_gitdir_metadata_path(gitdir: &Path, abs: &Path) -> bool {
+    let Ok(rel) = abs.strip_prefix(gitdir) else {
+        return false;
+    };
+    let mut components = rel.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    match first.to_str() {
+        Some("refs") => true,
+        Some("HEAD") | Some("index") => components.next().is_none(),
+        _ => false,
+    }
+}
+
+/// Whether `abs` is one of the shared ref paths under the common dir
+/// (`<main>/.git`): anything under `refs/`, or `packed-refs` as a direct
+/// child. Deliberately NOT `HEAD` (the main checkout's, not this workspace's)
+/// and not the per-worktree state under `worktrees/` (first component
+/// `worktrees`, so it never matches here).
+fn is_common_dir_ref_path(common_dir: &Path, abs: &Path) -> bool {
+    let Ok(rel) = abs.strip_prefix(common_dir) else {
+        return false;
+    };
+    let mut components = rel.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    match first.to_str() {
+        Some("refs") => true,
+        Some("packed-refs") => components.next().is_none(),
         _ => false,
     }
 }
@@ -317,6 +605,87 @@ mod tests {
     }
 
     #[test]
+    fn worktree_gitdir_path_filter_matches_head_index_and_per_worktree_refs() {
+        let gitdir = Path::new("/main/.git/worktrees/wt");
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/HEAD")
+        ));
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/index")
+        ));
+        // Per-worktree ref namespaces (gitrepository-layout(5)).
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/bisect/bad")
+        ));
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/worktree/x")
+        ));
+        assert!(is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/refs/rewritten/y")
+        ));
+        // Shared refs live in the common dir; nothing else in the gitdir
+        // matches.
+        assert!(!is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/ORIG_HEAD")
+        ));
+        assert!(!is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/index.lock")
+        ));
+        assert!(!is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/wt/logs/HEAD")
+        ));
+        // Outside this worktree's gitdir (sibling worktree, common dir).
+        assert!(!is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/worktrees/other/HEAD")
+        ));
+        assert!(!is_worktree_gitdir_metadata_path(
+            gitdir,
+            Path::new("/main/.git/HEAD")
+        ));
+    }
+
+    #[test]
+    fn common_dir_path_filter_matches_refs_but_not_head() {
+        let common = Path::new("/main/.git");
+        assert!(is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/refs/heads/main")
+        ));
+        assert!(is_common_dir_ref_path(common, Path::new("/main/.git/refs")));
+        assert!(is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/packed-refs")
+        ));
+        // The common dir's HEAD is the main checkout's, not a worktree's.
+        assert!(!is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/HEAD")
+        ));
+        // Per-worktree state under `worktrees/` never matches here.
+        assert!(!is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/worktrees/wt/HEAD")
+        ));
+        assert!(!is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/index")
+        ));
+        assert!(!is_common_dir_ref_path(
+            common,
+            Path::new("/main/.git/config")
+        ));
+    }
+
+    #[test]
     fn mutation_kind_filter_drops_access_and_other() {
         assert!(is_mutation_kind(&EventKind::Create(CreateKind::File)));
         assert!(is_mutation_kind(&EventKind::Modify(ModifyKind::Any)));
@@ -331,35 +700,75 @@ mod tests {
         let root = TempDir::new("nogit");
         let ws = test_workspace("ws-nogit", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus, api));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus,
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
 
-        let watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start must not error on a non-git root");
+        let watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            &GitCommonDirWatches::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        );
         assert!(watcher.is_none(), "no `.git` dir → no watch");
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn external_git_operation_triggers_status_refresh_without_file_events() {
+        // Serialized with the other real-watcher tests: these now ride shared
+        // streams, and running several of them concurrently delays registration
+        // enough to blow the delivery timeouts below.
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut status_sub, mut file_sub) = bus_and_subs().await;
         let root = TempDir::new("repo");
         let repo = init_repo(&root.path);
 
         let ws = test_workspace("ws-repo", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
-        let _watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start git metadata watcher")
-            .expect("git repo must gain a metadata watch");
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let _watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            &GitCommonDirWatches::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        )
+        .expect("git repo must gain a metadata watch");
         // Let the OS watch settle before mutating.
+        _watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
-        // (HEAD rewrite; no worktree change).
-        repo.set_head("refs/heads/other").unwrap();
-
-        let ev = next_event(&mut status_sub, &ws.id, Duration::from_secs(10))
-            .await
-            .expect("external HEAD change must yield a changes:git-status event");
+        // (HEAD rewrite; no worktree change). Retried because the shared stream
+        // can begin delivering a little after registration lands, and a HEAD
+        // rewrite that predates delivery leaves nothing to observe. Attempt
+        // count sized so the total probe budget (attempts x 1500ms) reaches
+        // `LIVENESS` — a pure-liveness bound (monorepo#1630).
+        let attempts = crate::events::LIVENESS.as_millis() / 1500;
+        let mut ev = None;
+        for i in 0..attempts {
+            let target = if i % 2 == 0 {
+                "refs/heads/other"
+            } else {
+                "refs/heads/main"
+            };
+            repo.set_head(target).unwrap();
+            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        let ev = ev.expect("external HEAD change must yield a changes:git-status event");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
         assert!(ev.data["status"].get("uncommittedCount").is_some());
@@ -376,18 +785,204 @@ mod tests {
         );
     }
 
+    /// Linked worktree of `repo` at `path` (`.git` is a gitfile pointer);
+    /// returns the worktree's own repository handle.
+    fn add_worktree(repo: &git2::Repository, name: &str, path: &Path) -> git2::Repository {
+        repo.worktree(name, path, None).unwrap();
+        git2::Repository::open(path).unwrap()
+    }
+
+    /// Regression (monorepo#1663): a workspace provisioned as a linked git
+    /// worktree (`.git` is a `gitdir:` pointer file) must gain a metadata
+    /// watch, and an external HEAD change in the worktree's own gitdir must
+    /// yield `changes:git-status` — mirroring
+    /// `external_git_operation_triggers_status_refresh_without_file_events`.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn external_head_change_in_linked_worktree_triggers_status_refresh() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut status_sub, mut file_sub) = bus_and_subs().await;
+        let main_root = TempDir::new("wt-main");
+        let main_repo = init_repo(&main_root.path);
+        let wt_parent = TempDir::new("wt-linked");
+        let wt_path = wt_parent.path.join("wt");
+        let wt_repo = add_worktree(&main_repo, "wt", &wt_path);
+
+        let ws = test_workspace("ws-worktree", &wt_path);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            &GitCommonDirWatches::new(),
+            refresher,
+            ws.id.clone(),
+            wt_path.clone(),
+        )
+        .expect("linked worktree workspace must gain a metadata watch");
+        watcher.wait_established(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // External `git checkout`-style HEAD rewrite in the worktree's own
+        // gitdir (`<main>/.git/worktrees/wt/HEAD`). Alternates between two
+        // worktree-local branches (`main` is checked out in the main repo, so
+        // git refuses it here). Retried for the same delivery-start race as
+        // the regular-repo test above.
+        let head_commit = wt_repo.head().unwrap().peel_to_commit().unwrap();
+        wt_repo.branch("wt-alt", &head_commit, false).unwrap();
+        let mut ev = None;
+        for i in 0..20 {
+            let target = if i % 2 == 0 {
+                "refs/heads/wt-alt"
+            } else {
+                "refs/heads/wt"
+            };
+            wt_repo.set_head(target).unwrap();
+            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
+            if ev.is_some() {
+                break;
+            }
+        }
+        let ev = ev.expect("external worktree HEAD change must yield a changes:git-status event");
+        assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
+        assert_eq!(ev.data["workspaceId"], ws.id.as_str());
+
+        // No `file:*` leakage for `.git`-internal paths, same contract as the
+        // regular-repo test.
+        let file_ev = next_event(&mut file_sub, &ws.id, Duration::from_secs(1)).await;
+        assert!(
+            file_ev.is_none(),
+            "`.git` metadata churn must not emit file:* events, got {file_ev:?}"
+        );
+    }
+
+    /// Two worktrees of one repo share ONE common-dir watch, a ref change in
+    /// the shared repo fans out to both workspaces, and the watch retires only
+    /// when the last workspace's watcher drops (monorepo#1663).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn shared_common_dir_ref_change_fans_out_to_all_worktrees() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut status_sub_a, _file_sub) = bus_and_subs().await;
+        // Second status subscription so B's event cannot be discarded while
+        // draining a batch for A.
+        let mut status_sub_b = bus.subscribe(SubscriptionFilter {
+            event_types: vec![CHANGES_GIT_STATUS.to_string()],
+            ..SubscriptionFilter::default()
+        });
+        let main_root = TempDir::new("fan-main");
+        let main_repo = init_repo(&main_root.path);
+        let wt_parent = TempDir::new("fan-linked");
+        let wt_a_path = wt_parent.path.join("wt-a");
+        let wt_b_path = wt_parent.path.join("wt-b");
+        add_worktree(&main_repo, "wt-a", &wt_a_path);
+        add_worktree(&main_repo, "wt-b", &wt_b_path);
+
+        let ws_a = test_workspace("ws-fan-a", &wt_a_path);
+        let ws_b = test_workspace("ws-fan-b", &wt_b_path);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws_a.clone(), ws_b.clone()]));
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let hub = SharedWatchHub::new();
+        let common = GitCommonDirWatches::new();
+        let watcher_a = GitMetadataWatcher::start(
+            &hub,
+            &common,
+            Arc::clone(&refresher),
+            ws_a.id.clone(),
+            wt_a_path.clone(),
+        )
+        .expect("worktree A must gain a metadata watch");
+        let watcher_b = GitMetadataWatcher::start(
+            &hub,
+            &common,
+            Arc::clone(&refresher),
+            ws_b.id.clone(),
+            wt_b_path.clone(),
+        )
+        .expect("worktree B must gain a metadata watch");
+        assert_eq!(
+            common.watch_count(),
+            1,
+            "one shared watch per canonical common dir"
+        );
+        watcher_a.wait_established(Duration::from_secs(10)).await;
+        watcher_b.wait_established(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // External ref churn in the SHARED repo (`<main>/.git/refs/heads/…`),
+        // e.g. a commit/fetch in the main checkout. Retried for the same
+        // delivery-start race as the other real-watcher tests.
+        let head_commit = main_repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ev_a = None;
+        for i in 0..20 {
+            main_repo
+                .branch(&format!("fan-{i}"), &head_commit, true)
+                .unwrap();
+            ev_a = next_event(&mut status_sub_a, &ws_a.id, Duration::from_millis(1500)).await;
+            if ev_a.is_some() {
+                break;
+            }
+        }
+        let ev_a = ev_a.expect("shared ref change must refresh worktree A");
+        assert_eq!(ev_a.event_type, CHANGES_GIT_STATUS);
+        let ev_b = next_event(&mut status_sub_b, &ws_b.id, Duration::from_secs(5))
+            .await
+            .expect("shared ref change must fan out to worktree B");
+        assert_eq!(ev_b.event_type, CHANGES_GIT_STATUS);
+
+        // Refcount lifecycle: the first drop keeps the shared watch alive for
+        // the survivor; the last drop retires it.
+        drop(watcher_a);
+        assert_eq!(
+            common.watch_count(),
+            1,
+            "shared watch must survive while a workspace still rides it"
+        );
+        drop(watcher_b);
+        assert_eq!(
+            common.watch_count(),
+            0,
+            "last workspace out must retire the shared watch"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn irrelevant_git_file_does_not_trigger_refresh() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (_db, bus, mut status_sub, _file_sub) = bus_and_subs().await;
         let root = TempDir::new("quiet");
         let _repo = init_repo(&root.path);
 
         let ws = test_workspace("ws-quiet", &root.path);
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
-        let refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api));
-        let _watcher = GitMetadataWatcher::start(refresher, ws.id.clone(), root.path.clone())
-            .expect("start git metadata watcher")
-            .expect("git repo must gain a metadata watch");
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let _watcher = GitMetadataWatcher::start(
+            &SharedWatchHub::new(),
+            &GitCommonDirWatches::new(),
+            refresher,
+            ws.id.clone(),
+            root.path.clone(),
+        )
+        .expect("git repo must gain a metadata watch");
+        _watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // `COMMIT_EDITMSG` lives in `.git` but is not watched metadata.

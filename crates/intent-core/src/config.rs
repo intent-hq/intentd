@@ -35,6 +35,42 @@ pub const DEFAULT_WORKSPACE_API_TOON_OUTPUT: bool = true;
 /// agent (`hooks.maxPerAgent`).
 pub const DEFAULT_HOOKS_MAX_PER_AGENT: u32 = 5;
 
+/// Default daemon-wide cap on outstanding slow-path RPCs
+/// (`server.maxOutstandingRpcs`); `0` means unlimited.
+pub const DEFAULT_SERVER_MAX_OUTSTANDING_RPCS: u32 = 256;
+
+/// Default for `wakeResume.enabled` — whether the daemon detects host
+/// sleep/wake and resumes work on wake. On by default.
+pub const DEFAULT_WAKE_RESUME_ENABLED: bool = true;
+
+/// Default for `wakeResume.thresholdSeconds` — the minimum suspend duration
+/// (in seconds) that counts as a sleep for the resume/enrollment gate.
+pub const DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 10;
+
+/// Floor for `wakeResume.thresholdSeconds`. The clock-skew detector samples
+/// roughly every second and flags a suspend when `skew >= threshold`; skew is
+/// non-negative by construction, so a `0` threshold classifies EVERY ~1s tick
+/// as a suspend (and the wake debounce may never settle). Clamp any sub-minimum
+/// value (notably `0`) up to this floor so the detector always requires a real
+/// ≥1s wall/monotonic divergence.
+pub const MIN_WAKE_RESUME_THRESHOLD_SECONDS: u32 = 1;
+
+/// Default poll cadence for the centralized PR-monitor loop
+/// (`prMonitor.pollSeconds`).
+pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
+
+/// Floor for `prMonitor.pollSeconds` — a tighter interval would hammer the
+/// forge. Sub-minimum values (notably `0`) are clamped up at read time.
+pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
+
+/// Default quiet window a changed PR must observe before its consolidated
+/// wake is delivered (`prMonitor.debounceSeconds`).
+pub const DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 60;
+
+/// Floor for `prMonitor.debounceSeconds`. Sub-minimum values (notably `0`)
+/// are clamped up at read time.
+pub const MIN_PR_MONITOR_DEBOUNCE_SECONDS: u64 = 10;
+
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -59,6 +95,15 @@ pub struct Config {
     /// Cap on concurrently active (scheduled/running) background hooks per
     /// agent (`hooks.maxPerAgent`).
     pub hooks_max_per_agent: u32,
+    /// Daemon-wide cap on outstanding slow-path RPCs
+    /// (`server.maxOutstandingRpcs`); `0` means unlimited.
+    pub server_max_outstanding_rpcs: u32,
+    /// Whether the daemon detects host sleep/wake and resumes work on wake
+    /// (`wakeResume.enabled`); on by default.
+    pub wake_resume_enabled: bool,
+    /// Minimum suspend duration in seconds that counts as a sleep for the
+    /// resume/enrollment gate (`wakeResume.thresholdSeconds`).
+    pub wake_resume_threshold_seconds: u32,
 }
 
 impl Config {
@@ -94,6 +139,15 @@ impl Config {
         let stream_retention_hours = env_u32("INTENTD_STREAM_RETENTION_HOURS")
             .unwrap_or(settings.events.stream_retention_hours);
         let hooks_max_per_agent = settings.hooks.max_per_agent;
+        let server_max_outstanding_rpcs = settings.server.max_outstanding_rpcs;
+        let wake_resume_enabled = settings.wake_resume.enabled;
+        // Clamp the configured threshold up to the floor: a `0` (or any
+        // sub-minimum) value would make the clock-skew detector flag every
+        // sampling tick as a suspend (see [`MIN_WAKE_RESUME_THRESHOLD_SECONDS`]).
+        let wake_resume_threshold_seconds = settings
+            .wake_resume
+            .threshold_seconds
+            .max(MIN_WAKE_RESUME_THRESHOLD_SECONDS);
 
         Ok(Self {
             data_dir,
@@ -104,6 +158,9 @@ impl Config {
             idle_reap_minutes,
             stream_retention_hours,
             hooks_max_per_agent,
+            server_max_outstanding_rpcs,
+            wake_resume_enabled,
+            wake_resume_threshold_seconds,
         })
     }
 }

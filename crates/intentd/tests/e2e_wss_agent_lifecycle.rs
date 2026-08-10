@@ -894,6 +894,12 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         idle.get("waitingOnHooks").is_none(),
         "agent:idle omits waitingOnHooks when the agent owns no active hook: {idle}"
     );
+    // Idle-visibility (unified external-wait): same omission rule for
+    // `waitingOnPrMonitors` — this agent owns no active PR monitor.
+    assert!(
+        idle.get("waitingOnPrMonitors").is_none(),
+        "agent:idle omits waitingOnPrMonitors when the agent owns no active monitor: {idle}"
+    );
     assert!(
         transitions.contains(&("active".to_string(), true)),
         "saw active/isActive=true transition (got {transitions:?})"
@@ -12532,5 +12538,345 @@ async fn direct_send_user_row_delta_over_chat_subscribe() {
     assert_eq!(
         snap_row["contentBlocks"][0]["id"], user_entity["block"]["id"],
         "fresh snapshot block id matches the delta's block id"
+    );
+}
+
+/// Tool-call activity pings over the real wire (monorepo#1414): a turn whose
+/// FIRST stretch is tool calls with no assistant text still ticks
+/// `agent:stream:activity`, and the ping carries `lastToolUse { name, status }`
+/// for the call just recorded. Before the fix only the text-chunk arm emitted,
+/// so a watched-agent row froze at the previous turn's text through the whole
+/// tool stretch.
+///
+/// The mock echoes three `tool_call` updates via `rawUpdates` BEFORE its text
+/// response, so the leading-edge ping of the turn necessarily comes from the
+/// tool arm: it names the first tool (`bash`, derived from the ACP title) and
+/// carries no `lastAgentResponse` (nothing had streamed yet).
+#[tokio::test]
+async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
+    let Some(script) = gate("WSS tool-call activity E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "tools done\n",
+        "rawUpdates": [
+            { "sessionUpdate": "tool_call", "toolCallId": "tca_1",
+              "title": "bash: cargo test --workspace", "kind": "execute",
+              "status": "in_progress" },
+            { "sessionUpdate": "tool_call", "toolCallId": "tca_2",
+              "title": "view: src/lib.rs", "kind": "read",
+              "status": "in_progress" },
+            { "sessionUpdate": "tool_call", "toolCallId": "tca_3",
+              "title": "bash: cargo fmt", "kind": "execute",
+              "status": "in_progress" }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent:* BEFORE the turn so no activity frame is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Tooler", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "run the tools" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect every activity frame up to the terminal stream:end under one
+    // total deadline (per-frame reads would reset on heartbeat Pings).
+    let activities = timeout(Duration::from_secs(30), async {
+        let mut frames: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            match ev["type"].as_str() {
+                Some("agent:stream:activity") => frames.push(ev["data"].clone()),
+                Some("agent:stream:end") => return frames,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn reached its terminal stream:end in time");
+
+    assert!(
+        !activities.is_empty(),
+        "the tool-only stretch emits at least one activity over WSS"
+    );
+    // Sanity cap, not throttle verification: the mock emits exactly 3
+    // `rawUpdates` plus one `agent_message_chunk` for the whole response, so 4
+    // is the no-throttle maximum. It guards against a future fixture change
+    // multiplying the emit count; the deterministic window-boundary coverage
+    // lives in the `agent_session` unit tests.
+    assert!(
+        activities.len() <= 4,
+        "at most one ping per emitter (3 tools + 1 chunk): {activities:?}"
+    );
+    // The leading-edge ping of the turn came from the tool arm: it names the
+    // first call and has no preview text yet.
+    let first = &activities[0];
+    assert_eq!(
+        first["agentId"].as_str(),
+        Some(agent_id.as_str()),
+        "activity carries the agent id: {first}"
+    );
+    assert_eq!(
+        first["lastToolUse"],
+        json!({ "name": "bash", "status": "started" }),
+        "tool-arm activity carries the just-recorded call's derived name + status: {first}"
+    );
+    assert!(
+        first.get("lastAgentResponse").is_none(),
+        "no assistant text had streamed when the first tool call landed: {first}"
+    );
+    assert!(
+        first.get("content").is_none(),
+        "activity payload never carries transcript content: {first}"
+    );
+}
+
+/// Streamed reasoning over the real WSS transport: two `agent_thought_chunk`
+/// updates coalesce into ONE `thinking` block on the live `chat.subscribe`
+/// channel, the assistant text that follows opens a separate `text` block,
+/// and both persist in stream order under the same ids `agent.getConversation`
+/// returns.
+#[tokio::test]
+async fn thinking_blocks_stream_and_persist_over_wss() {
+    let Some(script) = gate("WSS thinking-block E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The mock echoes the canned thought chunks before its response text.
+    let behavior = json!({
+        "response": "The answer is 42.",
+        "rawUpdates": [
+            { "sessionUpdate": "agent_thought_chunk",
+              "content": { "type": "text", "text": "Let me " } },
+            { "sessionUpdate": "agent_thought_chunk",
+              "content": { "type": "text", "text": "think." } }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Thinker", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "think then answer" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect live blocks until the turn's terminal (streamingComplete) delta.
+    // Single total deadline (per-frame reads would reset on heartbeat Pings).
+    let live: Vec<Value> = timeout(Duration::from_secs(30), async {
+        // Latest-wins per block id: the accumulating chunk deltas re-send the
+        // whole block, so the last copy seen is the complete one.
+        let mut blocks: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            let mut terminal = false;
+            for entity in delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                // The echoed user message rides the same channel and is
+                // complete on arrival; only the assistant turn ends the loop.
+                .filter(|e| {
+                    !e["messageId"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("user-msg"))
+                })
+            {
+                terminal |= entity.get("streamingComplete") == Some(&Value::Bool(true));
+                let block = entity["block"].clone();
+                match blocks.iter_mut().find(|b| b["id"] == block["id"]) {
+                    Some(existing) => *existing = block,
+                    None => blocks.push(block),
+                }
+            }
+            if terminal {
+                return blocks;
+            }
+        }
+    })
+    .await
+    .expect("turn reached its terminal delta in time");
+
+    let thinking = live
+        .iter()
+        .find(|b| b["type"] == "thinking")
+        .unwrap_or_else(|| panic!("a thinking block reached the chat channel: {live:?}"));
+    assert_eq!(
+        thinking["text"],
+        json!("Let me think."),
+        "consecutive thought chunks coalesce into one block: {thinking}"
+    );
+    let thinking_id = thinking["id"].as_str().expect("thinking id").to_string();
+    let text = live
+        .iter()
+        .find(|b| b["type"] == "text")
+        .expect("the assistant text block reached the chat channel");
+    assert_ne!(
+        text["id"].as_str(),
+        Some(thinking_id.as_str()),
+        "assistant text opens a block of its own: {text}"
+    );
+
+    // The persisted transcript holds both blocks in stream order under the
+    // SAME ids the live channel used.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let assistant = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant row persisted");
+    let persisted = assistant["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks array");
+    let types: Vec<&str> = persisted
+        .iter()
+        .filter_map(|b| b["type"].as_str())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["thinking", "text"],
+        "reasoning persists before the answer: {assistant}"
+    );
+    assert_eq!(persisted[0]["text"], json!("Let me think."));
+    assert_eq!(
+        persisted[0]["id"].as_str(),
+        Some(thinking_id.as_str()),
+        "live and persisted thinking-block ids agree: {assistant}"
+    );
+    assert!(
+        persisted[1]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("The answer is 42.")),
+        "the answer persists as assistant text: {assistant}"
+    );
+    // Reasoning never leaks into the agent-list preview.
+    let listed = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let preview = listed["agent"]["lastAgentResponse"].as_str().unwrap_or("");
+    assert!(
+        !preview.contains("Let me think."),
+        "thought text stays out of lastAgentResponse: {listed}"
     );
 }

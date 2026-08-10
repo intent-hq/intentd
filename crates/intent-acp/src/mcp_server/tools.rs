@@ -52,6 +52,10 @@ pub struct SpecialistModelOption {
 pub struct SpecialistModelOptions {
     /// Specialist id (the `specialist` param of delegate/create).
     pub specialist: String,
+    /// Compound id a no-`model` delegate would pin, as resolved by the same
+    /// resolver the `resolvedModel` preview uses; `None` when resolution
+    /// yields the provider CLI default.
+    pub default_model: Option<String>,
     /// Ordered options as authored in the winning tier's frontmatter.
     pub options: Vec<SpecialistModelOption>,
 }
@@ -149,7 +153,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
+  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -226,6 +230,7 @@ API:
   ws.agent.getQueue(agentId) → { ok, agentId, queueLength, queue }  // The agent's full pending message queue in drain order (position 0 = next delivery; interrupt-priority entries first, then normal FIFO; entries under edit are flagged `editing: true` at the end). Each entry: `{ id, content, queuedAt, position, turnId?, interruptPriority?, editing?, fromAgentId?, fromAgentName? }` — attribution absent for user-sent entries.
   ws.agent.removeQueuedMessage(agentId, messageId) → { ok, agentId, messageId }  // Retract YOUR OWN pending message from an agent's queue before delivery. Only messages you sent can be removed; entries from other senders (or the user) are rejected.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, unsettled child agents, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent’s conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -237,10 +242,8 @@ API:
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
-  ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
-  ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
@@ -259,12 +262,13 @@ API:
 
   ws.host.exec({ command, args?, cwd?, env?, timeoutMs? }) → { stdout, stderr, exitCode, timedOut? }  // One-shot process exec on the daemon host. `command` + `args` are argv (no shell interpolation); `cwd` is resolved against and contained within the workspace root; `timeoutMs` (max 600000) kills the whole process group on expiry (`timedOut: true`). For long-running or streaming processes use `ws.script.*` / terminals instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
-    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+  ws.hook.schedule({ name, code, delayMs, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` and `ws.host.exec` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
-  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+    `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
@@ -285,9 +289,14 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
-    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?` and `rulesKnown`.
+    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
+  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
+  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (the last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (the net changes since the last report, awaiting the debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+    `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
+    This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
+    These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -346,7 +355,7 @@ Namespaces (index — full signatures in API below):
   ws.terminal.* — read workspace terminal output
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — pr.snapshot = compact PR watch state; other PR ops use `gh`
+  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -444,6 +453,7 @@ API:
   ws.agent.status(agentId) → agent  // Detailed agent status including task linkage and activity timestamps. Sandboxed agents additionally surface `sandboxStatus` and `mergeOnTurnEnd` (sandbox merge state).
   ws.agent.mergeSandbox(agentId) → { ok, agentId, status, reason? }  // Start a sandbox merge-back into the workspace repo — the follow-up to `mergeOnTurnEnd: false` (inspect the sandbox, then merge when ready). ASYNC: returns immediately with `status: "started"` (merge runs in the background; large repos take minutes) or `"in_progress"` (a merge already owns the sandbox). Poll `ws.agent.status(agentId).sandboxStatus` for the outcome — `merged`, `conflict` (terminal; work preserved on an `sb/…` branch in the workspace repo), `merge_pending` (blocked/failed; retried automatically), or unchanged on a dirty bounce (uncommitted sandbox changes with workspace auto-commit off). Errors if the agent has no sandbox.
   ws.agent.diagnostics({ agentId?, taskNoteId?, includeCompleted?, staleRespondingAfterMs? }?) → { diagnostics, text }  // Sanitized snapshot of agent statuses, subscriptions, queues, delegation groups, delivery stats, recent delivery events, and stuck-risk signals.
+  ws.agent.snapshot() → { time, hooks?, agentWatches?, queuedMessages?, eventSubscriptions?, runningSubAgents?, numQuestionsAsked?, pendingAttention? }  // YOUR OWN compact state digest (the cheap counterpart to `diagnostics`): active hooks, sub-agent watches, queued messages, event subscriptions, unsettled child agents, pending structured questions, and any unresolved blocker/discussion you raised. Zero/absent fields are omitted; `time` is current UTC.
   ws.agent.wakeOrCreate(taskNoteId, contextMessage, model?, messageMetadata?, reasoningEffort?) → { ... }  // Ensure a task has a working agent: checks assigned agents, resumes a running/restorable one if possible, otherwise creates a new agent for the task. `reasoningEffort` applies only when a new agent is created.
   ws.agent.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }) → messages  // Read another agent's conversation history.
   ws.agent.summary(agentId) → summary  // Quick summary of what another agent did.
@@ -455,10 +465,8 @@ API:
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
 
-  ws.event.recentFiles(limit?) → [files]  // Recently modified files. Default limit is 10.
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
-  ws.event.directoryChanges(dir, limit?) → [changes]  // Recent file changes under one directory prefix.
   ws.event.query({ eventType?, actorType?, actorId?, path?, minutesAgo?, limit? }) → [events]  // Advanced event query filters. `eventType` accepts the same glob syntax as subscribe: a category wildcard like `note:*`, an exact type like `note:updated`, or bare `*` for no type filter.
   ws.event.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, eventTypes }  // Subscribe to batched workspace events. `eventTypes` must be an array: `["file:*", "task:*"]`. Use explicit categories or event types such as `file:*`, `task:*`, `git:*`, `note:*`, `terminal:*`, `test:*`, `build:*`, `workspace:*`, `spec:*`, `goal:*`, `comment:*`.
     Prefer explicit categories over bare `*`; `excludeSelf` defaults to true and `batchWindow` defaults to 500ms. `agent:*` events are not subscribable — use `ws.agent.watch(agentId)` to be woken when another agent completes, fails, or raises a blocker/discussion.
@@ -475,12 +483,13 @@ API:
   ws.script.run(scriptId, { maxLines?, timeoutSeconds? }) → { exitCode?, output, timedOut?, warning? }  // Run a command-mode script and wait for it to finish. Use this for builds/tests/linting, not long-running services.
     `timeoutSeconds` defaults to 30. If the timeout is hit, it returns partial output with `timedOut=true`. For service-mode scripts it returns a warning telling you to use `ws.script.start()` instead.
 
-  ws.hook.schedule({ name, code, delayMs, ttlMs? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
-    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions.
+  ws.hook.schedule({ name, code, delayMs, ttlMs?, perpetual? }) → { hook, dispatched }  // Register a background hook: a small JS script the daemon runs every `delayMs` ms (min 10000) until it returns `{ dispatch: true, message }` (you are woken with the message and the hook ends), throws/times out (evicted, you are woken with the error), is cancelled, or expires. `name` ≤ 50 chars — a short human-readable description of what the hook watches (shown to the user). The first run happens immediately as validation: a failure rejects the call, a dispatch wakes you right away (`dispatched: true`) without persisting a schedule.
+    The script runs with this same `ws.*` API available — the full surface, including `ws.pr.snapshot` — and a 60s budget per run, so make hooks self-checking: the hook performs the check itself and dispatches only on a meaningful change (diffed against `hookState`), not a bare timer that wakes you to do the check. Return `{ dispatch: false }` or nothing to keep watching. Use hooks to watch for conditions (CI results, PR activity, file changes) instead of blocking or polling in your own turn — idle turns time out after ~30 minutes of silence, so hooks are how to wait for slow external conditions. For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.
     Carry state between runs: a returned `state` field (any JSON value, ~16 KiB cap) persists and is injected into the next run as the `hookState` global (`null` on the first run); omit `state` to keep the previous value, return `state: null` to clear it.
     Every hook has a TTL counted from creation: `ttlMs` defaults to and is capped at 3600000 (60 minutes; values are clamped into [10000, 3600000]), persisted as `expiresAt` on the hook. When the TTL elapses the hook expires (terminal state `expired`; a run already in flight completes normally, and its dispatch still wins) and you are woken so you can schedule a new hook if the condition is still worth watching. Set `ttlMs` to your estimated time-to-fire plus reasonable margin rather than defaulting to the cap, so expiry doubles as an "overdue — reassess" wake.
-  ws.hook.list() → [hooks]  // Hooks in this workspace with `hookId`, `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
-  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of your active hooks.
+    `perpetual: true` makes a dispatch NON-terminal: you are woken exactly as usual, then the hook returns to `scheduled` with a fresh `nextRunAt` and keeps running on its cadence until its TTL elapses (or you cancel it, or a failing run evicts it) — so one hook can report a stream of changes instead of firing once. Each perpetual fire's wake states both facts (it fired, and it stays active until `expiresAt`) and points at `ws.hook.cancel`; the expiry notice reports runs AND dispatches. A dispatching validation run on a perpetual hook wakes you AND persists the active schedule. Omitted (or `false`) is the default one-shot hook: the first dispatch retires it.
+  ws.hook.list() → [hooks]  // Hooks in this workspace (every agent's, not just yours) with `hookId`, `agentId` (the owning agent), `name`, `state` (scheduled|running|dispatched|evicted|cancelled|expired), `nextRunAt`, `expiresAt` (TTL deadline, ≤ 60 min from creation), `runCount`, `perpetual`, `dispatchCount` (fires so far — only perpetual hooks ever exceed 1), `lastError?`, `lastState?` (the carry-over state JSON from the most recent run).
+  ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
   ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
@@ -501,9 +510,14 @@ API:
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
 
-  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount } }  // Compact, diff-friendly snapshot of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
-    Use this to monitor a PR: schedule a hook that diffs the snapshot against the previous one in hookState and dispatches on meaningful change (new comments incl. thread replies, failed checks, mergeBlockedReason, review decision) — or diff isMerged alone if merging is all the user cares about.
-    This is the only `ws.pr.*` method. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?` and `rulesKnown`.
+    The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
+  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
+  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (the last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (the net changes since the last report, awaiting the debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`.
+  ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, rulesKnown } }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, scoped to the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule's repo); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback.
+    `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
+    This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
+    These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -578,6 +592,14 @@ fn gated_prefixes(features: &AgentFeaturesSettings) -> Vec<(&'static str, &'stat
         ));
         out.push(("ws.agent.reportBlocker", "agentFeatures.attentionRequests"));
     }
+    if !features.pr_monitor {
+        // Method-level, not the whole `ws.pr.` namespace: `ws.pr.snapshot`
+        // survives the toggle. `monitors` is listed separately so the
+        // dispatch deny (exact match) covers it too.
+        out.push(("ws.pr.monitors", "agentFeatures.prMonitor"));
+        out.push(("ws.pr.monitor", "agentFeatures.prMonitor"));
+        out.push(("ws.pr.unmonitor", "agentFeatures.prMonitor"));
+    }
     out
 }
 
@@ -615,6 +637,20 @@ const SANDBOX_MERGE_SANDBOX_DOC_LINE: &str = "  ws.agent.mergeSandbox(agentId) �
 /// scrub is a no-op there (unit tests guard both needles).
 const HOOK_HOST_EXEC_INDEX_XREF: &str = " and host.exec";
 const HOOK_HOST_EXEC_DOC_XREF: &str = " and `ws.host.exec`";
+
+/// The cross-references to `ws.pr.monitor` that live OUTSIDE its own doc
+/// lines — the `ws.pr.*` Namespaces index entry, the `ws.hook.schedule`
+/// steer, and the `ws.pr.snapshot` steer (a whole continuation line, which
+/// method-line pruning cannot reach) plus its "only method" phrasing. All are
+/// scrubbed when `agentFeatures.prMonitor` is off so the surviving docs never
+/// advertise a pruned method (unit tests guard every needle verbatim).
+const PR_MONITOR_INDEX_XREF: &str = "pr.monitor = daemon-run PR watch (preferred); ";
+const PR_MONITOR_INDEX_SNAPSHOT_LABEL: &str = "pr.snapshot = one-shot state";
+const PR_MONITOR_INDEX_SNAPSHOT_LABEL_OFF: &str = "pr.snapshot = compact PR watch state";
+const PR_MONITOR_HOOK_XREF: &str = " For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.";
+const PR_MONITOR_SNAPSHOT_XREF_LINE: &str = "    This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.\n";
+const PR_MONITOR_ONLY_METHODS: &str = "These are the only `ws.pr.*` methods.";
+const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
@@ -722,6 +758,21 @@ pub fn workspace_api_description(
         out =
             out.replacen(HOOK_HOST_EXEC_INDEX_XREF, "", 1)
                 .replacen(HOOK_HOST_EXEC_DOC_XREF, "", 1);
+    }
+    // Cross-reference scrub for `prMonitor`: the three monitor doc lines are
+    // pruned above, but the surviving `ws.pr.*` index entry, hook steer and
+    // `ws.pr.snapshot` continuation lines still point at them.
+    if !features.pr_monitor {
+        out = out
+            .replacen(PR_MONITOR_INDEX_XREF, "", 1)
+            .replacen(
+                PR_MONITOR_INDEX_SNAPSHOT_LABEL,
+                PR_MONITOR_INDEX_SNAPSHOT_LABEL_OFF,
+                1,
+            )
+            .replacen(PR_MONITOR_HOOK_XREF, "", 1)
+            .replacen(PR_MONITOR_SNAPSHOT_XREF_LINE, "", 1)
+            .replacen(PR_MONITOR_ONLY_METHODS, PR_MONITOR_ONLY_METHODS_OFF, 1);
     }
     Cow::Owned(out)
 }
@@ -911,7 +962,9 @@ fn microvm_hints_block(hints: &MicrovmSpawnHints) -> String {
 }
 
 /// Render the injected continuation block: one header line plus one line per
-/// specialist listing its options as `` `<compound id>` (<hint>) `` entries
+/// specialist naming its resolved default (`` default `<compound id>` ``, or
+/// `default: provider default` when resolution yields the provider CLI
+/// default) followed by its options as `` `<compound id>` (<hint>) `` entries
 /// (the hint parenthetical is omitted when empty, and an option's declared
 /// reasoning effort is appended to it as `effort: <level>`). All lines are
 /// indented ≥4 so the `[agentFeatures]` pruning treats them as continuation
@@ -931,24 +984,24 @@ fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
         block.push_str("      ");
         block.push_str(&flat(&spec.specialist));
         block.push_str(": ");
-        let entries: Vec<String> = spec
-            .options
-            .iter()
-            .map(|o| {
-                let mut paren: Vec<String> = Vec::new();
-                if !o.hint.is_empty() {
-                    paren.push(flat(&o.hint));
-                }
-                if !o.reasoning_effort.is_empty() {
-                    paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
-                }
-                if paren.is_empty() {
-                    format!("`{}`", flat(&o.model))
-                } else {
-                    format!("`{}` ({})", flat(&o.model), paren.join("; "))
-                }
-            })
-            .collect();
+        let mut entries: Vec<String> = vec![match spec.default_model.as_deref() {
+            Some(m) => format!("default `{}`", flat(m)),
+            None => "default: provider default".to_string(),
+        }];
+        entries.extend(spec.options.iter().map(|o| {
+            let mut paren: Vec<String> = Vec::new();
+            if !o.hint.is_empty() {
+                paren.push(flat(&o.hint));
+            }
+            if !o.reasoning_effort.is_empty() {
+                paren.push(format!("effort: {}", flat(&o.reasoning_effort)));
+            }
+            if paren.is_empty() {
+                format!("`{}`", flat(&o.model))
+            } else {
+                format!("`{}` ({})", flat(&o.model), paren.join("; "))
+            }
+        }));
         block.push_str(&entries.join(", "));
         block.push('\n');
     }
@@ -961,7 +1014,9 @@ mod tests {
         denied_feature, help_index, help_namespace, workspace_api_description,
         workspace_api_description_with_model_options, AgentFeaturesSettings, Cow,
         MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
-        HOOK_HOST_EXEC_INDEX_XREF, REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
+        HOOK_HOST_EXEC_INDEX_XREF, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
+        PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
+        REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
         WORKSPACE_API_DESCRIPTION_CHIEF,
     };
     use std::collections::HashSet;
@@ -1324,6 +1379,8 @@ mod tests {
                 rich_chat_blocks: false,
                 structured_questions: false,
                 attention_requests: false,
+                state_snapshot: false,
+                pr_monitor: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1487,6 +1544,10 @@ mod tests {
                 &["ws.agent.requestDiscussion", "ws.agent.reportBlocker"],
                 |f| f.attention_requests = false,
             ),
+            (
+                &["ws.pr.monitors", "ws.pr.monitor", "ws.pr.unmonitor"],
+                |f| f.pr_monitor = false,
+            ),
         ]
     }
 
@@ -1569,6 +1630,8 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            state_snapshot: false,
+            pr_monitor: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features, true);
@@ -1753,6 +1816,52 @@ mod tests {
         }
     }
 
+    // Guard: every `prMonitor` cross-reference the scrub rewrites still
+    // matches both description variants verbatim, so a doc edit cannot
+    // silently turn a `replacen` into a no-op.
+    #[test]
+    fn pr_monitor_xrefs_match_both_variants() {
+        for base in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            for needle in [
+                PR_MONITOR_INDEX_XREF,
+                PR_MONITOR_INDEX_SNAPSHOT_LABEL,
+                PR_MONITOR_HOOK_XREF,
+                PR_MONITOR_SNAPSHOT_XREF_LINE,
+                PR_MONITOR_ONLY_METHODS,
+            ] {
+                assert!(base.contains(needle), "missing verbatim needle: {needle}");
+            }
+        }
+    }
+
+    // `prMonitor` is method-level: `ws.pr.snapshot` and its docs survive, no
+    // textual mention of the pruned monitor methods remains anywhere, and the
+    // surviving index entry / `ws.hook.schedule` steer stop advertising them.
+    #[test]
+    fn pr_monitor_off_scrubs_cross_references_but_keeps_snapshot() {
+        let features = AgentFeaturesSettings {
+            pr_monitor: false,
+            ..AgentFeaturesSettings::default()
+        };
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features, true);
+            assert!(
+                !pruned.contains("pr.monitor"),
+                "chief={is_chief}: a `pr.monitor` mention survived disabling prMonitor"
+            );
+            for kept in [
+                "ws.pr.snapshot(prNumber, { repo? }?)",
+                "pr.snapshot = compact PR watch state",
+                "This is the only `ws.pr.*` method.",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly pruned"
+                );
+            }
+        }
+    }
+
     // `attentionRequests` is method-level: other `ws.agent.*` docs — most
     // importantly `reportToParent`, minus its cross-reference to the pruned
     // pair — must survive it, and no textual mention of the pruned methods
@@ -1794,6 +1903,8 @@ mod tests {
             rich_chat_blocks: false,
             structured_questions: false,
             attention_requests: false,
+            state_snapshot: false,
+            pr_monitor: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -1827,6 +1938,10 @@ mod tests {
             denied_feature(&all_off, "agent.reportBlocker"),
             Some("agentFeatures.attentionRequests")
         );
+        // `ws.agent.snapshot()` is NEVER gated: `stateSnapshot` governs only
+        // the turn-prompt injection, so even a session created with the
+        // toggle already off keeps the tool callable.
+        assert_eq!(denied_feature(&all_off, "agent.snapshot"), None);
         // Un-gated namespaces pass even with everything off.
         assert_eq!(denied_feature(&all_off, "note.read"), None);
         assert_eq!(
@@ -1864,6 +1979,7 @@ mod tests {
         vec![
             SpecialistModelOptions {
                 specialist: "implementor".to_string(),
+                default_model: Some("auggie:claude-opus-5".to_string()),
                 options: vec![
                     SpecialistModelOption {
                         model: "opencode:kimi-k3".to_string(),
@@ -1877,8 +1993,10 @@ mod tests {
                     },
                 ],
             },
+            // No resolved default → the provider CLI default label.
             SpecialistModelOptions {
                 specialist: "verifier".to_string(),
+                default_model: None,
                 options: vec![SpecialistModelOption {
                     model: "grok:grok-5".to_string(),
                     hint: "fast reviews".to_string(),
@@ -1910,9 +2028,9 @@ mod tests {
     }
 
     // Options are injected as continuation lines directly under the
-    // `ws.agent.delegate` doc entry: compound id + hint per specialist, the
-    // hint parenthetical omitted when empty, and the next method line
-    // (`ws.agent.send`) still follows.
+    // `ws.agent.delegate` doc entry: the resolved default first, then compound
+    // id + hint per specialist, the hint parenthetical omitted when empty, and
+    // the next method line (`ws.agent.send`) still follows.
     #[test]
     fn model_options_injected_into_delegate_docs() {
         let features = AgentFeaturesSettings::default();
@@ -1929,12 +2047,17 @@ mod tests {
                 "chief={is_chief}: header missing"
             );
             assert!(
-                got.contains("implementor: `opencode:kimi-k3` (cheap), `auggie:opus`"),
+                got.contains(
+                    "implementor: default `auggie:claude-opus-5`, \
+                     `opencode:kimi-k3` (cheap), `auggie:opus`"
+                ),
                 "chief={is_chief}: implementor options line missing/miswritten:\n{got}"
             );
+            // An unresolved default renders the provider-CLI-default label
+            // rather than a fabricated id.
             assert!(
-                got.contains("verifier: `grok:grok-5` (fast reviews)"),
-                "chief={is_chief}: verifier options line missing"
+                got.contains("verifier: default: provider default, `grok:grok-5` (fast reviews)"),
+                "chief={is_chief}: verifier options line missing/miswritten:\n{got}"
             );
             // The block sits between the delegate entry and the next method
             // line, i.e. inside the delegate docs.
@@ -1971,6 +2094,7 @@ mod tests {
     fn model_options_block_renders_per_option_effort() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
+            default_model: None,
             options: vec![
                 SpecialistModelOption {
                     model: "fable-5".to_string(),
@@ -1993,7 +2117,8 @@ mod tests {
         );
         assert!(
             got.contains(
-                "implementor: `fable-5` (hard tasks; effort: high), `sonnet5` (effort: low)"
+                "implementor: default: provider default, `fable-5` (hard tasks; effort: high), \
+                 `sonnet5` (effort: low)"
             ),
             "per-option effort not rendered:\n{got}"
         );
@@ -2017,7 +2142,7 @@ mod tests {
         );
         assert!(!got.contains("ws.hook."), "pruned namespace resurfaced");
         assert!(
-            got.contains("implementor: `opencode:kimi-k3` (cheap)"),
+            got.contains("implementor: default `auggie:claude-opus-5`, `opencode:kimi-k3` (cheap)"),
             "options block missing on a pruned description"
         );
     }
@@ -2028,6 +2153,7 @@ mod tests {
     fn model_options_flatten_multiline_hints() {
         let options = vec![SpecialistModelOptions {
             specialist: "implementor".to_string(),
+            default_model: Some("auggie:claude-opus-5".to_string()),
             options: vec![SpecialistModelOption {
                 model: "opencode:kimi-k3".to_string(),
                 hint: "line one\nline two".to_string(),

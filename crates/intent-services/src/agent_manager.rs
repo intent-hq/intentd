@@ -306,10 +306,10 @@ pub struct TurnOptions {
     pub turn_id: Option<String>,
     /// Who originated this delivery (question hold, PROTOCOL §5.5):
     /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
-    /// is never held; the `Automatic` default fails closed — an automatic
-    /// send to an agent whose question hold is active enqueues instead of
-    /// claiming the turn slot, so a pending Q&A is never superseded by a
-    /// system/agent message.
+    /// is never held (but never releases the hold either); the `Automatic`
+    /// default fails closed — an automatic send to an agent whose question
+    /// hold is active enqueues instead of claiming the turn slot, so a
+    /// pending Q&A is never buried by a system/agent turn.
     pub origin: intent_core::MessageOrigin,
     /// `true` when this delivery carries `priority: "interrupt"`. Every
     /// fallback path that parks the message in the queue (question hold,
@@ -931,10 +931,7 @@ impl Drop for TempConfigFile {
     }
 }
 
-/// Env var pi-acp (0.0.31) reads to override the `pi` binary it spawns
-/// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
-/// `create_agent` points it at the generated wrapper script.
-const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
+use crate::pi_cli::{resolve_real_pi_command, PI_ACP_PI_COMMAND_ENV};
 
 /// Env var the bundled pi extension reads for the per-agent MCP bridge's
 /// loopback TCP address (`host:port`, see [`McpBridge::connect_addr`]).
@@ -1052,16 +1049,6 @@ fn guest_mcp_servers(bridge_connect_addr: String) -> NormalizedMcpServers {
     servers
 }
 
-/// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
-/// daemon env (the value pi-acp itself would have used, which the wrapper
-/// override shadows) or `pi` from the child's PATH — pi-acp's own fallback.
-fn resolve_real_pi_command() -> String {
-    std::env::var(PI_ACP_PI_COMMAND_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "pi".to_string())
-}
-
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
 /// request loop, the owned child (its process group is killed on teardown via
@@ -1151,6 +1138,29 @@ const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(200);
 const HARNESS_WAKE_POLL: Duration = Duration::from_millis(50);
 
 type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
+
+/// RAII guard returned by [`AgentManager::stop_many`]: while alive, the swept
+/// agents stay in the manager's `stopping` set, fencing them off from the
+/// lazy-spawn paths (`ensure_started` / `create_agent`). The caller holds it
+/// across the store cascade that deletes the swept session rows, then drops
+/// it — after which the rows are gone and a spawn attempt fails `NotFound`
+/// on its own store read.
+#[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
+pub struct TeardownFence {
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
+    ids: Vec<AgentId>,
+}
+
+impl Drop for TeardownFence {
+    fn drop(&mut self) {
+        // Poison recovery mirrors the delete-path sweeps: unfencing is the
+        // last chance to keep the set from leaking these ids forever.
+        let mut stopping = self.stopping.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            stopping.remove(id);
+        }
+    }
+}
 
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
@@ -1243,6 +1253,19 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents fenced off from the lazy-spawn paths because a batch teardown
+    /// ([`AgentManager::stop_many`]) is in flight and their session rows are
+    /// about to be cascade-deleted (`workspace.delete`). While an agent is in
+    /// this set, [`AgentManager::ensure_started`] refuses to (re)spawn it and
+    /// [`AgentManager::create_agent`] refuses to install a fresh handle —
+    /// otherwise a concurrent `agent.sendMessage` that passed its store check
+    /// before the sweep could lazily spawn a replacement child during the
+    /// shared grace wait, and that child would outlive its deleted session as
+    /// a ghost process no sweep ever kills. Armed by `stop_many` BEFORE the
+    /// first detach; cleared when the returned [`TeardownFence`] drops (after
+    /// the caller's store cascade, at which point the session row is gone and
+    /// the spawn path fails `NotFound` on its own).
+    stopping: Arc<Mutex<HashSet<AgentId>>>,
     /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
     /// monorepo#878): started on demand when an `unsloth`-provider agent
     /// spawns, reused while the served model matches, restarted on model
@@ -1312,6 +1335,7 @@ impl AgentManager {
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
         }
     }
@@ -1603,6 +1627,19 @@ impl AgentManager {
         // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
         // microVM spawns stage the extension + wrapper into the VM rootfs
         // instead.
+        //
+        // Fail fast before spawning when the `pi` CLI the wrapper would exec
+        // is missing or known-too-old for the pinned pi-acp adapter
+        // (monorepo#1662) — a clear error instead of a silent hang. The probe
+        // is blocking (subprocess, ≤3s budget), so it runs off the runtime.
+        // The probe checks the HOST pi binary, so it is skipped for microVM
+        // spawns where pi runs inside the guest rootfs.
+        if opts.provider.mcp_via_pi_extension && microvm_ws.is_none() {
+            let status = tokio::task::spawn_blocking(crate::pi_cli::probe_pi_cli)
+                .await
+                .map_err(|e| Error::Internal(format!("pi CLI probe task failed: {e}")))?;
+            crate::pi_cli::check_pi_cli_for_spawn(&status)?;
+        }
         let pi_extension = if microvm_ws.is_none() {
             pi_extension_delivery(opts.provider, &config_dir)?
         } else {
@@ -1773,9 +1810,12 @@ impl AgentManager {
             }
         };
 
-        let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
-            crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
-        );
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
+            Arc::new(crate::PtyTerminalHost::with_shell_mode(
+                self.services.pty(),
+                self.services.settings_registry(),
+                opts.provider.terminal_requires_shell,
+            ));
         // microVM sessions run the provider against guest paths
         // (`/workspace/...`): alias that prefix onto the host-side CoW clone
         // so `fs/read_text_file` / `fs/write_text_file` resolve correctly.
@@ -1840,10 +1880,37 @@ impl AgentManager {
                 kill_child_tree(child, stale_pid).await;
             }
         }
-        self.handles
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), handle);
+        // Teardown fence (ghost-agent race): a `workspace.delete` batch stop
+        // (`stop_many`) may have swept this agent AFTER the caller's session
+        // checks passed — installing the fresh handle now would leave a live
+        // child no sweep ever kills once the store cascade drops the session
+        // row. Check-and-insert under the `stopping` lock so the install is
+        // atomic against `stop_many` arming the fence: fence armed first →
+        // the install is refused here (fresh child killed below); handle
+        // installed first → `stop_many`'s detach finds it and kills it with
+        // the batch. Either interleaving leaves no orphaned process.
+        let fenced = {
+            let stopping = self.stopping.lock().unwrap();
+            if stopping.contains(&agent_id) {
+                Some(handle)
+            } else {
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(agent_id.clone(), handle);
+                None
+            }
+        };
+        if let Some(mut handle) = fenced {
+            self.registry.deregister(&agent_id);
+            let spawn_pid = handle.child_pid;
+            if let Some(child) = handle._child.take() {
+                kill_child_tree(child, spawn_pid).await;
+            }
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // Proactive dead-child detection (monorepo#764): watch the installed
         // child for an unexpected exit so an idle agent's death is reaped
         // (handle + registry) as it happens, not just at the next prompt.
@@ -2611,8 +2678,11 @@ impl AgentManager {
     /// the config id comes from the adapter's own `configOptions`
     /// (claude-agent-acp `effort`, codex-acp `reasoning_effort`), so no
     /// provider capability flag is needed and a provider that advertises no
-    /// such option silently ignores the field. Best-effort — a rejected call
-    /// is logged and never fails session startup.
+    /// such option silently ignores the field. The selector's surfaced levels
+    /// are persisted inside the open/recreate/resume fns themselves — where
+    /// the CAS outcome is known, so a lost CAS never clears them (see
+    /// [`Services::persist_session_effort_levels`]). Best-effort — a
+    /// rejected call is logged and never fails session startup.
     async fn install_and_apply_thought_level(
         &self,
         conn: &Connection,
@@ -3055,6 +3125,20 @@ impl AgentManager {
                 _ => prompt_text,
             },
         };
+        // Per-turn agent state snapshot (`current ws.agent.snapshot() =>
+        // {...}`): the outermost RECURRING per-turn decoration — before
+        // context/naming/reminder, after only the fire-once FirstTurnPrepend
+        // below. Rebuilt every turn for ALL agents (specialist and
+        // non-specialist, unlike the role reminder) and never persisted.
+        // `agent_state_snapshot_line` reads `agentFeatures.stateSnapshot`
+        // LIVE and returns `None` when the toggle is off or the snapshot is
+        // trivial (all counts zero, no pending attention), leaving the
+        // prompt byte-identical to pre-feature output.
+        let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
+        let prompt_text = match snapshot_line {
+            Some(line) => format!("{line}\n\n{prompt_text}"),
+            None => prompt_text,
+        };
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
         // assembled system prompt
@@ -3195,6 +3279,55 @@ impl AgentManager {
             kill_child_tree(child, spawn_pid).await;
         }
         removed
+    }
+
+    /// Stop MANY agents under ONE shared grace window: detach each agent with
+    /// the exact [`AgentManager::stop`] per-agent semantics (partial-turn
+    /// flush, recreate/prepend flag cleanup, live-turn slot release, handle
+    /// removal, deregistration), collect the detached children, and kill all
+    /// process groups concurrently via [`kill_child_trees`] — total teardown
+    /// stays ~one [`PROCESS_GROUP_TERM_GRACE`] period regardless of agent
+    /// count, instead of N sequential SIGTERM→grace→SIGKILL cycles. This is
+    /// the `workspace.delete` sweep (same detach-many → kill_child_trees
+    /// pattern as `shutdown()`, minus the interrupted-session capture).
+    ///
+    /// NOTE: with exactly one agent this is NEARLY but not exactly
+    /// [`AgentManager::stop`]: `kill_child_trees` adds a bounded
+    /// [`KILL_SWEEP_REAP_GRACE`] post-SIGKILL reap window that
+    /// `kill_child_tree` does not (a SIGTERM-ignoring single child pays up
+    /// to ~grace + reap-grace and is properly `wait()`ed), and descendants
+    /// are snapshotted via one batched `ps` (`descendant_pids_many`).
+    ///
+    /// Returns a [`TeardownFence`] that keeps the swept agents fenced off
+    /// from the lazy-spawn paths until dropped: the caller must hold it
+    /// across the store cascade that deletes the session rows, so a
+    /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
+    /// child that would outlive its deleted session as a ghost process.
+    #[must_use = "hold the fence until the swept agents' session rows are deleted"]
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+        // Arm the fence BEFORE the first detach: from here on, every lazy
+        // spawn for a swept agent is refused (`ensure_started` fast-fail +
+        // the `create_agent` install fence), so no replacement child can
+        // slip in during the shared grace wait below.
+        self.stopping
+            .lock()
+            .unwrap()
+            .extend(agent_ids.iter().cloned());
+        let fence = TeardownFence {
+            stopping: Arc::clone(&self.stopping),
+            ids: agent_ids.to_vec(),
+        };
+        let mut children = Vec::new();
+        for id in agent_ids {
+            let (_, child) = self.detach(id).await;
+            if let Some(child) = child {
+                children.push(child);
+            }
+        }
+        if !children.is_empty() {
+            kill_child_trees(children).await;
+        }
+        fence
     }
 
     /// Shared teardown body of [`AgentManager::stop`]: abort the worker, drop
@@ -3472,6 +3605,12 @@ impl AgentManager {
                 // agent owns no active hook).
                 self.services
                     .annotate_waiting_on_hooks(agent_id, &mut data)
+                    .await;
+                // Idle-visibility (unified external-wait): same
+                // `waitingOnPrMonitors` stamp as the settlement idle
+                // (omitted when the agent owns no active monitor).
+                self.services
+                    .annotate_waiting_on_pr_monitors(agent_id, &mut data)
                     .await;
                 self.services
                     .publish_agent_event(
@@ -3970,13 +4109,13 @@ impl AgentManager {
             return Ok(result);
         }
         // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
-        // whose last assistant message carries un-dismissed question blocks
-        // must NOT start a turn — the resulting user row would supersede the
-        // pending Q&A and the wizard would silently vanish. Park the message
-        // in the queue instead (interrupt priority included — no exceptions,
-        // spec §Decisions); `agent.dismissQuestions` or a user answer flips
-        // the hold false and kicks the drain. Checked BEFORE `try_begin` so
-        // even an idle agent holds the delivery.
+        // with un-dismissed pending questions must NOT start a turn — its
+        // turn would bury the pending Q&A under later transcript rows and
+        // steal the user's chance to answer. Park the message in the queue
+        // instead (interrupt priority included — no exceptions, spec
+        // §Decisions); only `agent.dismissQuestions` or an answer-tagged user
+        // row flips the hold false and kicks the drain. Checked BEFORE
+        // `try_begin` so even an idle agent holds the delivery.
         if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -4129,9 +4268,30 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
-        // The persisted user row supersedes a pending question tail, which
-        // can retire the workspace's needs_attention displayStatus (§6.5
-        // step 0): recompute-and-compare.
+        // Answer intake (PROTOCOL §5.5, question hold): a user row tagged
+        // `question_answers` naming the marked assistant message resolves the
+        // pending Q&A and clears the marker (a stale/foreign
+        // `answeredQuestionsMessageId` is a no-op). Only an ANSWER retires the
+        // hold now that pendingness is persisted — a plain user row leaves the
+        // marker as it was. Runs BEFORE the displayStatus recompute so the
+        // retired hold is reflected.
+        self.services
+            .resolve_pending_questions_for_answer(
+                &workspace_id,
+                &agent_id,
+                options.message_metadata.as_ref(),
+            )
+            .await;
+        // The retired hold can drop the workspace's needs_attention
+        // displayStatus (§6.5 step 0): recompute-and-compare. This recompute
+        // ALSO produces the visible `failed → in_progress` transition on the
+        // errored-agent redrive path (a fresh sendMessage to a non-poisoned
+        // Error session): the earlier recompute inside `try_begin`'s
+        // `agent_activity_begin` still reads `status = Error` (persisted to
+        // Active only afterwards) and is a no-op, so removing or reordering
+        // this call would leave the redriven turn stuck on `failed` for its
+        // whole duration. Pinned by
+        // `send_message_redrive_emits_failed_to_in_progress`.
         self.services
             .maybe_emit_display_status_changed(&workspace_id)
             .await;
@@ -4192,14 +4352,15 @@ impl AgentManager {
             }
         }
         // Question hold (PROTOCOL §5.5): AUTOMATIC queued messages stay
-        // parked while the agent's last assistant message carries
-        // un-dismissed question blocks — draining one would append a user
-        // row that supersedes the pending Q&A. `agent.dismissQuestions` and
-        // the post-answer turn end both re-kick this drain once the hold
-        // derivation flips false (mirrors the STAB-52 Error gate below). A
-        // parked USER-origin entry (a user send that lost a busy race) is
-        // exempt — the user answer is the hold's documented release, so it
-        // drains and supersedes the questions (`hold_drain` below).
+        // parked while the agent has un-dismissed pending questions — the
+        // turn a drained entry starts would bury the pending Q&A. The park
+        // now lasts across turns and daemon restarts (the marker is
+        // persisted): only `agent.dismissQuestions` and an answer-tagged user
+        // row flip the derivation false, and both re-kick this drain (mirrors
+        // the STAB-52 Error gate below). A parked USER-origin entry is
+        // exempt — it may itself BE the answer that releases the hold, so it
+        // drains rather than deadlocking behind it (`hold_drain` below); a
+        // plain user entry drains too but leaves the hold armed.
         let hold_drain = if self.services.question_hold_active(&agent_id).await {
             if !self.services.has_user_origin_ready(&agent_id) {
                 tracing::debug!(
@@ -4562,12 +4723,24 @@ impl AgentManager {
                     ),
                 )
                 .await;
-            // The persisted user row supersedes a pending question tail,
-            // which can retire the workspace's needs_attention displayStatus
-            // (§6.5 step 0): recompute-and-compare.
-            self.services
-                .maybe_emit_display_status_changed(&workspace_id)
-                .await;
+            // Answer intake (PROTOCOL §5.5, question hold): an answer that was
+            // queued and then explicitly sent still resolves the pending Q&A.
+            // An untagged entry leaves the marker (and the workspace's
+            // needs_attention displayStatus, §6.5 step 0) untouched, so the
+            // recompute only runs on an actual clear.
+            if self
+                .services
+                .resolve_pending_questions_for_answer(
+                    &workspace_id,
+                    &agent_id,
+                    entry.message_metadata.as_ref(),
+                )
+                .await
+            {
+                self.services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
         }
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
@@ -4633,7 +4806,7 @@ impl AgentManager {
         let pre_truncate = async {
             if let Some(model_id) = model {
                 self.services
-                    .agent_set_model_op(agent_id.clone(), model_id)
+                    .agent_set_model_op(agent_id.clone(), model_id, None)
                     .await?;
             }
             self.services
@@ -4650,8 +4823,11 @@ impl AgentManager {
         // Arm `recreated` AFTER `stop` (which clears it): it makes the next
         // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
-        // Explicit user action (question hold, PROTOCOL §5.5): the
-        // regenerated message deliberately supersedes any pending Q&A.
+        // Explicit user action (question hold, PROTOCOL §5.5): the send is
+        // user-origin so it is never held. The truncation above already
+        // re-derived the pending-questions marker against the post-truncation
+        // transcript, so a Q&A the edit cut away is gone and one that survived
+        // stays pending.
         options.origin = intent_core::MessageOrigin::User;
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
@@ -5042,9 +5218,9 @@ impl AgentManager {
             }
         }
         // Question hold (PROTOCOL §5.5): an implicit harness wake turn would
-        // append a fresh assistant message, superseding the pending Q&A the
-        // hold protects. Skip the tick (buffered notifications stay
-        // untouched) until the questions are answered or dismissed.
+        // append a fresh assistant message, burying the pending Q&A the hold
+        // protects. Skip the tick (buffered notifications stay untouched)
+        // until the questions are answered or dismissed.
         if self.services.question_hold_active(agent_id).await {
             return true;
         }
@@ -5075,6 +5251,9 @@ impl AgentManager {
         // cost-only (§5.23) — no turn, no busy slot, no phantom stream events
         // — instead of being dropped.
         match intent_acp::session::map_notification(&first) {
+            // A thought chunk materializes a `thinking` block just like a
+            // message chunk materializes a `text` one, so it opens a turn on
+            // the same terms (parity with `route_notification`).
             Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
             Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
                 if !tc.tool_name.trim().is_empty() => {}
@@ -5269,6 +5448,11 @@ impl AgentManager {
         // event carries stopReason: null.
         self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
             .await;
+        // Clearing the Error park retires the `failed` displayStatus rung
+        // (§6.5 step 0): recompute-and-compare so the demotion emits.
+        self.services
+            .maybe_emit_display_status_changed(workspace_id)
+            .await;
         Ok(())
     }
 
@@ -5436,6 +5620,19 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        // Teardown fence (ghost-agent race): refuse to (re)spawn an agent a
+        // `workspace.delete` batch stop (`stop_many`) is tearing down — its
+        // session row is about to be cascade-deleted, so a lazy spawn here
+        // would create a child that outlives the row. NotFound is
+        // non-retryable for `retry_spawn`, so the turn fails fast instead of
+        // burning spawn attempts against a fence that will not lift. The
+        // install-time fence in `create_agent` closes the interleaving where
+        // this check passes just before the fence arms.
+        if self.stopping.lock().unwrap().contains(agent_id) {
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
         // A delegate with CoW isolation provisions the sandbox in a background
         // task, off the delegate critical path (monorepo#871). Await
         // settlement BEFORE reading the session so the child never spawns
@@ -6934,19 +7131,77 @@ async fn run_message_worker(
                                     .unwrap()
                                     .get(&agent_id)
                                     .map(|h| h.connection.clone());
-                                let settled = match conn {
-                                    Some(conn) => {
-                                        cancel_and_settle_idle_prompt(
-                                            conn.as_ref(),
-                                            &agent_id,
-                                            &acp_session_id,
-                                        )
-                                        .await
+                                // Response watermark BEFORE `session/cancel`:
+                                // the idle timeout dropped `req_fut`, so the
+                                // hung prompt's pending-map entry is already
+                                // gone (drop guard) — the watermark is the
+                                // only way to observe its late response.
+                                let since = conn.as_ref().map(|c| c.response_seq());
+                                let settled = match conn.as_deref() {
+                                    Some(c) => {
+                                        cancel_and_settle_idle_prompt(c, &agent_id, &acp_session_id)
+                                            .await
                                     }
                                     None => false,
                                 };
-                                if !settled {
+                                // STAB-124 for the idle-timeout path:
+                                // attribution on the turn-less
+                                // `session/update` channel is positional,
+                                // so the cancelled turn's stragglers
+                                // (tool_call_update echoes, tail chunks)
+                                // must be discarded before the warning
+                                // turn's transcript starts consuming the
+                                // channel. The cancelled prompt's RESPONSE
+                                // is the deterministic end-of-turn boundary
+                                // on the child's ordered stdout — once it
+                                // lands, every straggler is already
+                                // buffered, so the `try_recv` sweep below
+                                // is complete, not racy. Bounded, cannot
+                                // deadlock: the timed-out worker released
+                                // the receiver lock when `run_prompt_turn`
+                                // returned, and the await is
+                                // timeout-bounded. A boundary that never
+                                // lands means the child may keep streaming
+                                // stragglers indefinitely — treated as NOT
+                                // settled below, so the child is torn down
+                                // and the warning turn spawns fresh (fresh
+                                // channel + reset watermark: bleed
+                                // impossible).
+                                let boundary_landed = if settled {
+                                    match (conn.as_ref(), since) {
+                                        (Some(conn), Some(since)) => {
+                                            let landed = conn
+                                                .await_response_after(since, Duration::from_secs(2))
+                                                .await;
+                                            if !landed {
+                                                tracing::warn!(
+                                                    agent = %agent_id,
+                                                    "idle-timeout settle: cancelled prompt's response did not land within the watermark window; tearing the child down so the warning turn starts on a fresh channel"
+                                                );
+                                            }
+                                            landed
+                                        }
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !boundary_landed {
                                     mgr.kill_child_only(&agent_id).await;
+                                } else {
+                                    // Hold the notifications lock across the
+                                    // drain so the warning turn cannot start
+                                    // consuming the channel mid-sweep.
+                                    let notes = mgr
+                                        .handles
+                                        .lock()
+                                        .unwrap()
+                                        .get(&agent_id)
+                                        .map(|h| h.notifications.clone());
+                                    if let Some(notes) = notes {
+                                        let mut guard = notes.lock().await;
+                                        Services::drain_replay_notifications(&mut guard).await;
+                                    }
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,
@@ -7037,6 +7292,42 @@ async fn run_message_worker(
                             .await;
                             mgr.release_in_flight_slot(&agent_id).await;
                             break 'outer;
+                        } else if suspend_interrupt_error(&e) {
+                            // Sleep-induced interruption (Task C):
+                            // `run_prompt_turn` already enrolled the turn as
+                            // interrupted (partial persisted with
+                            // `InterruptReason::SystemSuspend` + an
+                            // `interrupted_agent` row) and emitted the
+                            // interrupted terminal `agent:stream:end` — NOT
+                            // `agent:failed`. Suppress the terminal-failure path
+                            // (no Error status, no manual-retry surface): settle
+                            // the session to idle and stop the worker, leaving
+                            // the enrolled turn for the wake orchestrator (Task
+                            // D) to resume. Placed before the pre-output redrive
+                            // arm so a suspend-overlapping pre-output failure is
+                            // resumed via `session/load` (preserving the partial
+                            // turn) rather than silently redriven on a fresh
+                            // child.
+                            tracing::info!(
+                                agent = %agent_id,
+                                error = %e,
+                                "turn interrupted by system suspend — enrolled for wake-resume, suppressing terminal failure"
+                            );
+                            // Tear down the local provider child (mirrors the
+                            // silent-redrive branch below): the upstream API
+                            // stream dropped, but the claude-code/auggie child
+                            // and its IPC connection survive the disconnect. If
+                            // the handle is left live, the wake/self-heal resume
+                            // routes through `ensure_started`'s live-child reuse
+                            // branch and returns the stale `acpSessionId`
+                            // WITHOUT issuing `session/load` — skipping the very
+                            // recovery the enrollment promises. Removing the
+                            // handle here forces the resume to spawn a fresh
+                            // child and reload the persisted session via
+                            // `session/load` (or the recreate fallback).
+                            mgr.kill_child_only(&agent_id).await;
+                            mgr.end_turn(&agent_id).await;
+                            break 'outer;
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt
@@ -7116,13 +7407,13 @@ async fn run_message_worker(
                 break 'outer;
             }
         }
-        // Question hold (PROTOCOL §5.5): the turn that just ended may have
-        // ASKED questions — draining the next AUTOMATIC queued message would
-        // append a user row that supersedes the pending Q&A. A parked
-        // USER-origin entry (a user answer that lost the busy race against
-        // this very turn) is exempt: it IS the hold's documented release, so
-        // it drains and supersedes the questions. Otherwise skip the
-        // pre-release drain (no `break 'outer` here!) and fall through to the
+        // Question hold (PROTOCOL §5.5): questions may still be pending —
+        // asked by the turn that just ended, or by an earlier turn the hold
+        // has kept armed since — so draining the next AUTOMATIC queued
+        // message would bury them. A parked USER-origin entry (a user answer
+        // that lost the busy race against this very turn) is exempt: it may
+        // itself be the hold's release, so it drains regardless. Otherwise
+        // skip the pre-release drain (no `break 'outer` here!) and fall through to the
         // post-`end_turn` raced re-check below, which repeats this same
         // hold-aware `dequeue_user_origin_message` check AFTER the slot is
         // actually released — closing the window where a user answer enqueued
@@ -7392,13 +7683,42 @@ async fn run_message_worker(
     }
     mgr.clear_worker(&agent_id);
     // The agent finished its work (queue drained, slot released): raise the
-    // server-owned `attention` blue dot so every client surfaces it (§9.9).
-    if let Err(e) = mgr
-        .services
-        .raise_attention(&workspace_id, WorkspaceAttention::Unread)
-        .await
-    {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+    // server-owned `attention` blue dot so every client surfaces it (§9.9) —
+    // but only for TOP-LEVEL FOREGROUND agents (monorepo#1781): a delegated
+    // child or background agent's completion is surfaced to its
+    // parent/coordinator, not the user.
+    if should_raise_turn_end_unread(&mgr.services, &agent_id).await {
+        if let Err(e) = mgr
+            .services
+            .raise_attention(&workspace_id, WorkspaceAttention::Unread)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
+        }
+    }
+}
+
+/// Turn-end unread gate (monorepo#1781): the drain-end blue dot is reserved
+/// for TOP-LEVEL FOREGROUND agents — a delegated child (`parent_agent_id`
+/// set) or background agent (`is_background`) is a sub-agent whose
+/// completion is its parent/coordinator's attention surface, not the
+/// user's. Same sub-agent definition as the attention-clear gate above and
+/// rules.rs. `NotFound` means the agent was deleted while its drain
+/// finished — nothing to surface, skip. FAIL OPEN on any other store error
+/// (raise anyway): a missed blue dot for a real top-level turn is worse
+/// than a spurious one on a rare store fault.
+pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: &AgentId) -> bool {
+    match services.store.get_agent_session_summary(agent_id).await {
+        Ok(s) => s.parent_agent_id.is_none() && !s.is_background,
+        Err(Error::NotFound(_)) => false,
+        Err(e) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "turn-end unread gate: session lookup failed; raising anyway"
+            );
+            true
+        }
     }
 }
 
@@ -7671,12 +7991,20 @@ async fn persist_user(
             crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
         .await;
-    // The persisted user row supersedes a pending question tail, which can
-    // retire the workspace's needs_attention displayStatus (§6.5 step 0):
-    // recompute-and-compare.
-    mgr.services
-        .maybe_emit_display_status_changed(workspace_id)
-        .await;
+    // Answer intake (PROTOCOL §5.5, question hold): same contract as the
+    // direct-send persist — a `question_answers` tag naming the marked
+    // assistant message clears the pending-questions marker; anything else is
+    // a no-op, and only the clear can move the workspace's needs_attention
+    // displayStatus (§6.5 step 0).
+    if mgr
+        .services
+        .resolve_pending_questions_for_answer(workspace_id, agent_id, message_metadata)
+        .await
+    {
+        mgr.services
+            .maybe_emit_display_status_changed(workspace_id)
+            .await;
+    }
     true
 }
 
@@ -8083,6 +8411,14 @@ async fn persist_error_and_requeue(
         )
         .await;
 
+    // A top-level agent parked in Error drives the `failed` displayStatus
+    // rung (§6.5 step 0): recompute-and-compare so the promotion emits.
+    // Deliberately AFTER the requeue: clients key on status-changed →
+    // queue-updated ordering, and the recompute must not widen that window.
+    mgr.services
+        .maybe_emit_display_status_changed(workspace_id)
+        .await;
+
     // Durable transcript record of the terminal failure: a system-role message
     // with a single text block carrying the error text and
     // `meta.kind = "turn-failure"` (the InterruptionNotice shape, §5.35 — the
@@ -8304,6 +8640,24 @@ fn pre_output_transport_failure(err: &Error) -> bool {
     )
 }
 
+/// Whether a `run_turn` error carries the sleep-induced interrupt marker from
+/// `run_prompt_turn` (Task C): the turn died with a transient upstream
+/// disconnect whose active window overlapped a detected host suspend.
+/// `run_prompt_turn` already enrolled the turn as interrupted (persisted the
+/// partial with `InterruptReason::SystemSuspend` + an `interrupted_agent` row)
+/// and emitted the interrupted terminal `agent:stream:end` (NOT `agent:failed`),
+/// so the worker must SUPPRESS the terminal-failure path — no Error status, no
+/// manual-retry surface — and leave the enrolled turn for the wake orchestrator
+/// (Task D) to resume. Prefix-anchored for the same mid-string reason as the
+/// other markers.
+fn suspend_interrupt_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_SUSPEND_INTERRUPT_PREFIX)
+    )
+}
+
 /// Whether a `run_turn` error is the `session/prompt` idle timeout
 /// (`AcpError::PromptIdleTimeout`: the whole idle window passed with no
 /// `session/update` traffic). The structured `AcpError` is flattened to a
@@ -8426,7 +8780,7 @@ mod role_reminder_tests {
         dir
     }
 
-    fn workspace(id: &WorkspaceId) -> Workspace {
+    pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         let ts = now_iso();
         Workspace {
             id: id.clone(),
@@ -8488,6 +8842,7 @@ mod role_reminder_tests {
             name_explicitly_set: false,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: specialist.map(str::to_string),
@@ -8882,6 +9237,200 @@ mod role_reminder_tests {
             .await,
         );
         assert_eq!(text, "hello");
+    }
+
+    // ---- Per-turn agent state snapshot injection ----
+
+    /// Like [`manager_with`] but with a writable TOML-backed settings
+    /// registry wired, so tests can flip `agentFeatures.stateSnapshot` and
+    /// observe the live per-turn read.
+    async fn manager_with_registry() -> (AgentManager, AgentId, tempfile::TempDir, tempfile::TempDir)
+    {
+        let db_dir = crate::tests::test_tempdir("intentd-snap-");
+        let path = db_dir.path().join("store.db");
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let workspace_id = WorkspaceId::from("ws-1");
+        let agent_id = AgentId::from("agent-1");
+        store
+            .insert_workspace(&workspace(&workspace_id))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&session(&agent_id, &workspace_id, None))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (
+            AgentManager::new(services, sink, 4),
+            agent_id,
+            db_dir,
+            config_dir,
+        )
+    }
+
+    /// Make the agent's snapshot non-trivial (one pending queued message).
+    fn make_snapshot_nontrivial(mgr: &AgentManager, agent_id: &AgentId) {
+        mgr.services
+            .enqueue_message(agent_id, "pending".into(), None, None, None, None, false);
+    }
+
+    /// A trivial snapshot (all counts zero, no attention) never injects:
+    /// prompts stay byte-identical to pre-feature output, for specialist and
+    /// non-specialist agents alike.
+    #[tokio::test]
+    async fn snapshot_skipped_when_trivial() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "plain message",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "plain message");
+    }
+
+    /// A non-trivial snapshot injects `current ws.agent.snapshot() => {...}`
+    /// on EVERY turn (rebuilt per turn like the role reminder), including for
+    /// non-specialist agents, and also after a session recreate.
+    #[tokio::test]
+    async fn snapshot_injected_every_turn_for_all_agents() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        for _ in 0..2 {
+            let text = prompt_text(
+                &mgr.build_turn_prompt(
+                    &agent_id,
+                    &WorkspaceId::from("ws-1"),
+                    "do the thing",
+                    &TurnOptions::default(),
+                )
+                .await,
+            );
+            assert!(
+                text.starts_with("current ws.agent.snapshot() => {"),
+                "missing snapshot prefix: {text:?}"
+            );
+            assert!(text.contains("\"queuedMessages\":1"), "counts: {text:?}");
+            assert!(text.ends_with("do the thing"));
+        }
+        // Session-recreate turns keep the injection too.
+        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "resume",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with("current ws.agent.snapshot() => {"),
+            "missing snapshot prefix on recreate: {text:?}"
+        );
+    }
+
+    /// Ordering: the snapshot line is the outermost RECURRING decoration —
+    /// before the `Context:` block, naming instruction, and role reminder —
+    /// while the fire-once FirstTurnPrepend `<system>` block stays outermost
+    /// overall.
+    #[tokio::test]
+    async fn snapshot_ordering_outermost_recurring_after_first_turn_prepend() {
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        set_system_prompt(&mgr, &agent_id, "SP").await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let opts = TurnOptions {
+            stdin_context: Some("ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "do it", &opts)
+                .await,
+        );
+        assert!(
+            text.starts_with("<system>\nSP\n</system>\n\ncurrent ws.agent.snapshot() => {"),
+            "FirstTurnPrepend outermost, snapshot next: {text:?}"
+        );
+        let snapshot_pos = text.find("current ws.agent.snapshot()").unwrap();
+        let context_pos = text.find("Context:\nctx").expect("Context block");
+        let reminder_pos = text.find("[Role Reminder:").expect("role reminder");
+        assert!(snapshot_pos < context_pos && context_pos < reminder_pos);
+        // Second turn: prepend consumed, snapshot line now outermost.
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "again", &opts)
+                .await,
+        );
+        assert!(
+            text.starts_with("current ws.agent.snapshot() => {"),
+            "snapshot outermost once the prepend is consumed: {text:?}"
+        );
+    }
+
+    /// Live-read toggle: flipping `agentFeatures.stateSnapshot` off removes
+    /// the injection from the very next turn of the SAME session (prompt
+    /// byte-identical to pre-feature output), and flipping it back restores
+    /// it — no session recreation involved.
+    #[tokio::test]
+    async fn snapshot_toggle_is_read_live_each_turn() {
+        let (mgr, agent_id, _db, _cfg) = manager_with_registry().await;
+        make_snapshot_nontrivial(&mgr, &agent_id);
+        let ws = WorkspaceId::from("ws-1");
+
+        let on = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert!(on.starts_with("current ws.agent.snapshot() => {"));
+
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(false),
+            )])
+            .expect("apply toggle");
+        let off = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(off, "turn", "toggle off → byte-identical prompt");
+
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(true),
+            )])
+            .expect("apply toggle");
+        let back_on = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert!(
+            back_on.starts_with("current ws.agent.snapshot() => {"),
+            "toggle back on → next turn injects again: {back_on:?}"
+        );
     }
 
     #[test]
@@ -10592,6 +11141,7 @@ mod agent_retry_tests {
             name_explicitly_set: false,
             model: Some("model-1".to_string()),
             reasoning_effort: None,
+            effort_levels: None,
             provider: Some("provider-1".to_string()),
             system_prompt: None,
             specialist: None,

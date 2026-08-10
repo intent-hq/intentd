@@ -33,6 +33,7 @@ pub struct UsageStatsDelta {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub thought_tokens: u64,
     pub runs: u64,
     pub sessions_started: u64,
     pub longest_run_ms: u64,
@@ -67,6 +68,7 @@ pub struct UsageStatsRow {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    pub thought_tokens: u64,
     pub runs: u64,
     pub sessions_started: u64,
     pub longest_run_ms: u64,
@@ -75,7 +77,8 @@ pub struct UsageStatsRow {
 }
 
 const COUNTER_COLUMNS: &str = "input_tokens, output_tokens, cache_read_tokens, \
-    cache_creation_tokens, runs, sessions_started, longest_run_ms, lines_added, lines_deleted";
+    cache_creation_tokens, thought_tokens, runs, sessions_started, longest_run_ms, \
+    lines_added, lines_deleted";
 
 impl Store {
     /// Fold one [`UsageStatsDelta`] into the `(bucket_utc, model, provider)`
@@ -99,14 +102,15 @@ impl Store {
         sqlx::query(
             "INSERT INTO usage_stats_hourly (
                 bucket_utc, model, provider, local_date, local_hour, input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens, runs, sessions_started,
+                cache_read_tokens, cache_creation_tokens, thought_tokens, runs, sessions_started,
                 longest_run_ms, lines_added, lines_deleted
-             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(bucket_utc, model, provider) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
                 cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+                thought_tokens = thought_tokens + excluded.thought_tokens,
                 runs = runs + excluded.runs,
                 sessions_started = sessions_started + excluded.sessions_started,
                 longest_run_ms = MAX(longest_run_ms, excluded.longest_run_ms),
@@ -122,6 +126,7 @@ impl Store {
         .bind(delta.output_tokens as i64)
         .bind(delta.cache_read_tokens as i64)
         .bind(delta.cache_creation_tokens as i64)
+        .bind(delta.thought_tokens as i64)
         .bind(delta.runs as i64)
         .bind(delta.sessions_started as i64)
         .bind(delta.longest_run_ms as i64)
@@ -160,6 +165,7 @@ impl Store {
                 output_tokens: row.get::<i64, _>("output_tokens") as u64,
                 cache_read_tokens: row.get::<i64, _>("cache_read_tokens") as u64,
                 cache_creation_tokens: row.get::<i64, _>("cache_creation_tokens") as u64,
+                thought_tokens: row.get::<i64, _>("thought_tokens") as u64,
                 runs: row.get::<i64, _>("runs") as u64,
                 sessions_started: row.get::<i64, _>("sessions_started") as u64,
                 longest_run_ms: row.get::<i64, _>("longest_run_ms") as u64,
@@ -219,6 +225,7 @@ mod tests {
             output_tokens: 40,
             cache_read_tokens: 20,
             cache_creation_tokens: 10,
+            thought_tokens: 5,
             runs: 1,
             longest_run_ms: 5_000,
             ..Default::default()
@@ -230,6 +237,7 @@ mod tests {
         let second = UsageStatsDelta {
             input_tokens: 50,
             output_tokens: 10,
+            thought_tokens: 2,
             runs: 1,
             longest_run_ms: 2_000, // shorter run — MAX must keep 5000
             ..Default::default()
@@ -249,6 +257,7 @@ mod tests {
         assert_eq!(row.output_tokens, 50);
         assert_eq!(row.cache_read_tokens, 20);
         assert_eq!(row.cache_creation_tokens, 10);
+        assert_eq!(row.thought_tokens, 7);
         assert_eq!(row.runs, 2);
         assert_eq!(row.sessions_started, 0);
         assert_eq!(
@@ -590,6 +599,28 @@ mod tests {
                 .await
                 .expect("run migration statement");
         }
+        // The rebuild recreated the pre-thought_tokens shape; replay the
+        // shipped ALTER (single-statement migration, pulled from MIGRATOR so
+        // it can never drift from the real file) so the reads below see the
+        // current schema.
+        let thought_migration = crate::MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| {
+                m.sql
+                    .contains("ALTER TABLE usage_stats_hourly ADD COLUMN thought_tokens")
+            })
+            .expect("usage_stats_hourly thought_tokens migration present");
+        let alter: String = thought_migration
+            .sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sqlx::query(alter.trim().trim_end_matches(';'))
+            .execute(store.write_pool())
+            .await
+            .expect("re-apply thought_tokens ALTER");
 
         let rows = store.list_usage_stats_hourly().await.expect("list");
         assert_eq!(rows.len(), 2);

@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
-use crate::shell::{default_shell, scrubbed_env_vars_except};
+use crate::shell::{default_shell, scrubbed_env_vars_except, shell_true_invocation};
 use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
 
 /// How often the output streamer polls for natural process exit. The broadcast
@@ -586,12 +586,29 @@ pub struct PtyTerminalHost {
     /// ([`git_credential_env`]); `None` (minimal compositions) disables
     /// injection.
     settings: Option<Arc<SettingsRegistry>>,
+    /// When true, `terminal/create` spawns via a shell (`shell: true` semantics)
+    /// so providers that pack a shell line into `command` still work. Sourced
+    /// from [`intent_providers::ProviderConfig::terminal_requires_shell`].
+    terminal_requires_shell: bool,
 }
 
 impl PtyTerminalHost {
-    /// Wire the adapter over the shared host.
+    /// Wire the adapter over the shared host (argv-only terminal spawn).
     pub fn new(pty: Arc<PtyHost>, settings: Option<Arc<SettingsRegistry>>) -> Self {
-        Self { pty, settings }
+        Self::with_shell_mode(pty, settings, false)
+    }
+
+    /// Like [`Self::new`], with an explicit shell-wrap mode for the provider.
+    pub fn with_shell_mode(
+        pty: Arc<PtyHost>,
+        settings: Option<Arc<SettingsRegistry>>,
+        terminal_requires_shell: bool,
+    ) -> Self {
+        Self {
+            pty,
+            settings,
+            terminal_requires_shell,
+        }
     }
 }
 
@@ -599,10 +616,16 @@ impl TerminalHost for PtyTerminalHost {
     fn create(&self, params: TerminalCreateParams) -> BoxFuture<'_, AcpResult<String>> {
         let pty = self.pty.clone();
         let settings = self.settings.clone();
+        let terminal_requires_shell = self.terminal_requires_shell;
         Box::pin(async move {
             let credential = git_credential_env(settings.as_deref());
-            let mut spec = SpawnSpec::new(params.session_id, params.command);
-            spec.args = params.args;
+            let (command, args) = if terminal_requires_shell {
+                shell_true_invocation(&params.command, &params.args)
+            } else {
+                (params.command, params.args)
+            };
+            let mut spec = SpawnSpec::new(params.session_id, command);
+            spec.args = args;
             spec.env = overlay_credential_env(credential, params.env);
             let inherited_term = std::env::var("TERM").ok();
             ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
@@ -1957,6 +1980,32 @@ mod tests {
             adapter.kill("bad".to_string()).await,
             Err(AcpError::Terminal(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_shell_mode_accepts_packed_shell_command() {
+        let pty = host();
+        let adapter = PtyTerminalHost::with_shell_mode(pty.clone(), None, true);
+        let params = TerminalCreateParams {
+            session_id: "sess-shell".to_string(),
+            // Grok-style packed shell line (would ENOENT under argv-only
+            // spawn). `/bin/sh` rather than a hard-coded `/bin/bash` so the
+            // test is portable to hosts without bash.
+            command: "/bin/sh -c 'printf shell-mode-ok\\n'".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            output_byte_limit: None,
+        };
+        let id = adapter.create(params).await.unwrap();
+        let exit = adapter.wait_for_exit(id.clone()).await.unwrap();
+        assert_eq!(exit.exit_code, Some(0));
+        let out = adapter.output(id).await.unwrap();
+        assert!(
+            out.output.contains("shell-mode-ok"),
+            "expected shell-mode-ok in output, got {:?}",
+            out.output
+        );
     }
 
     #[tokio::test]

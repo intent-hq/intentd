@@ -20,7 +20,7 @@ use intent_store::Store;
 use intent_transport::{
     detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token,
     serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
-    SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -30,6 +30,7 @@ mod git_credential;
 mod import;
 mod legacy_import;
 mod rpc_profile;
+mod suspend;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -132,9 +133,13 @@ enum Command {
         rotate: bool,
     },
     /// Render the LAN pairing QR code in the terminal plus the plaintext
-    /// `intent://pair?…` payload URI. Requires a running daemon with the TCP
-    /// (WSS) listener up: queries `pairing.getInfo` over UDS so the payload
-    /// uses the exact same host/fingerprint/token sources as `intentd token`.
+    /// `intent://pair?…` payload URI. Requires a running daemon: queries
+    /// `pairing.getInfo` over UDS so the payload uses the exact same
+    /// host/fingerprint/token sources as `intentd token`. When the TCP (WSS)
+    /// listener is not running, offers to enable it on the spot (persisting
+    /// `server.wsApi.enabled = true` via `settings.update`, which also starts
+    /// the listener) — interactively via a [Y/n] prompt, or unattended with
+    /// `--yes`; non-interactive runs without `--yes` refuse instead.
     Pair {
         /// Also write the QR code as a PNG image to this path.
         #[arg(long, value_name = "PATH")]
@@ -142,6 +147,10 @@ enum Command {
         /// Also write the QR code as an SVG document to this path.
         #[arg(long, value_name = "PATH")]
         svg: Option<PathBuf>,
+        /// Enable the WSS listener without prompting when it is not running
+        /// (persists `server.wsApi.enabled = true`).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Daemon-backed git credential helper (monorepo#884): speaks the
     /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
@@ -207,7 +216,9 @@ async fn main() -> ExitCode {
             force,
         } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
-        Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
+        Command::Pair { png, svg, yes } => {
+            to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes).await)
+        }
         Command::GitCredential { operation } => cmd_git_credential(&operation).await,
         #[cfg(feature = "js-engine")]
         Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
@@ -268,20 +279,93 @@ async fn cmd_token(rotate: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when a `pairing.getInfo` error frame means the TCP (WSS) listener is
+/// not running — the one failure `intentd pair` can fix on the spot by
+/// enabling `server.wsApi.enabled`.
+fn is_listener_down_error(error: &Value) -> bool {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.contains("TCP listener is not running"))
+}
+
+/// Extract the most useful human-readable text from a JSON-RPC error frame:
+/// the router maps internal errors to a generic `message` ("Internal error")
+/// and carries the friendly text in `data`, while transport-level errors put
+/// it straight in `message`.
+fn rpc_error_text(error: &Value) -> String {
+    error
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .unwrap_or("unknown error")
+        .to_string()
+}
+
+/// Ask the user on the terminal whether to enable the WSS listener; default
+/// is yes (empty input). Returns an error when stdin is not a TTY — an
+/// unattended run must pass `--yes` to opt in explicitly.
+fn confirm_enable_wss() -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "the WSS listener is not running and stdin is not a terminal — \
+             re-run with --yes to enable it (persists server.wsApi.enabled = true), \
+             or enable it in config.toml"
+        );
+    }
+    eprint!("The WSS listener is not running. Enable it now? [Y/n] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    // EOF (0 bytes read, e.g. Ctrl-D before any input) is not a response —
+    // only an actual empty *line* (plain Enter) means the default yes.
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer.is_empty() || answer == "y" || answer == "yes")
+}
+
+/// Enable the WSS listener via `settings.update` over UDS: persists
+/// `server.wsApi.enabled = true` to config.toml and starts the listener
+/// through the server-control hooks — the same path the FE settings UI uses.
+async fn enable_wss_listener(socket: &Path) -> anyhow::Result<()> {
+    let response = rpc_call(
+        socket,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.enabled", "value": true }] }),
+    )
+    .await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("cannot enable the WSS listener: {}", rpc_error_text(error));
+    }
+    eprintln!("enabled server.wsApi.enabled (persisted to config.toml); WSS listener started");
+    Ok(())
+}
+
 /// Render the LAN pairing QR code in the terminal (§5.2). Queries
 /// `pairing.getInfo` over UDS — so the payload embeds the exact same
 /// hosts/fingerprint/token the daemon serves via `server.pairingInfo` and
 /// `intentd token` — then renders the `intent://pair?…` payload URI as a QR
 /// code in half-height unicode blocks, followed by the plaintext URI.
-async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> {
+/// When the TCP (WSS) listener is down, offers to enable it (prompt, or
+/// unattended via `yes`) through `settings.update` and retries the query.
+async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>, yes: bool) -> anyhow::Result<()> {
     let config = resolve_config()?;
-    let response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
+    let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
+    if response.get("error").is_some_and(is_listener_down_error) {
+        if !yes && !confirm_enable_wss()? {
+            anyhow::bail!(
+                "pairing requires the WSS listener — enable it later with \
+                 `intentd pair --yes` or via server.wsApi.enabled in config.toml"
+            );
+        }
+        enable_wss_listener(&config.socket_path).await?;
+        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
+    }
     if let Some(error) = response.get("error") {
-        let msg = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        anyhow::bail!("pairing.getInfo failed: {msg}");
+        anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
     }
     let result = &response["result"];
     let uri = result["uri"]
@@ -627,6 +711,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // store/services are initialized so the cache is ready when sandbox provisioning
     // needs it. The probe result is also reported by `intentd doctor`.
     probe_cow_at_startup(&config);
+    // Prewarm the login-shell PATH capture (`$SHELL -ilc`, ~5-10s cold: an
+    // interactive-shell attempt plus a non-interactive fallback, each up to
+    // 5s) off the async runtime so it races startup instead of blocking the
+    // first `host.providerDiscovery` / `host.findBinary` / `host.toolAvailability`
+    // RPC. `spawn_blocking` fires-and-forgets: the shared `OnceLock` behind it
+    // (`intent_core::path_utils::login_shell_dirs`) makes the eventual
+    // on-demand caller either reuse this warm result or, if it runs first,
+    // perform the one real capture itself — either way the shell spawns at
+    // most once per process.
+    tokio::task::spawn_blocking(intent_core::prewarm_login_shell_path);
     // OS-level single-instance backstop (§5.6): hold an exclusive advisory lock
     // on `data_dir/intentd.lock` for the whole process. Acquired before the
     // socket/pidfile guard so the strongest, configuration-independent guard
@@ -724,6 +818,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         intent_services::SettingsRegistry::load(&config.config_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
+    // One-time carry-over of the renamed `[backgroundAgents]` table into the
+    // `quickActions.*` keys (monorepo#1729), before the legacy import below
+    // discards and strips it. Unset quick-action keys inherit the old value;
+    // already-set ones are left alone.
+    intent_services::migrate_quick_action_settings(&settings_registry)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time legacy handling: retired keys still present in config.toml
     // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
     // captured by the load above; import any that still have a catalog entry
@@ -772,6 +872,21 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // subscribers on another (§10).
     let legacy_import_store = store.clone();
     let assets_root = config.data_dir.join("assets");
+
+    // Suspend/wake detector (clock-skew): infers host sleep/resume with no OS
+    // integration and exposes a shared tracker. Spawned in the common serve
+    // path (covers UDS/WSS/insecure/headless); skipped entirely when
+    // wakeResume.enabled is false. The tracker feeds two consumers: Task C
+    // enrollment (injected into `Services` as the `SuspendOverlapQuery` below)
+    // and the Task D wake-triggered resume orchestrator (subscribes to its
+    // resume-event stream further down).
+    let suspend_tracker: Option<Arc<suspend::SuspendTracker>> =
+        config.wake_resume_enabled.then(|| {
+            suspend::spawn_suspend_detector(Duration::from_secs(
+                config.wake_resume_threshold_seconds as u64,
+            ))
+        });
+
     let services = Services::new(store)
         .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
@@ -780,6 +895,33 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    // Inject the suspend-overlap query so Task C can recognize sleep-induced
+    // turn failures and enroll them for wake-resume. Left unset when wakeResume
+    // is disabled, keeping today's terminal behavior for transient disconnects.
+    //
+    // §13.1 E2E seam: `INTENTD_TEST_FORCE_SUSPEND_OVERLAP_SECS` swaps in a
+    // `ForcedSuspendOverlap` query (any transient disconnect counts as
+    // suspend-overlapping) so the WSS e2e can drive enrollment + the
+    // self-heal resume deterministically without a real host sleep. The real
+    // tracker still drives the wake orchestrator; it simply never records a
+    // suspend, so the enrolled row recovers via the self-heal, not a broadcast.
+    let suspend_overlap_query: Option<Arc<dyn intent_services::SuspendOverlapQuery>> =
+        match std::env::var("INTENTD_TEST_FORCE_SUSPEND_OVERLAP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0 && config.wake_resume_enabled)
+        {
+            Some(secs) => Some(Arc::new(suspend::ForcedSuspendOverlap::new(
+                Duration::from_secs(secs),
+            ))),
+            None => suspend_tracker
+                .clone()
+                .map(|t| t as Arc<dyn intent_services::SuspendOverlapQuery>),
+        };
+    let services = match suspend_overlap_query {
+        Some(query) => services.with_suspend_tracker(query),
+        None => services,
+    };
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -925,6 +1067,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
         Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
     }
+    // Rehydrate active PR monitors (`ws.pr.monitor`) so watches resume after a
+    // restart; monitors whose owning agent is gone are cancelled. Each resumed
+    // monitor is marked for catch-up, so its first poll delivers any change
+    // detected across the downtime immediately (no debounce). Best-effort: a
+    // failure is logged but never aborts startup.
+    match services.rehydrate_pr_monitors().await {
+        Ok(0) => {}
+        Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
+        Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
+    }
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
@@ -949,6 +1101,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
+    // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
+    // pollSeconds` (read live, floor 10s), poll each active monitor, diff it
+    // against its persisted baseline, and deliver one consolidated wake once
+    // the PR has been quiet for the debounce window. Safe when source control
+    // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
+    let pr_monitor_loop = services.spawn_pr_monitor_loop();
     // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
@@ -994,11 +1152,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // like the pre-#592 fetch bug). First tick fires immediately so stuck
     // sandboxes self-heal on startup. Aborted on clean shutdown.
     let merge_retry_task = spawn_sandbox_merge_retry_loop(services.clone());
-    // External MCP servers (§18.3): start every enabled, non-disabled server,
-    // then run the health monitor (periodic ping + auto-restart pushing
-    // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
-    // server processes remain (PTY-host reaping parity).
-    services.start_enabled_mcp_servers().await;
+    // External MCP servers (§18.3): the health monitor (periodic ping +
+    // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
+    // starting the enabled servers themselves is deferred to the background
+    // init below because each handshake can take seconds. The hub is reaped on
+    // shutdown so no orphan server processes remain (PTY-host reaping parity).
     let mcp_hub = services.mcp_hub();
     let mcp_monitor = mcp_hub.spawn_health_monitor();
 
@@ -1010,17 +1168,23 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
-    let git_status_refresher = Arc::new(GitStatusRefresher::start(bus.clone(), api.clone()));
-    // Start the watcher registry (#611): seeds a filesystem watcher per active
-    // workspace (debounced `file:*` events), a narrow `.git` metadata watch per
-    // git workspace (external git operations → git-status refresh, monorepo#1397),
-    // the skills watcher (`skills:changed`), and the specialists watcher
-    // (`specialists:changed`), then follows workspace lifecycle events so
-    // workspaces created/opened after boot gain watching and deleted/closed
-    // workspaces are torn down without a restart. The handle is held for the
-    // lifetime of `serve` and torn down on return.
-    let _watcher_registry =
-        WatcherRegistry::start(bus.clone(), api.clone(), Arc::clone(&git_status_refresher)).await;
+    let git_status_refresher = Arc::new(GitStatusRefresher::start(
+        bus.clone(),
+        api.clone(),
+        services.git_status_cache(),
+    ));
+    // Slow initializations run in the background so the listeners below bind —
+    // and `system.status` answers — without waiting on them (monorepo#1581):
+    // enabled MCP servers (started serially, each handshake up to a multi-second
+    // timeout) and the watcher registry (serial FSEvents registrations, which on
+    // a loaded macOS `fseventsd` cost seconds each). Both handles are aborted on
+    // clean shutdown, which drops the registry and every watcher it owns.
+    let mut mcp_start_task = {
+        let services = services.clone();
+        tokio::spawn(async move { services.start_enabled_mcp_servers().await })
+    };
+    let watcher_init_task =
+        spawn_watcher_registry_init(bus.clone(), api.clone(), Arc::clone(&git_status_refresher));
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -1032,6 +1196,17 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // over persisted settings for the port.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
+    // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
+    // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
+    // not per-connection or per-transport.
+    let rpc_limiter = RpcLimiter::new(config.server_max_outstanding_rpcs);
+    if config.server_max_outstanding_rpcs == 0 {
+        tracing::warn!(
+            "outstanding-RPC overload cap disabled (server.maxOutstandingRpcs = 0): \
+             slow-path RPC concurrency is unlimited"
+        );
+    }
+    ws_options.rpc_limiter = rpc_limiter.clone();
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
@@ -1077,6 +1252,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
+
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
@@ -1135,24 +1311,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
     // Valid external edits update the registry, run the same server runtime
     // hooks as `settings.update`, and emit `settings:changed`; invalid edits
-    // keep last-good values. Held for the lifetime of `serve`; dropping it on
-    // return tears the watch down with the daemon.
-    let watcher_services = services.clone();
-    let _config_watcher =
-        match intent_services::ConfigWatcher::start(settings_registry.clone(), move |notice| {
-            let services = watcher_services.clone();
-            async move { services.apply_external_settings_change(&notice).await }
-        }) {
-            Ok(watcher) => Some(watcher),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "config.toml live-reload watcher failed to start; \
-                     external edits will require a daemon restart"
-                );
-                None
-            }
-        };
+    // keep last-good values. Registration is a synchronous FSEvents call, so
+    // it too runs in the background (monorepo#1581) with the guard held by the
+    // task for the lifetime of `serve`; aborting the handle at shutdown drops
+    // the guard and tears the watch down with the daemon.
+    let config_watcher_task =
+        spawn_config_watcher_init(settings_registry.clone(), services.clone());
 
     // Boot-time secure WSS listener auto-start when the effective
     // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
@@ -1256,6 +1420,60 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         });
     }
 
+    // Wake-triggered auto-resume (sleep-resume Task D). When wakeResume is
+    // enabled, subscribe to the suspend detector's resume-event stream and, on
+    // each host wake, resume the turns Task C enrolled as
+    // `system_suspend`-interrupted (only those). A burst of wake ticks (sleep
+    // flaps) is debounced into a single sweep, and the per-row atomic claim in
+    // `resume_interrupted_agent` dedupes against a concurrent
+    // `agent.resolveInterrupted` / `--resume-all`. Skipped entirely when
+    // wakeResume is disabled (no tracker exists), honoring the config gate.
+    if let Some(tracker) = suspend_tracker.clone() {
+        let services_clone = services.clone();
+        let mut resume_rx = tracker.subscribe();
+        // Coalesce wake events landing within this window into one sweep.
+        const WAKE_RESUME_DEBOUNCE: Duration = Duration::from_secs(2);
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match resume_rx.recv().await {
+                    Ok(ev) => {
+                        tracing::info!(
+                            suspended_for_secs = ev.suspended_for.as_secs(),
+                            "wake-resume: host wake detected; scheduling resume sweep"
+                        );
+                        // Debounce flaps: drain any further wake events that
+                        // arrive within the window before running one sweep.
+                        loop {
+                            tokio::select! {
+                                _ = tokio::time::sleep(WAKE_RESUME_DEBOUNCE) => break,
+                                drained = resume_rx.recv() => match drained {
+                                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                                    Err(RecvError::Closed) => break,
+                                },
+                            }
+                        }
+                        services_clone.resume_suspend_interrupted_agents().await;
+                    }
+                    // A lag means we dropped some wake events; the sweep is
+                    // idempotent (it re-enumerates pending rows), so run a
+                    // catch-up sweep rather than missing a wake.
+                    Err(RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "wake-resume: resume stream lagged; running a catch-up sweep"
+                        );
+                        services_clone.resume_suspend_interrupted_agents().await;
+                    }
+                    Err(RecvError::Closed) => {
+                        tracing::debug!("wake-resume: resume stream closed; orchestrator exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // UDS always serves — it is the local control transport every deployment
     // relies on (status/stop/doctor, FE sidecar, pairing RPCs).
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
@@ -1267,6 +1485,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Some(system_control),
         pairing_info,
         reverse_registry.clone(),
+        rpc_limiter,
         shutdown,
     )
     .await?;
@@ -1278,6 +1497,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (ws_runtime.state.ws_server), not the stale boot-time ws_server variable.
     control.stop_ws_listener().await;
     pr_refresh.abort();
+    pr_monitor_loop.abort();
     token_usage_scan.abort();
     completion_delivery.abort();
     auto_commit_loop.abort();
@@ -1290,8 +1510,30 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     }
     idempotency_reap_task.abort();
     merge_retry_task.abort();
+    // Drop the watcher registry (and every filesystem/skills/specialists watch
+    // it owns) plus the config.toml live-reload watch by aborting the tasks
+    // that hold them.
+    watcher_init_task.abort();
+    config_watcher_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
-    // group so no orphan stdio servers survive the daemon (§18.3).
+    // group so no orphan stdio servers survive the daemon (§18.3). The deferred
+    // start task is JOINED (bounded) rather than merely aborted: a server still
+    // mid-handshake is not in the hub map yet, so cancelling it there would drop
+    // the child outside the process-group reap and its grandchildren would
+    // survive (`kill_on_drop` only covers the direct child). Letting the sweep
+    // settle first puts every child it spawned in the map, so `shutdown` reaps
+    // them. Only if the grace expires do we abort and accept the drop path.
+    match tokio::time::timeout(MCP_START_JOIN_GRACE, &mut mcp_start_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!(
+                grace_ms = MCP_START_JOIN_GRACE.as_millis() as u64,
+                "deferred MCP start sweep did not settle within the shutdown grace; \
+                 aborting it — a server mid-handshake may leave orphan grandchildren"
+            );
+            mcp_start_task.abort();
+        }
+    }
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
@@ -2403,6 +2645,128 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
     })
 }
 
+/// Test hook: artificial delay (milliseconds) before the watcher registry is
+/// started, standing in for a macOS `fseventsd` that takes seconds per
+/// `FSEventStreamStart` registration. Lets e2e tests prove the listeners bind
+/// off the watcher-init critical path (monorepo#1581). NOTE: this seam is
+/// compiled into release binaries too (release-mode e2e runs need it); it is
+/// inert unless the namespaced env var is set to a positive integer.
+const TEST_WATCHER_INIT_DELAY_MS_ENV: &str = "INTENTD_TEST_WATCHER_INIT_DELAY_MS";
+
+/// Bounded wait for the deferred MCP start sweep to settle at shutdown, so a
+/// server spawned mid-handshake lands in the hub map and is covered by the
+/// process-group reap (monorepo#1581). Sized to absorb an in-flight handshake
+/// while staying well inside the FE sidecar's kill grace.
+const MCP_START_JOIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Parse the watcher-init delay override; anything unset, non-numeric, or
+/// non-positive disables the hook.
+fn test_watcher_init_delay(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// Start the watcher registry (#611) in the background and hold it for the
+/// task's lifetime: a filesystem watcher per active workspace (debounced
+/// `file:*` events), a narrow `.git` metadata watch per git workspace
+/// (external git operations → git-status refresh, monorepo#1397), the skills
+/// watcher (`skills:changed`), and the specialists watcher
+/// (`specialists:changed`), then workspace lifecycle following so workspaces
+/// created/opened after boot gain watching and deleted/closed workspaces are
+/// torn down without a restart.
+///
+/// Spawned rather than awaited inline because each FSEvents registration is a
+/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
+/// which would otherwise delay the UDS bind past the FE sidecar's probe window
+/// (monorepo#1581), and run under `block_in_place` so the blocking registration
+/// cannot starve the worker driving `cmd_serve` either. The task parks after
+/// startup so it owns the registry; aborting the returned handle drops it,
+/// tearing down every watcher.
+fn spawn_watcher_registry_init(
+    bus: EventBus,
+    api: Arc<dyn WorkspaceApi>,
+    refresher: Arc<GitStatusRefresher>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // `block_in_place`, not a bare `spawn`: the registrations inside are
+        // synchronous `fseventsd` IPC that block the calling *thread*, so
+        // spawning alone would only move them onto another Tokio worker — on a
+        // saturated (or single-worker) runtime that can still be the worker
+        // driving `cmd_serve` toward the UDS bind. `block_in_place` hands this
+        // worker's remaining tasks to another thread for the duration.
+        let registry = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Some(delay) = test_watcher_init_delay(
+                    std::env::var(TEST_WATCHER_INIT_DELAY_MS_ENV)
+                        .ok()
+                        .as_deref(),
+                ) {
+                    tracing::warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "watcher registry startup: artificial delay (test seam)"
+                    );
+                    // A *blocking* sleep, standing in for the synchronous
+                    // FSEvents call: a yielding `tokio::time::sleep` would not
+                    // exercise worker starvation at all.
+                    std::thread::sleep(delay);
+                }
+                WatcherRegistry::start(bus, api, refresher).await
+            })
+        });
+        tracing::info!("watcher registry ready");
+        // Park forever so the registry (and every watcher it owns) stays alive
+        // until the handle is aborted at shutdown.
+        std::future::pending::<()>().await;
+        drop(registry);
+    })
+}
+
+/// Start the `config.toml` live-reload watcher (§9.8) in the background and
+/// hold it for the task's lifetime.
+///
+/// Spawned rather than started inline for the same reason as
+/// [`spawn_watcher_registry_init`]: `notify`'s FSEvents registration is a
+/// synchronous IPC to `fseventsd` that can take seconds on a loaded machine,
+/// which would otherwise delay the UDS bind past the FE sidecar's probe window
+/// (monorepo#1581), and it runs under `block_in_place` for the same reason. The
+/// task parks after startup so it owns the watcher guard; aborting the returned
+/// handle drops it, ending the OS subscription.
+fn spawn_config_watcher_init(
+    registry: Arc<intent_services::SettingsRegistry>,
+    services: Services,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let watcher_services = services.clone();
+        // `ConfigWatcher::start` is synchronous and its `notify` registration
+        // blocks the calling thread on `fseventsd` IPC, so it runs under
+        // `block_in_place` for the same reason as the watcher registry above.
+        // It stays inside the runtime context, so the watcher's own
+        // `tokio::spawn` of its debounce loop keeps working.
+        let started = tokio::task::block_in_place(|| {
+            intent_services::ConfigWatcher::start(registry, move |notice| {
+                let services = watcher_services.clone();
+                async move { services.apply_external_settings_change(&notice).await }
+            })
+        });
+        let watcher = match started {
+            Ok(watcher) => watcher,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "config.toml live-reload watcher failed to start; \
+                     external edits will require a daemon restart"
+                );
+                return;
+            }
+        };
+        tracing::info!("config.toml live-reload watcher ready");
+        // Park forever so the watch stays alive until the handle is aborted.
+        std::future::pending::<()>().await;
+        drop(watcher);
+    })
+}
+
 async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
     let config = resolve_config()?;
     let params: Value = match params {
@@ -2918,12 +3282,34 @@ async fn report_provider_availability(config: &Config) {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
-        // npx-only providers (claude-code) never resolve a local binary; report
-        // npx availability instead (the auth probe would need a package
+        // npx-only providers (claude-code, pi) never resolve a local binary;
+        // report npx availability instead (the auth probe would need a package
         // download, so it is skipped — auth is the external `claude` CLI).
         if let Some(pkg) = provider.npx_only_package {
             match &provider.resolved_path {
-                Some(npx) => println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display()),
+                Some(npx) => {
+                    // pi additionally requires the `pi` CLI (which the pi-acp
+                    // adapter spawns) at PI_CLI_MIN_VERSION+ (monorepo#1662);
+                    // append its verdict to the doctor line.
+                    let pi_cli = if provider.id == "pi" {
+                        Some(report_pi_cli_verdict().await)
+                    } else {
+                        None
+                    };
+                    match pi_cli {
+                        Some((true, verdict)) => println!(
+                            "  [ok] {} via npx: {} -y {pkg}{verdict}",
+                            provider.id,
+                            npx.display()
+                        ),
+                        Some((false, verdict)) => {
+                            println!("  [--] {} unavailable{verdict}", provider.id)
+                        }
+                        None => {
+                            println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display())
+                        }
+                    }
+                }
                 None => println!(
                     "  [--] {} unavailable (npx not found — {} is required)",
                     provider.id,
@@ -2965,6 +3351,39 @@ async fn report_provider_availability(config: &Config) {
             .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
+    }
+}
+
+/// Probe the `pi` CLI (the binary the pi-acp adapter spawns) and render the
+/// doctor verdict fragment (monorepo#1662): `(ok, fragment)` where `ok` is
+/// whether pi stays available. Missing/too-old CLI names
+/// `PI_CLI_REQUIREMENT` (like the Node requirement line for npx); an
+/// inconclusive probe is permissive with a warning fragment. The probe is
+/// blocking (subprocess, ≤3s), so it runs off the async runtime.
+async fn report_pi_cli_verdict() -> (bool, String) {
+    use intent_providers::PiCliGate;
+    let status = tokio::task::spawn_blocking(intent_services::pi_cli::probe_pi_cli)
+        .await
+        .expect("pi CLI probe task");
+    match &status.gate {
+        PiCliGate::Ok => {
+            let path = status
+                .resolved_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| status.command.clone());
+            let version = status.version_output.as_deref().unwrap_or("unknown");
+            (true, format!(" (pi CLI {version}: {path})"))
+        }
+        PiCliGate::Unknown => (
+            true,
+            " (pi CLI version unknown — probe inconclusive)".to_string(),
+        ),
+        gate => {
+            let reason = intent_providers::pi_gate_reason(gate)
+                .unwrap_or_else(|| intent_providers::PI_CLI_REQUIREMENT.to_string());
+            (false, format!(" ({reason})"))
+        }
     }
 }
 
@@ -3203,6 +3622,40 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn listener_down_error_is_detected_from_message() {
+        let err = json!({
+            "code": -32603,
+            "message": "TCP listener is not running — ensure the WSS listener is enabled"
+        });
+        assert!(is_listener_down_error(&err));
+        let other = json!({ "code": -32601, "message": "Method not found" });
+        assert!(!is_listener_down_error(&other));
+        let no_message = json!({ "code": -32603 });
+        assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[test]
+    fn rpc_error_text_prefers_data_over_message() {
+        let with_data = json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": "failed to start WSS listener: port 5181 already in use"
+        });
+        assert_eq!(
+            rpc_error_text(&with_data),
+            "failed to start WSS listener: port 5181 already in use"
+        );
+        let message_only = json!({ "code": -32001, "message": "pairing.getInfo is local-only" });
+        assert_eq!(
+            rpc_error_text(&message_only),
+            "pairing.getInfo is local-only"
+        );
+        let empty_data = json!({ "code": -32603, "message": "Internal error", "data": "" });
+        assert_eq!(rpc_error_text(&empty_data), "Internal error");
+        assert_eq!(rpc_error_text(&json!({})), "unknown error");
+    }
+
     fn temp_config() -> Config {
         let id = uuid::Uuid::new_v4().to_string();
         let dir = std::env::temp_dir().join(format!("intentd-si-{id}"));
@@ -3217,6 +3670,10 @@ mod tests {
             idle_reap_minutes: 30,
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
+            server_max_outstanding_rpcs: intent_core::config::DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
+            wake_resume_enabled: intent_core::config::DEFAULT_WAKE_RESUME_ENABLED,
+            wake_resume_threshold_seconds:
+                intent_core::config::DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
             data_dir: dir,
         }
     }
@@ -3303,6 +3760,30 @@ mod tests {
     fn boot_ws_listener_follows_ws_api_enabled_when_secure() {
         assert_eq!(boot_ws_listener(false, true), BootWsListener::SecureWss);
         assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
+    }
+
+    // test_watcher_init_delay takes the raw env value as a parameter, so the
+    // seam is testable without process-env mutation races.
+    #[test]
+    fn watcher_init_delay_parses_positive_milliseconds() {
+        assert_eq!(
+            test_watcher_init_delay(Some("250")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            test_watcher_init_delay(Some(" 5000 ")),
+            Some(Duration::from_millis(5000))
+        );
+    }
+
+    #[test]
+    fn watcher_init_delay_inert_unless_positive_integer() {
+        // Unset, non-numeric, negative, and zero all leave the hook off.
+        assert_eq!(test_watcher_init_delay(None), None);
+        assert_eq!(test_watcher_init_delay(Some("")), None);
+        assert_eq!(test_watcher_init_delay(Some("soon")), None);
+        assert_eq!(test_watcher_init_delay(Some("-1")), None);
+        assert_eq!(test_watcher_init_delay(Some("0")), None);
     }
 
     // resolve_ws_listener_port is pure (the env value is a parameter), so the

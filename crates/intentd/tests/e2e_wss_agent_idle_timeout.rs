@@ -592,6 +592,361 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     );
 }
 
+/// Regression for monorepo#1599 — the timed-out turn's tail must not bleed
+/// into the warning turn. The mock parks the first turn silent until the
+/// daemon's idle-timeout `session/cancel`, then (via `tailAfterCancel`)
+/// streams a trailing `agent_message_chunk` carrying `TAIL-AFTER-CANCEL`
+/// before resolving the cancelled prompt — modelling a child that emits late
+/// `session/update`s for the cancelled turn past the cancel. Today those
+/// stragglers sit in the notifications channel and are consumed by the
+/// injected `[SYSTEM WARNING]` turn, so the marker leaks into the warning
+/// turn's stream and assistant message. Asserts:
+/// - no `chat:stream:delta` AFTER the timed-out turn's stream:end (i.e.
+///   attributed to the warning turn) carries the marker — a pre-warning-turn
+///   drain re-emitting the straggler with the timed-out turn would land
+///   BEFORE that stream:end and stays allowed;
+/// - no assistant message in the transcript carries the marker;
+/// - the warning turn otherwise completes normally on the SAME child
+///   (`turn=2`, one warning row, no `agent:failed`).
+#[tokio::test]
+async fn idle_timeout_tail_does_not_bleed_into_warning_turn_over_wss() {
+    let Some(script) = gate("WSS idle-timeout tail-bleed regression E2E") else {
+        return;
+    };
+
+    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "silentUntilCancelTurns": 1,
+        "tailAfterCancel": TAIL_MARKER,
+        "response": "recovered after idle warning",
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "1500"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — `chat:stream:delta` is outside `agent:*`, so it is
+    // subscribed explicitly; subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "IdleTail", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "please do the silent work" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Track the two stream:ends (timed-out turn + warning turn) and collect
+    // every delta published AFTER the first end — those belong to the warning
+    // turn and must never carry the timed-out turn's tail marker.
+    let mut ends = 0u32;
+    let mut saw_idle = false;
+    let mut tainted_deltas: Vec<String> = Vec::new();
+    for _ in 0..300 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => {
+                panic!("idle timeout must NOT emit agent:failed: {ev}");
+            }
+            Some("agent:stream:end") => ends += 1,
+            Some("chat:stream:delta") if ends >= 1 => {
+                let data = serde_json::to_string(&ev["data"]).unwrap_or_default();
+                if data.contains(TAIL_MARKER) {
+                    tainted_deltas.push(data);
+                }
+            }
+            Some("agent:idle") => saw_idle = true,
+            _ => {}
+        }
+        if saw_idle && ends >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        ends, 2,
+        "two stream:ends: the timed-out turn + the warning turn"
+    );
+    assert!(saw_idle, "agent went idle after the warning turn");
+    assert!(
+        tainted_deltas.is_empty(),
+        "the timed-out turn's tail streamed into the warning turn (monorepo#1599): {tainted_deltas:?}"
+    );
+
+    // Transcript: the warning turn completed normally on the SAME child
+    // (turn=2), the warning row is there — and NO assistant message carries
+    // the tail marker.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let texts = conversation_texts(&conv);
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|(_, t)| t.contains("[SYSTEM WARNING]"))
+            .count(),
+        1,
+        "exactly one warning row: {conv}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(role, t)| role == "assistant"
+                && t.contains("recovered after idle warning turn=2")),
+        "warning turn completed on the SAME child (turn=2): {conv}"
+    );
+    let tainted_messages: Vec<&(String, String)> = texts
+        .iter()
+        .filter(|(role, t)| role == "assistant" && t.contains(TAIL_MARKER))
+        .collect();
+    assert!(
+        tainted_messages.is_empty(),
+        "the timed-out turn's tail bled into an assistant message (monorepo#1599): {tainted_messages:?}"
+    );
+}
+
+/// Timeout→teardown half of the monorepo#1599 drain (PR review follow-up):
+/// when the cancelled prompt's RESPONSE never lands within the watermark
+/// window, the child may keep streaming stragglers indefinitely — so the
+/// daemon must tear it down (fresh child, fresh notifications channel) rather
+/// than warn-and-proceed into a shared channel. The mock parks the first turn
+/// via `parkIfPromptEndsWith` (suffix-matched so the fresh child's replayed
+/// history does not re-trigger the park), streams a `TAIL-AFTER-CANCEL`
+/// straggler on `session/cancel`, and (via `neverResolveOnCancel`) never
+/// resolves the cancelled prompt. Asserts:
+/// - the warning turn still completes normally (no `agent:failed`, exactly
+///   one warning row, the recovery response lands);
+/// - no post-teardown delta or assistant message carries the tail marker;
+/// - the prompt log proves the warning turn ran on a FRESH child (its
+///   `session/prompt` is that process's turn 1, not the old child's turn 2).
+#[tokio::test]
+async fn idle_timeout_unresolved_cancel_tears_down_child_over_wss() {
+    let Some(script) = gate("WSS idle-timeout unresolved-cancel teardown E2E") else {
+        return;
+    };
+
+    const TAIL_MARKER: &str = "TAIL-AFTER-CANCEL";
+    const PARK_MARKER: &str = "PARK-FIRST-TURN-1599";
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().to_string();
+    let behavior = json!({
+        "parkIfPromptEndsWith": PARK_MARKER,
+        "tailAfterCancel": TAIL_MARKER,
+        "neverResolveOnCancel": true,
+        "response": "recovered after teardown",
+    })
+    .to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "1500"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "IdleTear", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": format!("please do the parked work {PARK_MARKER}") }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut ends = 0u32;
+    let mut saw_idle = false;
+    let mut tainted_deltas: Vec<String> = Vec::new();
+    for _ in 0..300 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match ev["type"].as_str() {
+            Some("agent:failed") => {
+                panic!("idle timeout must NOT emit agent:failed: {ev}");
+            }
+            Some("agent:stream:end") => ends += 1,
+            Some("chat:stream:delta") if ends >= 1 => {
+                let data = serde_json::to_string(&ev["data"]).unwrap_or_default();
+                if data.contains(TAIL_MARKER) {
+                    tainted_deltas.push(data);
+                }
+            }
+            Some("agent:idle") => saw_idle = true,
+            _ => {}
+        }
+        if saw_idle && ends >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        ends, 2,
+        "two stream:ends: the timed-out turn + the warning turn"
+    );
+    assert!(saw_idle, "agent went idle after the warning turn");
+    assert!(
+        tainted_deltas.is_empty(),
+        "the torn-down child's tail streamed into the warning turn (monorepo#1599): {tainted_deltas:?}"
+    );
+
+    // Transcript: the warning row is there, the recovery response landed, and
+    // NO assistant message carries the tail marker.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let texts = conversation_texts(&conv);
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|(_, t)| t.contains("[SYSTEM WARNING]"))
+            .count(),
+        1,
+        "exactly one warning row: {conv}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|(role, t)| role == "assistant" && t.contains("recovered after teardown")),
+        "warning turn completed after the teardown: {conv}"
+    );
+    let tainted_messages: Vec<&(String, String)> = texts
+        .iter()
+        .filter(|(role, t)| role == "assistant" && t.contains(TAIL_MARKER))
+        .collect();
+    assert!(
+        tainted_messages.is_empty(),
+        "the torn-down child's tail bled into an assistant message (monorepo#1599): {tainted_messages:?}"
+    );
+
+    // Prompt log: one JSON line per `session/prompt`, `turn` = the receiving
+    // PROCESS's per-spawn prompt counter. The warning prompt on `turn: 1`
+    // proves the daemon spawned a FRESH child (the kept-alive old child would
+    // have received it as its turn 2).
+    let log = std::fs::read_to_string(&prompt_log).expect("prompt log");
+    let entries: Vec<Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(entries.len(), 2, "two prompts total: {entries:?}");
+    assert!(
+        entries[0]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains(PARK_MARKER)),
+        "first prompt is the parked turn: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["turn"], 1,
+        "warning prompt is the FRESH child's turn 1 (teardown happened): {entries:?}"
+    );
+    assert!(
+        entries[1]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("[SYSTEM WARNING]")),
+        "second prompt is the warning turn: {entries:?}"
+    );
+}
+
 /// A delegated child's idle timeout must NOT consume the parent's completion
 /// watch: the warn-and-continue redrive keeps the child's turn alive, so the
 /// parent wakes exactly ONCE — on the child's real completion (its terminal

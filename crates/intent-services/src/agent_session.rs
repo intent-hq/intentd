@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
@@ -21,7 +22,7 @@ use intent_acp::session::{
 use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
     AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_ACTIVITY, AGENT_STREAM_END, AGENT_STREAM_START,
-    AGENT_STREAM_STATUS, AGENT_TOOL_CALL, CHAT_STREAM_DELTA,
+    AGENT_STREAM_STATUS, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA,
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
@@ -62,6 +63,53 @@ pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
 /// counter on this marker: intervening activity means the back-to-back
 /// timeout accounting starts over.
 pub(crate) const PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX: &str = "[turn streamed output]";
+
+/// Prefix marking a `session/prompt` failure that was recognized as
+/// sleep-induced (Task C): the turn died with a transient upstream disconnect
+/// (per [`intent_acp::is_transient_upstream_disconnect`]) whose active window
+/// overlapped a detected host suspend (per the injected [`SuspendOverlapQuery`]).
+/// [`Services::run_prompt_turn`] enrolls such a turn as interrupted (persisting
+/// the partial with [`InterruptReason::SystemSuspend`] + an `interrupted_agent`
+/// row) and emits the interrupted terminal `agent:stream:end` instead of
+/// `agent:failed`, so the turn worker suppresses the terminal-failure path (no
+/// hard error, no manual-retry surface) and the wake orchestrator (Task D) can
+/// resume it.
+pub(crate) const PROMPT_SUSPEND_INTERRUPT_PREFIX: &str =
+    "session/prompt interrupted by system suspend:";
+
+/// Debounce before the self-healing resume that [`enroll_suspend_interrupted_turn`]
+/// fires directly (independent of the host-wake broadcast). It must outlast the
+/// turn worker's post-enrollment teardown (`kill_child_only` + `end_turn`) so the
+/// resume spawns a fresh child and reloads via `session/load` rather than racing
+/// the still-live handle, and it coalesces a burst of concurrent enrollments
+/// (the resume itself is idempotent via the row's atomic claim). Overridable for
+/// tests via `INTENTD_WAKE_RESUME_SELF_HEAL_MS`.
+const WAKE_RESUME_SELF_HEAL_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Resolve the self-heal debounce, honoring the `INTENTD_WAKE_RESUME_SELF_HEAL_MS`
+/// test seam (milliseconds) so e2e/unit coverage need not wait the production
+/// window.
+fn wake_resume_self_heal_debounce() -> Duration {
+    std::env::var("INTENTD_WAKE_RESUME_SELF_HEAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WAKE_RESUME_SELF_HEAL_DEBOUNCE)
+}
+
+/// Query surface the turn driver uses to decide whether a failed turn's active
+/// window overlapped a host suspend. Implemented by the daemon's
+/// `SuspendTracker` (in the `intentd` binary crate, which depends on this one)
+/// and injected via [`Services::with_suspend_tracker`]: the service layer only
+/// needs the overlap query, so the concrete clock-skew detector/tracker stays
+/// in the binary crate. Absent (read-only / unit-test wiring, or `wakeResume`
+/// disabled), sleep-induced enrollment never triggers and turn failures keep
+/// today's terminal behavior.
+pub trait SuspendOverlapQuery: Send + Sync {
+    /// Total suspend duration whose recorded monotonic bracket overlaps the
+    /// window `[start, end]`, or `None` when no retained suspend overlaps it.
+    fn did_suspend_overlap(&self, start: Instant, end: Instant) -> Option<Duration>;
+}
 
 /// Whether a `session/prompt` failure is transport-shaped: the writer task
 /// observed a closed pipe (`transport closed: …`, e.g. "writer task closed")
@@ -122,17 +170,43 @@ pub struct ThoughtLevelOption {
     pub values: Vec<String>,
 }
 
+impl ThoughtLevelOption {
+    /// The levels worth surfacing to clients (PROTOCOL §5.5, Option C): the
+    /// advertised values minus the adapter's case-insensitive `"default"`
+    /// sentinel (claude-agent-acp lists it alongside the real levels; it is a
+    /// clear-selection affordance, not a level). `None` when nothing remains —
+    /// the persisted column stays NULL rather than `Some(empty)`.
+    pub fn surfaced_levels(&self) -> Option<Vec<String>> {
+        let levels: Vec<String> = self
+            .values
+            .iter()
+            .filter(|v| !v.eq_ignore_ascii_case("default"))
+            .cloned()
+            .collect();
+        (!levels.is_empty()).then_some(levels)
+    }
+}
+
 /// Accumulates streamed assistant content into one transcript message per turn,
 /// coalescing consecutive text chunks into a single text block and pushing
 /// `tool_use`/`tool_result` blocks for tool calls (CS-0 D6). Every block is
 /// stamped with a stable id `{messageId}:{blockIndex}` (CS-0 D1), where
 /// `messageId` is the assistant `AgentMessage` id minted at turn start; blocks
 /// are append-only so a block's index (and thus id) is fixed once assigned.
+///
+/// Streamed reasoning (`agent_thought_chunk`) shares the same coalescing
+/// buffer but flushes as a `thinking` block: consecutive thoughts merge into
+/// one block and a thought↔text switch closes the open block and starts a new
+/// one (Zed's model), so thoughts interleave with text/tool blocks in stream
+/// order.
 struct Transcript {
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
     text: String,
+    /// Whether the pending [`text`](Self::text) buffer holds reasoning (flushes
+    /// as a `thinking` block) rather than assistant text.
+    pending_thought: bool,
     /// `toolCallId` → index of its `tool_use` block (for status patching).
     tool_use_index: HashMap<String, usize>,
     /// `toolCallId` → index of its `tool_result` block (append-once, then patch).
@@ -152,6 +226,7 @@ impl Transcript {
             message_id,
             blocks: Vec::new(),
             text: String::new(),
+            pending_thought: false,
             tool_use_index: HashMap::new(),
             tool_result_index: HashMap::new(),
             proposal_index: HashMap::new(),
@@ -164,15 +239,18 @@ impl Transcript {
         format!("{}:{index}", self.message_id)
     }
 
-    /// Index the currently pending (or next) coalesced text block will occupy
-    /// once flushed — the same value for every consecutive text chunk, so they
-    /// share one block id.
-    fn current_text_index(&self) -> usize {
-        self.blocks.len()
-    }
-
-    fn push_text(&mut self, t: &str) {
+    /// Append a streamed chunk to the coalescing buffer and return the index
+    /// the block it lands in will occupy once flushed — the same value for
+    /// every consecutive chunk of the same kind, so they share one block id. A
+    /// thought↔text switch (either direction) flushes the open block first, so
+    /// the returned index names the freshly opened one.
+    fn push_chunk(&mut self, t: &str, thought: bool) -> usize {
+        if thought != self.pending_thought {
+            self.flush_text();
+            self.pending_thought = thought;
+        }
         self.text.push_str(t);
+        self.blocks.len()
     }
 
     /// Push a non-text passthrough content block, stamping its id; returns its
@@ -187,13 +265,26 @@ impl Transcript {
         index
     }
 
+    /// The block type the pending buffer flushes as: `thinking` for streamed
+    /// reasoning, `text` for assistant text.
+    fn pending_block_type(&self) -> &'static str {
+        if self.pending_thought {
+            "thinking"
+        } else {
+            "text"
+        }
+    }
+
     fn flush_text(&mut self) {
         if !self.text.is_empty() {
             let index = self.blocks.len();
             let id = self.block_id(index);
-            self.blocks
-                .push(json!({ "type": "text", "id": id, "text": std::mem::take(&mut self.text) }));
+            let block_type = self.pending_block_type();
+            self.blocks.push(
+                json!({ "type": block_type, "id": id, "text": std::mem::take(&mut self.text) }),
+            );
         }
+        self.pending_thought = false;
     }
 
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
@@ -376,8 +467,9 @@ impl Transcript {
     }
 
     /// A non-consuming snapshot of the coalesced blocks AS THEY STAND mid-turn
-    /// (CS-0 D5): the pushed blocks plus, when text is pending, the synthetic
-    /// `text` block it will flush into (same index/id it would ultimately take).
+    /// (CS-0 D5): the pushed blocks plus, when a chunk buffer is pending, the
+    /// synthetic `text`/`thinking` block it will flush into (same index/id it
+    /// would ultimately take).
     /// Used to publish the in-flight partial into the per-agent live-turn slot so
     /// a `chat.subscribe` arriving mid-turn can reconstruct it.
     fn snapshot_blocks(&self) -> Vec<Value> {
@@ -385,7 +477,7 @@ impl Transcript {
         if !self.text.is_empty() {
             let index = blocks.len();
             blocks.push(json!({
-                "type": "text",
+                "type": self.pending_block_type(),
                 "id": self.block_id(index),
                 "text": self.text.clone(),
             }));
@@ -394,25 +486,28 @@ impl Transcript {
     }
 
     /// The text of the coalesced `type: "text"` blocks AS THEY STAND mid-turn
-    /// (the pushed text blocks plus, when text is pending, the unflushed
-    /// buffer) — the input to the `agent:stream:activity` live-preview
+    /// (the pushed text blocks plus, when assistant text is pending, the
+    /// unflushed buffer) — the input to the `agent:stream:activity` live-preview
     /// derivation. Cheaper than [`snapshot_blocks`](Self::snapshot_blocks):
-    /// tool payloads (which can be large mid-turn) are never cloned.
+    /// tool payloads (which can be large mid-turn) are never cloned. Reasoning
+    /// never contributes: `thinking` blocks are skipped by the block filter and
+    /// a pending THOUGHT buffer is not appended.
     fn text_block_strings(&self) -> Vec<String> {
         let mut out = text_block_strings(&self.blocks);
-        if !self.text.is_empty() {
+        if !self.text.is_empty() && !self.pending_thought {
             out.push(self.text.clone());
         }
         out
     }
 
-    /// Whether the FINAL text block is still open (text pending in the
-    /// coalescing buffer, not yet flushed by a non-text block boundary). The
+    /// Whether the FINAL text block is still open (assistant text pending in
+    /// the coalescing buffer, not yet flushed by a block boundary). The
     /// live preview derivation only clips the trailing partial line of an
     /// OPEN final block — a text block closed by e.g. a tool call is complete
-    /// even without a trailing newline.
+    /// even without a trailing newline. A pending THOUGHT buffer feeds no
+    /// preview, so it leaves the final text block closed.
     fn final_text_block_open(&self) -> bool {
-        !self.text.is_empty()
+        !self.text.is_empty() && !self.pending_thought
     }
 }
 
@@ -465,6 +560,11 @@ pub(crate) enum InterruptReason {
     DaemonShutdown,
     /// Hard stop/kill teardown (agent delete, kill-path fallback, …).
     AgentStopped,
+    /// The turn's upstream stream dropped because the host suspended (laptop
+    /// sleep) mid-turn (Task C): recognized as a transient upstream disconnect
+    /// whose active window overlapped a detected suspend. Enrolled as
+    /// interrupted for wake-triggered resume instead of surfacing terminally.
+    SystemSuspend,
 }
 
 impl InterruptReason {
@@ -475,6 +575,7 @@ impl InterruptReason {
             InterruptReason::PreemptedByMessage => "preempted_by_message",
             InterruptReason::DaemonShutdown => "daemon_shutdown",
             InterruptReason::AgentStopped => "agent_stopped",
+            InterruptReason::SystemSuspend => "system_suspend",
         }
     }
 }
@@ -848,7 +949,7 @@ fn version_bearing_display<'a>(candidates: impl IntoIterator<Item = &'a str>) ->
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
 /// use other mechanisms — codex moved to the first-turn prepend fallback because
-/// the pinned codex-acp adapter (1.1.7) ignores `_meta.developerInstructions`,
+/// the pinned codex-acp adapter (1.1.14) ignores `_meta.developerInstructions`,
 /// #479).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
@@ -1299,10 +1400,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         })
     }
 
@@ -1355,8 +1459,11 @@ impl Services {
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
-        // The effective-model and thought-level resolutions are skipped for
-        // the same reason.
+        // The effective-model, thought-level, and effort-levels resolutions
+        // are skipped for the same reason — in particular the loser must NOT
+        // persist (or clear) `effort_levels`: its `None` means "CAS lost /
+        // unknown", not "the provider advertised no selector", and writing it
+        // would clobber what the winner just persisted.
         let (modes, thought_level) = if canonical == new_acp_session_id {
             self.persist_effective_model(
                 &workspace_id,
@@ -1366,6 +1473,8 @@ impl Services {
             )
             .await;
             let thought_level = discover_thought_level(resp.config_options.as_deref());
+            self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+                .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
@@ -1462,10 +1571,13 @@ impl Services {
             resp.config_options.as_deref(),
         )
         .await;
+        let thought_level = discover_thought_level(resp.config_options.as_deref());
+        self.persist_session_effort_levels(&workspace_id, agent_id, thought_level.as_ref())
+            .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
-            thought_level: discover_thought_level(resp.config_options.as_deref()),
+            thought_level,
         }))
     }
 
@@ -1648,6 +1760,43 @@ impl Services {
         // count as activity for the streak accounting too.
         let idle_timeout_streamed =
             prompt_idle_timeout && (any_update_received || !blocks.is_empty());
+        // Whether this turn's persisted content carries question resource
+        // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
+        // `blocks`, used for the pending-questions marker write below.
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        // Sleep-induced turn failure (Task C): the turn died with a transient
+        // upstream disconnect AND a detected host suspend overlapped its active
+        // window `[turn_started, now]`. Enroll it as interrupted (so the wake
+        // orchestrator in Task D can resume it via `session/load`) instead of
+        // surfacing a hard terminal failure. Gated on an injected
+        // [`SuspendOverlapQuery`]: absent (read-only / unit wiring, or
+        // `wakeResume` disabled), this is always false and failures keep
+        // today's behavior. Placed BEFORE the plain persist + terminal emits
+        // below so it takes precedence over the pre-output silent-redrive path
+        // (monorepo#764) for the suspend-overlapping case — a `session/load`
+        // resume preserves the partial turn, which a fresh-child redrive would
+        // not. `PromptIdleTimeout` is classified non-transient, so an idle
+        // timeout never routes here.
+        let suspend_interrupt = matches!(&result, Err(e) if intent_acp::is_transient_upstream_disconnect(e))
+            && self
+                .suspend_tracker
+                .as_ref()
+                .and_then(|t| t.did_suspend_overlap(turn_started, Instant::now()))
+                .is_some();
+        if suspend_interrupt {
+            // `matches!` above guarantees the `Err` arm.
+            let err = result.expect_err("suspend_interrupt implies Err");
+            return self
+                .enroll_suspend_interrupted_turn(
+                    agent_id,
+                    workspace_id,
+                    message_id,
+                    blocks,
+                    turn_id,
+                    err,
+                )
+                .await;
+        }
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -1662,12 +1811,23 @@ impl Services {
             self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
         }
-        // The new assistant tail moves the question-hold derivation (§6.5
-        // step 0): a trailing question resource block RAISES the workspace's
-        // needs_attention displayStatus; a question-free tail after a prior
-        // question message RETIRES it. Recompute-and-compare (transition-only
-        // emission inside) so steady-state question-free turns stay silent.
-        if message_persisted {
+        // Stored-on-write pending-questions marker (PROTOCOL §5.5, question
+        // hold): a question-bearing assistant tail arms the hold under this
+        // turn's message id (a newer question set overwrites an older marker
+        // — single-slot). A question-FREE turn end deliberately does NOT
+        // clear the marker: pendingness survives the agent's later turns
+        // until the user answers or dismisses.
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
+        }
+        // A question-bearing tail arms the marker above and so RAISES the
+        // workspace's needs_attention displayStatus (§6.5 step 0):
+        // recompute-and-compare. A question-FREE tail no longer moves the
+        // derivation at all — pendingness now survives the agent's later
+        // turns — so those turn ends skip the workspace-wide probe entirely
+        // instead of relying on the dedup cache to stay silent.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -1701,6 +1861,12 @@ impl Services {
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
             let turn_duration = turn_started.elapsed();
+            // Capture the turn-end wall clock next to the duration so the two
+            // stay consistent: the bookkeeping task below may queue behind a
+            // predecessor before it records, and a later clock read would push
+            // both the hourly bucket and the per-minute spread window past the
+            // real turn end.
+            let turn_end = time::OffsetDateTime::now_utc();
             let turn_usage = turn_usage.take();
             let prev = self
                 .turn_bookkeeping
@@ -1717,6 +1883,7 @@ impl Services {
                         &workspace_id_task,
                         turn_usage.as_ref(),
                         turn_duration,
+                        turn_end,
                         run_completed,
                     )
                     .await;
@@ -1816,12 +1983,17 @@ impl Services {
                 // alerts snapshot-consistently — a follow-up `agent.list`
                 // read can race the child's completion consuming the watch.
                 data["isWaitingForOtherAgents"] =
-                    Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+                    Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
                 // Idle-visibility: an idle agent still owning active
                 // (scheduled/running) background hooks is waiting, not
                 // stalled — stamp `waitingOnHooks` (omitted when none) so
                 // subscribers and the completion-watch wake can surface it.
                 self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+                // Idle-visibility (unified external-wait, mirrors the hook
+                // stamp above): same `waitingOnPrMonitors` stamp for active
+                // PR monitors (omitted when none).
+                self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
+                    .await;
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -1886,6 +2058,138 @@ impl Services {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
         })
+    }
+
+    /// Enroll a sleep-induced turn failure (Task C): a transient upstream
+    /// disconnect whose active window overlapped a detected host suspend. The
+    /// partial turn is persisted tagged [`InterruptReason::SystemSuspend`]
+    /// (empty blocks still record a row — every interruption is durably
+    /// anchored), an `interrupted_agent` row is written with `prev_status` = the
+    /// session's running status (mirroring the daemon-restart heal path) so the
+    /// wake orchestrator (Task D) can resume it via `session/load`, and the
+    /// terminal event is the interrupted `agent:stream:end` (`stopReason:
+    /// "interrupted"`, `interruptReason: "system_suspend"`) — NOT
+    /// `agent:failed` — so no hard error or manual-retry surface reaches the FE.
+    ///
+    /// Returns the original error wrapped with [`PROMPT_SUSPEND_INTERRUPT_PREFIX`]
+    /// so the turn worker suppresses the terminal-failure path.
+    async fn enroll_suspend_interrupted_turn(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        message_id: String,
+        blocks: Vec<Value>,
+        turn_id: Option<&str>,
+        err: AcpError,
+    ) -> Result<StopReason> {
+        // Final live-preview values from the partial turn (same contract as the
+        // interrupt terminal emit in `agent_manager`).
+        let preview_text_blocks = text_block_strings(&blocks);
+        // Persist the partial turn tagged as suspend-interrupted. Reuses the
+        // shared interrupt-flush path so the persisted row carries the
+        // `interruptReason` metadata (and clears the live-turn slot).
+        let live = LiveTurn {
+            message_id,
+            blocks,
+            final_text_block_open: false,
+            last_activity_at: now_iso(),
+            last_activity_emit: None,
+        };
+        let interrupted_message_id = self
+            .flush_partial_turn_on_interruption(
+                agent_id,
+                live,
+                InterruptReason::SystemSuspend,
+                None,
+            )
+            .await;
+        // Capture the session's running status for restore-on-resume, serialized
+        // to the stored form (e.g. "active", "Waiting") exactly like
+        // `heal_stale_agent_sessions`. A lookup failure falls back to "active".
+        let prev_status = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => serde_json::to_string(&session.status)
+                .unwrap_or_else(|_| "\"active\"".to_string())
+                .trim_matches('"')
+                .to_string(),
+            Err(e) => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "suspend enrollment: session status lookup failed, defaulting prev_status=active"
+                );
+                "active".to_string()
+            }
+        };
+        match self
+            .store
+            .insert_interrupted_agent_with_reason(
+                agent_id,
+                workspace_id,
+                &prev_status,
+                &now_iso(),
+                Some(InterruptReason::SystemSuspend.as_str()),
+            )
+            .await
+        {
+            Ok(_) => {
+                // Self-heal (independent of the host-wake broadcast): the wake
+                // orchestrator runs one debounced sweep per detected wake, so a
+                // disconnect that surfaces AFTER that sweep would strand this
+                // row until the NEXT host wake — even though the normal
+                // failure/retry surface was suppressed. Fire a gated, debounced
+                // resume directly for this agent so it recovers on its own; the
+                // wake sweep stays the catch-all. The debounce lets the worker's
+                // post-enrollment `kill_child_only` + `end_turn` settle first,
+                // and the row's atomic claim dedupes against a racing wake sweep
+                // / `resolveInterrupted`.
+                let services = self.clone();
+                let debounce = wake_resume_self_heal_debounce();
+                tokio::spawn(async move {
+                    tokio::time::sleep(debounce).await;
+                    services.resume_suspend_interrupted_agents().await;
+                });
+            }
+            Err(e) => {
+                // Fail-soft: the interrupted terminal state is still emitted
+                // below so the FE never sees a hard error. A missing row only
+                // forgoes the wake-triggered/self-heal resume (a manual retry
+                // still works).
+                tracing::warn!(
+                    agent = %agent_id,
+                    workspace_id = %workspace_id.0,
+                    error = %e,
+                    "failed to enroll suspend-interrupted agent row"
+                );
+            }
+        }
+        // Terminal event is the interrupted `agent:stream:end` (mirrors the
+        // interrupt path in `agent_manager`), NOT `agent:failed` — the FE
+        // renders a Stopped/resuming indicator rather than a hard error with a
+        // Retry button.
+        let mut end_data = json!({
+            "agentId": agent_id.0,
+            "stopReason": "interrupted",
+            "interruptReason": InterruptReason::SystemSuspend.as_str(),
+        });
+        if let Some(ref mid) = interrupted_message_id {
+            end_data["messageId"] = json!(mid);
+        }
+        if let Some(tid) = turn_id {
+            end_data["turnId"] = json!(tid);
+        }
+        stamp_preview_fields(&mut end_data, &preview_text_blocks);
+        self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
+            .await;
+        tracing::info!(
+            agent = %agent_id,
+            error = %err,
+            "turn interrupted by system suspend — enrolled for wake-resume"
+        );
+        // The wrapped marker tells the turn worker to suppress the
+        // terminal-failure path (no `agent:failed`, no Error status / retry).
+        Err(Error::Internal(format!(
+            "{PROMPT_SUSPEND_INTERRUPT_PREFIX} {err}"
+        )))
     }
 
     /// Drive one implicit agent-initiated turn (monorepo#855): the agent's
@@ -1976,6 +2280,7 @@ impl Services {
         }
         let blocks = transcript.into_blocks();
         let preview_text_blocks = text_block_strings(&blocks);
+        let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
         let mut message_persisted = false;
         if !blocks.is_empty() {
             match self
@@ -2001,9 +2306,16 @@ impl Services {
         } else if !updates_applied {
             tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
         }
-        // Same §6.5 step-0 recompute as the prompt-turn persist: the new
-        // assistant tail moves the question-hold derivation either way.
-        if message_persisted {
+        // Same stored-on-write pending-questions marker as the prompt-turn
+        // persist: a question-bearing wake tail arms the hold (question-free
+        // tails leave the marker untouched).
+        if message_persisted && questions_persisted {
+            self.record_pending_questions_marker(workspace_id, agent_id, &message_id)
+                .await;
+        }
+        // Same §6.5 step-0 recompute as the prompt-turn persist: only a
+        // question-bearing tail moves the question-hold derivation.
+        if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
         self.clear_live_turn(agent_id);
@@ -2051,10 +2363,15 @@ impl Services {
         // Same emit-time waiting flag as the prompt-turn idle (see
         // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
         data["isWaitingForOtherAgents"] =
-            Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
+            Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
         // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
         // idle (omitted when the agent owns no active hook).
         self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+        // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
+        // stamp as the prompt-turn idle (omitted when the agent owns no
+        // active monitor).
+        self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
+            .await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
@@ -2176,6 +2493,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         usage: Option<&session::Usage>,
         turn_duration: std::time::Duration,
+        turn_end: time::OffsetDateTime,
         run_completed: bool,
     ) {
         if usage.is_none() && !run_completed {
@@ -2206,6 +2524,7 @@ impl Services {
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
             runs: run_completed as u64,
             longest_run_ms: if run_completed {
                 turn_duration.as_millis() as u64
@@ -2214,7 +2533,11 @@ impl Services {
             },
             ..Default::default()
         };
-        let now = time::OffsetDateTime::now_utc();
+        // `turn_end` is captured at the same instant as `turn_duration` at the
+        // call site, before this task is spawned/awaited — reading the clock
+        // here instead would drift the hourly bucket and the per-minute spread
+        // window past the real turn end by however long the bookkeeping queued.
+        let now = turn_end;
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         // Stats attribution only: no configured-default upgrade here (unlike
@@ -2235,19 +2558,28 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
-        // Same clamped per-turn delta, folded into the per-minute rate
-        // history behind `stats.getRateHistory` (§5.39). All-zero deltas are
-        // skipped — they add nothing and would only churn the capped table.
+        // Same clamped per-turn delta, spread evenly across every per-minute
+        // bucket the turn spanned in `stats.getRateHistory` (§5.39) so a
+        // multi-minute turn reads as a plateau rather than a lone end-minute
+        // spike. All-zero deltas (and all-zero split parts) are skipped — they
+        // add nothing and would only churn the capped table.
         let rate_delta = intent_store::UsageRateDelta {
             input_tokens: tokens.input_tokens,
             output_tokens: tokens.output_tokens,
             cache_read_tokens: tokens.cache_read_tokens,
             cache_creation_tokens: tokens.cache_creation_tokens,
+            thought_tokens: tokens.thought_tokens,
         };
         if !rate_delta.is_zero() {
-            let minute = crate::usage_rate::minute_bucket_utc(now);
-            if let Err(e) = self.store.add_usage_rate(&minute, &rate_delta).await {
-                tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+            for (bucket, part) in
+                crate::usage_rate::split_delta_across_minutes(now, turn_duration, &rate_delta)
+            {
+                if part.is_zero() {
+                    continue;
+                }
+                if let Err(e) = self.store.add_usage_rate(&bucket, &part).await {
+                    tracing::warn!(agent = %agent_id, error = %e, "record turn usage rate failed");
+                }
             }
         }
     }
@@ -2269,15 +2601,22 @@ impl Services {
         };
         let message_id = transcript.message_id.clone();
         match mapped {
-            MappedUpdate::Chunk { content, text } => {
+            MappedUpdate::Chunk {
+                content,
+                text,
+                thought,
+            } => {
                 // Accumulate into the transcript and compute the block index this
-                // chunk lands at; consecutive text chunks coalesce onto one index
-                // (and thus one stable block id), a non-text block starts a new one.
+                // chunk lands at; consecutive chunks of the same kind coalesce
+                // onto one index (and thus one stable block id), while a
+                // thought↔text switch or a non-text block starts a new one.
+                // Thought chunks flush as `thinking` blocks (Zed's model) and
+                // ride the same `chat:stream:delta` shape.
                 let (block_index, block_type) = match &text {
                     Some(t) => {
-                        let index = transcript.current_text_index();
-                        transcript.push_text(t);
-                        (index, "text".to_string())
+                        let index = transcript.push_chunk(t, thought);
+                        let block_type = if thought { "thinking" } else { "text" };
+                        (index, block_type.to_string())
                     }
                     None => {
                         let block_type = content
@@ -2404,7 +2743,7 @@ impl Services {
                 // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({
                     "agentId": agent_id.0,
-                    "toolName": tool_name,
+                    "toolName": &tool_name,
                     "title": title,
                     "toolKind": tool_kind,
                     "toolCallId": tc.tool_call_id,
@@ -2425,6 +2764,36 @@ impl Services {
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_TOOL_CALL, data)
                     .await;
+                // External activity signal (§7): tool calls keep the liveness
+                // tick (and the pushed preview) alive through tool-heavy
+                // stretches where no assistant text streams — otherwise a
+                // watched-agent row freezes at the turn's last text
+                // (monorepo#1414). Shares the ONE per-agent leading-edge
+                // throttle window with the chunk arm, so a turn mixing text
+                // and tool calls still emits at most one activity per second.
+                // Adds `lastToolUse` describing the call just recorded.
+                if self.should_emit_activity(agent_id) {
+                    let mut activity_data = json!({
+                        "agentId": agent_id.0,
+                        "messageId": message_id,
+                        "lastToolUse": {
+                            "name": tool_name,
+                            "status": tc.status,
+                        },
+                    });
+                    stamp_live_preview_fields(
+                        &mut activity_data,
+                        &transcript.text_block_strings(),
+                        transcript.final_text_block_open(),
+                    );
+                    self.publish_agent_event(
+                        workspace_id,
+                        agent_id,
+                        AGENT_STREAM_ACTIVITY,
+                        activity_data,
+                    )
+                    .await;
+                }
             }
         }
         // Refresh the live-turn slot with the partial transcript so a mid-turn
@@ -2511,6 +2880,53 @@ impl Services {
             crate::publish_event_transient(&self.event_bus, event);
         } else {
             crate::publish_event(&self.event_bus, event).await;
+        }
+    }
+
+    /// Persist the session-discovered effort levels (PROTOCOL §5.5, Option C)
+    /// after a session open: the `thought_level` selector's surfaced levels
+    /// ([`ThoughtLevelOption::surfaced_levels`] — advertised values minus the
+    /// `"default"` sentinel), `None` when the provider advertised no selector
+    /// (clears a set persisted by a previous provider). Emits `agent:updated`
+    /// with `effortLevels` ONLY when the stored set actually changed
+    /// ([`set_agent_effort_levels`](intent_store::Store::set_agent_effort_levels)
+    /// reports the change), so the every-open wholesale replace never spams
+    /// the bus. Best-effort: a store error is logged and never fails session
+    /// startup.
+    pub(crate) async fn persist_session_effort_levels(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        thought_level: Option<&ThoughtLevelOption>,
+    ) {
+        let levels = thought_level.and_then(ThoughtLevelOption::surfaced_levels);
+        match self
+            .store
+            .set_agent_effort_levels(workspace_id, agent_id, levels.as_deref(), &now_iso())
+            .await
+        {
+            Ok(true) => {
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_UPDATED,
+                    json!({
+                        "agentId": agent_id.0,
+                        "effortLevels": levels.map_or(Value::Null, |l| json!(l)),
+                    }),
+                )
+                .await;
+            }
+            Ok(false) => {
+                // Unchanged set — no write, no event (the common case).
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "persist session effort levels failed"
+                );
+            }
         }
     }
 }

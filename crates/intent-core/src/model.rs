@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
 use crate::settings_file::SandboxType;
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
@@ -110,13 +110,17 @@ pub enum NoteVisibility {
 }
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
-/// the BE-owned "current cycle" status rollup over the active/latest PR,
-/// `taskStats`, live agent activity, and the per-workspace needs-attention
-/// signal. Wire values are the snake_case variant names, matching the FE
-/// union exactly. A top-level agent waiting on the user (pending attention
-/// request or pending structured questions) promotes the rollup to
-/// `NeedsAttention` above everything else; a running agent promotes it to
-/// `InProgress`; without one, a task-stage rollup (`InProgress`/`NotStarted`)
+/// the BE-owned canonical status rollup over the active/latest PR,
+/// `taskStats`, live agent activity, the per-workspace attention axes, and
+/// the dismissible workspace attention flag. Wire values are the snake_case
+/// variant names, matching the FE union exactly. Canonical precedence
+/// (§6.5): `Failed` (a top-level agent parked in `error`) > `Blocked` (a
+/// top-level pending `blocker` attention request) > `NeedsAttention`
+/// (discussion requests, pending structured questions, or the
+/// `review_required` attention flag) > `InProgress` (running agent) >
+/// `Unread` (the `unread` attention flag, promoting only over the
+/// idle/terminal bases `Idle`/`Complete`/`PrMerged`) > the PR/task rollup.
+/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
 /// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
 /// never reach the wire on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +129,9 @@ pub enum WorkspaceDisplayStatus {
     NotStarted,
     InProgress,
     NeedsAttention,
+    Failed,
+    Blocked,
+    Unread,
     Idle,
     Complete,
     PrReady,
@@ -408,9 +415,9 @@ impl UsageCost {
     }
 }
 
-/// The four consumption counters of a token tally (PROTOCOL §5.23 / §19.1),
-/// plus the optional provider-reported cost. Reused for the per-agent,
-/// per-model, and workspace-wide rollups.
+/// The consumption counters of a token tally (PROTOCOL §5.23 / §19.1), plus
+/// the optional provider-reported cost. Reused for the per-agent, per-model,
+/// and workspace-wide rollups.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsageTotals {
@@ -418,14 +425,24 @@ pub struct TokenUsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Cumulative reasoning ("thought") tokens, reported by providers that
+    /// break them out of `outputTokens` via ACP `usage_update.thoughtTokens`.
+    /// Omitted (not `0`) when nothing reported any, so clients that predate
+    /// the field see the previous shape byte-for-byte.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub thought_tokens: u64,
     /// Cumulative cost, present only when at least one contributing session
     /// reported one via ACP `usage_update`. Omitted (not `null`) otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<UsageCost>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl TokenUsageTotals {
-    /// Whether all four consumption counters are zero, i.e. this tally carries
+    /// Whether every consumption counter is zero, i.e. this tally carries
     /// no token report at all. A persisted session snapshot in that state is a
     /// cost-only report (§5.23) and MUST NOT suppress the per-message token
     /// fallback for a provider that never sends an end-of-turn token report.
@@ -434,6 +451,7 @@ impl TokenUsageTotals {
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
             && self.cache_creation_tokens == 0
+            && self.thought_tokens == 0
     }
 }
 
@@ -1868,10 +1886,10 @@ pub struct Event {
 }
 
 /// One file-change activity row (§5.10; `agent-event-tools.ts` `FileActivity`).
-/// Returned by `event.recentFiles` / `event.directoryChanges` and embedded in
-/// `event.workspaceSummary`. `actor` is `"type:name"` for the workspace-wide
-/// helpers and the bare actor name for the per-agent variant; absent optionals
-/// are omitted from the wire to match the TS `JSON.stringify` shape.
+/// Returned by `event.agentActivity` (per-agent variant) and embedded in
+/// `event.workspaceSummary`. `actor` is `"type:name"` in the summary and the bare
+/// actor name for the per-agent variant; absent optionals are omitted from the
+/// wire to match the TS `JSON.stringify` shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileActivity {
@@ -2068,6 +2086,21 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
 /// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
 pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
 
+/// Metadata key under which the pending-questions marker is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// assistant message whose trailing question resource blocks are still
+/// awaiting an answer. Written at turn end when the persisted assistant tail
+/// bears question blocks (a newer question-bearing turn overwrites it —
+/// single-slot), and cleared (written as the empty string, which reads back as
+/// absent) when the answer for that exact message id persists or the
+/// transcript is truncated by `agent.editAndRegenerate`. Stored-on-write so
+/// the hold derivation stays a bounded metadata read and pendingness survives
+/// later user messages, agent turns, and daemon restarts. No schema migration
+/// — the marker rides the existing free-form `metadata` column. Read back by
+/// [`AgentSession::pending_questions_message_id`] /
+/// [`AgentSession::pending_questions_marker_written`].
+pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
+
 /// Metadata key under which the per-conversation seen marker is persisted on
 /// the `agent_session.metadata` JSON (PROTOCOL §5.5): the id of the newest
 /// transcript message the user has seen, advanced monotonically by
@@ -2078,13 +2111,14 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
-/// user-originated entry point — which always delivers immediately (a user
-/// message supersedes any pending Q&A). Everything else (MCP front-door
-/// sends, reportToParent / completion-watch / event-subscription wakes,
+/// user-originated entry point — which always delivers immediately; it
+/// bypasses the hold but does NOT release it (only an answer-tagged row or
+/// `agent.dismissQuestions` does). Everything else (MCP front-door sends,
+/// reportToParent / completion-watch / event-subscription wakes,
 /// `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations) is
 /// `Automatic` and is held in the queue while the target agent's question
 /// hold is active. `Automatic` is the `Default` so unmarked internal paths
-/// fail closed (held) rather than dismissing a pending Q&A.
+/// fail closed (held) rather than burying a pending Q&A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
     /// FE-originated `agent.sendMessage` (typed message or wizard answers):
@@ -2144,6 +2178,13 @@ pub struct AgentSession {
     /// `None` = provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Effort levels the provider's `thought_level` config option advertised
+    /// at the most recent session open (PROTOCOL §5.5, Option C), minus the
+    /// adapter's `"default"` sentinel. Replaced wholesale at every session
+    /// open; `None` when the provider advertised no such option (the FE falls
+    /// back to catalog metadata). Never `Some(empty)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2281,6 +2322,37 @@ impl AgentSession {
             .filter(|s| !s.is_empty())
     }
 
+    /// The pending-questions marker persisted under
+    /// [`PENDING_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
+    /// `metadata`: `Some` only when the metadata is an object carrying a
+    /// non-empty string under that key. The question-hold derivation reads it
+    /// directly (no transcript walk) — a set marker that differs from
+    /// [`AgentSession::dismissed_questions_message_id`] means questions are
+    /// still pending. Cleared markers are written as the empty string, which
+    /// reads back as `None` here while
+    /// [`AgentSession::pending_questions_marker_written`] stays `true`.
+    pub fn pending_questions_message_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_QUESTIONS_MESSAGE_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// `true` when the pending-questions marker key is PRESENT in the
+    /// session's metadata at all (set or cleared-to-empty). Distinguishes a
+    /// session the marker-based derivation has already written (an empty
+    /// marker authoritatively means "nothing pending") from a pre-upgrade
+    /// session that never saw a marker write, where the hold derivation must
+    /// fall back to the transcript tail walk so a live hold is not lost
+    /// across the upgrade.
+    pub fn pending_questions_marker_written(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(PENDING_QUESTIONS_MESSAGE_ID_KEY))
+            .is_some_and(serde_json::Value::is_string)
+    }
+
     /// The per-conversation seen marker persisted under
     /// [`LAST_SEEN_MESSAGE_ID_KEY`] in the session's free-form `metadata`:
     /// `Some` only when the metadata is an object carrying a non-empty string
@@ -2380,6 +2452,11 @@ pub struct AgentLite {
     /// mirrors [`AgentSession::reasoning_effort`]. Omitted when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Session-discovered effort levels (PROTOCOL §5.5, Option C); mirrors
+    /// [`AgentSession::effort_levels`]. Omitted when the provider advertised
+    /// no `thought_level` option at session open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_levels: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub status: AgentStatus,
@@ -2425,6 +2502,15 @@ pub struct AgentLite {
     /// the service projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on_hooks: Vec<serde_json::Value>,
+    /// Idle-visibility (unified external-wait, mirrors `waitingOnHooks`):
+    /// light metadata for the agent's active PR monitors —
+    /// `[{ monitorId, repo, prNumber, title? }]` — so a parent/client can
+    /// tell a PR-monitor-waiting idle agent from a stalled one. Omitted when
+    /// the agent owns no active monitor. Stays empty in
+    /// [`AgentLite::from_session`] (no runtime context) and is overlaid by
+    /// the service projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on_pr_monitors: Vec<serde_json::Value>,
     /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
     /// `session/prompt` turn's live-turn slot is open for this agent, and
     /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
@@ -2459,6 +2545,15 @@ pub struct AgentLite {
     /// (the same gate as the live `lastAgentResponse` overlay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_role: Option<String>,
+    /// Row id of the session's newest user/assistant transcript message —
+    /// system (and any other) rows are transparent, matching
+    /// `lastMessageRole`. Additive wire field; omitted when the session has
+    /// no user/assistant message. Serves per-agent unread computation
+    /// against `metadata.lastSeenMessageId` without transcript reads
+    /// (intent-hq/monorepo#1597). No live-turn overlay: mid-turn it stays on
+    /// the last persisted message until the assistant row persists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
@@ -2495,6 +2590,7 @@ impl AgentLite {
         last_user_message: Option<String>,
         digest: Option<String>,
         last_message_role: Option<String>,
+        last_message_id: Option<String>,
     ) -> Self {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
@@ -2527,6 +2623,7 @@ impl AgentLite {
             name_explicitly_set: session.name_explicitly_set,
             model: session.model,
             reasoning_effort: session.reasoning_effort,
+            effort_levels: session.effort_levels,
             provider: session.provider,
             status: session.status,
             is_active: session.is_active,
@@ -2537,6 +2634,7 @@ impl AgentLite {
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: Vec::new(),
             waiting_on_hooks: Vec::new(),
+            waiting_on_pr_monitors: Vec::new(),
             turn_in_flight: false,
             last_stream_activity_at: None,
             stats: session.stats,
@@ -2547,6 +2645,7 @@ impl AgentLite {
             last_agent_response,
             last_user_message,
             last_message_role,
+            last_message_id,
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
@@ -3012,6 +3111,78 @@ pub struct Hook {
     /// never expire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// Perpetual hooks stay active after a dispatch (the owner is woken and
+    /// the hook returns to `scheduled`), running on their cadence until TTL
+    /// expiry, cancel, or eviction. `false` is the one-shot default.
+    #[serde(default)]
+    pub perpetual: bool,
+    /// How many runs signalled a dispatch. Always ≤ 1 for a one-shot hook;
+    /// perpetual hooks accumulate across fires.
+    #[serde(default)]
+    pub dispatch_count: i64,
+}
+
+/// Lifecycle state of a PR monitor. `active` is the only live state
+/// (rehydrated into the poll loop at boot); `completed` (the PR merged or
+/// closed) and `cancelled` are terminal. Completed rows are RETAINED and stay
+/// visible in list surfaces; cancelled rows are excluded. Wire/DB words are
+/// the lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrMonitorState {
+    /// Being polled; changes accumulate and wake the owner after the
+    /// debounce window.
+    Active,
+    /// The PR reached a terminal lifecycle (merged or closed); the owner was
+    /// woken immediately and monitoring stopped.
+    Completed,
+    /// Cancelled by the owning agent (`ws.pr.unmonitor`) or from the app
+    /// (`prMonitor.cancel`).
+    Cancelled,
+}
+
+/// A PR monitor: an agent-owned watch on one pull request, polled centrally
+/// by the daemon. Changes to the PR's merge-requirements checklist are
+/// accumulated (`pendingChanges`) and delivered as ONE consolidated wake once
+/// the PR has been quiet for the debounce window. Persisted to the
+/// `pr_monitor` table so monitors survive a daemon restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrMonitor {
+    pub monitor_id: PrMonitorId,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: i64,
+    pub state: PrMonitorState,
+    /// JSON-serialized merge-requirements baseline the next poll diffs
+    /// against. `None` until the first successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot: Option<String>,
+    /// JSON-serialized snapshot as of the last delivered wake (or
+    /// registration) — the emit baseline pending changes are coalesced
+    /// against. Backfilled from `last_snapshot` for pre-existing rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_snapshot: Option<String>,
+    /// Change lines accumulated since the last emit, awaiting the debounce
+    /// window to close. Empty when nothing is pending.
+    #[serde(default)]
+    pub pending_changes: Vec<String>,
+    /// When the oldest un-emitted change was detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_since: Option<String>,
+    /// When the most recent change was detected — the quiet-window anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_polled_at: Option<String>,
+    /// Most recent forge-poll error (cleared by a successful poll); a failing
+    /// poll never kills the loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
@@ -3661,6 +3832,7 @@ mod tests {
                 output_tokens: 3400,
                 cache_read_tokens: 8000,
                 cache_creation_tokens: 1200,
+                thought_tokens: 0,
                 cost: None,
             },
         );
@@ -3682,8 +3854,52 @@ mod tests {
         // Absent cost is OMITTED (not null) so existing clients see the
         // pre-cost shape byte-for-byte.
         assert!(v["totals"].get("cost").is_none());
+        // Same for an unreported thought count — zero omits the key.
+        assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// Reported reasoning tokens serialize as the additive camelCase
+    /// `thoughtTokens` counter on every `TokenUsage` bucket and round-trip
+    /// (§5.23).
+    #[test]
+    fn token_usage_thought_tokens_wire_shape() {
+        let totals = TokenUsageTotals {
+            input_tokens: 10,
+            output_tokens: 5,
+            thought_tokens: 42,
+            ..TokenUsageTotals::default()
+        };
+        let mut by_agent_id = BTreeMap::new();
+        by_agent_id.insert("agent-123".to_string(), totals.clone());
+        let mut by_model = BTreeMap::new();
+        by_model.insert("opus-4.8".to_string(), totals.clone());
+        let usage = TokenUsage {
+            by_agent_id,
+            totals,
+            by_model,
+            last_scan_at: None,
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert_eq!(v["totals"]["thoughtTokens"], 42);
+        assert_eq!(v["byAgentId"]["agent-123"]["thoughtTokens"], 42);
+        assert_eq!(v["byModel"]["opus-4.8"]["thoughtTokens"], 42);
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    /// A thought-only tally still counts as a token report, so it does not
+    /// fall through to the per-message usage fallback (§5.23).
+    #[test]
+    fn thought_tokens_alone_count_as_a_report() {
+        let thought_only = TokenUsageTotals {
+            thought_tokens: 5,
+            ..TokenUsageTotals::default()
+        };
+        assert!(!thought_only.counters_are_zero());
+        assert!(token_usage_reported(None, Some(&thought_only)));
+        assert!(TokenUsageTotals::default().counters_are_zero());
     }
 
     /// A reported cost serializes as camelCase `cost: { amount, currency }`
@@ -3693,12 +3909,11 @@ mod tests {
         let totals = TokenUsageTotals {
             input_tokens: 10,
             output_tokens: 5,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
             cost: Some(UsageCost {
                 amount: 1.25,
                 currency: "USD".to_string(),
             }),
+            ..TokenUsageTotals::default()
         };
         let mut by_agent_id = BTreeMap::new();
         by_agent_id.insert("agent-123".to_string(), totals.clone());
@@ -3950,6 +4165,7 @@ mod tests {
             name_explicitly_set: true,
             model: None,
             reasoning_effort: None,
+            effort_levels: None,
             provider: None,
             system_prompt: None,
             specialist: Some("implementor".to_string()),
@@ -3989,6 +4205,7 @@ mod tests {
             Some("hi".to_string()),
             None,
             Some("user".to_string()),
+            Some("msg-last".to_string()),
         );
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
@@ -4011,6 +4228,7 @@ mod tests {
         assert_eq!(v["waitingForAgentIds"], json!([]));
         assert_eq!(v["lastUserMessage"], "hi");
         assert_eq!(v["lastMessageRole"], "user");
+        assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
     }
 
@@ -4029,6 +4247,7 @@ mod tests {
             name_explicitly_set: true,
             model: Some("opus".to_string()),
             reasoning_effort: None,
+            effort_levels: Some(vec!["low".to_string(), "high".to_string()]),
             provider: Some("auggie".to_string()),
             system_prompt: None,
             specialist: None,
@@ -4077,6 +4296,7 @@ mod tests {
                 "name": "Builder",
                 "nameExplicitlySet": true,
                 "model": "opus",
+                "effortLevels": ["low", "high"],
                 "provider": "auggie",
                 "status": "active",
                 "isActive": true,
