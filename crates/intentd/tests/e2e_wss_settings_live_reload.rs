@@ -40,6 +40,14 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+/// Pure-liveness deadline for positive event-driven waits (monorepo#1849,
+/// mirroring the `LIVENESS` pattern from intent-hq/intentd#1030/#1043): the
+/// waits below return as soon as the awaited event arrives, so this bound
+/// only has to outlast a genuine wedge (fs-event registration/delivery
+/// stalls under full-suite parallel load), never a passing run. Negative
+/// assertions keep their short bounds.
+const LIVENESS: Duration = Duration::from_secs(300);
+
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -183,7 +191,7 @@ async fn wss_rpc(ws: &mut Wss, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(common::rpc_read_timeout(), ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
@@ -203,9 +211,10 @@ async fn wss_rpc(ws: &mut Wss, id: i64, method: &str, params: Value) -> Value {
 }
 
 /// Pump the dedicated subscriber connection until a `settings:changed`
-/// `events.event` frame arrives (or `secs` elapses). Returns the full frame.
-async fn next_settings_event(ws: &mut Wss, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+/// `events.event` frame arrives (or [`LIVENESS`] elapses). Returns the full
+/// frame. Pure-liveness positive wait: returns as soon as the event lands.
+async fn next_settings_event(ws: &mut Wss) -> Value {
+    let deadline = tokio::time::Instant::now() + LIVENESS;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let next = timeout(remaining, ws.next())
@@ -261,6 +270,35 @@ fn atomic_write(path: &Path, content: &str) {
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, content).expect("write tmp config");
     std::fs::rename(&tmp, path).expect("rename tmp over config.toml");
+}
+
+/// Wait until the daemon's config.toml live-reload watcher is registered,
+/// by polling daemon.log for the readiness line the composition root emits
+/// (`spawn_config_watcher_init` in `crates/intentd/src/main.rs`). The
+/// watcher registers in a background task (monorepo#1581), so a fast test
+/// can otherwise hand-edit config.toml before the FSEvents watch exists and
+/// the edit is missed entirely — no wait on `settings:changed`, however
+/// long, can recover it (monorepo#1849). Bounded by [`LIVENESS`]; fails
+/// fast if the daemon reports the watcher failed to start.
+async fn await_config_watcher_ready(data_dir: &Path) {
+    let log_path = data_dir.join("daemon.log");
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("config.toml live-reload watcher ready") {
+            return;
+        }
+        assert!(
+            !log.contains("config.toml live-reload watcher failed to start"),
+            "config watcher failed to start\n--- daemon log ---\n{log}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "config.toml live-reload watcher never became ready within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Boot with the WSS listener enabled, discover the WSS port + fingerprint via
@@ -362,7 +400,7 @@ async fn settings_update_over_wss_rewrites_config_toml_and_emits_event() {
     );
 
     // §6.5: settings:changed with data.changes = applied pairs.
-    let ev = next_settings_event(&mut sub, 15).await;
+    let ev = next_settings_event(&mut sub).await;
     assert_eq!(ev["method"], json!("events.event"));
     assert_eq!(
         ev["params"]["event"]["data"]["changes"],
@@ -430,13 +468,18 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     assert_eq!(get["result"]["value"], json!("before/"), "{get}");
     assert_eq!(get["result"]["origin"], json!("file"), "{get}");
 
+    // The watcher registers in a background task off the boot path
+    // (monorepo#1581): gate the first external edit on its readiness so the
+    // edit cannot land before the FSEvents watch exists (monorepo#1849).
+    await_config_watcher_ready(&data_dir).await;
+
     // Valid external edit (atomic tmp+rename) → live-reload: the watcher
     // emits settings:changed naming the changed key with the new value.
     atomic_write(
         &config_path,
         &format!("[workspace]\nbranchPrefix = \"after/\"\n\n{ws_api_block}"),
     );
-    let ev = next_settings_event(&mut sub, 15).await;
+    let ev = next_settings_event(&mut sub).await;
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
         .expect("changes array");
@@ -486,7 +529,7 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
         &config_path,
         &format!("[workspace]\nbranchPrefix = \"recovered/\"\n\n{ws_api_block}"),
     );
-    let ev = next_settings_event(&mut sub, 15).await;
+    let ev = next_settings_event(&mut sub).await;
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
         .expect("changes array");
