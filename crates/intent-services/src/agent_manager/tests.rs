@@ -10916,10 +10916,13 @@ mod question_hold_gates {
     }
 
     /// Automatic `send_message` parks in the queue with `heldForQuestions`
-    /// and never claims the in-flight slot; a User send passes through —
-    /// but a PLAIN user send does not RELEASE the hold: the automatic entry
-    /// stays parked across that turn, and only the answer-tagged send drains
-    /// it (the persistent-pendingness contract, spec §Decisions 1-3).
+    /// and never claims the in-flight slot; a User send passes through the
+    /// hold gate — and since monorepo#1791 a user send arriving while the
+    /// hold has PARKED entries converts to a user-origin enqueue + drain
+    /// kick, so the parked automatic backlog rides the user-led combined
+    /// flush turn FIFO instead of being bypassed. A plain user send still
+    /// does not RELEASE the hold (no answer tag): later automatic sends
+    /// keep parking until the answer-tagged send clears the marker.
     #[tokio::test]
     async fn automatic_send_held_user_send_not() {
         let script = mock_agent_script();
@@ -10956,10 +10959,12 @@ mod question_hold_gates {
         // Hold still active (no user row was appended).
         assert!(mgr.services.question_hold_active(&id).await);
 
-        // A PLAIN user-origin send is NOT held: it claims the slot and drives
-        // a real turn (mock provider). It carries no answer tag, so the
-        // pending-questions marker survives it — the automatic entry is still
-        // parked when the turn (and its end-of-turn drain) finishes.
+        // A PLAIN user-origin send is NOT held — but with a parked backlog
+        // it converts to a user-origin enqueue + drain kick (monorepo#1791):
+        // the batch flush delivers the parked automatic entry FIFO in the
+        // SAME combined turn as the user message instead of bypassing it.
+        // No answer tag rode along, so the pending-questions marker
+        // survives the combined turn.
         let plain = TurnOptions {
             origin: MessageOrigin::User,
             ..TurnOptions::default()
@@ -10980,29 +10985,76 @@ mod question_hold_gates {
             None,
             "user sends bypass the hold gate"
         );
-        assert_eq!(r["queued"], json!(false), "user send starts a turn");
+        assert_eq!(
+            r["queued"],
+            json!(true),
+            "user send with a parked backlog converts to enqueue + flush"
+        );
         timeout(Duration::from_secs(10), async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("plain user turn completes");
+        .expect("combined flush turn completes");
         assert!(
             mgr.services.question_hold_active(&id).await,
             "a plain user message does not resolve the pending Q&A"
         );
-        assert_eq!(
-            mgr.services.queue_snapshot(&id).len(),
-            1,
-            "automatic entry stays parked across the user turn"
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "the parked automatic entry rode the user-led flush turn"
+        );
+        // FIFO: the older parked wake's user row precedes the newer user
+        // message's row in the transcript.
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row_idx = |needle: &str| {
+            messages.iter().position(|m| {
+                m.role == "user"
+                    && m.content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                    })
+            })
+        };
+        let wake_idx = row_idx("auto wake").expect("parked wake row landed");
+        let aside_idx = row_idx("unrelated aside").expect("user row landed");
+        assert!(
+            wake_idx < aside_idx,
+            "older parked wake drains FIFO ahead of the newer user message: \
+             wake={wake_idx} aside={aside_idx}"
         );
 
-        // The ANSWER releases the hold, and the worker's end-of-turn drain
-        // then delivers the parked automatic message.
+        // A LATER automatic send still parks — the hold is armed until the
+        // answer or dismissal.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake 2".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("second held send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
+        // The ANSWER releases the hold; with a parked backlog it converts to
+        // the same enqueue + flush, draining the parked wake alongside it.
         let answer = TurnOptions {
             origin: MessageOrigin::User,
             message_metadata: Some(answer_metadata(&asked)),
@@ -11028,6 +11080,101 @@ mod question_hold_gates {
         assert!(
             !mgr.services.question_hold_active(&id).await,
             "hold cleared"
+        );
+    }
+
+    /// monorepo#1791 regression: an automatic `after_all` settlement wake
+    /// parked by the hold on an IDLE agent must not be bypassed by a newer
+    /// plain user message — the user send converts to a user-origin enqueue
+    /// and the flush delivers the wake FIFO in the same combined turn.
+    #[tokio::test]
+    async fn parked_settlement_wake_drains_with_newer_user_message() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-qh-1791"), AgentId::from("a-qh-1791"));
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        arm_hold(&mgr, &ws, &id).await;
+
+        // The settlement wake (automatic) parks at position 0 on the idle
+        // agent — the monorepo#1791 incident shape.
+        let wake = "[WORKSPACE EVENTS] All 3 delegated child agent(s) settled";
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                wake.to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+
+        // The user's later "check" must NOT run past the parked wake.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "check".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("check send");
+        assert_eq!(r["queued"], json!(true), "converted to enqueue + flush");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("combined turn completes");
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "settlement wake no longer stuck in the queue"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row_idx = |needle: &str| {
+            messages.iter().position(|m| {
+                m.role == "user"
+                    && m.content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                    })
+            })
+        };
+        let wake_idx = row_idx("delegated child agent(s) settled").expect("wake row landed");
+        let check_idx = row_idx("check").expect("check row landed");
+        assert!(
+            wake_idx < check_idx,
+            "settlement wake delivered FIFO ahead of the newer user message: \
+             wake={wake_idx} check={check_idx}"
         );
     }
 

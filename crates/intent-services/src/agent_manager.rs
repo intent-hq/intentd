@@ -3830,6 +3830,46 @@ impl AgentManager {
             }
             return Ok(result);
         }
+        // FIFO restore under an active hold (monorepo#1791): a USER-origin
+        // send to an agent whose hold has parked ready-to-send entries must
+        // not bypass them with a direct turn — the parked backlog (e.g. an
+        // `after_all` settlement wake) would sit at position 0 while newer
+        // user messages run whole turns past it. Convert the send into a
+        // queue-fallback enqueue (user-origin) and kick the drain: the batch
+        // flush delivers the older parked entries FIFO in the SAME combined
+        // turn as this user message (a non-batching flush mode drains the
+        // user entry alone, hold contract unchanged). Skipped when nothing
+        // is parked, so the common direct-send path is untouched — and
+        // skipped for a session parked in `Error`, whose documented recovery
+        // IS the direct fresh send (the STAB-52 gate in `try_drain_queue`
+        // would strand a converted entry there).
+        if options.origin.is_user()
+            && session.status != AgentStatus::Error
+            && self.services.has_ready_to_send(&agent_id)
+            && self.services.question_hold_active(&agent_id).await
+        {
+            let (queued, position) = self.services.enqueue_message_with_origin(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                true,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            self.clone()
+                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                .await;
+            return Ok(result);
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message_with_origin(
                 &agent_id,
@@ -4093,12 +4133,13 @@ impl AgentManager {
             return;
         }
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
-        // batching mode and MORE THAN ONE eligible entry waiting (under an
-        // active hold: user-origin entries only — the hold contract is
-        // unchanged), drain them all into ONE combined provider turn while
-        // persisting each entry as its own transcript row. A single eligible
-        // entry (or the `off` mode) falls through to the existing
-        // single-entry path unchanged.
+        // batching mode and MORE THAN ONE eligible entry waiting, drain them
+        // all into ONE combined provider turn while persisting each entry as
+        // its own transcript row. Under an active hold (`hold_drain`) the
+        // flush fires only because a user-origin entry is ready — the parked
+        // automatic entries ride its combined turn FIFO instead of being
+        // bypassed (monorepo#1791). A single eligible entry (or the `off`
+        // mode) falls through to the existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
             if let Some(batch) = self
@@ -7227,7 +7268,14 @@ async fn run_message_worker(
             let hold = mgr.services.question_hold_active(&agent_id).await;
             let extra_batch = match mode {
                 intent_core::FlushQueuedMessagesMode::All => {
-                    mgr.services.dequeue_ready_batch(&agent_id, hold, 1)
+                    // Under an active hold `next` is user-origin by
+                    // construction (the raced pop above used
+                    // `dequeue_user_origin_message`), and that user entry IS
+                    // the flush's user-origin requirement — the remaining
+                    // ready entries (parked automatic wakes included) ride
+                    // its combined turn FIFO (monorepo#1791).
+                    mgr.services
+                        .dequeue_ready_batch(&agent_id, hold && !next.user_origin, 1)
                 }
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
                     if hold || next.user_origin {
