@@ -172,7 +172,12 @@ fn run_channel_command(
 /// `--check` only reports installed vs latest; the full form installs a
 /// newer version (newer-only, never a downgrade) and, when a supervised
 /// serve-mode sitter is running, restarts its daemon via SIGHUP so the new
-/// binary takes effect immediately.
+/// binary takes effect immediately. The automatic restart is skipped when
+/// the channel came from this invocation's flag/env override and differs
+/// from the channel the running service follows (config pin > stable
+/// default — service definitions pass no flag or env): silently restarting
+/// a stable-pinned service onto a beta binary would put it on the wrong
+/// channel.
 fn run_update_command(
     check: bool,
     args: &SitterArgs,
@@ -227,6 +232,16 @@ fn run_update_command(
                      (was {previous})"
                 ),
                 None => println!("installed intentd {version} from channel {channel}"),
+            }
+            let service = config::resolve_channel(None, config::load_channel(&paths.config_path));
+            if channel != service.channel {
+                println!(
+                    "not restarting the running service: it follows channel {} \
+                     (from {}), not {channel}; to switch it, pin the channel with \
+                     `intentd sitter channel {channel}` and run `intentd restart`",
+                    service.channel, service.origin
+                );
+                return 0;
             }
             apply_installed_update(paths)
         }

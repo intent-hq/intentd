@@ -155,18 +155,29 @@ fn preinstall(paths: &SitterPaths, version: &str) {
     state::save(&paths.state_path, &state).unwrap();
 }
 
-/// Publish a release on the stable channel: manifest + archive routes.
-fn publish_stable(routes: &Routes, base_url: &str, version: &str, bin_contents: &[u8]) -> String {
-    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+/// Publish a release on `channel`: manifest + archive routes.
+fn publish_channel(
+    routes: &Routes,
+    base_url: &str,
+    channel: &str,
+    version: &str,
+    bin_contents: &[u8],
+) -> String {
+    let asset = format!("intentd-{channel}-{TARGET_TRIPLE}.tar.xz");
     let archive = make_tar_xz(bin_contents);
     let sha = sha256_hex(&archive);
     let mut routes = routes.lock().unwrap();
     routes.insert(format!("/{asset}"), archive);
     routes.insert(
-        "/channel-stable/stable.json".to_string(),
+        format!("/channel-{channel}/{channel}.json"),
         manifest_json(version, base_url, &asset, &sha),
     );
     asset
+}
+
+/// Publish a release on the stable channel: manifest + archive routes.
+fn publish_stable(routes: &Routes, base_url: &str, version: &str, bin_contents: &[u8]) -> String {
+    publish_channel(routes, base_url, "stable", version, bin_contents)
 }
 
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
@@ -395,6 +406,66 @@ fn update_signals_running_supervised_sitter() {
     assert!(
         fs::read_to_string(&hup_log).is_ok_and(|s| s.contains("HUP")),
         "the supervised sitter must receive SIGHUP"
+    );
+
+    let _ = fake_sitter.kill();
+    let _ = fake_sitter.wait();
+}
+
+#[test]
+fn update_with_channel_override_skips_restart_of_mismatched_service() {
+    // `intentd update --sitter-channel beta` while the running service
+    // follows stable (the default): the beta binary is installed, but the
+    // service must NOT be SIGHUP'd onto a channel it does not follow.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0");
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, _requests) = serve_recording(Arc::clone(&routes));
+    publish_channel(&routes, &base_url, "beta", "0.2.0", b"beta daemon 0.2.0");
+
+    let hup_log = dir.path().join("hup.log");
+    let mut fake_sitter = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "trap 'echo HUP >> \"{}\"' HUP; while :; do sleep 0.1; done",
+            hup_log.display()
+        ))
+        .spawn()
+        .unwrap();
+    fs::create_dir_all(paths.pid_path.parent().unwrap()).unwrap();
+    fs::write(&paths.pid_path, format!("{}\n", fake_sitter.id())).unwrap();
+
+    let output = run_sitter(
+        dir.path(),
+        &base_url,
+        &["update", "--sitter-channel", "beta"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("installed intentd 0.2.0 from channel beta (was 0.1.0)"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("not restarting the running service"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sent SIGHUP"),
+        "must not signal a service on a different channel; stdout: {stdout}"
+    );
+
+    // Give any stray (buggy) SIGHUP a moment to land, then assert none did.
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !fs::read_to_string(&hup_log).is_ok_and(|s| s.contains("HUP")),
+        "the supervised sitter must not receive SIGHUP on a channel mismatch"
     );
 
     let _ = fake_sitter.kill();

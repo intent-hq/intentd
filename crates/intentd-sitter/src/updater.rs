@@ -245,12 +245,9 @@ impl Updater {
                 .unwrap_or_default()
         ));
         fs::create_dir_all(&tmp_dir)?;
-        let result = self.download_and_install(&manifest.version, channel, entry, &tmp_dir);
+        let result = self.download_and_install(&manifest.version, channel, entry, &tmp_dir, force);
         let _ = fs::remove_dir_all(&tmp_dir);
-        result.map(|()| UpdateOutcome::Installed {
-            version: manifest.version.clone(),
-            previous: state.current_version,
-        })
+        result
     }
 
     fn download_and_install(
@@ -259,7 +256,8 @@ impl Updater {
         channel: Channel,
         entry: &PlatformEntry,
         tmp_dir: &Path,
-    ) -> Result<(), UpdateError> {
+        force: bool,
+    ) -> Result<UpdateOutcome, UpdateError> {
         let archive_path = tmp_dir.join(&entry.asset);
         self.download_verified(entry, &archive_path)?;
 
@@ -275,14 +273,41 @@ impl Updater {
         self.install_version(version, &extracted_bin)?;
 
         // state.json is written only after the binary is fully installed.
+        // Reload it here instead of trusting the pre-download snapshot:
+        // another updater (e.g. a serve-mode sitter's periodic check running
+        // next to a CLI `intentd update`) may have installed an equal or
+        // newer version while we were downloading, and overwriting its state
+        // entry would activate a downgrade on the next (re)spawn. `force`
+        // skips the guard — it is the explicit downgrade path.
         let mut new_state = state::load(&self.paths.state_path);
+        if !force {
+            if let Some(current) = new_state.current_version.as_deref() {
+                // Strictly newer only: an equal version is our own reinstall
+                // (or an identical concurrent install) and must still commit;
+                // `install_version` above already made `version`'s binary
+                // exist, so an "is current installed?" check can't be used
+                // here. Unparseable `current` never wins.
+                if self.paths.daemon_binary(current).exists()
+                    && manifest_is_newer(current, version).unwrap_or(false)
+                {
+                    // Lost the race: keep the winner's state. Our orphaned
+                    // `versions/<version>/` dir is swept by a later prune.
+                    return Ok(UpdateOutcome::AlreadyCurrent {
+                        version: current.to_string(),
+                    });
+                }
+            }
+        }
         let previous = new_state.current_version.take();
         new_state.channel = channel;
         new_state.current_version = Some(version.to_string());
         state::save(&self.paths.state_path, &new_state)?;
 
         self.prune(version, previous.as_deref());
-        Ok(())
+        Ok(UpdateOutcome::Installed {
+            version: version.to_string(),
+            previous,
+        })
     }
 
     /// Fetch and parse the channel manifest, trying each configured base
