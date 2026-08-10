@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.6] - 2026-08-10
+
+### 🚀 Features
+
+- Real streaming progress for cache ensure + submodules ([#1069](https://github.com/intent-hq/intentd/pull/1069))
+- Remove the cortex feature-code gate ([#1068](https://github.com/intent-hq/intentd/pull/1068))
+- Cancel active PR monitors in the workspace.archive sweep ([#1067](https://github.com/intent-hq/intentd/pull/1067))
+- Machine-readable listener-down discriminator on pairing.getInfo ([#1065](https://github.com/intent-hq/intentd/pull/1065))
+- Ls-remote fallback for github.branches.listCached ([#1072](https://github.com/intent-hq/intentd/pull/1072))
+
+### 🐛 Bug Fixes
+
+- Non-blocking cached-branch read during in-flight clone ([#1071](https://github.com/intent-hq/intentd/pull/1071))
+
+### 🧪 Testing
+
+- *(intentd)* WSS e2e for create-scoped progress frames ([#1073](https://github.com/intent-hq/intentd/pull/1073))
+
+
 ## [0.6.5] - 2026-08-10
 
 ### 🚀 Features
