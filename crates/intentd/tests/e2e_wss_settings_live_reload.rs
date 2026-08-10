@@ -80,10 +80,20 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         common::enable_ws_api(data_dir);
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    // Guarantee the config-watcher readiness marker (INFO, target `intentd`)
+    // reaches daemon.log even when the caller's RUST_LOG is stricter (e.g.
+    // `warn`): append a crate-scoped directive, which EnvFilter resolves in
+    // favor of the more specific target. `await_config_watcher_ready` gates
+    // on that marker.
+    let rust_log = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.is_empty() => format!("{v},intentd=info"),
+        _ => "info".to_string(),
+    };
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("RUST_LOG", rust_log)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
