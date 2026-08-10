@@ -45,18 +45,27 @@ impl Store {
     }
 
     /// Bulk [`upsert_script`](Self::upsert_script): insert or replace many
-    /// definitions in chunked multi-row statements, so persisting N scripts
-    /// costs O(1) statements instead of N (intent-hq/monorepo#1778 — the
-    /// `script.list` bootstrap used to trip the per-dispatch statement budget
-    /// with one INSERT per repo-config script). Chunked to stay under the
-    /// bundled SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32766 since 3.32).
+    /// definitions in chunked multi-row statements inside one transaction, so
+    /// persisting N scripts costs O(1) statements and is all-or-nothing
+    /// (intent-hq/monorepo#1778 — the `script.list` bootstrap used to trip the
+    /// per-dispatch statement budget with one INSERT per repo-config script).
+    /// Chunked to stay under the bundled SQLite's `SQLITE_MAX_VARIABLE_NUMBER`
+    /// (32766 since 3.32).
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
-        // 12 bound values per row (SCRIPT_COLUMNS); 2048 rows = 24576 binds,
-        // well under the 32766 cap. One chunk covers any plausible repo
-        // config, so the caller's statement count stays flat.
+        // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
+        // row and chunk math cannot drift if the persisted set changes.
+        // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
+        // covers any plausible repo config, so the statement count stays flat.
         const ROWS_PER_STATEMENT: usize = 2048;
+        let binds_per_row = SCRIPT_COLUMNS.split(',').count();
+        let row = format!("({})", vec!["?"; binds_per_row].join(","));
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("bulk upsert scripts begin failed: {e}")))?;
         for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
-            let placeholders = vec!["(?,?,?,?,?,?,?,?,?,?,?,?)"; chunk.len()].join(",");
+            let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
                 format!("INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES {placeholders}");
             let mut query = sqlx::query(&sql);
@@ -76,10 +85,13 @@ impl Store {
                     .bind(&s.updated_at);
             }
             query
-                .execute(self.write_pool())
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("bulk upsert scripts failed: {e}")))?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
         Ok(())
     }
 
