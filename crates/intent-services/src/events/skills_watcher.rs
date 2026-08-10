@@ -143,7 +143,10 @@ impl SkillsWatcher {
     async fn barrier(&self) {
         let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
         let _ = self.raw_tx.send(SkillsMsg::Barrier(ack_tx));
-        let _ = tokio::time::timeout(crate::events::LIVENESS, ack_rx.recv()).await;
+        tokio::time::timeout(crate::events::LIVENESS, ack_rx.recv())
+            .await
+            .expect("skills debounce loop did not ack barrier within LIVENESS")
+            .expect("skills debounce loop dropped before acking barrier");
     }
 
     /// Resume a suspended workspace (unarchive): re-watch the project tier and
