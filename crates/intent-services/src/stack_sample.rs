@@ -89,10 +89,74 @@ pub async fn sample_stacks(
     }
 }
 
+/// Pre-capture snapshot of the process-wide `SIGPROF` disposition and
+/// `ITIMER_PROF` timer. `pprof`'s guard drop does not restore the prior
+/// state — it sets `SIGPROF` to ignore and clears the timer — so without
+/// this snapshot one call would permanently disable any external CPU
+/// profiler already attached to the daemon.
+#[cfg(unix)]
+struct SigprofSnapshot {
+    action: libc::sigaction,
+    timer: libc::itimerval,
+}
+
+#[cfg(unix)]
+fn snapshot_sigprof() -> Option<SigprofSnapshot> {
+    // SAFETY: null `act` reads the current disposition without changing it;
+    // `getitimer` only reads. Both write into locally owned zeroed structs.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        let mut timer: libc::itimerval = std::mem::zeroed();
+        if libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut action) != 0 {
+            return None;
+        }
+        if libc::getitimer(libc::ITIMER_PROF, &mut timer) != 0 {
+            return None;
+        }
+        Some(SigprofSnapshot { action, timer })
+    }
+}
+
+/// Reinstate an external profiler captured by [`snapshot_sigprof`]. Only a
+/// real prior handler is restored: when none existed, `pprof`'s post-drop
+/// state (`SIGPROF` ignored, timer cleared) is kept — restoring `SIG_DFL`
+/// would turn any stray late `SIGPROF` into process termination.
+#[cfg(unix)]
+struct RestoreSigprof(Option<SigprofSnapshot>);
+
+#[cfg(unix)]
+impl Drop for RestoreSigprof {
+    fn drop(&mut self) {
+        let Some(snap) = &self.0 else { return };
+        let had_handler =
+            snap.action.sa_sigaction != libc::SIG_DFL && snap.action.sa_sigaction != libc::SIG_IGN;
+        if !had_handler {
+            return;
+        }
+        let timer_armed = snap.timer.it_value.tv_sec != 0
+            || snap.timer.it_value.tv_usec != 0
+            || snap.timer.it_interval.tv_sec != 0
+            || snap.timer.it_interval.tv_usec != 0;
+        // SAFETY: reinstates a disposition/timer that were live on this
+        // process moments ago; handler before timer so no SIGPROF is
+        // delivered to a not-yet-restored handler.
+        unsafe {
+            let _ = libc::sigaction(libc::SIGPROF, &snap.action, std::ptr::null_mut());
+            if timer_armed {
+                let _ = libc::setitimer(libc::ITIMER_PROF, &snap.timer, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 /// Blocking capture: install the profiler guard, sleep the window, then
 /// build and render the report. Runs on the blocking pool only.
 #[cfg(unix)]
 fn capture(duration_ms: i64, frequency_hz: i64) -> Result<serde_json::Value> {
+    // Declared before the guard so it drops after it: the guard's drop wipes
+    // the SIGPROF state, then this reinstates any external profiler.
+    let _restore = RestoreSigprof(snapshot_sigprof());
+
     // Blocklist per pprof guidance: unwinding through these from the signal
     // handler risks deadlocks on their internal locks.
     let guard = pprof::ProfilerGuardBuilder::default()
@@ -227,6 +291,48 @@ mod tests {
         {
             let err = result.expect_err("unsupported off unix");
             assert!(matches!(err, Error::Unsupported(_)));
+        }
+    }
+
+    /// A pre-existing external `SIGPROF` handler (an attached CPU profiler)
+    /// survives a sampling session: `pprof`'s guard drop wipes the SIGPROF
+    /// disposition, and `RestoreSigprof` must reinstate the prior handler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preexisting_sigprof_handler_is_restored() {
+        let _serial = CAPTURE_SERIAL.lock().await;
+
+        extern "C" fn external_handler(_: libc::c_int) {}
+
+        // SAFETY: installs/reads SIGPROF dispositions on this test process
+        // only; serialized with the other capture tests via CAPTURE_SERIAL.
+        unsafe {
+            let mut external: libc::sigaction = std::mem::zeroed();
+            external.sa_sigaction = external_handler as *const () as usize;
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGPROF, &external, &mut previous),
+                0,
+                "install external handler"
+            );
+
+            sample_stacks(Some(0), Some(99))
+                .await
+                .expect("sampling succeeds");
+
+            let mut after: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGPROF, std::ptr::null(), &mut after),
+                0,
+                "read disposition after sampling"
+            );
+            // Put the original disposition back before asserting.
+            libc::sigaction(libc::SIGPROF, &previous, std::ptr::null_mut());
+
+            assert_eq!(
+                after.sa_sigaction, external_handler as *const () as usize,
+                "external SIGPROF handler must be restored after sampling"
+            );
         }
     }
 
