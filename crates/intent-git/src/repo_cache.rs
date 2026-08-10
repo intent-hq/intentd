@@ -45,7 +45,7 @@ const CACHE_CLONE_TIMEOUT: Duration = Duration::from_secs(300);
 const CACHE_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Poll interval while waiting for a shelled-out git child to exit.
-const GIT_POLL: Duration = Duration::from_millis(50);
+pub(crate) const GIT_POLL: Duration = Duration::from_millis(50);
 
 /// Raw output chunk callback for a streamed git child: called once per
 /// `\r`/`\n`-delimited chunk of the child's stderr (and stdout, where the

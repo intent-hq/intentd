@@ -236,6 +236,12 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override for the remote URL base the
+    /// `github.branches.listCached` ls-remote fallback targets. Production
+    /// composition leaves this `None` (`https://github.com`); tests point it
+    /// at a `file://` directory of `<owner>/<repo>.git` fixtures so the
+    /// fallback path never touches the network.
+    branches_ls_remote_base: Option<String>,
     /// Test-only override for npx discovery on the one-shot ACP route
     /// (`agent.completeOnce` §5.32). Outer `None` (production) resolves via
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
@@ -669,6 +675,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            branches_ls_remote_base: None,
             one_shot_npx: None,
             auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
@@ -2308,6 +2315,15 @@ impl Services {
     /// so the one-shot CLI path is deterministic.
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
+        self
+    }
+
+    /// Override the remote URL base the `github.branches.listCached`
+    /// ls-remote fallback targets (production: `https://github.com`). Tests
+    /// point it at a `file://` directory of `<owner>/<repo>.git` fixtures so
+    /// the fallback path never touches the network.
+    pub fn with_branches_ls_remote_base(mut self, base: String) -> Self {
+        self.branches_ls_remote_base = Some(base);
         self
     }
 
@@ -19567,12 +19583,15 @@ impl WorkspaceApi for Services {
             .configured_worktrees_location()
             .or_else(|| self.workspaces_root.clone())
             .unwrap_or_else(default_workspaces_root);
+        let registry = self.settings_registry.clone();
+        let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
             let cache_root = cache_parent.join(".repo-cache");
             match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
                 Some(cached) => {
                     let mut result = serde_json::json!({
                         "cached": true,
+                        "source": "cache",
                         "branches": cached.branches,
                     });
                     // `defaultBranch` is optional on the wire: omitted (not
@@ -19582,10 +19601,41 @@ impl WorkspaceApi for Services {
                     }
                     Ok(result)
                 }
-                None => Ok(serde_json::json!({
-                    "cached": false,
-                    "branches": [],
-                })),
+                // Cold cache: fall back to one `git ls-remote` against the
+                // GitHub remote (monorepo#1955) — one child process, one
+                // round-trip, token offered via env exactly like the clone
+                // pipeline. Any failure (offline, missing repo, no access)
+                // folds to the pre-fallback `{ cached: false, branches: [] }`
+                // — this method never errors for the FE seam.
+                None => {
+                    let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
+                    let url = format!("{base}/{owner}/{repo}.git");
+                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                    match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+                        Ok(remote) => {
+                            let mut result = serde_json::json!({
+                                "cached": false,
+                                "source": "ls-remote",
+                                "branches": remote.branches,
+                            });
+                            if let Some(default) = remote.default_branch {
+                                result["defaultBranch"] = serde_json::Value::String(default);
+                            }
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                owner = %owner,
+                                repo = %repo,
+                                "branches.listCached ls-remote fallback failed: {e}"
+                            );
+                            Ok(serde_json::json!({
+                                "cached": false,
+                                "branches": [],
+                            }))
+                        }
+                    }
+                }
             }
         })
     }
