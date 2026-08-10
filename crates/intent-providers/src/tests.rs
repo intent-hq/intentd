@@ -95,7 +95,8 @@ fn registry_field_parity() {
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");
-    assert_eq!(cortex.requires_feature_code, Some("cortex"));
+    // Un-gated (monorepo#1902): cortex carries no feature code.
+    assert_eq!(cortex.requires_feature_code, None);
 
     let oc = find_provider("opencode").unwrap();
     assert_eq!(oc.base_args, &["acp"]);
