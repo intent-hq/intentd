@@ -26,6 +26,7 @@ use intent_core::events::{
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, UsageCost, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -1994,6 +1995,11 @@ impl Services {
                 // PR monitors (omitted when none).
                 self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
                     .await;
+                // Archived-workspace suppression hint: stamp
+                // `workspaceArchived: true` (omitted when not archived) so
+                // notification clients stay quiet for parked workspaces.
+                self.annotate_workspace_archived(workspace_id, &mut data)
+                    .await;
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -2372,10 +2378,41 @@ impl Services {
         // active monitor).
         self.annotate_waiting_on_pr_monitors(agent_id, &mut data)
             .await;
+        // Same archived-workspace suppression hint as the prompt-turn idle
+        // (omitted when the workspace is not archived).
+        self.annotate_workspace_archived(workspace_id, &mut data)
+            .await;
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
             .await;
+    }
+
+    /// Stamp `workspaceArchived: true` on an `agent:idle` payload when the
+    /// containing workspace's status is `Archived`, so notification clients
+    /// can suppress "agent finished" alerts for parked workspaces without a
+    /// follow-up `workspace.get` read. Omitted when not archived — absent ≠
+    /// present-false (additive field; older-payload readers are unaffected).
+    /// Best-effort: a workspace read failure omits the field and the event
+    /// still fires with the base payload.
+    pub(crate) async fn annotate_workspace_archived(
+        &self,
+        workspace_id: &WorkspaceId,
+        data: &mut Value,
+    ) {
+        match self.store.get_workspace(workspace_id).await {
+            Ok(ws) if ws.status == WorkspaceStatus::Archived => {
+                data["workspaceArchived"] = Value::Bool(true);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    workspace = %workspace_id,
+                    error = %e,
+                    "agent:idle workspaceArchived stamp: workspace read failed; omitting"
+                );
+            }
+        }
     }
 
     /// Persist a standalone ACP `usage_update` cost (§5.23), ordered against

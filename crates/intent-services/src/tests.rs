@@ -22189,7 +22189,7 @@ mod last_activity_events {
 /// unread. On a session-load error the gate FAILS OPEN (raise anyway).
 #[cfg(test)]
 mod turn_end_unread_gate {
-    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId, WorkspaceStatus};
     use intent_store::Store;
 
     use super::{workspace, TempDb};
@@ -22220,7 +22220,7 @@ mod turn_end_unread_gate {
         }
     }
 
-    fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+    pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
             id: agent_id.clone(),
             workspace_id: ws.clone(),
@@ -22345,6 +22345,207 @@ mod turn_end_unread_gate {
         assert!(
             should_raise_turn_end_unread(&h.services, &agent_id).await,
             "the gate fails open on a genuine store error"
+        );
+    }
+
+    /// A top-level foreground agent finishing its drain in an ARCHIVED
+    /// workspace must NOT raise the blue dot: the user parked the
+    /// workspace, so turn ends there stay quiet until unarchive.
+    #[tokio::test]
+    async fn archived_workspace_skips_raise() {
+        let h = harness().await;
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.status = WorkspaceStatus::Archived;
+        row.archived = true;
+        h.store
+            .insert_workspace(&row)
+            .await
+            .expect("seed archived workspace");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &ws))
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an archived workspace must not get the turn-end blue dot"
+        );
+    }
+
+    /// A workspace-read failure FAILS OPEN (raise anyway), same rationale
+    /// as the session-read fault: a missed blue dot for a real top-level
+    /// turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn workspace_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+            .execute(h.store.write_pool())
+            .await
+            .expect("rename workspace table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the archived gate fails open on a workspace store error"
+        );
+    }
+}
+
+/// Regression tests for the `workspaceArchived` `agent:idle` suppression
+/// hint: `annotate_workspace_archived` stamps `workspaceArchived: true` iff
+/// the workspace row's status is `Archived` — omitted when active (absent ≠
+/// present-false, additive) and omitted on a failed workspace read — and
+/// `publish_harness_wake_idle` carries the stamp end-to-end on the emitted
+/// event (the prompt-turn idle stamps through the same helper).
+#[cfg(test)]
+mod idle_workspace_archived_stamp {
+    use std::time::Duration;
+
+    use intent_core::events::AGENT_IDLE;
+    use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+    use tokio::time::timeout;
+
+    use super::turn_end_unread_gate::session;
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+        }
+    }
+
+    /// Seed a workspace row; `archived` controls the lifecycle status.
+    async fn seed_workspace(h: &Harness, archived: bool) -> WorkspaceId {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        if archived {
+            row.status = WorkspaceStatus::Archived;
+            row.archived = true;
+        }
+        h.store
+            .insert_workspace(&row)
+            .await
+            .expect("seed workspace");
+        ws
+    }
+
+    #[tokio::test]
+    async fn stamps_true_when_archived() {
+        let h = harness().await;
+        let ws = seed_workspace(&h, true).await;
+        let mut data = json!({});
+        h.services.annotate_workspace_archived(&ws, &mut data).await;
+        assert_eq!(
+            data["workspaceArchived"],
+            json!(true),
+            "archived workspace stamps workspaceArchived: true"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_when_active() {
+        let h = harness().await;
+        let ws = seed_workspace(&h, false).await;
+        let mut data = json!({});
+        h.services.annotate_workspace_archived(&ws, &mut data).await;
+        assert!(
+            data.get("workspaceArchived").is_none(),
+            "an active workspace omits the field entirely: {data}"
+        );
+    }
+
+    /// Best-effort: a failed workspace read (missing row) omits the field
+    /// rather than erroring or stamping false.
+    #[tokio::test]
+    async fn omitted_on_workspace_read_failure() {
+        let h = harness().await;
+        let missing = WorkspaceId::new();
+        let mut data = json!({});
+        h.services
+            .annotate_workspace_archived(&missing, &mut data)
+            .await;
+        assert!(
+            data.get("workspaceArchived").is_none(),
+            "a workspace read failure omits the field: {data}"
+        );
+    }
+
+    fn subscribe_idle(h: &Harness, ws: &WorkspaceId) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            event_types: vec![AGENT_IDLE.to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_idle(sub: &mut Subscription) -> Value {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("agent:idle delivered")
+            .expect("subscription open");
+        assert!(!batch.is_empty());
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    /// The harness-wake idle emit carries the stamp end-to-end: present
+    /// (`true`) for an archived workspace, absent for an active one.
+    #[tokio::test]
+    async fn harness_wake_idle_carries_stamp() {
+        let h = harness().await;
+
+        let archived_ws = seed_workspace(&h, true).await;
+        let archived_agent = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&archived_agent, &archived_ws))
+            .await
+            .expect("insert archived-ws session");
+        let mut sub = subscribe_idle(&h, &archived_ws);
+        h.services
+            .publish_harness_wake_idle(&archived_agent, &archived_ws)
+            .await;
+        let ev = recv_idle(&mut sub).await;
+        assert_eq!(ev["type"], AGENT_IDLE);
+        assert_eq!(
+            ev["data"]["workspaceArchived"],
+            json!(true),
+            "archived-workspace idle carries workspaceArchived: true: {ev}"
+        );
+
+        let active_ws = seed_workspace(&h, false).await;
+        let active_agent = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&active_agent, &active_ws))
+            .await
+            .expect("insert active-ws session");
+        let mut sub = subscribe_idle(&h, &active_ws);
+        h.services
+            .publish_harness_wake_idle(&active_agent, &active_ws)
+            .await;
+        let ev = recv_idle(&mut sub).await;
+        assert!(
+            ev["data"].get("workspaceArchived").is_none(),
+            "active-workspace idle omits workspaceArchived: {ev}"
         );
     }
 }
