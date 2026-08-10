@@ -110,6 +110,14 @@ impl CliAuthProbe {
 ///
 /// The generic (exit-code) arm nulls stdout and stderr — auggie's `token print`
 /// probe prints the auth session secret, so its output must never be captured.
+///
+/// Every arm spawns via [`probe_command`], which prepends the resolved
+/// binary's own directory to the child's PATH (monorepo#1863): an
+/// nvm-installed CLI's `#!/usr/bin/env node` shebang resolves the sibling
+/// `node` even when the daemon's PATH (systemd user unit) carries none. An
+/// exit of 127 (command-resolution failure) means the probe could not run at
+/// all, so it maps to [`CliAuthProbe::Failed`] — never to
+/// [`CliAuthProbe::NotAuthenticated`].
 pub async fn check_provider_auth_cli(
     provider_id: &str,
     program: &OsStr,
@@ -117,7 +125,7 @@ pub async fn check_provider_auth_cli(
 ) -> CliAuthProbe {
     match provider_id {
         "grok" => {
-            let mut cmd = tokio::process::Command::new(program);
+            let mut cmd = probe_command(program);
             cmd.args(auth_check_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -138,13 +146,14 @@ pub async fn check_provider_auth_cli(
             }
         }
         "opencode" => {
-            let mut cmd = tokio::process::Command::new(program);
+            let mut cmd = probe_command(program);
             cmd.args(auth_check_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
             match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if could_not_run(&output.status) => CliAuthProbe::Failed,
                 Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
                 Ok(Ok(output)) => {
                     if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
@@ -158,7 +167,7 @@ pub async fn check_provider_auth_cli(
             }
         }
         _ => {
-            let mut cmd = tokio::process::Command::new(program);
+            let mut cmd = probe_command(program);
             cmd.args(auth_check_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -166,12 +175,50 @@ pub async fn check_provider_auth_cli(
                 .kill_on_drop(true);
             match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.status()).await {
                 Ok(Ok(status)) if status.success() => CliAuthProbe::Authenticated,
+                Ok(Ok(status)) if could_not_run(&status) => CliAuthProbe::Failed,
                 Ok(Ok(_)) => CliAuthProbe::NotAuthenticated,
                 Ok(Err(_)) => CliAuthProbe::Failed,
                 Err(_) => CliAuthProbe::TimedOut,
             }
         }
     }
+}
+
+/// Base command for a CLI auth probe: the resolved binary spawned with the
+/// enhanced PATH — its own parent directory prepended, then the enriched
+/// tool dirs and the inherited PATH ([`intent_providers::enhanced_path`],
+/// the same env the provider session / model-catalog probe spawns use). The
+/// discovery tiers (intentd#1045) can find a binary in a directory the
+/// daemon's PATH does not carry (an nvm versions bin dir under a systemd
+/// user unit); spawning with the bare daemon env then fails with exit 127
+/// because `#!/usr/bin/env node` cannot resolve the sibling `node`
+/// (monorepo#1863).
+///
+/// A path-shaped `program` (more than one component — e.g. a relative
+/// `providers.paths.*` override, which `resolve_auggie_override` accepts as
+/// any existing file) is lexically absolutized first (no symlink
+/// resolution): `enhanced_path` only prepends the parent dir of an absolute
+/// path. A bare name (doctor's fallback when discovery has no resolved
+/// path) is passed through untouched — absolutizing it would put the
+/// process CWD at the head of the child's PATH.
+fn probe_command(program: &OsStr) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    let program_path = std::path::Path::new(program);
+    let program_path = if program_path.components().count() > 1 {
+        std::path::absolute(program_path).unwrap_or_else(|_| program_path.to_path_buf())
+    } else {
+        program_path.to_path_buf()
+    };
+    cmd.env("PATH", intent_providers::enhanced_path(Some(&program_path)));
+    cmd
+}
+
+/// Whether an exit status is the shell/loader command-resolution failure
+/// code (127 — e.g. `env: 'node': No such file or directory` from a
+/// Node-shebang CLI). Such a probe never ran the CLI's auth check, so it
+/// carries no auth verdict.
+fn could_not_run(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(127)
 }
 
 /// Map a parsed `grok models` run to a probe outcome. Explicit markers win;
@@ -515,6 +562,89 @@ mod tests {
                 check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
             assert_eq!(probe, expected, "stub {name}");
         }
+    }
+
+    /// monorepo#1863 regression: the probe child's PATH must carry the
+    /// resolved binary's own directory so an nvm-installed CLI's
+    /// `#!/usr/bin/env node` shebang resolves the sibling `node`. The stub
+    /// execs a bare-named sibling that only resolves through that prepended
+    /// directory (it exists nowhere on the inherited PATH) — before the fix
+    /// the spawn exited 127 and the probe reported NotAuthenticated.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_child_path_carries_resolved_binary_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("path-prepend");
+        let sibling = dir.path().join("intent-test-sibling-node");
+        std::fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stub = dir.path().join("auggie");
+        std::fs::write(&stub, "#!/bin/sh\nexec intent-test-sibling-node\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+        assert_eq!(probe, CliAuthProbe::Authenticated);
+    }
+
+    /// monorepo#1863 regression: exit 127 is a command-resolution failure —
+    /// the probe never ran the CLI's auth check — so it maps to Failed
+    /// (`authenticated: null` on the wire), never to NotAuthenticated. Pinned
+    /// on both exit-code arms (generic and opencode).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_127_is_probe_failure_not_logged_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("exit-127");
+        let stub = dir.path().join("stub-cli");
+        std::fs::write(&stub, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for provider_id in ["auggie", "opencode"] {
+            let probe = check_provider_auth_cli(provider_id, stub.as_os_str(), &["status"]).await;
+            assert_eq!(probe, CliAuthProbe::Failed, "provider {provider_id}");
+            assert_eq!(probe.auth_status(), None, "provider {provider_id}");
+        }
+    }
+
+    /// Reads the PATH env `probe_command` sets on the child (no spawn).
+    fn probe_command_child_path(program: &str) -> String {
+        probe_command(std::ffi::OsStr::new(program))
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .expect("probe_command sets PATH")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// monorepo#1863 follow-up (PR review): a relative `providers.paths.*`
+    /// override is a valid resolution, but `enhanced_path` only prepends the
+    /// parent dir of an absolute path — so `probe_command` must lexically
+    /// absolutize a path-shaped program first. Pinned by inspecting the
+    /// child's PATH env directly (no spawn).
+    #[test]
+    fn probe_command_absolutizes_relative_program_for_path() {
+        let path_env = probe_command_child_path("rel-dir/fake-cli");
+        let expected_dir = std::path::absolute("rel-dir").expect("absolutize test dir");
+        let first = path_env
+            .split(if cfg!(windows) { ';' } else { ':' })
+            .next()
+            .expect("PATH has entries");
+        assert_eq!(std::path::Path::new(first), expected_dir);
+    }
+
+    /// Counterpart pin: a bare program name (doctor's fallback when
+    /// discovery has no resolved path) is NOT absolutized — that would put
+    /// the process CWD at the head of the child's PATH, letting a
+    /// CWD-resident binary shadow the real one.
+    #[test]
+    fn probe_command_bare_name_does_not_prepend_cwd() {
+        let path_env = probe_command_child_path("fake-cli");
+        let cwd = std::env::current_dir().expect("cwd");
+        let first = path_env
+            .split(if cfg!(windows) { ';' } else { ':' })
+            .next()
+            .expect("PATH has entries");
+        assert_ne!(std::path::Path::new(first), cwd);
     }
 
     #[test]

@@ -333,17 +333,25 @@ function sessionConfigOptions() {
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
-  // at a file — one JSON line per prompt ({ turn, text }) — so e2e tests can
-  // assert exact outbound prompt assembly (e.g. the FirstTurnPrepend
-  // `<system>` block fires on the first turn of a fresh session and never
-  // repeats). Written BEFORE the turn resolves, so a test that observed the
-  // turn's stream:end can read the line without polling.
+  // at a file — one JSON line per prompt ({ turn, text, blockTypes }) — so
+  // e2e tests can assert exact outbound prompt assembly (e.g. the
+  // FirstTurnPrepend `<system>` block fires on the first turn of a fresh
+  // session and never repeats). `blockTypes` lists each prompt content
+  // block's `type` in order, so tests can assert non-text blocks (e.g. a
+  // redelivered image) reached the wire. Written BEFORE the turn resolves,
+  // so a test that observed the turn's stream:end can read the line without
+  // polling.
   const promptLog = process.env.MOCK_AGENT_PROMPT_LOG;
   if (promptLog) {
     try {
+      const blocks = Array.isArray(params && params.prompt) ? params.prompt : [];
       fs.appendFileSync(
         promptLog,
-        JSON.stringify({ turn: promptCount, text: extractPromptText(params) }) + '\n',
+        JSON.stringify({
+          turn: promptCount,
+          text: extractPromptText(params),
+          blockTypes: blocks.map((b) => (b && typeof b.type === 'string' ? b.type : '')),
+        }) + '\n',
       );
     } catch (err) {
       log(`prompt log write failed: ${err.message}`);

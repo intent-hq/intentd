@@ -1193,6 +1193,20 @@ pub struct AgentManager {
     /// exactly once — the duplicate is acknowledged idempotently instead of
     /// cancelling the interrupt turn it raced and re-persisting the message.
     interrupt_ids: Arc<Mutex<HashMap<AgentId, String>>>,
+    /// Pending prompt-only redelivery payloads armed by a zero-output user
+    /// stop (intent-hq/monorepo#1757): a plain `agent.stop` cancelling a turn
+    /// that produced NO assistant output drops the turn's user message
+    /// provider-side (`session/cancel` discards the in-flight prompt), so the
+    /// stopped message's text + attachments are captured here and merged into
+    /// the NEXT turn's `prepend_*` options by [`AgentManager::spawn_worker`]
+    /// — the same combined-delivery semantics the interrupt-priority
+    /// preemption path gets from [`AgentManager::preempt_busy_turn`]
+    /// (monorepo#1014). Prompt-only: the user row is already persisted, so
+    /// nothing is appended to the transcript. Armed on both the keep-alive
+    /// interrupt path and the spawn-window fallback-to-kill path; cleared by
+    /// [`AgentManager::edit_and_regenerate`] (the truncation may remove the
+    /// captured message, and the recreate's history replay covers survivors).
+    stop_redelivery: Arc<Mutex<HashMap<AgentId, crate::agent_ops::QueuedPrepend>>>,
     /// Agents whose NEXT session establishment must SKIP the `session/load`
     /// resume and open a fresh `session/new` instead — armed by
     /// [`AgentManager::edit_and_regenerate`] (immediately after target
@@ -1299,6 +1313,7 @@ impl AgentManager {
             recreated: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
+            stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
@@ -2876,6 +2891,21 @@ impl AgentManager {
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
+        self.detach_with_redelivery(agent_id, None).await
+    }
+
+    /// [`AgentManager::detach`] with an optional pre-derived zero-output
+    /// stop-redelivery payload (intent-hq/monorepo#1757) to install in place
+    /// of the default drop. `stop_with_redelivery_arm` (the spawn-window user
+    /// stop) passes `Some`: the payload must be visible BEFORE `end_turn`
+    /// releases the busy slot, because a concurrent send claims the slot the
+    /// moment it frees and its worker spawn consumes the map right then —
+    /// arming after the teardown (the previous shape) lost that race.
+    async fn detach_with_redelivery(
+        &self,
+        agent_id: &AgentId,
+        redelivery: Option<crate::agent_ops::QueuedPrepend>,
+    ) -> (bool, Option<(Child, Option<u32>)>) {
         // Snapshot the live-turn slot BEFORE aborting the worker (the abort
         // drops LiveTurnGuard, clearing the slot), then flush the partial
         // in-flight assistant content AFTER the abort — same convention as
@@ -2902,8 +2932,25 @@ impl AgentManager {
         // Drop any pending recreate/prepend flags: the next spawn re-decides
         // resume vs recreate from scratch, so stale flags must not survive a
         // teardown (a session/load resume must not fire a stale prepend).
+        // The zero-output stop-redelivery payload (intent-hq/monorepo#1757)
+        // is dropped on the same terms — a hard teardown's next session is
+        // either recreated (history replay covers the stopped message) or the
+        // agent is being deleted — UNLESS the caller pre-derived a payload
+        // (the spawn-window user stop), which is installed here so it is
+        // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
+        {
+            let mut armed = self.stop_redelivery.lock().unwrap();
+            match redelivery {
+                Some(payload) => {
+                    armed.insert(agent_id.clone(), payload);
+                }
+                None => {
+                    armed.remove(agent_id);
+                }
+            }
+        }
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
@@ -2968,7 +3015,7 @@ impl AgentManager {
         let Some(conn) = conn else {
             // No live session to interrupt → keep-alive is a no-op; fall back to
             // the hard kill path (itself a no-op when the agent is already gone).
-            return (self.stop(agent_id).await, None);
+            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
         };
         // Resolve the persisted session for the workspace (terminal event) + the
         // `acpSessionId` to cancel. Without an `acpSessionId` there is no
@@ -2976,13 +3023,20 @@ impl AgentManager {
         let session = self.services.store.get_agent_session(agent_id).await.ok();
         let acp_session_id = session.as_ref().and_then(|s| s.acp_session_id.clone());
         let Some(acp_session_id) = acp_session_id else {
-            return (self.stop(agent_id).await, None);
+            return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
         };
         // Snapshot the live-turn slot BEFORE aborting the worker: the abort
         // drops the worker future and with it the LiveTurnGuard, which clears
         // the slot — reading after the abort would race that drop and
-        // frequently lose the partial content.
+        // frequently lose the partial content. The busy flag is snapshotted
+        // alongside (before `end_turn` below releases it) for the zero-output
+        // stop-redelivery arm at the bottom of this method.
         let partial_turn = self.services.live_turn(agent_id);
+        let turn_in_flight = self.is_busy(agent_id);
+        let had_output = partial_turn
+            .as_ref()
+            .map(|live| !live.blocks.is_empty())
+            .unwrap_or(false);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
@@ -3020,6 +3074,21 @@ impl AgentManager {
             }
             None => None,
         };
+        // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
+        // provider turn dropped the stopped message before producing any
+        // output, so arm the prompt-only redelivery payload for the NEXT
+        // turn (consumed in `spawn_worker`). Armed HERE — after the marker
+        // row flush (so its id is known for exclusion) but BEFORE `end_turn`
+        // below releases the busy slot — so a concurrent send that claims
+        // the slot the moment it frees cannot spawn before the payload is
+        // visible. Only the plain `agent.stop` keep-alive path (`UserStop`)
+        // arms it — the message-preemption path threads the same payload
+        // through `preempt_busy_turn`'s combined delivery, and
+        // shutdown/suspend interrupts have their own resume semantics.
+        if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
+            self.arm_stop_redelivery(agent_id, interrupted_message_id.as_ref())
+                .await;
+        }
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
         // best-effort — a wire error never blocks the stop.
@@ -3162,6 +3231,80 @@ impl AgentManager {
             }
         }
         (true, interrupted_message_id)
+    }
+
+    /// Derive the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
+    /// from the transcript's last user row. Returns `None` when the turn
+    /// already progressed (any non-user row after the last user message —
+    /// same bounded check as `preempt_busy_turn`'s combined delivery, with
+    /// the just-persisted EMPTY interrupted marker row excluded by id) or
+    /// when the row carries nothing to redeliver.
+    async fn derive_stop_redelivery(
+        &self,
+        agent_id: &AgentId,
+        marker_row_id: Option<&String>,
+    ) -> Option<crate::agent_ops::QueuedPrepend> {
+        let messages = self
+            .services
+            .store
+            .get_agent_messages(agent_id, Some(10))
+            .await
+            .ok()?;
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user")?;
+        if turn_progressed_after(&messages, last_user_idx, marker_row_id) {
+            return None;
+        }
+        let payload = extract_user_prepend(&messages[last_user_idx].content);
+        if payload.content.is_none()
+            && payload.image_blocks.is_none()
+            && payload.file_blocks.is_none()
+        {
+            return None;
+        }
+        Some(payload)
+    }
+
+    /// Arm the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
+    /// for consumption by the next `spawn_worker`. A repeat stop before the
+    /// payload is consumed re-derives the same last user row, so the insert
+    /// stays idempotent. MUST run before the busy slot is released
+    /// (`end_turn`): a concurrent send claims the slot the moment it frees,
+    /// and its worker spawn must see the payload.
+    async fn arm_stop_redelivery(&self, agent_id: &AgentId, marker_row_id: Option<&String>) {
+        if let Some(payload) = self.derive_stop_redelivery(agent_id, marker_row_id).await {
+            self.stop_redelivery
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), payload);
+        }
+    }
+
+    /// Hard-stop fallback for the interrupt paths (no live handle /
+    /// `acpSessionId` — the spawn window): derive the zero-output stop
+    /// redelivery for a user stop, then run the [`AgentManager::stop`]
+    /// teardown with the payload installed BEFORE `detach` releases the busy
+    /// slot — a concurrent send claiming the freed slot must already see it
+    /// (the same ordering `interrupt_inner` observes on the keep-alive path).
+    /// The payload is derived from the pre-flush transcript (no marker row
+    /// persisted yet, so there is no marker id to exclude and the progressed
+    /// check sees the true turn state).
+    async fn stop_with_redelivery_arm(&self, agent_id: &AgentId, reason: InterruptReason) -> bool {
+        let turn_in_flight = self.is_busy(agent_id);
+        let had_output = self
+            .services
+            .live_turn(agent_id)
+            .map(|live| !live.blocks.is_empty())
+            .unwrap_or(false);
+        let redelivery = if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
+            self.derive_stop_redelivery(agent_id, None).await
+        } else {
+            None
+        };
+        let (removed, child) = self.detach_with_redelivery(agent_id, redelivery).await;
+        if let Some((child, spawn_pid)) = child {
+            kill_child_tree(child, spawn_pid).await;
+        }
+        removed
     }
 
     /// Whether a turn loop is currently in flight for `agent_id` (consulted by
@@ -4362,6 +4505,10 @@ impl AgentManager {
         // Arm `recreated` AFTER `stop` (which clears it): it makes the next
         // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
+        // Drop any pending zero-output stop redelivery
+        // (intent-hq/monorepo#1757): the truncation may have removed the
+        // captured message, and the history replay above covers survivors.
+        self.stop_redelivery.lock().unwrap().remove(&agent_id);
         // Explicit user action (question hold, PROTOCOL §5.5): the send is
         // user-origin so it is never held. The truncation above already
         // re-derived the pending-questions marker against the post-truncation
@@ -4584,44 +4731,10 @@ impl AgentManager {
                     );
 
                     if !has_non_user_after {
-                        // Extract text from content blocks (JSON array).
-                        let text_content = if let Some(blocks) = last_user_msg.content.as_array() {
-                            blocks
-                                .iter()
-                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                .collect::<Vec<&str>>()
-                                .join("\n")
-                        } else {
-                            String::new()
-                        };
-
-                        // Extract image_blocks and file_blocks from content.
-                        let image_blocks = last_user_msg.content.as_array().and_then(|blocks| {
-                            let imgs: Vec<Value> = blocks
-                                .iter()
-                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
-                                .cloned()
-                                .collect();
-                            if imgs.is_empty() {
-                                None
-                            } else {
-                                Some(Value::Array(imgs))
-                            }
-                        });
-
-                        let file_blocks = last_user_msg.content.as_array().and_then(|blocks| {
-                            let files: Vec<Value> = blocks
-                                .iter()
-                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("file"))
-                                .cloned()
-                                .collect();
-                            if files.is_empty() {
-                                None
-                            } else {
-                                Some(Value::Array(files))
-                            }
-                        });
+                        // Extract the preempted message's text + attachments
+                        // (shared with the zero-output user-stop redelivery
+                        // arm, intent-hq/monorepo#1757).
+                        let payload = extract_user_prepend(&last_user_msg.content);
 
                         // Prompt-only prepend: both user rows are
                         // already persisted, so nothing is appended to
@@ -4632,18 +4745,22 @@ impl AgentManager {
                         // own `prepend_*`): the entry's older prepend
                         // stays first, the just-preempted message follows
                         // — transcript order, nothing clobbered.
-                        if !text_content.is_empty() {
+                        if let Some(text) = payload.content.filter(|t| !t.is_empty()) {
                             options.prepend_content = Some(match options.prepend_content.take() {
                                 Some(existing) if !existing.is_empty() => {
-                                    format!("{existing}\n\n{text_content}")
+                                    format!("{existing}\n\n{text}")
                                 }
-                                _ => text_content,
+                                _ => text,
                             });
                         }
-                        options.prepend_image_blocks =
-                            merge_block_arrays(options.prepend_image_blocks.take(), image_blocks);
-                        options.prepend_file_blocks =
-                            merge_block_arrays(options.prepend_file_blocks.take(), file_blocks);
+                        options.prepend_image_blocks = merge_block_arrays(
+                            options.prepend_image_blocks.take(),
+                            payload.image_blocks,
+                        );
+                        options.prepend_file_blocks = merge_block_arrays(
+                            options.prepend_file_blocks.take(),
+                            payload.file_blocks,
+                        );
                     }
                 }
             }
@@ -4668,6 +4785,33 @@ impl AgentManager {
         // preserved `turn_id`) keep it.
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
+        }
+        // Consume a pending zero-output stop redelivery
+        // (intent-hq/monorepo#1757): the stopped turn's user message (text +
+        // attachments) is merged into this turn's `prepend_*` options so the
+        // provider — which dropped it on `session/cancel` — sees it ahead of
+        // this turn's own content. Every worker spawn flows through here, so
+        // the payload is consumed by whichever turn runs next (direct send,
+        // queue drain, `sendQueuedMessageNow`, retry redrive). MERGE order:
+        // an entry-carried prepend (an even earlier preempted message riding
+        // a requeued entry) stays FIRST — the armed row is the transcript's
+        // last user row at stop time, so it is the newest prepend payload.
+        // On a recreated session `build_turn_prompt`'s history replay covers
+        // the prepend TEXT (`history_covers_prepend`), same as the
+        // preemption path; attachments are still emitted (history is
+        // text-only).
+        let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
+        if let Some(armed) = armed {
+            if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
+                options.prepend_content = Some(match options.prepend_content.take() {
+                    Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+                    _ => text,
+                });
+            }
+            options.prepend_image_blocks =
+                merge_block_arrays(options.prepend_image_blocks.take(), armed.image_blocks);
+            options.prepend_file_blocks =
+                merge_block_arrays(options.prepend_file_blocks.take(), armed.file_blocks);
         }
         let mgr = self.clone();
         let id = agent_id.clone();
@@ -5989,6 +6133,43 @@ fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOption
     push_file_blocks(blocks, options.prepend_file_blocks.as_ref());
     push_image_blocks(blocks, options.image_blocks.as_ref());
     push_file_blocks(blocks, options.file_blocks.as_ref());
+}
+
+/// Extract a persisted user row's redeliverable payload — its text (joined
+/// `text` blocks), image blocks, and file blocks — as a
+/// [`QueuedPrepend`](crate::agent_ops::QueuedPrepend). Shared by the
+/// zero-output preemption path ([`AgentManager::preempt_busy_turn`],
+/// monorepo#1014) and the zero-output user-stop redelivery arm
+/// (intent-hq/monorepo#1757).
+fn extract_user_prepend(content: &Value) -> crate::agent_ops::QueuedPrepend {
+    let blocks = content.as_array();
+    let text = blocks
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<&str>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let pick = |kind: &str| -> Option<Value> {
+        let items: Vec<Value> = blocks?
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some(kind))
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            None
+        } else {
+            Some(Value::Array(items))
+        }
+    };
+    crate::agent_ops::QueuedPrepend {
+        content: (!text.is_empty()).then_some(text),
+        image_blocks: pick("image"),
+        file_blocks: pick("file"),
+    }
 }
 
 /// Merge two optional JSON block arrays, `first`'s entries preceding

@@ -105,6 +105,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+pub mod stack_sample;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
@@ -8859,6 +8860,14 @@ impl WorkspaceApi for Services {
             }
             Ok(serde_json::Value::Object(caps))
         })
+    }
+
+    fn debug_sample_stacks(
+        &self,
+        duration_ms: Option<i64>,
+        frequency_hz: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { stack_sample::sample_stacks(duration_ms, frequency_hz).await })
     }
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {

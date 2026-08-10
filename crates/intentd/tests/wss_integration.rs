@@ -2469,6 +2469,53 @@ async fn wss_system_capabilities_reports_cow_supported() {
     srv.ws.stop().await;
 }
 
+/// `debug.sampleStacks` (PROTOCOL §5.43, monorepo#1755): point-in-time
+/// sample of the daemon's own thread stacks — no workspaceId, both params
+/// optional and clamped server-side. Asserts the documented result shape
+/// (`report` non-empty string, echoed effective `durationMs`/`frequencyHz`,
+/// numeric `sampleCount`/`distinctStacks`) over the real WSS transport, plus
+/// the `-32602` caller error for a non-numeric param. Unix-only capture —
+/// these test hosts are Unix, so the success path is exercised directly.
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_debug_sample_stacks_returns_report() {
+    let srv = start(WsOptions::default()).await;
+
+    // durationMs below the 100ms floor is clamped, keeping the test fast.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"debug.sampleStacks","params":{"durationMs":1,"frequencyHz":99}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    let result = resp["result"].as_object().expect("result is an object");
+    let report = result["report"].as_str().expect("report is a string");
+    assert!(
+        report.contains("intentd stack sample"),
+        "report carries the header even with zero samples: {resp}"
+    );
+    assert_eq!(result["durationMs"], 100, "clamped to the 100ms floor");
+    assert_eq!(result["frequencyHz"], 99);
+    assert!(result["sampleCount"].is_number(), "sampleCount: {resp}");
+    assert!(
+        result["distinctStacks"].is_number(),
+        "distinctStacks: {resp}"
+    );
+
+    // A present non-numeric param is a caller error, not a silent default.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"debug.sampleStacks","params":{"durationMs":"long"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "non-numeric param: {resp}");
+
+    srv.ws.stop().await;
+}
+
 /// `providers.catalog` (monorepo#928): no params, no workspaceId — the
 /// provider registry is compiled-in daemon data. Asserts the documented
 /// result shape: one row per `ACP_PROVIDERS` entry in registry order,
