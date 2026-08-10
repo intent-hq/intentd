@@ -1,4 +1,5 @@
-//! `host.*` host-services: `checkGit` + `listDirectory` + `directoryStatus`
+//! `host.*` host-services: `checkGit` + `checkNode` + `checkGh`
+//!   + `listDirectory` + `directoryStatus`
 //!   + `checkAuggie` + `findBinary` + `toolAvailability` + `env` + `findApp`
 //!   + `listInstalledEditors` (§5.14).
 //!
@@ -304,6 +305,32 @@ pub(crate) fn check_git_with(resolver: &dyn BinaryResolver, probe: &dyn VersionP
 /// Production `check_git` — uses the real resolver + version probe.
 pub(crate) fn check_git() -> Value {
     check_git_with(&OsBinaryResolver, &OsVersionProbe)
+}
+
+/// Build the `host.checkNode` result. Same contract as [`check_git_with`]:
+/// `available:false` (never an RPC error) when not found or when the version
+/// probe fails; always uncached so a fresh install is seen immediately. Pure:
+/// takes injected resolver + probe so tests don't hit the host.
+pub(crate) fn check_node_with(resolver: &dyn BinaryResolver, probe: &dyn VersionProbe) -> Value {
+    build_check_result(resolver.find("node"), probe)
+}
+
+/// Production `check_node` — uses the real resolver + version probe.
+pub(crate) fn check_node() -> Value {
+    check_node_with(&OsBinaryResolver, &OsVersionProbe)
+}
+
+/// Build the `host.checkGh` result. Same contract as [`check_git_with`]:
+/// `available:false` (never an RPC error) when not found or when the version
+/// probe fails; always uncached so a fresh install is seen immediately. Pure:
+/// takes injected resolver + probe so tests don't hit the host.
+pub(crate) fn check_gh_with(resolver: &dyn BinaryResolver, probe: &dyn VersionProbe) -> Value {
+    build_check_result(resolver.find("gh"), probe)
+}
+
+/// Production `check_gh` — uses the real resolver + version probe.
+pub(crate) fn check_gh() -> Value {
+    check_gh_with(&OsBinaryResolver, &OsVersionProbe)
 }
 
 /// Build the `host.checkAuggie` result `{ available, path? }`, given a
