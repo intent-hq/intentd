@@ -71,12 +71,14 @@ pub enum CliError {
     UnexpectedChannelArg(String),
     #[error("unexpected argument {0:?} to `intentd restart` (it takes no arguments)")]
     UnexpectedRestartArg(String),
+    #[error("unexpected argument {0:?} to `intentd update` (it takes only --check)")]
+    UnexpectedUpdateArg(String),
 }
 
 /// Intercepted sitter-owned subcommand, recognized when `sitter` (or bare
-/// `restart`) is the first passthrough token — like the `--sitter-*` flag
-/// namespace it is never forwarded to the daemon. A bare `--` before it
-/// still forwards everything verbatim.
+/// `restart` / `update`) is the first passthrough token — like the
+/// `--sitter-*` flag namespace it is never forwarded to the daemon. A bare
+/// `--` before it still forwards everything verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SitterCommand {
     /// `intentd sitter channel [stable|beta] [--redownload]` — get or set
@@ -92,6 +94,12 @@ pub enum SitterCommand {
     /// `intentd restart` — restart the supervised daemon in place by
     /// signaling the serve-mode sitter found via its pidfile (SIGHUP).
     Restart,
+    /// `intentd update [--check]` — force an update check on the effective
+    /// channel now, instead of waiting for the periodic serve-mode check.
+    Update {
+        /// Dry-run: report installed vs latest without installing anything.
+        check: bool,
+    },
 }
 
 impl SitterCommand {
@@ -215,9 +223,9 @@ impl SitterArgs {
     }
 
     /// The intercepted sitter-owned subcommand, when the first passthrough
-    /// token is `sitter` or `restart`. After a bare `--` the first
-    /// passthrough token is the `--` itself, so `intentd -- sitter …` and
-    /// `intentd -- restart` still forward verbatim.
+    /// token is `sitter`, `restart`, or `update`. After a bare `--` the
+    /// first passthrough token is the `--` itself, so `intentd -- sitter …`,
+    /// `intentd -- restart`, and `intentd -- update` still forward verbatim.
     pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
         let first = self.passthrough.first()?;
         match first.to_str() {
@@ -228,6 +236,20 @@ impl SitterArgs {
                 )),
                 None => Ok(SitterCommand::Restart),
             }),
+            Some("update") => {
+                let mut check = false;
+                for arg in &self.passthrough[1..] {
+                    match arg.to_str() {
+                        Some("--check") => check = true,
+                        _ => {
+                            return Some(Err(CliError::UnexpectedUpdateArg(
+                                arg.to_string_lossy().into_owned(),
+                            )));
+                        }
+                    }
+                }
+                Some(Ok(SitterCommand::Update { check }))
+            }
             _ => None,
         }
     }
@@ -473,6 +495,53 @@ mod tests {
     #[test]
     fn restart_not_first_token_is_forwarded() {
         assert_eq!(sitter_cmd(&["serve", "restart"]), None);
+    }
+
+    #[test]
+    fn bare_update_is_intercepted() {
+        assert_eq!(
+            sitter_cmd(&["update"]),
+            Some(Ok(SitterCommand::Update { check: false }))
+        );
+    }
+
+    #[test]
+    fn update_check_flag_is_parsed() {
+        assert_eq!(
+            sitter_cmd(&["update", "--check"]),
+            Some(Ok(SitterCommand::Update { check: true }))
+        );
+    }
+
+    #[test]
+    fn update_with_extra_args_is_error() {
+        assert_eq!(
+            sitter_cmd(&["update", "now"]),
+            Some(Err(CliError::UnexpectedUpdateArg("now".to_string())))
+        );
+        assert_eq!(
+            sitter_cmd(&["update", "--force"]),
+            Some(Err(CliError::UnexpectedUpdateArg("--force".to_string())))
+        );
+        assert_eq!(
+            sitter_cmd(&["update", "--check", "beta"]),
+            Some(Err(CliError::UnexpectedUpdateArg("beta".to_string())))
+        );
+    }
+
+    #[test]
+    fn update_not_first_token_is_forwarded() {
+        assert_eq!(sitter_cmd(&["serve", "update"]), None);
+    }
+
+    #[test]
+    fn double_dash_forwards_update_verbatim() {
+        let args = parse(&["--", "update"], None).unwrap();
+        assert_eq!(args.sitter_command(), None);
+        assert_eq!(
+            args.passthrough,
+            vec![OsString::from("--"), OsString::from("update")]
+        );
     }
 
     #[test]

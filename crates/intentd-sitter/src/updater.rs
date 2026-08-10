@@ -46,6 +46,20 @@ pub enum UpdateOutcome {
     AlreadyCurrent { version: String },
 }
 
+/// Result of a dry-run check ([`Updater::check_only`]): installed vs latest,
+/// nothing downloaded or installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCheck {
+    /// Currently installed version, when its binary actually exists (a
+    /// wiped `versions/` dir reads as nothing installed, mirroring
+    /// [`Updater::check_and_install`]).
+    pub installed: Option<String>,
+    /// Version the channel manifest points at.
+    pub latest: String,
+    /// True when a real check would install `latest`.
+    pub update_available: bool,
+}
+
 /// Soft failures from an update check. The caller decides how to proceed
 /// (typically: log and start the last installed daemon).
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +167,34 @@ impl Updater {
     /// daemon (the new binary takes effect on the next spawn).
     pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
         self.install_from_manifest(channel, true)
+    }
+
+    /// Dry-run: fetch the channel manifest and report installed vs latest
+    /// without downloading or installing anything. Applies the same
+    /// newer-only comparison (and the same "installed only counts when the
+    /// binary exists" rule) as [`Updater::check_and_install`].
+    pub fn check_only(&self, channel: Channel) -> Result<UpdateCheck, UpdateError> {
+        let manifest = self.fetch_manifest(channel)?;
+        semver::Version::parse(&manifest.version).map_err(|source| {
+            UpdateError::InvalidManifestVersion {
+                version: manifest.version.clone(),
+                source,
+            }
+        })?;
+
+        let state = state::load(&self.paths.state_path);
+        let installed = state
+            .current_version
+            .filter(|current| self.paths.daemon_binary(current).exists());
+        let update_available = match installed.as_deref() {
+            Some(current) => manifest_is_newer(&manifest.version, current)?,
+            None => true,
+        };
+        Ok(UpdateCheck {
+            installed,
+            latest: manifest.version,
+            update_available,
+        })
     }
 
     fn install_from_manifest(
