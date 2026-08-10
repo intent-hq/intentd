@@ -196,26 +196,32 @@ fn is_expired(expires_at: Option<&str>, skew_ms: i64) -> bool {
 /// the same `[agentFeatures]` toggles as the `workspace_api` tool (prelude
 /// pruning + dispatch deny; all-defaults is byte-identical to the ungated
 /// environment) and interpret its return value against the script contract.
+/// `is_sub_agent` mirrors the owning session's bridge derivation
+/// (`parent_agent_id.is_some() || is_background`): a sub-agent-owned hook
+/// gets the same `ws.app.question.*` pruning + top-level-only dispatch
+/// denial its `workspace_api` bridge would apply.
 /// Never panics; every failure mode folds into [`RunOutcome::Failed`].
 async fn run_hook_script(
     api: Arc<dyn WorkspaceApi>,
     hook: &Hook,
     timeout: Duration,
     agent_features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
 ) -> RunOutcome {
-    let host = intent_acp::make_workspace_host_for(
+    let host = intent_acp::make_workspace_host_for_bridge(
         api,
         hook.workspace_id.clone(),
         Some(hook.agent_id.clone()),
         None,
         agent_features.clone(),
+        is_sub_agent,
     );
     // Same `{__k, __v}` envelope as the `workspace_api` dispatch so an
     // `undefined` return (no dispatch) survives the JSON bridge, extended
     // with a `console.*` shim whose capped line buffer rides back as
     // `__logs`. A user-code throw is caught in-envelope (`__k: 'e'`) so its
     // logs survive; only a timeout/engine failure loses them.
-    let prelude = intent_acp::bindings_prelude_for(agent_features);
+    let prelude = intent_acp::bindings_prelude_for_bridge(agent_features, is_sub_agent);
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
@@ -419,6 +425,20 @@ fn waiting_on_hooks_entry(h: Hook) -> Value {
 }
 
 impl Services {
+    /// Whether a hook's owning session is a sub-agent
+    /// (`parent_agent_id.is_some() || is_background`) — the same derivation
+    /// the session's `workspace_api` bridge captures at spawn, so a
+    /// sub-agent-owned hook gets the same `ws.app.question.*` gate. A
+    /// missing/unreadable session falls back to `false`: the dispatch host
+    /// still requires a live turn registry for `question.ask`, so nothing is
+    /// exposed by treating an orphan as top-level.
+    async fn hook_owner_is_sub_agent(&self, agent_id: &AgentId) -> bool {
+        match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => session.parent_agent_id.is_some() || session.is_background,
+            Err(_) => false,
+        }
+    }
+
     /// `hook.schedule`: validate, run the script once immediately (a real run
     /// — a dispatch wakes the owner and, for a one-shot hook, never persists
     /// a schedule; a perpetual hook persists and schedules anyway; a failure
@@ -518,7 +538,15 @@ impl Services {
         // lifecycle event fires — the error surfaces on the call itself); a
         // dispatch wakes the owner immediately and the hook never schedules.
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.clone());
-        let outcome = run_hook_script(api, &hook, self.hook_eval_timeout, &agent_features).await;
+        let is_sub_agent = self.hook_owner_is_sub_agent(agent_id).await;
+        let outcome = run_hook_script(
+            api,
+            &hook,
+            self.hook_eval_timeout,
+            &agent_features,
+            is_sub_agent,
+        )
+        .await;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
@@ -1073,9 +1101,18 @@ impl Services {
         let api: Arc<dyn WorkspaceApi> = Arc::new(self.clone());
         // Feature flags are read fresh per run: a hook outlives sessions and
         // daemon restarts, so the current effective `[agentFeatures]` gate is
-        // the same one a newly created session's bridge would capture.
+        // the same one a newly created session's bridge would capture. The
+        // owner's sub-agent status is likewise re-derived per run.
         let agent_features = self.effective_settings().agent_features;
-        let outcome = run_hook_script(api, hook, self.hook_eval_timeout, &agent_features).await;
+        let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
+        let outcome = run_hook_script(
+            api,
+            hook,
+            self.hook_eval_timeout,
+            &agent_features,
+            is_sub_agent,
+        )
+        .await;
         let last_run_at = now_iso();
         match outcome {
             RunOutcome::Continue { logs, state } => {
@@ -3467,6 +3504,53 @@ mod tests {
             wake.contains("disabled in settings (agentFeatures.hostExec = false)"),
             "{wake}"
         );
+    }
+
+    /// A hook owned by a sub-agent session (`is_background`, and equally a
+    /// `parent_agent_id`) runs with the sub-agent question gate: the prelude
+    /// omits `ws.app.question` and a raw `host({...})` frame is denied with
+    /// the top-level-only redirect — never the settings-gate error. The
+    /// top-level owner's hook keeps the binding installed.
+    #[tokio::test]
+    async fn sub_agent_owned_hook_runs_with_question_gate() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let mut bg = agent(&ws, "agent-bg-hooks");
+        bg.is_background = true;
+        svc.store().insert_agent_session(&bg).await.unwrap();
+        let code = "let denied = '';\n\
+                    try { await host({ method: 'app.question.ask', args: { question: { header: 'h', question: 'q', options: [{label:'a'},{label:'b'}] } } }); }\n\
+                    catch (e) { denied = String(e); }\n\
+                    return { dispatch: true, message: typeof (ws.app && ws.app.question) + '|' + denied };";
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &bg.id,
+                &json!({ "name": "sub-agent-gate", "code": code, "delayMs": 10_000 }),
+            )
+            .await
+            .expect("validation run dispatches");
+        assert_eq!(out.get("dispatched"), Some(&json!(true)));
+        let wake = wait_for_wake(&svc, &bg.id, "undefined|").await;
+        assert!(
+            wake.contains("only available to top-level agents")
+                && wake.contains("ws.agent.requestDiscussion"),
+            "{wake}"
+        );
+        assert!(!wake.contains("disabled in settings"), "{wake}");
+
+        // The top-level owner's hook keeps the question binding installed.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({ "name": "top-level-env",
+                         "code": "return { dispatch: true, message: 'q=' + typeof (ws.app && ws.app.question) };",
+                         "delayMs": 10_000 }),
+            )
+            .await
+            .expect("validation run dispatches");
+        assert_eq!(out.get("dispatched"), Some(&json!(true)));
+        wait_for_wake(&svc, &owner, "q=object").await;
     }
 
     #[test]
