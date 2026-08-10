@@ -7060,10 +7060,10 @@ async fn models_list_unknown_provider_degrades_to_static_never_errors() {
 }
 
 #[tokio::test]
-async fn models_list_cortex_is_feature_code_gated() {
+async fn models_list_cortex_gate_is_open_and_serves_empty_list() {
     let (_t, svc, _ws) = setup().await;
-    // cortex is registered but feature-code gated: empty list + warning under
-    // its own source tag — the static tier catalog must not leak past the gate.
+    // cortex is un-gated (monorepo#1902): empty list with no gating warning
+    // under its own source tag — the provider CLI owns model selection.
     let res = svc
         .models_list_op(Some("cortex".to_string()), true)
         .await
@@ -7071,7 +7071,10 @@ async fn models_list_cortex_is_feature_code_gated() {
     assert_eq!(res["providerId"], "cortex");
     assert_eq!(res["source"], "cortex");
     assert!(res["models"].as_array().unwrap().is_empty());
-    assert!(res["warning"].as_str().unwrap().contains("Cortex"));
+    assert!(
+        res.get("warning").is_none(),
+        "open gate ⇒ no warning: {res}"
+    );
 }
 
 /// Seed the unified model cache under the legacy auggie key `("auggie", "")`

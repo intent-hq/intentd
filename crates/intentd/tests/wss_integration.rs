@@ -2520,7 +2520,7 @@ async fn wss_debug_sample_stacks_returns_report() {
 /// provider registry is compiled-in daemon data. Asserts the documented
 /// result shape: one row per `ACP_PROVIDERS` entry in registry order,
 /// daemon-evaluated `visible` with the raw gating fields passed through
-/// (cortex's feature code always gates — default-deny), and no default
+/// (mock's env-var gate; cortex is un-gated — monorepo#1902), and no default
 /// designation or tier metadata anywhere in the payload.
 #[tokio::test]
 async fn wss_providers_catalog_round_trip() {
@@ -2584,13 +2584,15 @@ async fn wss_providers_catalog_round_trip() {
         );
     }
 
-    // Gating: cortex's feature code always gates (the daemon stores no
-    // feature-code enablement — default-deny), with the raw field passed
-    // through; ungated providers are visible.
+    // Gating: cortex is un-gated (monorepo#1902) — visible, with no gating
+    // fields on the row; ungated providers are visible.
     let cortex = &providers[3];
     assert_eq!(cortex["shortName"], "Cortex");
-    assert_eq!(cortex["visible"], Value::Bool(false));
-    assert_eq!(cortex["requiresFeatureCode"].as_str(), Some("cortex"));
+    assert_eq!(cortex["visible"], Value::Bool(true));
+    assert!(
+        cortex.get("requiresFeatureCode").is_none(),
+        "cortex must carry no requiresFeatureCode: {resp}"
+    );
     let auggie = &providers[0];
     assert_eq!(auggie["shortName"], "Auggie");
     assert_eq!(auggie["visible"], Value::Bool(true));
@@ -3110,7 +3112,8 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the empty
     // static fallback (`source: "static"` + warning, never an error); cortex
-    // is feature-code gated (empty list + warning under its own source tag).
+    // is un-gated (monorepo#1902) and serves an open-gate empty list with no
+    // warning under its own source tag.
     let srv = start(WsOptions::default()).await;
 
     let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
@@ -3153,13 +3156,11 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .expect("models")
         .is_empty());
     assert!(
-        resp["result"]["warning"]
-            .as_str()
-            .expect("warning")
-            .contains("Cortex"),
-        "{resp}"
+        resp["result"].get("warning").is_none(),
+        "open gate ⇒ no warning: {resp}"
     );
-    // Gated empty success is fresh, not stale: same exact key set.
+    // Open-gate empty success is fresh, not stale: exactly the documented
+    // keys, with no warning and no stale flag.
     let mut keys: Vec<_> = resp["result"]
         .as_object()
         .expect("result object")
@@ -3167,11 +3168,7 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .cloned()
         .collect();
     keys.sort();
-    assert_eq!(
-        keys,
-        ["models", "providerId", "source", "warning"],
-        "{resp}"
-    );
+    assert_eq!(keys, ["models", "providerId", "source"], "{resp}");
 
     // Legacy path with only `forceRefresh` (no providerId): still routes and
     // keeps the legacy shape. On a fresh daemon there is no last-good cache

@@ -10721,16 +10721,16 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    // Setup script write (§5.25 repo-config sole source of truth):
-                    // when an explicit non-empty `setupScript` is provided, write it
-                    // into the repo config; otherwise leave the repo config alone
-                    // (the existing `setupScript` key, if any, remains readable).
-                    // The workspace DB row's `setup_script` column is retired from
-                    // the write path — it stays NULL (wire compat) and the read path
-                    // (§5.25) routes through the repo config with a legacy fallback.
-                    // Stash explicit setupScript for write AFTER worktree provisioning
-                    // (must land in the workspace's worktree, not the repo root, to be
-                    // visible as a committable change in the workspace).
+                    // Setup script param is execute-only (§5.1): an explicit
+                    // non-empty `setupScript` executes as supplied for this create
+                    // (taking precedence over the committed repo-config script) but
+                    // is never persisted — no repo-config merge-write, no DB
+                    // `setup_script` write. Explicit persistence stays with
+                    // `workspace.saveSetupScript` / `repoConfig.*`. The workspace
+                    // DB row's `setup_script` column stays NULL (wire compat) and
+                    // the read path (§5.25) routes through the repo config with a
+                    // legacy fallback. Stash the explicit script for the execution
+                    // spawn AFTER worktree provisioning.
                     let explicit_setup_script = input.setup_script.clone().filter(|s| !s.is_empty());
                     let mut ws = Workspace {
                         id,
@@ -11356,41 +11356,6 @@ impl WorkspaceApi for Services {
                     store
                         .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
                         .await?;
-                    // Write explicit setupScript to the workspace's worktree (AFTER provisioning
-                    // so git_ops::worktree_path resolves correctly). Must land as a committable
-                    // change in the workspace, visible in the workspace's diff view.
-                    // Best-effort — a failure warns and continues (matches post-insert pattern
-                    // for other filesystem operations like .workspace/workspace.json).
-                    if let Some(explicit) = explicit_setup_script {
-                        // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
-                        // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
-                        match git_ops::worktree_path(&ws) {
-                            Some(repo_path) => {
-                                let mut repo_config =
-                                    crate::repo_config::read_repo_config(&repo_path).await;
-                                // Only write if the script differs (no-op when identical).
-                                if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
-                                    repo_config.setup_script = Some(explicit.clone());
-                                    if let Err(e) =
-                                        crate::repo_config::write_repo_config(&repo_path, repo_config)
-                                            .await
-                                    {
-                                        tracing::warn!(
-                                            workspace = %ws.id.as_str(),
-                                            error = %e,
-                                            "workspace.create: failed to write explicit setupScript to repo config"
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::warn!(
-                                    workspace = %ws.id.as_str(),
-                                    "workspace.create: cannot persist setupScript; worktreePath and repositoryPath both empty"
-                                );
-                            }
-                        }
-                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -11596,8 +11561,9 @@ impl WorkspaceApi for Services {
                         initial_agent = created.get("agent").cloned();
                     }
                     // Execute the workspace setup script (fire-and-forget): after worktree
-                    // provisioning and repo-config write, read the effective setup script
-                    // (explicit request param > repo config) and run it in a "Setup" terminal.
+                    // provisioning, resolve the effective setup script (explicit request
+                    // param > repo config > legacy DB row) and run it in a "Setup" terminal.
+                    // The explicit param is execute-only — it is never persisted (§5.1).
                     // Execution is non-blocking (tokio::spawn) and must never fail the create.
                     // Skipped when skipWorktree or no worktree was provisioned.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
@@ -11624,22 +11590,26 @@ impl WorkspaceApi for Services {
                         let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
                         tokio::spawn(async move {
-                            // Read effective setup script (repo config with legacy DB fallback).
-                            let repo_config =
-                                crate::repo_config::read_repo_config(&worktree_for_read).await;
-                            let effective_script = repo_config
-                                .setup_script
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    legacy_script.as_ref().and_then(|ss| {
-                                        let script = ss.script.trim();
-                                        if script.is_empty() {
-                                            None
-                                        } else {
-                                            Some(script.to_string())
-                                        }
-                                    })
-                                });
+                            // Resolve the effective setup script: the explicit param wins
+                            // for this create; an omitted param falls back to the
+                            // worktree-first repo-config read, then the legacy DB row.
+                            let effective_script = match explicit_setup_script {
+                                Some(explicit) => Some(explicit),
+                                None => crate::repo_config::read_repo_config(&worktree_for_read)
+                                    .await
+                                    .setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        legacy_script.as_ref().and_then(|ss| {
+                                            let script = ss.script.trim();
+                                            if script.is_empty() {
+                                                None
+                                            } else {
+                                                Some(script.to_string())
+                                            }
+                                        })
+                                    }),
+                            };
                             let script = match effective_script {
                                 Some(s) => s,
                                 None => return, // No script to execute
@@ -12590,6 +12560,14 @@ impl WorkspaceApi for Services {
                 // turn spawned) — the same reason the interrupt sweep above
                 // runs post-persist.
                 this.cancel_workspace_hooks(&id).await;
+                // Cancel every ACTIVE PR monitor the same way
+                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
+                // `prMonitor:cancelled` emitted, owner woken with a notice
+                // that parks behind the same archived gate. Unarchive does
+                // NOT resurrect cancelled monitors. Without this sweep an
+                // archived workspace's displayStatus rollup reads
+                // `in_progress` indefinitely off the active-monitor signal.
+                this.cancel_workspace_pr_monitors(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
