@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.4] - 2026-08-10
+
+### 🚀 Features
+
+- Add debug.sampleStacks RPC for in-process daemon stack sampling ([#1057](https://github.com/intent-hq/intentd/pull/1057))
+
+### 🐛 Bug Fixes
+
+- Spawn CLI auth probes with the enhanced PATH; treat exit 127 as probe failure ([#1056](https://github.com/intent-hq/intentd/pull/1056))
+- Exit quietly on EPIPE when a one-shot CLI's stdout pipe closes early ([#1055](https://github.com/intent-hq/intentd/pull/1055))
+- Batch script.list bootstrap persists to stay within SQL statement budget ([#1054](https://github.com/intent-hq/intentd/pull/1054))
+
+### 🧪 Testing
+
+- *(services)* Deterministic pause barrier for skills_watcher resume catch-up test ([#1053](https://github.com/intent-hq/intentd/pull/1053))
+- *(intentd)* Pure-liveness deadlines for settings live-reload e2e ([#1052](https://github.com/intent-hq/intentd/pull/1052))
+
+
 ## [0.6.3] - 2026-08-09
 
 ### 🚀 Features
