@@ -12560,6 +12560,14 @@ impl WorkspaceApi for Services {
                 // turn spawned) — the same reason the interrupt sweep above
                 // runs post-persist.
                 this.cancel_workspace_hooks(&id).await;
+                // Cancel every ACTIVE PR monitor the same way
+                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
+                // `prMonitor:cancelled` emitted, owner woken with a notice
+                // that parks behind the same archived gate. Unarchive does
+                // NOT resurrect cancelled monitors. Without this sweep an
+                // archived workspace's displayStatus rollup reads
+                // `in_progress` indefinitely off the active-monitor signal.
+                this.cancel_workspace_pr_monitors(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
