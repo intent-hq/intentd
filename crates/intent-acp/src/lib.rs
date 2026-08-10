@@ -57,9 +57,9 @@ pub use mcp_env::{
     merge_mcp_env, redact_mcp_env_for_logging, EnvMap, REDACTED_VALUE,
 };
 pub use mcp_server::{
-    bindings_prelude, bindings_prelude_for, make_workspace_host, make_workspace_host_for,
-    SpecialistModelOption, SpecialistModelOptions, ToolDef, WorkspaceMcpServer,
-    MCP_PROTOCOL_VERSION,
+    bindings_prelude, bindings_prelude_for, bindings_prelude_for_bridge, make_workspace_host,
+    make_workspace_host_for, make_workspace_host_for_bridge, SpecialistModelOption,
+    SpecialistModelOptions, ToolDef, WorkspaceMcpServer, MCP_PROTOCOL_VERSION,
 };
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,

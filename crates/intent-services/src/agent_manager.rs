@@ -1462,6 +1462,22 @@ impl AgentManager {
     ) -> Result<()> {
         self.registry.acquire(&agent_id).await;
 
+        // Session row for the sub-agent derivation below and the prompt
+        // assembly further down (one read, shared). The session was inserted
+        // by the caller before `create_agent` runs, so propagate any store
+        // error rather than silently defaulting to top-level (which would
+        // mis-scope both surfaces and hide DB failures).
+        let session = self.services.store.get_agent_session(&agent_id).await?;
+        // Sub-agent gating: delegated children (`parent_agent_id` set) and
+        // background workers (`is_background`) — the same derivation the
+        // prompt assembly uses. Captured once here, at bridge creation:
+        // parentage never changes for a live session, and while
+        // `is_background` can flip at runtime via `agent.update`, the bridge
+        // keeps its spawn-time surface until the next respawn re-derives the
+        // flag (same snapshot semantics as the `[agentFeatures]` capture
+        // below).
+        let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
         // a loopback bridge a real spawned child reaches via `--mcp-config`.
@@ -1477,6 +1493,9 @@ impl AgentManager {
                 // creation, so they apply to new sessions only — a settings
                 // change never mutates a live agent's surface.
                 .with_agent_features(self.services.effective_settings().agent_features)
+                // Sub-agent bridges prune/deny `ws.app.question.*` (top-level
+                // agents only own a user-facing chat turn).
+                .with_sub_agent(is_sub_agent)
                 // Specialist `modelOptions` (PROTOCOL §5.11) resolved once
                 // at bridge creation, same snapshot semantics as the
                 // feature toggles: the delegate docs in this agent's
@@ -1573,15 +1592,9 @@ impl AgentManager {
             // will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
-            // Sub-agent gating: delegated children (`parent_agent_id` set) and
-            // background workers (`is_background`) skip the suggested-prompts
-            // directive, matching the reference `isSubAgent` derivation. The
-            // session was inserted by the caller before `create_agent` runs,
-            // so propagate any store error rather than silently defaulting to
-            // top-level (which would mis-scope the SP-1 footer and hide DB
-            // failures).
-            let session = self.services.store.get_agent_session(&agent_id).await?;
-            let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+            // Sub-agent gating: `is_sub_agent` (derived from the session read
+            // at the top of this function) also skips the suggested-prompts
+            // directive, matching the reference `isSubAgent` derivation.
             // Fetch workspace for mode-dependent prompt hints (Task 6).
             let workspace = self.services.store.get_workspace(&workspace_id).await.ok();
             if let Some(prompt) = crate::rules::assemble_system_prompt(
