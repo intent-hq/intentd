@@ -1219,6 +1219,7 @@ fn run_git_os_streamed(
 fn drain_chunks(stderr: impl std::io::Read, cb: &ProgressChunkFn) -> String {
     let mut full = String::new();
     let mut pending = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
     let mut byte_buf = [0u8; 4096];
     let mut stderr = stderr;
     loop {
@@ -1228,7 +1229,8 @@ fn drain_chunks(stderr: impl std::io::Read, cb: &ProgressChunkFn) -> String {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let text = String::from_utf8_lossy(&byte_buf[..n]);
+        bytes.extend_from_slice(&byte_buf[..n]);
+        let text = take_valid_utf8(&mut bytes);
         full.push_str(&text);
         pending.push_str(&text);
         while let Some(pos) = pending.find(['\r', '\n']) {
@@ -1239,10 +1241,52 @@ fn drain_chunks(stderr: impl std::io::Read, cb: &ProgressChunkFn) -> String {
             }
         }
     }
+    if !bytes.is_empty() {
+        // A truncated multibyte tail at EOF is genuinely malformed.
+        let text = String::from_utf8_lossy(&bytes);
+        full.push_str(&text);
+        pending.push_str(&text);
+    }
     if !pending.trim().is_empty() {
         cb(&pending);
     }
     full
+}
+
+/// Decode the longest valid-UTF-8 prefix of `bytes` (lossily replacing any
+/// complete invalid sequences), leaving an incomplete trailing multibyte
+/// sequence in the buffer for the next read — so a character split across a
+/// 4KiB read boundary never becomes U+FFFD.
+fn take_valid_utf8(bytes: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut input = bytes.as_slice();
+    loop {
+        match std::str::from_utf8(input) {
+            Ok(s) => {
+                out.push_str(s);
+                input = &[];
+                break;
+            }
+            Err(e) => {
+                let (valid, rest) = input.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).expect("validated prefix"));
+                match e.error_len() {
+                    Some(len) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        input = &rest[len..];
+                    }
+                    None => {
+                        // Incomplete trailing sequence: keep for the next read.
+                        input = rest;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let keep = input.len();
+    bytes.drain(..bytes.len() - keep);
+    out
 }
 
 /// The git subcommand in `args` for error attribution: the first argument
@@ -2759,5 +2803,66 @@ mod tests {
             chunks.iter().any(|c| c.contains("checked out")),
             "submodule update output streamed: {chunks:?}"
         );
+    }
+
+    /// A reader that yields its bytes in fixed-size slices, so a multibyte
+    /// character can be split across `read` calls — as a pipe read at the
+    /// 4KiB buffer boundary would.
+    struct ChoppedReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl std::io::Read for ChoppedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// A multibyte character split across read boundaries must survive
+    /// intact — in the streamed chunks and in the accumulated text used for
+    /// error attribution — instead of becoming U+FFFD.
+    #[test]
+    fn drain_chunks_reassembles_split_utf8() {
+        let text = "fatal: pathspec 'süb/böse' did not match\n";
+        for step in 1..=4 {
+            let reader = ChoppedReader {
+                data: text.as_bytes().to_vec(),
+                pos: 0,
+                step,
+            };
+            let chunks: Arc<Mutex<Vec<String>>> = Arc::default();
+            let sink = chunks.clone();
+            let cb: ProgressChunkFn = Arc::new(move |chunk: &str| {
+                sink.lock().unwrap().push(chunk.to_string());
+            });
+            let full = drain_chunks(reader, &cb);
+            assert_eq!(full, text, "step {step}: accumulated text intact");
+            let chunks = chunks.lock().unwrap();
+            assert_eq!(chunks.len(), 1, "step {step}");
+            assert_eq!(chunks[0], text.trim_end(), "step {step}: chunk intact");
+        }
+    }
+
+    /// A genuinely invalid byte still decodes lossily (U+FFFD) rather than
+    /// stalling the pending buffer forever.
+    #[test]
+    fn drain_chunks_replaces_invalid_bytes() {
+        let reader = ChoppedReader {
+            data: b"bad \xff byte\n".to_vec(),
+            pos: 0,
+            step: 3,
+        };
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = chunks.clone();
+        let cb: ProgressChunkFn = Arc::new(move |chunk: &str| {
+            sink.lock().unwrap().push(chunk.to_string());
+        });
+        let full = drain_chunks(reader, &cb);
+        assert_eq!(full, "bad \u{FFFD} byte\n");
     }
 }

@@ -10386,7 +10386,18 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                 if let Some(pump) = ensure_pump {
-                                    let _ = pump.await;
+                                    // Bounded: on the ensure's timeout path a
+                                    // lingering grandchild (e.g.
+                                    // git-remote-https) can hold the pipe —
+                                    // and thus a callback clone — open
+                                    // indefinitely; don't let it delay error
+                                    // surfacing (buffered frames only matter
+                                    // cosmetically there).
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        pump,
+                                    )
+                                    .await;
                                 }
                                 let cache_path = match ensure_result {
                                     Ok(path) => path,
@@ -11000,7 +11011,14 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                     if let Some(pump) = sub_pump {
-                                        let _ = pump.await;
+                                        // Bounded for the same reason as the
+                                        // ensure pump: a lingering grandchild
+                                        // can hold the callback open.
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            pump,
+                                        )
+                                        .await;
                                     }
                                     result
                                 }

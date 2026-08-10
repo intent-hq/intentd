@@ -674,6 +674,13 @@ fn scan_phase_percents(text: &str, out: &mut Vec<(&'static str, u32, String)>) {
     }
 }
 
+/// Local-completion cap: a submodule's own phases top out at this share of
+/// its slice, leaving headroom for submodules discovered later — nested
+/// submodules register mid-flight, after earlier ones may already have
+/// finished — so the aggregate percent never pins at 100 early (the
+/// downstream reporter clamps monotonically and would otherwise freeze).
+const SUBMODULE_LOCAL_CAP: u32 = 95;
+
 /// Stateful, submodule-aware progress parser over git's `--progress` stderr.
 ///
 /// A `git clone --recurse-submodules --progress` stream interleaves the
@@ -684,11 +691,20 @@ fn scan_phase_percents(text: &str, out: &mut Vec<(&'static str, u32, String)>) {
 /// the first boundary into one aggregated `submodules` phase whose percent is
 /// distributed across the registered submodules ("Cloning submodules (N/M)").
 ///
+/// The aggregate percent is allocated forward-only: each submodule gets a
+/// slice of the *remaining* distance to 100 (sized by how many known
+/// submodules are left), and its own clone phases fill the slice up to
+/// [`SUBMODULE_LOCAL_CAP`]. The series is monotone by construction even when
+/// the total grows mid-flight (nested registrations), so late submodules
+/// always show forward movement instead of being pinned by the reporter's
+/// monotonic clamp.
+///
 /// [`SubmoduleAwareParser::for_submodule_update`] parses a standalone
 /// `git submodule update --init --recursive --force --progress` stream
 /// instead: every frame is submodule-scoped, and `Submodule path '<p>':
 /// checked out` completions drive an "Updating submodules (N)" counter for
-/// already-cloned modules that print no clone phases.
+/// already-cloned modules that print no clone phases (each completion
+/// advances halfway through the remaining distance — the total is unknown).
 pub(crate) struct SubmoduleAwareParser {
     /// Every frame is submodule-scoped (no superproject clone in front).
     submodules_only: bool,
@@ -702,6 +718,11 @@ pub(crate) struct SubmoduleAwareParser {
     started: usize,
     /// Submodules checked out so far ("Submodule path '…': checked out").
     checked_out: usize,
+    /// Monotone floor of the aggregate percent: everything at or below is
+    /// spoken for by finished (or superseded) submodules.
+    base: u32,
+    /// The in-flight submodule's `(lo, hi)` share of the aggregate percent.
+    slice: Option<(u32, u32)>,
 }
 
 impl SubmoduleAwareParser {
@@ -722,6 +743,8 @@ impl SubmoduleAwareParser {
             registered: 0,
             started: 0,
             checked_out: 0,
+            base: 0,
+            slice: None,
         }
     }
 
@@ -730,36 +753,59 @@ impl SubmoduleAwareParser {
         self.submodules_only || self.started > 0
     }
 
-    /// Aggregate 0–100 percent across all submodules: submodule `started`
-    /// occupies its `1/registered` slice, positioned by the weighted local
-    /// clone-phase percent. With no registration count (a bare submodule
-    /// update), the local percent passes through — the reporter's monotonic
-    /// clamp keeps the series non-decreasing.
-    fn submodule_percent(&self, local: u32) -> u32 {
-        if self.registered > 0 && self.started > 0 {
-            let total = self.registered.max(self.started) as u32;
-            let idx = (self.started as u32).min(total) - 1;
-            let lo = idx * 100 / total;
-            let hi = (idx + 1) * 100 / total;
-            crate::create_progress::map_segment(lo, hi, local)
-        } else {
-            local.min(100)
+    /// The highest percent a slice may emit: its local cap point.
+    fn capped_top((lo, hi): (u32, u32)) -> u32 {
+        lo + (hi - lo) * SUBMODULE_LOCAL_CAP / 100
+    }
+
+    /// Open the next submodule's slice: seal any in-flight slice at its cap,
+    /// then give the new one an equal share of the remaining distance to 100
+    /// (counting known-but-unstarted registrations). Integer widths can
+    /// collapse to zero near 100 — the slice then pins at `base`, still
+    /// monotone.
+    fn open_slice(&mut self) {
+        if let Some(slice) = self.slice.take() {
+            self.base = Self::capped_top(slice);
+        }
+        let remaining = (self.registered.saturating_sub(self.started) + 1) as u32;
+        let width = (100 - self.base) / remaining;
+        self.slice = Some((self.base, self.base + width));
+    }
+
+    /// Position `local` (a 0–100 weighted clone-phase percent) inside the
+    /// in-flight slice, capped at [`SUBMODULE_LOCAL_CAP`] of it. With no
+    /// slice open (phases arriving outside a boundary), hold at `base`.
+    fn slice_percent(&self, local: u32) -> u32 {
+        match self.slice {
+            Some((lo, hi)) => lo + (hi - lo) * local.min(SUBMODULE_LOCAL_CAP) / 100,
+            None => self.base,
         }
     }
 
-    /// Human message carrying the submodule count/index. Update-mode
-    /// completions ("checked out" lines) read "Updating submodules (N)";
-    /// clone boundaries read "Cloning submodules (N)" or, when the
-    /// registration count is known, "Cloning submodules (N/M)".
+    /// A module finished ("checked out" completion): seal the in-flight
+    /// slice at its cap, or — with no slice open (already-cloned modules
+    /// print no clone phases at all) — advance halfway through the remaining
+    /// distance, since the total is unknown. Returns the new floor.
+    fn complete_one(&mut self) -> u32 {
+        self.base = match self.slice.take() {
+            Some(slice) => Self::capped_top(slice),
+            None => self.base + (100 - self.base) / 2,
+        };
+        self.base
+    }
+
+    /// Human message for clone boundaries and phases: "Cloning submodules
+    /// (N)" or, when the registration count is known, "Cloning submodules
+    /// (N/M)". Update-mode completions format "Updating submodules (N)"
+    /// directly at the call site.
     fn submodule_message(&self) -> String {
         if self.registered > 0 {
+            let total = self.registered.max(self.started);
             format!(
                 "Cloning submodules ({}/{})",
-                self.started.min(self.registered),
-                self.registered
+                self.started.clamp(1, total),
+                total
             )
-        } else if self.submodules_only && self.checked_out >= self.started.max(1) {
-            format!("Updating submodules ({})", self.checked_out)
         } else {
             format!("Cloning submodules ({})", self.started.max(1))
         }
@@ -788,9 +834,10 @@ impl SubmoduleAwareParser {
                 out.push(("starting", 0, "Cloning repository...".to_string()));
             } else {
                 self.started += 1;
+                self.open_slice();
                 out.push((
                     "submodules",
-                    self.submodule_percent(0),
+                    self.slice_percent(0),
                     self.submodule_message(),
                 ));
             }
@@ -799,13 +846,14 @@ impl SubmoduleAwareParser {
         // `git submodule update` prints one completion line per module
         // ("Submodule path 'sub': checked out '<sha>'"); count them so
         // already-cloned modules (no clone phases at all) still move the
-        // message forward.
+        // percent and message forward.
         if self.submodules_only && line.contains("Submodule path") && line.contains("checked out") {
             self.checked_out += 1;
+            let pct = self.complete_one();
             out.push((
                 "submodules",
-                self.submodule_percent(100),
-                self.submodule_message(),
+                pct,
+                format!("Updating submodules ({})", self.checked_out),
             ));
             return;
         }
@@ -819,7 +867,7 @@ impl SubmoduleAwareParser {
                 let local = crate::create_progress::map_segment(lo, hi, pct);
                 out.push((
                     "submodules",
-                    self.submodule_percent(local),
+                    self.slice_percent(local),
                     self.submodule_message(),
                 ));
             } else {
@@ -1508,26 +1556,27 @@ mod tests {
             .parse("Submodule 'libb' (https://x/libb.git) registered for path 'libb'")
             .is_empty());
         // First submodule boundary: N/M in the message, percent at its
-        // slice's start.
+        // slice's start. Two known submodules split the remaining 0..100
+        // evenly: slice 1 is 0..50.
         let f = parser.parse("Cloning into '/tmp/repo/liba'...");
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].0, "submodules");
         assert_eq!(f[0].1, 0);
         assert_eq!(f[0].2, "Cloning submodules (1/2)");
-        // Its clone phases stay inside slice 1 (0..50): a finished checkout
-        // tops the slice.
+        // Its clone phases stay inside slice 1: a finished checkout tops the
+        // slice at its 95% local cap → 47.
         let f = parser.parse("Checking out files: 100% (4/4), done.");
         assert_eq!(f[0].0, "submodules");
-        assert_eq!(f[0].1, 50);
+        assert_eq!(f[0].1, 47);
         assert_eq!(f[0].2, "Cloning submodules (1/2)");
-        // Second boundary opens slice 2 (50..100).
+        // Second boundary seals slice 1 and opens slice 2 (47..100).
         let f = parser.parse("Cloning into '/tmp/repo/libb'...");
-        assert_eq!(f[0].1, 50);
+        assert_eq!(f[0].1, 47);
         assert_eq!(f[0].2, "Cloning submodules (2/2)");
         let f = parser.parse("Receiving objects: 100% (8/8), done.");
         assert_eq!(f[0].0, "submodules");
-        // receiving tops at 70 of the local weight → 50 + 70/2 = 85.
-        assert_eq!(f[0].1, 85);
+        // receiving tops at 70 of the local weight → 47 + 53*70/100 = 84.
+        assert_eq!(f[0].1, 84);
     }
 
     /// Multi-line chunks parse line-by-line: registrations and a boundary in
@@ -1546,8 +1595,9 @@ mod tests {
     }
 
     /// Submodule-update mode: no superproject boundary — every frame is
-    /// submodule-scoped, and "checked out" completions advance a counter for
-    /// modules that stream no clone phases at all.
+    /// submodule-scoped, and "checked out" completions advance the percent
+    /// (halfway through the remaining distance) and message for modules that
+    /// stream no clone phases at all.
     #[test]
     fn submodule_aware_parser_update_mode() {
         let mut parser = SubmoduleAwareParser::for_submodule_update();
@@ -1557,26 +1607,46 @@ mod tests {
         let f = parser.parse("Submodule path 'liba': checked out 'abc123'");
         assert_eq!(f[0].0, "submodules");
         assert_eq!(f[0].2, "Updating submodules (1)");
+        let first = f[0].1;
+        // A pre-cloned module with no clone boundary of its own still moves
+        // the percent forward.
         let f = parser.parse("Submodule path 'libb': checked out 'def456'");
         assert_eq!(f[0].2, "Updating submodules (2)");
+        assert!(f[0].1 > first, "{} !> {first}", f[0].1);
+        assert!(f[0].1 < 100);
     }
 
     /// Nested submodules can register mid-flight (during their parent's
-    /// clone); the parser keeps counting without panicking and the total in
-    /// the message grows.
+    /// clone); the total in the message grows and the aggregate percent stays
+    /// non-decreasing — the parent's finished slice is sealed below 100, so
+    /// late modules still show forward movement.
     #[test]
     fn submodule_aware_parser_nested_registration() {
         let mut parser = SubmoduleAwareParser::for_clone();
         parser.parse("Cloning into 'repo'...");
         parser.parse("Submodule 'a' (https://x/a.git) registered for path 'a'");
-        let f = parser.parse("Cloning into '/tmp/repo/a'...");
-        assert_eq!(f[0].2, "Cloning submodules (1/1)");
-        // A nested submodule registers while `a` clones, then starts.
+        let mut last = 0;
+        let mut check = |frames: Vec<(&'static str, u32, String)>| -> (u32, String) {
+            let (_, pct, msg) = frames.into_iter().next().expect("one frame");
+            assert!(pct >= last, "{pct} regressed below {last}");
+            last = pct;
+            (pct, msg)
+        };
+        let (_, msg) = check(parser.parse("Cloning into '/tmp/repo/a'..."));
+        assert_eq!(msg, "Cloning submodules (1/1)");
+        // `a` finishes its own clone phases before the nested module is known:
+        // the local cap keeps its slice sealed below 100.
+        let (pct, _) = check(parser.parse("Checking out files: 100% (2/2), done."));
+        assert!(pct < 100);
+        // A nested submodule registers while `a` clones, then starts — the
+        // denominator grows and its frames keep advancing past the parent's.
         parser.parse("Submodule 'inner' (https://x/i.git) registered for path 'a/inner'");
-        let f = parser.parse("Cloning into '/tmp/repo/a/inner'...");
-        assert_eq!(f[0].2, "Cloning submodules (2/2)");
-        let f = parser.parse("Resolving deltas: 100% (3/3), done.");
-        assert!(f[0].1 <= 100);
+        let (_, msg) = check(parser.parse("Cloning into '/tmp/repo/a/inner'..."));
+        assert_eq!(msg, "Cloning submodules (2/2)");
+        let (start, _) = check(parser.parse("Receiving objects:  50% (1/2)"));
+        let (end, _) = check(parser.parse("Resolving deltas: 100% (3/3), done."));
+        assert!(end > start, "nested module shows forward movement");
+        assert!(end <= 100);
     }
 
     /// Spawn a shell that forks a `sleep 30` grandchild in the same process
