@@ -45,7 +45,8 @@ pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 // `workspace_api` tool installs, so the two environments cannot drift.
 pub use bindings::prelude as bindings_prelude;
 pub use bindings::prelude_for as bindings_prelude_for;
-pub use dispatch::{make_workspace_host, make_workspace_host_for};
+pub use bindings::prelude_for_bridge as bindings_prelude_for_bridge;
+pub use dispatch::{make_workspace_host, make_workspace_host_for, make_workspace_host_for_bridge};
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";

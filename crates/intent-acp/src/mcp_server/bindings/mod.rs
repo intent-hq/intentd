@@ -58,6 +58,26 @@ pub fn prelude() -> String {
 /// background hook scheduler in `intent-services` installs the same gated
 /// environment its owning session's `workspace_api` bridge would.
 pub fn prelude_for(features: &AgentFeaturesSettings) -> String {
+    prelude_for_bridge(features, false)
+}
+
+/// [`prelude_for`] plus the sub-agent flag: a sub-agent environment forces
+/// `structuredQuestions` off so `ws.app.question` is omitted through the
+/// exact same pruning machinery as the settings toggle (the surfaces cannot
+/// drift). Mirrors `WorkspaceMcpServer::effective_agent_features`; used by
+/// the background hook scheduler for hooks owned by background/delegated
+/// sessions.
+pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
+    let forced;
+    let features = if is_sub_agent && features.structured_questions {
+        forced = AgentFeaturesSettings {
+            structured_questions: false,
+            ..features.clone()
+        };
+        &forced
+    } else {
+        features
+    };
     let pr = pr::prelude_for(features);
     let mut fragments: Vec<&str> = vec![
         help::PRELUDE,

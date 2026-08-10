@@ -422,7 +422,11 @@ pub fn make_workspace_host_for(
 /// top-level-only redirect error before the feature-gate check, so a raw
 /// `host({...})` call cannot bypass the description/prelude pruning and the
 /// error never misleads with "disabled in settings".
-fn make_workspace_host_for_bridge(
+///
+/// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
+/// the background hook scheduler in `intent-services` applies the same
+/// sub-agent gate to hooks owned by background/delegated sessions.
+pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
