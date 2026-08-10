@@ -90,6 +90,29 @@ directly.
 > repo — the temporary public mirror for release assets until this repo is
 > open-sourced. The formula itself lives in the public `intent-hq/homebrew-tap`.
 
+> **Installing for the Intent desktop app?** You don't need to: desktop releases in
+> [intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases)
+> bundle intentd as a sidecar and are self-contained. Install standalone intentd only
+> for a **headless** machine (a remote Linux box, a spare Mac) that the desktop/mobile
+> apps connect to remotely — see
+> [Pairing a remote client](#pairing-a-remote-client-wss). The user-facing install
+> guide lives on the
+> [intent-hq/intentd-releases README](https://github.com/intent-hq/intentd-releases#readme);
+> keep the two in sync when editing this section.
+
+### Requirements
+
+The daemon expects a few tools on the host it runs on:
+
+- **git** — required. Workspace provisioning and daemon-side fetch/pull/push shell
+  out to the `git` CLI (local status/stage/commit use bundled libgit2).
+- **Node.js** (with `npm`/`npx`) — required to run the coding-agent provider CLIs:
+  several providers are npm-installed or launched via pinned `npx` packages
+  (auggie, claude-code, codex, …).
+- **gh** (GitHub CLI) — optional. Enables the GitHub integration without a manual
+  token: the daemon resolves its GitHub token as secrets store (the in-app GitHub
+  connection) → `GITHUB_TOKEN`/`GH_TOKEN` env → `gh auth token`.
+
 ### One-line script (macOS / Linux)
 
 ```sh
@@ -265,9 +288,11 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Pairing a remote client (WSS)
 
-`intentd pair` renders the `intent://pair?…` QR code / payload URI a LAN client (e.g.
-the iOS app) scans to connect over the WSS/TLS listener. The payload embeds the bearer
-token and TLS fingerprint, so the command is local-only (it queries `pairing.getInfo`
+`intentd pair` renders the `intent://pair?…` QR code / payload URI a LAN client (the
+Intent desktop or iOS app) scans to connect over the WSS/TLS listener. The payload
+embeds everything a client needs — the machine's LAN IP(s), the WSS port
+(`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients pin
+it), and the bearer token — so the command is local-only (it queries `pairing.getInfo`
 over the UDS socket).
 
 ```bash
