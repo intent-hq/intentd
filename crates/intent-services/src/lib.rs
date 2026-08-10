@@ -3433,6 +3433,11 @@ impl Services {
         // active.
         self.annotate_waiting_on_pr_monitors(child_id, &mut data)
             .await;
+        // Archived-workspace suppression hint: same `workspaceArchived`
+        // stamp as the live idle emit sites (omitted when the workspace is
+        // not archived).
+        self.annotate_workspace_archived(&session.workspace_id, &mut data)
+            .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
             workspace_id: session.workspace_id,
