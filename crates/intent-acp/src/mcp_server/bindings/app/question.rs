@@ -1,8 +1,14 @@
 //! `ws.app.question.ask` binding — structured clarifying questions.
 //!
 //! DELIBERATE deviation from the other `app/*` submodules: there is NO
-//! chief-workspace gate here — any workspace agent may ask the user
-//! structured questions mid-task. One question per `ask` call; the model
+//! chief-workspace gate here — any TOP-LEVEL workspace agent may ask the
+//! user structured questions mid-task. Sub-agents (a session with a
+//! `parent_agent_id` or `is_background`) don't own a user-facing chat turn,
+//! so their bridges prune this binding from the description and prelude and
+//! the dispatch host denies their frames with a redirect to
+//! `ws.agent.requestDiscussion` / `ws.agent.reportToParent` (see
+//! `dispatch::SUB_AGENT_QUESTION_DENIED`) — the gate never reaches this
+//! module. One question per `ask` call; the model
 //! calls it once per question. Each call registers ONE turn attachment under
 //! [`AttachmentPolicy::AtTurnEnd`], so every question asked during a turn
 //! lands as a trailing `application/vnd.intent.question+json` resource block

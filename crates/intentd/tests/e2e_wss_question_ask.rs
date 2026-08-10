@@ -1,7 +1,7 @@
 //! WSS e2e for the `ws.app.question.ask` Q&A round trip.
 //!
 //! Drives a NON-chief agent (regular seeded workspace — proving the binding
-//! is un-gated, unlike the rest of `ws.app.*`) on the mock ACP provider:
+//! is chief-un-gated, unlike the rest of `ws.app.*`) on the mock ACP provider:
 //!
 //! * Turn 1: the mock calls `workspace_api` TWICE, each invoking
 //!   `ws.app.question.ask` with ONE question. Both must land as trailing
@@ -13,6 +13,12 @@
 //!   `agent.sendMessage`; the daemon must deliver that text to the provider
 //!   VERBATIM (asserted via the mock fixture's `MOCK_AGENT_PROMPT_LOG` seam)
 //!   — there is no daemon-side answer intake or transformation.
+//!
+//! A second test proves the SUB-AGENT gate over the same real path: a
+//! background agent's per-agent MCP bridge prunes `ws.app.question.*` from
+//! its tool description and JS prelude and denies the raw dispatch frame
+//! with the top-level-only redirect error, while a top-level agent's bridge
+//! on the same daemon keeps the full surface.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -664,5 +670,311 @@ async fn question_ask_round_trip_over_wss() {
                     })
         }),
         "answers persisted as a plain user text message: {messages2:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sub-agent gate: per-agent MCP bridge client (parse the generated
+// `intentd-mcp-*.json` and speak newline-delimited JSON-RPC to the loopback
+// bridge directly, exactly like a spawned provider child would).
+// ---------------------------------------------------------------------------
+
+/// List the generated `intentd-mcp-*.json` config files under
+/// `<data_dir>/agent-configs`, sorted for deterministic diffing.
+fn mcp_config_files(data_dir: &Path) -> Vec<PathBuf> {
+    let dir = data_dir.join("agent-configs");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("intentd-mcp-") && n.ends_with(".json"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Extract the bridge `--connect <addr>` from a generated MCP config file.
+fn bridge_addr_from_config(path: &Path) -> String {
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read mcp config"))
+        .expect("parse mcp config");
+    let args = cfg["mcpServers"]["workspace-mcp"]["args"]
+        .as_array()
+        .expect("workspace-mcp args");
+    let idx = args
+        .iter()
+        .position(|a| a == "--connect")
+        .expect("--connect flag in bridge args");
+    args[idx + 1].as_str().expect("bridge addr").to_string()
+}
+
+struct BridgeClient {
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    next_id: i64,
+}
+
+impl BridgeClient {
+    async fn connect(addr: &str) -> Self {
+        use tokio::io::BufReader;
+        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
+            .await
+            .expect("bridge connect timeout")
+            .expect("bridge connect");
+        let (r, w) = stream.into_split();
+        let mut c = BridgeClient {
+            reader: BufReader::new(r),
+            writer: w,
+            next_id: 1,
+        };
+        let init = c.request("initialize", json!({})).await;
+        assert!(
+            init["result"]["serverInfo"].is_object(),
+            "initialize: {init}"
+        );
+        c
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("bridge write");
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
+                .await
+                .expect("bridge read timeout")
+                .expect("bridge read");
+            assert!(n > 0, "bridge closed while waiting for response");
+            let v: Value = match serde_json::from_str(buf.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v["id"] == id {
+                return v;
+            }
+        }
+    }
+
+    /// `tools/list` → the `workspace_api` tool description.
+    async fn workspace_api_description(&mut self) -> String {
+        let resp = self.request("tools/list", json!({})).await;
+        let tools = resp["result"]["tools"].as_array().expect("tools array");
+        tools
+            .iter()
+            .find(|t| t["name"] == "workspace_api")
+            .expect("workspace_api tool listed")["description"]
+            .as_str()
+            .expect("description string")
+            .to_string()
+    }
+
+    /// `tools/call workspace_api` with agent JS; returns `(is_error, text)`.
+    async fn call_js(&mut self, code: &str) -> (bool, String) {
+        let resp = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "e2e sub-agent gate probe" },
+                }),
+            )
+            .await;
+        assert!(
+            resp.get("error").is_none(),
+            "tools/call transport error: {resp}"
+        );
+        let result = &resp["result"];
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (is_error, text)
+    }
+}
+
+/// Sub-agent question gate over the real WSS + bridge path: a background
+/// agent's bridge (a sub-agent by the `parent_agent_id.is_some() ||
+/// is_background` derivation) prunes `ws.app.question.*` from its tool
+/// description and JS prelude and denies the raw `host({...})` frame with
+/// the top-level-only redirect error; a top-level agent's bridge on the same
+/// daemon keeps the full question surface (with `structuredQuestions` on).
+#[tokio::test]
+async fn sub_agent_question_ask_denied_over_wss() {
+    let Some(script) = gate("WSS sub-agent question gate E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "done" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Subscriber conn — before any agent activity.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // ---- Top-level agent: full question surface on its bridge ----
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "TopLevel", "model": "mock:default" }),
+    )
+    .await;
+    let top_agent = created["agent"]["id"]
+        .as_str()
+        .expect("top-level agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": top_agent, "content": "say done" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &top_agent).await;
+
+    let configs_top = mcp_config_files(&data_dir);
+    assert_eq!(
+        configs_top.len(),
+        1,
+        "one agent → one mcp config: {configs_top:?}"
+    );
+    let mut bridge_top = BridgeClient::connect(&bridge_addr_from_config(&configs_top[0])).await;
+    let desc_top = bridge_top.workspace_api_description().await;
+    assert!(
+        desc_top.contains("ws.app.question.ask("),
+        "top-level description must advertise ws.app.question.ask"
+    );
+    let (err, text) = bridge_top
+        .call_js("return typeof ws.app.question.ask;")
+        .await;
+    assert!(!err, "typeof probe on top-level bridge: {text}");
+    assert!(
+        text.contains("function"),
+        "question installer present on top-level bridge: {text}"
+    );
+
+    // ---- Background agent (sub-agent): gated bridge ----
+    let created_bg = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "BgWorker",
+            "model": "mock:default",
+            "isBackground": true,
+        }),
+    )
+    .await;
+    let bg_agent = created_bg["agent"]["id"]
+        .as_str()
+        .expect("background agent id")
+        .to_string();
+    let sent_bg = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": bg_agent, "content": "say done" }),
+    )
+    .await;
+    assert_eq!(sent_bg["success"], true, "bg sendMessage ok: {sent_bg}");
+    await_stream_end(&mut sub, &bg_agent).await;
+
+    let configs_all = mcp_config_files(&data_dir);
+    assert_eq!(
+        configs_all.len(),
+        2,
+        "two agents → two mcp configs: {configs_all:?}"
+    );
+    let config_bg = configs_all
+        .iter()
+        .find(|p| !configs_top.contains(p))
+        .expect("new mcp config for the background agent");
+    let mut bridge_bg = BridgeClient::connect(&bridge_addr_from_config(config_bg)).await;
+
+    // Layer (a): description pruned of ws.app.question.*.
+    let desc_bg = bridge_bg.workspace_api_description().await;
+    assert!(
+        !desc_bg.contains("ws.app.question."),
+        "sub-agent description must not advertise ws.app.question.*"
+    );
+    assert!(
+        desc_bg.contains("ws.agent.requestDiscussion("),
+        "attention-request docs must survive the sub-agent gate"
+    );
+
+    // Layer (b): prelude omits the installer.
+    let (err, text) = bridge_bg
+        .call_js("return typeof (ws.app && ws.app.question);")
+        .await;
+    assert!(!err, "typeof probe on sub-agent bridge: {text}");
+    assert!(
+        text.contains("undefined"),
+        "question installer must be absent on the sub-agent bridge: {text}"
+    );
+
+    // Layer (c): the raw dispatch frame is denied with the redirect error.
+    let (err, text) = bridge_bg
+        .call_js(
+            "return await host({ method: 'app.question.ask', args: { question: { header: 'h', \
+             question: 'q', options: [{label:'a'},{label:'b'}] } } });",
+        )
+        .await;
+    assert!(err, "sub-agent ask must be denied: {text}");
+    assert!(
+        text.contains("only available to top-level agents")
+            && text.contains("ws.agent.requestDiscussion")
+            && text.contains("ws.agent.reportToParent"),
+        "expected top-level-only redirect denial, got: {text}"
+    );
+    assert!(
+        !text.contains("disabled in settings"),
+        "sub-agent denial must not masquerade as a settings gate: {text}"
     );
 }

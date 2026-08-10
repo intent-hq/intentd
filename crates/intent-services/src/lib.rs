@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod create_progress;
 mod discovery_cache;
 mod disk_usage;
 mod drafts;
@@ -10158,6 +10159,29 @@ impl WorkspaceApi for Services {
 
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
+            // Unified provisioning progress (PROTOCOL §5.1): when the request
+            // carries a `progressId`, the closure below stashes its reporter
+            // here so the wrapper can emit the exactly-one terminal
+            // `git:clone:done` for every outcome — success or failure, in
+            // every checkout mode. Stays empty on idempotent replays (the
+            // closure never runs) and for requests without a `progressId`.
+            let progress_slot: std::sync::Arc<
+                std::sync::Mutex<Option<std::sync::Arc<create_progress::CreateProgress>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let progress_slot_op = progress_slot.clone();
+            // Kept at the wrapper so a failure BEFORE the closure arms the
+            // slot (idempotency-store read/decode error, or an early config
+            // error inside the closure such as an invalid
+            // `workspace.worktreesLocation`) still gets its terminal
+            // `ok:false` done below — no workspace id exists yet on those
+            // paths, so that frame publishes under the empty sentinel id.
+            let wrapper_progress_id = input
+                .progress_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let wrapper_bus = bus.clone();
             let result = with_idempotency(
                 &store,
                 "",
@@ -10178,6 +10202,19 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
+                    // Unified provisioning progress (PROTOCOL §5.1): a
+                    // client-supplied `progressId` arms a per-create reporter
+                    // that echoes the id on every `git:clone:*` frame,
+                    // normalizes percent to one non-decreasing 0–100 scale
+                    // across all provisioning modes, and hands terminal-done
+                    // ownership to the wrapper around this closure. Absent
+                    // (or with no bus wired) every event path stays legacy.
+                    let progress_id = input
+                        .progress_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
@@ -10191,6 +10228,21 @@ impl WorkspaceApi for Services {
                     // directory reflects intent and deleted ids are never
                     // recycled.
                     let id = derive_workspace_id(&store, &input, &workspaces_root).await;
+                    let progress = progress_id.and_then(|pid| {
+                        bus.clone().map(|b| {
+                            std::sync::Arc::new(create_progress::CreateProgress::new(
+                                b,
+                                id.clone(),
+                                pid,
+                            ))
+                        })
+                    });
+                    if let Some(reporter) = progress.clone() {
+                        *progress_slot_op.lock().unwrap() = Some(reporter.clone());
+                        reporter
+                            .milestone("starting", 0, "Preparing workspace...")
+                            .await;
+                    }
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
                     // repo, clone it *before* branch naming so the branch
@@ -10272,19 +10324,37 @@ impl WorkspaceApi for Services {
                                 // a terminal done. Checkout provisioning
                                 // below is local-only, matching the legacy
                                 // flow where worktree provisioning runs
-                                // after `git:clone:done`.
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::progress_event(
-                                        &id,
-                                        &request_id,
-                                        "starting",
-                                        0,
-                                        "Preparing repository cache...",
-                                    ),
-                                )
-                                .await;
+                                // after `git:clone:done`. With a reporter
+                                // armed the frames route through it instead
+                                // (new `cache` phase, unified percent, no
+                                // terminal frames here — the wrapper owns
+                                // the exactly-one done).
+                                match progress.as_deref() {
+                                    Some(reporter) => {
+                                        reporter
+                                            .milestone(
+                                                "cache",
+                                                5,
+                                                "Preparing repository cache...",
+                                            )
+                                            .await;
+                                    }
+                                    None => {
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::progress_event(
+                                                &id,
+                                                &request_id,
+                                                "starting",
+                                                0,
+                                                "Preparing repository cache...",
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 let token = github_git_token_for_url(
                                     services.settings_registry.as_deref(),
                                     url,
@@ -10317,42 +10387,69 @@ impl WorkspaceApi for Services {
                                         let error_code = (category
                                             != intent_core::CloneErrorCategory::Other)
                                             .then_some(category);
-                                        clone_ops::publish(
-                                            &bus_ref,
-                                            &id,
-                                            clone_ops::done_event(
+                                        // Reporter-armed creates defer the
+                                        // terminal done to the wrapper (which
+                                        // sees this same CloneFailed error).
+                                        if progress.is_none() {
+                                            clone_ops::publish(
+                                                &bus_ref,
                                                 &id,
-                                                &request_id,
-                                                false,
-                                                Some(&detail),
-                                                error_code,
-                                            ),
-                                        )
-                                        .await;
+                                                clone_ops::done_event(
+                                                    &id,
+                                                    &request_id,
+                                                    false,
+                                                    Some(&detail),
+                                                    error_code,
+                                                    None,
+                                                ),
+                                            )
+                                            .await;
+                                        }
                                         return Err(Error::CloneFailed {
                                             category,
                                             detail,
                                         });
                                     }
                                 };
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::progress_event(
-                                        &id,
-                                        &request_id,
-                                        "checkout",
-                                        90,
-                                        "Repository cache ready",
-                                    ),
-                                )
-                                .await;
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::done_event(&id, &request_id, true, None, None),
-                                )
-                                .await;
+                                match progress.as_deref() {
+                                    Some(reporter) => {
+                                        reporter
+                                            .milestone(
+                                                "cache",
+                                                create_progress::CLONE_SEGMENT_END,
+                                                "Repository cache ready",
+                                            )
+                                            .await;
+                                    }
+                                    None => {
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::progress_event(
+                                                &id,
+                                                &request_id,
+                                                "checkout",
+                                                90,
+                                                "Repository cache ready",
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::done_event(
+                                                &id,
+                                                &request_id,
+                                                true,
+                                                None,
+                                                None,
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -10429,6 +10526,7 @@ impl WorkspaceApi for Services {
                                 target_path: target.clone(),
                                 token,
                                 bus: bus_ref,
+                                progress: progress.clone(),
                             })
                             .await
                             .map_err(|failure| Error::CloneFailed {
@@ -10772,6 +10870,28 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Direct
                                 }
                             };
+                            // Provisioning milestone on the unified scale
+                            // (85–100 segment): the copy/checkout is the
+                            // slow local step between the cache ensure and
+                            // the row insert.
+                            if let Some(reporter) = progress.as_deref() {
+                                match mode {
+                                    intent_core::CheckoutMode::Cow => {
+                                        reporter
+                                            .milestone("cow-copy", 88, "Copying repository...")
+                                            .await
+                                    }
+                                    _ => {
+                                        reporter
+                                            .milestone(
+                                                "checkout",
+                                                88,
+                                                "Checking out repository...",
+                                            )
+                                            .await
+                                    }
+                                }
+                            }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
@@ -10885,6 +11005,18 @@ impl WorkspaceApi for Services {
                                 && !has_worktree
                                 && repo_dir.join(".git").exists()
                             {
+                                // Direct-mode milestone (unified scale): the
+                                // branch checkout is the only provisioning
+                                // step on this fast path.
+                                if let Some(reporter) = progress.as_deref() {
+                                    reporter
+                                        .milestone(
+                                            "checkout",
+                                            50,
+                                            "Checking out workspace branch...",
+                                        )
+                                        .await;
+                                }
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
@@ -11014,6 +11146,34 @@ impl WorkspaceApi for Services {
                                 } else {
                                     intent_core::CheckoutMode::Worktree
                                 };
+                                // Local-repo provisioning milestone (unified
+                                // scale): the CoW copy / worktree add is the
+                                // dominant step of a local create, so it sits
+                                // mid-scale (no clone segment ran before it;
+                                // after a network clone the monotonic clamp
+                                // lifts it to the 85+ tail automatically).
+                                if let Some(reporter) = progress.as_deref() {
+                                    match mode {
+                                        intent_core::CheckoutMode::Cow => {
+                                            reporter
+                                                .milestone(
+                                                    "cow-copy",
+                                                    30,
+                                                    "Copying repository (CoW)...",
+                                                )
+                                                .await
+                                        }
+                                        _ => {
+                                            reporter
+                                                .milestone(
+                                                    "worktree",
+                                                    30,
+                                                    "Creating linked worktree...",
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
                                 let provision = |mode: intent_core::CheckoutMode| {
                                     let name = name.clone();
                                     let branch = branch.clone();
@@ -11178,6 +11338,15 @@ impl WorkspaceApi for Services {
                                 );
                             }
                         }
+                    }
+                    // Provisioning is done in every mode; the remaining work
+                    // (row insert, spec seed, initial agent) is fast local
+                    // bookkeeping — the unified scale's last milestone before
+                    // the wrapper's terminal `complete 100` + done.
+                    if let Some(reporter) = progress.as_deref() {
+                        reporter
+                            .milestone("finalizing", 95, "Finalizing workspace...")
+                            .await;
                     }
                     // Mirror-at-creation (spec Diagnosis §3b): persist the
                     // global `git.autoCommit` as the workspace's own override
@@ -11639,6 +11808,45 @@ impl WorkspaceApi for Services {
                 },
             )
             .await;
+
+            // Terminal frame ownership (PROTOCOL §5.1): when the create armed
+            // a progress reporter, exactly one `git:clone:done` is emitted
+            // here — `ok:true` after any successful create, `ok:false`
+            // carrying the sanitized detail (+ machine-readable category for
+            // classified clone failures) on any error, in every checkout
+            // mode. The slot stays empty on idempotent replays (the closure
+            // never runs; nothing is emitted — the cached success result is
+            // the answer) and on `progressId`-less requests. A FAILURE that
+            // never armed the slot (idempotency-store read/decode error, or
+            // an early config error such as an invalid
+            // `workspace.worktreesLocation`) synthesizes a sentinel-scoped
+            // reporter so a `progressId` create's error path always closes
+            // the stream with its `ok:false` done.
+            let mut reporter = progress_slot.lock().unwrap().take();
+            if reporter.is_none() && result.is_err() {
+                if let (Some(pid), Some(b)) = (&wrapper_progress_id, &wrapper_bus) {
+                    reporter = Some(std::sync::Arc::new(create_progress::CreateProgress::new(
+                        b.clone(),
+                        WorkspaceId::from_string(String::new()),
+                        pid.clone(),
+                    )));
+                }
+            }
+            if let Some(reporter) = reporter {
+                match &result {
+                    Ok(_) => reporter.done_ok().await,
+                    Err(Error::CloneFailed { category, detail }) => {
+                        let error_code = (*category != intent_core::CloneErrorCategory::Other)
+                            .then_some(*category);
+                        reporter.done_err(detail, error_code).await;
+                    }
+                    Err(e) => {
+                        reporter
+                            .done_err(&clone_ops::redact_credentials(&e.to_string()), None)
+                            .await;
+                    }
+                }
+            }
 
             // Log workspace.create failures at WARN so they are diagnosable
             // (STAB-68: iOS saw -32603 with no daemon-side log evidence).
@@ -16711,6 +16919,7 @@ impl WorkspaceApi for Services {
                     target_path: spawn_target,
                     token,
                     bus,
+                    progress: None,
                 });
             });
             Ok(serde_json::json!({

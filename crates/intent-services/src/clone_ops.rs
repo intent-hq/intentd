@@ -228,6 +228,13 @@ pub(crate) struct CloneJob {
     /// environment only — never argv, never logged.
     pub token: Option<String>,
     pub bus: EventBus,
+    /// Unified `workspace.create` progress reporter (PROTOCOL §5.1). When
+    /// set, every frame routes through the reporter — stderr percentages are
+    /// normalized into the 0–85 clone segment of the create's unified scale,
+    /// carry the create's `progressId`, and NO terminal frames are emitted
+    /// here (the create wrapper owns the exactly-one `git:clone:done`).
+    /// `None` keeps the legacy standalone `git.clone` framing exactly.
+    pub progress: Option<std::sync::Arc<crate::create_progress::CreateProgress>>,
 }
 
 /// Kick off a streaming clone on a background task and return immediately. The
@@ -303,6 +310,60 @@ fn build_clone_command(
     cmd
 }
 
+/// How [`run_clone`] emits its frames: the legacy standalone `git.clone`
+/// framing (raw stderr percentages, terminal frames owned here), or a
+/// `workspace.create` reporter (normalized percentages + `progressId`,
+/// terminal frames owned by the create wrapper — see [`CloneJob::progress`]).
+#[derive(Clone)]
+enum ProgressSink {
+    Legacy {
+        bus: EventBus,
+        ws: WorkspaceId,
+        request_id: String,
+    },
+    Create(std::sync::Arc<crate::create_progress::CreateProgress>),
+}
+
+impl ProgressSink {
+    async fn progress(&self, phase: &str, percent: u32, message: &str) {
+        match self {
+            ProgressSink::Legacy {
+                bus,
+                ws,
+                request_id,
+            } => {
+                publish(
+                    bus,
+                    ws,
+                    progress_event(ws, request_id, phase, percent, message, None),
+                )
+                .await;
+            }
+            ProgressSink::Create(reporter) => {
+                reporter.clone_progress(phase, percent, message).await
+            }
+        }
+    }
+
+    /// Legacy-only terminal done; the create wrapper owns the terminal frame
+    /// when a reporter is active (exactly-one `git:clone:done` per create).
+    async fn done(&self, ok: bool, error: Option<&str>, error_code: Option<CloneErrorCategory>) {
+        if let ProgressSink::Legacy {
+            bus,
+            ws,
+            request_id,
+        } = self
+        {
+            publish(
+                bus,
+                ws,
+                done_event(ws, request_id, ok, error, error_code, None),
+            )
+            .await;
+        }
+    }
+}
+
 async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     let CloneJob {
         request_id,
@@ -311,16 +372,20 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         target_path,
         token,
         bus,
+        progress,
     } = job;
     let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+    let sink = match progress {
+        Some(reporter) => ProgressSink::Create(reporter),
+        None => ProgressSink::Legacy {
+            bus,
+            ws,
+            request_id,
+        },
+    };
 
     // Initial "starting" frame (parity with the FE's first tick).
-    publish(
-        &bus,
-        &ws,
-        progress_event(&ws, &request_id, "starting", 0, "Starting clone..."),
-    )
-    .await;
+    sink.progress("starting", 0, "Starting clone...").await;
 
     // Ensure a target-parent exists so `git clone` doesn't fail on a fresh
     // workspace path. Not fatal if it already exists.
@@ -354,12 +419,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("git spawn failed: {e}");
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             return Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -371,12 +431,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         None => {
             let _ = child.kill().await;
             let msg = "git stderr not piped".to_string();
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             return Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -384,12 +439,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
     };
 
-    let bus_reader = bus.clone();
-    let ws_reader = ws.clone();
-    let request_id_reader = request_id.clone();
-    let reader_task = tokio::spawn(async move {
-        stream_stderr(stderr, bus_reader, ws_reader, request_id_reader).await
-    });
+    let sink_reader = sink.clone();
+    let reader_task = tokio::spawn(async move { stream_stderr(stderr, sink_reader).await });
 
     // Wait for the child under a hard timeout so a stalled clone never wedges
     // the daemon. On timeout, reap the process group and emit `ok:false`.
@@ -399,13 +450,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
 
     match wait_result {
         Ok(Ok(status)) if status.success() => {
-            publish(
-                &bus,
-                &ws,
-                progress_event(&ws, &request_id, "complete", 100, "Clone complete!"),
-            )
-            .await;
-            publish(&bus, &ws, done_event(&ws, &request_id, true, None, None)).await;
+            sink.progress("complete", 100, "Clone complete!").await;
+            sink.done(true, None, None).await;
             Ok(())
         }
         Ok(Ok(status)) => {
@@ -415,12 +461,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             };
             let redacted = redact_credentials(&msg);
             let category = classified(&redacted);
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&redacted), category),
-            )
-            .await;
+            sink.done(false, Some(&redacted), category).await;
             Err(CloneFailure {
                 category,
                 detail: redacted,
@@ -428,12 +469,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
         Ok(Err(e)) => {
             let msg = format!("git wait failed: {e}");
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -445,12 +481,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             // per the clone failure taxonomy (PROTOCOL §9.1).
             let msg = "git clone timed out".to_string();
             let category = classified(&msg);
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), category),
-            )
-            .await;
+            sink.done(false, Some(&msg), category).await;
             Err(CloneFailure {
                 category,
                 detail: msg,
@@ -492,12 +523,7 @@ fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
 /// Parse `git clone --progress` stderr line-by-line and publish one
 /// `git:clone:progress` per matched phase transition. Returns the final chunk
 /// of stderr text (best-effort) so a non-zero exit can surface a useful error.
-async fn stream_stderr<R>(
-    stderr: R,
-    bus: EventBus,
-    ws: WorkspaceId,
-    request_id: String,
-) -> Option<String>
+async fn stream_stderr<R>(stderr: R, sink: ProgressSink) -> Option<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -520,12 +546,7 @@ where
             if phase != last_phase || percent > last_percent {
                 last_phase = phase.to_string();
                 last_percent = percent;
-                publish(
-                    &bus,
-                    &ws,
-                    progress_event(&ws, &request_id, phase, percent, &message),
-                )
-                .await;
+                sink.progress(phase, percent, &message).await;
             }
         }
         // Keep a bounded tail (~4KiB) of stderr for error messages.
@@ -667,14 +688,29 @@ fn percent_after(text: &str, label: &str) -> Option<u32> {
 
 /// Shared with the `workspace.create` cache-hydration arm in `lib.rs`, which
 /// streams the same `git:clone:progress` / `git:clone:done` frames while
-/// hydrating from the repo cache instead of a network clone.
+/// hydrating from the repo cache instead of a network clone. `progress_id`
+/// is the client-supplied `workspace.create` correlation id (PROTOCOL §5.1):
+/// present only on create-scoped frames whose request carried one — the key
+/// is omitted entirely otherwise, so legacy consumers are unaffected.
 pub(crate) fn progress_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     phase: &str,
     percent: u32,
     message: &str,
+    progress_id: Option<&str>,
 ) -> NewEvent {
+    let mut data = json!({
+        "requestId": request_id,
+        "phase": phase,
+        "percent": percent,
+        "message": message,
+    });
+    if let Some(pid) = progress_id {
+        data.as_object_mut()
+            .unwrap()
+            .insert("progressId".to_string(), json!(pid));
+    }
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -684,12 +720,7 @@ pub(crate) fn progress_event(
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: json!({
-            "requestId": request_id,
-            "phase": phase,
-            "percent": percent,
-            "message": message,
-        }),
+        data,
     }
 }
 
@@ -699,12 +730,18 @@ pub(crate) fn done_event(
     ok: bool,
     error: Option<&str>,
     error_code: Option<CloneErrorCategory>,
+    progress_id: Option<&str>,
 ) -> NewEvent {
     let mut data = json!({ "requestId": request_id, "ok": ok });
     if let Some(err) = error {
         data.as_object_mut()
             .unwrap()
             .insert("error".to_string(), json!(err));
+    }
+    if let Some(pid) = progress_id {
+        data.as_object_mut()
+            .unwrap()
+            .insert("progressId".to_string(), json!(pid));
     }
     // Machine-readable failure category (monorepo#825/#826): present only on
     // classified failures so existing consumers of the `error` prose are
@@ -1238,6 +1275,7 @@ mod tests {
             false,
             Some("terminal prompts disabled"),
             classified("terminal prompts disabled"),
+            None,
         );
         assert_eq!(ev.data["errorCode"], json!("auth-required"));
         let ev = done_event(
@@ -1246,9 +1284,10 @@ mod tests {
             false,
             Some("weird failure"),
             classified("weird failure"),
+            None,
         );
         assert!(ev.data.get("errorCode").is_none());
-        let ev = done_event(&ws, "r3", true, None, None);
+        let ev = done_event(&ws, "r3", true, None, None, None);
         assert!(ev.data.get("errorCode").is_none());
         // The daemon's own timeout message classifies as `network`.
         assert_eq!(classified("git clone timed out"), Some(C::Network));
