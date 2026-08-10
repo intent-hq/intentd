@@ -2891,6 +2891,21 @@ impl AgentManager {
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
+        self.detach_with_redelivery(agent_id, None).await
+    }
+
+    /// [`AgentManager::detach`] with an optional pre-derived zero-output
+    /// stop-redelivery payload (intent-hq/monorepo#1757) to install in place
+    /// of the default drop. `stop_with_redelivery_arm` (the spawn-window user
+    /// stop) passes `Some`: the payload must be visible BEFORE `end_turn`
+    /// releases the busy slot, because a concurrent send claims the slot the
+    /// moment it frees and its worker spawn consumes the map right then —
+    /// arming after the teardown (the previous shape) lost that race.
+    async fn detach_with_redelivery(
+        &self,
+        agent_id: &AgentId,
+        redelivery: Option<crate::agent_ops::QueuedPrepend>,
+    ) -> (bool, Option<(Child, Option<u32>)>) {
         // Snapshot the live-turn slot BEFORE aborting the worker (the abort
         // drops LiveTurnGuard, clearing the slot), then flush the partial
         // in-flight assistant content AFTER the abort — same convention as
@@ -2920,11 +2935,22 @@ impl AgentManager {
         // The zero-output stop-redelivery payload (intent-hq/monorepo#1757)
         // is dropped on the same terms — a hard teardown's next session is
         // either recreated (history replay covers the stopped message) or the
-        // agent is being deleted; the interrupt fallback path re-arms AFTER
-        // this stop, so a spawn-window user stop still redelivers.
+        // agent is being deleted — UNLESS the caller pre-derived a payload
+        // (the spawn-window user stop), which is installed here so it is
+        // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
-        self.stop_redelivery.lock().unwrap().remove(agent_id);
+        {
+            let mut armed = self.stop_redelivery.lock().unwrap();
+            match redelivery {
+                Some(payload) => {
+                    armed.insert(agent_id.clone(), payload);
+                }
+                None => {
+                    armed.remove(agent_id);
+                }
+            }
+        }
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
@@ -3048,6 +3074,21 @@ impl AgentManager {
             }
             None => None,
         };
+        // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
+        // provider turn dropped the stopped message before producing any
+        // output, so arm the prompt-only redelivery payload for the NEXT
+        // turn (consumed in `spawn_worker`). Armed HERE — after the marker
+        // row flush (so its id is known for exclusion) but BEFORE `end_turn`
+        // below releases the busy slot — so a concurrent send that claims
+        // the slot the moment it frees cannot spawn before the payload is
+        // visible. Only the plain `agent.stop` keep-alive path (`UserStop`)
+        // arms it — the message-preemption path threads the same payload
+        // through `preempt_busy_turn`'s combined delivery, and
+        // shutdown/suspend interrupts have their own resume semantics.
+        if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
+            self.arm_stop_redelivery(agent_id, interrupted_message_id.as_ref())
+                .await;
+        }
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
         // best-effort — a wire error never blocks the stop.
@@ -3189,76 +3230,79 @@ impl AgentManager {
                     .await;
             }
         }
-        // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
-        // provider turn dropped the stopped message before producing any
-        // output, so arm the prompt-only redelivery payload for the NEXT
-        // turn (consumed in `spawn_worker`). Only the plain `agent.stop`
-        // keep-alive path (`UserStop`) arms it — the message-preemption path
-        // threads the same payload through `preempt_busy_turn`'s combined
-        // delivery, and shutdown/suspend interrupts have their own resume
-        // semantics.
-        if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
-            self.arm_stop_redelivery(agent_id, interrupted_message_id.as_ref())
-                .await;
-        }
         (true, interrupted_message_id)
     }
 
-    /// Arm the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
-    /// from the transcript's last user row, unless the turn already
-    /// progressed (any non-user row after the last user message — same
-    /// bounded check as `preempt_busy_turn`'s combined delivery, with the
-    /// just-persisted EMPTY interrupted marker row excluded by id). A repeat
-    /// stop before the payload is consumed re-derives the same last user row,
-    /// so the insert stays idempotent.
-    async fn arm_stop_redelivery(&self, agent_id: &AgentId, marker_row_id: Option<&String>) {
-        let Ok(messages) = self
+    /// Derive the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
+    /// from the transcript's last user row. Returns `None` when the turn
+    /// already progressed (any non-user row after the last user message —
+    /// same bounded check as `preempt_busy_turn`'s combined delivery, with
+    /// the just-persisted EMPTY interrupted marker row excluded by id) or
+    /// when the row carries nothing to redeliver.
+    async fn derive_stop_redelivery(
+        &self,
+        agent_id: &AgentId,
+        marker_row_id: Option<&String>,
+    ) -> Option<crate::agent_ops::QueuedPrepend> {
+        let messages = self
             .services
             .store
             .get_agent_messages(agent_id, Some(10))
             .await
-        else {
-            return;
-        };
-        let Some(last_user_idx) = messages.iter().rposition(|m| m.role == "user") else {
-            return;
-        };
+            .ok()?;
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user")?;
         if turn_progressed_after(&messages, last_user_idx, marker_row_id) {
-            return;
+            return None;
         }
         let payload = extract_user_prepend(&messages[last_user_idx].content);
         if payload.content.is_none()
             && payload.image_blocks.is_none()
             && payload.file_blocks.is_none()
         {
-            return;
+            return None;
         }
-        self.stop_redelivery
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), payload);
+        Some(payload)
+    }
+
+    /// Arm the zero-output stop-redelivery payload (intent-hq/monorepo#1757)
+    /// for consumption by the next `spawn_worker`. A repeat stop before the
+    /// payload is consumed re-derives the same last user row, so the insert
+    /// stays idempotent. MUST run before the busy slot is released
+    /// (`end_turn`): a concurrent send claims the slot the moment it frees,
+    /// and its worker spawn must see the payload.
+    async fn arm_stop_redelivery(&self, agent_id: &AgentId, marker_row_id: Option<&String>) {
+        if let Some(payload) = self.derive_stop_redelivery(agent_id, marker_row_id).await {
+            self.stop_redelivery
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), payload);
+        }
     }
 
     /// Hard-stop fallback for the interrupt paths (no live handle /
-    /// `acpSessionId` — the spawn window): run [`AgentManager::stop`], then
-    /// arm the zero-output stop redelivery for a user stop. The arm runs
-    /// AFTER `stop` because `detach` flushes the live turn itself
-    /// (`AgentStopped` marker row) — arming first would see a pre-flush
-    /// transcript and the marker row would then count as progress on the next
-    /// read. `detach`'s flush stamps `agent_stopped`, so the marker row id is
-    /// re-read from the flushed transcript tail here.
+    /// `acpSessionId` — the spawn window): derive the zero-output stop
+    /// redelivery for a user stop, then run the [`AgentManager::stop`]
+    /// teardown with the payload installed BEFORE `detach` releases the busy
+    /// slot — a concurrent send claiming the freed slot must already see it
+    /// (the same ordering `interrupt_inner` observes on the keep-alive path).
+    /// The payload is derived from the pre-flush transcript (no marker row
+    /// persisted yet, so there is no marker id to exclude and the progressed
+    /// check sees the true turn state).
     async fn stop_with_redelivery_arm(&self, agent_id: &AgentId, reason: InterruptReason) -> bool {
-        let live = self.services.live_turn(agent_id);
         let turn_in_flight = self.is_busy(agent_id);
-        let had_output = live
-            .as_ref()
+        let had_output = self
+            .services
+            .live_turn(agent_id)
             .map(|live| !live.blocks.is_empty())
             .unwrap_or(false);
-        let live_message_id = live.map(|l| l.message_id);
-        let removed = self.stop(agent_id).await;
-        if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
-            self.arm_stop_redelivery(agent_id, live_message_id.as_ref())
-                .await;
+        let redelivery = if reason == InterruptReason::UserStop && turn_in_flight && !had_output {
+            self.derive_stop_redelivery(agent_id, None).await
+        } else {
+            None
+        };
+        let (removed, child) = self.detach_with_redelivery(agent_id, redelivery).await;
+        if let Some((child, spawn_pid)) = child {
+            kill_child_tree(child, spawn_pid).await;
         }
         removed
     }
