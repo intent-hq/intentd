@@ -47,6 +47,35 @@ const CACHE_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 /// Poll interval while waiting for a shelled-out git child to exit.
 const GIT_POLL: Duration = Duration::from_millis(50);
 
+/// Raw output chunk callback for a streamed git child: called once per
+/// `\r`/`\n`-delimited chunk of the child's stderr (and stdout, where the
+/// caller pipes it). Runs on the drain thread — implementations must be cheap
+/// and non-blocking (e.g. a channel send).
+pub type ProgressChunkFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Progress events surfaced by [`ensure_cached_repo_with_progress`]. Raw git
+/// output travels as text chunks — parsing/normalizing them is the caller's
+/// concern, keeping this crate free of event-bus/protocol dependencies.
+#[derive(Debug, Clone)]
+pub enum CacheEnsureEvent {
+    /// Output chunk from superproject-shaped `git --progress` work: the cache
+    /// clone (`git clone --recurse-submodules --progress`, submodule clones
+    /// included) or the refresh fetch.
+    CloneChunk(String),
+    /// Output chunk from the cache-refresh
+    /// `git submodule update --init --recursive --force --progress`.
+    SubmoduleChunk(String),
+    /// A named refresh step boundary: `fetch`, `reset`, `submodule-sync`,
+    /// `submodule-update`, or `clean`. Emitted before the step runs so a
+    /// warm-cache refresh shows movement even when the steps stream nothing.
+    Step(&'static str),
+}
+
+/// Callback receiving [`CacheEnsureEvent`]s during
+/// [`ensure_cached_repo_with_progress`]. Called from the blocking pool /
+/// drain threads — implementations must be cheap and non-blocking.
+pub type CacheEnsureProgress = Arc<dyn Fn(CacheEnsureEvent) + Send + Sync>;
+
 /// Process-global per-repo lock registry, keyed by cache path. Concurrent
 /// workspace creates for the same repo serialize their refresh/clone here;
 /// different repos never contend.
@@ -80,6 +109,22 @@ pub async fn ensure_cached_repo(
     repo: &str,
     token: Option<&str>,
 ) -> Result<PathBuf> {
+    ensure_cached_repo_with_progress(cache_root, github_url, owner, repo, token, None).await
+}
+
+/// [`ensure_cached_repo`] with an optional progress callback: raw git output
+/// chunks and refresh step boundaries stream through `progress` as
+/// [`CacheEnsureEvent`]s while the ensure runs. The callback is invoked from
+/// the blocking pool and drain threads — it must be cheap and non-blocking
+/// (e.g. a channel send). `None` behaves exactly like [`ensure_cached_repo`].
+pub async fn ensure_cached_repo_with_progress(
+    cache_root: &Path,
+    github_url: &str,
+    owner: &str,
+    repo: &str,
+    token: Option<&str>,
+    progress: Option<CacheEnsureProgress>,
+) -> Result<PathBuf> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
     let cache_path = cache_root.join(owner).join(repo);
@@ -90,18 +135,25 @@ pub async fn ensure_cached_repo(
     let path = cache_path.clone();
     let url = github_url.to_string();
     let token = token.map(str::to_owned);
-    tokio::task::spawn_blocking(move || ensure_blocking(&path, &url, token.as_deref()))
-        .await
-        .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))??;
+    tokio::task::spawn_blocking(move || {
+        ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))??;
     Ok(cache_path)
 }
 
 /// Blocking body of [`ensure_cached_repo`]: refresh when a cache is present,
 /// otherwise (or when the refresh reports any anomaly) wipe and re-clone.
-fn ensure_blocking(cache_path: &Path, github_url: &str, token: Option<&str>) -> Result<()> {
+fn ensure_blocking(
+    cache_path: &Path,
+    github_url: &str,
+    token: Option<&str>,
+    progress: Option<&CacheEnsureProgress>,
+) -> Result<()> {
     if cache_path.exists() {
         if origin_matches(cache_path, github_url) {
-            match refresh(cache_path, token) {
+            match refresh(cache_path, token, progress) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(
@@ -124,7 +176,7 @@ fn ensure_blocking(cache_path: &Path, github_url: &str, token: Option<&str>) -> 
         }
     }
     remove_cache_path(cache_path)?;
-    clone(github_url, cache_path, token)
+    clone(github_url, cache_path, token, progress)
 }
 
 /// Whether the cache's `origin` remote points at exactly `github_url`. Any
@@ -198,12 +250,25 @@ fn origin_is_github_slot(url: &str, owner: &str, repo: &str) -> bool {
 /// never merged — and prune module git dirs the current `.gitmodules` no
 /// longer names. Every failure here is an anomaly the caller self-heals by
 /// re-cloning.
-fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
-    run_git(
+fn refresh(
+    cache_path: &Path,
+    token: Option<&str>,
+    progress: Option<&CacheEnsureProgress>,
+) -> Result<()> {
+    emit(progress, CacheEnsureEvent::Step("fetch"));
+    // `--progress` only when someone is listening: it forces progress output
+    // on a non-tty stderr, which would otherwise pollute error tails.
+    let fetch_args: &[&str] = if progress.is_some() {
+        &["fetch", "--prune", "--progress", "origin"]
+    } else {
+        &["fetch", "--prune", "origin"]
+    };
+    run_git_streamed(
         cache_path,
-        &["fetch", "--prune", "origin"],
+        fetch_args,
         token,
         CACHE_FETCH_TIMEOUT,
+        chunk_fn(progress, CacheEnsureEvent::CloneChunk),
     )?;
     run_git(
         cache_path,
@@ -228,6 +293,7 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     repo.set_head(&format!("refs/heads/{default}"))
         .map_err(map_git_err)?;
     drop(repo);
+    emit(progress, CacheEnsureEvent::Step("reset"));
     crate::reset::reset_hard(cache_path, "HEAD")?;
     // Submodules (checked after the reset so `.gitmodules` reflects the new
     // tip; skipped cheaply when there is none): `sync` re-points recorded
@@ -237,17 +303,32 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     // needs the new commit — so the token is offered.
     let has_submodules = crate::submodule::has_submodules(cache_path);
     if has_submodules {
+        emit(progress, CacheEnsureEvent::Step("submodule-sync"));
         run_git(
             cache_path,
             &["submodule", "sync", "--recursive"],
             token,
             CACHE_FETCH_TIMEOUT,
         )?;
-        run_git(
+        emit(progress, CacheEnsureEvent::Step("submodule-update"));
+        let update_args: &[&str] = if progress.is_some() {
+            &[
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--force",
+                "--progress",
+            ]
+        } else {
+            &["submodule", "update", "--init", "--recursive", "--force"]
+        };
+        run_git_streamed(
             cache_path,
-            &["submodule", "update", "--init", "--recursive", "--force"],
+            update_args,
             token,
             CACHE_FETCH_TIMEOUT,
+            chunk_fn(progress, CacheEnsureEvent::SubmoduleChunk),
         )?;
     }
     // Untracked pollution (e.g. leftovers from a process killed mid-checkout
@@ -255,6 +336,7 @@ fn refresh(cache_path: &Path, token: Option<&str>) -> Result<()> {
     // hydrated checkout; clean it so refresh restores a pristine work tree.
     // Double `-f` so an orphaned submodule checkout — a nested repo left
     // behind when upstream removed the submodule — is removable too.
+    emit(progress, CacheEnsureEvent::Step("clean"));
     run_git(cache_path, &["clean", "-ffdx"], None, CACHE_FETCH_TIMEOUT)?;
     if has_submodules {
         // Untracked pollution inside live submodule work trees is invisible
@@ -306,7 +388,12 @@ fn default_branch(repo: &Repository) -> Result<String> {
 /// ends up checked out, `origin/HEAD` recorded, and every submodule work tree
 /// populated at its recorded gitlink, exactly the state [`refresh`] relies
 /// on. [`CACHE_CLONE_TIMEOUT`] bounds the whole clone, submodules included.
-fn clone(github_url: &str, cache_path: &Path, token: Option<&str>) -> Result<()> {
+fn clone(
+    github_url: &str,
+    cache_path: &Path,
+    token: Option<&str>,
+    progress: Option<&CacheEnsureProgress>,
+) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Internal(format!("failed to create cache dir: {e}")))?;
@@ -320,18 +407,44 @@ fn clone(github_url: &str, cache_path: &Path, token: Option<&str>) -> Result<()>
         .file_name()
         .ok_or_else(|| Error::Internal("cache path has no file name".to_string()))?;
     // `--` so a caller-supplied URL starting with `-` can never be parsed as
-    // a git option (option injection).
-    let args: Vec<&std::ffi::OsStr> = vec![
-        "clone".as_ref(),
-        "--recurse-submodules".as_ref(),
-        "--".as_ref(),
-        github_url.as_ref(),
-        dir_name,
-    ];
-    run_git_os(parent, &args, token, CACHE_CLONE_TIMEOUT).inspect_err(|_| {
+    // a git option (option injection). `--progress` only when someone is
+    // listening: it forces progress output on a non-tty stderr.
+    let mut args: Vec<&std::ffi::OsStr> = vec!["clone".as_ref(), "--recurse-submodules".as_ref()];
+    if progress.is_some() {
+        args.push("--progress".as_ref());
+    }
+    args.extend(["--".as_ref(), github_url.as_ref(), dir_name]);
+    run_git_os_streamed(
+        parent,
+        &args,
+        token,
+        CACHE_CLONE_TIMEOUT,
+        chunk_fn(progress, CacheEnsureEvent::CloneChunk),
+    )
+    .inspect_err(|_| {
         // A failed clone must not leave a half-written cache behind for the
         // next caller's refresh to trip over.
         let _ = std::fs::remove_dir_all(cache_path);
+    })
+}
+
+/// Forward one [`CacheEnsureEvent`] to the callback, if any.
+fn emit(progress: Option<&CacheEnsureProgress>, event: CacheEnsureEvent) {
+    if let Some(cb) = progress {
+        cb(event);
+    }
+}
+
+/// Adapt the ensure-level callback into a per-chunk [`ProgressChunkFn`] that
+/// wraps each raw chunk in `variant` (e.g. [`CacheEnsureEvent::CloneChunk`]).
+/// `None` when no one is listening, so streamed runs skip the pipe work.
+fn chunk_fn(
+    progress: Option<&CacheEnsureProgress>,
+    variant: fn(String) -> CacheEnsureEvent,
+) -> Option<ProgressChunkFn> {
+    progress.map(|cb| {
+        let cb = cb.clone();
+        Arc::new(move |chunk: &str| cb(variant(chunk.to_string()))) as ProgressChunkFn
     })
 }
 
@@ -468,6 +581,28 @@ pub fn provision_direct_checkout(
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {
+    provision_direct_checkout_with_progress(
+        cache_path,
+        checkout_path,
+        origin_url,
+        branch,
+        base_ref,
+        None,
+    )
+}
+
+/// [`provision_direct_checkout`] with an optional raw-chunk progress
+/// callback: the submodule-population `git submodule update … --progress`
+/// output streams through `on_submodule_chunk` as it arrives. `None` behaves
+/// exactly like [`provision_direct_checkout`].
+pub fn provision_direct_checkout_with_progress(
+    cache_path: &Path,
+    checkout_path: &Path,
+    origin_url: &str,
+    branch: &str,
+    base_ref: Option<&str>,
+    on_submodule_chunk: Option<ProgressChunkFn>,
+) -> Result<String> {
     let sha = provision_plain_clone_checkout(
         cache_path,
         checkout_path,
@@ -475,7 +610,7 @@ pub fn provision_direct_checkout(
         branch,
         base_ref,
     )?;
-    if let Err(e) = hydrate_submodules_from_cache(cache_path, checkout_path) {
+    if let Err(e) = hydrate_submodules_from_cache(cache_path, checkout_path, on_submodule_chunk) {
         tracing::warn!(
             checkout = %checkout_path.display(),
             cache = %cache_path.display(),
@@ -520,7 +655,11 @@ pub fn provision_direct_checkout(
 /// the closing [`prune_stale_modules`] then removes the dead nested dirs
 /// the copy kept. A liveness/copy/prune failure follows the caller's
 /// existing degrade-with-warning path.
-fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Result<()> {
+fn hydrate_submodules_from_cache(
+    cache_path: &Path,
+    checkout_path: &Path,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
     if !crate::submodule::has_submodules(checkout_path) {
         return Ok(());
     }
@@ -539,7 +678,7 @@ fn hydrate_submodules_from_cache(cache_path: &Path, checkout_path: &Path) -> Res
             ))
         })?;
     }
-    update_checkout_submodules(checkout_path)?;
+    update_checkout_submodules_streamed(checkout_path, on_chunk)?;
     // Only now do the checkout's work trees match its checked-out ref, so
     // nested liveness is decidable: drop the dead nested module dirs the
     // wholesale copy above kept.
@@ -576,21 +715,31 @@ pub(crate) fn sync_submodule_urls(checkout_path: &Path) -> Result<()> {
 /// the source's module git dirs but whose hard reset never touches submodule
 /// work trees. No token: these paths never touch the network.
 pub(crate) fn update_checkout_submodules(checkout_path: &Path) -> Result<()> {
-    run_git(
-        checkout_path,
-        &[
-            "-c",
-            "protocol.allow=never",
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-            "--force",
-            "--no-fetch",
-        ],
-        None,
-        CACHE_FETCH_TIMEOUT,
-    )
+    update_checkout_submodules_streamed(checkout_path, None)
+}
+
+/// [`update_checkout_submodules`] with an optional per-chunk stderr callback:
+/// when set, `--progress` is added and the update's output streams through
+/// `on_chunk` as it arrives (submodule checkout progress for large modules).
+fn update_checkout_submodules_streamed(
+    checkout_path: &Path,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
+    let base = [
+        "-c",
+        "protocol.allow=never",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "--force",
+        "--no-fetch",
+    ];
+    let mut args: Vec<&str> = base.to_vec();
+    if on_chunk.is_some() {
+        args.push("--progress");
+    }
+    run_git_streamed(checkout_path, &args, None, CACHE_FETCH_TIMEOUT, on_chunk)
 }
 
 /// Plain recursive directory copy (dirs, files, symlinks recreated). The
@@ -925,8 +1074,20 @@ fn validate_segment(what: &str, value: &str) -> Result<()> {
 /// piped stderr for the error message, and a poll loop that kills the child
 /// at `timeout`. The optional token travels only via [`TOKEN_ENV`].
 fn run_git(dir: &Path, args: &[&str], token: Option<&str>, timeout: Duration) -> Result<()> {
+    run_git_streamed(dir, args, token, timeout, None)
+}
+
+/// [`run_git`] with an optional per-chunk stderr callback (see
+/// [`run_git_os_streamed`]).
+fn run_git_streamed(
+    dir: &Path,
+    args: &[&str],
+    token: Option<&str>,
+    timeout: Duration,
+    on_chunk: Option<ProgressChunkFn>,
+) -> Result<()> {
     let os_args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_ref()).collect();
-    run_git_os(dir, &os_args, token, timeout)
+    run_git_os_streamed(dir, &os_args, token, timeout, on_chunk)
 }
 
 fn run_git_os(
@@ -934,6 +1095,22 @@ fn run_git_os(
     args: &[&std::ffi::OsStr],
     token: Option<&str>,
     timeout: Duration,
+) -> Result<()> {
+    run_git_os_streamed(dir, args, token, timeout, None)
+}
+
+/// [`run_git_os`] with an optional per-chunk output callback: when set, the
+/// child's stdout is piped alongside stderr and both streams invoke
+/// `on_chunk` once per `\r`/`\n`-delimited chunk as they arrive (git emits
+/// `--progress` updates on stderr but per-item lines like `Submodule path
+/// '…': checked out` on stdout), so callers can stream progress live. The
+/// full stderr is still accumulated for error attribution either way.
+fn run_git_os_streamed(
+    dir: &Path,
+    args: &[&std::ffi::OsStr],
+    token: Option<&str>,
+    timeout: Duration,
+    on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
@@ -948,23 +1125,47 @@ fn run_git_os(
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if on_chunk.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
+
+    // Drain stdout (piped only when streaming) on its own thread so the
+    // child never blocks on a full pipe; its text feeds the callback only.
+    let stdout_drain = child.stdout.take().map(|stdout| {
+        let cb = on_chunk.clone();
+        std::thread::spawn(move || {
+            if let Some(cb) = cb {
+                let _ = drain_chunks(stdout, &cb);
+            }
+        })
+    });
 
     // Drain stderr concurrently: clone/fetch progress and diagnostics can
     // fill the pipe on larger repos, and an undrained pipe blocks the child
     // forever — the poll loop below would then kill a healthy child at the
     // deadline.
-    let drain = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            buf
+    let drain = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || match on_chunk {
+            Some(cb) => drain_chunks(stderr, &cb),
+            None => {
+                use std::io::Read;
+                let mut stderr = stderr;
+                let mut buf = String::new();
+                let _ = stderr.read_to_string(&mut buf);
+                buf
+            }
         })
     });
+    let join_stdout = |h: Option<std::thread::JoinHandle<()>>| {
+        if let Some(h) = h {
+            let _ = h.join();
+        }
+    };
     let read_stderr = |drain: Option<std::thread::JoinHandle<String>>| {
         drain.and_then(|h| h.join().ok()).unwrap_or_default()
     };
@@ -973,7 +1174,12 @@ fn run_git_os(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // The child has exited, so both pipes are at EOF — the drain
+                // threads finish promptly; join them so every chunk reached
+                // the callback before we return.
+                join_stdout(stdout_drain);
                 if status.success() {
+                    let _ = read_stderr(drain);
                     return Ok(());
                 }
                 // Redact before embedding: git stderr routinely echoes the
@@ -1005,6 +1211,82 @@ fn run_git_os(
             }
         }
     }
+}
+
+/// Drain a child's stderr chunk-by-chunk: invoke `cb` once per
+/// `\r`/`\n`-delimited chunk (git uses `\r` for in-place progress updates)
+/// and return the full accumulated text for error attribution.
+fn drain_chunks(stderr: impl std::io::Read, cb: &ProgressChunkFn) -> String {
+    let mut full = String::new();
+    let mut pending = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut byte_buf = [0u8; 4096];
+    let mut stderr = stderr;
+    loop {
+        let n = match stderr.read(&mut byte_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        bytes.extend_from_slice(&byte_buf[..n]);
+        let text = take_valid_utf8(&mut bytes);
+        full.push_str(&text);
+        pending.push_str(&text);
+        while let Some(pos) = pending.find(['\r', '\n']) {
+            let chunk: String = pending.drain(..=pos).collect();
+            let chunk = chunk.trim_end_matches(['\r', '\n']);
+            if !chunk.trim().is_empty() {
+                cb(chunk);
+            }
+        }
+    }
+    if !bytes.is_empty() {
+        // A truncated multibyte tail at EOF is genuinely malformed.
+        let text = String::from_utf8_lossy(&bytes);
+        full.push_str(&text);
+        pending.push_str(&text);
+    }
+    if !pending.trim().is_empty() {
+        cb(&pending);
+    }
+    full
+}
+
+/// Decode the longest valid-UTF-8 prefix of `bytes` (lossily replacing any
+/// complete invalid sequences), leaving an incomplete trailing multibyte
+/// sequence in the buffer for the next read — so a character split across a
+/// 4KiB read boundary never becomes U+FFFD.
+fn take_valid_utf8(bytes: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut input = bytes.as_slice();
+    loop {
+        match std::str::from_utf8(input) {
+            Ok(s) => {
+                out.push_str(s);
+                input = &[];
+                break;
+            }
+            Err(e) => {
+                let (valid, rest) = input.split_at(e.valid_up_to());
+                out.push_str(std::str::from_utf8(valid).expect("validated prefix"));
+                match e.error_len() {
+                    Some(len) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        input = &rest[len..];
+                    }
+                    None => {
+                        // Incomplete trailing sequence: keep for the next read.
+                        input = rest;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let keep = input.len();
+    bytes.drain(..bytes.len() - keep);
+    out
 }
 
 /// The git subcommand in `args` for error attribution: the first argument
@@ -2354,5 +2636,233 @@ mod tests {
                 .is_dir(),
             "nested module gitdir is copied despite being dead at the tip"
         );
+    }
+
+    /// Collector for [`CacheEnsureEvent`]s: the callback pushes into a shared
+    /// vec the test inspects after the ensure returns.
+    fn event_collector() -> (CacheEnsureProgress, Arc<Mutex<Vec<CacheEnsureEvent>>>) {
+        let events: Arc<Mutex<Vec<CacheEnsureEvent>>> = Arc::default();
+        let sink = events.clone();
+        let cb: CacheEnsureProgress = Arc::new(move |ev| {
+            sink.lock().unwrap().push(ev);
+        });
+        (cb, events)
+    }
+
+    /// A cold ensure (fresh clone) streams raw `CloneChunk`s from the
+    /// `git clone --recurse-submodules --progress` child, including the
+    /// "Cloning into" boundary and per-submodule output.
+    #[tokio::test]
+    async fn ensure_with_progress_streams_clone_chunks() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-progclone");
+        let root = CacheRoot::new("progclone");
+        let url = file_url(origin.path());
+        let (cb, events) = event_collector();
+
+        ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let clone_chunks: Vec<&String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::CloneChunk(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            clone_chunks.iter().any(|c| c.contains("Cloning into")),
+            "clone boundary streamed: {clone_chunks:?}"
+        );
+        assert!(
+            clone_chunks
+                .iter()
+                .any(|c| c.contains("registered for path")),
+            "submodule registration streamed: {clone_chunks:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, CacheEnsureEvent::Step(_))),
+            "a cold ensure runs no refresh steps"
+        );
+    }
+
+    /// A warm ensure (refresh) emits the named step boundaries — fetch,
+    /// reset, submodule-sync, submodule-update, clean — in order, plus
+    /// `SubmoduleChunk`s from the `--progress` submodule update.
+    #[tokio::test]
+    async fn ensure_with_progress_emits_refresh_steps() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-progrefresh");
+        let root = CacheRoot::new("progrefresh");
+        let url = file_url(origin.path());
+        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let (cb, events) = event_collector();
+        ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                "fetch",
+                "reset",
+                "submodule-sync",
+                "submodule-update",
+                "clean"
+            ],
+            "refresh step boundaries in order"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, CacheEnsureEvent::SubmoduleChunk(_))),
+            "submodule update streams chunks"
+        );
+    }
+
+    /// A warm ensure without submodules skips the submodule steps but still
+    /// frames fetch/reset/clean, so the refresh visibly moves.
+    #[tokio::test]
+    async fn ensure_with_progress_refresh_without_submodules() {
+        let origin = init_repo("repocache-prognosub");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("prognosub");
+        let url = file_url(origin.path());
+        ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let (cb, events) = event_collector();
+        ensure_cached_repo_with_progress(root.path(), &url, "acme", "widget", None, Some(cb))
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        let steps: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CacheEnsureEvent::Step(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, vec!["fetch", "reset", "clean"]);
+    }
+
+    /// Direct hydration with a chunk callback streams the submodule
+    /// population's `--progress` output ("Cloning into" per module gitdir
+    /// reconnect + the "checked out" completions).
+    #[tokio::test]
+    async fn direct_checkout_with_progress_streams_submodule_chunks() {
+        allow_file_submodules();
+        let (origin, _child) = submodule_fixture("repocache-progdirect");
+        let root = CacheRoot::new("progdirect");
+        let url = file_url(origin.path());
+        let cache = ensure_cached_repo(root.path(), &url, "acme", "widget", None)
+            .await
+            .unwrap();
+
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = chunks.clone();
+        let cb: ProgressChunkFn = Arc::new(move |chunk: &str| {
+            sink.lock().unwrap().push(chunk.to_string());
+        });
+        let checkout_root = CacheRoot::new("progdirect-dst");
+        let checkout = checkout_root.path().join("ws").join("widget");
+        provision_direct_checkout_with_progress(
+            &cache,
+            &checkout,
+            &url,
+            "ws-branch",
+            None,
+            Some(cb),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("sub").join("c.txt")).unwrap(),
+            "sub one\n",
+            "submodule work tree is populated"
+        );
+        let chunks = chunks.lock().unwrap();
+        assert!(
+            chunks.iter().any(|c| c.contains("checked out")),
+            "submodule update output streamed: {chunks:?}"
+        );
+    }
+
+    /// A reader that yields its bytes in fixed-size slices, so a multibyte
+    /// character can be split across `read` calls — as a pipe read at the
+    /// 4KiB buffer boundary would.
+    struct ChoppedReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl std::io::Read for ChoppedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// A multibyte character split across read boundaries must survive
+    /// intact — in the streamed chunks and in the accumulated text used for
+    /// error attribution — instead of becoming U+FFFD.
+    #[test]
+    fn drain_chunks_reassembles_split_utf8() {
+        let text = "fatal: pathspec 'süb/böse' did not match\n";
+        for step in 1..=4 {
+            let reader = ChoppedReader {
+                data: text.as_bytes().to_vec(),
+                pos: 0,
+                step,
+            };
+            let chunks: Arc<Mutex<Vec<String>>> = Arc::default();
+            let sink = chunks.clone();
+            let cb: ProgressChunkFn = Arc::new(move |chunk: &str| {
+                sink.lock().unwrap().push(chunk.to_string());
+            });
+            let full = drain_chunks(reader, &cb);
+            assert_eq!(full, text, "step {step}: accumulated text intact");
+            let chunks = chunks.lock().unwrap();
+            assert_eq!(chunks.len(), 1, "step {step}");
+            assert_eq!(chunks[0], text.trim_end(), "step {step}: chunk intact");
+        }
+    }
+
+    /// A genuinely invalid byte still decodes lossily (U+FFFD) rather than
+    /// stalling the pending buffer forever.
+    #[test]
+    fn drain_chunks_replaces_invalid_bytes() {
+        let reader = ChoppedReader {
+            data: b"bad \xff byte\n".to_vec(),
+            pos: 0,
+            step: 3,
+        };
+        let chunks: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = chunks.clone();
+        let cb: ProgressChunkFn = Arc::new(move |chunk: &str| {
+            sink.lock().unwrap().push(chunk.to_string());
+        });
+        let full = drain_chunks(reader, &cb);
+        assert_eq!(full, "bad \u{FFFD} byte\n");
     }
 }
