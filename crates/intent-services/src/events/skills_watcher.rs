@@ -135,6 +135,17 @@ impl SkillsWatcher {
         let _ = self.raw_tx.send(SkillsMsg::Pause(workspace_id.clone()));
     }
 
+    /// Test-only barrier: resolves once the debounce loop has fully processed
+    /// every message sent before this call (the raw channel is FIFO). Lets
+    /// tests wait deterministically for e.g. a `Pause` fingerprint snapshot
+    /// instead of sleeping, which loses under full-suite load (monorepo#1841).
+    #[cfg(test)]
+    async fn barrier(&self) {
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
+        let _ = self.raw_tx.send(SkillsMsg::Barrier(ack_tx));
+        let _ = tokio::time::timeout(crate::events::LIVENESS, ack_rx.recv()).await;
+    }
+
     /// Resume a suspended workspace (unarchive): re-watch the project tier and
     /// schedule one catch-up flush compared against the fingerprint retained
     /// by [`Self::pause_workspace`], so an unchanged tree emits nothing and an
@@ -190,6 +201,9 @@ enum SkillsMsg {
     /// Workspace re-registered after a suspension (unarchive): like `Add`,
     /// plus a due-now flush so changes missed while suspended are picked up.
     Resume(WorkspaceId, PathBuf),
+    /// Test-only sync point: acked once all earlier messages are processed.
+    #[cfg(test)]
+    Barrier(mpsc::UnboundedSender<()>),
 }
 
 /// Fingerprint the resolved skill set for a workspace: a hash of the
@@ -299,6 +313,10 @@ async fn debounce_loop(
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watches' own events coalesce into it.
                     pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
+                }
+                #[cfg(test)]
+                Some(SkillsMsg::Barrier(ack)) => {
+                    let _ = ack.send(());
                 }
                 None => {
                     // All senders dropped: flush and exit
@@ -585,8 +603,11 @@ mod tests {
         // shared DISCOVERY_CACHE — exactly what `unarchive_workspace`'s queue
         // drain does before the delta is published. The retained fingerprint,
         // not the cache, must be what the resume flush compares against.
+        // The barrier (not a sleep) guarantees the pause fingerprint has been
+        // snapshotted BEFORE the edit below, so the baseline cannot absorb it
+        // when the debounce loop lags under full-suite load (monorepo#1841).
         watcher.pause_workspace(&ws_id);
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        watcher.barrier().await;
 
         let added = ws.path.join(".intent").join("skills").join("added-skill");
         std::fs::create_dir_all(&added).expect("mk added skill dir");
