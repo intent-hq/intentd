@@ -235,6 +235,10 @@ pub(crate) struct CloneJob {
     /// here (the create wrapper owns the exactly-one `git:clone:done`).
     /// `None` keeps the legacy standalone `git.clone` framing exactly.
     pub progress: Option<std::sync::Arc<crate::create_progress::CreateProgress>>,
+    /// Clone with `--recurse-submodules` so the checkout lands with populated
+    /// submodule work trees. Set by the `workspace.create` explicit-`clonePath`
+    /// arm; the standalone `git.clone` RPC keeps its historical plain clone.
+    pub recurse_submodules: bool,
 }
 
 /// Kick off a streaming clone on a background task and return immediately. The
@@ -295,15 +299,18 @@ fn build_clone_command(
     target_path: &Path,
     token: Option<&str>,
     inherited_config_parameters: Option<&str>,
+    recurse_submodules: bool,
 ) -> Command {
     let mut cmd = Command::new("git");
     for (key, value) in intent_git::auth::scoped_credential_env(token, inherited_config_parameters)
     {
         cmd.env(key, value);
     }
-    cmd.arg("clone")
-        .arg("--progress")
-        .arg(url)
+    cmd.arg("clone").arg("--progress");
+    if recurse_submodules {
+        cmd.arg("--recurse-submodules");
+    }
+    cmd.arg(url)
         .arg(target_path)
         .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
         .env("GIT_TERMINAL_PROMPT", "0");
@@ -373,6 +380,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         token,
         bus,
         progress,
+        recurse_submodules,
     } = job;
     let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string(String::new()));
     let sink = match progress {
@@ -402,6 +410,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         &target_path,
         token.as_deref(),
         inherited_config_parameters.as_deref(),
+        recurse_submodules,
     );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -529,8 +538,8 @@ where
 {
     let mut reader = BufReader::new(stderr);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let mut last_phase = String::from("starting");
-    let mut last_percent: u32 = 0;
+    let mut parser = SubmoduleAwareParser::for_clone();
+    let mut last_frame: Option<(String, u32, String)> = None;
     let mut tail: String = String::new();
     loop {
         buf.clear();
@@ -542,10 +551,17 @@ where
             Err(_) => break,
         };
         let text = String::from_utf8_lossy(&buf[..n]);
-        for (phase, percent, message) in parse_progress(&text) {
-            if phase != last_phase || percent > last_percent {
-                last_phase = phase.to_string();
-                last_percent = percent;
+        for (phase, percent, message) in parser.parse(&text) {
+            // Message-aware dedup: submodule frames advance by message
+            // ("Cloning submodules (N/M)") even when the aggregate percent
+            // holds still, and per-phase percents never move backwards.
+            let key = (phase.to_string(), percent, message.clone());
+            let emit = match &last_frame {
+                Some((lp, lpct, lmsg)) => *lp != key.0 || *lmsg != key.2 || percent > *lpct,
+                None => true,
+            };
+            if emit {
+                last_frame = Some(key);
                 sink.progress(phase, percent, &message).await;
             }
         }
@@ -631,14 +647,13 @@ where
     }
 }
 
-/// Ported from the FE's stderr regex table: match one canonical phase per line.
-fn parse_progress(text: &str) -> Vec<(&'static str, u32, String)> {
-    let mut out = Vec::new();
-    // Static regex-lite scanners keep the dep footprint at zero. Each rule
-    // returns (phase, percent, human_message).
-    if text.contains("Cloning into") {
-        out.push(("starting", 0, "Cloning repository...".to_string()));
-    }
+/// The percent-bearing phase rules, ported from the FE's stderr regex table
+/// (one canonical phase per line). [`SubmoduleAwareParser`] layers the
+/// "Cloning into" boundary / registration handling on top. Static regex-lite
+/// scanners keep the dep footprint at zero; each rule pushes
+/// `(phase, percent, human_message)`. `Updating files:` is git ≥2.29's
+/// spelling of the checkout phase.
+fn scan_phase_percents(text: &str, out: &mut Vec<(&'static str, u32, String)>) {
     if text.contains("Counting objects") {
         out.push(("counting", 0, "Counting objects...".to_string()));
     }
@@ -654,7 +669,164 @@ fn parse_progress(text: &str) -> Vec<(&'static str, u32, String)> {
     if let Some(pct) = percent_after(text, "Checking out files:") {
         out.push(("checkout", pct, format!("Checking out files: {pct}%")));
     }
-    out
+    if let Some(pct) = percent_after(text, "Updating files:") {
+        out.push(("checkout", pct, format!("Updating files: {pct}%")));
+    }
+}
+
+/// Stateful, submodule-aware progress parser over git's `--progress` stderr.
+///
+/// A `git clone --recurse-submodules --progress` stream interleaves the
+/// superproject clone with one nested clone per submodule, each announced by
+/// its own `Cloning into '<path>'...` boundary and preceded by
+/// `Submodule '<name>' (<url>) registered for path '<path>'` registrations.
+/// This parser keeps the superproject phases as-is and folds everything after
+/// the first boundary into one aggregated `submodules` phase whose percent is
+/// distributed across the registered submodules ("Cloning submodules (N/M)").
+///
+/// [`SubmoduleAwareParser::for_submodule_update`] parses a standalone
+/// `git submodule update --init --recursive --force --progress` stream
+/// instead: every frame is submodule-scoped, and `Submodule path '<p>':
+/// checked out` completions drive an "Updating submodules (N)" counter for
+/// already-cloned modules that print no clone phases.
+pub(crate) struct SubmoduleAwareParser {
+    /// Every frame is submodule-scoped (no superproject clone in front).
+    submodules_only: bool,
+    /// The superproject's own "Cloning into" boundary has been consumed.
+    seen_superproject: bool,
+    /// Submodules registered so far ("registered for path" lines). Nested
+    /// submodules register during their parent's clone, so this can still
+    /// grow after cloning starts.
+    registered: usize,
+    /// Submodule clones started so far ("Cloning into" boundaries).
+    started: usize,
+    /// Submodules checked out so far ("Submodule path '…': checked out").
+    checked_out: usize,
+}
+
+impl SubmoduleAwareParser {
+    /// Parser for a full `git clone [--recurse-submodules] --progress` stream.
+    pub(crate) fn for_clone() -> Self {
+        Self::new(false)
+    }
+
+    /// Parser for a `git submodule update … --progress` stream.
+    pub(crate) fn for_submodule_update() -> Self {
+        Self::new(true)
+    }
+
+    fn new(submodules_only: bool) -> Self {
+        Self {
+            submodules_only,
+            seen_superproject: false,
+            registered: 0,
+            started: 0,
+            checked_out: 0,
+        }
+    }
+
+    /// Whether frames are currently submodule-scoped.
+    fn in_submodules(&self) -> bool {
+        self.submodules_only || self.started > 0
+    }
+
+    /// Aggregate 0–100 percent across all submodules: submodule `started`
+    /// occupies its `1/registered` slice, positioned by the weighted local
+    /// clone-phase percent. With no registration count (a bare submodule
+    /// update), the local percent passes through — the reporter's monotonic
+    /// clamp keeps the series non-decreasing.
+    fn submodule_percent(&self, local: u32) -> u32 {
+        if self.registered > 0 && self.started > 0 {
+            let total = self.registered.max(self.started) as u32;
+            let idx = (self.started as u32).min(total) - 1;
+            let lo = idx * 100 / total;
+            let hi = (idx + 1) * 100 / total;
+            crate::create_progress::map_segment(lo, hi, local)
+        } else {
+            local.min(100)
+        }
+    }
+
+    /// Human message carrying the submodule count/index. Update-mode
+    /// completions ("checked out" lines) read "Updating submodules (N)";
+    /// clone boundaries read "Cloning submodules (N)" or, when the
+    /// registration count is known, "Cloning submodules (N/M)".
+    fn submodule_message(&self) -> String {
+        if self.registered > 0 {
+            format!(
+                "Cloning submodules ({}/{})",
+                self.started.min(self.registered),
+                self.registered
+            )
+        } else if self.submodules_only && self.checked_out >= self.started.max(1) {
+            format!("Updating submodules ({})", self.checked_out)
+        } else {
+            format!("Cloning submodules ({})", self.started.max(1))
+        }
+    }
+
+    /// Parse one stderr chunk (any mix of `\r`/`\n`-separated lines) into
+    /// `(phase, percent, message)` frames.
+    pub(crate) fn parse(&mut self, text: &str) -> Vec<(&'static str, u32, String)> {
+        let mut out = Vec::new();
+        for line in text.split(['\r', '\n']) {
+            if !line.trim().is_empty() {
+                self.parse_line(line, &mut out);
+            }
+        }
+        out
+    }
+
+    fn parse_line(&mut self, line: &str, out: &mut Vec<(&'static str, u32, String)>) {
+        if line.contains("registered for path") {
+            self.registered += 1;
+            return;
+        }
+        if line.contains("Cloning into") {
+            if !self.submodules_only && !self.seen_superproject {
+                self.seen_superproject = true;
+                out.push(("starting", 0, "Cloning repository...".to_string()));
+            } else {
+                self.started += 1;
+                out.push((
+                    "submodules",
+                    self.submodule_percent(0),
+                    self.submodule_message(),
+                ));
+            }
+            return;
+        }
+        // `git submodule update` prints one completion line per module
+        // ("Submodule path 'sub': checked out '<sha>'"); count them so
+        // already-cloned modules (no clone phases at all) still move the
+        // message forward.
+        if self.submodules_only && line.contains("Submodule path") && line.contains("checked out") {
+            self.checked_out += 1;
+            out.push((
+                "submodules",
+                self.submodule_percent(100),
+                self.submodule_message(),
+            ));
+            return;
+        }
+        let mut frames = Vec::new();
+        scan_phase_percents(line, &mut frames);
+        for (phase, pct, msg) in frames {
+            if self.in_submodules() {
+                // Weight the submodule's own clone phase into its slice of
+                // the aggregate percent.
+                let (lo, hi) = crate::create_progress::clone_phase_segment(phase);
+                let local = crate::create_progress::map_segment(lo, hi, pct);
+                out.push((
+                    "submodules",
+                    self.submodule_percent(local),
+                    self.submodule_message(),
+                ));
+            } else {
+                out.push((phase, pct, msg));
+            }
+        }
+    }
 }
 
 /// Return the integer percent immediately after `label` in `text`, e.g. for
@@ -1158,6 +1330,7 @@ mod tests {
             Path::new("/tmp/x"),
             Some(token),
             None,
+            false,
         );
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -1216,6 +1389,7 @@ mod tests {
             Path::new("/tmp/x"),
             Some("tok"),
             Some("'foo.bar=baz'"),
+            false,
         );
         let params = cmd
             .as_std()
@@ -1241,6 +1415,7 @@ mod tests {
                 Path::new("/tmp/x"),
                 token,
                 None,
+                false,
             );
             let std_cmd = cmd.as_std();
             let args: Vec<String> = std_cmd
@@ -1295,13 +1470,113 @@ mod tests {
 
     #[test]
     fn parse_progress_matches_phases() {
-        let ph = parse_progress("Receiving objects:  45% (10/22)");
+        let mut parser = SubmoduleAwareParser::for_clone();
+        let ph = parser.parse("Receiving objects:  45% (10/22)");
         assert_eq!(ph.len(), 1);
         assert_eq!(ph[0].0, "receiving");
         assert_eq!(ph[0].1, 45);
-        let ch = parse_progress("Checking out files: 100% (1/1), done.");
+        let ch = parser.parse("Checking out files: 100% (1/1), done.");
         assert_eq!(ch[0].0, "checkout");
         assert_eq!(ch[0].1, 100);
+        // git ≥2.29 spells the checkout phase "Updating files:".
+        let uf = parser.parse("Updating files:  60% (3/5)");
+        assert_eq!(uf[0].0, "checkout");
+        assert_eq!(uf[0].1, 60);
+    }
+
+    /// A recursive clone stream: superproject phases pass through untouched;
+    /// everything after the first submodule "Cloning into" boundary becomes
+    /// the aggregated `submodules` phase, with the registration count carried
+    /// in the message and the percent distributed across submodule slices.
+    #[test]
+    fn submodule_aware_parser_detects_boundaries() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        // Superproject boundary + phases.
+        let f = parser.parse("Cloning into 'repo'...");
+        assert_eq!(
+            f,
+            vec![("starting", 0, "Cloning repository...".to_string())]
+        );
+        let f = parser.parse("Receiving objects:  50% (5/10)");
+        assert_eq!(f[0].0, "receiving");
+        assert_eq!(f[0].1, 50);
+        // Registrations announce M before any submodule clone starts.
+        assert!(parser
+            .parse("Submodule 'liba' (https://x/liba.git) registered for path 'liba'")
+            .is_empty());
+        assert!(parser
+            .parse("Submodule 'libb' (https://x/libb.git) registered for path 'libb'")
+            .is_empty());
+        // First submodule boundary: N/M in the message, percent at its
+        // slice's start.
+        let f = parser.parse("Cloning into '/tmp/repo/liba'...");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].1, 0);
+        assert_eq!(f[0].2, "Cloning submodules (1/2)");
+        // Its clone phases stay inside slice 1 (0..50): a finished checkout
+        // tops the slice.
+        let f = parser.parse("Checking out files: 100% (4/4), done.");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].1, 50);
+        assert_eq!(f[0].2, "Cloning submodules (1/2)");
+        // Second boundary opens slice 2 (50..100).
+        let f = parser.parse("Cloning into '/tmp/repo/libb'...");
+        assert_eq!(f[0].1, 50);
+        assert_eq!(f[0].2, "Cloning submodules (2/2)");
+        let f = parser.parse("Receiving objects: 100% (8/8), done.");
+        assert_eq!(f[0].0, "submodules");
+        // receiving tops at 70 of the local weight → 50 + 70/2 = 85.
+        assert_eq!(f[0].1, 85);
+    }
+
+    /// Multi-line chunks parse line-by-line: registrations and a boundary in
+    /// one chunk yield the boundary frame with the right count.
+    #[test]
+    fn submodule_aware_parser_handles_multiline_chunks() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        let chunk = "Cloning into 'repo'...\n\
+                     Submodule 'a' (https://x/a.git) registered for path 'a'\n\
+                     Cloning into '/tmp/repo/a'...\n";
+        let frames = parser.parse(chunk);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, "starting");
+        assert_eq!(frames[1].0, "submodules");
+        assert_eq!(frames[1].2, "Cloning submodules (1/1)");
+    }
+
+    /// Submodule-update mode: no superproject boundary — every frame is
+    /// submodule-scoped, and "checked out" completions advance a counter for
+    /// modules that stream no clone phases at all.
+    #[test]
+    fn submodule_aware_parser_update_mode() {
+        let mut parser = SubmoduleAwareParser::for_submodule_update();
+        let f = parser.parse("Cloning into '/ws/repo/liba'...");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].2, "Cloning submodules (1)");
+        let f = parser.parse("Submodule path 'liba': checked out 'abc123'");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].2, "Updating submodules (1)");
+        let f = parser.parse("Submodule path 'libb': checked out 'def456'");
+        assert_eq!(f[0].2, "Updating submodules (2)");
+    }
+
+    /// Nested submodules can register mid-flight (during their parent's
+    /// clone); the parser keeps counting without panicking and the total in
+    /// the message grows.
+    #[test]
+    fn submodule_aware_parser_nested_registration() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        parser.parse("Cloning into 'repo'...");
+        parser.parse("Submodule 'a' (https://x/a.git) registered for path 'a'");
+        let f = parser.parse("Cloning into '/tmp/repo/a'...");
+        assert_eq!(f[0].2, "Cloning submodules (1/1)");
+        // A nested submodule registers while `a` clones, then starts.
+        parser.parse("Submodule 'inner' (https://x/i.git) registered for path 'a/inner'");
+        let f = parser.parse("Cloning into '/tmp/repo/a/inner'...");
+        assert_eq!(f[0].2, "Cloning submodules (2/2)");
+        let f = parser.parse("Resolving deltas: 100% (3/3), done.");
+        assert!(f[0].1 <= 100);
     }
 
     /// Spawn a shell that forks a `sleep 30` grandchild in the same process

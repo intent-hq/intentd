@@ -30,6 +30,11 @@ use crate::events::EventBus;
 /// work maps into `0..=85`, the local provisioning tail into `85..=100`.
 pub(crate) const CLONE_SEGMENT_END: u32 = 85;
 
+/// Boundary between the superproject clone/cache work and the submodule
+/// work inside the clone segment: superproject phases map into
+/// `0..=70`, submodule progress into `70..=`[`CLONE_SEGMENT_END`].
+pub(crate) const SUBMODULE_SEGMENT_START: u32 = 70;
+
 /// Map a local `0..=100` progress value into the `lo..=hi` segment of the
 /// unified scale. Values above 100 clamp; `lo >= hi` collapses to `lo`.
 pub(crate) fn map_segment(lo: u32, hi: u32, local_percent: u32) -> u32 {
@@ -44,7 +49,9 @@ pub(crate) fn map_segment(lo: u32, hi: u32, local_percent: u32) -> u32 {
 /// per-phase 0–100 stderr percentages become one non-decreasing 0–100 series
 /// (receiving dominates wall-clock time; counting/compressing are cheap).
 /// Unknown phases span the whole range (their raw percent passes through).
-fn clone_phase_segment(phase: &str) -> (u32, u32) {
+/// Shared with the submodule-aware parser ([`crate::clone_ops`]), which uses
+/// it to weight per-submodule clone phases inside one submodule's slice.
+pub(crate) fn clone_phase_segment(phase: &str) -> (u32, u32) {
     match phase {
         "starting" => (0, 0),
         "counting" => (0, 5),
@@ -58,10 +65,128 @@ fn clone_phase_segment(phase: &str) -> (u32, u32) {
 }
 
 /// Normalize a clone stderr phase + percent into the unified scale's
-/// `0..=`[`CLONE_SEGMENT_END`] clone segment.
+/// `0..=`[`CLONE_SEGMENT_END`] clone segment. Superproject phases map into
+/// `0..=`[`SUBMODULE_SEGMENT_START`]; the `submodules` phase (whose percent
+/// is already 0–100 across all submodules, produced by the submodule-aware
+/// parser) fills [`SUBMODULE_SEGMENT_START`]`..=`[`CLONE_SEGMENT_END`];
+/// `complete` tops the whole clone segment.
 pub(crate) fn clone_overall_percent(phase: &str, percent: u32) -> u32 {
-    let (lo, hi) = clone_phase_segment(phase);
-    map_segment(0, CLONE_SEGMENT_END, map_segment(lo, hi, percent))
+    match phase {
+        "submodules" => map_segment(SUBMODULE_SEGMENT_START, CLONE_SEGMENT_END, percent),
+        "complete" => CLONE_SEGMENT_END,
+        _ => {
+            let (lo, hi) = clone_phase_segment(phase);
+            map_segment(0, SUBMODULE_SEGMENT_START, map_segment(lo, hi, percent))
+        }
+    }
+}
+
+/// Sub-segment of the provisioning tail used for the direct-hydration
+/// submodule population (`git submodule update … --progress` in the
+/// checkout): after the `checkout`/`cow-copy` milestone (88), before the
+/// `finalizing` milestone (95).
+const HYDRATE_SUBMODULE_LO: u32 = 89;
+const HYDRATE_SUBMODULE_HI: u32 = 94;
+
+/// Bridge a repo-cache ensure to `reporter`: returns the callback to pass to
+/// `intent_git::repo_cache::ensure_cached_repo_with_progress` plus the pump
+/// task translating its raw events into unified-scale frames. The callback is
+/// invoked on blocking/drain threads and only does a channel send; the pump
+/// parses chunks (submodule-aware) and reports. The pump ends when the last
+/// callback clone is dropped — await the handle to flush buffered frames
+/// before emitting any later milestone.
+pub(crate) fn cache_ensure_reporter(
+    reporter: std::sync::Arc<CreateProgress>,
+) -> (
+    intent_git::repo_cache::CacheEnsureProgress,
+    tokio::task::JoinHandle<()>,
+) {
+    use intent_git::repo_cache::CacheEnsureEvent as Ev;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
+    let handle = tokio::spawn(async move {
+        // One parser per stream shape: the ensure clone/fetch is
+        // superproject-shaped; the refresh submodule update is
+        // submodule-scoped throughout.
+        let mut clone_parser = crate::clone_ops::SubmoduleAwareParser::for_clone();
+        let mut sub_parser = crate::clone_ops::SubmoduleAwareParser::for_submodule_update();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Ev::CloneChunk(text) => {
+                    for (phase, pct, msg) in clone_parser.parse(&text) {
+                        reporter.clone_progress(phase, pct, &msg).await;
+                    }
+                }
+                Ev::SubmoduleChunk(text) => {
+                    for (phase, pct, msg) in sub_parser.parse(&text) {
+                        reporter.clone_progress(phase, pct, &msg).await;
+                    }
+                }
+                // Refresh step boundaries: coarse milestones so a warm-cache
+                // refresh moves even when its steps stream nothing. Percents
+                // sit on the unified scale (monotonic clamp orders them
+                // against any streamed frames).
+                Ev::Step(step) => {
+                    let (phase, pct, msg) = match step {
+                        "fetch" => ("cache", 5, "Refreshing repository cache..."),
+                        "reset" => ("cache", 60, "Updating cache branch..."),
+                        "submodule-sync" => (
+                            "submodules",
+                            SUBMODULE_SEGMENT_START,
+                            "Syncing submodules...",
+                        ),
+                        "submodule-update" => (
+                            "submodules",
+                            SUBMODULE_SEGMENT_START,
+                            "Updating submodules...",
+                        ),
+                        "clean" => (
+                            "cache",
+                            CLONE_SEGMENT_END - 1,
+                            "Cleaning repository cache...",
+                        ),
+                        _ => continue,
+                    };
+                    reporter.milestone(phase, pct, msg).await;
+                }
+            }
+        }
+    });
+    let cb: intent_git::repo_cache::CacheEnsureProgress = std::sync::Arc::new(move |ev| {
+        let _ = tx.send(ev);
+    });
+    (cb, handle)
+}
+
+/// Bridge the direct-hydration submodule population to `reporter`: returns
+/// the chunk callback to pass to
+/// `intent_git::repo_cache::provision_direct_checkout_with_progress` plus the
+/// pump task mapping the update's progress into the provisioning tail's
+/// [`HYDRATE_SUBMODULE_LO`]`..=`[`HYDRATE_SUBMODULE_HI`] sub-segment.
+pub(crate) fn submodule_hydration_reporter(
+    reporter: std::sync::Arc<CreateProgress>,
+) -> (
+    intent_git::repo_cache::ProgressChunkFn,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let handle = tokio::spawn(async move {
+        let mut parser = crate::clone_ops::SubmoduleAwareParser::for_submodule_update();
+        while let Some(text) = rx.recv().await {
+            for (_phase, pct, msg) in parser.parse(&text) {
+                reporter
+                    .milestone(
+                        "submodules",
+                        map_segment(HYDRATE_SUBMODULE_LO, HYDRATE_SUBMODULE_HI, pct),
+                        &msg,
+                    )
+                    .await;
+            }
+        }
+    });
+    let cb: intent_git::repo_cache::ProgressChunkFn = std::sync::Arc::new(move |chunk: &str| {
+        let _ = tx.send(chunk.to_string());
+    });
+    (cb, handle)
 }
 
 struct ProgressState {
@@ -231,8 +356,9 @@ mod tests {
 
     #[test]
     fn clone_overall_percent_is_monotonic_across_phases() {
-        // A representative clone stderr sequence: each mapped value must be
-        // ≥ the previous one and the whole series stays within 0..=85.
+        // A representative clone stderr sequence (submodules included): each
+        // mapped value must be ≥ the previous one and the whole series stays
+        // within 0..=85, with superproject phases below the submodule segment.
         let seq = [
             ("starting", 0),
             ("counting", 0),
@@ -245,6 +371,9 @@ mod tests {
             ("resolving", 100),
             ("checkout", 30),
             ("checkout", 100),
+            ("submodules", 0),
+            ("submodules", 50),
+            ("submodules", 100),
             ("complete", 100),
         ];
         let mut last = 0;
@@ -255,17 +384,31 @@ mod tests {
                 "{phase} {pct}% mapped to {overall}, below previous {last}"
             );
             assert!(overall <= CLONE_SEGMENT_END);
+            if phase != "submodules" && phase != "complete" {
+                assert!(overall <= SUBMODULE_SEGMENT_START, "{phase} {pct}%");
+            }
             last = overall;
         }
         assert_eq!(last, CLONE_SEGMENT_END, "a finished clone tops the segment");
     }
 
     #[test]
+    fn clone_overall_percent_submodule_segment() {
+        assert_eq!(
+            clone_overall_percent("submodules", 0),
+            SUBMODULE_SEGMENT_START
+        );
+        assert_eq!(clone_overall_percent("submodules", 100), CLONE_SEGMENT_END);
+        let mid = clone_overall_percent("submodules", 50);
+        assert!(mid > SUBMODULE_SEGMENT_START && mid < CLONE_SEGMENT_END);
+    }
+
+    #[test]
     fn clone_overall_percent_unknown_phase_passes_raw_percent() {
         assert_eq!(
             clone_overall_percent("mystery", 100),
-            CLONE_SEGMENT_END,
-            "unknown phases span the full clone segment"
+            SUBMODULE_SEGMENT_START,
+            "unknown phases span the superproject sub-segment"
         );
         assert_eq!(clone_overall_percent("mystery", 0), 0);
     }

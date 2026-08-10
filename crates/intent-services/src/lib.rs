@@ -10361,15 +10361,34 @@ impl WorkspaceApi for Services {
                                 )
                                 .await;
                                 let cache_root = workspaces_root.join(".repo-cache");
-                                let cache_path = match intent_git::repo_cache::ensure_cached_repo(
-                                    &cache_root,
-                                    url,
-                                    &owner,
-                                    &name,
-                                    token.as_deref(),
-                                )
-                                .await
-                                {
+                                // Real streaming progress for the ensure: the
+                                // callback forwards raw git output to a pump
+                                // task that parses it (submodule-aware) and
+                                // reports on the unified scale. Await the pump
+                                // after the ensure so buffered frames flush
+                                // before the "cache ready" milestone.
+                                let (ensure_progress, ensure_pump) = match progress.clone() {
+                                    Some(reporter) => {
+                                        let (cb, pump) =
+                                            create_progress::cache_ensure_reporter(reporter);
+                                        (Some(cb), Some(pump))
+                                    }
+                                    None => (None, None),
+                                };
+                                let ensure_result =
+                                    intent_git::repo_cache::ensure_cached_repo_with_progress(
+                                        &cache_root,
+                                        url,
+                                        &owner,
+                                        &name,
+                                        token.as_deref(),
+                                        ensure_progress,
+                                    )
+                                    .await;
+                                if let Some(pump) = ensure_pump {
+                                    let _ = pump.await;
+                                }
+                                let cache_path = match ensure_result {
                                     Ok(path) => path,
                                     Err(e) => {
                                         // Legacy-clone parity: redact any
@@ -10527,6 +10546,10 @@ impl WorkspaceApi for Services {
                                 token,
                                 bus: bus_ref,
                                 progress: progress.clone(),
+                                // Workspace checkouts should land with
+                                // populated submodules, like the cache
+                                // hydration path (decision 2026-08-10).
+                                recurse_submodules: true,
                             })
                             .await
                             .map_err(|failure| Error::CloneFailed {
@@ -10894,15 +10917,39 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
+                            let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
                                 let url = hydration_url.clone();
+                                let progress = provision_progress.clone();
                                 async move {
                                     let lock_cache = cache.clone();
-                                    intent_git::repo_cache::with_cache_lock_blocking(
+                                    // Direct hydration streams its submodule
+                                    // population through the reporter (the
+                                    // update's `--progress` output, mapped
+                                    // into the provisioning tail); the pump
+                                    // is awaited after the blocking work so
+                                    // buffered frames flush in order.
+                                    let (sub_chunk, sub_pump) = match (
+                                        mode,
+                                        progress,
+                                    ) {
+                                        (
+                                            intent_core::CheckoutMode::Direct,
+                                            Some(reporter),
+                                        ) => {
+                                            let (cb, pump) =
+                                                create_progress::submodule_hydration_reporter(
+                                                    reporter,
+                                                );
+                                            (Some(cb), Some(pump))
+                                        }
+                                        _ => (None, None),
+                                    };
+                                    let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
                                         move || match mode {
                                             intent_core::CheckoutMode::Cow => {
@@ -10934,12 +10981,13 @@ impl WorkspaceApi for Services {
                                                 Ok(sha)
                                             }
                                             intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout(
+                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
                                                     &cache,
                                                     &checkout,
                                                     &url,
                                                     &branch,
                                                     base_ref.as_deref(),
+                                                    sub_chunk,
                                                 )
                                             }
                                             intent_core::CheckoutMode::Worktree => {
@@ -10950,7 +10998,11 @@ impl WorkspaceApi for Services {
                                             }
                                         },
                                     )
-                                    .await
+                                    .await;
+                                    if let Some(pump) = sub_pump {
+                                        let _ = pump.await;
+                                    }
+                                    result
                                 }
                             };
                             let sha = match provision(mode).await {
@@ -16920,6 +16972,9 @@ impl WorkspaceApi for Services {
                     token,
                     bus,
                     progress: None,
+                    // Standalone `git.clone` keeps its historical plain
+                    // (non-recursive) clone.
+                    recurse_submodules: false,
                 });
             });
             Ok(serde_json::json!({
