@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -520,6 +521,47 @@ async fn token_rotate_refuses_when_env_var_set() {
     assert!(
         stdout.contains("token:"),
         "should still print token: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Regression test for intent-hq/monorepo#1827: piping one-shot CLI output
+/// into a consumer that closes the pipe early (`intentd status | head`) must
+/// not panic with a broken-pipe backtrace. The read end of the pipe is closed
+/// before the child spawns, so its very first stdout write hits EPIPE
+/// deterministically (no daemon is running: `status` prints the
+/// "intentd: down" lines). Expected: a quiet exit with the SIGPIPE-style
+/// status 141 (128 + SIGPIPE) — never a panic backtrace.
+#[tokio::test]
+async fn status_exits_quietly_when_stdout_pipe_closes_early() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let (pipe_read, pipe_write) = nix::unistd::pipe().expect("pipe(2)");
+    drop(pipe_read);
+    let stdout = Stdio::from(pipe_write);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("status")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn intentd status");
+    let output = child.wait_with_output().expect("wait intentd status");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.to_lowercase().contains("panic"),
+        "broken-pipe stdout must not panic; stderr: {stderr}"
+    );
+    assert!(
+        output.status.code() == Some(141)
+            || output.status.signal() == Some(nix::sys::signal::Signal::SIGPIPE as i32),
+        "expected quiet SIGPIPE-style exit (141) or SIGPIPE death, got {:?}; stderr: {stderr}",
+        output.status
     );
 
     let _ = std::fs::remove_dir_all(&data_dir);

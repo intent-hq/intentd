@@ -44,6 +44,57 @@ impl Store {
         Ok(())
     }
 
+    /// Bulk [`upsert_script`](Self::upsert_script): insert or replace many
+    /// definitions in chunked multi-row statements inside one transaction, so
+    /// persisting N scripts costs O(1) statements and is all-or-nothing
+    /// (intent-hq/monorepo#1778 — the `script.list` bootstrap used to trip the
+    /// per-dispatch statement budget with one INSERT per repo-config script).
+    /// Chunked to stay under the bundled SQLite's `SQLITE_MAX_VARIABLE_NUMBER`
+    /// (32766 since 3.32).
+    pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
+        // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
+        // row and chunk math cannot drift if the persisted set changes.
+        // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
+        // covers any plausible repo config, so the statement count stays flat.
+        const ROWS_PER_STATEMENT: usize = 2048;
+        let binds_per_row = SCRIPT_COLUMNS.split(',').count();
+        let row = format!("({})", vec!["?"; binds_per_row].join(","));
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("bulk upsert scripts begin failed: {e}")))?;
+        for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
+            let placeholders = vec![row.as_str(); chunk.len()].join(",");
+            let sql =
+                format!("INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES {placeholders}");
+            let mut query = sqlx::query(&sql);
+            for s in chunk {
+                query = query
+                    .bind(&s.id)
+                    .bind(&s.workspace_id)
+                    .bind(&s.name)
+                    .bind(&s.command)
+                    .bind(&s.cwd)
+                    .bind(env_to_db(s)?)
+                    .bind(enum_to_db(&s.mode)?)
+                    .bind(&s.category)
+                    .bind(&s.source)
+                    .bind(s.auto_start.map(|b| b as i64))
+                    .bind(&s.created_at)
+                    .bind(&s.updated_at);
+            }
+            query
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("bulk upsert scripts failed: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("bulk upsert scripts commit failed: {e}")))?;
+        Ok(())
+    }
+
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
     /// a row was actually removed; deleting an unknown id is not an error.
     pub async fn remove_script(&self, id: &str) -> Result<bool> {
