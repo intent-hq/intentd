@@ -22208,11 +22208,12 @@ async fn dequeue_ready_batch_returns_none_below_min_ready() {
     );
 }
 
-/// Under an active question hold the flush drains ONLY user-origin entries
-/// (`user_origin_only`); automatic entries stay parked, preserving the hold
-/// contract.
+/// Under an active question hold the flush fires only when a user-origin
+/// entry is ready, and then carries EVERY ready entry — parked automatic
+/// entries ride the user-led combined turn in FIFO order instead of being
+/// bypassed by the newer user message (monorepo#1791).
 #[tokio::test]
-async fn dequeue_ready_batch_user_origin_only_leaves_automatic_parked() {
+async fn dequeue_ready_batch_under_hold_carries_automatic_entries_with_user_entry() {
     let (_t, svc, ws) = setup().await;
     let agent = create_agent(&svc, &ws, "BatchHold").await;
 
@@ -22227,25 +22228,43 @@ async fn dequeue_ready_batch_user_origin_only_leaves_automatic_parked() {
         false,
         true,
     );
-    svc.enqueue_message_with_origin(
-        &agent,
-        "answer-2".into(),
-        None,
-        None,
-        None,
-        None,
-        false,
-        true,
-    );
+    svc.enqueue_message(&agent, "auto-2".into(), None, None, None, None, false);
 
     let batch = svc
         .dequeue_ready_batch(&agent, true, 2)
-        .expect("two user-origin entries meet the min");
+        .expect("a ready user-origin entry lets the whole ready queue flush");
     let contents: Vec<_> = batch.iter().map(|m| m.content.as_str()).collect();
-    assert_eq!(contents, vec!["answer-1", "answer-2"]);
-    let snap = svc.queue_snapshot(&agent);
-    assert_eq!(snap.len(), 1, "automatic entry stays parked under the hold");
-    assert_eq!(snap[0]["content"], json!("auto-1"));
+    assert_eq!(
+        contents,
+        vec!["auto-1", "answer-1", "auto-2"],
+        "parked automatic entries ride the user-led flush FIFO"
+    );
+    assert!(
+        svc.queue_snapshot(&agent).is_empty(),
+        "queue fully drained by the combined flush"
+    );
+}
+
+/// With NO user-origin entry ready the hold keeps every automatic entry
+/// parked — the batch dequeue is a no-op (an automatic entry alone must not
+/// start a turn over the pending Q&A).
+#[tokio::test]
+async fn dequeue_ready_batch_under_hold_without_user_entry_is_noop() {
+    let (_t, svc, ws) = setup().await;
+    let agent = create_agent(&svc, &ws, "BatchHoldAuto").await;
+
+    svc.enqueue_message(&agent, "auto-1".into(), None, None, None, None, false);
+    svc.enqueue_message(&agent, "auto-2".into(), None, None, None, None, false);
+
+    assert!(
+        svc.dequeue_ready_batch(&agent, true, 2).is_none(),
+        "automatic entries stay parked under the hold"
+    );
+    assert_eq!(
+        svc.queue_snapshot(&agent).len(),
+        2,
+        "queue untouched on the None path"
+    );
 }
 
 /// System-only batch dequeue (`agents.flushQueuedMessages = "systemOnly"`):

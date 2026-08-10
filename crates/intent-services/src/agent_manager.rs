@@ -3843,6 +3843,51 @@ impl AgentManager {
             }
             return Ok(result);
         }
+        // FIFO restore under an active hold (monorepo#1791): a USER-origin
+        // send to an agent whose hold has parked ready-to-send entries must
+        // not bypass them with a direct turn — the parked backlog (e.g. an
+        // `after_all` settlement wake) would sit at position 0 while newer
+        // user messages run whole turns past it. Convert the send into a
+        // queue-fallback enqueue (user-origin) and kick the drain: the batch
+        // flush delivers the older parked entries FIFO in the SAME combined
+        // turn as this user message. Requires the `all` flush mode (the
+        // default): without batching no combined turn exists to carry the
+        // parked entries, so the conversion would only add a queue hop —
+        // under `systemOnly`/`off` the direct send stays as documented (the
+        // hold contract for automatic entries is unchanged either way).
+        // Also skipped when nothing is parked, so the common direct-send
+        // path is untouched — and for a session parked in `Error`, whose
+        // documented recovery IS the direct fresh send (the STAB-52 gate in
+        // `try_drain_queue` would strand a converted entry there).
+        if options.origin.is_user()
+            && session.status != AgentStatus::Error
+            && self.services.flush_queued_messages_mode()
+                == intent_core::FlushQueuedMessagesMode::All
+            && self.services.has_ready_to_send(&agent_id)
+            && self.services.question_hold_active(&agent_id).await
+        {
+            let (queued, position) = self.services.enqueue_message_with_origin(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+                options.queued_prepend(),
+                options.interrupt_priority,
+                true,
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            self.clone()
+                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                .await;
+            return Ok(result);
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message_with_origin(
                 &agent_id,
@@ -4106,12 +4151,13 @@ impl AgentManager {
             return;
         }
         // Batch flush (`agents.flushQueuedMessages`, default `all`): with a
-        // batching mode and MORE THAN ONE eligible entry waiting (under an
-        // active hold: user-origin entries only — the hold contract is
-        // unchanged), drain them all into ONE combined provider turn while
-        // persisting each entry as its own transcript row. A single eligible
-        // entry (or the `off` mode) falls through to the existing
-        // single-entry path unchanged.
+        // batching mode and MORE THAN ONE eligible entry waiting, drain them
+        // all into ONE combined provider turn while persisting each entry as
+        // its own transcript row. Under an active hold (`hold_drain`) the
+        // flush fires only because a user-origin entry is ready — the parked
+        // automatic entries ride its combined turn FIFO instead of being
+        // bypassed (monorepo#1791). A single eligible entry (or the `off`
+        // mode) falls through to the existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
             if let Some(batch) = self
@@ -7081,8 +7127,10 @@ async fn run_message_worker(
         // kick `try_drain_queue`.
         let hold_active = mgr.services.question_hold_active(&agent_id).await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
-        // `try_drain_queue` flush arm — ≥2 eligible entries (user-origin only
-        // under an active hold) drain into one combined provider turn;
+        // `try_drain_queue` flush arm — ≥2 ready entries drain into one
+        // combined provider turn. Under an active hold the flush fires only
+        // when a user-origin entry is ready, and then carries EVERY ready
+        // entry FIFO (parked automatic wakes included, monorepo#1791);
         // otherwise the single-entry arm below runs unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
@@ -7202,12 +7250,36 @@ async fn run_message_worker(
         // question-hold contract as the pre-release arm: while the hold is
         // active only a user-origin entry may drain.
         mgr.end_turn(&agent_id).await;
-        let raced = if mgr.services.question_hold_active(&agent_id).await {
-            mgr.services.dequeue_user_origin_message(&agent_id)
+        let raced_mode = mgr.services.flush_queued_messages_mode();
+        // Under an active hold with the `all` flush mode the raced re-check
+        // pops the WHOLE ready batch in ONE locked call (it fires only when
+        // a user-origin entry is ready). The oldest ready user entry may sit
+        // BEHIND older parked automatic entries, so a user-origin pop
+        // followed by a later batch fold + prepend would persist and prompt
+        // the newer user message ahead of the parked wakes it was dequeued
+        // from behind — a FIFO violation in exactly the race window this
+        // arm handles (monorepo#1791 review). The atomic batch keeps stored
+        // order end-to-end, and the slot-race failure below hands it back
+        // unchanged (`requeue_front_batch`).
+        let mut raced: Vec<QueuedMessage> = if mgr.services.question_hold_active(&agent_id).await {
+            match raced_mode {
+                intent_core::FlushQueuedMessagesMode::All => mgr
+                    .services
+                    .dequeue_ready_batch(&agent_id, true, 1)
+                    .unwrap_or_default(),
+                _ => mgr
+                    .services
+                    .dequeue_user_origin_message(&agent_id)
+                    .into_iter()
+                    .collect(),
+            }
         } else {
-            mgr.services.dequeue_message(&agent_id)
+            mgr.services
+                .dequeue_message(&agent_id)
+                .into_iter()
+                .collect()
         };
-        let Some(mut next) = raced else {
+        if raced.is_empty() {
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
             // the busy slot (`end_turn` above runs after `run_prompt_turn`
@@ -7226,21 +7298,54 @@ async fn run_message_worker(
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
-            // Batch flush (`agents.flushQueuedMessages`): `next` was popped
-            // before the slot re-claim, so fold any FURTHER eligible entries
-            // in behind it and run them as one combined turn. Mode `all`:
-            // any further ready entry (min 1 more ⇒ ≥2 total, user-origin
-            // only under an active hold, matching the other flush arms).
-            // Mode `systemOnly`: only when `next` is ITSELF system-origin
-            // (and no hold is active) — a user-origin `next` never batches
-            // under `systemOnly`, so it falls through to the single-entry
-            // path below unchanged. With no extra entry (or the `off` mode)
-            // the single-entry path below also runs unchanged.
+            // A multi-entry raced pop (hold + `all` above) is already the
+            // complete ready batch in stored order — run it as one combined
+            // turn directly; folding or reordering here would break the
+            // FIFO guarantee the atomic pop just preserved.
+            if raced.len() > 1 {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, raced).await {
+                    FlushPrep::Turn {
+                        content: c,
+                        options: o,
+                    } => {
+                        content = c;
+                        options = *o;
+                        user_persisted = true;
+                        // New messages → fresh silent-redrive budget
+                        // (monorepo#764).
+                        silent_redrive_used = false;
+                        continue 'outer;
+                    }
+                    FlushPrep::Parked => {
+                        mgr.release_in_flight_slot(&agent_id).await;
+                        break 'outer;
+                    }
+                }
+            }
+            let mut next = raced.pop().expect("raced batch non-empty");
+            // Batch flush (`agents.flushQueuedMessages`): the single `next`
+            // was popped before the slot re-claim, so fold any FURTHER
+            // eligible entries in behind it and run them as one combined
+            // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
+            // total; only the multi-entry hold case was handled atomically
+            // above, so a hold armed SINCE the pop still requires a
+            // user-origin entry — see the arm comment below). Mode
+            // `systemOnly`: only when `next` is ITSELF system-origin (and no
+            // hold is active) — a user-origin `next` never batches under
+            // `systemOnly`, so it falls through to the single-entry path
+            // below unchanged. With no extra entry (or the `off` mode) the
+            // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
             let hold = mgr.services.question_hold_active(&agent_id).await;
             let extra_batch = match mode {
                 intent_core::FlushQueuedMessagesMode::All => {
-                    mgr.services.dequeue_ready_batch(&agent_id, hold, 1)
+                    // A single-entry raced pop under hold + `all` means
+                    // `next` was the ONLY ready entry at pop time; a hold
+                    // armed since (or an entry that raced in) still requires
+                    // a ready user-origin entry unless `next` itself is one
+                    // (monorepo#1791).
+                    mgr.services
+                        .dequeue_ready_batch(&agent_id, hold && !next.user_origin, 1)
                 }
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
                     if hold || next.user_origin {
@@ -7335,9 +7440,10 @@ async fn run_message_worker(
             }
             continue 'outer;
         }
-        // A concurrent send won the slot; hand the message back to it and
-        // exit — that worker's own drain loop will pick it up.
-        mgr.services.requeue_front(&agent_id, next);
+        // A concurrent send won the slot; hand the message(s) back to it in
+        // original order and exit — that worker's own drain loop will pick
+        // them up.
+        mgr.services.requeue_front_batch(&agent_id, raced);
         break 'outer;
     }
     mgr.clear_worker(&agent_id);

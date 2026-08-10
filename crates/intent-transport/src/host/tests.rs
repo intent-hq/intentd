@@ -177,6 +177,8 @@ fn classify_matches_host_status_and_host_services() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "method": "host.status" })).is_some());
     // The additive host-services classify too.
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "host.checkGit" })).is_some());
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "host.checkNode" })).is_some());
+    assert!(classify(&json!({ "jsonrpc": "2.0", "id": 2, "method": "host.checkGh" })).is_some());
     assert!(classify(
         &json!({ "jsonrpc": "2.0", "id": 3, "method": "host.listDirectory", "params": { "path": "/tmp" } })
     )
@@ -274,6 +276,34 @@ async fn handle_check_git_returns_available_boolean() {
     let frame = handle(req, &NoopApi, None, true, &idle_reverse())
         .await
         .expect("checkGit always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 10);
+    assert!(
+        parsed["result"]["available"].is_boolean(),
+        "available is always present"
+    );
+}
+
+#[tokio::test]
+async fn handle_check_node_returns_available_boolean() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.checkNode" })).unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("checkNode always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 10);
+    assert!(
+        parsed["result"]["available"].is_boolean(),
+        "available is always present"
+    );
+}
+
+#[tokio::test]
+async fn handle_check_gh_returns_available_boolean() {
+    let req = classify(&json!({ "jsonrpc": "2.0", "id": 10, "method": "host.checkGh" })).unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("checkGh always replies");
     let parsed: Value = serde_json::from_str(&frame).unwrap();
     assert_eq!(parsed["id"], 10);
     assert!(
