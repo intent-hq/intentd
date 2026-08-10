@@ -197,6 +197,23 @@ fn run_sitter(data_dir: &Path, base_url: &str, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Like [`run_sitter`] but with `INTENTD_CHANNEL` set instead of scrubbed.
+fn run_sitter_with_channel_env(
+    data_dir: &Path,
+    base_url: &str,
+    channel: &str,
+    args: &[&str],
+) -> Output {
+    Command::new(SITTER_BIN)
+        .env(CHANNEL_ENV, channel)
+        .env(DATA_DIR_ENV, data_dir)
+        .env(MANIFEST_BASE_URL_ENV, base_url)
+        .env(FAKE_DAEMON_LOG, daemon_log_path(data_dir))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -252,6 +269,62 @@ fn check_reports_update_available_without_downloading() {
     assert!(
         !daemon_log_path(dir.path()).exists(),
         "`intentd update` must never spawn the daemon"
+    );
+}
+
+#[test]
+fn check_honors_flag_and_env_channel_precedence() {
+    // `update` must resolve the effective channel like serve mode does:
+    // --sitter-channel > INTENTD_CHANNEL > config pin > stable default.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0");
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+    publish_stable(&routes, &base_url, "0.1.0", b"stable daemon 0.1.0");
+    publish_channel(&routes, &base_url, "beta", "0.2.0", b"beta daemon 0.2.0");
+
+    // Env override selects beta.
+    let output = run_sitter_with_channel_env(dir.path(), &base_url, "beta", &["update", "--check"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("latest on channel beta: intentd 0.2.0"),
+        "stdout: {stdout}"
+    );
+
+    // Flag beats env: --sitter-channel stable while the env says beta.
+    let output = run_sitter_with_channel_env(
+        dir.path(),
+        &base_url,
+        "beta",
+        &["update", "--check", "--sitter-channel", "stable"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("latest on channel stable: intentd 0.1.0"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("already up to date"), "stdout: {stdout}");
+
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        [
+            "/channel-beta/beta.json".to_string(),
+            "/channel-stable/stable.json".to_string(),
+        ],
+        "each check must fetch exactly the resolved channel's manifest"
     );
 }
 

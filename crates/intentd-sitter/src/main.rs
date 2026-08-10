@@ -169,7 +169,9 @@ fn run_channel_command(
 
 /// `intentd update [--check]` — force an update check on the effective
 /// channel now instead of waiting for the periodic serve-mode check.
-/// `--check` only reports installed vs latest; the full form installs a
+/// `--check` only reports installed vs latest and exits 0 whenever the
+/// check itself succeeded, update available or not (scripts parse stdout
+/// to tell the two apart); the full form installs a
 /// newer version (newer-only, never a downgrade) and, when a supervised
 /// serve-mode sitter is running, restarts its daemon via SIGHUP so the new
 /// binary takes effect immediately. The automatic restart is skipped when
@@ -252,6 +254,19 @@ fn run_update_command(
     }
 }
 
+/// Restart the supervised daemon: SIGHUP the serve-mode sitter so it
+/// gracefully stops the daemon and respawns it on the currently installed
+/// version. Shared by `intentd restart` and `intentd update`.
+#[cfg(unix)]
+fn send_sighup_to_sitter(pid: nix::unistd::Pid) -> i32 {
+    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP) {
+        eprintln!("intentd-sitter: failed to signal the supervised sitter (pid {pid}): {e}");
+        return 1;
+    }
+    println!("restarting intentd: sent SIGHUP to the supervised sitter (pid {pid})");
+    0
+}
+
 /// Activate a freshly installed daemon: when a supervised serve-mode sitter
 /// is running, SIGHUP it so it respawns on the new version now; otherwise
 /// the new binary simply takes effect on the next start.
@@ -264,12 +279,7 @@ fn apply_installed_update(paths: &SitterPaths) -> i32 {
         );
         return 0;
     };
-    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP) {
-        eprintln!("intentd-sitter: failed to signal the supervised sitter (pid {pid}): {e}");
-        return 1;
-    }
-    println!("restarting intentd: sent SIGHUP to the supervised sitter (pid {pid})");
-    0
+    send_sighup_to_sitter(pid)
 }
 
 /// No SIGHUP on windows: the new binary takes effect on the next (service)
@@ -294,12 +304,7 @@ fn run_restart(paths: &SitterPaths) -> i32 {
         );
         return 1;
     };
-    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP) {
-        eprintln!("intentd-sitter: failed to signal the supervised sitter (pid {pid}): {e}");
-        return 1;
-    }
-    println!("restarting intentd: sent SIGHUP to the supervised sitter (pid {pid})");
-    0
+    send_sighup_to_sitter(pid)
 }
 
 /// No SIGHUP on windows: point at the service manager instead.

@@ -224,9 +224,11 @@ intentd sitter channel beta --redownload && intentd restart   # switch and activ
   available it downloads and installs it (newer-only — never a downgrade), then
   restarts a running supervised daemon via the same SIGHUP path as `intentd restart`
   so the new version takes effect immediately (with no running service, the new
-  binary simply takes effect on the next start). `intentd update --check` is the
+  binary simply takes effect on the next start; on Windows the install still
+  happens — restart the service to activate it). `intentd update --check` is the
   dry-run form: it reports the installed and latest versions without downloading or
-  installing anything.
+  installing anything. Exit 0 means the check succeeded, whether or not an update
+  is available — parse stdout to tell the two apart.
 
 Per-launch overrides still work and take precedence over the pin — pass
 `--sitter-channel beta` or set `INTENTD_CHANNEL=beta`:
