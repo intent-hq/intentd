@@ -935,6 +935,82 @@ impl Services {
         Ok(monitor)
     }
 
+    /// Archive sweep (`workspace.archive`): cancel every ACTIVE PR monitor
+    /// in the workspace, mirroring the hook sweep
+    /// ([`Services::cancel_workspace_hooks`]) — state persisted to
+    /// `cancelled`, `prMonitor:cancelled` emitted, owner woken with a notice
+    /// so the agent learns why its watch stopped. Runs AFTER the archived
+    /// row is persisted: the wake rides the archived gate in
+    /// [`Services::deliver_wake_message`], so it parks in the queue (at
+    /// most) and never starts a turn while the workspace is archived.
+    /// Terminal monitors are untouched, and unarchive does NOT resurrect
+    /// cancelled monitors — the notice tells the owner to re-register if the
+    /// PR still matters. Best-effort per monitor: a store failure is logged
+    /// and the sweep moves on — archiving must not fail because one monitor
+    /// row would not update.
+    pub(crate) async fn cancel_workspace_pr_monitors(&self, workspace_id: &WorkspaceId) {
+        let monitors = match self
+            .store
+            .list_active_pr_monitors_by_workspace(workspace_id)
+            .await
+        {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    error = %e,
+                    "archive pr-monitor sweep: monitor list failed; skipping"
+                );
+                return;
+            }
+        };
+        let mut cancelled_any = false;
+        for mut monitor in monitors {
+            let now = now_iso();
+            match self
+                .store
+                .update_pr_monitor_state(&monitor.monitor_id, PrMonitorState::Cancelled, &now)
+                .await
+            {
+                Ok(true) => {}
+                // A concurrent cancel/complete won between the list read and
+                // the guarded write; the monitor is no longer active either
+                // way.
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.0,
+                        monitor = %monitor.monitor_id.0,
+                        error = %e,
+                        "archive pr-monitor sweep: cancel failed; continuing"
+                    );
+                    continue;
+                }
+            }
+            monitor.state = PrMonitorState::Cancelled;
+            monitor.updated_at = now;
+            self.pr_monitor_catch_up
+                .lock()
+                .unwrap()
+                .remove(&monitor.monitor_id);
+            self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
+                .await;
+            cancelled_any = true;
+            let label = monitor_label(&monitor);
+            let notice = format!(
+                "[PR monitor {label}] This monitor was cancelled because its workspace was \
+                 archived — it will not report again."
+            );
+            self.wake_pr_monitor_owner(&monitor, &notice, "cancelled")
+                .await;
+        }
+        // The sweep settling the last active monitor can demote the derived
+        // displayStatus (§6.5) — best-effort, transition-only emission.
+        if cancelled_any {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
+    }
+
     /// Deliver a monitor's pending consolidated wake right now, bypassing the
     /// remaining debounce window, and reset the debounce state. A no-op
     /// (`Ok(false)`) when nothing is pending.
@@ -3934,6 +4010,70 @@ mod tests {
             .await
             .expect("delete owner");
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
+        assert_eq!(
+            display_status_events(&svc, &ws).await,
+            vec!["in_progress", "idle", "in_progress", "idle"]
+        );
+    }
+
+    /// Regression for intent-hq/monorepo#1828: `workspace.archive` cancels
+    /// every ACTIVE PR monitor in the workspace — state persisted to
+    /// `cancelled`, `prMonitor:cancelled` emitted, owner told why — while
+    /// terminal monitors are untouched, and the displayStatus recompute
+    /// demotes the rollup so an archived workspace never reads
+    /// `in_progress` off a stale monitor signal indefinitely.
+    #[tokio::test]
+    async fn archive_cancels_active_pr_monitors_and_demotes_display_status() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_display_status_changed(&ws).await;
+        // A terminal monitor first: owner-cancelled before the archive.
+        let terminal = register(&svc, &ws, &owner).await;
+        svc.pr_monitor_cancel(&ws, &terminal.monitor_id, Some(&owner))
+            .await
+            .expect("owner cancel");
+        // And one ACTIVE monitor promoting the rollup.
+        let (active, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+
+        let archived = svc
+            .archive_workspace(ws.clone(), None)
+            .await
+            .expect("archive");
+        assert!(archived.archived, "workspace archived");
+
+        let row = svc
+            .store()
+            .get_pr_monitor(&active.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+        assert!(
+            !svc.workspace_has_active_pr_monitors(&ws).await,
+            "no active monitors survive the archive sweep"
+        );
+        // The owner learns why its watch stopped (store-only wake here: no
+        // manager attached, so nothing can spawn a turn; the wake parks
+        // behind the archived gate at most).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = owner_messages(&svc, &owner).await;
+            if text.contains("workspace was archived") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "archive wake never delivered; last = {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The demotion emitted: the first register/cancel pair transitioned
+        // in_progress → idle, the second register promoted again, and the
+        // archive sweep's recompute demoted.
         assert_eq!(
             display_status_events(&svc, &ws).await,
             vec!["in_progress", "idle", "in_progress", "idle"]
