@@ -1,4 +1,4 @@
-//! E2E tests for CLI subcommands (status, stop, doctor, token, pair) to exercise
+//! E2E tests for CLI subcommands (status, stop, doctor, pair) to exercise
 //! intentd binary coverage through daemon control paths.
 
 #![cfg(unix)]
@@ -159,109 +159,60 @@ async fn stop_succeeds_when_daemon_not_running() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
-#[tokio::test]
-async fn token_generates_and_prints_token_and_fingerprint() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
-    let secrets_file = data_dir.join("secrets.json");
-
-    // Run `intentd token` (no rotation)
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("token")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .output()
-        .expect("run intentd token");
-
-    assert!(
-        output.status.success(),
-        "token command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("token:"),
-        "token output should include token: {stdout}"
-    );
-    assert!(
-        stdout.contains("fingerprint:"),
-        "token output should include fingerprint: {stdout}"
-    );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
-}
-
-#[tokio::test]
-async fn token_rotate_flag_generates_new_token() {
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
-    let secrets_file = data_dir.join("secrets.json");
-
-    // First token
-    let output1 = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("token")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .output()
-        .expect("run intentd token");
-
-    assert!(output1.status.success(), "first token command failed");
-    let stdout1 = String::from_utf8_lossy(&output1.stdout);
-    let token1 = stdout1
-        .lines()
-        .find(|l| l.starts_with("token:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .expect("extract token1");
-
-    // Rotate
-    let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("token")
-        .arg("--rotate")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_SECRETS_FILE", &secrets_file)
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .output()
-        .expect("run intentd token --rotate");
-
-    assert!(output2.status.success(), "rotate token command failed");
-    let stdout2 = String::from_utf8_lossy(&output2.stdout);
-    let token2 = stdout2
-        .lines()
-        .find(|l| l.starts_with("token:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .expect("extract token2");
-
-    assert_ne!(token1, token2, "rotated token should be different");
-
-    let _ = std::fs::remove_dir_all(&data_dir);
-}
-
-/// Spawn a daemon with both UDS and TCP (WSS) listeners and a fixed token, as
-/// `intentd pair` requires a running TCP listener to build the payload. The
-/// WSS listener is enabled via `server.wsApi.enabled` in config.toml.
-fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
+/// Spawn a daemon with both UDS and TCP (WSS) listeners, as `intentd pair`
+/// requires a running TCP listener to build the payload. The WSS listener is
+/// enabled via `server.wsApi.enabled` in config.toml. `token` fixes the bearer
+/// token via `INTENTD_AUTH_TOKEN`; `None` uses the file-backed secrets store
+/// (required by rotation tests — an env-fixed token cannot rotate).
+fn spawn_daemon_both(data_dir: &PathBuf, token: Option<&str>) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
     common::enable_ws_api(data_dir);
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("serve")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_TCP_PORT", "0")
-        .env("INTENTD_AUTH_TOKEN", token)
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve (ws api enabled)")
+        .stderr(Stdio::from(log));
+    match token {
+        Some(token) => cmd.env("INTENTD_AUTH_TOKEN", token),
+        None => cmd.env_remove("INTENTD_AUTH_TOKEN"),
+    };
+    cmd.spawn().expect("spawn intentd serve (ws api enabled)")
+}
+
+/// Run `intentd pair` with `args`, retrying until it succeeds: the WSS
+/// listener binds asynchronously after the UDS socket accepts, so early runs
+/// can fail with listener-down (bounded by the startup budget).
+async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process::Output {
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .args(args)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd pair");
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Extract the value of a labeled credential line (`Token:`, `Fingerprint:`)
+/// from `intentd pair` stdout.
+fn labeled_value<'a>(stdout: &'a str, label: &str) -> Option<&'a str> {
+    stdout
+        .lines()
+        .find(|l| l.starts_with(label))
+        .and_then(|l| l.split_whitespace().nth(1))
 }
 
 #[tokio::test]
@@ -272,33 +223,25 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let socket = data_dir.join("intentd.sock");
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-    let child = spawn_daemon_both(&data_dir, token);
+    let child = spawn_daemon_both(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
     await_socket(&mut daemon, &socket).await;
 
-    // `pair` needs the WSS listener, which binds asynchronously after the UDS
-    // socket accepts; retry until it is up (bounded by the startup budget).
     let png_path = data_dir.join("pair.png");
     let svg_path = data_dir.join("pair.svg");
-    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
-    let output = loop {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("pair")
-            .arg("--png")
-            .arg(&png_path)
-            .arg("--svg")
-            .arg(&svg_path)
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .output()
-            .expect("run intentd pair");
-        if output.status.success() || std::time::Instant::now() >= deadline {
-            break output;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let output = run_pair_until_success(
+        &data_dir,
+        &[
+            "--png",
+            png_path.to_str().unwrap(),
+            "--svg",
+            svg_path.to_str().unwrap(),
+        ],
+    )
+    .await;
 
     assert!(
         output.status.success(),
@@ -308,12 +251,39 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("intent://pair?v=1&host="),
-        "pair output should include the payload URI: {stdout}"
+        stdout.contains("URL:         intent://pair?v=1&host="),
+        "pair output should include the labeled payload URL: {stdout}"
     );
     assert!(
         stdout.contains(&format!("token={token}")),
         "payload URI should embed the token"
+    );
+    assert!(
+        stdout.contains(&format!("Token:       {token}")),
+        "pair output should include the labeled token line: {stdout}"
+    );
+    let fingerprint =
+        labeled_value(&stdout, "Fingerprint:").expect("labeled fingerprint line present");
+    assert!(
+        fingerprint.contains(':') && fingerprint.len() == 95,
+        "fingerprint should be a colon-separated sha256 hex: {fingerprint}"
+    );
+    assert!(
+        stdout.contains("Scan with the Intent iOS app"),
+        "pair output should explain the QR code: {stdout}"
+    );
+    // Each credential line carries a one-line usage explanation.
+    assert!(
+        stdout.contains("Same payload as the QR code"),
+        "URL line should have a usage note: {stdout}"
+    );
+    assert!(
+        stdout.contains("Bearer token"),
+        "token line should have a usage note: {stdout}"
+    );
+    assert!(
+        stdout.contains("TLS certificate fingerprint"),
+        "fingerprint line should have a usage note: {stdout}"
     );
     // The ANSI QR rendering uses unicode block characters.
     assert!(
@@ -431,8 +401,8 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         "pair --yes should enable the listener and succeed: {stderr}"
     );
     assert!(
-        stderr.contains("WSS listener started"),
-        "should report the listener was enabled: {stderr}"
+        stderr.contains("External connections enabled"),
+        "should report external connections were enabled: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -461,7 +431,7 @@ async fn pair_with_yes_enables_wss_and_prints_payload() {
         "pair should succeed with the listener already up: {stderr2}"
     );
     assert!(
-        !stderr2.contains("WSS listener started"),
+        !stderr2.contains("External connections enabled"),
         "second run must not re-enable: {stderr2}"
     );
 }
@@ -492,23 +462,84 @@ async fn pair_fails_when_daemon_down() {
 }
 
 #[tokio::test]
-async fn token_rotate_refuses_when_env_var_set() {
+async fn pair_rotate_mints_new_token() {
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
 
-    // Run with INTENTD_AUTH_TOKEN set
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("token")
-        .arg("--rotate")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_AUTH_TOKEN", "fixed-token-from-env")
-        .output()
-        .expect("run intentd token --rotate with env var");
+    // File-backed token store (no INTENTD_AUTH_TOKEN): rotation goes through
+    // the daemon's `server.rotateToken`, so the subsequent `pairing.getInfo`
+    // must serve the NEW token (not a stale in-process cache entry).
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output1 = run_pair_until_success(&data_dir, &[]).await;
+    assert!(
+        output1.status.success(),
+        "first pair run failed: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+    let stdout1 = String::from_utf8_lossy(&output1.stdout).to_string();
+    let token1 = labeled_value(&stdout1, "Token:").expect("extract token1");
+
+    let output2 = run_pair_until_success(&data_dir, &["--rotate"]).await;
+    assert!(
+        output2.status.success(),
+        "pair --rotate failed: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let stdout2 = String::from_utf8_lossy(&output2.stdout).to_string();
+    let token2 = labeled_value(&stdout2, "Token:").expect("extract token2");
+
+    assert_ne!(token1, token2, "rotated token should be different");
+    assert!(
+        stdout2.contains(&format!("token={token2}")),
+        "payload URI should embed the rotated token: {stdout2}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rotate_refuses_when_env_var_set() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+    let token = "abababababababababababababababababababababababababababababababab";
+
+    // Daemon and CLI share a fixed INTENTD_AUTH_TOKEN: rotation is a no-op
+    // with a stderr note, and the env token is printed unchanged.
+    let child = spawn_daemon_both(&data_dir, Some(token));
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let output = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .arg("--rotate")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_AUTH_TOKEN", token)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd pair --rotate with env var");
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
 
     assert!(
         output.status.success(),
-        "token command should succeed but not rotate"
+        "pair --rotate should succeed but not rotate: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -519,11 +550,9 @@ async fn token_rotate_refuses_when_env_var_set() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("token:"),
-        "should still print token: {stdout}"
+        stdout.contains(&format!("Token:       {token}")),
+        "should still print the fixed token: {stdout}"
     );
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// Regression test for intent-hq/monorepo#1827: piping one-shot CLI output

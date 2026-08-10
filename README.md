@@ -290,25 +290,31 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Pairing a remote client (WSS)
 
-`intentd pair` renders the `intent://pair?…` QR code / payload URI the Intent iOS app
-scans to connect over the WSS/TLS listener (the desktop app's remote-connection flow
-takes the host, port, and token entered manually instead — `intentd token` prints
-them). The payload embeds everything a client needs — the machine's LAN IP(s), the WSS
-port (`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients
-pin it), and the bearer token — so the command is local-only (it queries
-`pairing.getInfo` over the UDS socket).
+`intentd pair` prints everything a client needs to pair with this machine over the
+WSS/TLS listener: the `intent://pair?…` QR code the Intent iOS app scans, followed by
+labeled URL, bearer token, and TLS certificate fingerprint lines (each with a short
+usage note — the token and fingerprint are what the desktop app's remote-connection
+flow takes manually). The payload embeds the machine's LAN IP(s), the WSS port
+(`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients pin
+it), and the bearer token — so the command is local-only (it queries `pairing.getInfo`
+over the UDS socket).
 
 ```bash
-intentd pair                  # QR code + payload URI in the terminal
+intentd pair                  # QR code + labeled URL/token/fingerprint lines
 intentd pair --png pair.png   # also export the QR code as an image (0600)
+intentd pair --rotate         # mint a NEW bearer token first (invalidates the old one)
 ```
 
-If the WSS listener is not running, `pair` offers to enable it on the spot: it persists
-`server.wsApi.enabled = true` to `config.toml` via the daemon's `settings.update`
-pipeline (the same path the settings UI uses), which also starts the listener
-immediately — no restart needed. Interactively this is a `[Y/n]` prompt; unattended
-runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the command fails with
-guidance. `intentd token` prints the same credentials in plaintext.
+`--rotate` rotates the token through the daemon (`server.rotateToken`), so live WSS
+auth picks up the new token immediately; when `INTENTD_AUTH_TOKEN` is set the token is
+fixed by the env var and cannot be rotated (a note is printed to stderr).
+
+If external connections (the WSS listener) are disabled, `pair` offers to enable them
+on the spot: it persists `server.wsApi.enabled = true` to `config.toml` via the
+daemon's `settings.update` pipeline (the same path the settings UI uses), which also
+starts the listener immediately — no restart needed. Interactively this is a `[Y/n]`
+prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
+command fails with guidance.
 
 ## Current status
 

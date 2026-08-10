@@ -18,9 +18,9 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, generate_token, get_or_create_token,
-    serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry,
-    RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer, WsOptions,
+    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds_with_reverse,
+    AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl,
+    SystemStatus, TokenStore, WsApiServer, WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -124,19 +124,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Print WSS pairing credentials (bearer token + TLS fingerprint); --rotate
-    /// regenerates the token.
-    Token {
-        /// Mint and persist a NEW token, replacing the old one. Ignored when
-        /// `INTENTD_AUTH_TOKEN` is set (the token is fixed by the env var).
-        #[arg(long)]
-        rotate: bool,
-    },
-    /// Render the LAN pairing QR code in the terminal plus the plaintext
-    /// `intent://pair?…` payload URI. Requires a running daemon: queries
-    /// `pairing.getInfo` over UDS so the payload uses the exact same
-    /// host/fingerprint/token sources as `intentd token`. When the TCP (WSS)
-    /// listener is not running, offers to enable it on the spot (persisting
+    /// Print everything a client needs to pair with this daemon: the LAN
+    /// pairing QR code, then labeled URL (`intent://pair?…` payload URI),
+    /// bearer token, and TLS certificate fingerprint lines — each with a short
+    /// usage note. Requires a running daemon: queries `pairing.getInfo` over
+    /// UDS so all values come from the exact same host/fingerprint/token
+    /// sources the daemon serves. When external connections (the WSS listener)
+    /// are disabled, offers to enable them on the spot (persisting
     /// `server.wsApi.enabled = true` via `settings.update`, which also starts
     /// the listener) — interactively via a [Y/n] prompt, or unattended with
     /// `--yes`; non-interactive runs without `--yes` refuse instead.
@@ -147,10 +141,15 @@ enum Command {
         /// Also write the QR code as an SVG document to this path.
         #[arg(long, value_name = "PATH")]
         svg: Option<PathBuf>,
-        /// Enable the WSS listener without prompting when it is not running
-        /// (persists `server.wsApi.enabled = true`).
+        /// Enable external connections without prompting when they are
+        /// disabled (persists `server.wsApi.enabled = true`).
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Mint and persist a NEW bearer token (replacing the old one) before
+        /// printing, via `server.rotateToken`. Ignored with a stderr note when
+        /// `INTENTD_AUTH_TOKEN` is set (the token is fixed by the env var).
+        #[arg(long)]
+        rotate: bool,
     },
     /// Daemon-backed git credential helper (monorepo#884): speaks the
     /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
@@ -232,10 +231,12 @@ async fn main() -> ExitCode {
             dry_run,
             force,
         } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
-        Command::Token { rotate } => to_exit(cmd_token(rotate).await),
-        Command::Pair { png, svg, yes } => {
-            to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes).await)
-        }
+        Command::Pair {
+            png,
+            svg,
+            yes,
+            rotate,
+        } => to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await),
         Command::GitCredential { operation } => cmd_git_credential(&operation).await,
         #[cfg(feature = "js-engine")]
         Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
@@ -258,42 +259,6 @@ async fn cmd_js_eval(code: &str, timeout_ms: u64) -> anyhow::Result<()> {
         }
         Err(e) => Err(anyhow::Error::from(e)),
     }
-}
-
-/// Print the WSS pairing credentials (§5.2/§5.3): the bearer token a client
-/// sends and the TLS cert fingerprint it pins. Resolves the token via
-/// [`resolve_token_store`] (env seam ⇒ secrets file) and the fingerprint via
-/// [`ensure_tls_certificate`] (the same cert `serve` reuses, so it is stable to
-/// pin). `rotate` mints+persists a NEW token first — but when
-/// `INTENTD_AUTH_TOKEN` is set the token is fixed by the env var and cannot be
-/// rotated: a note is written to stderr and the env token is printed unchanged.
-/// The token is never logged via `tracing`; both lines go to stdout.
-async fn cmd_token(rotate: bool) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let store = AsyncTokenStore::new(resolve_token_store());
-    let env_fixed = std::env::var("INTENTD_AUTH_TOKEN")
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
-    let token = if rotate && !env_fixed {
-        generate_token(&store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-    } else {
-        if rotate {
-            eprintln!(
-                "note: INTENTD_AUTH_TOKEN is set; the token is fixed by the env var and cannot be rotated"
-            );
-        }
-        get_or_create_token(&store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-    };
-    let tls =
-        ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    println!("token:       {token}");
-    println!("fingerprint: {}", tls.fingerprint256);
-    Ok(())
 }
 
 /// True when a `pairing.getInfo` error frame means the TCP (WSS) listener is
@@ -330,19 +295,25 @@ fn rpc_error_text(error: &Value) -> String {
         .to_string()
 }
 
-/// Ask the user on the terminal whether to enable the WSS listener; default
-/// is yes (empty input). Returns an error when stdin is not a TTY — an
-/// unattended run must pass `--yes` to opt in explicitly.
+/// Ask the user on the terminal whether to enable external connections (the
+/// WSS listener); default is yes (empty input). Returns an error when stdin is
+/// not a TTY — an unattended run must pass `--yes` to opt in explicitly.
 fn confirm_enable_wss() -> anyhow::Result<bool> {
     use std::io::{BufRead, IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "the WSS listener is not running and stdin is not a terminal — \
-             re-run with --yes to enable it (persists server.wsApi.enabled = true), \
-             or enable it in config.toml"
+            "pairing lets other Intent apps — Intent on another computer or the \
+             Intent mobile app — securely connect to this machine, but external \
+             connections are currently disabled and this run cannot prompt \
+             (stdin is not a terminal) — re-run with --yes to enable them \
+             (persists server.wsApi.enabled = true), or enable them in config.toml"
         );
     }
-    eprint!("The WSS listener is not running. Enable it now? [Y/n] ");
+    eprintln!(
+        "Pairing lets other Intent apps — Intent on another computer or the \
+         Intent mobile app — securely connect to this machine."
+    );
+    eprint!("External connections are currently disabled. Enable them now? [Y/n] ");
     std::io::stderr().flush()?;
     let mut line = String::new();
     // EOF (0 bytes read, e.g. Ctrl-D before any input) is not a response —
@@ -354,8 +325,8 @@ fn confirm_enable_wss() -> anyhow::Result<bool> {
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
-/// Enable the WSS listener via `settings.update` over UDS: persists
-/// `server.wsApi.enabled = true` to config.toml and starts the listener
+/// Enable external connections via `settings.update` over UDS: persists
+/// `server.wsApi.enabled = true` to config.toml and starts the WSS listener
 /// through the server-control hooks — the same path the FE settings UI uses.
 async fn enable_wss_listener(socket: &Path) -> anyhow::Result<()> {
     let response = rpc_call(
@@ -365,27 +336,74 @@ async fn enable_wss_listener(socket: &Path) -> anyhow::Result<()> {
     )
     .await?;
     if let Some(error) = response.get("error") {
-        anyhow::bail!("cannot enable the WSS listener: {}", rpc_error_text(error));
+        anyhow::bail!(
+            "cannot enable external connections: {}",
+            rpc_error_text(error)
+        );
     }
-    eprintln!("enabled server.wsApi.enabled (persisted to config.toml); WSS listener started");
+    eprintln!(
+        "External connections enabled — other Intent apps can now pair with this \
+         machine (server.wsApi.enabled = true persisted to config.toml)."
+    );
     Ok(())
 }
 
-/// Render the LAN pairing QR code in the terminal (§5.2). Queries
-/// `pairing.getInfo` over UDS — so the payload embeds the exact same
-/// hosts/fingerprint/token the daemon serves via `server.pairingInfo` and
-/// `intentd token` — then renders the `intent://pair?…` payload URI as a QR
-/// code in half-height unicode blocks, followed by the plaintext URI.
-/// When the TCP (WSS) listener is down, offers to enable it (prompt, or
-/// unattended via `yes`) through `settings.update` and retries the query.
-async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>, yes: bool) -> anyhow::Result<()> {
+/// Rotate the pairing bearer token via `server.rotateToken` over UDS — the
+/// daemon-side path, so the daemon's in-process token cache and live WSS auth
+/// layer pick up the new token immediately (a direct secrets-file write from
+/// this process would leave the daemon serving the stale cached token until
+/// its cache TTL expires). When `INTENTD_AUTH_TOKEN` fixes the token (in this
+/// process's env or the daemon's), rotation is a no-op with a stderr note and
+/// the fixed token is printed unchanged.
+async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
+    const ENV_FIXED_NOTE: &str =
+        "note: INTENTD_AUTH_TOKEN is set; the token is fixed by the env var and cannot be rotated";
+    let env_fixed = std::env::var("INTENTD_AUTH_TOKEN")
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    if env_fixed {
+        eprintln!("{ENV_FIXED_NOTE}");
+        return Ok(());
+    }
+    let response = rpc_call(socket, "server.rotateToken", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        let text = rpc_error_text(error);
+        if text.contains("INTENTD_AUTH_TOKEN") {
+            eprintln!("{ENV_FIXED_NOTE}");
+            return Ok(());
+        }
+        anyhow::bail!("cannot rotate the pairing token: {text}");
+    }
+    Ok(())
+}
+
+/// Print the full pairing credentials (§5.2/§5.3): the LAN pairing QR code,
+/// then labeled URL / Token / Fingerprint lines, each with a one-line usage
+/// note. Queries `pairing.getInfo` over UDS — so every value comes from the
+/// exact same hosts/fingerprint/token sources the daemon serves via
+/// `server.pairingInfo` — and renders the `intent://pair?…` payload URI as a
+/// QR code in half-height unicode blocks. `rotate` mints a new token first
+/// via [`rotate_pairing_token`]. When external connections (the WSS listener)
+/// are disabled, offers to enable them (prompt, or unattended via `yes`)
+/// through `settings.update` and retries the query. The token is never logged
+/// via `tracing`; all credential lines go to stdout.
+async fn cmd_pair(
+    png: Option<&Path>,
+    svg: Option<&Path>,
+    yes: bool,
+    rotate: bool,
+) -> anyhow::Result<()> {
     let config = resolve_config()?;
+    if rotate {
+        rotate_pairing_token(&config.socket_path).await?;
+    }
     let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     if response.get("error").is_some_and(is_listener_down_error) {
         if !yes && !confirm_enable_wss()? {
             anyhow::bail!(
-                "pairing requires the WSS listener — enable it later with \
-                 `intentd pair --yes` or via server.wsApi.enabled in config.toml"
+                "pairing requires external connections to be enabled — enable them \
+                 later with `intentd pair --yes` or via server.wsApi.enabled in \
+                 config.toml"
             );
         }
         enable_wss_listener(&config.socket_path).await?;
@@ -398,6 +416,12 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>, yes: bool) -> anyhow::
     let uri = result["uri"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `uri`"))?;
+    let token = result["token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `token`"))?;
+    let fingerprint = result["fingerprint"].as_str().ok_or_else(|| {
+        anyhow::anyhow!("malformed pairing.getInfo result: missing `fingerprint`")
+    })?;
 
     let code = qrcode::QrCode::new(uri.as_bytes())
         .map_err(|e| anyhow::anyhow!("cannot encode pairing payload as a QR code: {e}"))?;
@@ -407,7 +431,14 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>, yes: bool) -> anyhow::
         .build();
     println!("{art}");
     println!();
-    println!("{uri}");
+    println!("  Scan with the Intent iOS app to pair this device automatically.");
+    println!();
+    println!("URL:         {uri}");
+    println!("             Same payload as the QR code — paste it into a client that can't scan.");
+    println!("Token:       {token}");
+    println!("             Bearer token — enter it (with host + port) in the desktop app's remote-connection dialog.");
+    println!("Fingerprint: {fingerprint}");
+    println!("             TLS certificate fingerprint — confirm the client shows this exact value before trusting the connection.");
 
     if let Some(path) = png {
         let img = code.render::<image::Luma<u8>>().build();
