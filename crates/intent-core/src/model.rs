@@ -799,6 +799,12 @@ pub struct WorkspaceCreate {
     /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
     /// an existing git repo is a no-op.
     pub is_new_repo: Option<bool>,
+    /// Client-supplied correlation id (PROTOCOL §5.1): when present, every
+    /// `git:clone:progress` / `git:clone:done` frame this create emits echoes
+    /// it as `data.progressId`, and provisioning paths that stream nothing
+    /// today (worktree / CoW / direct) emit milestone frames. Absent keeps
+    /// the legacy event behavior exactly. Never persisted.
+    pub progress_id: Option<String>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }
