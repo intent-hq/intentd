@@ -103,6 +103,22 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn debug_sample_stacks(
+        &self,
+        duration_ms: Option<i64>,
+        frequency_hz: Option<i64>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "report": "fake stack report",
+                "durationMs": duration_ms,
+                "frequencyHz": frequency_hz,
+                "sampleCount": 1,
+                "distinctStacks": 1,
+            }))
+        })
+    }
+
     fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async { Ok(vec![sample_ws()]) })
     }
@@ -1889,6 +1905,58 @@ async fn sentry_assign_issue_routes_with_or_without_assigned_to() {
 
 fn err_code(v: &Value) -> i64 {
     v["error"]["code"].as_i64().expect("error code")
+}
+
+/// `debug.sampleStacks` (PROTOCOL §5.43): both params optional — absent
+/// params dispatch as `None` and the params object itself may be omitted;
+/// numeric values are forwarded to the service layer.
+#[tokio::test]
+async fn debug_sample_stacks_dispatches_optional_params() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"debug.sampleStacks","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(v["result"]["report"], "fake stack report");
+    assert!(v["result"]["durationMs"].is_null());
+    assert!(v["result"]["frequencyHz"].is_null());
+
+    let v = call(r#"{"jsonrpc":"2.0","id":2,"method":"debug.sampleStacks"}"#)
+        .await
+        .unwrap();
+    assert_eq!(v["result"]["report"], "fake stack report");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"debug.sampleStacks","params":{"durationMs":500,"frequencyHz":50}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["durationMs"], 500);
+    assert_eq!(v["result"]["frequencyHz"], 50);
+}
+
+/// `debug.sampleStacks`: a present but non-numeric `durationMs` /
+/// `frequencyHz` is a caller error (`-32602`), not silently defaulted;
+/// `null` is tolerated as absent (matching the `opt_int` convention).
+#[tokio::test]
+async fn debug_sample_stacks_non_numeric_params_are_invalid() {
+    for params in [
+        r#"{"durationMs":"1000"}"#,
+        r#"{"frequencyHz":"99"}"#,
+        r#"{"durationMs":true}"#,
+        r#"{"frequencyHz":[]}"#,
+    ] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"debug.sampleStacks","params":{params}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "params={params}");
+    }
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"debug.sampleStacks","params":{"durationMs":null}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"]["durationMs"].is_null(), "null tolerated: {v}");
 }
 
 #[tokio::test]
