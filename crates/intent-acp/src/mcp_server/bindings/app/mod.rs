@@ -3,8 +3,9 @@
 //! Namespace module for Chief-of-Staff workspace-only APIs. All `ws.app.*`
 //! methods gate on `workspace_id.is_chief()` — non-chief agents receive a
 //! clear "ws.app.* is only available in the Chief of Staff workspace" error
-//! — EXCEPT `ws.app.question.*`, which is available to every workspace agent
-//! (see the `question` module docs).
+//! — EXCEPT `ws.app.question.*`, which is available to every TOP-LEVEL
+//! workspace agent regardless of chief-ness (see the `question` module docs;
+//! sub-agent callers are denied one layer up, in the dispatch host).
 //!
 //! Structure: `app/mod.rs` owns the PRELUDE assembly and top-level dispatch
 //! routing to submodules (`workspaces`, `agents`, `settings`, `specialists`).
@@ -43,7 +44,9 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// Returns `Ok(None)` when the subnamespace is unknown; `Ok(Some(v))` on
 /// success; `Err(msg)` on failure. The chief-workspace gate is delegated to
 /// each submodule's dispatch so they can surface the same clear error —
-/// except `question.*`, which is deliberately un-gated (any agent may ask).
+/// except `question.*`, which is deliberately chief-un-gated (any TOP-LEVEL
+/// agent may ask; the sub-agent gate lives in the dispatch host, before
+/// this router is reached).
 /// `caller_agent_id` threads the tool-call's agent context to the
 /// caller-aware `agents` methods (`waitFor`) and to `question.ask` (the
 /// turn-attachment registry keys pending questions by agent);
