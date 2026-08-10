@@ -146,8 +146,10 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
         /// Mint and persist a NEW bearer token (replacing the old one) before
-        /// printing, via `server.rotateToken`. Ignored with a stderr note when
-        /// `INTENTD_AUTH_TOKEN` is set (the token is fixed by the env var).
+        /// printing, via `server.rotateToken` — only after the listener is
+        /// confirmed up, so a declined enable prompt never invalidates
+        /// existing tokens. Ignored with a stderr note when the daemon's
+        /// token is fixed by its `INTENTD_AUTH_TOKEN` env var.
         #[arg(long)]
         rotate: bool,
     },
@@ -352,24 +354,19 @@ async fn enable_wss_listener(socket: &Path) -> anyhow::Result<()> {
 /// daemon-side path, so the daemon's in-process token cache and live WSS auth
 /// layer pick up the new token immediately (a direct secrets-file write from
 /// this process would leave the daemon serving the stale cached token until
-/// its cache TTL expires). When `INTENTD_AUTH_TOKEN` fixes the token (in this
-/// process's env or the daemon's), rotation is a no-op with a stderr note and
-/// the fixed token is printed unchanged.
+/// its cache TTL expires). The daemon is the authority on whether rotation is
+/// possible: this process's own `INTENTD_AUTH_TOKEN` is irrelevant (it may
+/// differ from the daemon's environment). When the *daemon's* token is fixed
+/// by `INTENTD_AUTH_TOKEN`, `server.rotateToken` rejects; that becomes a
+/// stderr note and the fixed token is printed unchanged.
 async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
-    const ENV_FIXED_NOTE: &str =
-        "note: INTENTD_AUTH_TOKEN is set; the token is fixed by the env var and cannot be rotated";
-    let env_fixed = std::env::var("INTENTD_AUTH_TOKEN")
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
-    if env_fixed {
-        eprintln!("{ENV_FIXED_NOTE}");
-        return Ok(());
-    }
     let response = rpc_call(socket, "server.rotateToken", json!({})).await?;
     if let Some(error) = response.get("error") {
         let text = rpc_error_text(error);
         if text.contains("INTENTD_AUTH_TOKEN") {
-            eprintln!("{ENV_FIXED_NOTE}");
+            eprintln!(
+                "note: the daemon's token is fixed by the INTENTD_AUTH_TOKEN env var and cannot be rotated"
+            );
             return Ok(());
         }
         anyhow::bail!("cannot rotate the pairing token: {text}");
@@ -382,11 +379,14 @@ async fn rotate_pairing_token(socket: &Path) -> anyhow::Result<()> {
 /// note. Queries `pairing.getInfo` over UDS — so every value comes from the
 /// exact same hosts/fingerprint/token sources the daemon serves via
 /// `server.pairingInfo` — and renders the `intent://pair?…` payload URI as a
-/// QR code in half-height unicode blocks. `rotate` mints a new token first
-/// via [`rotate_pairing_token`]. When external connections (the WSS listener)
-/// are disabled, offers to enable them (prompt, or unattended via `yes`)
-/// through `settings.update` and retries the query. The token is never logged
-/// via `tracing`; all credential lines go to stdout.
+/// QR code in half-height unicode blocks. When external connections (the WSS
+/// listener) are disabled, offers to enable them (prompt, or unattended via
+/// `yes`) through `settings.update` and retries the query. `rotate` mints a
+/// new token via [`rotate_pairing_token`] — only AFTER the listener is
+/// confirmed up (pairing info is obtainable), so a declined enable prompt (or
+/// a non-TTY run without `--yes`) never invalidates existing clients' tokens
+/// while exiting without a usable payload. The token is never logged via
+/// `tracing`; all credential lines go to stdout.
 async fn cmd_pair(
     png: Option<&Path>,
     svg: Option<&Path>,
@@ -394,9 +394,6 @@ async fn cmd_pair(
     rotate: bool,
 ) -> anyhow::Result<()> {
     let config = resolve_config()?;
-    if rotate {
-        rotate_pairing_token(&config.socket_path).await?;
-    }
     let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
     if response.get("error").is_some_and(is_listener_down_error) {
         if !yes && !confirm_enable_wss()? {
@@ -411,6 +408,14 @@ async fn cmd_pair(
     }
     if let Some(error) = response.get("error") {
         anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
+    }
+    if rotate {
+        rotate_pairing_token(&config.socket_path).await?;
+        // Re-fetch so the printed payload embeds the NEW token.
+        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
+        }
     }
     let result = &response["result"];
     let uri = result["uri"]

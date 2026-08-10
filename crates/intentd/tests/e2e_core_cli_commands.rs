@@ -215,6 +215,31 @@ fn labeled_value<'a>(stdout: &'a str, label: &str) -> Option<&'a str> {
         .and_then(|l| l.split_whitespace().nth(1))
 }
 
+/// Read the daemon's stored bearer token straight from the secrets file
+/// (`server.auth.token` account), bypassing the CLI — lets rotation tests
+/// assert the persisted state, not just printed output.
+fn stored_token(data_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(data_dir.join("secrets.json")).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    map.get("server.auth.token")?.as_str().map(str::to_string)
+}
+
+/// Poll until the daemon has persisted a token to the secrets file (it does so
+/// during startup via `get_or_create_token`), bounded by the startup budget.
+async fn await_stored_token(data_dir: &Path) -> String {
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    loop {
+        if let Some(token) = stored_token(data_dir) {
+            break token;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never persisted a token to secrets.json"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let id = Uuid::new_v4().simple().to_string();
@@ -504,15 +529,16 @@ async fn pair_rotate_mints_new_token() {
 }
 
 #[tokio::test]
-async fn pair_rotate_refuses_when_env_var_set() {
+async fn pair_rotate_refuses_when_daemon_token_env_fixed() {
     let id = Uuid::new_v4().simple().to_string();
     let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     let socket = data_dir.join("intentd.sock");
     let token = "abababababababababababababababababababababababababababababababab";
 
-    // Daemon and CLI share a fixed INTENTD_AUTH_TOKEN: rotation is a no-op
-    // with a stderr note, and the env token is printed unchanged.
+    // The DAEMON's token is fixed by INTENTD_AUTH_TOKEN (the CLI's own env is
+    // clean — the daemon is the authority): `server.rotateToken` rejects,
+    // which becomes a stderr note, and the fixed token is printed unchanged.
     let child = spawn_daemon_both(&data_dir, Some(token));
     let mut daemon = Daemon {
         child,
@@ -520,21 +546,7 @@ async fn pair_rotate_refuses_when_env_var_set() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
-    let output = loop {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("pair")
-            .arg("--rotate")
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .env("INTENTD_AUTH_TOKEN", token)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run intentd pair --rotate with env var");
-        if output.status.success() || std::time::Instant::now() >= deadline {
-            break output;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let output = run_pair_until_success(&data_dir, &["--rotate"]).await;
 
     assert!(
         output.status.success(),
@@ -544,14 +556,113 @@ async fn pair_rotate_refuses_when_env_var_set() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("fixed by the env var and cannot be rotated"),
-        "should warn about env var: {stderr}"
+        stderr.contains("fixed by the INTENTD_AUTH_TOKEN env var and cannot be rotated"),
+        "should warn about the daemon's env-fixed token: {stderr}"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!("Token:       {token}")),
         "should still print the fixed token: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rotate_uses_daemon_authority_not_cli_env() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // Regression (PR #1074 review): INTENTD_AUTH_TOKEN set only in the CLI's
+    // env, while the daemon uses its file-backed store. The CLI env must NOT
+    // gate rotation — the daemon is the authority, so rotation MUST happen.
+    let child = spawn_daemon_both(&data_dir, None);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+    let before = await_stored_token(&data_dir).await;
+
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let output = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .arg("--rotate")
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_AUTH_TOKEN", "cli-only-env-token-not-the-daemons")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd pair --rotate with CLI-only env var");
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert!(
+        output.status.success(),
+        "pair --rotate should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cannot be rotated"),
+        "CLI-only env var must not block rotation: {stderr}"
+    );
+
+    let after = stored_token(&data_dir).expect("stored token after rotate");
+    assert_ne!(before, after, "daemon's stored token should have rotated");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Token:       {after}")),
+        "printed token should be the NEW stored token: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // Regression (PR #1074 review): rotation must only happen AFTER the
+    // listener is confirmed up. UDS-only daemon + non-TTY stdin without
+    // --yes: the enable path refuses, the command fails, and the stored
+    // token must be UNCHANGED (no client tokens invalidated without a
+    // usable pairing payload).
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+    let before = await_stored_token(&data_dir).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .arg("--rotate")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair --rotate without listener");
+
+    assert!(
+        !output.status.success(),
+        "pair --rotate must fail when the enable path refuses"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("re-run with --yes"),
+        "should point at --yes: {stderr}"
+    );
+
+    let after = stored_token(&data_dir).expect("stored token after declined run");
+    assert_eq!(
+        before, after,
+        "declined enable must not rotate the stored token"
     );
 }
 

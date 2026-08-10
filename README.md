@@ -302,12 +302,15 @@ over the UDS socket).
 ```bash
 intentd pair                  # QR code + labeled URL/token/fingerprint lines
 intentd pair --png pair.png   # also export the QR code as an image (0600)
-intentd pair --rotate         # mint a NEW bearer token first (invalidates the old one)
+intentd pair --rotate         # mint a NEW bearer token (invalidates the old one)
 ```
 
 `--rotate` rotates the token through the daemon (`server.rotateToken`), so live WSS
-auth picks up the new token immediately; when `INTENTD_AUTH_TOKEN` is set the token is
-fixed by the env var and cannot be rotated (a note is printed to stderr).
+auth picks up the new token immediately. Rotation only happens once the listener is
+confirmed up — declining the enable prompt (or an unattended run without `--yes`)
+never invalidates existing clients' tokens. The daemon is the authority on whether
+rotation is possible: when the daemon's token is fixed by its `INTENTD_AUTH_TOKEN`
+env var it cannot be rotated (a note is printed to stderr).
 
 If external connections (the WSS listener) are disabled, `pair` offers to enable them
 on the spot: it persists `server.wsApi.enabled = true` to `config.toml` via the
