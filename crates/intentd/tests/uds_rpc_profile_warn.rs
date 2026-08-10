@@ -82,9 +82,13 @@ async fn await_socket(socket: &PathBuf) -> bool {
 }
 
 async fn rpc(socket: &PathBuf, method: &str) -> Value {
+    rpc_with_params(socket, method, json!({})).await
+}
+
+async fn rpc_with_params(socket: &PathBuf, method: &str, params: Value) -> Value {
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
-    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let mut line = serde_json::to_string(&frame).unwrap();
     line.push('\n');
     write_half.write_all(line.as_bytes()).await.unwrap();
@@ -185,5 +189,91 @@ async fn default_thresholds_stay_quiet_for_normal_traffic() {
         count_lines(&log, &["intentd::rpc_profile"]),
         0,
         "expected no profiling WARNs, log:\n{log}"
+    );
+}
+
+struct TempRepo(PathBuf);
+
+impl Drop for TempRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create a temporary git repo (initial commit on `main`) carrying the given
+/// `.intent/config.json` contents.
+fn create_repo_with_config(config: &str) -> TempRepo {
+    let repo_path = std::env::temp_dir().join(format!("itdp-repo-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo_path)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test User"]);
+    let intent_dir = repo_path.join(".intent");
+    std::fs::create_dir_all(&intent_dir).expect("mkdir .intent");
+    std::fs::write(intent_dir.join("config.json"), config).expect("write config");
+    std::fs::write(repo_path.join("README.md"), "test").expect("write README");
+    git(&["add", "."]);
+    git(&["commit", "-m", "Initial commit"]);
+    TempRepo(repo_path)
+}
+
+/// Regression test for intent-hq/monorepo#1778: the first `script.list` for a
+/// fresh workspace bootstraps repo-config scripts, and used to persist each
+/// one individually (1 × get_workspace + N × upsert_script), so any repo with
+/// ≥ 25 configured scripts tripped the default statement budget on that first
+/// call. The bootstrap now persists in a single batched upsert, keeping the
+/// dispatch at ~2 statements regardless of how many scripts the config
+/// declares.
+#[tokio::test]
+async fn script_list_bootstrap_stays_within_statement_budget() {
+    // Default thresholds: with 30 configured scripts the pre-fix bootstrap
+    // executed 31 statements — over the default budget of 25.
+    let (_daemon, socket, log_path) = spawn_daemon("itdp-boot", &[]);
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let scripts: Vec<Value> = (0..30)
+        .map(|i| json!({ "name": format!("script-{i}"), "command": format!("echo {i}"), "mode": "command" }))
+        .collect();
+    let repo = create_repo_with_config(&json!({ "scripts": scripts }).to_string());
+
+    let resp = rpc_with_params(
+        &socket,
+        "workspace.create",
+        json!({ "repositoryPath": repo.0.to_str().unwrap() }),
+    )
+    .await;
+    let workspace_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // First script.list triggers the repo-config bootstrap.
+    let resp = rpc_with_params(
+        &socket,
+        "script.list",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    let listed = resp["result"]["scripts"].as_array().expect("scripts array");
+    assert_eq!(listed.len(), 30, "all repo-config scripts seeded");
+
+    // The statement-budget WARN (were it wrongly emitted) lands on stderr
+    // before the response frame is written, so a single read is sufficient.
+    let log = std::fs::read_to_string(&log_path).expect("read daemon log");
+    assert_eq!(
+        count_lines(
+            &log,
+            &["exceeded SQL statement budget", "method=script.list"]
+        ),
+        0,
+        "script.list bootstrap exceeded the statement budget, log:\n{log}"
     );
 }

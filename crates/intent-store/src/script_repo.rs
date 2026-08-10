@@ -44,6 +44,43 @@ impl Store {
         Ok(())
     }
 
+    /// Bulk [`upsert_script`](Self::upsert_script): insert or replace many
+    /// definitions in chunked multi-row statements, so persisting N scripts
+    /// costs O(1) statements instead of N (intent-hq/monorepo#1778 — the
+    /// `script.list` bootstrap used to trip the per-dispatch statement budget
+    /// with one INSERT per repo-config script). Chunked to stay well under
+    /// SQLite's legacy 999-bind-variable limit.
+    pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
+        // 12 bound values per row (SCRIPT_COLUMNS); 80 rows = 960 binds.
+        const ROWS_PER_STATEMENT: usize = 80;
+        for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
+            let placeholders = vec!["(?,?,?,?,?,?,?,?,?,?,?,?)"; chunk.len()].join(",");
+            let sql =
+                format!("INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES {placeholders}");
+            let mut query = sqlx::query(&sql);
+            for s in chunk {
+                query = query
+                    .bind(&s.id)
+                    .bind(&s.workspace_id)
+                    .bind(&s.name)
+                    .bind(&s.command)
+                    .bind(&s.cwd)
+                    .bind(env_to_db(s)?)
+                    .bind(enum_to_db(&s.mode)?)
+                    .bind(&s.category)
+                    .bind(&s.source)
+                    .bind(s.auto_start.map(|b| b as i64))
+                    .bind(&s.created_at)
+                    .bind(&s.updated_at);
+            }
+            query
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("bulk upsert scripts failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Delete a script definition by `id` (FE `removeScript`). Returns whether
     /// a row was actually removed; deleting an unknown id is not an error.
     pub async fn remove_script(&self, id: &str) -> Result<bool> {
