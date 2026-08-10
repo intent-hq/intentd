@@ -11178,6 +11178,96 @@ mod question_hold_gates {
         );
     }
 
+    /// The monorepo#1791 conversion requires the `all` flush mode: without
+    /// batching no combined turn exists to carry the parked entries, so a
+    /// user send under hold stays a DIRECT send (documented bypass) and the
+    /// parked automatic entry stays parked — the pre-fix contract, pinned
+    /// here for the non-default `off` mode.
+    #[tokio::test]
+    async fn user_send_under_hold_stays_direct_when_flush_mode_off() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
+            .expect("disable flush");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-qh-1791-off"),
+            AgentId::from("a-qh-1791-off"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        arm_hold(&mgr, &ws, &id).await;
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "check".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("check send");
+        assert_eq!(
+            r["queued"],
+            json!(false),
+            "no combined turn exists in `off` mode — the direct send stands"
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("direct turn completes");
+        let snapshot = mgr.services.queue_snapshot(&id);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "the automatic entry stays parked under the hold (no batch to ride)"
+        );
+        assert_eq!(snapshot[0]["content"], json!("auto wake"));
+    }
+
     /// `try_drain_queue` refuses to drain while the hold is active, and
     /// drains normally once the questions are dismissed.
     #[tokio::test]

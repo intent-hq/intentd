@@ -3837,14 +3837,19 @@ impl AgentManager {
         // user messages run whole turns past it. Convert the send into a
         // queue-fallback enqueue (user-origin) and kick the drain: the batch
         // flush delivers the older parked entries FIFO in the SAME combined
-        // turn as this user message (a non-batching flush mode drains the
-        // user entry alone, hold contract unchanged). Skipped when nothing
-        // is parked, so the common direct-send path is untouched — and
-        // skipped for a session parked in `Error`, whose documented recovery
-        // IS the direct fresh send (the STAB-52 gate in `try_drain_queue`
-        // would strand a converted entry there).
+        // turn as this user message. Requires the `all` flush mode (the
+        // default): without batching no combined turn exists to carry the
+        // parked entries, so the conversion would only add a queue hop —
+        // under `systemOnly`/`off` the direct send stays as documented (the
+        // hold contract for automatic entries is unchanged either way).
+        // Also skipped when nothing is parked, so the common direct-send
+        // path is untouched — and for a session parked in `Error`, whose
+        // documented recovery IS the direct fresh send (the STAB-52 gate in
+        // `try_drain_queue` would strand a converted entry there).
         if options.origin.is_user()
             && session.status != AgentStatus::Error
+            && self.services.flush_queued_messages_mode()
+                == intent_core::FlushQueuedMessagesMode::All
             && self.services.has_ready_to_send(&agent_id)
             && self.services.question_hold_active(&agent_id).await
         {
@@ -7109,8 +7114,10 @@ async fn run_message_worker(
         // kick `try_drain_queue`.
         let hold_active = mgr.services.question_hold_active(&agent_id).await;
         // Batch flush (`agents.flushQueuedMessages`): same contract as the
-        // `try_drain_queue` flush arm — ≥2 eligible entries (user-origin only
-        // under an active hold) drain into one combined provider turn;
+        // `try_drain_queue` flush arm — ≥2 ready entries drain into one
+        // combined provider turn. Under an active hold the flush fires only
+        // when a user-origin entry is ready, and then carries EVERY ready
+        // entry FIFO (parked automatic wakes included, monorepo#1791);
         // otherwise the single-entry arm below runs unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
@@ -7303,16 +7310,18 @@ async fn run_message_worker(
                 }
             }
             let mut next = raced.pop().expect("raced batch non-empty");
-            // Batch flush (`agents.flushQueuedMessages`): `next` was popped
-            // before the slot re-claim, so fold any FURTHER eligible entries
-            // in behind it and run them as one combined turn. Mode `all`:
-            // any further ready entry (min 1 more ⇒ ≥2 total, user-origin
-            // only under an active hold, matching the other flush arms).
-            // Mode `systemOnly`: only when `next` is ITSELF system-origin
-            // (and no hold is active) — a user-origin `next` never batches
-            // under `systemOnly`, so it falls through to the single-entry
-            // path below unchanged. With no extra entry (or the `off` mode)
-            // the single-entry path below also runs unchanged.
+            // Batch flush (`agents.flushQueuedMessages`): the single `next`
+            // was popped before the slot re-claim, so fold any FURTHER
+            // eligible entries in behind it and run them as one combined
+            // turn. Mode `all`: any further ready entry (min 1 more ⇒ ≥2
+            // total; only the multi-entry hold case was handled atomically
+            // above, so a hold armed SINCE the pop still requires a
+            // user-origin entry — see the arm comment below). Mode
+            // `systemOnly`: only when `next` is ITSELF system-origin (and no
+            // hold is active) — a user-origin `next` never batches under
+            // `systemOnly`, so it falls through to the single-entry path
+            // below unchanged. With no extra entry (or the `off` mode) the
+            // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
             let hold = mgr.services.question_hold_active(&agent_id).await;
             let extra_batch = match mode {
