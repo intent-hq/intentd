@@ -9283,6 +9283,222 @@ async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss()
     );
 }
 
+/// intent-hq/monorepo#1757 regression: a plain `agent.stop` landing on a
+/// zero-output turn must NOT lose the stopped turn's user message. The
+/// provider drops the cancelled prompt on `session/cancel`, so the daemon
+/// arms a prompt-only redelivery payload and the next plain follow-up send
+/// delivers the stopped message's text AND image attachment ahead of its own
+/// content in the SAME `session/prompt` — while the transcript keeps exactly
+/// the two original user rows (no duplicate).
+///
+/// Uses `parkBeforeFirstChunk` (zero output) + a deterministic wait for
+/// phase="prompt" before the stop; the follow-up outbound prompt is asserted
+/// via the fixture's `MOCK_AGENT_PROMPT_LOG` seam (`text` + `blockTypes`).
+#[tokio::test]
+async fn agent_stop_zero_output_redelivers_message_and_image_on_follow_up_over_wss() {
+    let Some(script) = gate("zero-output stop redelivery E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    // parkBeforeFirstChunk parks the FIRST turn with zero assistant output;
+    // the follow-up turn (promptCount 2) responds normally.
+    let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "StopRedeliver", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // First message carries text + an image attachment (the monorepo#1757
+    // repro shape: screenshot + prompt as the workspace's first message).
+    let image_data =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "first with screenshot",
+            "imageBlocks": [
+                { "type": "image", "data": image_data, "mimeType": "image/png" }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Deterministic wait for phase="prompt": the ACP session is established
+    // and the turn is cancellable, but nothing has streamed (the mock parks
+    // before its first chunk — zero output).
+    let mut saw_prompt_phase = false;
+    for _ in 0..50 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:status"
+                && frame["params"]["event"]["data"]["phase"] == "prompt"
+            {
+                saw_prompt_phase = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_prompt_phase, "turn started (phase=prompt) before stop");
+
+    // Plain stop (keep-alive UserStop) with zero output.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": &agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+
+    // Wait for the stopped turn's terminal stream:end before following up.
+    let mut saw_stream_end = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            assert_eq!(
+                frame["params"]["event"]["data"]["stopReason"], "interrupted",
+                "stop stream:end carries stopReason: {frame}"
+            );
+            saw_stream_end = true;
+            break;
+        }
+    }
+    assert!(saw_stream_end, "terminal agent:stream:end emitted on stop");
+
+    // Plain follow-up send (NOT interrupt priority — the monorepo#1757 path).
+    let follow_up = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "sorry just file an issue",
+        }),
+    )
+    .await;
+    assert_eq!(follow_up["success"], true, "follow-up ok: {follow_up}");
+
+    // Outbound-prompt contract: poll the fixture's prompt log until the
+    // follow-up turn's prompt lands. It must carry the stopped message's
+    // text BEFORE the follow-up text, plus the stopped message's image
+    // block (redelivered — the provider dropped the cancelled prompt).
+    let mut follow_up_prompt = None;
+    for _ in 0..50 {
+        if let Ok(log) = std::fs::read_to_string(&prompt_log) {
+            if let Some(p) = log
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .find(|p| {
+                    p["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("sorry just file an issue")
+                })
+            {
+                follow_up_prompt = Some(p);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    let prompt = follow_up_prompt.expect("follow-up turn's prompt reached the mock");
+    let text = prompt["text"].as_str().unwrap_or_default();
+    let stopped_pos = text.find("first with screenshot").unwrap_or_else(|| {
+        panic!("follow-up prompt redelivers the stopped message's text: {text}")
+    });
+    let follow_pos = text
+        .find("sorry just file an issue")
+        .unwrap_or_else(|| panic!("follow-up prompt carries its own content: {text}"));
+    assert!(
+        stopped_pos < follow_pos,
+        "stopped message precedes the follow-up content: {text}"
+    );
+    let block_types: Vec<&str> = prompt["blockTypes"]
+        .as_array()
+        .expect("prompt log carries blockTypes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        block_types.contains(&"image"),
+        "follow-up prompt redelivers the stopped message's image block: {block_types:?}"
+    );
+
+    // Transcript integrity: exactly the two original user rows, in order,
+    // with the first still carrying its image block — redelivery is
+    // wire-only, nothing is re-persisted.
+    let conv = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_rows: Vec<&Value> = messages.iter().filter(|m| m["role"] == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        2,
+        "exactly the two original user rows persist (no duplicate): {conv}"
+    );
+    assert_eq!(
+        user_rows[0]["contentBlocks"][0]["text"], "first with screenshot",
+        "stopped message row intact: {conv}"
+    );
+    assert!(
+        user_rows[0]["contentBlocks"]
+            .as_array()
+            .expect("contentBlocks")
+            .iter()
+            .any(|b| b["type"] == "image"),
+        "stopped message row keeps its image block: {conv}"
+    );
+    assert_eq!(
+        user_rows[1]["contentBlocks"][0]["text"], "sorry just file an issue",
+        "follow-up row intact: {conv}"
+    );
+}
+
 /// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
 /// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
 /// `tool_call` (in_progress); on `session/cancel` it echoes a title-less
