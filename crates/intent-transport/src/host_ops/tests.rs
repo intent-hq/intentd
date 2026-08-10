@@ -61,6 +61,62 @@ fn check_git_unavailable_when_probe_fails_even_if_resolver_finds() {
 }
 
 #[test]
+fn check_node_reports_unavailable_when_not_found() {
+    let v = check_node_with(&StubResolver(None), &StubProbe(None));
+    assert_eq!(v["available"], false);
+    assert!(v.get("version").is_none());
+    assert!(v.get("path").is_none());
+}
+
+#[test]
+fn check_node_reports_available_when_resolver_and_probe_succeed() {
+    let v = check_node_with(
+        &StubResolver(Some(PathBuf::from("/usr/local/bin/node"))),
+        &StubProbe(Some("v24.1.0".to_string())),
+    );
+    assert_eq!(v["available"], true);
+    assert_eq!(v["version"], "v24.1.0");
+    assert_eq!(v["path"], "/usr/local/bin/node");
+}
+
+#[test]
+fn check_node_unavailable_when_probe_fails_even_if_resolver_finds() {
+    let v = check_node_with(
+        &StubResolver(Some(PathBuf::from("/usr/local/bin/node"))),
+        &StubProbe(None),
+    );
+    assert_eq!(v["available"], false);
+}
+
+#[test]
+fn check_gh_reports_unavailable_when_not_found() {
+    let v = check_gh_with(&StubResolver(None), &StubProbe(None));
+    assert_eq!(v["available"], false);
+    assert!(v.get("version").is_none());
+    assert!(v.get("path").is_none());
+}
+
+#[test]
+fn check_gh_reports_available_when_resolver_and_probe_succeed() {
+    let v = check_gh_with(
+        &StubResolver(Some(PathBuf::from("/opt/homebrew/bin/gh"))),
+        &StubProbe(Some("gh version 2.62.0 (2024-11-14)".to_string())),
+    );
+    assert_eq!(v["available"], true);
+    assert_eq!(v["version"], "gh version 2.62.0 (2024-11-14)");
+    assert_eq!(v["path"], "/opt/homebrew/bin/gh");
+}
+
+#[test]
+fn check_gh_unavailable_when_probe_fails_even_if_resolver_finds() {
+    let v = check_gh_with(
+        &StubResolver(Some(PathBuf::from("/opt/homebrew/bin/gh"))),
+        &StubProbe(None),
+    );
+    assert_eq!(v["available"], false);
+}
+
+#[test]
 fn check_auggie_reports_unavailable_when_unresolved() {
     let v = check_auggie_with(None);
     assert_eq!(v["available"], false);

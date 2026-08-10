@@ -53,9 +53,13 @@
 //! 308 total. Version 6.3 adds `debug.sampleStacks` (additive; §5.43,
 //! monorepo#1755): a point-in-time sample of the daemon's own thread stacks
 //! rendered as a human-readable text report — 272 router methods, 309 total.
+//! Version 6.4 adds the `host.checkNode` and `host.checkGh` fast-path methods
+//! (additive; §5.14, monorepo#1891): uncached node/gh detection mirroring
+//! `host.checkGit` (`{ available, version?, path? }`) so a fresh install is
+//! seen immediately — 272 router methods, 311 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.3";
+pub const PROTOCOL_VERSION: &str = "6.4";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
