@@ -181,5 +181,8 @@ async fn handle_get_info_no_tcp_listener_errors() {
         .as_str()
         .unwrap()
         .contains("TCP listener is not running"));
+    // Machine-readable discriminator so `intentd pair` stops matching on
+    // prose (monorepo#1822).
+    assert_eq!(parsed["error"]["data"]["code"], "listener-down");
     let _ = std::fs::remove_dir_all(&tmpdir);
 }

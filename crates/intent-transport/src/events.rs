@@ -165,5 +165,19 @@ pub(crate) fn error_frame(id: Value, code: i32, message: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Serialize a JSON-RPC error response carrying an explicit `error.data`
+/// payload — for fast-path sites that attach a machine-readable
+/// discriminator beyond the centralized `-32602` tagging in [`error_frame`]
+/// (e.g. the pairing listener-down `{ "code": "listener-down" }`,
+/// monorepo#1822).
+pub(crate) fn error_frame_with_data(id: Value, code: i32, message: &str, data: Value) -> String {
+    serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": data }
+    }))
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests;

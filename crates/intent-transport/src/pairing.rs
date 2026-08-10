@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::events::{error_frame, success_frame};
+use crate::events::{error_frame, error_frame_with_data, success_frame};
 use crate::server::{collect_local_ips, ServerPairingInfo};
 use intent_core::{Error, Result};
 
@@ -110,23 +110,26 @@ pub(crate) async fn handle(
     }
     match result {
         Ok(v) => Some(success_frame(req.id_echo, v)),
+        // Listener-down carries the machine-readable discriminator
+        // `error.data.code = "listener-down"` so `intentd pair` auto-enable
+        // stops depending on message prose (monorepo#1822).
+        Err(e @ Error::ListenerDown) => Some(error_frame_with_data(
+            req.id_echo,
+            e.code(),
+            &e.to_string(),
+            json!({ "code": "listener-down" }),
+        )),
         Err(e) => Some(error_frame(req.id_echo, e.code(), &e.to_string())),
     }
 }
 
 /// Build the `pairing.getInfo` result JSON: `{ uri, hosts, port, fingerprint,
 /// token, version }`. Errors clearly when the TCP listener is not running —
-/// there is no port to embed in the payload, so pairing is impossible.
+/// there is no port to embed in the payload, so pairing is impossible
+/// ([`Error::ListenerDown`], surfaced with `error.data.code = "listener-down"`).
 async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
-    let port = snapshot.port.ok_or_else(|| {
-        Error::Unsupported(
-            "TCP listener is not running — ensure the WSS listener is enabled \
-             (server.wsApi.enabled) and started successfully (check daemon logs for bind \
-             errors, e.g. port already in use) before pairing"
-                .to_string(),
-        )
-    })?;
+    let port = snapshot.port.ok_or(Error::ListenerDown)?;
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     let hosts = collect_local_ips();
