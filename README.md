@@ -87,8 +87,9 @@ directly.
 > sitter installer assets (archives, `.deb` packages, the `install.sh` / `install.ps1`
 > scripts, and the archives the Homebrew formula downloads) are all mirrored to the
 > public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
-> repo — the temporary public mirror for release assets until this repo is
-> open-sourced. The formula itself lives in the public `intent-hq/homebrew-tap`.
+> repo — the permanent public distribution channel for release assets (manifests,
+> download URLs, and the Homebrew formula keep pointing at it even after this repo
+> goes public). The formula itself lives in the public `intent-hq/homebrew-tap`.
 
 > **Installing for the Intent desktop app?** You don't need to: desktop releases in
 > [intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases)
@@ -104,8 +105,9 @@ directly.
 
 The daemon expects a few tools on the host it runs on:
 
-- **git** — required. Workspace provisioning and daemon-side fetch/pull/push shell
-  out to the `git` CLI (local status/stage/commit use bundled libgit2).
+- **git** — required. Workspace provisioning and daemon-side fetch (including the
+  fetch step of pull) shell out to the `git` CLI (local status/stage/commit and
+  push use bundled libgit2).
 - **Node.js** (with `npm`/`npx`) — required to run the coding-agent provider CLIs:
   several providers are npm-installed or launched via pinned `npx` packages
   (auggie, claude-code, codex, …).
@@ -288,12 +290,13 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Pairing a remote client (WSS)
 
-`intentd pair` renders the `intent://pair?…` QR code / payload URI a LAN client (the
-Intent desktop or iOS app) scans to connect over the WSS/TLS listener. The payload
-embeds everything a client needs — the machine's LAN IP(s), the WSS port
-(`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients pin
-it), and the bearer token — so the command is local-only (it queries `pairing.getInfo`
-over the UDS socket).
+`intentd pair` renders the `intent://pair?…` QR code / payload URI the Intent iOS app
+scans to connect over the WSS/TLS listener (the desktop app's remote-connection flow
+takes the host, port, and token entered manually instead — `intentd token` prints
+them). The payload embeds everything a client needs — the machine's LAN IP(s), the WSS
+port (`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients
+pin it), and the bearer token — so the command is local-only (it queries
+`pairing.getInfo` over the UDS socket).
 
 ```bash
 intentd pair                  # QR code + payload URI in the terminal
