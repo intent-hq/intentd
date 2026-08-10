@@ -182,7 +182,24 @@ enum Command {
 async fn main() -> ExitCode {
     init_tracing();
     install_panic_hook();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    // Rust starts with SIGPIPE ignored, so `println!` to a pipe whose reader
+    // closed early (`intentd status | head`) gets EPIPE and panics — and the
+    // panic hook logs an ERROR backtrace, making a routine shell pipeline
+    // look like a daemon crash (monorepo#1827). Mark one-shot subcommands so
+    // the panic hook turns that stdio broken-pipe panic into a quiet
+    // SIGPIPE-style exit instead. SIGPIPE itself stays ignored process-wide:
+    // socket writes (`call`/`status`/`stop`/`pair` RPC exchanges, the serving
+    // daemon's clients, the MCP bridge) must keep surfacing EPIPE as plain
+    // errors — e.g. `stop` falls back to SIGTERM/SIGKILL escalation when the
+    // control RPC fails — rather than kill the process mid-write.
+    if !matches!(
+        cli.command,
+        Command::Serve { .. } | Command::McpBridge { .. }
+    ) {
+        ONE_SHOT_CLI.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    match cli.command {
         Command::Serve {
             mode,
             insecure,
@@ -651,6 +668,15 @@ fn init_tracing() {
     }
 }
 
+/// Set for every subcommand except `serve` and `mcp-bridge`: the panic hook
+/// downgrades a stdio broken-pipe panic to a quiet exit for one-shot CLI
+/// invocations only (monorepo#1827).
+static ONE_SHOT_CLI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
+/// code shells report for standard Unix tools whose output pipe closes early.
+const SIGPIPE_EXIT_CODE: i32 = 141;
+
 /// Install a panic hook that logs the panic message and backtrace to the
 /// tracing log. This ensures panic details are written to the rotating log
 /// file (INTENTD_DATA_DIR/intentd.log) for post-mortem diagnosis of unexpected
@@ -674,6 +700,20 @@ fn install_panic_hook() {
         } else {
             "unknown panic payload".to_string()
         };
+
+        // One-shot CLI subcommands piped into an early-closing consumer
+        // (`intentd status | head`) panic inside `std::io::stdio::_print`
+        // with EPIPE because Rust ignores SIGPIPE. Exit quietly like a
+        // SIG_DFL SIGPIPE death instead of logging a scary ERROR backtrace
+        // (monorepo#1827). Matches std's stable stdio panic message
+        // ("failed printing to stdout/stderr: Broken pipe (os error 32)").
+        // Never taken for `serve`/`mcp-bridge` (flag unset).
+        if ONE_SHOT_CLI.load(std::sync::atomic::Ordering::Relaxed)
+            && message.starts_with("failed printing to")
+            && message.contains("Broken pipe")
+        {
+            std::process::exit(SIGPIPE_EXIT_CODE);
+        }
 
         tracing::error!(
             location = %location,
