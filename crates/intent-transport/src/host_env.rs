@@ -46,7 +46,7 @@ pub fn detect_display_server() -> Option<String> {
 
 /// Local OS hostname (`os.hostname()` equivalent), or `intent` on failure.
 pub(crate) fn local_hostname() -> String {
-    whoami::fallible::hostname()
+    whoami::hostname()
         .ok()
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "intent".to_string())

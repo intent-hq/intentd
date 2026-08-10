@@ -472,7 +472,7 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
 
 /// Lowercased OS hostname (`os.hostname()` equivalent), or empty on failure.
 fn local_hostname() -> String {
-    whoami::fallible::hostname()
+    whoami::hostname()
         .map(|h| h.to_lowercase())
         .unwrap_or_default()
 }
