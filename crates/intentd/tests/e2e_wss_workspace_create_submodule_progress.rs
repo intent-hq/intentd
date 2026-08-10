@@ -209,7 +209,10 @@ where
 }
 
 /// Drain `events.event` frames whose `data.progressId` matches, in arrival
-/// order. Stops at the terminal `git:clone:done` or after `secs` of quiet.
+/// order. After the first `git:clone:done`, keeps listening for a short quiet
+/// grace window so a duplicate done (or any stray frame after the terminal
+/// one) is captured and fails the "exactly one done / done is terminal"
+/// assertions instead of going unread. Gives up after `secs` of quiet.
 async fn drain_progress_events<S>(
     ws: &mut WebSocketStream<S>,
     progress_id: &str,
@@ -219,7 +222,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut out: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
+    let mut deadline =
+        tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -241,7 +245,13 @@ where
                         let done = evt["type"] == json!("git:clone:done");
                         out.push(evt.clone());
                         if done {
-                            return out;
+                            // Terminal frame observed: shrink the deadline to
+                            // a short grace window rather than returning, so
+                            // any post-done frame still lands in `out`.
+                            deadline = deadline.min(
+                                tokio::time::Instant::now()
+                                    + common::test_timeout(Duration::from_secs(2)),
+                            );
                         }
                     }
                 }
