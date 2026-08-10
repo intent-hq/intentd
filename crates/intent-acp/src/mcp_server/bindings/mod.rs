@@ -127,18 +127,22 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
 /// bindings that register attachments mid-dispatch (`ws.app.question.ask`);
 /// `None` keeps those bindings inert (FE front door, tests).
 /// `features` threads the caller's effective `[agentFeatures]` so `ws.help`
-/// renders the same gated docs its tool description advertises.
+/// renders the same gated docs its tool description advertises;
+/// `is_sub_agent` lets the help error path attribute `app.question` pruning
+/// to the top-level-only rule instead of a settings toggle.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     caller_agent_id: &Option<AgentId>,
     turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
     features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
     method: &str,
     args: &Value,
 ) -> Result<Option<Value>, String> {
     if let Some(rest) = method.strip_prefix("help.") {
-        return help::dispatch(workspace_id, features, rest, args).map(Some);
+        return help::dispatch(workspace_id, features, is_sub_agent, rest, args).map(Some);
     }
     if let Some(rest) = method.strip_prefix("workspace.") {
         return workspace::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)

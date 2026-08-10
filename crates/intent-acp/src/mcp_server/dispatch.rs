@@ -499,6 +499,7 @@ async fn workspace_host_dispatch(
         &caller_agent_id,
         turn_attachments.as_ref(),
         agent_features,
+        is_sub_agent,
         method,
         &args,
     )

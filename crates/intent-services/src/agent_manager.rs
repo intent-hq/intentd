@@ -1471,7 +1471,11 @@ impl AgentManager {
         // Sub-agent gating: delegated children (`parent_agent_id` set) and
         // background workers (`is_background`) — the same derivation the
         // prompt assembly uses. Captured once here, at bridge creation:
-        // parentage never changes for a live session.
+        // parentage never changes for a live session, and while
+        // `is_background` can flip at runtime via `agent.update`, the bridge
+        // keeps its spawn-time surface until the next respawn re-derives the
+        // flag (same snapshot semantics as the `[agentFeatures]` capture
+        // below).
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
 
         // Per-agent in-process MCP server over the SAME services surface the FE
