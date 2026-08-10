@@ -3881,6 +3881,255 @@ async fn stop_with_empty_live_turn_persists_empty_interrupted_row() {
     );
 }
 
+/// Regression for intent-hq/monorepo#1757: a plain `agent.stop` (keep-alive
+/// `UserStop` interrupt) landing on a ZERO-output turn drops the turn's user
+/// message provider-side (`session/cancel` discards the in-flight prompt),
+/// so the NEXT plain follow-up send must redeliver the stopped message's
+/// text AND attachments ahead of the follow-up content in ONE
+/// `session/prompt` — same combined-delivery semantics as the
+/// interrupt-priority preemption path (monorepo#1014). The transcript is
+/// untouched (prompt-only redelivery, no duplicate user rows).
+#[tokio::test]
+async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachments() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-redeliver"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-stop-redeliver")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    // The in-flight turn's user message (text + image attachment) is already
+    // persisted; the live-turn slot is open with ZERO streamed blocks.
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .set_live_turn(&id, "msg-stop-redeliver", Vec::new());
+
+    assert!(
+        mgr.interrupt(&id).await,
+        "keep-alive stop finds the live agent"
+    );
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the keep-alive stop"
+    );
+
+    // Plain follow-up send (NOT interrupt-priority — the agent is idle now).
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+
+    // The follow-up turn's `session/prompt` carries the stopped message's
+    // text ahead of the follow-up text, plus its image attachment.
+    let mut prompt_params = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                prompt_params = Some(params.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let params = prompt_params.expect("session/prompt sent for the follow-up turn");
+    let blocks = params["prompt"].as_array().expect("prompt blocks");
+    let prompt_text = blocks
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first_pos = prompt_text
+        .find("first with screenshot")
+        .expect("follow-up prompt redelivers the stopped message's text");
+    let follow_pos = prompt_text
+        .find("follow-up")
+        .expect("follow-up prompt carries its own content");
+    assert!(
+        first_pos < follow_pos,
+        "stopped message precedes the follow-up: {prompt_text:?}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+        "follow-up prompt redelivers the stopped message's image attachment: {blocks:?}"
+    );
+
+    // Prompt-only redelivery: the transcript keeps exactly the two user rows
+    // (stopped message + follow-up) — nothing re-appended.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        2,
+        "no duplicate user rows appended: {messages:?}"
+    );
+}
+
+/// Companion gate: a `agent.stop` landing on a turn that already STREAMED
+/// output must NOT redeliver the stopped message on the follow-up turn — the
+/// provider saw the message (it produced output for it), so redelivery would
+/// duplicate context and risk re-running side effects.
+#[tokio::test]
+async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-progress"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-stop-progress")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "first with screenshot" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // The turn streamed a block before the stop → the provider received and
+    // acted on the message.
+    mgr.services.set_live_turn(
+        &id,
+        "msg-stop-progress",
+        vec![json!({ "type": "text", "id": "msg-stop-progress:0", "text": "partial…" })],
+    );
+
+    assert!(
+        mgr.interrupt(&id).await,
+        "keep-alive stop finds the live agent"
+    );
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+
+    let mut prompt_text = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                let text = params["prompt"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == json!("text"))
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompt_text = Some(text);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let prompt_text = prompt_text.expect("session/prompt sent for the follow-up turn");
+    assert!(
+        !prompt_text.contains("first with screenshot"),
+        "a progressed (output-producing) stopped turn is NOT redelivered: {prompt_text:?}"
+    );
+    assert!(prompt_text.contains("follow-up"));
+}
+
+/// Spawn-window fallback: a user stop landing with no `acpSessionId` yet
+/// falls back to the hard kill path — the redelivery payload must still be
+/// armed (post-`stop`, which clears stale per-agent flags) so the next turn
+/// redelivers the stopped message's text + attachments.
+#[tokio::test]
+async fn stop_fallback_kill_path_arms_redelivery_for_next_turn() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-fb"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    // NO acpSessionId → `interrupt` falls back to the kill path.
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.set_live_turn(&id, "msg-stop-fb", Vec::new());
+
+    assert!(mgr.interrupt(&id).await, "fallback stop finds the agent");
+
+    let armed = mgr.stop_redelivery.lock().unwrap().get(&id).cloned();
+    let armed = armed.expect("zero-output fallback stop arms the redelivery payload");
+    assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    assert_eq!(
+        armed.image_blocks,
+        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+    );
+    assert!(armed.file_blocks.is_none());
+}
+
 /// Shutdown-capture companion: a graceful daemon shutdown landing while the
 /// live-turn slot is open but EMPTY persists the empty interrupted row
 /// stamped `daemon_shutdown` (every interruption leaves a marker row).
