@@ -4088,6 +4088,34 @@ async fn wss_host_status_override_forces_local() {
 }
 
 #[tokio::test]
+async fn wss_host_check_node_and_check_gh_answered_on_wss() {
+    // host.checkNode / host.checkGh (§5.14, protocol 6.4) ride the same
+    // cross-transport host.* fast-path as host.checkGit: always answered on
+    // WSS with `{ available: false }` or `{ available: true, version, path }`
+    // — never an RPC error.
+    let srv = start(WsOptions::default()).await;
+    for (id, frame) in [
+        (7, r#"{"jsonrpc":"2.0","id":7,"method":"host.checkNode"}"#),
+        (8, r#"{"jsonrpc":"2.0","id":8,"method":"host.checkGh"}"#),
+    ] {
+        let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+        assert_eq!(resp["id"], id);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert!(resp.get("error").is_none(), "never an RPC error");
+        let r = &resp["result"];
+        assert!(r["available"].is_boolean(), "available is always present");
+        if r["available"] == true {
+            assert!(r["version"].is_string());
+            assert!(r["path"].is_string());
+        } else {
+            assert!(r.get("version").is_none());
+            assert!(r.get("path").is_none());
+        }
+    }
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn bind_fails_fast_on_occupied_port() {
     // Fixed-port fail-fast (§5.6): a busy configured port must surface the OS
     // bind error immediately — no port walking, no retry. Occupy the port for
