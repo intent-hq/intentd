@@ -20,6 +20,35 @@ You can open local files directly using file:// URLs:
 }
 ```
 
+## Cleaning Up Tabs
+
+Close tabs you opened for testing/automation when you are done with them. `closeTab`
+requires an explicit `tabId` (discover it via `listTabs`) — it never falls back to the
+sequence-level default `tabId`.
+
+```json
+// Open a tab, find its id, work with it, then close it
+{
+  "actions": [
+    { "action": "openTab", "url": "http://localhost:5173" }
+  ]
+}
+
+{
+  "actions": [
+    { "action": "listTabs" }
+  ]
+}
+// Returns tabs with their ids, e.g. { tabId: "tab-abc123", url: "http://localhost:5173", ... }
+
+{
+  "actions": [
+    { "action": "getAccessibilityTree", "tabId": "tab-abc123" },
+    { "action": "closeTab", "tabId": "tab-abc123" }
+  ]
+}
+```
+
 ## Debugging a Page Load
 
 ```json

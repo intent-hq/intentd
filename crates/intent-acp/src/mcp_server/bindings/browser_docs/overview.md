@@ -26,6 +26,8 @@ Actions are executed as a sequence of declarative operations.
 ## UI Control
 - `{ action: "openTab", url, position? }` - Open a new browser tab in the UI
   - position: 'adjacent' (default), 'replace', or 'same'
+- `{ action: "closeTab", tabId }` - Close a browser tab
+  - tabId is REQUIRED; it does not fall back to the sequence-level default tabId
 
 ## Supported Protocols
 The embedded browser supports http://, https://, and file:// URLs.

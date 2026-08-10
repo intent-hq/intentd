@@ -30,7 +30,7 @@ time.workspace = true
 getrandom = "0.4"
 subtle = "2"
 hex = "0.4"
-whoami = "1"
+whoami = "2"
 base64.workspace = true
 
 [dev-dependencies]

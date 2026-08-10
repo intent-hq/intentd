@@ -219,6 +219,16 @@ intentd sitter channel beta --redownload && intentd restart   # switch and activ
   it on the currently installed version and channel pin. Unix only — on Windows,
   restart the service instead. With no running supervised `serve`, it exits non-zero
   with guidance to start the service first.
+- **`intentd update`** forces an update check on the effective channel right now,
+  instead of waiting for the periodic serve-mode check. When a newer version is
+  available it downloads and installs it (newer-only — never a downgrade), then
+  restarts a running supervised daemon via the same SIGHUP path as `intentd restart`
+  so the new version takes effect immediately (with no running service, the new
+  binary simply takes effect on the next start; on Windows the install still
+  happens — restart the service to activate it). `intentd update --check` is the
+  dry-run form: it reports the installed and latest versions without downloading or
+  installing anything. Exit 0 means the check succeeded, whether or not an update
+  is available — parse stdout to tell the two apart.
 
 Per-launch overrides still work and take precedence over the pin — pass
 `--sitter-channel beta` or set `INTENTD_CHANNEL=beta`:
@@ -231,8 +241,8 @@ Effective-channel precedence: `--sitter-channel` flag > `INTENTD_CHANNEL` env >
 `sitter/config.toml` > stable default. A flag/env selection stays pinned for that
 process's lifetime (its periodic checks do not re-read the config file).
 
-`--sitter-*` flags and the intercepted `sitter` / `restart` commands belong to the
-sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
+`--sitter-*` flags and the intercepted `sitter` / `restart` / `update` commands belong
+to the sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
 `--version`) goes to the daemon verbatim. A leading `--` forwards even those
 literally (`intentd -- restart` sends `restart` to the daemon).
 
@@ -251,6 +261,9 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
+- `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
+  no restart required; `intentd update --check` reports what would happen without
+  installing (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
   installed yet, they fail fast with guidance to start it first (`intentd serve` or
@@ -290,25 +303,34 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 ### Pairing a remote client (WSS)
 
-`intentd pair` renders the `intent://pair?…` QR code / payload URI the Intent iOS app
-scans to connect over the WSS/TLS listener (the desktop app's remote-connection flow
-takes the host, port, and token entered manually instead — `intentd token` prints
-them). The payload embeds everything a client needs — the machine's LAN IP(s), the WSS
-port (`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients
-pin it), and the bearer token — so the command is local-only (it queries
-`pairing.getInfo` over the UDS socket).
+`intentd pair` prints everything a client needs to pair with this machine over the
+WSS/TLS listener: the `intent://pair?…` QR code the Intent iOS app scans, followed by
+labeled URL, bearer token, and TLS certificate fingerprint lines (each with a short
+usage note — the token and fingerprint are what the desktop app's remote-connection
+flow takes manually). The payload embeds the machine's LAN IP(s), the WSS port
+(`server.wsApi.port`, default **5181**), the TLS certificate fingerprint (clients pin
+it), and the bearer token — so the command is local-only (it queries `pairing.getInfo`
+over the UDS socket).
 
 ```bash
-intentd pair                  # QR code + payload URI in the terminal
+intentd pair                  # QR code + labeled URL/token/fingerprint lines
 intentd pair --png pair.png   # also export the QR code as an image (0600)
+intentd pair --rotate         # mint a NEW bearer token (invalidates the old one)
 ```
 
-If the WSS listener is not running, `pair` offers to enable it on the spot: it persists
-`server.wsApi.enabled = true` to `config.toml` via the daemon's `settings.update`
-pipeline (the same path the settings UI uses), which also starts the listener
-immediately — no restart needed. Interactively this is a `[Y/n]` prompt; unattended
-runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the command fails with
-guidance. `intentd token` prints the same credentials in plaintext.
+`--rotate` rotates the token through the daemon (`server.rotateToken`), so live WSS
+auth picks up the new token immediately. Rotation only happens once the listener is
+confirmed up — declining the enable prompt (or an unattended run without `--yes`)
+never invalidates existing clients' tokens. The daemon is the authority on whether
+rotation is possible: when the daemon's token is fixed by its `INTENTD_AUTH_TOKEN`
+env var it cannot be rotated (a note is printed to stderr).
+
+If external connections (the WSS listener) are disabled, `pair` offers to enable them
+on the spot: it persists `server.wsApi.enabled = true` to `config.toml` via the
+daemon's `settings.update` pipeline (the same path the settings UI uses), which also
+starts the listener immediately — no restart needed. Interactively this is a `[Y/n]`
+prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
+command fails with guidance.
 
 ## Current status
 
