@@ -492,6 +492,118 @@ fn empty_base_url_list_is_a_soft_error() {
     );
 }
 
+/// Serve a release for `version` whose archive download triggers
+/// `on_archive_request` (once, before the response bytes are sent) — used to
+/// interleave a concurrent install mid-download deterministically.
+fn serve_release_with_archive_hook(
+    version: &str,
+    bin_contents: &[u8],
+    on_archive_request: impl FnOnce() + Send + 'static,
+) -> String {
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let archive = make_tar_xz(bin_contents);
+    let sha = sha256_hex(&archive);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let manifest = manifest_json(version, &base_url, &asset, &sha);
+    let archive_path = format!("/{asset}");
+
+    let hook = std::sync::Mutex::new(Some(on_archive_request));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+                    _ => break,
+                }
+            }
+            let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+            let (status, body) = if path == "/channel-stable/stable.json" {
+                ("200 OK", manifest.clone())
+            } else if path == archive_path {
+                if let Some(hook) = hook.lock().unwrap().take() {
+                    hook();
+                }
+                ("200 OK", archive.clone())
+            } else {
+                ("404 Not Found", b"not found".to_vec())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    base_url
+}
+
+#[test]
+fn losing_an_install_race_keeps_the_concurrent_winners_state() {
+    // A concurrent updater (the serve-mode sitter's periodic check) installs
+    // 0.3.0 while this check_and_install of 0.2.0 is mid-download: the state
+    // write must yield to the newer winner instead of activating a downgrade.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "0.1.0", Channel::Stable);
+
+    let winner_paths = paths.clone();
+    let base_url = serve_release_with_archive_hook("0.2.0", b"slow daemon 0.2.0", move || {
+        preinstall(&winner_paths, "0.3.0", Channel::Stable);
+    });
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::AlreadyCurrent {
+            version: "0.3.0".to_string()
+        },
+        "the older invocation must lose the race, not overwrite the winner"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.3.0"),
+        "state.json must keep the concurrent winner's version"
+    );
+}
+
+#[test]
+fn force_install_still_overwrites_a_concurrent_newer_install() {
+    // force_install is the explicit downgrade path (`sitter channel
+    // <value> --redownload`): the race guard must not apply to it.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "0.1.0", Channel::Stable);
+
+    let winner_paths = paths.clone();
+    let base_url = serve_release_with_archive_hook("0.2.0", b"forced daemon 0.2.0", move || {
+        preinstall(&winner_paths, "0.3.0", Channel::Stable);
+    });
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let outcome = updater.force_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::Installed {
+            version: "0.2.0".to_string(),
+            previous: Some("0.3.0".to_string()),
+        }
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+}
+
 #[test]
 fn with_base_url_means_exactly_one_base_and_never_falls_back() {
     let dir = tempfile::tempdir().unwrap();

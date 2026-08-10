@@ -219,6 +219,16 @@ intentd sitter channel beta --redownload && intentd restart   # switch and activ
   it on the currently installed version and channel pin. Unix only — on Windows,
   restart the service instead. With no running supervised `serve`, it exits non-zero
   with guidance to start the service first.
+- **`intentd update`** forces an update check on the effective channel right now,
+  instead of waiting for the periodic serve-mode check. When a newer version is
+  available it downloads and installs it (newer-only — never a downgrade), then
+  restarts a running supervised daemon via the same SIGHUP path as `intentd restart`
+  so the new version takes effect immediately (with no running service, the new
+  binary simply takes effect on the next start; on Windows the install still
+  happens — restart the service to activate it). `intentd update --check` is the
+  dry-run form: it reports the installed and latest versions without downloading or
+  installing anything. Exit 0 means the check succeeded, whether or not an update
+  is available — parse stdout to tell the two apart.
 
 Per-launch overrides still work and take precedence over the pin — pass
 `--sitter-channel beta` or set `INTENTD_CHANNEL=beta`:
@@ -231,8 +241,8 @@ Effective-channel precedence: `--sitter-channel` flag > `INTENTD_CHANNEL` env >
 `sitter/config.toml` > stable default. A flag/env selection stays pinned for that
 process's lifetime (its periodic checks do not re-read the config file).
 
-`--sitter-*` flags and the intercepted `sitter` / `restart` commands belong to the
-sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
+`--sitter-*` flags and the intercepted `sitter` / `restart` / `update` commands belong
+to the sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
 `--version`) goes to the daemon verbatim. A leading `--` forwards even those
 literally (`intentd -- restart` sends `restart` to the daemon).
 
@@ -251,6 +261,9 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
+- `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
+  no restart required; `intentd update --check` reports what would happen without
+  installing (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
   installed yet, they fail fast with guidance to start it first (`intentd serve` or
