@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5] - 2026-08-10
+
+### 🚀 Features
+
+- Add uncached host.checkNode and host.checkGh fast-path methods ([#1064](https://github.com/intent-hq/intentd/pull/1064))
+- ProgressId plumbing + unified provisioning progress for workspace.create ([#1062](https://github.com/intent-hq/intentd/pull/1062))
+- Gate ws.app.question.ask to top-level agents ([#1063](https://github.com/intent-hq/intentd/pull/1063))
+- Make workspace.create setupScript param execute-only (no config write) ([#1066](https://github.com/intent-hq/intentd/pull/1066))
+
+### 🐛 Bug Fixes
+
+- Redeliver a zero-output stopped turn's user message on the next turn ([#1058](https://github.com/intent-hq/intentd/pull/1058))
+- Drain parked automatic queue entries FIFO with user deliveries under a question hold ([#1059](https://github.com/intent-hq/intentd/pull/1059))
+
+
 ## [0.6.4] - 2026-08-10
 
 ### 🚀 Features
