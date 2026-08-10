@@ -54,10 +54,20 @@ fn temp_data_dir() -> PathBuf {
 }
 
 fn spawn_serve(data_dir: &Path) -> Child {
+    common::enable_ws_api(data_dir);
+    spawn_serve_inner(data_dir)
+}
+
+/// Spawn without enabling the WSS listener — the daemon serves UDS only, so
+/// `pairing.getInfo` fails with the listener-down error.
+fn spawn_serve_wss_disabled(data_dir: &Path) -> Child {
+    spawn_serve_inner(data_dir)
+}
+
+fn spawn_serve_inner(data_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    common::enable_ws_api(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
         .env("INTENTD_DATA_DIR", data_dir)
@@ -311,6 +321,33 @@ async fn pairing_get_info_over_uds() {
         hosts.join(",")
     );
     assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_get_info_listener_down_over_uds() {
+    let data_dir = temp_data_dir();
+    let mut daemon = Daemon {
+        child: spawn_serve_wss_disabled(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // With the WSS listener disabled, pairing.getInfo over UDS fails with
+    // the listener-down error carrying the machine-readable discriminator
+    // `error.data.code = "listener-down"` (monorepo#1822) — the wire shape
+    // `intentd pair` keys its auto-enable flow on.
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let error = &response["error"];
+
+    assert_eq!(error["code"].as_i64().unwrap(), -32603);
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("TCP listener is not running"));
+    assert_eq!(error["data"]["code"].as_str().unwrap(), "listener-down");
 
     daemon.child.kill().ok();
 }
