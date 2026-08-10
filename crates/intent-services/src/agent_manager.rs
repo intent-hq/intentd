@@ -33,6 +33,7 @@ use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
     now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
     BoxFuture, Error, EventActor, Result, UsageCost, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_providers::{InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -3232,6 +3233,14 @@ impl AgentManager {
                 // (omitted when the agent owns no active monitor).
                 self.services
                     .annotate_waiting_on_pr_monitors(agent_id, &mut data)
+                    .await;
+                // Archived-workspace suppression hint: same
+                // `workspaceArchived` stamp as the settlement idle (omitted
+                // when the workspace is not archived). `workspace.archive`
+                // persists `Archived` BEFORE its interrupt sweep, so this is
+                // exactly the idle that fires in a just-archived workspace.
+                self.services
+                    .annotate_workspace_archived(&workspace_id, &mut data)
                     .await;
                 self.services
                     .publish_agent_event(
@@ -7469,18 +7478,36 @@ async fn run_message_worker(
 /// completion is its parent/coordinator's attention surface, not the
 /// user's. Same sub-agent definition as the attention-clear gate above and
 /// rules.rs. `NotFound` means the agent was deleted while its drain
-/// finished — nothing to surface, skip. FAIL OPEN on any other store error
-/// (raise anyway): a missed blue dot for a real top-level turn is worse
-/// than a spurious one on a rare store fault.
+/// finished — nothing to surface, skip. Archived workspaces additionally
+/// stay quiet: a turn finishing in a workspace whose status is `Archived`
+/// skips the raise (the user parked the workspace; unarchiving restores
+/// normal behavior — no persisted suppression state). FAIL OPEN on any
+/// other store error, on either the session or the workspace read (raise
+/// anyway): a missed blue dot for a real top-level turn is worse than a
+/// spurious one on a rare store fault.
 pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: &AgentId) -> bool {
-    match services.store.get_agent_session_summary(agent_id).await {
-        Ok(s) => s.parent_agent_id.is_none() && !s.is_background,
-        Err(Error::NotFound(_)) => false,
+    let session = match services.store.get_agent_session_summary(agent_id).await {
+        Ok(s) => s,
+        Err(Error::NotFound(_)) => return false,
         Err(e) => {
             tracing::warn!(
                 agent = %agent_id,
                 error = %e,
                 "turn-end unread gate: session lookup failed; raising anyway"
+            );
+            return true;
+        }
+    };
+    if session.parent_agent_id.is_some() || session.is_background {
+        return false;
+    }
+    match services.store.get_workspace(&session.workspace_id).await {
+        Ok(ws) => ws.status != WorkspaceStatus::Archived,
+        Err(e) => {
+            tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "turn-end unread gate: workspace lookup failed; raising anyway"
             );
             true
         }
