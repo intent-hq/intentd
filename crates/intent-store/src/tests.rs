@@ -4696,11 +4696,11 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
     store.upsert_scripts(&[]).await.expect("empty upsert");
     assert!(store.list_all_scripts().await.expect("list").is_empty());
 
-    // 100 scripts cross the 80-rows-per-statement chunk boundary; every
+    // 2100 scripts cross the 2048-rows-per-statement chunk boundary; every
     // field round-trips, including the JSON env map and sparse optionals.
     let mut env = std::collections::BTreeMap::new();
     env.insert("PORT".to_string(), "3000".to_string());
-    let scripts: Vec<intent_core::Script> = (0..100)
+    let scripts: Vec<intent_core::Script> = (0..2100)
         .map(|i| intent_core::Script {
             id: format!("s-{i}"),
             workspace_id: "ws-1".to_string(),
@@ -4718,7 +4718,7 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
         .collect();
     store.upsert_scripts(&scripts).await.expect("bulk insert");
     let listed = store.list_all_scripts().await.expect("list");
-    assert_eq!(listed.len(), 100);
+    assert_eq!(listed.len(), 2100);
     for script in &scripts {
         assert!(listed.contains(script), "missing {}", script.id);
     }
@@ -4730,7 +4730,7 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
     }
     store.upsert_scripts(&renamed).await.expect("bulk replace");
     let listed = store.list_all_scripts().await.expect("list");
-    assert_eq!(listed.len(), 100);
+    assert_eq!(listed.len(), 2100);
     for script in &renamed {
         assert!(listed.contains(script), "missing replaced {}", script.id);
     }

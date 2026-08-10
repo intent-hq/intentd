@@ -229,9 +229,9 @@ fn create_repo_with_config(config: &str) -> TempRepo {
 /// fresh workspace bootstraps repo-config scripts, and used to persist each
 /// one individually (1 × get_workspace + N × upsert_script), so any repo with
 /// ≥ 25 configured scripts tripped the default statement budget on that first
-/// call. The bootstrap now persists in a single batched upsert, keeping the
-/// dispatch at ~2 statements regardless of how many scripts the config
-/// declares.
+/// call. The bootstrap now persists in chunked batched upserts (2048 rows per
+/// statement), keeping the dispatch at ~2 statements for any plausible config
+/// size.
 #[tokio::test]
 async fn script_list_bootstrap_stays_within_statement_budget() {
     // Default thresholds: with 30 configured scripts the pre-fix bootstrap

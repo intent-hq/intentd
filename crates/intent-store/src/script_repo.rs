@@ -48,11 +48,13 @@ impl Store {
     /// definitions in chunked multi-row statements, so persisting N scripts
     /// costs O(1) statements instead of N (intent-hq/monorepo#1778 — the
     /// `script.list` bootstrap used to trip the per-dispatch statement budget
-    /// with one INSERT per repo-config script). Chunked to stay well under
-    /// SQLite's legacy 999-bind-variable limit.
+    /// with one INSERT per repo-config script). Chunked to stay under the
+    /// bundled SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32766 since 3.32).
     pub async fn upsert_scripts(&self, scripts: &[Script]) -> Result<()> {
-        // 12 bound values per row (SCRIPT_COLUMNS); 80 rows = 960 binds.
-        const ROWS_PER_STATEMENT: usize = 80;
+        // 12 bound values per row (SCRIPT_COLUMNS); 2048 rows = 24576 binds,
+        // well under the 32766 cap. One chunk covers any plausible repo
+        // config, so the caller's statement count stays flat.
+        const ROWS_PER_STATEMENT: usize = 2048;
         for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
             let placeholders = vec!["(?,?,?,?,?,?,?,?,?,?,?,?)"; chunk.len()].join(",");
             let sql =
