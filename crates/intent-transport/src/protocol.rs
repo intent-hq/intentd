@@ -50,10 +50,12 @@
 //! event category — 270 router methods, 307 total. Version 6.2 adds
 //! `github.branches.listCached` (additive; §5.27): branch names read from
 //! the daemon's local repo cache with no network I/O — 271 router methods,
-//! 308 total.
+//! 308 total. Version 6.3 adds `debug.sampleStacks` (additive; §5.43,
+//! monorepo#1755): a point-in-time sample of the daemon's own thread stacks
+//! rendered as a human-readable text report — 272 router methods, 309 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.2";
+pub const PROTOCOL_VERSION: &str = "6.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
