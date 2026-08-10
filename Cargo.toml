@@ -22,7 +22,7 @@ base64 = "0.23"
 # `unstable_end_turn_token_usage` surfaces the optional end-of-turn `usage`
 # snapshot on `PromptResponse` (cumulative-per-session token counts).
 agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage"] }
-octocrab = "0.53"
+octocrab = "0.54"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 git2 = { version = "0.21", features = ["https", "ssh"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
