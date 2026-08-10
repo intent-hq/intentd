@@ -135,14 +135,15 @@ impl CreateProgress {
 
     /// Emit a clone stderr frame, mapped through the per-phase weights into
     /// the unified scale's clone segment (`0..=`[`CLONE_SEGMENT_END`]).
-    /// The clone's own terminal `complete` frame is re-labeled `checkout` —
-    /// on the unified scale the clone finishing (85%) is not "complete";
-    /// only the create's own terminal frame carries `complete 100`.
+    /// The clone's own terminal `complete` frame is re-labeled `checkout`
+    /// (message rephrased to match) — on the unified scale the clone
+    /// finishing (85%) is not "complete"; only the create's own terminal
+    /// frame carries `complete 100`.
     pub(crate) async fn clone_progress(&self, phase: &str, percent: u32, message: &str) {
-        let unified_phase = if phase == "complete" {
-            "checkout"
+        let (unified_phase, message) = if phase == "complete" {
+            ("checkout", "Repository cloned")
         } else {
-            phase
+            (phase, message)
         };
         self.milestone(
             unified_phase,

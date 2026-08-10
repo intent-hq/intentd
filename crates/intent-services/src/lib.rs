@@ -10169,6 +10169,19 @@ impl WorkspaceApi for Services {
                 std::sync::Mutex<Option<std::sync::Arc<create_progress::CreateProgress>>>,
             > = std::sync::Arc::new(std::sync::Mutex::new(None));
             let progress_slot_op = progress_slot.clone();
+            // Kept at the wrapper so a failure BEFORE the closure arms the
+            // slot (idempotency-store read/decode error, or an early config
+            // error inside the closure such as an invalid
+            // `workspace.worktreesLocation`) still gets its terminal
+            // `ok:false` done below — no workspace id exists yet on those
+            // paths, so that frame publishes under the empty sentinel id.
+            let wrapper_progress_id = input
+                .progress_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let wrapper_bus = bus.clone();
             let result = with_idempotency(
                 &store,
                 "",
@@ -10202,29 +10215,11 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
-                    let workspaces_root = match resolve_workspaces_parent(
+                    let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
                         &worktrees_location,
-                    ) {
-                        Ok(root) => root,
-                        Err(e) => {
-                            // The terminal-done contract holds even for this
-                            // pre-derivation config failure: no workspace id
-                            // exists yet, so the wrapper's `ok:false` frame
-                            // publishes under the empty sentinel id (same as
-                            // workspace-adjacent clones).
-                            if let (Some(pid), Some(b)) = (progress_id.clone(), bus.clone()) {
-                                *progress_slot_op.lock().unwrap() =
-                                    Some(std::sync::Arc::new(create_progress::CreateProgress::new(
-                                        b,
-                                        WorkspaceId::from_string(String::new()),
-                                        pid,
-                                    )));
-                            }
-                            return Err(e);
-                        }
-                    };
+                    )?;
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
                     // random adjective-animal pair; uniquified with a `-N`
@@ -11819,9 +11814,24 @@ impl WorkspaceApi for Services {
             // here — `ok:true` after any successful create, `ok:false`
             // carrying the sanitized detail (+ machine-readable category for
             // classified clone failures) on any error, in every checkout
-            // mode. The slot stays empty on idempotent replays and
-            // `progressId`-less requests, so nothing is emitted for those.
-            let reporter = progress_slot.lock().unwrap().take();
+            // mode. The slot stays empty on idempotent replays (the closure
+            // never runs; nothing is emitted — the cached success result is
+            // the answer) and on `progressId`-less requests. A FAILURE that
+            // never armed the slot (idempotency-store read/decode error, or
+            // an early config error such as an invalid
+            // `workspace.worktreesLocation`) synthesizes a sentinel-scoped
+            // reporter so a `progressId` create's error path always closes
+            // the stream with its `ok:false` done.
+            let mut reporter = progress_slot.lock().unwrap().take();
+            if reporter.is_none() && result.is_err() {
+                if let (Some(pid), Some(b)) = (&wrapper_progress_id, &wrapper_bus) {
+                    reporter = Some(std::sync::Arc::new(create_progress::CreateProgress::new(
+                        b.clone(),
+                        WorkspaceId::from_string(String::new()),
+                        pid.clone(),
+                    )));
+                }
+            }
             if let Some(reporter) = reporter {
                 match &result {
                     Ok(_) => reporter.done_ok().await,

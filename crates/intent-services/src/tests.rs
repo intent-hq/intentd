@@ -20457,6 +20457,116 @@ mod clone_orchestration {
         );
     }
 
+    /// Idempotent replays emit nothing: repeating an identical
+    /// `workspace.create` with the same `idempotency_key` + `progressId`
+    /// returns the cached result without re-running provisioning, so no
+    /// `git:clone:*` frames (progress OR done) are re-emitted.
+    #[tokio::test]
+    async fn progress_id_idempotent_replay_emits_nothing() {
+        let repo = seed_repo("intentd-prog-idem-src");
+        let root = unique_dir("intentd-prog-idem-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let input = WorkspaceCreate {
+            repository_path: Some(repo.0.to_string_lossy().to_string()),
+            progress_id: Some("prog-idem-1".to_string()),
+            ..Default::default()
+        };
+        let key = Some("idem-key-prog-1".to_string());
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let first = svc
+            .create_workspace(input.clone(), key.clone())
+            .await
+            .expect("first create");
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(!frames.is_empty(), "first create streams frames");
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let replay = svc
+            .create_workspace(input, key)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(
+            replay.workspace.id, first.workspace.id,
+            "replay returns the cached result"
+        );
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(
+            frames.is_empty(),
+            "idempotent replay emits no git:clone frames: {frames:?}"
+        );
+    }
+
+    /// Pinned CoW coverage (probe-gated like the checkout-mode tests): with
+    /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
+    /// create streams the `cow-copy 30` milestone (not `worktree`) with the
+    /// echoed `progressId` and one terminal done.
+    #[tokio::test]
+    async fn progress_id_cow_create_streams_cow_copy_milestone() {
+        let repo = seed_repo("intentd-prog-cow-src");
+        let root = unique_dir("intentd-prog-cow-root");
+        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let cfg_dir = unique_dir("intentd-prog-cow-conf");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(cfg_dir.0.join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.cowIsolation".to_string(),
+                serde_json::json!(true),
+            )])
+            .expect("set cowIsolation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo.0.to_string_lossy().to_string()),
+                    progress_id: Some("prog-cow-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow),
+            "pinned CoW checkout"
+        );
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-cow-1");
+        let cow = frames
+            .iter()
+            .find(|f| f.data["phase"] == "cow-copy")
+            .expect("cow-copy milestone emitted");
+        assert_eq!(cow.data["percent"], 30, "local CoW copy sits mid-scale");
+        assert!(
+            !frames.iter().any(|f| f.data["phase"] == "worktree"),
+            "no worktree milestone on the CoW path: {frames:?}"
+        );
+    }
+
     /// The terminal-done contract holds for pre-derivation configuration
     /// failures: an invalid `workspace.worktreesLocation` (relative path)
     /// errors the create before a workspace id exists, yet a supplied
