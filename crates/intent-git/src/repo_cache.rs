@@ -485,7 +485,10 @@ pub struct CachedBranches {
 /// the lock is contended the write path is actively (re)building the slot,
 /// so its refs are not trustworthy anyway and this read reports a miss
 /// (`Ok(None)`) immediately instead of stalling behind an entire
-/// clone/refresh (submodules included).
+/// clone/refresh (submodules included). A [`with_cache_lock_blocking`]
+/// holder (checkout provisioning FROM the cache, whose refs are perfectly
+/// trustworthy) folds to the same graceful miss — a deliberate trade-off
+/// favoring promptness over a hit during that briefer window.
 ///
 /// The cache is keyed by `<owner>/<repo>` segments only, while creation
 /// accepts GitHub-style URLs from any host and treats same-named origins as
