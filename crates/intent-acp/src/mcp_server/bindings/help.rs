@@ -22,6 +22,7 @@ pub(crate) const PRELUDE: &str = r#"
 pub(crate) fn dispatch(
     workspace_id: &WorkspaceId,
     features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -29,7 +30,9 @@ pub(crate) fn dispatch(
         "get" => {
             let is_chief = workspace_id.is_chief();
             match opt_str(args, "namespace") {
-                Some(ns) => help_namespace(is_chief, features, &ns).map(Value::String),
+                Some(ns) => {
+                    help_namespace(is_chief, features, is_sub_agent, &ns).map(Value::String)
+                }
                 None => Ok(Value::String(help_index(is_chief, features))),
             }
         }
@@ -46,14 +49,15 @@ mod tests {
     fn get_returns_index_or_namespace_docs() {
         let ws: WorkspaceId = "ws-1".parse().unwrap();
         let features = AgentFeaturesSettings::default();
-        let index = dispatch(&ws, &features, "get", &json!({})).unwrap();
+        let index = dispatch(&ws, &features, false, "get", &json!({})).unwrap();
         assert!(index.as_str().unwrap().starts_with("Namespaces"));
-        let pr = dispatch(&ws, &features, "get", &json!({ "namespace": "pr" })).unwrap();
+        let pr = dispatch(&ws, &features, false, "get", &json!({ "namespace": "pr" })).unwrap();
         assert!(pr.as_str().unwrap().contains("ws.pr.snapshot("));
         // Chief workspaces get the chief surface.
         let app = dispatch(
             &WorkspaceId::chief(),
             &features,
+            false,
             "get",
             &json!({ "namespace": "app" }),
         )
@@ -64,8 +68,14 @@ mod tests {
     #[test]
     fn unknown_method_errors() {
         let ws: WorkspaceId = "ws-1".parse().unwrap();
-        let err =
-            dispatch(&ws, &AgentFeaturesSettings::default(), "nope", &Value::Null).unwrap_err();
+        let err = dispatch(
+            &ws,
+            &AgentFeaturesSettings::default(),
+            false,
+            "nope",
+            &Value::Null,
+        )
+        .unwrap_err();
         assert!(err.contains("help.nope"));
     }
 }

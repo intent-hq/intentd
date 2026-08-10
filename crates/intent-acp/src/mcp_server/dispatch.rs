@@ -67,19 +67,24 @@ impl WorkspaceMcpServer {
         // `summary` is required by the input schema but is not fed into the
         // engine — it is a UI hint for the caller, not part of the eval
         // environment. Accept and ignore for now.
-        let host = make_workspace_host_for(
+        // Sub-agent bridges see `structuredQuestions` forced off in the
+        // effective features (prelude/help pruning); the flag itself rides
+        // separately so the dispatch deny can name the top-level-only rule.
+        let effective_features = self.effective_agent_features();
+        let host = make_workspace_host_for_bridge(
             self.api.clone(),
             self.workspace_id.clone(),
             self.caller_agent_id.clone(),
             self.turn_attachments.clone(),
-            self.agent_features.clone(),
+            effective_features.clone(),
+            self.is_sub_agent,
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
         // `serde_json::Value` cannot represent on its own. `__k` is `"u"` for
         // an undefined return (prints "(no return value)") and `"v"` for a
         // JSON-serializable value (prints as pretty JSON, including `null`).
-        let bindings_prelude = super::bindings::prelude_for(&self.agent_features);
+        let bindings_prelude = super::bindings::prelude_for(&effective_features);
         let full_code = format!(
             "{bindings_prelude}\n\
              const __wsapi_user = await (async () => {{ {code}\n}})();\n\
@@ -393,13 +398,41 @@ pub fn make_workspace_host(
 /// gated by a disabled `[agentFeatures]` toggle are denied with an explicit
 /// "disabled in settings" error before reaching the bindings (defense in
 /// depth behind the description/prelude pruning — a raw `host({...})` call
-/// cannot bypass the gate).
+/// cannot bypass the gate). Treats the caller as top-level; sub-agent
+/// bridges use [`make_workspace_host_for_bridge`].
 pub fn make_workspace_host_for(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
+) -> HostFn {
+    make_workspace_host_for_bridge(
+        api,
+        workspace_id,
+        caller_agent_id,
+        turn_attachments,
+        agent_features,
+        false,
+    )
+}
+
+/// [`make_workspace_host_for`] plus the sub-agent flag: `app.question.*`
+/// frames from a sub-agent caller are denied with the explicit
+/// top-level-only redirect error before the feature-gate check, so a raw
+/// `host({...})` call cannot bypass the description/prelude pruning and the
+/// error never misleads with "disabled in settings".
+///
+/// `pub` (re-exported as `intent_acp::make_workspace_host_for_bridge`) so
+/// the background hook scheduler in `intent-services` applies the same
+/// sub-agent gate to hooks owned by background/delegated sessions.
+pub fn make_workspace_host_for_bridge(
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    caller_agent_id: Option<AgentId>,
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    agent_features: AgentFeaturesSettings,
+    is_sub_agent: bool,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     Arc::new(move |arg| {
@@ -409,27 +442,51 @@ pub fn make_workspace_host_for(
         let registry = turn_attachments.clone();
         let features = features.clone();
         Box::pin(async move {
-            workspace_host_dispatch(api, workspace_id, caller, registry, &features, arg).await
+            workspace_host_dispatch(
+                api,
+                workspace_id,
+                caller,
+                registry,
+                &features,
+                is_sub_agent,
+                arg,
+            )
+            .await
         }) as BoxFuture<'static, std::result::Result<Value, String>>
     })
 }
 
+/// The dispatch-layer denial for a sub-agent's `app.question.*` frame —
+/// names the two methods a sub-agent should use instead.
+pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
+    "ws.app.question.ask is only available to top-level agents — raise \
+     ws.agent.requestDiscussion when you need user/coordinator input, or report \
+     progress with ws.agent.reportToParent";
+
 /// Route one `host({method, args})` frame to a `WorkspaceApi` method via
 /// [`super::bindings::try_dispatch`], which owns the per-namespace method →
-/// trait mapping. Methods gated by a disabled `[agentFeatures]` toggle are
-/// denied before dispatch.
+/// trait mapping. Sub-agent `app.question.*` frames and methods gated by a
+/// disabled `[agentFeatures]` toggle are denied before dispatch.
 async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
+    // Sub-agent question gate FIRST: the redirect error must win over the
+    // feature-gate denial (a sub-agent bridge's effective features force
+    // `structuredQuestions` off, which would otherwise claim the frame with
+    // a misleading "disabled in settings").
+    if is_sub_agent && method.starts_with("app.question.") {
+        return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
+    }
     if let Some(feature) = super::tools::denied_feature(agent_features, method) {
         return Err(format!(
             "host: method `{method}` is disabled in settings ({feature} = false)"
@@ -442,6 +499,7 @@ async fn workspace_host_dispatch(
         &caller_agent_id,
         turn_attachments.as_ref(),
         agent_features,
+        is_sub_agent,
         method,
         &args,
     )
