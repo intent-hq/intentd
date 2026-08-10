@@ -3234,6 +3234,14 @@ impl AgentManager {
                 self.services
                     .annotate_waiting_on_pr_monitors(agent_id, &mut data)
                     .await;
+                // Archived-workspace suppression hint: same
+                // `workspaceArchived` stamp as the settlement idle (omitted
+                // when the workspace is not archived). `workspace.archive`
+                // persists `Archived` BEFORE its interrupt sweep, so this is
+                // exactly the idle that fires in a just-archived workspace.
+                self.services
+                    .annotate_workspace_archived(&workspace_id, &mut data)
+                    .await;
                 self.services
                     .publish_agent_event(
                         &workspace_id,
