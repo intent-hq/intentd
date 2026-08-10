@@ -193,12 +193,16 @@ pub async fn check_provider_auth_cli(
 /// user unit); spawning with the bare daemon env then fails with exit 127
 /// because `#!/usr/bin/env node` cannot resolve the sibling `node`
 /// (monorepo#1863).
+///
+/// `program` is lexically absolutized first (no symlink resolution):
+/// `enhanced_path` only prepends the parent dir of an absolute path, and a
+/// relative `providers.paths.*` override is a valid resolution
+/// (`resolve_auggie_override` accepts any existing file).
 fn probe_command(program: &OsStr) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.env(
-        "PATH",
-        intent_providers::enhanced_path(Some(std::path::Path::new(program))),
-    );
+    let program_path =
+        std::path::absolute(program).unwrap_or_else(|_| std::path::PathBuf::from(program));
+    cmd.env("PATH", intent_providers::enhanced_path(Some(&program_path)));
     cmd
 }
 
@@ -591,6 +595,30 @@ mod tests {
             assert_eq!(probe, CliAuthProbe::Failed, "provider {provider_id}");
             assert_eq!(probe.auth_status(), None, "provider {provider_id}");
         }
+    }
+
+    /// monorepo#1863 follow-up (PR review): a relative `providers.paths.*`
+    /// override is a valid resolution, but `enhanced_path` only prepends the
+    /// parent dir of an absolute path — so `probe_command` must lexically
+    /// absolutize the program first. Pinned by inspecting the child's PATH
+    /// env directly (no spawn).
+    #[test]
+    fn probe_command_absolutizes_relative_program_for_path() {
+        let cmd = probe_command(std::ffi::OsStr::new("rel-dir/fake-cli"));
+        let path_env = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .expect("probe_command sets PATH")
+            .to_string_lossy()
+            .into_owned();
+        let expected_dir = std::path::absolute("rel-dir").expect("absolutize test dir");
+        let first = path_env
+            .split(if cfg!(windows) { ';' } else { ':' })
+            .next()
+            .expect("PATH has entries");
+        assert_eq!(std::path::Path::new(first), expected_dir);
     }
 
     #[test]
