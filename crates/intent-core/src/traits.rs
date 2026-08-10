@@ -4007,6 +4007,26 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `debug.sampleStacks`: capture a point-in-time sample of the daemon's
+    /// own thread stacks over a short window and return the rendered text
+    /// report — `{ report, durationMs, frequencyHz, sampleCount,
+    /// distinctStacks }` (PROTOCOL §5.43, monorepo#1755). Both params are
+    /// optional and clamped server-side (`durationMs` 100–10000, default
+    /// 1000; `frequencyHz` 1–250, default 99). Unix-only; other platforms
+    /// return `Error::Unsupported`. Daemon-global — no `workspaceId`.
+    fn debug_sample_stacks(
+        &self,
+        duration_ms: Option<i64>,
+        frequency_hz: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (duration_ms, frequency_hz);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::debug_sample_stacks not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `providers.catalog`: the static provider registry (monorepo#928) —
     /// `{ providers: [...] }`, one row per registered provider in registry
     /// order, so clients no longer need a local copy of the provider config.
