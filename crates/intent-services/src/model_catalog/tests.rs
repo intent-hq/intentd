@@ -185,6 +185,15 @@ fn persistence_roundtrips_across_instances() {
     assert!(corrupt.last_good("p", "v1").is_none());
 }
 
+/// cortex is un-gated (monorepo#1902): its source serves an open-gate empty
+/// list with no warning — the provider CLI owns model selection.
+#[tokio::test]
+async fn cortex_source_serves_open_gate_empty_list() {
+    let r = (source_for("cortex").unwrap().fetch)().await;
+    assert_eq!(r.models, Some(Vec::new()));
+    assert_eq!(r.warning, None);
+}
+
 #[test]
 fn registry_covers_all_nine_providers() {
     for provider in [

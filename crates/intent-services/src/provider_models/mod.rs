@@ -33,9 +33,10 @@
 //!   within ~70% of total system RAM (a parsed parameter count × a
 //!   Q4-class bytes/param estimate). See [`parse::build_unsloth_rows`].
 //!
-//! auggie (existing CLI path in `agent_ops`) and cortex (static catalog) are
-//! deliberately NOT implemented here — they live in [`crate::model_catalog`],
-//! whose provider→source registry wires these sources into `models.list`
+//! auggie (existing CLI path in `agent_ops`) and cortex (open-gate empty
+//! list — the provider CLI owns model selection) are deliberately NOT
+//! implemented here — they live in [`crate::model_catalog`], whose
+//! provider→source registry wires these sources into `models.list`
 //! alongside them.
 
 use std::path::{Path, PathBuf};
@@ -106,8 +107,8 @@ fn finish(provider_id: &str, outcome: Result<Vec<Value>, ProbeError>) -> Provide
 }
 
 /// Dispatch a model-catalog fetch by provider id. Providers without a
-/// daemon-side source here (auggie's CLI path and cortex's static catalog are
-/// wired elsewhere) return `None` with a warning.
+/// daemon-side source here (auggie's CLI path and cortex's open-gate empty
+/// list are wired elsewhere) return `None` with a warning.
 pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
     match provider_id {
         "claude-code" => fetch_claude_code_models().await,

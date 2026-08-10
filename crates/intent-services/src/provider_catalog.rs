@@ -32,8 +32,8 @@ fn build_providers_catalog_with_env(env_has: &dyn Fn(&str) -> bool) -> Value {
 
 /// Whether a provider passes the daemon-side visibility gate. Derived from
 /// [`intent_providers::gated_reason_with_env`] — the single env-var/
-/// feature-code gate shared with discovery's `gatedOff` and the default-deny
-/// `models.list` applies to cortex — so the surfaces can never drift.
+/// feature-code gate shared with discovery's `gatedOff` and the
+/// `models.list` cortex source — so the surfaces can never drift.
 fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> bool {
     intent_providers::gated_reason_with_env(p, env_has).is_none()
 }
@@ -171,11 +171,27 @@ mod tests {
     #[test]
     fn feature_code_gate_always_hides_and_passes_raw_field_through() {
         // The daemon stores no feature-code enablement, so a configured code
-        // always gates (default-deny, same as models.list for cortex).
-        let v = catalog(&|_| true);
+        // always gates (default-deny). No registry provider carries a feature
+        // code today (cortex was un-gated, monorepo#1902), so the mechanism
+        // is covered with a synthetic config.
+        let synthetic = intent_providers::ProviderConfig {
+            requires_feature_code: Some("test-code"),
+            ..*intent_providers::find_provider("auggie").unwrap()
+        };
+        let r = provider_row(&synthetic, &|_| true);
+        assert_eq!(r["visible"], false);
+        assert_eq!(r["requiresFeatureCode"], "test-code");
+    }
+
+    /// Regression (monorepo#1902): cortex is un-gated — served visible with
+    /// no gating fields.
+    #[test]
+    fn cortex_is_ungated_and_visible() {
+        let v = catalog(&|_| false);
         let cortex = row(&v, "cortex");
-        assert_eq!(cortex["visible"], false);
-        assert_eq!(cortex["requiresFeatureCode"], "cortex");
+        assert_eq!(cortex["visible"], true);
+        assert!(cortex.get("requiresFeatureCode").is_none());
+        assert!(cortex.get("requiresEnvVar").is_none());
     }
 
     #[test]
@@ -185,6 +201,7 @@ mod tests {
             "auggie",
             "claude-code",
             "codex",
+            "cortex",
             "opencode",
             "unsloth",
             "pi",

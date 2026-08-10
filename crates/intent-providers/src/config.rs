@@ -339,7 +339,6 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Electron,
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
-        requires_feature_code: Some("cortex"),
         short_name: "Cortex",
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
