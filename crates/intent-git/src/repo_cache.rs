@@ -481,7 +481,11 @@ pub struct CachedBranches {
 /// without touching the network. A cache miss (missing dir or an unopenable
 /// repo) is a graceful `Ok(None)`, never an error. Briefly holds the
 /// per-repo cache lock so a concurrent [`ensure_cached_repo`] refresh or
-/// re-clone is never observed mid-mutation.
+/// re-clone is never observed mid-mutation — but only via `try_lock`: when
+/// the lock is contended the write path is actively (re)building the slot,
+/// so its refs are not trustworthy anyway and this read reports a miss
+/// (`Ok(None)`) immediately instead of stalling behind an entire
+/// clone/refresh (submodules included).
 ///
 /// The cache is keyed by `<owner>/<repo>` segments only, while creation
 /// accepts GitHub-style URLs from any host and treats same-named origins as
@@ -499,7 +503,9 @@ pub async fn list_cached_branches(
     let cache_path = cache_root.join(owner).join(repo);
 
     let lock = lock_for(&cache_path);
-    let _guard = lock.lock().await;
+    let Ok(_guard) = lock.try_lock() else {
+        return Ok(None);
+    };
 
     let owner = owner.to_string();
     let repo = repo.to_string();
@@ -1989,6 +1995,46 @@ mod tests {
             .await
             .unwrap();
         assert!(miss.is_none());
+    }
+
+    /// A contended per-repo lock (an [`ensure_cached_repo`] clone/refresh in
+    /// flight) makes the read report a miss promptly — even on a warm cache —
+    /// instead of blocking out the entire clone. Uncontended reads still hit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_cached_branches_contended_lock_is_prompt_none() {
+        let origin = init_repo("repocache-listcached-contended");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("listcached-contended");
+        let cache = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "acme",
+            "widget",
+            None,
+        )
+        .await
+        .unwrap();
+        set_github_origin(&cache, "acme", "widget");
+
+        // Hold the per-repo lock as an in-flight ensure would.
+        let lock = lock_for(&cache);
+        let guard = lock.lock().await;
+
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            list_cached_branches(root.path(), "acme", "widget"),
+        )
+        .await
+        .expect("contended read must return promptly, not wait out the lock")
+        .unwrap();
+        assert!(read.is_none(), "contended read must be a miss");
+
+        // Once the lock is released the warm cache hits again.
+        drop(guard);
+        let hit = list_cached_branches(root.path(), "acme", "widget")
+            .await
+            .unwrap();
+        assert!(hit.is_some(), "uncontended warm read must hit");
     }
 
     /// Invalid owner/repo segments are rejected before any filesystem work,
