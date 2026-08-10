@@ -171,6 +171,12 @@ pub(crate) fn error_frame(id: Value, code: i32, message: &str) -> String {
 /// (e.g. the pairing listener-down `{ "code": "listener-down" }`,
 /// monorepo#1822).
 pub(crate) fn error_frame_with_data(id: Value, code: i32, message: &str, data: Value) -> String {
+    // §3.3 invariant: every -32602 carries an `error.data.code` discriminator
+    // — a caller bypassing the centralized tagging must supply one itself.
+    debug_assert!(
+        code != -32602 || data.get("code").is_some(),
+        "-32602 error.data must carry a `code` discriminator (PROTOCOL §3.3)"
+    );
     serde_json::to_string(&json!({
         "jsonrpc": "2.0",
         "id": id,
