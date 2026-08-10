@@ -298,8 +298,18 @@ async fn cmd_token(rotate: bool) -> anyhow::Result<()> {
 
 /// True when a `pairing.getInfo` error frame means the TCP (WSS) listener is
 /// not running — the one failure `intentd pair` can fix on the spot by
-/// enabling `server.wsApi.enabled`.
+/// enabling `server.wsApi.enabled`. Prefers the machine-readable
+/// `error.data.code == "listener-down"` discriminator (monorepo#1822); the
+/// message-prose match stays as a fallback for older daemons that predate
+/// the discriminator.
 fn is_listener_down_error(error: &Value) -> bool {
+    if error
+        .pointer("/data/code")
+        .and_then(Value::as_str)
+        .is_some_and(|c| c == "listener-down")
+    {
+        return true;
+    }
     error
         .get("message")
         .and_then(Value::as_str)
@@ -3635,7 +3645,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn listener_down_error_is_detected_from_data_code() {
+        // Preferred detection: the machine-readable discriminator
+        // (monorepo#1822) — message prose is irrelevant when it is present.
+        let err = json!({
+            "code": -32603,
+            "message": "anything at all",
+            "data": { "code": "listener-down" }
+        });
+        assert!(is_listener_down_error(&err));
+        // A different data code does not match on its own.
+        let other_code = json!({
+            "code": -32603,
+            "message": "boom",
+            "data": { "code": "not-found" }
+        });
+        assert!(!is_listener_down_error(&other_code));
+    }
+
+    #[test]
     fn listener_down_error_is_detected_from_message() {
+        // Prose fallback for older daemons that predate the discriminator.
         let err = json!({
             "code": -32603,
             "message": "TCP listener is not running — ensure the WSS listener is enabled"
