@@ -10180,11 +10180,42 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
-                    let workspaces_root = resolve_workspaces_parent(
+                    // Unified provisioning progress (PROTOCOL §5.1): a
+                    // client-supplied `progressId` arms a per-create reporter
+                    // that echoes the id on every `git:clone:*` frame,
+                    // normalizes percent to one non-decreasing 0–100 scale
+                    // across all provisioning modes, and hands terminal-done
+                    // ownership to the wrapper around this closure. Absent
+                    // (or with no bus wired) every event path stays legacy.
+                    let progress_id = input
+                        .progress_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let workspaces_root = match resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
                         &worktrees_location,
-                    )?;
+                    ) {
+                        Ok(root) => root,
+                        Err(e) => {
+                            // The terminal-done contract holds even for this
+                            // pre-derivation config failure: no workspace id
+                            // exists yet, so the wrapper's `ok:false` frame
+                            // publishes under the empty sentinel id (same as
+                            // workspace-adjacent clones).
+                            if let (Some(pid), Some(b)) = (progress_id.clone(), bus.clone()) {
+                                *progress_slot_op.lock().unwrap() =
+                                    Some(std::sync::Arc::new(create_progress::CreateProgress::new(
+                                        b,
+                                        WorkspaceId::from_string(String::new()),
+                                        pid,
+                                    )));
+                            }
+                            return Err(e);
+                        }
+                    };
                     // Workspace id derivation (TS `generateLocalSlug` parity):
                     // slug from the initial-agent prompt when possible, else a
                     // random adjective-animal pair; uniquified with a `-N`
@@ -10193,27 +10224,15 @@ impl WorkspaceApi for Services {
                     // directory reflects intent and deleted ids are never
                     // recycled.
                     let id = derive_workspace_id(&store, &input, &workspaces_root).await;
-                    // Unified provisioning progress (PROTOCOL §5.1): a
-                    // client-supplied `progressId` arms a per-create reporter
-                    // that echoes the id on every `git:clone:*` frame,
-                    // normalizes percent to one non-decreasing 0–100 scale
-                    // across all provisioning modes, and hands terminal-done
-                    // ownership to the wrapper around this closure. Absent
-                    // (or with no bus wired) every event path stays legacy.
-                    let progress = input
-                        .progress_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .and_then(|pid| {
-                            bus.clone().map(|b| {
-                                std::sync::Arc::new(create_progress::CreateProgress::new(
-                                    b,
-                                    id.clone(),
-                                    pid.to_string(),
-                                ))
-                            })
-                        });
+                    let progress = progress_id.and_then(|pid| {
+                        bus.clone().map(|b| {
+                            std::sync::Arc::new(create_progress::CreateProgress::new(
+                                b,
+                                id.clone(),
+                                pid,
+                            ))
+                        })
+                    });
                     if let Some(reporter) = progress.clone() {
                         *progress_slot_op.lock().unwrap() = Some(reporter.clone());
                         reporter

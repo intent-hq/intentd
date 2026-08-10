@@ -20457,6 +20457,62 @@ mod clone_orchestration {
         );
     }
 
+    /// The terminal-done contract holds for pre-derivation configuration
+    /// failures: an invalid `workspace.worktreesLocation` (relative path)
+    /// errors the create before a workspace id exists, yet a supplied
+    /// `progressId` still gets exactly one `git:clone:done { ok:false }`.
+    #[tokio::test]
+    async fn progress_id_early_config_error_emits_done_err() {
+        let root = unique_dir("intentd-prog-cfg-root");
+        let repo = seed_repo("intentd-prog-cfg-src");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let cfg_dir = unique_dir("intentd-prog-cfg-conf");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(cfg_dir.0.join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!("relative/not-absolute"),
+            )])
+            .expect("apply worktreesLocation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(repo.0.to_string_lossy().to_string()),
+                progress_id: Some("prog-cfg-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("relative worktreesLocation must fail the create");
+
+        let frames = drain_clone_frames(&mut sub).await;
+        let dones: Vec<&intent_core::Event> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:done")
+            .collect();
+        assert_eq!(dones.len(), 1, "exactly one terminal done: {frames:?}");
+        assert_eq!(dones[0].data["ok"], false);
+        assert_eq!(dones[0].data["progressId"].as_str(), Some("prog-cfg-1"));
+        assert!(
+            dones[0].data["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktreesLocation"),
+            "done carries the config-error detail: {:?}",
+            dones[0].data
+        );
+    }
+
     /// Rollback safety: without a `progressId`, a local-repo create emits no
     /// `git:clone:*` frames at all (legacy behavior), and legacy clone paths
     /// carry no `progressId` key.
