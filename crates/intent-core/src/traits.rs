@@ -92,6 +92,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.transfer.plan`: read-only preview of a workspace transfer
+    /// (PROTOCOL §5.1) — the versioned [`crate::transfer::TransferManifest`]
+    /// plus a size estimate broken down as DB row bytes + asset bytes +
+    /// estimated git bundle bytes, and non-blocking pre-flight warnings.
+    /// No side effects; `NotFound` if the workspace is absent.
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<crate::transfer::TransferPlan>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_transfer_plan not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is
@@ -5139,6 +5156,32 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_stat not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.placeAttachment`: place an attachment payload into the
+    /// workspace's `.intent/attachments/` directory with a collision-safe
+    /// name and return `{ ok, path, fileName, size }` where `path` is
+    /// workspace-relative and `size` is the placed byte length
+    /// (PROTOCOL §5.9; intent-hq/monorepo#1948). Exactly one of `data`
+    /// (base64 payload, `data:` URL prefix tolerated) or `source_path`
+    /// (absolute host-local file to copy — the daemon and caller share the
+    /// host) must be provided; anything else is `Error::InvalidParams`
+    /// (→ `-32602`). The directory is covered by the default
+    /// `.intent/.gitignore`, so placed files never reach git tracking,
+    /// auto-commit, or attribution.
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_name, data, source_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_place_attachment not implemented".to_string(),
             ))
         })
     }

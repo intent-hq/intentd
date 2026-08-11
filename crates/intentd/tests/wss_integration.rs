@@ -1055,6 +1055,140 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
     srv.ws.stop().await;
 }
 
+/// intent-hq/monorepo#1897 over the real WSS wire: a ready-to-send queue
+/// entry older than the stale-queue threshold on an idle agent surfaces as a
+/// `stale-queue-entry` stuck-risk in the `agent.diagnostics` response —
+/// `stuckRisks` names the agent and oldest entry, `summary.stuckRisks` counts
+/// it, and the `text` rendering mentions it. The stale entry is seeded via
+/// the durable queue snapshot + rehydration path (the same path a daemon
+/// restart uses), so the wire read reflects the live in-memory queue.
+#[tokio::test]
+async fn wss_agent_diagnostics_flags_stale_queue_entry() {
+    let dir = test_tempdir("intentd-wss-stalequeue-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    // Keep a concrete handle (Services is Clone over shared internals) so the
+    // test can rehydrate the seeded queue into the same live registry the
+    // WSS listener serves from.
+    let services_handle = services.clone();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let mut opts = WsOptions {
+        base_port: 0,
+        ..WsOptions::default()
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = server.start().await.expect("start");
+
+    let created_ws = wss_call(
+        port,
+        cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Stale Queue"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Stale Queue Target"}}}}"#
+    );
+    let created = wss_call(port, cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+
+    // Seed one backdated and one fresh ready-to-send entry through the
+    // durable snapshot, then rehydrate into the live in-memory registry.
+    let stale_at = "2020-01-01T00:00:00Z";
+    let fresh_at = now_iso();
+    let row = |id: &str, position: i64, queued_at: &str| intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position,
+        payload: serde_json::json!({
+            "id": id,
+            "content": "undelivered wake",
+            "queuedAt": queued_at,
+        }),
+        created_at: queued_at.into(),
+        turn_id: id.into(),
+    };
+    store
+        .replace_agent_queue(
+            &agent,
+            &[
+                row("qmsg-stale", 0, stale_at),
+                row("qmsg-fresh", 1, &fresh_at),
+            ],
+        )
+        .await
+        .expect("seed queue");
+    let rehydrated = services_handle
+        .rehydrate_agent_queues()
+        .await
+        .expect("rehydrate queues");
+    assert_eq!(rehydrated, 2, "both seeded entries rehydrated");
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(port, cfg.clone(), &diag_frame).await;
+    assert_eq!(diag["jsonrpc"], Value::String("2.0".into()), "{diag}");
+    assert_eq!(diag["id"], Value::from(3), "{diag}");
+    let d = &diag["result"]["diagnostics"];
+    let risks = d["stuckRisks"].as_array().expect("stuckRisks array");
+    let risk = risks
+        .iter()
+        .find(|r| r["type"] == serde_json::json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk on the wire");
+    assert_eq!(risk["severity"], Value::String("warning".into()), "{risk}");
+    assert_eq!(risk["agentId"], Value::String(agent_id.clone()), "{risk}");
+    assert_eq!(
+        risk["entryId"],
+        Value::String("qmsg-stale".into()),
+        "{risk}"
+    );
+    assert_eq!(
+        risk["count"],
+        Value::from(1),
+        "fresh entry excluded: {risk}"
+    );
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "{risk}"
+    );
+    assert_eq!(
+        d["summary"]["stuckRisks"],
+        Value::from(risks.len()),
+        "summary counts the risks: {d}"
+    );
+    let text = diag["result"]["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    server.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
@@ -7200,6 +7334,143 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
         serde_json::json!({ "code": "invalid-params" }),
         "missing param must carry the invalid-params discriminator: {resp}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1):
+/// the result carries `{ plan }` with the versioned manifest (formatVersion,
+/// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
+/// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
+/// never listed; unknown workspace ids map to `-32602 Workspace not found`.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Transfer"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let manifest = &plan["manifest"];
+    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert!(
+        manifest["creatingIntentdVersion"].is_string(),
+        "manifest records the creating daemon version: {resp}"
+    );
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
+    let tables = manifest["tables"].as_array().expect("tables array");
+    assert!(
+        tables.iter().any(|t| t["name"] == "workspace"
+            && t["rowCount"] == 1
+            && t["approxBytes"].as_i64().unwrap_or(0) > 0),
+        "workspace row is counted with a byte estimate: {resp}"
+    );
+    assert!(
+        tables.iter().all(|t| t["name"] != "event"),
+        "event log is excluded from the manifest: {resp}"
+    );
+    assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(total, db + assets + bundle, "size breakdown sums: {resp}");
+    assert!(plan["warnings"].is_array(), "{resp}");
+
+    // Unknown workspace → the standard workspace-not-found mapping.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Workspace not found", "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
+/// monorepo#1948): a base64 payload lands in the workspace's
+/// `.intent/attachments/` directory and the response carries the
+/// workspace-relative `{ ok, path, fileName, size }`; a same-name re-place
+/// answers a collision-suffixed name; the `.intent/.gitignore` exclusion file
+/// is ensured; and the exactly-one-of `data`/`sourcePath` violation is the
+/// documented `-32602`.
+#[tokio::test]
+async fn wss_file_place_attachment_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-placeatt-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "ok": true,
+            "path": ".intent/attachments/trace.har",
+            "fileName": "trace.har",
+            "size": 26
+        }),
+        "result: {resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
+        b"oversized attachment bytes"
+    );
+    // The exclusion contract: the default `.intent/.gitignore` (ignore
+    // everything except config.json) was ensured on the way.
+    let gitignore =
+        std::fs::read_to_string(root.join(".intent/.gitignore")).expect("gitignore ensured");
+    assert!(gitignore.contains("*"), "gitignore content: {gitignore}");
+
+    // Same name again → collision-suffixed `trace-2.har`.
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    assert_eq!(resp2["result"]["fileName"], "trace-2.har", "{resp2}");
+    assert_eq!(
+        resp2["result"]["path"], ".intent/attachments/trace-2.har",
+        "{resp2}"
+    );
+
+    // Neither `data` nor `sourcePath` → -32602.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"x.bin"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
 
     srv.ws.stop().await;
 }

@@ -146,6 +146,41 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(intent_core::transfer::TransferPlan {
+                manifest: intent_core::transfer::TransferManifest {
+                    format_version: intent_core::transfer::TRANSFER_FORMAT_VERSION,
+                    creating_intentd_version: "0.0.0".to_string(),
+                    workspace_id: id,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    tables: vec![intent_core::transfer::TransferTableStat {
+                        name: "note".to_string(),
+                        row_count: 2,
+                        approx_bytes: 100,
+                    }],
+                    assets: vec![],
+                    git: intent_core::transfer::TransferGitSummary {
+                        has_repository: false,
+                        branch: None,
+                        dirty_files: vec![],
+                        sandbox_branches: vec![],
+                    },
+                },
+                total_size_bytes: 100,
+                db_row_bytes: 100,
+                asset_bytes: 0,
+                estimated_git_bundle_bytes: 0,
+                warnings: vec![],
+            })
+        })
+    }
     fn create_workspace(
         &self,
         input: WorkspaceCreate,
@@ -2286,6 +2321,58 @@ async fn workspace_disk_usage_missing_id_is_minus_32602() {
 async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.transfer.plan` wraps the service payload as `{ plan }` with the
+/// camelCase manifest/size fields (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_transfer_plan_returns_plan_envelope() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    let plan = &v["result"]["plan"];
+    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(1));
+    assert_eq!(plan["manifest"]["workspaceId"], serde_json::json!("ws-1"));
+    assert_eq!(
+        plan["manifest"]["tables"][0]["rowCount"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        plan["manifest"]["git"]["hasRepository"],
+        serde_json::json!(false)
+    );
+    assert_eq!(plan["totalSizeBytes"], serde_json::json!(100));
+    assert_eq!(plan["dbRowBytes"], serde_json::json!(100));
+    assert_eq!(plan["assetBytes"], serde_json::json!(0));
+    assert_eq!(plan["estimatedGitBundleBytes"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();

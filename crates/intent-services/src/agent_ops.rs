@@ -23,6 +23,15 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Age past which an undelivered ready-to-send queue entry on an agent that is
+/// not actively running counts as a `stale-queue-entry` stuck-risk in
+/// `agent.diagnostics` (intent-hq/monorepo#1897): during the monorepo#1791
+/// incident a settlement wake sat undelivered at position 0 for ~13 minutes on
+/// an idle agent while diagnostics reported zero stuck risks. Five minutes is
+/// comfortably past any normal drain latency (drains trigger in seconds) while
+/// catching a wedged queue well before the incident's timescale.
+const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -760,10 +769,20 @@ impl QueuedMessage {
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
 /// quarantine park, append-failure auto-queue) still deliver the preempted
 /// message ahead of the interrupt message when the entry drains.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializes to camelCase JSON as the durable `agent_stop_redelivery.payload`
+/// shape (intent-hq/monorepo#1899): the zero-output stop-redelivery arm mirrors
+/// the in-memory payload write-through so it survives a daemon restart. The
+/// fields take `#[serde(default)]` so older payloads missing a later field
+/// still rehydrate.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
     pub image_blocks: Option<Value>,
+    #[serde(default)]
     pub file_blocks: Option<Value>,
 }
 
@@ -6631,6 +6650,12 @@ impl Services {
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
     /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// A queue whose ready-to-send entries have sat undelivered past
+    /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
+    /// responding raises a `stale-queue-entry` stuck-risk
+    /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
+    /// archived workspaces park every entry, and an active question hold
+    /// parks automatic (non-user-origin) entries — neither is stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -7018,6 +7043,113 @@ impl Services {
                 }
                 stuck_risks.push(Value::Object(risk));
             }
+        }
+        // Stale undelivered queue entries (intent-hq/monorepo#1897): a
+        // ready-to-send entry older than [`STALE_QUEUE_ENTRY_AFTER_MS`] whose
+        // target agent is not actively responding should have drained long
+        // ago — surface it instead of leaving the wake invisible. Entries
+        // under edit are excluded (the drain skips them by design), as are
+        // entries whose `queuedAt` fails to parse. An actively-responding,
+        // non-stale agent legitimately holds its queue until the turn ends.
+        //
+        // Affirmatively-parked queues are expected, not stuck: an archived
+        // workspace parks every queue until unarchive (the drain kick then
+        // delivers), and an active question hold (PROTOCOL §5.5) parks
+        // automatic entries until the user answers or dismisses — but never
+        // user-origin entries, which drain through the hold, so a stale
+        // user-origin entry under a hold is still a genuine risk. Both checks
+        // are lazy — one workspace read per call and one bounded
+        // [`Services::question_hold_active`] session read per agent, paid
+        // only when a stale candidate actually exists.
+        let mut workspace_archived: Option<bool> = None;
+        for q in &queues {
+            let aid = q["agentId"].as_str().unwrap_or_default();
+            let actively_responding = session_by_id.get(aid).is_some_and(|s| {
+                agent_status_wire(s.status) == Some("responding")
+                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+            });
+            if actively_responding {
+                continue;
+            }
+            let mut stale: Vec<(&str, i64)> = q["entries"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e["editing"].as_bool() != Some(true))
+                        .filter_map(|e| {
+                            let queued_at = e["queuedAt"].as_str()?;
+                            let queued_ms =
+                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let age = (now_ms - queued_ms).max(0);
+                            if age > STALE_QUEUE_ENTRY_AFTER_MS {
+                                Some((e["id"].as_str().unwrap_or_default(), age))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if stale.is_empty() {
+                continue;
+            }
+            let archived = match workspace_archived {
+                Some(v) => v,
+                None => {
+                    let v = !workspace_id.is_chief()
+                        && self
+                            .store
+                            .get_workspace(&workspace_id)
+                            .await
+                            .map(|w| w.archived)
+                            .unwrap_or(false);
+                    workspace_archived = Some(v);
+                    v
+                }
+            };
+            if archived {
+                break;
+            }
+            let agent = AgentId(aid.to_string());
+            if self.question_hold_active(&agent).await {
+                let user_origin_ids: HashSet<String> = {
+                    let guard = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    guard
+                        .get(&agent)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|m| m.user_origin)
+                                .map(|m| m.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                stale.retain(|(id, _)| user_origin_ids.contains(*id));
+            }
+            let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
+                continue;
+            };
+            let status = session_by_id
+                .get(aid)
+                .and_then(|s| agent_status_wire(s.status))
+                .unwrap_or("unknown");
+            stuck_risks.push(json!({
+                "type": "stale-queue-entry",
+                "severity": "warning",
+                "message": format!(
+                    "Agent {aid} ({status}) has {} undelivered queued message(s); oldest entry {oldest_id} queued {oldest_age}ms ago",
+                    stale.len(),
+                ),
+                "agentId": aid,
+                "entryId": oldest_id,
+                "ageMs": oldest_age,
+                "count": stale.len(),
+            }));
         }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {

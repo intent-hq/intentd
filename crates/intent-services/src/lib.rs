@@ -108,6 +108,7 @@ mod shell;
 pub mod stack_sample;
 mod terminal_ops;
 pub mod tool_block;
+mod transfer;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -3715,7 +3716,12 @@ impl Services {
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
         // failures fail open (no annotation); the wake always proceeds.
-        let stall = if watches.is_empty() {
+        // monorepo#1898: an event payload carrying a report (copied from the
+        // session at emit time) means the child DID report — suppress the
+        // suspicion entirely (text AND `stallSuspected` metadata) even if the
+        // persisted report was cleared since, so the machine-readable flag
+        // can never contradict the rendered `Report:` clause.
+        let stall = if watches.is_empty() || event_carries_report(&event.data) {
             None
         } else {
             self.stall_suspicion_for_completion(child_id, &event.event_type)
@@ -7968,6 +7974,19 @@ fn replace_uuid_tokens(text: &str) -> String {
     out
 }
 
+/// monorepo#1898: does this completion event's payload carry a non-empty
+/// completion report (`completionReport`, canonical, or the legacy `report`
+/// key)? The report is copied from the session at emit time, so a carrying
+/// event means the child DID report — used to suppress the stall suspicion
+/// (text and `stallSuspected` metadata) even when the persisted session
+/// report was cleared after emit.
+pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| !r.is_empty())
+}
+
 /// Build a concise, human-readable wake string describing a child agent's
 /// completion for its parent. A minimal port of the TS formatEventNotification
 /// intent: it names the child, the completion kind, and any completion
@@ -7996,6 +8015,7 @@ fn format_completion_wake(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = event
         .data
         .get("completionReport")
@@ -8004,6 +8024,7 @@ fn format_completion_wake(
         .filter(|s| !s.is_empty())
     {
         msg.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -8018,8 +8039,14 @@ fn format_completion_wake(
             msg.push_str(&format!(" Error: {err}"));
         }
     }
+    // monorepo#1898: the stall suspicion and the report can come from
+    // different session reads, so the tail is derived from what was actually
+    // rendered — a wake carrying a `Report:` clause never gets the
+    // contradictory "No completion report … may have stalled" suffix.
     if let Some(stall) = stall {
-        msg.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            msg.push_str(&stall.annotation_suffix());
+        }
     }
     msg
 }
@@ -8051,6 +8078,7 @@ pub(crate) fn format_group_child_line(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut line = format!("- {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = completion_report
         .or_else(|| {
             event
@@ -8062,6 +8090,7 @@ pub(crate) fn format_group_child_line(
         .filter(|r| !r.is_empty())
     {
         line.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -8099,8 +8128,13 @@ pub(crate) fn format_group_child_line(
             .unwrap_or("");
         line.push_str(&format!(" {verb}: {reason}"));
     }
+    // monorepo#1898: same consistency guard as `format_completion_wake` —
+    // never append the "No completion report" tail to a line that already
+    // rendered a `Report:` clause.
     if let Some(stall) = stall {
-        line.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            line.push_str(&stall.annotation_suffix());
+        }
     }
     line
 }
@@ -8144,9 +8178,10 @@ impl StallSuspicion {
 impl Services {
     /// Evaluate the monorepo#1016 stall predicate for a child completion:
     /// `agent:idle` AND no persisted completion report AND the session has an
-    /// assigned task note whose status is not complete/cancelled. Every store
-    /// failure fails OPEN (returns `None`) — annotation is best-effort and
-    /// must never block, delay, or drop a wake.
+    /// assigned task note whose status is not complete/cancelled/
+    /// review_required (monorepo#1898). Every store failure fails OPEN
+    /// (returns `None`) — annotation is best-effort and must never block,
+    /// delay, or drop a wake.
     pub(crate) async fn stall_suspicion_for_completion(
         &self,
         child_id: &AgentId,
@@ -8179,7 +8214,18 @@ impl Services {
             .await
             .ok()?;
         let task = note.metadata.task.as_ref()?;
-        if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+        // `review_required` is excluded alongside the terminal statuses
+        // (monorepo#1898): it is set by the child's explicit completion
+        // signal (`agent.reportToParent`'s TASK-B transition), so the child
+        // finished and awaits review — "may have stalled rather than
+        // finished" would contradict it. Incident shape (monorepo#1791): a
+        // child reports (task → review_required), a later turn clears the
+        // persisted report (`clear_completion_report_if_present`), and the
+        // final idle would otherwise get the self-contradictory stall tail.
+        if matches!(
+            task.status,
+            TaskStatus::Complete | TaskStatus::Cancelled | TaskStatus::ReviewRequired
+        ) {
             return None;
         }
         let task_status = serde_json::to_value(task.status)
@@ -9756,6 +9802,63 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let decoded;
+            let source = match (&data, &source_path) {
+                (Some(b64), None) => {
+                    let payload = note_ops::strip_data_url_prefix(b64);
+                    decoded = base64::engine::general_purpose::STANDARD
+                        .decode(payload.trim())
+                        .map_err(|e| {
+                            Error::InvalidParams(format!("invalid base64 attachment data: {e}"))
+                        })?;
+                    file_ops::AttachmentSource::Bytes(&decoded)
+                }
+                (None, Some(src)) => {
+                    // Same-host FE fast path: copy a host-local file without
+                    // routing its bytes through the wire (streamed by
+                    // `fs::copy`, never buffered — the file may exceed the
+                    // transport cap by design). Absolute paths only — a
+                    // relative path would silently resolve against the
+                    // daemon's CWD.
+                    if !std::path::Path::new(src).is_absolute() {
+                        return Err(Error::InvalidParams(format!(
+                            "sourcePath must be absolute: {src}"
+                        )));
+                    }
+                    file_ops::AttachmentSource::CopyFrom(std::path::Path::new(src))
+                }
+                _ => {
+                    return Err(Error::InvalidParams(
+                        "exactly one of data or sourcePath is required".to_string(),
+                    ))
+                }
+            };
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            if root.is_empty() {
+                return Err(Error::Internal(
+                    "workspace has no resolved filesystem root".to_string(),
+                ));
+            }
+            // The exclusion contract (monorepo#1948) rides on the default
+            // `.intent/.gitignore` (ignore everything except config.json), so
+            // make sure the directory + gitignore exist before placing.
+            // `place_attachment` additionally drops an ignore-all `.gitignore`
+            // inside `attachments/` to cover repos with a customized
+            // `.intent/.gitignore`.
+            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
+            file_ops::place_attachment(&root, &file_name, source)
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         workspace_id: WorkspaceId,
@@ -10193,6 +10296,13 @@ impl WorkspaceApi for Services {
 
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_disk_usage_op(id).await })
+    }
+
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+        Box::pin(async move { self.workspace_transfer_plan_op(id).await })
     }
 
     fn create_workspace(
@@ -11575,10 +11685,10 @@ impl WorkspaceApi for Services {
                         // `instruction-service.ts` prompt-cache `':initial'`
                         // suffix, `agent-persistence.ts`) uses to classify the
                         // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON — the strict
-                        // `AgentLite.metadata` projection does not surface them
-                        // yet (future work if the daemon-only wire path grows
-                        // a consumer). The caller's metadata object is
+                        // the raw `AgentSession.metadata` JSON; the strict
+                        // `AgentLite.metadata` projection surfaces
+                        // `isInitialAgent` (presence-detected, `true`-only —
+                        // PROTOCOL §5.5). The caller's metadata object is
                         // forwarded as-is; like agent.create, only the
                         // harvested gap fields persist today (P2-12a) —
                         // `behaviorPrompt` has no session column and the
