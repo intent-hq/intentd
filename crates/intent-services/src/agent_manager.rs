@@ -1619,12 +1619,15 @@ impl AgentManager {
                 rules_config = Some(TempConfigFile { path });
                 // Persist the assembled systemPrompt on the session so
                 // `agent.getSession` can return it without re-assembly.
-                let mut updated_session = session;
-                updated_session.system_prompt = Some(prompt);
+                // Narrow write (system_prompt only): persisting the session
+                // snapshot read at the top of this function through the
+                // full-row `update_agent_session` silently reverted a
+                // concurrent `agent.setModel` landing inside the spawn window,
+                // so the next turn never saw the switch (monorepo#1936).
                 if let Err(e) = self
                     .services
                     .store
-                    .update_agent_session(&workspace_id, &updated_session)
+                    .set_agent_session_system_prompt(&workspace_id, &agent_id, &prompt)
                     .await
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "failed to persist system_prompt on session");
@@ -2905,7 +2908,7 @@ impl AgentManager {
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
-        self.detach_with_redelivery(agent_id, None).await
+        self.detach_with_redelivery(agent_id, None, true).await
     }
 
     /// [`AgentManager::detach`] with an optional pre-derived zero-output
@@ -2915,10 +2918,17 @@ impl AgentManager {
     /// releases the busy slot, because a concurrent send claims the slot the
     /// moment it frees and its worker spawn consumes the map right then —
     /// arming after the teardown (the previous shape) lost that race.
+    ///
+    /// `sync_store` controls the durable stop-redelivery mirror
+    /// (intent-hq/monorepo#1899): `true` (every hard-stop path) writes the
+    /// in-memory outcome through to `agent_stop_redelivery`; `false` (the
+    /// graceful-shutdown sweep) leaves the persisted row untouched so an
+    /// armed payload survives the restart and is rehydrated at next boot.
     async fn detach_with_redelivery(
         &self,
         agent_id: &AgentId,
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
+        sync_store: bool,
     ) -> (bool, Option<(Child, Option<u32>)>) {
         // Snapshot the live-turn slot BEFORE aborting the worker (the abort
         // drops LiveTurnGuard, clearing the slot), then flush the partial
@@ -2964,6 +2974,14 @@ impl AgentManager {
                     armed.remove(agent_id);
                 }
             }
+        }
+        // Sync unconditionally (not only when the map changed): the durable
+        // clear after a consume runs in the spawned worker task, which this
+        // detach aborts — a hard stop landing in that gap sees no map entry
+        // yet a stale row may survive in the store (the DELETE is a cheap
+        // no-op when no row exists).
+        if sync_store {
+            self.sync_stop_redelivery(agent_id).await;
         }
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
@@ -3298,7 +3316,83 @@ impl AgentManager {
                 .lock()
                 .unwrap()
                 .insert(agent_id.clone(), payload);
+            self.sync_stop_redelivery(agent_id).await;
         }
+    }
+
+    /// Write the current in-memory stop-redelivery state for one agent
+    /// through to the durable `agent_stop_redelivery` mirror
+    /// (intent-hq/monorepo#1899): upsert when a payload is armed, delete when
+    /// none is — so a daemon restart between the stop and the follow-up turn
+    /// rehydrates exactly the payload the map held. Re-reads the map at call
+    /// time (rather than taking a payload argument), so a sync racing an
+    /// arm/consume usually lands the newest state — but map-read order is
+    /// not commit order on the write pool, so a residual window remains
+    /// where e.g. a consume's DELETE commits after a re-arm's UPSERT,
+    /// leaving the store missing a payload the map holds. That agent then
+    /// degrades to pre-#1899 in-memory-only behavior until the next sync.
+    /// Best-effort by design: a store failure is logged and never blocks
+    /// the stop/turn path (the in-memory payload still serves the current
+    /// daemon lifetime).
+    async fn sync_stop_redelivery(&self, agent_id: &AgentId) {
+        let armed = self.stop_redelivery.lock().unwrap().get(agent_id).cloned();
+        let result = match armed {
+            Some(payload) => match serde_json::to_value(&payload) {
+                Ok(value) => {
+                    self.services
+                        .store
+                        .set_stop_redelivery(agent_id, &value, &now_iso())
+                        .await
+                }
+                Err(e) => Err(intent_core::Error::Internal(format!(
+                    "encode stop redelivery payload failed: {e}"
+                ))),
+            },
+            None => self.services.store.clear_stop_redelivery(agent_id).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(agent = %agent_id, error = %e, "stop-redelivery persistence sync failed");
+        }
+    }
+
+    /// Rehydrate the durable stop-redelivery mirror into the in-memory map at
+    /// daemon startup (intent-hq/monorepo#1899), so a zero-output stop armed
+    /// before a restart still redelivers on the follow-up turn. Agents that
+    /// already hold an in-memory payload are skipped (defensive; at boot the
+    /// map is empty). Undecodable payloads are dropped from the store (they
+    /// can never be consumed) and skipped. Returns the number rehydrated.
+    pub async fn rehydrate_stop_redeliveries(&self) -> Result<usize> {
+        let rows = self.services.store.load_all_stop_redeliveries().await?;
+        let mut count = 0;
+        for row in rows {
+            match serde_json::from_value::<crate::agent_ops::QueuedPrepend>(row.payload) {
+                Ok(payload) => {
+                    let mut armed = self.stop_redelivery.lock().unwrap();
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        armed.entry(row.agent_id)
+                    {
+                        entry.insert(payload);
+                        count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %row.agent_id,
+                        error = %e,
+                        "dropping undecodable persisted stop-redelivery payload"
+                    );
+                    if let Err(e) = self
+                        .services
+                        .store
+                        .clear_stop_redelivery(&row.agent_id)
+                        .await
+                    {
+                        tracing::warn!(agent = %row.agent_id, error = %e, "failed to drop undecodable stop-redelivery row");
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Hard-stop fallback for the interrupt paths (no live handle /
@@ -3322,7 +3416,9 @@ impl AgentManager {
         } else {
             None
         };
-        let (removed, child) = self.detach_with_redelivery(agent_id, redelivery).await;
+        let (removed, child) = self
+            .detach_with_redelivery(agent_id, redelivery, true)
+            .await;
         if let Some((child, spawn_pid)) = child {
             kill_child_tree(child, spawn_pid).await;
         }
@@ -4576,7 +4672,17 @@ impl AgentManager {
         // Drop any pending zero-output stop redelivery
         // (intent-hq/monorepo#1757): the truncation may have removed the
         // captured message, and the history replay above covers survivors.
-        self.stop_redelivery.lock().unwrap().remove(&agent_id);
+        // The durable mirror is cleared too (intent-hq/monorepo#1899) so a
+        // restart cannot resurrect the dropped payload.
+        let dropped = self
+            .stop_redelivery
+            .lock()
+            .unwrap()
+            .remove(&agent_id)
+            .is_some();
+        if dropped {
+            self.sync_stop_redelivery(&agent_id).await;
+        }
         // Explicit user action (question hold, PROTOCOL §5.5): the send is
         // user-origin so it is never held. The truncation above already
         // re-derived the pending-questions marker against the post-truncation
@@ -4869,6 +4975,7 @@ impl AgentManager {
         // preemption path; attachments are still emitted (history is
         // text-only).
         let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
+        let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
             if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
                 options.prepend_content = Some(match options.prepend_content.take() {
@@ -4884,6 +4991,15 @@ impl AgentManager {
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
+            // Clear the durable stop-redelivery mirror before the turn runs
+            // (intent-hq/monorepo#1899): the payload was consumed into this
+            // turn's prompt above, so a restart after this point must not
+            // rehydrate — and redeliver — it a second time. The sync re-reads
+            // the map, so a repeat stop that re-armed in the gap upserts the
+            // new payload instead of deleting.
+            if consumed_redelivery {
+                mgr.sync_stop_redelivery(&id).await;
+            }
             run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
         });
         self.workers.lock().unwrap().insert(agent_id, handle);
@@ -5703,9 +5819,14 @@ impl AgentManager {
         // grace period regardless of agent count, instead of N sequential
         // SIGTERM→grace→SIGKILL cycles (which would blow past the 5s
         // SIGTERM→SIGKILL windows of `intentd stop` and the Electron sidecar).
+        // `sync_store: false`: the graceful-shutdown detach drops the
+        // in-memory stop-redelivery payload with the rest of the runtime
+        // state, but must leave the durable `agent_stop_redelivery` row in
+        // place — the whole point of the mirror (intent-hq/monorepo#1899) is
+        // that the next boot rehydrates it for the follow-up turn.
         let mut children = Vec::new();
         for id in &ids {
-            let (_, child) = self.detach(id).await;
+            let (_, child) = self.detach_with_redelivery(id, None, false).await;
             if let Some(child) = child {
                 children.push(child);
             }
