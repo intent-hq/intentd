@@ -11,12 +11,20 @@
 //! helper reading [`TOKEN_ENV`] ([`crate::auth::token_helper_config`]) —
 //! never argv; and stderr is credential-redacted before it travels into an
 //! error.
+//!
+//! Concurrent calls for the same URL are single-flighted: they share one
+//! child (and its outcome) instead of each spawning their own and each
+//! pinning a blocking-pool worker for up to the deadline
+//! (intent-hq/monorepo#1926).
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use intent_core::{Error, Result};
+use tokio::sync::OnceCell as AsyncOnceCell;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::repo_cache::GIT_POLL;
@@ -29,7 +37,7 @@ use crate::repo_cache::GIT_POLL;
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Branches read from a remote by [`ls_remote_branches`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RemoteBranches {
     /// Branch short names (`refs/heads/*`), sorted.
     pub branches: Vec<String>,
@@ -37,16 +45,85 @@ pub struct RemoteBranches {
     pub default_branch: Option<String>,
 }
 
+/// A shared in-flight ls-remote: concurrent callers for the same URL await
+/// the same cell. The error side is the flattened message (`Error` is not
+/// `Clone`); every producer here builds `Error::Internal`, so nothing is
+/// lost re-wrapping on the way out.
+type Flight = Arc<AsyncOnceCell<std::result::Result<RemoteBranches, String>>>;
+
+/// Process-global in-flight registry, keyed by remote URL (one URL per
+/// `owner/repo` slot). Entries live only for the duration of a flight —
+/// completed flights are removed so the next cold-cache call runs fresh
+/// (outcomes are never cached, only shared while in flight).
+fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<String, Flight>>> = OnceLock::new();
+    FLIGHTS.get_or_init(Default::default)
+}
+
 /// List `url`'s branches (and default branch) with one `git ls-remote`.
 /// `token` is an optional caller-resolved GitHub token offered to the child
 /// via the environment only ([`crate::auth::token_helper_config`] reading
 /// [`TOKEN_ENV`]); it never appears in argv or error text.
+///
+/// Concurrent calls for the same `url` share one child and its outcome
+/// (single-flight, monorepo#1926); the joiners' `token`s are ignored in
+/// favor of the flight leader's. Callers resolve the token identically per
+/// URL, so this cannot swap credentials across users.
 pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
-    let url = url.to_string();
+    let owned_url = url.to_string();
     let token = token.map(str::to_owned);
-    tokio::task::spawn_blocking(move || ls_remote_blocking(&url, token.as_deref()))
+    single_flight(url, move || {
+        ls_remote_blocking(&owned_url, token.as_deref())
+    })
+    .await
+}
+
+/// Run `work` (one blocking ls-remote, one child process) on the blocking
+/// pool, deduping concurrent callers per `key`: the first caller in wins the
+/// [`AsyncOnceCell`] init and runs `work`; callers arriving while the flight
+/// is in the registry await the same cell and share the outcome. The
+/// completed flight is then retired so later calls start fresh.
+async fn single_flight<F>(key: &str, work: F) -> Result<RemoteBranches>
+where
+    F: FnOnce() -> Result<RemoteBranches> + Send + 'static,
+{
+    let flight = {
+        let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+        map.entry(key.to_string()).or_default().clone()
+    };
+    let outcome = flight
+        .get_or_init(|| async {
+            let joined = tokio::task::spawn_blocking(work)
+                .await
+                .map_err(|e| Error::Internal(format!("ls-remote task failed: {e}")));
+            match joined {
+                Ok(Ok(branches)) => Ok(branches),
+                // Flatten to the message for the Clone-able shared cell;
+                // re-wrapped as `Error::Internal` on the way out.
+                Ok(Err(e)) | Err(e) => Err(flatten_internal(e)),
+            }
+        })
         .await
-        .map_err(|e| Error::Internal(format!("ls-remote task failed: {e}")))?
+        .clone();
+    // Retire the completed flight — but only this one: a fresh flight may
+    // already occupy the slot if another caller arrived after completion.
+    {
+        let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+        if map.get(key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
+            map.remove(key);
+        }
+    }
+    outcome.map_err(Error::Internal)
+}
+
+/// The message inside an [`Error::Internal`] (what every ls-remote failure
+/// path produces), or the display form of anything else, so the shared cell
+/// round-trip does not stack `internal error:` prefixes.
+fn flatten_internal(e: Error) -> String {
+    match e {
+        Error::Internal(msg) => msg,
+        other => other.to_string(),
+    }
 }
 
 /// Blocking body of [`ls_remote_branches`]: spawn, drain both pipes off-thread
@@ -246,5 +323,120 @@ mod tests {
         let err = ls_remote_branches(&url, None).await.expect_err("must fail");
         let msg = format!("{err}");
         assert!(msg.contains("ls-remote"), "unexpected error: {msg}");
+    }
+
+    /// N concurrent cold-cache calls for the same key run `work` — the seam
+    /// that spawns exactly one child per invocation — exactly once, and every
+    /// caller gets the shared result (monorepo#1926).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_share_one_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let spawns = Arc::clone(&spawns);
+            tasks.push(tokio::spawn(async move {
+                single_flight("flight-shared", move || {
+                    spawns.fetch_add(1, Ordering::SeqCst);
+                    // Hold the flight open long enough for every caller to
+                    // join it before it retires.
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(RemoteBranches {
+                        branches: vec!["main".to_string()],
+                        default_branch: Some("main".to_string()),
+                    })
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            let r = task.await.unwrap().expect("shared flight result");
+            assert_eq!(r.branches, vec!["main"]);
+            assert_eq!(r.default_branch.as_deref(), Some("main"));
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "must spawn exactly once");
+    }
+
+    /// A completed flight is retired, not cached: a later call for the same
+    /// key runs `work` again — for successes and failures alike.
+    #[tokio::test]
+    async fn completed_flight_retires_and_reruns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let spawns = Arc::clone(&spawns);
+            single_flight("flight-retire", move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                Ok(RemoteBranches {
+                    branches: vec![],
+                    default_branch: None,
+                })
+            })
+            .await
+            .expect("flight result");
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 2, "outcomes must not cache");
+        assert!(
+            !in_flight().lock().unwrap().contains_key("flight-retire"),
+            "completed flight must leave the registry"
+        );
+    }
+
+    /// A failed flight is shared too — every concurrent caller gets the same
+    /// error, without stacked `internal error:` prefixes — and then retires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_flight_shares_the_error() {
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            tasks.push(tokio::spawn(async move {
+                single_flight("flight-error", || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    Err(Error::Internal("git ls-remote failed: boom".to_string()))
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            let err = task.await.unwrap().expect_err("shared flight error");
+            assert_eq!(
+                format!("{err}"),
+                "internal error: git ls-remote failed: boom"
+            );
+        }
+        assert!(
+            !in_flight().lock().unwrap().contains_key("flight-error"),
+            "failed flight must leave the registry"
+        );
+    }
+
+    /// Distinct keys never contend: concurrent calls for different URLs each
+    /// run their own `work`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_keys_fly_independently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..3 {
+            let spawns = Arc::clone(&spawns);
+            let key = format!("flight-distinct-{i}");
+            tasks.push(tokio::spawn(async move {
+                single_flight(&key, move || {
+                    spawns.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(RemoteBranches {
+                        branches: vec![],
+                        default_branch: None,
+                    })
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().expect("flight result");
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 3, "one spawn per key");
     }
 }
