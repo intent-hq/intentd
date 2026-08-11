@@ -7582,6 +7582,278 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
+/// staged, atomic import lifecycle over the real WSS transport. A fixture
+/// zip archive (manifest + rows) is uploaded in two chunks and committed;
+/// the imported workspace only appears in `workspace.list` after commit,
+/// with the import transforms applied, and the commit's `workspace:created`
+/// event reaches an `events.subscribe` subscriber. A version-mismatched
+/// manifest is rejected by `begin` naming both versions, and `abort` retires
+/// a pending session idempotently.
+#[tokio::test]
+async fn wss_workspace_import_lifecycle() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = "ws-wss-imported";
+    let t = "2026-08-11T00:00:00Z";
+
+    // Manifest must carry the exact intentd version (workspace-synchronized
+    // crate versions make CARGO_PKG_VERSION valid here).
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "workspaceId": ws_id,
+        "createdAt": t,
+        "tables": [],
+        "assets": [],
+        "git": { "hasRepository": false, "dirtyFiles": [], "sandboxBranches": [] }
+    });
+
+    // Fixture archive: manifest.json + rows/{workspace,agent_session}.jsonl.
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut buf);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("manifest.json", options).expect("manifest");
+    zip.write_all(manifest.to_string().as_bytes())
+        .expect("manifest bytes");
+    zip.start_file("rows/workspace.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": ws_id, "title": "WSS Imported", "branch": "main",
+                "status": "Active", "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("workspace row");
+    zip.start_file("rows/agent_session.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": "agent-wss-import", "workspace_id": ws_id, "name": "A",
+                "status": "active", "is_active": 1, "acp_session_id": "acp-stale",
+                "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("session row");
+    zip.finish().expect("zip");
+    let archive = buf.into_inner();
+    let sha = format!("{:x}", Sha256::digest(&archive));
+
+    // begin → { importId, maxChunkBytes }.
+    let begin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{},"archiveSha256":"{sha}"}}}}"#,
+            archive.len()
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    assert!(begin["result"]["maxChunkBytes"].as_u64().unwrap() > 0);
+
+    // Not visible before commit.
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        !list["result"]["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .any(|w| w["id"] == ws_id),
+        "workspace must not be listed before commit"
+    );
+
+    // Two chunks; seq 0 retried idempotently.
+    let mid = archive.len() / 2;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    for (id, seq, part) in [
+        (3, 0, &archive[..mid]),
+        (4, 1, &archive[mid..]),
+        (5, 0, &archive[..mid]),
+    ] {
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":{seq},"data":"{}"}}}}"#,
+                b64(part)
+            ),
+        )
+        .await;
+        assert_eq!(resp["result"]["seq"], seq, "{resp}");
+    }
+
+    // Subscribe BEFORE commit so the `workspace:created` notification the
+    // commit publishes (§6.5) is delivered to this connection.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created"]}}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub = loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // commit → workspace live with transforms applied.
+    let committed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+    assert_eq!(
+        committed["result"]["interruptedAgents"],
+        serde_json::json!(["agent-wss-import"]),
+        "in-flight agent surfaced as interrupted: {committed}"
+    );
+    assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
+
+    // The commit's `workspace:created` event reaches the subscriber (§6.3).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:created"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:created after import commit");
+    assert_eq!(evt["workspaceId"], ws_id, "{evt}");
+
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        list["result"]["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .any(|w| w["id"] == ws_id),
+        "workspace listed after commit"
+    );
+    let interrupted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"agent.listInterrupted","params":{}}"#,
+    )
+    .await;
+    assert!(
+        interrupted["result"]["agents"]
+            .as_array()
+            .expect("interrupted agents")
+            .iter()
+            .any(|r| r["agentId"] == "agent-wss-import"),
+        "imported in-flight agent offered for resumption: {interrupted}"
+    );
+
+    // Version mismatch → -32602 naming both versions.
+    let mut wrong = manifest.clone();
+    wrong["creatingIntentdVersion"] = serde_json::json!("0.0.1-elsewhere");
+    wrong["workspaceId"] = serde_json::json!("ws-other");
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.import.begin","params":{{"manifest":{wrong},"archiveSizeBytes":10,"archiveSha256":"{sha}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "{rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().expect("message");
+    assert!(
+        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        "error names both versions: {msg}"
+    );
+
+    // abort: pending session → true, retired/unknown → false (idempotent).
+    let mut ok = manifest.clone();
+    ok["workspaceId"] = serde_json::json!("ws-abortable");
+    let begun = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"workspace.import.begin","params":{{"manifest":{ok},"archiveSizeBytes":10,"archiveSha256":"{sha}"}}}}"#
+        ),
+    )
+    .await;
+    let abort_id = begun["result"]["importId"].as_str().expect("importId");
+    let aborted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.import.abort","params":{{"importId":"{abort_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(aborted["result"]["aborted"], true, "{aborted}");
+    let again = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"workspace.import.abort","params":{{"importId":"{abort_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(again["result"]["aborted"], false, "{again}");
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
