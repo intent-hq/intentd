@@ -555,6 +555,11 @@ mod tests {
 
     #[test]
     fn enhanced_path_dirs_includes_current_path() {
+        // Hold the fake-shell lock: this can be the first caller of the
+        // LOGIN_SHELL_CAPTURE OnceLock, whose lazy init forks the real
+        // login shell and must not overlap a sibling's script write.
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         // Should at least include the directories from current PATH
         assert!(!dirs.is_empty());
@@ -562,6 +567,9 @@ mod tests {
 
     #[test]
     fn enhanced_path_dirs_deduplicates() {
+        // Hold the fake-shell lock: may lazily init LOGIN_SHELL_CAPTURE (forks)
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         let mut seen = HashSet::new();
         for dir in &dirs {
@@ -576,6 +584,9 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn enhanced_path_dirs_includes_common_unix_dirs() {
+        // Hold the fake-shell lock: may lazily init LOGIN_SHELL_CAPTURE (forks)
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         let dir_strs: Vec<String> = dirs
             .iter()
