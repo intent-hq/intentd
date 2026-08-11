@@ -61,6 +61,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -166,6 +167,8 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )
@@ -286,6 +289,8 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
             vec![],
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("mark as task");
@@ -376,6 +381,8 @@ async fn agent_delegate_creates_new_agent_for_task() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )

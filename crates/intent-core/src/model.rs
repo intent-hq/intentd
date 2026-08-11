@@ -254,6 +254,14 @@ pub struct Workspace {
     /// directory (remote / skip-isolation / chief).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<WorkspaceDiskUsage>,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.1): set on
+    /// `workspace.list` / `workspace.get` rows while a `workspace.delete`
+    /// grace window (`undoDelayMs > 0`) is running, so clients can render or
+    /// hide the row as they choose. Never persisted — a daemon restart drops
+    /// the pending deletion and the field disappears. Omitted (not `null`)
+    /// when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -352,6 +360,7 @@ pub fn chief_workspace() -> Workspace {
         cow_supported: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -1048,6 +1057,15 @@ pub struct TaskMetadata {
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_order: Option<i64>,
+    /// Task-note ids this task depends on (hard ordering edges). Written via
+    /// `task.setRelations` / `task.markAsTask`; cycle-checked at write time.
+    /// Omitted on the wire when empty so pre-existing notes are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    /// Task-note ids this task conflicts with (advisory, symmetric by
+    /// convention — no cycle check). Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
 }
 
 /// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.
@@ -1316,6 +1334,15 @@ pub struct NoteTaskRow {
     pub status: String,
     pub task_note_id: Option<String>,
     pub linked_task_note_id: Option<String>,
+    /// Relations mirrored from the linked task note's metadata (empty and
+    /// omitted for rows without a linked task note).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Result of `note.readAsset` (PROTOCOL §5.2). `data` is base64; `sizeKb` is
@@ -1509,6 +1536,10 @@ pub struct TaskGetMyTaskResult {
     pub assigned_agents: Vec<AgentId>,
     /// Monotonic version counter echoed from the backing note (§8.3/§8.4).
     pub rev: i64,
+    /// Computed: `dependsOn` ids whose task is not yet `complete` (missing
+    /// and cancelled deps count as unmet). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Canonical task facts for a workspace (TS `WorkspaceTask`, `shared/types.ts`).
@@ -1522,6 +1553,14 @@ pub struct WorkspaceTask {
     pub title: String,
     pub status: TaskStatus,
     pub updated_at: String,
+    /// Task relations (empty and omitted for tasks without them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
@@ -1543,6 +1582,21 @@ pub struct TaskMarkAsTaskResult {
     pub ok: bool,
     pub note_id: NoteId,
     pub status: TaskStatus,
+}
+
+/// Result of `task.setRelations` (PROTOCOL §5.4). Echoes the stored relations
+/// after the write so callers see the normalized (deduped) lists — always
+/// present (a cleared list echoes `[]`), unlike the omitted-when-empty
+/// projections on the read paths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSetRelationsResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    #[serde(default)]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default)]
+    pub conflicts_with: Vec<NoteId>,
 }
 
 /// Result of `task.convertBlocks`.
@@ -2065,6 +2119,14 @@ pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
 /// [`AgentSession::last_seen_message_id`].
 pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 
+/// Metadata key under which the initial-agent flag is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.1/§5.5): stamped `true` by the
+/// daemon's `workspace.create` initial-agent orchestration so clients can
+/// classify the workspace's coordinator. No schema migration — the flag rides
+/// the existing free-form `metadata` column and survives daemon restarts.
+/// Read back by [`AgentSession::is_initial_agent`].
+pub const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
+
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
 /// user-originated entry point — which always delivers immediately; it
@@ -2259,6 +2321,15 @@ pub struct AgentSession {
     /// the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.getSession` reads while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session. NOT persisted — the
+    /// service layer overlays it on read from the in-memory registry, and a
+    /// daemon restart drops the pending deletion (the session survives and
+    /// the field disappears). Omitted (not `null`) when no deletion is
+    /// pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2321,6 +2392,19 @@ impl AgentSession {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
     }
+
+    /// The initial-agent flag persisted under [`IS_INITIAL_AGENT_KEY`] in the
+    /// session's free-form `metadata`: `true` only when the metadata is an
+    /// object carrying the JSON boolean `true` under that key (any other
+    /// value — absent, `false`, or non-boolean — reads as `false`). Stamped
+    /// by the daemon's `workspace.create` initial-agent orchestration.
+    pub fn is_initial_agent(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(IS_INITIAL_AGENT_KEY))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -2379,6 +2463,12 @@ pub struct AgentMetadata {
     /// after it on conversation entry. Omitted when nothing was marked seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_message_id: Option<String>,
+    /// Initial-agent flag (PROTOCOL §5.1/§5.5): present as `true` only when
+    /// the raw session metadata carries the daemon-stamped
+    /// [`IS_INITIAL_AGENT_KEY`] boolean `true` (the `workspace.create`
+    /// initial-agent orchestration). Omitted otherwise — never `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_initial_agent: Option<bool>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -2533,6 +2623,16 @@ pub struct AgentLite {
     /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.list` / `agent.get` rows while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session, so clients can render
+    /// or hide the row as they choose. Never persisted — overlaid by the
+    /// service projection from the in-memory registry (stays `None` in
+    /// [`AgentLite::from_session`], which has no runtime context); a daemon
+    /// restart drops the pending deletion and the field disappears. Omitted
+    /// (not `null`) when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
     pub metadata: AgentMetadata,
 }
 
@@ -2551,6 +2651,7 @@ impl AgentLite {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
+        let is_initial_agent = session.is_initial_agent().then_some(true);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -2568,6 +2669,7 @@ impl AgentLite {
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
             last_seen_message_id,
+            is_initial_agent,
         };
         Self {
             id: session.id,
@@ -2608,6 +2710,7 @@ impl AgentLite {
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
+            pending_delete_at: session.pending_delete_at,
             metadata,
         }
     }
@@ -2751,12 +2854,26 @@ pub enum GitFileStatus {
 /// One entry in [`GitStatus::files`] (`{ path, status, staged }`), mirroring the
 /// TS `FileStatus`. A file with both staged and unstaged changes yields two
 /// entries (matching the TS `parseStatusOutput`).
+///
+/// Submodule (gitlink) entries additionally carry `mode: "160000"` plus the
+/// old/new pin SHAs (monorepo#1739) so a client can route them to a dedicated
+/// presentation without probing `git.showFile`. All three fields are omitted
+/// for regular file entries (additive, backward-compatible).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStatus {
     pub path: String,
     pub status: GitFileStatus,
     pub staged: bool,
+    /// Octal tree-entry mode string, present only for gitlinks (`"160000"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Pre-change submodule pin SHA (`None` for a newly added submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_sha: Option<String>,
+    /// Post-change submodule pin SHA (`None` for a deleted submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_sha: Option<String>,
 }
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
@@ -3542,6 +3659,7 @@ mod tests {
             cow_supported: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -4092,10 +4210,12 @@ mod tests {
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
                 LAST_SEEN_MESSAGE_ID_KEY: "msg-seen",
+                IS_INITIAL_AGENT_KEY: true,
             })),
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -4118,6 +4238,8 @@ mod tests {
         assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
         // The per-conversation seen marker is lifted the same way.
         assert_eq!(v["metadata"]["lastSeenMessageId"], "msg-seen");
+        // The daemon-stamped initial-agent flag is lifted the same way.
+        assert_eq!(v["metadata"]["isInitialAgent"], true);
         // The persisted session value is served, not a hard-coded `false`
         // (G-A1/P3-1.2c).
         assert_eq!(v["metadata"]["isBackground"], true);
@@ -4134,6 +4256,79 @@ mod tests {
         assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
+    }
+
+    /// `metadata.isInitialAgent` is presence-detected: omitted from the
+    /// `AgentLite` metadata projection when the raw session metadata lacks the
+    /// key, and equally omitted when the key is present but not the JSON
+    /// boolean `true` (`false` or a non-boolean value) — never `false`, never
+    /// `null` (PROTOCOL §5.5).
+    #[test]
+    fn agent_lite_is_initial_agent_omitted_unless_true() {
+        let session = |metadata: Option<serde_json::Value>| AgentSession {
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let project = |metadata: Option<serde_json::Value>| {
+            let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
+            serde_json::to_value(&lite).unwrap()
+        };
+
+        // No metadata at all, key absent, `false`, and non-boolean values all
+        // omit the key entirely.
+        for metadata in [
+            None,
+            Some(json!({})),
+            Some(json!({ IS_INITIAL_AGENT_KEY: false })),
+            Some(json!({ IS_INITIAL_AGENT_KEY: "true" })),
+        ] {
+            let v = project(metadata.clone());
+            assert!(
+                v["metadata"].get("isInitialAgent").is_none(),
+                "expected isInitialAgent omitted for metadata {metadata:?}: {v}"
+            );
+        }
+
+        // Only the JSON boolean `true` surfaces the flag.
+        let v = project(Some(json!({ IS_INITIAL_AGENT_KEY: true })));
+        assert_eq!(v["metadata"]["isInitialAgent"], true);
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:
@@ -4184,6 +4379,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

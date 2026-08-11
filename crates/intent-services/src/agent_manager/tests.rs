@@ -349,6 +349,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -393,6 +394,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         })
         .await
         .unwrap();
@@ -436,6 +438,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         })
         .await
         .unwrap();
@@ -493,6 +496,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         })
         .await
         .unwrap();
@@ -579,6 +583,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         })
         .await
         .unwrap();
@@ -1321,6 +1326,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -1841,6 +1847,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     let session = AgentSession {
         id: id.clone(),
@@ -1881,6 +1888,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     mgr.services
         .store
@@ -4130,6 +4138,241 @@ async fn stop_fallback_kill_path_arms_redelivery_for_next_turn() {
     assert!(armed.file_blocks.is_none());
 }
 
+/// A second [`AgentManager`] over the SAME store, standing in for the daemon
+/// process that replaces the stopped one in the restart regression tests.
+fn restarted_manager(mgr: &AgentManager) -> AgentManager {
+    let store = mgr.services.store.clone();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    AgentManager::new(services, sink, 8)
+}
+
+/// Drive a zero-output user stop that arms the redelivery payload (the
+/// spawn-window fallback path — no `acpSessionId`), shared by the
+/// persistence regression tests below.
+async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    seed_agent(mgr, ws, id).await;
+    track(mgr, id);
+    assert!(mgr.try_begin(id, ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .set_live_turn(id, "msg-stop-persist", Vec::new());
+    assert!(mgr.interrupt(id).await, "fallback stop finds the agent");
+    assert!(
+        mgr.stop_redelivery.lock().unwrap().contains_key(id),
+        "zero-output fallback stop arms the redelivery payload"
+    );
+}
+
+/// Regression for intent-hq/monorepo#1899: the armed zero-output
+/// stop-redelivery payload is mirrored to the store, survives a daemon
+/// restart (graceful shutdown → fresh manager over the same store →
+/// rehydration), and the follow-up turn on the NEW manager still redelivers
+/// the stopped message's text + attachments — then clears the persisted row
+/// so a second restart cannot redeliver it again.
+#[tokio::test]
+async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-restart"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // The arm wrote through to the durable mirror.
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(rows.len(), 1, "armed payload persisted: {rows:?}");
+    assert_eq!(rows[0].agent_id, id);
+    assert_eq!(rows[0].payload["content"], json!("first with screenshot"));
+
+    // Graceful daemon shutdown must NOT clear the persisted row.
+    mgr.shutdown().await;
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(
+        rows.len(),
+        1,
+        "graceful shutdown preserves the persisted payload: {rows:?}"
+    );
+
+    // "Restart": a fresh manager over the same store rehydrates the payload.
+    let mgr2 = Arc::new(restarted_manager(&mgr));
+    let rehydrated = mgr2
+        .rehydrate_stop_redeliveries()
+        .await
+        .expect("rehydrate stop redeliveries");
+    assert_eq!(rehydrated, 1);
+    let armed = mgr2.stop_redelivery.lock().unwrap().get(&id).cloned();
+    let armed = armed.expect("rehydrated payload lands in the in-memory map");
+    assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    assert_eq!(
+        armed.image_blocks,
+        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+    );
+
+    // Follow-up send on the restarted manager: the prompt redelivers the
+    // stopped message's text ahead of the follow-up, plus its attachment.
+    let (_agent, log) = track_mock_agent_with_log(&mgr2, &id, false);
+    let result = mgr2
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+    let mut prompt_params = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                prompt_params = Some(params.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let params = prompt_params.expect("session/prompt sent for the follow-up turn");
+    let blocks = params["prompt"].as_array().expect("prompt blocks");
+    let prompt_text = blocks
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first_pos = prompt_text
+        .find("first with screenshot")
+        .expect("restarted follow-up redelivers the stopped message's text");
+    let follow_pos = prompt_text
+        .find("follow-up")
+        .expect("follow-up prompt carries its own content");
+    assert!(
+        first_pos < follow_pos,
+        "stopped message precedes the follow-up: {prompt_text:?}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+        "restarted follow-up redelivers the stopped message's image attachment: {blocks:?}"
+    );
+
+    // Consumption clears the durable mirror (async, from the worker task):
+    // a restart after the follow-up turn must not redeliver a second time.
+    let mut cleared = false;
+    for _ in 0..50 {
+        let rows = mgr2
+            .services
+            .store
+            .load_all_stop_redeliveries()
+            .await
+            .expect("load stop redeliveries");
+        if rows.is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(cleared, "consumed payload's persisted row is cleared");
+}
+
+/// Companion gate for intent-hq/monorepo#1899: a hard `agent.stop` landing
+/// while a payload is armed drops BOTH the in-memory payload and its durable
+/// mirror — a restart after the stop must not resurrect it.
+#[tokio::test]
+async fn hard_stop_clears_persisted_stop_redelivery() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-clear"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // Re-track (the fallback stop removed the handle) and hard-stop.
+    track(&mgr, &id);
+    assert!(mgr.stop(&id).await);
+
+    assert!(
+        !mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "hard stop drops the in-memory payload"
+    );
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert!(
+        rows.is_empty(),
+        "hard stop clears the persisted payload: {rows:?}"
+    );
+}
+
+/// Regression for the consume-gap race (intent-hq/monorepo#1899 review):
+/// `spawn_worker` removes the map entry synchronously but clears the durable
+/// row from the spawned (abortable) worker task. A hard stop landing in that
+/// gap sees no map entry, so it must sync the store UNCONDITIONALLY — a
+/// change-gated sync would skip the clear, leaving a stale row that a later
+/// restart rehydrates (double redelivery of an already-consumed message).
+#[tokio::test]
+async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-gap"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // Simulate the consume gap: the map entry is gone (spawn_worker removed
+    // it) but the durable row still exists (the worker task's clear never
+    // ran because the hard stop aborts it).
+    mgr.stop_redelivery.lock().unwrap().remove(&id);
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(rows.len(), 1, "stale persisted row set up: {rows:?}");
+
+    track(&mgr, &id);
+    assert!(mgr.stop(&id).await);
+
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert!(
+        rows.is_empty(),
+        "hard stop clears the stale persisted row even with no map entry: {rows:?}"
+    );
+}
+
 /// Shutdown-capture companion: a graceful daemon shutdown landing while the
 /// live-turn slot is open but EMPTY persists the empty interrupted row
 /// stamped `daemon_shutdown` (every interruption leaves a marker row).
@@ -5119,6 +5362,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 
@@ -5510,6 +5754,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     mgr.services
         .store
@@ -5613,6 +5858,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store
         .insert_workspace(&workspace)
@@ -8497,6 +8743,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -8719,6 +8966,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
 
     assert_eq!(

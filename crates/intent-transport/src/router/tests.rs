@@ -59,6 +59,7 @@ fn sample_ws() -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -146,6 +147,41 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(intent_core::transfer::TransferPlan {
+                manifest: intent_core::transfer::TransferManifest {
+                    format_version: intent_core::transfer::TRANSFER_FORMAT_VERSION,
+                    creating_intentd_version: "0.0.0".to_string(),
+                    workspace_id: id,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    tables: vec![intent_core::transfer::TransferTableStat {
+                        name: "note".to_string(),
+                        row_count: 2,
+                        approx_bytes: 100,
+                    }],
+                    assets: vec![],
+                    git: intent_core::transfer::TransferGitSummary {
+                        has_repository: false,
+                        branch: None,
+                        dirty_files: vec![],
+                        sandbox_branches: vec![],
+                    },
+                },
+                total_size_bytes: 100,
+                db_row_bytes: 100,
+                asset_bytes: 0,
+                estimated_git_bundle_bytes: 0,
+                warnings: vec![],
+            })
+        })
+    }
     fn create_workspace(
         &self,
         input: WorkspaceCreate,
@@ -187,6 +223,61 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(())
+        })
+    }
+    fn schedule_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(format!("2026-01-01T00:00:{:02}Z", undo_delay_ms / 1000))
+        })
+    }
+    fn cancel_workspace_delete(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            // "pending" has a scheduled deletion; anything else reports the
+            // race-safe non-error `false`.
+            Ok(id.as_str() == "pending")
+        })
+    }
+    fn agent_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+    fn agent_schedule_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(format!("2026-01-01T00:00:{:02}Z", undo_delay_ms / 1000))
+        })
+    }
+    fn agent_cancel_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            // "agent-pending" has a scheduled deletion; anything else reports
+            // the race-safe non-error `false`.
+            Ok(agent_id.0 == "agent-pending")
         })
     }
     fn archive_workspace(
@@ -501,6 +592,9 @@ impl WorkspaceApi for FakeApi {
                 status: "todo".to_string(),
                 task_note_id: None,
                 linked_task_note_id: None,
+                depends_on: Vec::new(),
+                conflicts_with: Vec::new(),
+                unmet_depends_on: Vec::new(),
             }])
         })
     }
@@ -719,6 +813,9 @@ impl WorkspaceApi for FakeApi {
                     path: "src/a.ts".to_string(),
                     status: GitFileStatus::Modified,
                     staged: true,
+                    mode: None,
+                    old_sha: None,
+                    new_sha: None,
                 }],
                 has_uncommitted_changes: true,
                 has_untracked_files: false,
@@ -2293,6 +2390,58 @@ async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     );
 }
 
+/// `workspace.transfer.plan` wraps the service payload as `{ plan }` with the
+/// camelCase manifest/size fields (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_transfer_plan_returns_plan_envelope() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    let plan = &v["result"]["plan"];
+    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(1));
+    assert_eq!(plan["manifest"]["workspaceId"], serde_json::json!("ws-1"));
+    assert_eq!(
+        plan["manifest"]["tables"][0]["rowCount"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        plan["manifest"]["git"]["hasRepository"],
+        serde_json::json!(false)
+    );
+    assert_eq!(plan["totalSizeBytes"], serde_json::json!(100));
+    assert_eq!(plan["dbRowBytes"], serde_json::json!(100));
+    assert_eq!(plan["assetBytes"], serde_json::json!(0));
+    assert_eq!(plan["estimatedGitBundleBytes"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
 #[tokio::test]
 async fn workspace_create_returns_workspace_object() {
     let v =
@@ -2444,6 +2593,153 @@ async fn workspace_delete_returns_success_true() {
     assert_eq!(v["result"]["success"], serde_json::json!(true));
 }
 
+/// `undoDelayMs: 0` (and explicit `null`) keep the immediate-delete result
+/// byte-identical (§5.1): bare `{ success: true }`, no `scheduled`/`deleteAt`.
+#[tokio::test]
+async fn workspace_delete_zero_or_null_undo_delay_is_immediate() {
+    for params in [
+        r#"{"workspaceId":"ws-1","undoDelayMs":0}"#,
+        r#"{"workspaceId":"ws-1","undoDelayMs":null}"#,
+    ] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"], serde_json::json!({ "success": true }), "{v}");
+    }
+}
+
+/// `undoDelayMs > 0` schedules the grace window (§5.1): the result carries
+/// `scheduled: true` plus the ISO `deleteAt` deadline from the API.
+#[tokio::test]
+async fn workspace_delete_with_undo_delay_returns_scheduled_shape() {
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{"workspaceId":"ws-1","undoDelayMs":15000}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "deleteAt": "2026-01-01T00:00:15Z",
+        }),
+        "{v}"
+    );
+}
+
+/// A non-integer `undoDelayMs` is `-32602` (negative numbers and strings both
+/// fail `as_u64`).
+#[tokio::test]
+async fn workspace_delete_invalid_undo_delay_is_minus_32602() {
+    for bad in [r#""soon""#, "-1", "1.5", "true"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{{"workspaceId":"ws-1","undoDelayMs":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "undoDelayMs={bad}: {v}");
+    }
+}
+
+/// `workspace.cancelDelete` returns `{ cancelled: bool }` (§5.1): `true` when
+/// a pending deletion was cancelled, `false` otherwise — a non-error,
+/// race-safe outcome (never `-32602`/`-32603` for "nothing pending").
+#[tokio::test]
+async fn workspace_cancel_delete_returns_cancelled_flag() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.cancelDelete","params":{"workspaceId":"pending"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "cancelled": true }), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.cancelDelete","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "cancelled": false }),
+        "{v}"
+    );
+}
+
+/// `undoDelayMs: 0` (and explicit `null`) keep the immediate agent-delete
+/// result byte-identical (§5.5): bare `{ success: true }`, no
+/// `scheduled`/`deleteAt`.
+#[tokio::test]
+async fn agent_delete_zero_or_null_undo_delay_is_immediate() {
+    for params in [
+        r#"{"agentId":"agent-1","undoDelayMs":0}"#,
+        r#"{"agentId":"agent-1","undoDelayMs":null}"#,
+        r#"{"agentId":"agent-1"}"#,
+    ] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"], serde_json::json!({ "success": true }), "{v}");
+    }
+}
+
+/// `undoDelayMs > 0` schedules the agent delete grace window (§5.5): the
+/// result carries `scheduled: true` plus the ISO `deleteAt` deadline from
+/// the API.
+#[tokio::test]
+async fn agent_delete_with_undo_delay_returns_scheduled_shape() {
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{"agentId":"agent-1","undoDelayMs":15000}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "deleteAt": "2026-01-01T00:00:15Z",
+        }),
+        "{v}"
+    );
+}
+
+/// A non-integer `undoDelayMs` on `agent.delete` is `-32602` (negative
+/// numbers and strings both fail `as_u64`).
+#[tokio::test]
+async fn agent_delete_invalid_undo_delay_is_minus_32602() {
+    for bad in [r#""soon""#, "-1", "1.5", "true"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{{"agentId":"agent-1","undoDelayMs":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "undoDelayMs={bad}: {v}");
+    }
+}
+
+/// `agent.cancelDelete` returns `{ cancelled: bool }` (§5.5): `true` when a
+/// pending deletion was cancelled, `false` otherwise — a non-error, race-safe
+/// outcome (never `-32602`/`-32603` for "nothing pending"). `agentId` is
+/// required.
+#[tokio::test]
+async fn agent_cancel_delete_returns_cancelled_flag() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.cancelDelete","params":{"agentId":"agent-pending"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "cancelled": true }), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.cancelDelete","params":{"agentId":"agent-1","workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "cancelled": false }),
+        "{v}"
+    );
+
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.cancelDelete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+}
+
 /// `workspace.archive` and `workspace.unarchive` return the updated
 /// `workspace` record (§5.1) — a `{success:true}` shape would force a
 /// follow-up `workspace.get` on the FE. The `archived` flag flips through
@@ -2510,6 +2806,7 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
     for method in [
         "workspace.update",
         "workspace.delete",
+        "workspace.cancelDelete",
         "workspace.archive",
         "workspace.unarchive",
         "workspace.dismissAttention",

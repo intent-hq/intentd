@@ -1089,6 +1089,19 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(rehydrated) => tracing::info!(rehydrated, "rehydrated persisted agent queue messages"),
         Err(e) => tracing::warn!(error = %e, "agent queue rehydration failed"),
     }
+    // Rehydrate persisted zero-output stop-redelivery payloads (write-through
+    // `agent_stop_redelivery` mirror, intent-hq/monorepo#1899) so a stop armed
+    // before the restart still redelivers the stopped message on the next
+    // turn. Restore-only, like the queue rehydration above: it never starts a
+    // turn. Best-effort: a failure is logged but never aborts startup.
+    match manager.rehydrate_stop_redeliveries().await {
+        Ok(0) => {}
+        Ok(rehydrated) => tracing::info!(
+            rehydrated,
+            "rehydrated persisted stop-redelivery payloads on startup"
+        ),
+        Err(e) => tracing::warn!(error = %e, "stop-redelivery rehydration failed"),
+    }
     // STAB-108: Rehydrate undelivered delegation groups on startup so groups
     // survive daemon restarts without requiring the resume path. Groups are
     // reconciled against current agent state (already-completed children are

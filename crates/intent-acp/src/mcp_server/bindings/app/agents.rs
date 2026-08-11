@@ -493,6 +493,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -536,6 +537,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -553,6 +555,7 @@ mod tests {
                 sandbox_path: None,
                 dismissed_questions_message_id: None,
                 last_seen_message_id: None,
+                is_initial_agent: None,
             },
         }
     }

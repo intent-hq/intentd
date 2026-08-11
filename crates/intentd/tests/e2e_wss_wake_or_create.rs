@@ -269,6 +269,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -308,6 +309,8 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
             note.id.clone(),
             "not_started".into(),
             vec![],
+            None,
+            None,
             None,
             None,
         )

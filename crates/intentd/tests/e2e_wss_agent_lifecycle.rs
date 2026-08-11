@@ -4340,6 +4340,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -6683,6 +6684,12 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         "server-minted agent-{{uuid}} id: {created}"
     );
     assert_eq!(created["initialAgent"]["name"], "Initial agent");
+    // The initialAgent result is the AgentLite projection and surfaces the
+    // daemon-stamped initial-agent flag (PROTOCOL §5.5, presence-detected).
+    assert_eq!(
+        created["initialAgent"]["metadata"]["isInitialAgent"], true,
+        "initialAgent result carries metadata.isInitialAgent: {created}"
+    );
 
     // Event flow: workspace:created for the new id, agent:created for the
     // initial agent, ≥1 stream chunk keyed to it, exactly one stream:end.
@@ -6768,6 +6775,56 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     assert!(
         messages.iter().any(|m| m["role"] == "assistant"),
         "initial agent produced an assistant reply: {conv}"
+    );
+
+    // The persisted flag survives to later AgentLite reads: `agent.get`
+    // serves `metadata.isInitialAgent: true` for the initial agent, and a
+    // plain `agent.create`d sibling OMITS the key entirely (never `false` —
+    // presence-detected, PROTOCOL §5.5). `agent.list` agrees per row.
+    let got = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["agent"]["metadata"]["isInitialAgent"], true,
+        "agent.get serves metadata.isInitialAgent for the initial agent: {got}"
+    );
+    let sibling = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Sibling", "model": "mock:default" }),
+    )
+    .await;
+    let sibling_id = sibling["agent"]["id"]
+        .as_str()
+        .expect("sibling agent id")
+        .to_string();
+    assert!(
+        sibling["agent"]["metadata"].get("isInitialAgent").is_none(),
+        "non-initial agent omits metadata.isInitialAgent: {sibling}"
+    );
+    let listed = wss_rpc(&mut rpc, 17, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let agents = listed["agents"].as_array().expect("agents array");
+    let by_id = |id: &str| {
+        agents
+            .iter()
+            .find(|a| a["id"] == id)
+            .unwrap_or_else(|| panic!("agent {id} in list: {listed}"))
+    };
+    assert_eq!(
+        by_id(&agent_id)["metadata"]["isInitialAgent"],
+        true,
+        "agent.list serves metadata.isInitialAgent for the initial agent: {listed}"
+    );
+    assert!(
+        by_id(&sibling_id)["metadata"]
+            .get("isInitialAgent")
+            .is_none(),
+        "agent.list omits metadata.isInitialAgent for the sibling: {listed}"
     );
 
     // Replay with the same idempotencyKey: the stored result comes back (same

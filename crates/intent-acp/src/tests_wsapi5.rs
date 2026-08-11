@@ -107,6 +107,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -761,6 +762,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         metadata: AgentMetadata {
             is_background: false,
             specialist: None,
@@ -778,6 +780,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
             sandbox_branch: None,
             dismissed_questions_message_id: None,
             last_seen_message_id: None,
+            is_initial_agent: None,
         },
     }
 }
