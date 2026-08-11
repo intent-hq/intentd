@@ -39,6 +39,11 @@ pub struct MaterializedGit {
     pub checkout_dir: PathBuf,
     /// Display name registered in `known_repo`.
     pub repo_name: String,
+    /// Branch the checkout is on — the bundled `workspace_branch`, which is
+    /// whatever HEAD pointed at when the bundle was built and may differ
+    /// from the imported row's `branch`; [`MaterializedGit::apply`] rewrites
+    /// the row to match.
+    pub workspace_branch: String,
     /// The workspace base commit as recorded in the bundle manifest, for
     /// backfilling `Workspace.base_commit_sha` when the imported row has
     /// none.
@@ -54,17 +59,19 @@ pub struct MaterializedGit {
 impl MaterializedGit {
     /// Rewrite the imported rows against the materialized target paths: the
     /// workspace becomes a standalone Direct checkout at [`checkout_dir`]
-    /// (`base_commit_sha` backfilled from the bundle when missing), sandbox
-    /// rows get their target paths, and rows whose branch never made it into
-    /// the bundle are dropped — a row pointing at a directory that does not
-    /// exist would present a broken sandbox.
+    /// on [`workspace_branch`] (`base_commit_sha` backfilled from the bundle
+    /// when missing), sandbox rows get their target paths, and rows whose
+    /// branch never made it into the bundle are dropped — a row pointing at
+    /// a directory that does not exist would present a broken sandbox.
     ///
     /// [`checkout_dir`]: MaterializedGit::checkout_dir
+    /// [`workspace_branch`]: MaterializedGit::workspace_branch
     pub fn apply(&self, ws: &mut Workspace, sandboxes: &mut Vec<Sandbox>) {
         let checkout = self.checkout_dir.to_string_lossy().to_string();
         ws.repository_path = Some(checkout);
         ws.worktree_path = None;
         ws.checkout_mode = Some(CheckoutMode::Direct);
+        ws.branch = self.workspace_branch.clone();
         if ws.base_commit_sha.is_none() {
             ws.base_commit_sha = self.base_sha.clone();
         }
@@ -108,18 +115,43 @@ pub async fn materialize_workspace_git(
         )
         .await
     {
-        let created: Vec<PathBuf> = std::iter::once(out.checkout_dir.clone())
-            .chain(out.sandboxes.iter().map(|s| {
-                s.path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| s.path.clone())
-            }))
-            .collect();
-        rollback_created(&created, &ws_dir);
+        rollback_created(&created_paths(&out), &ws_dir);
         return Err(e);
     }
     Ok(out)
+}
+
+/// Every directory a successful materialization created, in
+/// [`rollback_created`] order: the checkout, then each sandbox's agent
+/// directory.
+fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
+    std::iter::once(out.checkout_dir.clone())
+        .chain(out.sandboxes.iter().map(|s| {
+            s.path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| s.path.clone())
+        }))
+        .collect()
+}
+
+/// Undo a SUCCESSFUL materialization after a later commit step fails (e.g.
+/// the row insert): remove the created checkout/sandbox directories and the
+/// `known_repo` registration, restoring the target exactly as found so the
+/// staged import can be retried or aborted. Best-effort — failures are
+/// logged, the commit error being unwound takes precedence.
+pub async fn rollback_materialized(store: &Store, out: &MaterializedGit, ws_dir: &Path) {
+    rollback_created(&created_paths(out), ws_dir);
+    if let Err(e) = store
+        .remove_known_repo(&out.checkout_dir.to_string_lossy())
+        .await
+    {
+        tracing::warn!(
+            path = %out.checkout_dir.display(),
+            error = %e,
+            "materialize rollback: failed to remove known_repo registration"
+        );
+    }
 }
 
 /// Materialize the workspace's git state from the transfer bundle. Blocking
@@ -319,6 +351,7 @@ fn materialize_inner(
     Ok(MaterializedGit {
         checkout_dir,
         repo_name,
+        workspace_branch: refs.workspace_branch.clone(),
         base_sha: refs.base_sha.clone(),
         sandboxes: materialized,
         skipped_agent_ids: skipped,
