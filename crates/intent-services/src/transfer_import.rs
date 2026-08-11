@@ -1857,9 +1857,32 @@ mod tests {
               "status": "idle", "created_at": t, "updated_at": t }
         ]);
 
-        // Bundle the source exactly as the export orchestrator would.
-        let src_ws = workspace_for_materialize(&ws, &ws_row);
-        let src_sb = sandbox_for_materialize(&sb_row);
+        // Bundle the source exactly as the export orchestrator would — the
+        // models are built as independent literals (not via the
+        // workspace_for_materialize / sandbox_for_materialize helpers under
+        // test) so a row-key mapping mistake in a helper cannot cancel out
+        // across the export/import round-trip.
+        let src_ws = {
+            let mut w = crate::tests::workspace(&ws);
+            w.branch = "feature".to_string();
+            w.base_ref = Some("main".to_string());
+            w.repository_path = Some(repo.to_string_lossy().into_owned());
+            w.repository_name = Some("test-repo".to_string());
+            w
+        };
+        let src_sb = Sandbox {
+            id: "sb-1".to_string(),
+            workspace_id: ws.clone(),
+            agent_id: AgentId(agent.to_string()),
+            path: sb_src.to_string_lossy().into_owned(),
+            branch: sb_branch.clone(),
+            base_commit_sha: base.clone(),
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: t.to_string(),
+            updated_at: t.to_string(),
+        };
         let staging = src.0.join("staging");
         let (bundle_path, refs) = crate::transfer_git::create_transfer_bundle(
             &src_ws,
@@ -2041,7 +2064,12 @@ mod tests {
             "created_at": t, "updated_at": t
         });
 
-        let src_ws = workspace_for_materialize(&ws, &ws_row);
+        let src_ws = {
+            let mut w = crate::tests::workspace(&ws);
+            w.repository_path = Some(repo.to_string_lossy().into_owned());
+            w.repository_name = Some("test-repo".to_string());
+            w
+        };
         let staging = src.0.join("staging");
         let (bundle_path, refs) =
             crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");

@@ -7749,6 +7749,191 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
+/// `workspace.import.commit` with a git payload over the real WSS transport
+/// (§5.1): the archive carries `git/repo.bundle` + `git/refs.json` built by
+/// the export bundler from a dirty source repo. Commit materializes the
+/// checkout under the daemon's workspaces root (WIP snapshot unwound — the
+/// dirty file restored, not committed), rewrites the stored workspace row
+/// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
+/// direct), and registers the checkout in `known_repo`. Skips when `git` is
+/// unavailable on PATH (the bundler shells out to it).
+#[tokio::test]
+async fn wss_workspace_import_commit_materializes_git() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping WSS git import E2E: git not available");
+        return;
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = "ws-wss-git-imported";
+    let t = "2026-08-11T00:00:00Z";
+
+    // Source repo: one commit on `main` plus an untracked file, so the
+    // bundle carries a WIP snapshot the import must unwind.
+    let src = test_tempdir("intentd-wss-import-git-src-");
+    let repo = src.path().join("source-repo");
+    {
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "Tester")
+                .env("GIT_AUTHOR_EMAIL", "t@e.dev")
+                .env("GIT_COMMITTER_NAME", "Tester")
+                .env("GIT_COMMITTER_EMAIL", "t@e.dev")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("seed file");
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "chore: init"]);
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").expect("wip file");
+    }
+
+    // Bundle the source exactly as the export orchestrator would.
+    let mut src_ws = fixture_workspace(&WorkspaceId(ws_id.to_string()));
+    src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
+    src_ws.repository_name = Some("test-repo".to_string());
+    let staging = src.path().join("staging");
+    let (bundle_path, refs) =
+        intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+            .expect("bundle");
+    assert!(
+        refs.workspace_wip_commit_sha.is_some(),
+        "source was dirty: {refs:?}"
+    );
+
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "workspaceId": ws_id,
+        "createdAt": t,
+        "tables": [],
+        "assets": [],
+        "git": { "hasRepository": true, "dirtyFiles": [], "sandboxBranches": [] }
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut buf);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("manifest.json", options).expect("manifest");
+    zip.write_all(manifest.to_string().as_bytes())
+        .expect("manifest bytes");
+    zip.start_file("rows/workspace.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": ws_id, "title": "WSS Git Imported", "branch": "main",
+                "status": "Active",
+                "repository_path": repo.to_string_lossy(),
+                "repository_name": "test-repo",
+                "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("workspace row");
+    zip.start_file("git/repo.bundle", options).expect("bundle");
+    zip.write_all(&std::fs::read(&bundle_path).expect("bundle bytes"))
+        .expect("bundle write");
+    zip.start_file("git/refs.json", options).expect("refs");
+    zip.write_all(serde_json::to_string(&refs).expect("refs json").as_bytes())
+        .expect("refs write");
+    zip.finish().expect("zip");
+    let archive = buf.into_inner();
+    let sha = format!("{:x}", Sha256::digest(&archive));
+
+    // begin → chunk → commit over the wire.
+    let begin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{},"archiveSha256":"{sha}"}}}}"#,
+            archive.len()
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&archive);
+    let chunk = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":0,"data":"{b64}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(chunk["result"]["seq"], 0, "{chunk}");
+    let committed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+
+    // The result's workspace payload carries the materialized checkout
+    // (PROTOCOL §5.1: the workspace envelope after import transforms).
+    let ws_payload = &committed["result"]["workspace"];
+    let checkout = srv
+        ._dir
+        .path()
+        .join("workspaces")
+        .join(ws_id)
+        .join("test-repo");
+    assert_eq!(
+        ws_payload["repositoryPath"].as_str(),
+        checkout.to_str(),
+        "{committed}"
+    );
+    assert!(ws_payload["worktreePath"].is_null(), "{committed}");
+    assert_eq!(ws_payload["checkoutMode"], "direct", "{committed}");
+
+    // On disk: checkout exists with the WIP snapshot unwound — the dirty
+    // file restored as uncommitted work.
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("README.md")).expect("committed file"),
+        "hello\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("wip.txt")).expect("wip file restored"),
+        "uncommitted\n"
+    );
+
+    // The checkout is registered in known_repo.
+    let known = srv.store.list_known_repos().await.expect("known repos");
+    assert!(
+        known
+            .iter()
+            .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
+        "checkout registered in known_repo: {known:?}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
