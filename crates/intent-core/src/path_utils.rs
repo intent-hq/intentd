@@ -527,6 +527,32 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Serializes every fake-shell test's script write + shell spawn.
+    ///
+    /// Under parallel test runs, a sibling test's `fork` can inherit the
+    /// still-open write fd of another test's script (CLOEXEC only closes it
+    /// at `exec`), so exec'ing that just-written script intermittently fails
+    /// with ETXTBSY and the capture silently degrades to empty
+    /// (intent-hq/monorepo#1968).
+    #[cfg(unix)]
+    static FAKE_SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn lock_fake_shell() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_SHELL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Write the fake shell script and run the capture under the shared
+    /// lock, so no other test's fork can race this script's write + exec.
+    #[cfg(unix)]
+    fn write_and_capture(path: &std::path::Path, content: &str) -> LoginShellCapture {
+        let _guard = lock_fake_shell();
+        write_fake_shell(path, content);
+        capture_login_shell_with(Some(path.to_str().unwrap()))
+    }
+
     #[test]
     fn enhanced_path_dirs_includes_current_path() {
         let dirs = enhanced_path_dirs();
@@ -581,12 +607,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
 
         // Script responds to -ilc with sentinel-wrapped PATH
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         let dirs = capture.dirs;
@@ -598,6 +622,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn capture_login_shell_path_with_invalid_shell_degrades_silently() {
+        // Locked too: this spawn's fork must not overlap a sibling's script write
+        let _guard = lock_fake_shell();
         let capture = capture_login_shell_with(Some("/nonexistent/shell"));
         assert!(capture.dirs.is_empty());
         assert!(capture.credential_env.is_empty());
@@ -737,12 +763,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_noise_{pid}_{nanos}.sh"));
 
         // Script prints noise before and after the sentinel-wrapped PATH
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  echo 'Loading nvm...'\n  echo 'nvm initialized'\n  printf '__INTENT_PATH_S__/noise/bin:/test/bin__INTENT_PATH_E__'\n  echo 'Shell ready'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2);
@@ -765,12 +790,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_no_sentinel_{pid}_{nanos}.sh"));
 
         // Script outputs PATH without sentinels
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '/missing/bin:/sentinels/bin'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert!(
@@ -794,12 +818,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_fallback_{pid}_{nanos}.sh"));
 
         // Script fails on -ilc but succeeds on -lc
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  exit 1\nelif [ \"$1\" = \"-lc\" ]; then\n  printf '__INTENT_PATH_S__/fallback/bin:/backup/bin__INTENT_PATH_E__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should fall back to -lc when -ilc fails");
@@ -822,12 +845,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_multi_{pid}_{nanos}.sh"));
 
         // Script outputs sentinels multiple times
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/first/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__/last/bin:/final/bin__INTENT_PATH_E__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should use last sentinel occurrence");
@@ -850,12 +872,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_trailing_{pid}_{nanos}.sh"));
 
         // Script outputs a complete pair followed by a bare start sentinel
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/valid/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -887,10 +908,8 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
             noise
         );
-        write_fake_shell(&fake_shell, &script);
-
         let start = std::time::Instant::now();
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        let dirs = write_and_capture(&fake_shell, &script).dirs;
         let elapsed = start.elapsed();
         fs::remove_file(&fake_shell).ok();
 
@@ -963,12 +982,10 @@ mod tests {
 
         // Script emits PATH sentinels plus a NUL-separated env payload with
         // an exact-name var, a prefix var, and a non-allow-listed var
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'ANTHROPIC_API_KEY=test-exact\\0AUGGIE_TOKEN=test-prefix\\0NOT_ALLOWED=dropped\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/env/bin")]);
@@ -1005,12 +1022,10 @@ mod tests {
 
         // An env *value* containing the literal PATH end sentinel must not
         // re-anchor the PATH extraction into the env payload.
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
@@ -1034,12 +1049,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_env_nl_{pid}_{nanos}.sh"));
 
         // Value contains a newline; NUL separation must keep it intact
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_MULTI=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -1069,12 +1082,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_env_none_{pid}_{nanos}.sh"));
 
         // PATH sentinels only — env sentinels absent
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/only/bin__INTENT_PATH_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/only/bin")]);
