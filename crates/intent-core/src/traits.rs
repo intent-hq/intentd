@@ -20,9 +20,9 @@ use crate::model::{
     NoteVersionSummary, ProjectType, ReadAssetResult, RepoConfig, SaveAssetResult,
     ScriptCreateParams, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskRemoveAgentFromAllTasksResult, TaskUpdateNoteStatusResult, TaskUpdateResult,
-    TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult,
-    WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceTask, WorkspaceUpdate,
 };
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
@@ -1032,9 +1032,14 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `task.markAsTask`: attach/replace task metadata on a note (PROTOCOL §5.4).
     ///
+    /// `depends_on` / `conflicts_with` optionally seed the task's relations
+    /// (validated + cycle-checked like `task.setRelations`); `None` leaves any
+    /// existing relations untouched.
+    ///
     /// `caller_agent_id` attributes the resulting `task:created` /
     /// `task:status-changed` event to the invoking agent (the MCP front door
     /// passes it); `None` → system-attributed.
+    #[allow(clippy::too_many_arguments)]
     fn mark_as_task(
         &self,
         workspace_id: WorkspaceId,
@@ -1042,6 +1047,8 @@ pub trait WorkspaceApi: Send + Sync {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        depends_on: Option<Vec<NoteId>>,
+        conflicts_with: Option<Vec<NoteId>>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let _ = (
@@ -1050,11 +1057,33 @@ pub trait WorkspaceApi: Send + Sync {
             status,
             acceptance_criteria,
             effort,
+            depends_on,
+            conflicts_with,
             caller_agent_id,
         );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mark_as_task not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `task.setRelations`: replace a task's `dependsOn` / `conflictsWith`
+    /// relation lists (PROTOCOL §5.4). `None` keeps the existing list;
+    /// `Some(vec![])` clears it. Ids are validated (must be task notes in the
+    /// same workspace, no self-edges) and `depends_on` writes that would close
+    /// a dependency cycle are rejected with the cycle path named in the error.
+    fn task_set_relations(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        depends_on: Option<Vec<NoteId>>,
+        conflicts_with: Option<Vec<NoteId>>,
+    ) -> BoxFuture<'_, Result<TaskSetRelationsResult>> {
+        let _ = (workspace_id, note_id, depends_on, conflicts_with);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_set_relations not implemented".to_string(),
             ))
         })
     }

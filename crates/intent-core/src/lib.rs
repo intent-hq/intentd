@@ -82,13 +82,13 @@ pub use model::{
     ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
     SetupScriptGeneratedBy, SuggestionDiff, TaskAgentLink, TaskAssignAgentResult,
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
-    WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDiskUsage,
-    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask,
-    WorkspaceTaskStats, WorkspaceUpdate,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
+    WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};

@@ -37,9 +37,9 @@ use intent_core::{
     NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
+    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -5572,6 +5572,7 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
         .map(|n| extract_spec_task_ids(&n.content))
         .unwrap_or_default();
     let has_links = !linked.is_empty();
+    let status_by_id = task_status_by_id(notes);
 
     let mut seen = HashSet::new();
     let mut tasks = Vec::new();
@@ -5601,15 +5602,144 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
             },
             status: task.status,
             updated_at: note.updated_at.clone(),
+            depends_on: task.depends_on.clone(),
+            conflicts_with: task.conflicts_with.clone(),
+            unmet_depends_on: unmet_depends_on_ids(&task.depends_on, &status_by_id),
         });
     }
     tasks
 }
 
+/// Index a workspace's task-note statuses by note id, for the computed
+/// `unmetDependsOn` projections.
+fn task_status_by_id(notes: &[Note]) -> HashMap<String, TaskStatus> {
+    notes
+        .iter()
+        .filter_map(|n| {
+            n.metadata
+                .task
+                .as_ref()
+                .map(|t| (n.id.as_str().to_string(), t.status))
+        })
+        .collect()
+}
+
+/// Compute the unmet subset of a `dependsOn` list: a dependency is satisfied
+/// only when a task note with that id exists and is `complete` — missing and
+/// cancelled dependencies both count as unmet (spec §2.1/§2.2).
+fn unmet_depends_on_ids(
+    depends_on: &[NoteId],
+    status_by_id: &HashMap<String, TaskStatus>,
+) -> Vec<NoteId> {
+    depends_on
+        .iter()
+        .filter(|id| status_by_id.get(id.as_str()) != Some(&TaskStatus::Complete))
+        .cloned()
+        .collect()
+}
+
+/// Dedup a relation id list, preserving first-seen order.
+fn normalize_relation_ids(ids: Vec<NoteId>) -> Vec<NoteId> {
+    let mut seen = HashSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// Validate a relation id list for `task.setRelations` / `task.markAsTask`:
+/// no self-edges, and every id must name a task note in this workspace.
+fn validate_relation_ids(
+    self_id: &NoteId,
+    ids: &[NoteId],
+    notes: &[Note],
+    field: &str,
+) -> Result<()> {
+    for id in ids {
+        if id == self_id {
+            return Err(Error::Internal(format!(
+                "{field} cannot reference the task itself ({})",
+                id.as_str()
+            )));
+        }
+        let is_task = notes
+            .iter()
+            .any(|n| n.id == *id && n.metadata.task.is_some());
+        if !is_task {
+            return Err(Error::Internal(format!(
+                "{field} references {} which is not a task note in this workspace",
+                id.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Detect whether writing `source.dependsOn = new_deps` would close a
+/// dependency cycle. Walks the workspace `dependsOn` graph (with the proposed
+/// edges substituted for `source`) and returns the offending path — starting
+/// and ending at `source` — so the rejection error can name the cycle.
+/// Iterative DFS with an explicit stack: node ids are caller-controlled, so
+/// recursion depth must not scale with chain length.
+fn find_dependency_cycle(
+    source: &NoteId,
+    new_deps: &[NoteId],
+    notes: &[Note],
+) -> Option<Vec<String>> {
+    let mut graph: HashMap<&str, Vec<&str>> = notes
+        .iter()
+        .filter_map(|n| {
+            n.metadata.task.as_ref().map(|t| {
+                (
+                    n.id.as_str(),
+                    t.depends_on.iter().map(|d| d.as_str()).collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect();
+    graph.insert(
+        source.as_str(),
+        new_deps.iter().map(|d| d.as_str()).collect(),
+    );
+
+    let target = source.as_str();
+    let mut visited: HashSet<&str> = HashSet::new();
+    visited.insert(target);
+    // Stack of (node, next-edge-index); `path` mirrors the stack's nodes so a
+    // hit can report the full walk from `source` back to itself.
+    let mut stack: Vec<(&str, usize)> = vec![(target, 0)];
+    let mut path: Vec<&str> = vec![target];
+    while let Some((node, idx)) = stack.last_mut() {
+        let next = graph.get(*node).and_then(|edges| edges.get(*idx).copied());
+        match next {
+            Some(next) => {
+                *idx += 1;
+                if next == target {
+                    path.push(next);
+                    return Some(path.into_iter().map(str::to_string).collect());
+                }
+                if visited.insert(next) {
+                    stack.push((next, 0));
+                    path.push(next);
+                }
+            }
+            None => {
+                stack.pop();
+                path.pop();
+            }
+        }
+    }
+    None
+}
+
 /// Project a single note into a [`WorkspaceTask`], applying the TS
 /// `Untitled task` title fallback. Returns `Internal` when the note is not a
 /// task (mirrors `task.getMyTask`'s "Note is not a task" guard).
-fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
+/// `status_by_id` feeds the computed `unmetDependsOn` (callers may pass an
+/// empty map when the note has no `dependsOn` edges).
+fn note_to_workspace_task(
+    note: &Note,
+    status_by_id: &HashMap<String, TaskStatus>,
+) -> Result<WorkspaceTask> {
     let task = match &note.metadata.task {
         Some(t) => t,
         None => return Err(Error::Internal("Note is not a task".to_string())),
@@ -5623,6 +5753,9 @@ fn note_to_workspace_task(note: &Note) -> Result<WorkspaceTask> {
         },
         status: task.status,
         updated_at: note.updated_at.clone(),
+        depends_on: task.depends_on.clone(),
+        conflicts_with: task.conflicts_with.clone(),
+        unmet_depends_on: unmet_depends_on_ids(&task.depends_on, status_by_id),
     })
 }
 
@@ -14940,7 +15073,30 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            Ok(note_ops::parse_tasks(&note.content))
+            let mut rows = note_ops::parse_tasks(&note.content);
+            // Mirror linked task notes' relations onto their rows. One
+            // task-notes-only fetch (`task_json IS NOT NULL`), only when some
+            // row is actually linked.
+            if rows.iter().any(|r| r.task_note_id.is_some()) {
+                let all = store.list_tasks(&workspace_id).await?;
+                let status_by_id = task_status_by_id(&all);
+                for row in &mut rows {
+                    let Some(linked_id) = &row.task_note_id else {
+                        continue;
+                    };
+                    let Some(task) = all
+                        .iter()
+                        .find(|n| n.id.as_str() == linked_id)
+                        .and_then(|n| n.metadata.task.as_ref())
+                    else {
+                        continue;
+                    };
+                    row.depends_on = task.depends_on.clone();
+                    row.conflicts_with = task.conflicts_with.clone();
+                    row.unmet_depends_on = unmet_depends_on_ids(&task.depends_on, &status_by_id);
+                }
+            }
+            Ok(rows)
         })
     }
 
@@ -15367,7 +15523,15 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            note_to_workspace_task(&note)
+            // Only fetch the workspace note set when there are `dependsOn`
+            // edges to project into `unmetDependsOn`.
+            let status_by_id = match &note.metadata.task {
+                Some(t) if !t.depends_on.is_empty() => {
+                    task_status_by_id(&store.list_notes(&workspace_id).await?)
+                }
+                _ => HashMap::new(),
+            };
+            note_to_workspace_task(&note, &status_by_id)
         })
     }
 
@@ -15405,6 +15569,7 @@ impl WorkspaceApi for Services {
                         .to_string(),
                 })
                 .collect();
+            let unmet_depends_on = unmet_depends_on_ids(&task.depends_on, &task_status_by_id(&all));
             Ok(TaskGetMyTaskResult {
                 note_id: note.id.clone(),
                 title: note.title.clone(),
@@ -15415,6 +15580,7 @@ impl WorkspaceApi for Services {
                 subtasks,
                 task_metadata: task,
                 rev: note.rev,
+                unmet_depends_on,
             })
         })
     }
@@ -15426,6 +15592,8 @@ impl WorkspaceApi for Services {
         status: String,
         acceptance_criteria: Vec<String>,
         effort: Option<String>,
+        depends_on: Option<Vec<NoteId>>,
+        conflicts_with: Option<Vec<NoteId>>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
@@ -15435,20 +15603,60 @@ impl WorkspaceApi for Services {
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            // Relation writes are validated + cycle-checked against the
+            // workspace task-note set, exactly like `task.setRelations`. The
+            // fetch only happens when relations were supplied.
+            let depends_on = depends_on.map(normalize_relation_ids);
+            let conflicts_with = conflicts_with.map(normalize_relation_ids);
+            if depends_on.is_some() || conflicts_with.is_some() {
+                let all = store.list_tasks(&workspace_id).await?;
+                if let Some(deps) = &depends_on {
+                    validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
+                    if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
+                        return Err(Error::Internal(format!(
+                            "dependsOn would create a cycle: {}",
+                            cycle.join(" -> ")
+                        )));
+                    }
+                }
+                if let Some(conflicts) = &conflicts_with {
+                    validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
+                }
+            }
             let now = now_iso();
             let previous_status = note.metadata.task.as_ref().map(|t| t.status);
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
                     apply_status_transition(&mut existing, new_status, &now);
+                    if let Some(deps) = depends_on {
+                        existing.depends_on = deps;
+                    }
+                    if let Some(conflicts) = conflicts_with {
+                        existing.conflicts_with = conflicts;
+                    }
                     note.metadata.task = Some(existing);
                 }
                 // Fresh task (or same status) → set the markAsTask metadata.
-                _ => {
+                // Omitted relation params keep an existing task's relations
+                // (same contract as the changing-status arm above).
+                existing => {
                     let mut task = TaskMetadata {
                         status: new_status,
                         acceptance_criteria,
                         estimated_effort: effort,
+                        depends_on: depends_on.unwrap_or_else(|| {
+                            existing
+                                .as_ref()
+                                .map(|t| t.depends_on.clone())
+                                .unwrap_or_default()
+                        }),
+                        conflicts_with: conflicts_with.unwrap_or_else(|| {
+                            existing
+                                .as_ref()
+                                .map(|t| t.conflicts_with.clone())
+                                .unwrap_or_default()
+                        }),
                         ..Default::default()
                     };
                     apply_status_transition(&mut task, new_status, &now);
@@ -15532,6 +15740,83 @@ impl WorkspaceApi for Services {
                 note_id: note.id,
                 status: new_status,
             })
+        })
+    }
+
+    fn task_set_relations(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        depends_on: Option<Vec<NoteId>>,
+        conflicts_with: Option<Vec<NoteId>>,
+    ) -> BoxFuture<'_, Result<TaskSetRelationsResult>> {
+        let store = self.store.clone();
+        let services = self.clone();
+        Box::pin(async move {
+            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let mut task = match note.metadata.task.clone() {
+                Some(t) => t,
+                None => return Err(Error::Internal("Note is not a task".to_string())),
+            };
+            let depends_on = depends_on.map(normalize_relation_ids);
+            let conflicts_with = conflicts_with.map(normalize_relation_ids);
+            // Validation + cycle check read the same workspace snapshot the
+            // write is based on (task notes only — `task_json IS NOT NULL`).
+            // Like every other task-metadata write this is last-writer-wins
+            // (no versioned CAS): concurrent relation writes are
+            // coordinator-driven and rare, and a racing write that slips a
+            // stale cycle past the check degrades readiness for the tasks
+            // involved, not data integrity.
+            let all = store.list_tasks(&workspace_id).await?;
+            if let Some(deps) = &depends_on {
+                validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
+                if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
+                    return Err(Error::Internal(format!(
+                        "dependsOn would create a cycle: {}",
+                        cycle.join(" -> ")
+                    )));
+                }
+            }
+            if let Some(conflicts) = &conflicts_with {
+                validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
+            }
+            let mut changed = false;
+            if let Some(deps) = depends_on {
+                changed |= task.depends_on != deps;
+                task.depends_on = deps;
+            }
+            if let Some(conflicts) = conflicts_with {
+                changed |= task.conflicts_with != conflicts;
+                task.conflicts_with = conflicts;
+            }
+            let result = TaskSetRelationsResult {
+                ok: true,
+                note_id: note.id.clone(),
+                depends_on: task.depends_on.clone(),
+                conflicts_with: task.conflicts_with.clone(),
+            };
+            // No-op write (same lists after normalization) → skip the store
+            // write and the `note:updated` emission entirely.
+            if !changed {
+                return Ok(result);
+            }
+            note.metadata.task = Some(task);
+            note.updated_at = now_iso();
+            store.update_note(&note).await?;
+            // Metadata changed → subscribers refetch the note (§6.5), same as
+            // every other task-metadata write.
+            publish_event(
+                &services.event_bus,
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            Ok(result)
         })
     }
 

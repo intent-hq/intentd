@@ -592,6 +592,9 @@ impl WorkspaceApi for FakeApi {
                 status: "todo".to_string(),
                 task_note_id: None,
                 linked_task_note_id: None,
+                depends_on: Vec::new(),
+                conflicts_with: Vec::new(),
+                unmet_depends_on: Vec::new(),
             }])
         })
     }

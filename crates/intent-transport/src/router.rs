@@ -849,8 +849,30 @@ async fn dispatch(
             let status = require_str_param(params, "status")?;
             let acceptance_criteria = normalize_acceptance_criteria(params);
             let effort = opt_str(params, "effort");
+            let depends_on = opt_note_id_array(params, "dependsOn");
+            let conflicts_with = opt_note_id_array(params, "conflictsWith");
             let result = api
-                .mark_as_task(ws, note_id, status, acceptance_criteria, effort, None)
+                .mark_as_task(
+                    ws,
+                    note_id,
+                    status,
+                    acceptance_criteria,
+                    effort,
+                    depends_on,
+                    conflicts_with,
+                    None,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.setRelations" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let depends_on = opt_note_id_array(params, "dependsOn");
+            let conflicts_with = opt_note_id_array(params, "conflictsWith");
+            let result = api
+                .task_set_relations(ws, note_id, depends_on, conflicts_with)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -3612,6 +3634,12 @@ fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>>
             .map(str::to_string)
             .collect()
     })
+}
+
+/// Optional note-id-array param — `opt_str_array` mapped into `NoteId`s. Used
+/// for the `task.setRelations` / `task.markAsTask` relation lists.
+fn opt_note_id_array(params: &Map<String, Value>, name: &str) -> Option<Vec<NoteId>> {
+    opt_str_array(params, name).map(|ids| ids.into_iter().map(NoteId::from).collect())
 }
 
 /// Strict optional string-array param: absent/null → `Ok(None)`; an array of

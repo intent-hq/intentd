@@ -1350,6 +1350,8 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             vec!["criterion one".into()],
             Some("M".into()),
             None,
+            None,
+            None,
         )
         .await
         .expect("markAsTask");
@@ -1509,6 +1511,260 @@ async fn task_list_and_get_project_workspace_tasks() {
     assert!(svc.task_get(ws, NoteId::from("plain")).await.is_err());
 }
 
+/// `task.setRelations` round-trips `dependsOn`/`conflictsWith` (deduped),
+/// validates ids (self-edges, non-task notes), rejects dependency cycles with
+/// the cycle path named, and the computed `unmetDependsOn` surfaces in
+/// `task.list` / `task.get` / `task.getMyTask`. `task.markAsTask` accepts the
+/// same relation params with identical validation.
+#[tokio::test]
+async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let spec = note(
+        &ws,
+        "spec",
+        "- [A](intent://local/task/task-a)\n- [B](intent://local/task/task-b)\n\
+         - [C](intent://local/task/task-c)",
+    );
+    store.insert_note(&spec).await.expect("spec");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = title.to_string();
+        tn.parent_id = Some(NoteId::from("spec"));
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", "Alpha", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", "Beta", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", "Gamma", TaskStatus::NotStarted))
+        .await
+        .unwrap();
+    let mut plain = note(&ws, "plain", "body");
+    plain.parent_id = Some(NoteId::from("spec"));
+    store.insert_note(&plain).await.unwrap();
+
+    let svc = Services::new(store);
+
+    // Round-trip with dedup: c dependsOn [a, b, a] → [a, b].
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-c"),
+            Some(vec![
+                NoteId::from("task-a"),
+                NoteId::from("task-b"),
+                NoteId::from("task-a"),
+            ]),
+            Some(vec![NoteId::from("task-b")]),
+        )
+        .await
+        .expect("setRelations");
+    assert!(r.ok);
+    let dep_ids: Vec<&str> = r.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(dep_ids, vec!["task-a", "task-b"]);
+    assert_eq!(r.conflicts_with[0].as_str(), "task-b");
+
+    // Persisted on the note's TaskMetadata; unmetDependsOn excludes complete
+    // deps (a) and keeps in-progress deps (b).
+    let mine = svc
+        .get_my_task(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("getMyTask");
+    assert_eq!(mine.task_metadata.depends_on.len(), 2);
+    assert_eq!(mine.task_metadata.conflicts_with.len(), 1);
+    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // task.list projects the same fields.
+    let listed = svc.task_list(ws.clone(), None).await.expect("task.list");
+    let c = listed
+        .tasks
+        .iter()
+        .find(|t| t.id.as_str() == "task-c")
+        .expect("task-c row");
+    assert_eq!(c.depends_on.len(), 2);
+    let unmet: Vec<&str> = c.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // task.get projects them too.
+    let got = svc
+        .task_get(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("task.get");
+    let unmet: Vec<&str> = got.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // Omitted field is kept; `[]` clears.
+    let r = svc
+        .task_set_relations(ws.clone(), NoteId::from("task-c"), None, Some(vec![]))
+        .await
+        .expect("setRelations keep/clear");
+    assert_eq!(r.depends_on.len(), 2, "omitted dependsOn kept");
+    assert!(r.conflicts_with.is_empty(), "conflictsWith cleared");
+
+    // Self-edge rejected.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-c"),
+            Some(vec![NoteId::from("task-c")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot reference the task itself"));
+
+    // Non-task id rejected (both a plain note and a missing note).
+    for bad in ["plain", "ghost"] {
+        let err = svc
+            .task_set_relations(
+                ws.clone(),
+                NoteId::from("task-c"),
+                Some(vec![NoteId::from(bad)]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a task note"),
+            "expected not-a-task error for {bad}: {err}"
+        );
+    }
+
+    // Cycle rejected with the cycle named: c → b (existing edge b → c is
+    // written first), then b dependsOn c closes b → c → b.
+    svc.task_set_relations(
+        ws.clone(),
+        NoteId::from("task-c"),
+        Some(vec![NoteId::from("task-b")]),
+        None,
+    )
+    .await
+    .expect("c dependsOn b");
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-b"),
+            Some(vec![NoteId::from("task-c")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cycle"), "cycle named: {msg}");
+    assert!(
+        msg.contains("task-b -> task-c -> task-b"),
+        "cycle path named: {msg}"
+    );
+
+    // markAsTask carries the same relation params + validation.
+    let err = svc
+        .mark_as_task(
+            ws.clone(),
+            NoteId::from("task-b"),
+            "in_progress".into(),
+            vec![],
+            None,
+            Some(vec![NoteId::from("task-c")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cycle"));
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "in_progress".into(),
+        vec![],
+        None,
+        Some(vec![NoteId::from("task-a")]),
+        Some(vec![NoteId::from("task-c")]),
+        None,
+    )
+    .await
+    .expect("markAsTask with relations");
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b");
+    assert_eq!(b.task_metadata.depends_on[0].as_str(), "task-a");
+    assert_eq!(b.task_metadata.conflicts_with[0].as_str(), "task-c");
+    assert!(b.unmet_depends_on.is_empty(), "complete dep is met");
+
+    // Re-marking at the SAME status with omitted relation params keeps the
+    // existing relations (regression: the same-status arm rebuilds metadata
+    // from scratch and must carry them over).
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("same-status re-mark");
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after re-mark");
+    assert_eq!(
+        b.task_metadata.depends_on[0].as_str(),
+        "task-a",
+        "same-status re-mark must keep dependsOn"
+    );
+    assert_eq!(
+        b.task_metadata.conflicts_with[0].as_str(),
+        "task-c",
+        "same-status re-mark must keep conflictsWith"
+    );
+
+    // No-op setRelations (identical lists) skips the store write: rev is
+    // unchanged.
+    let rev_before = b.rev;
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-b"),
+            Some(vec![NoteId::from("task-a")]),
+            None,
+        )
+        .await
+        .expect("no-op setRelations");
+    assert!(r.ok);
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after no-op");
+    assert_eq!(b.rev, rev_before, "no-op setRelations must not bump rev");
+
+    // setRelations on a non-task note is rejected.
+    let err = svc
+        .task_set_relations(ws, NoteId::from("plain"), Some(vec![]), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a task"));
+}
+
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
@@ -1517,6 +1773,8 @@ async fn assign_agent_validates_and_starts_task() {
         id.clone(),
         "not_started".into(),
         vec![],
+        None,
+        None,
         None,
         None,
     )
@@ -4326,6 +4584,8 @@ mod change_event_parity {
                 vec![],
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("markAsTask");
@@ -4362,6 +4622,8 @@ mod change_event_parity {
                 n.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 None,
             )
@@ -4402,6 +4664,8 @@ mod change_event_parity {
                 n.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 None,
             )
@@ -4605,6 +4869,8 @@ mod change_event_parity {
                 "not_started".to_string(),
                 vec![],
                 None,
+                None,
+                None,
                 caller.clone(),
             )
             .await
@@ -4623,6 +4889,8 @@ mod change_event_parity {
                 plain.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 caller.clone(),
             )
