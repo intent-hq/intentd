@@ -666,6 +666,12 @@ pub struct Services {
     /// Cap on concurrently active PR monitors per agent (mirrors
     /// `[hooks] maxPerAgent`).
     pr_monitors_max_per_agent: u32,
+    /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
+    /// in production) — defense in depth above the client-level network
+    /// timeouts, so a hung connection can never wedge the sweep loop. Tests
+    /// compress it via the `#[cfg(test)]`-only `with_pr_monitor_fetch_timeout`
+    /// so hung-fetch coverage completes in milliseconds.
+    pr_monitor_fetch_timeout: std::time::Duration,
     /// In-memory pending workspace deletions for the delete grace window
     /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
@@ -782,6 +788,7 @@ impl Services {
             pr_monitor_poll_seconds: None,
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+            pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -807,6 +814,14 @@ impl Services {
     /// Override the per-agent active-monitor cap.
     pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the per-fetch timeout of the PR-monitor sweep so
+    /// hung-fetch coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pr_monitor_fetch_timeout = timeout;
         self
     }
 
@@ -5748,6 +5763,56 @@ fn find_dependency_cycle(
         }
     }
     None
+}
+
+/// Reject a `dependsOn` id that is a tree ancestor or descendant of `source`
+/// in the workspace note tree (`parent_id` chains). Such an edge creates a
+/// permanent mutual readiness block (monorepo#1982): the parent waits on the
+/// child via the tree rule (`compute_ready_task_ids` keeps a task out of the
+/// ready set while any task child is incomplete) while the child waits on the
+/// parent via the edge, so neither ever becomes ready. Walks ALL workspace
+/// notes so ancestry chains crossing non-task notes are caught too. The
+/// rejection names the offending relationship, mirroring the cycle check.
+fn ensure_no_tree_relative_dependency(
+    source: &NoteId,
+    new_deps: &[NoteId],
+    notes: &[Note],
+) -> Result<()> {
+    let parent_of: HashMap<&str, &str> = notes
+        .iter()
+        .filter_map(|n| n.parent_id.as_ref().map(|p| (n.id.as_str(), p.as_str())))
+        .collect();
+    // Ancestor chain of `start`, cycle-guarded: node ids are caller-controlled
+    // and a malformed parent loop must not hang the write path.
+    let ancestors_of = |start: &str| -> HashSet<&str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = start;
+        while let Some(p) = parent_of.get(cur).copied() {
+            if !seen.insert(p) {
+                break;
+            }
+            cur = p;
+        }
+        seen
+    };
+    let source_ancestors = ancestors_of(source.as_str());
+    for dep in new_deps {
+        if source_ancestors.contains(dep.as_str()) {
+            return Err(Error::Internal(format!(
+                "dependsOn cannot reference a tree ancestor: {} is an ancestor of {}",
+                dep.as_str(),
+                source.as_str()
+            )));
+        }
+        if ancestors_of(dep.as_str()).contains(source.as_str()) {
+            return Err(Error::Internal(format!(
+                "dependsOn cannot reference a tree descendant: {} is a descendant of {}",
+                dep.as_str(),
+                source.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Project a single note into a [`WorkspaceTask`], applying the TS
@@ -15665,13 +15730,15 @@ impl WorkspaceApi for Services {
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            // Relation writes are validated + cycle-checked against the
-            // workspace task-note set, exactly like `task.setRelations`. The
-            // fetch only happens when relations were supplied.
+            // Relation writes are validated + cycle/tree-checked against the
+            // workspace note set, exactly like `task.setRelations` (ALL notes,
+            // not just tasks — the tree-relative check walks `parent_id`
+            // chains that may cross non-task notes). The fetch only happens
+            // when relations were supplied.
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
             if depends_on.is_some() || conflicts_with.is_some() {
-                let all = store.list_tasks(&workspace_id).await?;
+                let all = store.list_notes(&workspace_id).await?;
                 if let Some(deps) = &depends_on {
                     validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
                     if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
@@ -15680,6 +15747,7 @@ impl WorkspaceApi for Services {
                             cycle.join(" -> ")
                         )));
                     }
+                    ensure_no_tree_relative_dependency(&note.id, deps, &all)?;
                 }
                 if let Some(conflicts) = &conflicts_with {
                     validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
@@ -15822,14 +15890,15 @@ impl WorkspaceApi for Services {
             };
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
-            // Validation + cycle check read the same workspace snapshot the
-            // write is based on (task notes only — `task_json IS NOT NULL`).
-            // Like every other task-metadata write this is last-writer-wins
-            // (no versioned CAS): concurrent relation writes are
-            // coordinator-driven and rare, and a racing write that slips a
+            // Validation + cycle/tree checks read the same workspace snapshot
+            // the write is based on (ALL notes, not just tasks — the
+            // tree-relative check walks `parent_id` chains that may cross
+            // non-task notes). Like every other task-metadata write this is
+            // last-writer-wins (no versioned CAS): concurrent relation writes
+            // are coordinator-driven and rare, and a racing write that slips a
             // stale cycle past the check degrades readiness for the tasks
             // involved, not data integrity.
-            let all = store.list_tasks(&workspace_id).await?;
+            let all = store.list_notes(&workspace_id).await?;
             if let Some(deps) = &depends_on {
                 validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
                 if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
@@ -15838,6 +15907,7 @@ impl WorkspaceApi for Services {
                         cycle.join(" -> ")
                     )));
                 }
+                ensure_no_tree_relative_dependency(&note.id, deps, &all)?;
             }
             if let Some(conflicts) = &conflicts_with {
                 validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
@@ -21722,12 +21792,17 @@ impl WorkspaceApi for Services {
     }
 
     /// `prMonitor.flush`: emit the pending debounced changes immediately.
+    /// `check: true` re-polls the monitor on demand first.
     fn pr_monitor_flush_pending(
         &self,
         workspace_id: WorkspaceId,
         monitor_id: intent_core::PrMonitorId,
+        check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.pr_monitor_flush_op(&workspace_id, &monitor_id).await })
+        Box::pin(async move {
+            self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
+                .await
+        })
     }
 }
 

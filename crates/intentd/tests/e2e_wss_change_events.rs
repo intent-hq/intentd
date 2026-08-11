@@ -3152,3 +3152,159 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
         "gated ready over a cancelled dep: {evt}"
     );
 }
+
+/// End-to-end tree-relative `dependsOn` rejection (PROTOCOL.md §5.4,
+/// monorepo#1982) over WSS: a `dependsOn` edge naming a tree ancestor or
+/// descendant of the task — the permanent mutual readiness block — is
+/// rejected by both `task.setRelations` and `task.markAsTask` with `-32603`
+/// and the offending relationship named in `error.data`, mirroring the
+/// cycle-rejection envelope; sibling edges stay valid.
+#[tokio::test]
+async fn task_relations_reject_tree_relative_edges_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "TreeEdges", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // parent (root-level task) → child (task nested under parent), plus a
+    // root-level sibling task.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Parent", "content": "body" }),
+    )
+    .await;
+    let parent = created["note"]["id"].as_str().expect("note id").to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Child", "content": "body", "parentId": parent }),
+    )
+    .await;
+    let child = created["note"]["id"].as_str().expect("note id").to_string();
+    let created = wss_rpc(
+        &mut rpc,
+        4,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Sibling", "content": "body" }),
+    )
+    .await;
+    let sibling = created["note"]["id"].as_str().expect("note id").to_string();
+    for (i, id) in [&parent, &child, &sibling].iter().enumerate() {
+        wss_rpc(
+            &mut rpc,
+            i as i64 + 5,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": id, "status": "not_started" }),
+        )
+        .await;
+    }
+
+    // child dependsOn parent → -32603, ancestor relationship named in data.
+    // The full JSON-RPC error envelope shape is asserted (§1): `jsonrpc`,
+    // echoed `id`, `error` with `code`/`message`/`data`, and no `result`.
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        10,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": child, "dependsOn": [parent] }),
+    )
+    .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(10), "envelope id echoed: {err}");
+    assert!(err.get("result").is_none(), "no result on error: {err}");
+    assert!(
+        err["error"]["message"].is_string(),
+        "error message present: {err}"
+    );
+    assert_eq!(err["error"]["code"], json!(-32603), "ancestor: {err}");
+    let detail = err["error"]["data"]
+        .as_str()
+        .expect("ancestor error detail");
+    assert!(
+        detail.contains("tree ancestor"),
+        "ancestor rejection: {err}"
+    );
+    assert!(
+        detail.contains(&format!("{parent} is an ancestor of {child}")),
+        "relationship named: {detail}"
+    );
+
+    // parent dependsOn child → -32603, descendant relationship named.
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": parent, "dependsOn": [child] }),
+    )
+    .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(11), "envelope id echoed: {err}");
+    assert_eq!(err["error"]["code"], json!(-32603), "descendant: {err}");
+    let detail = err["error"]["data"]
+        .as_str()
+        .expect("descendant error detail");
+    assert!(
+        detail.contains(&format!("{child} is a descendant of {parent}")),
+        "relationship named: {detail}"
+    );
+
+    // markAsTask enforces the same rejection envelope.
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        12,
+        "task.markAsTask",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": child,
+            "status": "not_started",
+            "dependsOn": [parent],
+        }),
+    )
+    .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(12), "envelope id echoed: {err}");
+    assert_eq!(err["error"]["code"], json!(-32603), "markAsTask: {err}");
+    assert!(
+        err["error"]["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("tree ancestor"),
+        "markAsTask ancestor rejection: {err}"
+    );
+
+    // A sibling edge stays valid, and the rejected writes persisted nothing.
+    let set = wss_rpc(
+        &mut rpc,
+        13,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": child, "dependsOn": [sibling] }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "sibling edge: {set}");
+    let mine = wss_rpc(
+        &mut rpc,
+        14,
+        "task.getMyTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": parent }),
+    )
+    .await;
+    assert!(
+        mine["taskMetadata"].get("dependsOn").is_none(),
+        "rejected write persisted: {mine}"
+    );
+}

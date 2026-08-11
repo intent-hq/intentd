@@ -766,6 +766,95 @@ async fn pr_monitor_flush_delivers_pending_changes_over_wss() {
     assert_eq!(again, json!({ "ok": true, "flushed": false }));
 }
 
+/// `prMonitor.flush { check: true }` over the wire re-polls the PR on demand
+/// first: a change the loop has NOT seen yet is fetched fresh and the wake
+/// delivered immediately (emitting `prMonitor:emitted`), while a checked
+/// flush with nothing changed returns `flushed: false`. A non-boolean
+/// `check` is `-32602`.
+#[tokio::test]
+async fn pr_monitor_flush_with_check_repolls_on_demand_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:emitted"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // A comment lands AFTER registration, with no sweep in between: the
+    // un-checked flush sees no pending set, the checked one re-polls.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let unchecked = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    assert_eq!(unchecked, json!({ "ok": true, "flushed": false }));
+
+    let before = fx.forge.fetches();
+    let checked = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "monitorId": monitor.monitor_id.as_str(),
+            "check": true,
+        }),
+    )
+    .await;
+    assert_eq!(checked, json!({ "ok": true, "flushed": true }));
+    assert_eq!(fx.forge.fetches(), before + 1, "one on-demand fetch");
+
+    let evt = next_event(&mut sub, "prMonitor:emitted").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "the checked flush must deliver the consolidated wake"
+    );
+
+    // Nothing changed since the emit → the check finds nothing to flush.
+    let quiet = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.flush",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "monitorId": monitor.monitor_id.as_str(),
+            "check": true,
+        }),
+    )
+    .await;
+    assert_eq!(quiet, json!({ "ok": true, "flushed": false }));
+
+    // A non-boolean `check` is rejected with -32602 before any side effect.
+    let bad = wss_call(
+        &mut rpc,
+        5,
+        "prMonitor.flush",
+        json!({
+            "workspaceId": fx.ws_id.as_str(),
+            "monitorId": monitor.monitor_id.as_str(),
+            "check": "yes",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+}
+
 /// `prMonitor.cancel` over the wire (the FE path) cancels the monitor, removes
 /// it from `prMonitor.list`, emits `prMonitor:cancelled`, and notifies the
 /// owning agent — unlike an agent's own `ws.pr.unmonitor`.

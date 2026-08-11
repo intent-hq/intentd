@@ -23402,3 +23402,253 @@ async fn agent_snapshot_counts_pending_questions() {
         "dismissed questions must not count: {v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch `agent.delegate` (tasks[] + greedy): full request→response shape over
+// the service op — classification is unit-tested in `batch.rs`; these lock
+// the wiring (validation, per-task delegation, response rows, unlock plan,
+// idempotent re-call).
+// ---------------------------------------------------------------------------
+
+fn batch_input(ids: &[&NoteId], greedy: Option<bool>) -> AgentDelegateInput {
+    AgentDelegateInput {
+        tasks: Some(ids.iter().map(|id| (*id).clone()).collect()),
+        greedy,
+        ..Default::default()
+    }
+}
+
+fn row_for<'a>(resp: &'a serde_json::Value, id: &NoteId) -> &'a serde_json::Value {
+    resp["tasks"]
+        .as_array()
+        .expect("tasks array")
+        .iter()
+        .find(|r| r["taskNoteId"] == json!(id.0))
+        .unwrap_or_else(|| panic!("row for {} in {resp}", id.0))
+}
+
+/// Empty `tasks`, and mixing `tasks` with single-task addressing, are both
+/// rejected up front with no side effects.
+#[tokio::test]
+async fn batch_delegate_rejects_empty_and_mixed_addressing() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Solo").await;
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![]),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("empty tasks rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![note_id.clone()]),
+                task_note_id: Some(note_id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("mixed addressing rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("mutually exclusive"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    let ghost = NoteId::new();
+    let err = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&ghost], None), None)
+        .await
+        .expect_err("unknown task id rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains(&ghost.0), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    // Single-task-only params are rejected, not silently dropped.
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do it my way".into()),
+                ..batch_input(&[&note_id], None)
+            },
+            None,
+        )
+        .await
+        .expect_err("agentInstructions rejected in batch mode");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("agentInstructions"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                force: Some(true),
+                ..batch_input(&[&note_id], None)
+            },
+            None,
+        )
+        .await
+        .expect_err("force rejected in batch mode");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("force"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+}
+
+/// The full batch shape: ready task starts (agent created + assigned),
+/// dep-blocked task holds with the unmet ids, and the unlock plan names it.
+#[tokio::test]
+async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
+    let (_t, svc, ws) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    svc.task_set_relations(ws.clone(), t2.clone(), Some(vec![t1.clone()]), None)
+        .await
+        .expect("t2 dependsOn t1");
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .await
+        .expect("batch delegate");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["greedy"], false);
+    assert_eq!(resp["tasks"].as_array().unwrap().len(), 2);
+
+    let r1 = row_for(&resp, &t1);
+    assert_eq!(r1["disposition"], "started");
+    let agent_id = r1["agentId"].as_str().expect("started row carries agentId");
+    assert_eq!(resp["startedTaskIds"], json!([t1.0]));
+
+    let r2 = row_for(&resp, &t2);
+    assert_eq!(r2["disposition"], "held:blocked-on-deps");
+    assert_eq!(r2["unmetDependsOn"], json!([t1.0]));
+    assert!(r2["reason"].as_str().unwrap().contains(&t1.0));
+
+    assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([t2.0]));
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("re-call agent.delegate"),
+        "{resp}"
+    );
+
+    // The started task really was delegated: agent exists and is assigned.
+    let note = svc.get_note(ws.clone(), t1.clone()).await.expect("note");
+    assert_eq!(
+        note.metadata.task.expect("task").assigned_agent_ids,
+        vec![AgentId::from(agent_id)]
+    );
+
+    // Idempotent re-call: same list → started task now skips (already
+    // running, naming its agent), held task still holds; nothing new starts.
+    let again = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .await
+        .expect("re-call");
+    let r1 = row_for(&again, &t1);
+    assert_eq!(r1["disposition"], "skipped");
+    assert_eq!(r1["agentId"], json!(agent_id));
+    assert_eq!(
+        row_for(&again, &t2)["disposition"],
+        "held:blocked-on-deps",
+        "{again}"
+    );
+    assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
+}
+
+/// Conflicts: greedy=false holds the later task of a conflicting pair;
+/// greedy=true starts it anyway and names the pair.
+#[tokio::test]
+async fn batch_delegate_conflicts_hold_unless_greedy() {
+    let (_t, svc, ws) = setup().await;
+    let a = seed_task(&svc, &ws, "A").await;
+    let b = seed_task(&svc, &ws, "B").await;
+    svc.task_set_relations(ws.clone(), a.clone(), None, Some(vec![b.clone()]))
+        .await
+        .expect("a conflictsWith b");
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b], None), None)
+        .await
+        .expect("batch");
+    assert_eq!(row_for(&resp, &a)["disposition"], "started");
+    let rb = row_for(&resp, &b);
+    assert_eq!(rb["disposition"], "held:conflict");
+    assert_eq!(rb["conflictsWith"], json!([a.0]));
+    assert!(rb["reason"].as_str().unwrap().contains("greedy"), "{rb}");
+    assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([b.0]));
+
+    // Fresh pair under greedy=true: both start; the overlapping one names
+    // the pair and warns about rebases.
+    let c = seed_task(&svc, &ws, "C").await;
+    let d = seed_task(&svc, &ws, "D").await;
+    svc.task_set_relations(ws.clone(), c.clone(), None, Some(vec![d.clone()]))
+        .await
+        .expect("c conflictsWith d");
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&c, &d], Some(true)), None)
+        .await
+        .expect("greedy batch");
+    assert_eq!(resp["greedy"], true);
+    assert_eq!(row_for(&resp, &c)["disposition"], "started");
+    let rd = row_for(&resp, &d);
+    assert_eq!(rd["disposition"], "started");
+    assert_eq!(rd["conflictsWith"], json!([c.0]));
+    assert!(rd["reason"].as_str().unwrap().contains("expect rebases"));
+}
+
+/// Terminal statuses skip; a cancelled dependency surfaces as
+/// decision-needed rather than a plain hold.
+#[tokio::test]
+async fn batch_delegate_skips_terminal_and_flags_cancelled_deps() {
+    let (_t, svc, ws) = setup().await;
+    let done = seed_task(&svc, &ws, "Done").await;
+    svc.task_update_note_status(ws.clone(), done.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete");
+    let dead = seed_task(&svc, &ws, "Dead").await;
+    svc.task_update_note_status(ws.clone(), dead.clone(), "cancelled".into(), None, None)
+        .await
+        .expect("cancel");
+    let blocked = seed_task(&svc, &ws, "Blocked").await;
+    svc.task_set_relations(ws.clone(), blocked.clone(), Some(vec![dead.clone()]), None)
+        .await
+        .expect("blocked dependsOn dead");
+
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            batch_input(&[&done, &dead, &blocked], None),
+            None,
+        )
+        .await
+        .expect("batch");
+    assert_eq!(row_for(&resp, &done)["disposition"], "skipped");
+    assert_eq!(
+        row_for(&resp, &done)["reason"],
+        json!("task is complete"),
+        "{resp}"
+    );
+    assert_eq!(row_for(&resp, &dead)["disposition"], "skipped");
+    let rb = row_for(&resp, &blocked);
+    assert_eq!(rb["disposition"], "held:blocked-on-deps");
+    assert_eq!(rb["decisionNeeded"], json!([dead.0]));
+    assert!(rb["reason"].as_str().unwrap().contains("decision needed"));
+    // A cancelled dep is never unlocked by settlement.
+    assert_eq!(
+        resp["unlockPlan"]["unlockedBySettlement"],
+        json!([] as [String; 0])
+    );
+}

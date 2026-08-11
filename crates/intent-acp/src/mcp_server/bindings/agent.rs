@@ -266,6 +266,21 @@ async fn delegate(
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    let tasks = match args.get("tasks").and_then(Value::as_array) {
+        Some(a) => {
+            if let Some(bad) = a.iter().find(|v| !v.is_string()) {
+                return Err(format!(
+                    "tasks must be an array of task note id strings, got: {bad}"
+                ));
+            }
+            Some(
+                a.iter()
+                    .filter_map(|v| v.as_str().map(NoteId::from_string))
+                    .collect(),
+            )
+        }
+        None => None,
+    };
     let input = AgentDelegateInput {
         task_note_id: opt_str(args, "taskNoteId").map(NoteId::from_string),
         note_id: opt_str(args, "noteId").map(NoteId::from_string),
@@ -279,6 +294,8 @@ async fn delegate(
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
+        tasks,
+        greedy: opt_bool(args, "greedy"),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())
