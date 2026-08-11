@@ -1066,6 +1066,13 @@ pub struct TaskMetadata {
     /// convention — no cycle check). Omitted on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts_with: Vec<NoteId>,
+    /// **Computed, never persisted** (monorepo#1979): the `depends_on` subset
+    /// whose task note is not `complete` (missing and cancelled deps count as
+    /// unmet — same rule as the `task.list` projection). Projected onto
+    /// note-shaped reads/pushes at the service layer; stripped from
+    /// `task_json` at store encode time. Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.
@@ -2782,6 +2789,19 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+    /// Batch form (PROTOCOL §5.5): a list of task-note ids to classify and
+    /// start together. Mutually exclusive with `taskNoteId`/`noteId`/
+    /// `taskText`, and the single-task-only `agentInstructions`/`force` are
+    /// rejected alongside it; when present the result enumerates every listed
+    /// task with its disposition (`started` / `held:*` / `skipped`) plus the
+    /// unlock plan. Single-task calls (this field absent) behave exactly as
+    /// before.
+    pub tasks: Option<Vec<NoteId>>,
+    /// Batch-only conflict policy (default false): `false` holds a task whose
+    /// `conflictsWith` intersects the running/starting set, admitting
+    /// startable tasks in effort-weighted critical-path priority order;
+    /// `true` starts it anyway and names the conflict pairs in the result.
+    pub greedy: Option<bool>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the

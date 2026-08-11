@@ -136,6 +136,8 @@ pub(crate) struct AssignedAgentScan {
     pub(crate) poisoned: Vec<AgentId>,
 }
 
+mod batch;
+
 #[cfg(test)]
 mod tests;
 
@@ -5302,13 +5304,20 @@ impl Services {
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the
-    /// target task note (PROTOCOL §5.5).
+    /// target task note (PROTOCOL §5.5). The batch form (`tasks` present)
+    /// routes to [`Self::agent_delegate_batch_op`]; single-task calls are
+    /// unchanged.
     pub(crate) async fn agent_delegate_op(
         &self,
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        if input.tasks.is_some() {
+            return self
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
+                .await;
+        }
         let wait_mode = input.wait_mode.clone();
         // Persist the task linkage + skipAutoCommit on the session so the
         // auto-commit-on-idle subscriber (LNI-1) can resolve `Linked-Note-Id:`
@@ -5804,6 +5813,299 @@ impl Services {
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
         Ok(result)
+    }
+
+    /// Batch `agent.delegate` (PROTOCOL §5.5): classify every task in
+    /// `input.tasks` as start / held / skipped — a PURE function of current
+    /// state (task statuses, `dependsOn`/`conflictsWith` edges, live assigned
+    /// agents; see [`batch::classify_batch_tasks`]) — then delegate exactly
+    /// the start subset through the unchanged single-task path (per-task
+    /// agent creation, group enrollment honoring `waitMode`). No scheduler
+    /// state is written: held tasks are simply not started, and re-calling
+    /// with the same list is idempotent (running/terminal tasks classify as
+    /// `skipped`). The result enumerates EVERY supplied task with its
+    /// disposition + reason and projects the unlock plan; the existing group
+    /// settlement wake is the resume signal — the caller re-calls delegate
+    /// then, which recomputes everything.
+    async fn agent_delegate_batch_op(
+        &self,
+        workspace_id: WorkspaceId,
+        input: intent_core::AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition, BatchTaskSnap};
+
+        let requested: Vec<String> = input
+            .tasks
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        if requested.is_empty() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: tasks must be a non-empty array of task note ids".to_string(),
+            ));
+        }
+        // The batch form is an alternative addressing mode: mixing it with
+        // the single-task addressing params is ambiguous and rejected.
+        if input.task_note_id.is_some() || input.note_id.is_some() || input.task_text.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: tasks is mutually exclusive with taskNoteId/noteId/taskText"
+                    .to_string(),
+            ));
+        }
+        // Single-task-only params are rejected rather than silently dropped:
+        // `agentInstructions` addresses ONE child's first message (each batch
+        // child resolves its own from its task note), and `force` overrides
+        // the occupancy gate that batch mode deliberately maps to `skipped`.
+        if input.agent_instructions.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: agentInstructions is not supported with tasks — each started task's first message resolves from its own task note".to_string(),
+            ));
+        }
+        if input.force == Some(true) {
+            return Err(Error::InvalidParams(
+                "agent.delegate: force is not supported with tasks — occupied tasks classify as skipped (use the single-task form to force a second agent)".to_string(),
+            ));
+        }
+        // Depth + watch-scope guards up front (the same checks the
+        // single-task path runs before any side-effectful work) so a
+        // rejection is one clear error before any child is created, not N
+        // identical per-task failures.
+        if let Some(parent) = &parent_agent_id {
+            let parent_session = self.store.get_agent_session(parent).await.ok();
+            let parent_depth = parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+            if let Some(session) = parent_session
+                .as_ref()
+                .filter(|s| s.status != AgentStatus::Deleted)
+            {
+                crate::agent_subscriptions::check_watch_scope(
+                    &session.workspace_id,
+                    &workspace_id,
+                )?;
+            }
+        }
+
+        // Snapshot every task note in the workspace (not just the requested
+        // ones): conflicts are symmetric and a running non-requested task
+        // must still hold a requested one, and dependency statuses can name
+        // any task note.
+        let notes = self.store.list_notes(&workspace_id).await?;
+        let mut titles: HashMap<String, String> = HashMap::new();
+        let mut snaps: HashMap<String, BatchTaskSnap> = HashMap::new();
+        for note in &notes {
+            let Some(task) = &note.metadata.task else {
+                continue;
+            };
+            let live_agent = if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+                || task.assigned_agent_ids.is_empty()
+            {
+                None
+            } else {
+                self.scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                    .map(|s| (s.id.0, s.name))
+            };
+            titles.insert(note.id.0.clone(), note.title.clone());
+            snaps.insert(
+                note.id.0.clone(),
+                BatchTaskSnap {
+                    status: task.status,
+                    depends_on: task.depends_on.iter().map(|d| d.0.clone()).collect(),
+                    conflicts_with: task.conflicts_with.iter().map(|c| c.0.clone()).collect(),
+                    live_agent,
+                    effort_minutes: task
+                        .estimated_effort
+                        .as_deref()
+                        .and_then(crate::task_effort::parse_effort_minutes),
+                },
+            );
+        }
+        let unknown: Vec<&String> = requested
+            .iter()
+            .filter(|id| !snaps.contains_key(*id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Error::InvalidParams(format!(
+                "agent.delegate: tasks names ids that are not task notes in this workspace: {}",
+                unknown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let greedy = input.greedy.unwrap_or(false);
+        let classified = classify_batch_tasks(&requested, &snaps, greedy);
+
+        // Delegate the start subset through the unchanged single-task path.
+        // A per-task failure becomes an `error` disposition rather than
+        // failing the batch — earlier tasks may already have started.
+        let mut rows: Vec<Value> = Vec::new();
+        let mut started_ids: Vec<String> = Vec::new();
+        for (id, disposition) in &classified {
+            let title = titles.get(id).cloned().unwrap_or_default();
+            let mut row = json!({ "taskNoteId": id, "title": title });
+            let obj = row.as_object_mut().unwrap();
+            match disposition {
+                BatchDisposition::Start { conflicts_with } => {
+                    let single = intent_core::AgentDelegateInput {
+                        task_note_id: Some(NoteId::from(id.as_str())),
+                        specialist: input.specialist.clone(),
+                        model: input.model.clone(),
+                        reasoning_effort: input.reasoning_effort.clone(),
+                        behavior_prompt: input.behavior_prompt.clone(),
+                        wait_mode: input.wait_mode.clone(),
+                        skip_auto_commit: input.skip_auto_commit,
+                        isolation: input.isolation.clone(),
+                        ..Default::default()
+                    };
+                    match Box::pin(self.agent_delegate_op(
+                        workspace_id.clone(),
+                        single,
+                        parent_agent_id.clone(),
+                    ))
+                    .await
+                    {
+                        Ok(res) => {
+                            obj.insert("disposition".into(), json!("started"));
+                            obj.insert("agentId".into(), res["agentId"].clone());
+                            obj.insert("agentName".into(), res["name"].clone());
+                            if !conflicts_with.is_empty() {
+                                obj.insert("conflictsWith".into(), json!(conflicts_with));
+                                obj.insert(
+                                    "reason".into(),
+                                    json!(format!(
+                                        "started despite conflictsWith overlap with {} (greedy) — expect rebases",
+                                        conflicts_with.join(", ")
+                                    )),
+                                );
+                            }
+                            started_ids.push(id.clone());
+                        }
+                        Err(e) => {
+                            obj.insert("disposition".into(), json!("error"));
+                            obj.insert("reason".into(), json!(e.to_string()));
+                        }
+                    }
+                }
+                BatchDisposition::HeldOnDeps {
+                    unmet,
+                    decision_needed,
+                } => {
+                    obj.insert("disposition".into(), json!("held:blocked-on-deps"));
+                    obj.insert("unmetDependsOn".into(), json!(unmet));
+                    let mut reason =
+                        format!("waiting on incomplete dependencies: {}", unmet.join(", "));
+                    if !decision_needed.is_empty() {
+                        obj.insert("decisionNeeded".into(), json!(decision_needed));
+                        reason.push_str(&format!(
+                            "; dependencies {} are cancelled or missing and will never complete — decision needed",
+                            decision_needed.join(", ")
+                        ));
+                    }
+                    obj.insert("reason".into(), json!(reason));
+                }
+                BatchDisposition::HeldOnConflict { conflicts_with } => {
+                    obj.insert("disposition".into(), json!("held:conflict"));
+                    obj.insert("conflictsWith".into(), json!(conflicts_with));
+                    obj.insert(
+                        "reason".into(),
+                        json!(format!(
+                            "conflictsWith intersects the running/starting set ({}); pass greedy: true to start anyway",
+                            conflicts_with.join(", ")
+                        )),
+                    );
+                }
+                BatchDisposition::SkippedAlreadyRunning {
+                    agent_id,
+                    agent_name,
+                } => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("agentId".into(), json!(agent_id));
+                    obj.insert("agentName".into(), json!(agent_name));
+                    obj.insert(
+                        "reason".into(),
+                        json!(format!(
+                            "already being worked by agent {agent_id} (\"{agent_name}\")"
+                        )),
+                    );
+                }
+                BatchDisposition::SkippedComplete => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("reason".into(), json!("task is complete"));
+                }
+                BatchDisposition::SkippedCancelled => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("reason".into(), json!("task is cancelled"));
+                }
+            }
+            rows.push(row);
+        }
+
+        // Project the unlock plan from what ACTUALLY started (an errored
+        // start never settles) plus every live-agent task in the workspace —
+        // requested or not — since any of those settling can release a hold.
+        let unlocked = project_unlock_plan(&classified, &snaps, &started_ids);
+
+        let held_count = rows
+            .iter()
+            .filter(|r| {
+                r["disposition"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("held:"))
+            })
+            .count();
+        let mut unlock_message = if unlocked.is_empty() {
+            if held_count == 0 {
+                "Nothing is held; no re-call needed beyond the normal completion wakes.".to_string()
+            } else {
+                "Held tasks are not unlocked by the started/running set settling alone (dependencies outside it that are incomplete, cancelled, or missing — possibly needing a decision — or conflicts with tasks that are not settling). Resolve those, then re-call agent.delegate.".to_string()
+            }
+        } else {
+            format!(
+                "When the started/running tasks settle, {} become startable — re-call agent.delegate then with the same list or a subset (classification is recomputed each call).",
+                unlocked.join(", ")
+            )
+        };
+        // Effort-weighted critical-path estimate (response text only, no wake
+        // changes): surfaced only when at least one involved task carries a
+        // parseable estimate — otherwise the number is pure defaults.
+        let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
+        if let Some(minutes) = critical_path_minutes {
+            unlock_message.push_str(&format!(
+                " ~{minutes} min of serial work remains on the critical path."
+            ));
+        }
+
+        let mut unlock_plan = json!({
+            "unlockedBySettlement": unlocked,
+            "message": unlock_message,
+        });
+        if let Some(minutes) = critical_path_minutes {
+            unlock_plan
+                .as_object_mut()
+                .unwrap()
+                .insert("criticalPathMinutes".into(), json!(minutes));
+        }
+        Ok(json!({
+            "ok": true,
+            "greedy": greedy,
+            "tasks": rows,
+            "startedTaskIds": started_ids,
+            "unlockPlan": unlock_plan,
+        }))
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run

@@ -108,6 +108,7 @@ mod settings;
 mod settings_registry;
 mod shell;
 pub mod stack_sample;
+mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
 mod transfer;
@@ -669,6 +670,12 @@ pub struct Services {
     /// Cap on concurrently active PR monitors per agent (mirrors
     /// `[hooks] maxPerAgent`).
     pr_monitors_max_per_agent: u32,
+    /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
+    /// in production) — defense in depth above the client-level network
+    /// timeouts, so a hung connection can never wedge the sweep loop. Tests
+    /// compress it via the `#[cfg(test)]`-only `with_pr_monitor_fetch_timeout`
+    /// so hung-fetch coverage completes in milliseconds.
+    pr_monitor_fetch_timeout: std::time::Duration,
     /// In-memory pending workspace deletions for the delete grace window
     /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
@@ -791,6 +798,7 @@ impl Services {
             pr_monitor_poll_seconds: None,
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+            pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -817,6 +825,14 @@ impl Services {
     /// Override the per-agent active-monitor cap.
     pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the per-fetch timeout of the PR-monitor sweep so
+    /// hung-fetch coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pr_monitor_fetch_timeout = timeout;
         self
     }
 
@@ -5667,6 +5683,30 @@ fn unmet_depends_on_ids(
         .collect()
 }
 
+/// Project the computed `unmetDependsOn` onto a note's task metadata in place
+/// (monorepo#1979): for a task note with `dependsOn` edges, populate
+/// `metadata.task.unmet_depends_on` with the unmet subset (same rule as the
+/// `task.list` projection — missing and cancelled deps count as unmet). The
+/// field is never persisted (stripped at store encode time); relation-less
+/// tasks and plain notes are untouched, so the wire shape stays additive
+/// (omitted when empty).
+fn project_unmet_depends_on(note: &mut Note, status_by_id: &HashMap<String, TaskStatus>) {
+    if let Some(task) = note.metadata.task.as_mut() {
+        if !task.depends_on.is_empty() {
+            task.unmet_depends_on = unmet_depends_on_ids(&task.depends_on, status_by_id);
+        }
+    }
+}
+
+/// Project `unmetDependsOn` onto every task note in a listing, computing the
+/// status index once from the same rows.
+fn project_unmet_depends_on_all(notes: &mut [Note]) {
+    let status_by_id = task_status_by_id(notes);
+    for note in notes.iter_mut() {
+        project_unmet_depends_on(note, &status_by_id);
+    }
+}
+
 /// Dedup a relation id list, preserving first-seen order.
 fn normalize_relation_ids(ids: Vec<NoteId>) -> Vec<NoteId> {
     let mut seen = HashSet::new();
@@ -5758,6 +5798,56 @@ fn find_dependency_cycle(
         }
     }
     None
+}
+
+/// Reject a `dependsOn` id that is a tree ancestor or descendant of `source`
+/// in the workspace note tree (`parent_id` chains). Such an edge creates a
+/// permanent mutual readiness block (monorepo#1982): the parent waits on the
+/// child via the tree rule (`compute_ready_task_ids` keeps a task out of the
+/// ready set while any task child is incomplete) while the child waits on the
+/// parent via the edge, so neither ever becomes ready. Walks ALL workspace
+/// notes so ancestry chains crossing non-task notes are caught too. The
+/// rejection names the offending relationship, mirroring the cycle check.
+fn ensure_no_tree_relative_dependency(
+    source: &NoteId,
+    new_deps: &[NoteId],
+    notes: &[Note],
+) -> Result<()> {
+    let parent_of: HashMap<&str, &str> = notes
+        .iter()
+        .filter_map(|n| n.parent_id.as_ref().map(|p| (n.id.as_str(), p.as_str())))
+        .collect();
+    // Ancestor chain of `start`, cycle-guarded: node ids are caller-controlled
+    // and a malformed parent loop must not hang the write path.
+    let ancestors_of = |start: &str| -> HashSet<&str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = start;
+        while let Some(p) = parent_of.get(cur).copied() {
+            if !seen.insert(p) {
+                break;
+            }
+            cur = p;
+        }
+        seen
+    };
+    let source_ancestors = ancestors_of(source.as_str());
+    for dep in new_deps {
+        if source_ancestors.contains(dep.as_str()) {
+            return Err(Error::Internal(format!(
+                "dependsOn cannot reference a tree ancestor: {} is an ancestor of {}",
+                dep.as_str(),
+                source.as_str()
+            )));
+        }
+        if ancestors_of(dep.as_str()).contains(source.as_str()) {
+            return Err(Error::Internal(format!(
+                "dependsOn cannot reference a tree descendant: {} is a descendant of {}",
+                dep.as_str(),
+                source.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Project a single note into a [`WorkspaceTask`], applying the TS
@@ -6814,6 +6904,33 @@ fn note_change_event(
             "title": title,
             "action": action,
         }),
+    }
+}
+
+/// Emit `note:updated` for every task note whose `dependsOn` list names the
+/// changed task (monorepo#1979): a dependency status transition moves the
+/// dependents' computed `unmetDependsOn`, so subscribers must refetch them.
+/// `notes` is the workspace listing the caller already holds (no extra query).
+async fn publish_dependent_note_updates(
+    bus: &Option<EventBus>,
+    workspace_id: &WorkspaceId,
+    changed_note_id: &NoteId,
+    notes: &[Note],
+) {
+    for note in notes {
+        if note.id != *changed_note_id
+            && note
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| t.depends_on.contains(changed_note_id))
+        {
+            publish_event(
+                bus,
+                note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
+            )
+            .await;
+        }
     }
 }
 
@@ -14567,13 +14684,33 @@ impl WorkspaceApi for Services {
                     );
                 }
             }
-            store.list_notes(&id).await
+            let mut notes = store.list_notes(&id).await?;
+            // Project the computed `unmetDependsOn` onto task notes with
+            // `dependsOn` edges (monorepo#1979) — O(rows) over the same rows,
+            // no extra queries.
+            project_unmet_depends_on_all(&mut notes);
+            Ok(notes)
         })
     }
 
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
-        Box::pin(async move { fetch_note(&store, &workspace_id, &note_id).await })
+        Box::pin(async move {
+            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
+            // Project `unmetDependsOn` (monorepo#1979). The dep-status index
+            // is only needed — and only fetched — when the note actually has
+            // `dependsOn` edges, so plain reads stay single-query.
+            if note
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| !t.depends_on.is_empty())
+            {
+                let status_by_id = task_status_by_id(&store.list_tasks(&workspace_id).await?);
+                project_unmet_depends_on(&mut note, &status_by_id);
+            }
+            Ok(note)
+        })
     }
 
     fn create_note(
@@ -15155,7 +15292,15 @@ impl WorkspaceApi for Services {
             .await;
             // Deleting a task note can move the derived displayStatus rollup
             // (§6.5), e.g. removing the last open spec-child task.
-            if note.metadata.task.is_some() {
+            if let Some(task) = &note.metadata.task {
+                // Deleting a *complete* task flips its dependents' computed
+                // unmetDependsOn from met to unmet (missing = unmet), so
+                // re-announce them for subscriber refetch (monorepo#1979).
+                // Other statuses were already unmet — no projection change.
+                if task.status == TaskStatus::Complete {
+                    let all = store.list_notes(&workspace_id).await?;
+                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &all).await;
+                }
                 services
                     .maybe_emit_display_status_changed(&workspace_id)
                     .await;
@@ -15501,6 +15646,13 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // Re-announce dependents only when the transition crosses the
+                // complete boundary — that is the only move that changes their
+                // computed `unmetDependsOn` (monorepo#1979).
+                if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
+                {
+                    publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                }
                 // A task-status transition can move the derived displayStatus
                 // rollup (§6.5): recompute-and-compare, emitting only on an
                 // actual transition.
@@ -15706,13 +15858,15 @@ impl WorkspaceApi for Services {
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            // Relation writes are validated + cycle-checked against the
-            // workspace task-note set, exactly like `task.setRelations`. The
-            // fetch only happens when relations were supplied.
+            // Relation writes are validated + cycle/tree-checked against the
+            // workspace note set, exactly like `task.setRelations` (ALL notes,
+            // not just tasks — the tree-relative check walks `parent_id`
+            // chains that may cross non-task notes). The fetch only happens
+            // when relations were supplied.
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
             if depends_on.is_some() || conflicts_with.is_some() {
-                let all = store.list_tasks(&workspace_id).await?;
+                let all = store.list_notes(&workspace_id).await?;
                 if let Some(deps) = &depends_on {
                     validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
                     if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
@@ -15721,6 +15875,7 @@ impl WorkspaceApi for Services {
                             cycle.join(" -> ")
                         )));
                     }
+                    ensure_no_tree_relative_dependency(&note.id, deps, &all)?;
                 }
                 if let Some(conflicts) = &conflicts_with {
                     validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
@@ -15830,6 +15985,18 @@ impl WorkspaceApi for Services {
                         ),
                     )
                     .await;
+                    // Re-announce dependents only when the re-mark crosses the
+                    // complete boundary — the only move that changes their
+                    // computed `unmetDependsOn` (monorepo#1979).
+                    if (previous == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
+                        publish_dependent_note_updates(
+                            &services.event_bus,
+                            &note.workspace_id,
+                            &note.id,
+                            &all,
+                        )
+                        .await;
+                    }
                 }
                 Some(_) => {}
             }
@@ -15863,14 +16030,15 @@ impl WorkspaceApi for Services {
             };
             let depends_on = depends_on.map(normalize_relation_ids);
             let conflicts_with = conflicts_with.map(normalize_relation_ids);
-            // Validation + cycle check read the same workspace snapshot the
-            // write is based on (task notes only — `task_json IS NOT NULL`).
-            // Like every other task-metadata write this is last-writer-wins
-            // (no versioned CAS): concurrent relation writes are
-            // coordinator-driven and rare, and a racing write that slips a
+            // Validation + cycle/tree checks read the same workspace snapshot
+            // the write is based on (ALL notes, not just tasks — the
+            // tree-relative check walks `parent_id` chains that may cross
+            // non-task notes). Like every other task-metadata write this is
+            // last-writer-wins (no versioned CAS): concurrent relation writes
+            // are coordinator-driven and rare, and a racing write that slips a
             // stale cycle past the check degrades readiness for the tasks
             // involved, not data integrity.
-            let all = store.list_tasks(&workspace_id).await?;
+            let all = store.list_notes(&workspace_id).await?;
             if let Some(deps) = &depends_on {
                 validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
                 if let Some(cycle) = find_dependency_cycle(&note.id, deps, &all) {
@@ -15879,6 +16047,7 @@ impl WorkspaceApi for Services {
                         cycle.join(" -> ")
                     )));
                 }
+                ensure_no_tree_relative_dependency(&note.id, deps, &all)?;
             }
             if let Some(conflicts) = &conflicts_with {
                 validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
@@ -16107,6 +16276,9 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // No dependent re-announce here: the not_started → in_progress
+                // move never crosses the complete boundary, so dependents'
+                // computed `unmetDependsOn` is unchanged (monorepo#1979).
                 // The not_started → in_progress transition can move the
                 // derived displayStatus rollup (§6.5).
                 services
@@ -21763,12 +21935,17 @@ impl WorkspaceApi for Services {
     }
 
     /// `prMonitor.flush`: emit the pending debounced changes immediately.
+    /// `check: true` re-polls the monitor on demand first.
     fn pr_monitor_flush_pending(
         &self,
         workspace_id: WorkspaceId,
         monitor_id: intent_core::PrMonitorId,
+        check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.pr_monitor_flush_op(&workspace_id, &monitor_id).await })
+        Box::pin(async move {
+            self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
+                .await
+        })
     }
 }
 

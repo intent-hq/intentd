@@ -1765,6 +1765,278 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     assert!(err.to_string().contains("not a task"));
 }
 
+/// `dependsOn` edges onto tree ancestors/descendants are rejected
+/// (monorepo#1982): a child dependsOn its parent — the permanent mutual
+/// readiness block (the parent waits on the child via the tree rule, the
+/// child on the parent via the edge) — can no longer be written, in either
+/// direction, through `task.setRelations` or `task.markAsTask`. Ancestry
+/// chains crossing non-task notes are caught too; sibling edges stay valid.
+#[tokio::test]
+async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Tree: parent (task) → child (task), parent → mid (NON-task) →
+    // grandchild (task), parent → sibling (task).
+    let mk_task = |id: &str, parent: &str| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = id.to_string();
+        tn.parent_id = Some(NoteId::from(parent));
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        tn
+    };
+    store.insert_note(&note(&ws, "root", "body")).await.unwrap();
+    store.insert_note(&mk_task("parent", "root")).await.unwrap();
+    store
+        .insert_note(&mk_task("child", "parent"))
+        .await
+        .unwrap();
+    let mut mid = note(&ws, "mid", "body");
+    mid.parent_id = Some(NoteId::from("parent"));
+    store.insert_note(&mid).await.unwrap();
+    store
+        .insert_note(&mk_task("grandchild", "mid"))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("sibling", "parent"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // child dependsOn parent → ancestor rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("parent")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("tree ancestor"), "ancestor rejection: {msg}");
+    assert!(
+        msg.contains("parent is an ancestor of child"),
+        "relationship named: {msg}"
+    );
+
+    // parent dependsOn child → descendant rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("parent"),
+            Some(vec![NoteId::from("child")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tree descendant"),
+        "descendant rejection: {msg}"
+    );
+    assert!(
+        msg.contains("child is a descendant of parent"),
+        "relationship named: {msg}"
+    );
+
+    // The ancestry chain crossing a NON-task note (parent → mid →
+    // grandchild) is caught in both directions.
+    for (src, dep) in [("grandchild", "parent"), ("parent", "grandchild")] {
+        let err = svc
+            .task_set_relations(
+                ws.clone(),
+                NoteId::from(src),
+                Some(vec![NoteId::from(dep)]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("tree"),
+            "chain via non-task note rejected ({src} dependsOn {dep}): {err}"
+        );
+    }
+
+    // markAsTask enforces the same check.
+    let err = svc
+        .mark_as_task(
+            ws.clone(),
+            NoteId::from("child"),
+            "not_started".into(),
+            vec![],
+            None,
+            Some(vec![NoteId::from("parent")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("tree ancestor"),
+        "markAsTask ancestor rejection: {err}"
+    );
+
+    // Sibling and cross-subtree edges remain valid.
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("sibling"), NoteId::from("grandchild")]),
+            None,
+        )
+        .await
+        .expect("sibling/cross-subtree edges still valid");
+    assert!(r.ok);
+
+    // The rejected writes persisted nothing.
+    let p = svc
+        .get_my_task(ws, NoteId::from("parent"))
+        .await
+        .expect("getMyTask parent");
+    assert!(p.task_metadata.depends_on.is_empty());
+}
+
+/// monorepo#1979: note-shaped reads project the computed `unmetDependsOn`
+/// onto `metadata.task` — `note.get` / `note.list` carry the same unmet
+/// subset as the `task.list` projection, the field tracks dependency status
+/// changes, is omitted when empty (additive wire shape), and is never
+/// persisted into `task_json`.
+#[tokio::test]
+async fn note_reads_project_unmet_depends_on() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = title.to_string();
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", "Alpha", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", "Beta", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", "Gamma", TaskStatus::NotStarted))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store.clone());
+    svc.task_set_relations(
+        ws.clone(),
+        NoteId::from("task-c"),
+        Some(vec![NoteId::from("task-a"), NoteId::from("task-b")]),
+        None,
+    )
+    .await
+    .expect("setRelations");
+
+    // note.get: the complete dep (a) is met, the in-progress dep (b) is not.
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c");
+    let task = c.metadata.task.as_ref().expect("task metadata");
+    let unmet: Vec<&str> = task.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // note.list: same projection; dep-less task rows omit the field on the
+    // wire (empty vec → skip_serializing_if).
+    let notes = svc.list_notes(&ws).await.expect("list");
+    let row_c = notes.iter().find(|n| n.id.as_str() == "task-c").unwrap();
+    assert_eq!(
+        row_c.metadata.task.as_ref().unwrap().unmet_depends_on,
+        vec![NoteId::from("task-b")]
+    );
+    let row_b = notes.iter().find(|n| n.id.as_str() == "task-b").unwrap();
+    let b_json = serde_json::to_value(row_b).unwrap();
+    assert!(
+        b_json["metadata"]["task"].get("unmetDependsOn").is_none(),
+        "dep-less task omits unmetDependsOn: {b_json}"
+    );
+
+    // The projection is computed, not persisted: the raw store row is clean.
+    let raw = store.get_note(&ws, &NoteId::from("task-c")).await.unwrap();
+    assert!(raw.metadata.task.unwrap().unmet_depends_on.is_empty());
+
+    // Completing dep b empties c's projection (omitted on the wire).
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("complete b");
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c after b complete");
+    assert!(c
+        .metadata
+        .task
+        .as_ref()
+        .unwrap()
+        .unmet_depends_on
+        .is_empty());
+    let c_json = serde_json::to_value(&c).unwrap();
+    assert!(c_json["metadata"]["task"].get("unmetDependsOn").is_none());
+
+    // Cancelling dep b makes it unmet again (cancelled = unmet).
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "cancelled".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("cancel b");
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c after b cancelled");
+    assert_eq!(
+        c.metadata.task.unwrap().unmet_depends_on,
+        vec![NoteId::from("task-b")]
+    );
+
+    // Deleting the complete dep a makes it unmet too (missing = unmet).
+    svc.delete_note(ws.clone(), NoteId::from("task-a"), None)
+        .await
+        .expect("delete a");
+    let c = svc
+        .get_note(ws, NoteId::from("task-c"))
+        .await
+        .expect("get c after a deleted");
+    assert_eq!(
+        c.metadata.task.unwrap().unmet_depends_on,
+        vec![NoteId::from("task-a"), NoteId::from("task-b")]
+    );
+}
+
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
@@ -5025,6 +5297,11 @@ mod change_event_parity {
         // dep-b (leaf → ready). `gated` is NOT ready — dep-b is incomplete —
         // and parent-b is blocked by its incomplete child dep-b.
         assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-a", "dep-b"]));
+        // The dep transition moves `gated`'s computed unmetDependsOn, so its
+        // note is re-announced for subscriber refetch (monorepo#1979).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
 
         // Complete dep-b: both dependsOn edges are now satisfied, so `gated`
         // joins the ready set.
@@ -5046,6 +5323,9 @@ mod change_event_parity {
             ev["data"]["readyTaskIds"],
             json!(["parent-a", "parent-b", "gated"])
         );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
 
         // Cancelled deps do NOT satisfy edges: cancelling dep-a (complete →
         // cancelled) makes `gated` un-ready again (and parent-a too — a
@@ -5065,6 +5345,59 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
         assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-b"]));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // A transition that does NOT cross the complete boundary (cancelled →
+        // in_progress) leaves dependents' unmetDependsOn unchanged, so no
+        // dependent re-announce fires: the next boundary-crossing transition's
+        // `task:status-changed` follows the ready-set event directly.
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("restart dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("re-complete dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // Deleting a *complete* dep also moves dependents' unmetDependsOn
+        // (missing = unmet), so the dependent is re-announced after the
+        // `note:deleted` (monorepo#1979).
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep-b"), None)
+            .await
+            .expect("delete dep-b");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        assert_eq!(ev["data"]["noteId"], json!("dep-b"));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
     }
 
     #[tokio::test]
