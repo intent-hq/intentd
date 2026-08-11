@@ -142,8 +142,11 @@ fn collect_files(repo: &Repository) -> Result<Vec<FileStatus>> {
 
 /// Gitlink metadata for one status delta: `Some((mode, old_sha, new_sha))`
 /// when either side is a `160000` submodule pin, else `None` (monorepo#1739).
-/// A zero OID (missing side — added/deleted submodule, or a workdir side
-/// libgit2 could not resolve) folds to `None` on that side.
+/// Each side's SHA is emitted only when **that side** is in gitlink mode — a
+/// type change (gitlink→regular file or the reverse) keeps only the pin side,
+/// never leaking the regular side's blob OID as a pin SHA. A zero OID (missing
+/// side — added/deleted submodule, or a workdir side libgit2 could not
+/// resolve) also folds to `None` on that side.
 fn gitlink_info(delta: &DiffDelta) -> Option<(String, Option<String>, Option<String>)> {
     let commit_mode = FileMode::Commit;
     let old = delta.old_file();
@@ -152,7 +155,7 @@ fn gitlink_info(delta: &DiffDelta) -> Option<(String, Option<String>, Option<Str
         return None;
     }
     let sha = |f: git2::DiffFile| {
-        if f.id().is_zero() {
+        if f.mode() != commit_mode || f.id().is_zero() {
             None
         } else {
             Some(f.id().to_string())
@@ -359,5 +362,34 @@ mod tests {
         assert_eq!(plain.mode, None);
         assert_eq!(plain.old_sha, None);
         assert_eq!(plain.new_sha, None);
+    }
+
+    /// A gitlink→regular-file replacement (type change) keeps the pin SHA on
+    /// the gitlink side only: the entry is still flagged `mode: "160000"` but
+    /// the regular side's blob OID is never exposed as a pin SHA
+    /// (monorepo#1739 review).
+    #[test]
+    fn gitlink_typechange_never_exposes_blob_as_pin() {
+        let parent = init_repo("status-gitlink-typechange");
+        commit_file(parent.path(), "p.txt", "root\n");
+        let old_sha = "7257a190564088376227525989c4994e46082ad1";
+        crate::testutil::commit_gitlink_bump(parent.path(), "sub", old_sha);
+        // Stage a regular file where the gitlink was.
+        let repo = git2::Repository::open(parent.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new("sub")).unwrap();
+        write_file(parent.path(), "sub", "now a file\n");
+        index.add_path(std::path::Path::new("sub")).unwrap();
+        index.write().unwrap();
+
+        let st = status(parent.path()).unwrap();
+        let sub = st
+            .files
+            .iter()
+            .find(|f| f.path == "sub" && f.staged)
+            .unwrap();
+        assert_eq!(sub.mode.as_deref(), Some("160000"));
+        assert_eq!(sub.old_sha.as_deref(), Some(old_sha));
+        assert_eq!(sub.new_sha, None, "blob OID must not leak as a pin SHA");
     }
 }

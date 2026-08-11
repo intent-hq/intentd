@@ -406,12 +406,14 @@ pub(crate) fn build_diffs(
             }
             // A gitlink delta has no blob content for libgit2 to patch, so
             // synthesize the `Subproject commit <sha>` pseudo-hunk from the
-            // pin SHAs (monorepo#1739).
+            // pin SHAs (monorepo#1739). Only the gitlink side(s) contribute a
+            // pin line — on a gitlink↔file type change the regular side's
+            // blob is never rendered as a pin.
             let gitlink_hunks;
-            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_gitlink {
+            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_gitlink() {
                 gitlink_hunks = intent_git::diff::gitlink_hunks(
-                    entry.file.old_blob.as_deref(),
-                    entry.file.new_blob.as_deref(),
+                    entry.file.gitlink_old_sha(),
+                    entry.file.gitlink_new_sha(),
                 );
                 &gitlink_hunks
             } else if entry.file.is_binary {
@@ -453,11 +455,12 @@ pub(crate) fn build_diffs(
                 continue;
             }
         }
-        let hunks = if fd.is_gitlink {
+        let hunks = if fd.is_gitlink() {
             // Gitlink pins are commit SHAs in the submodule's odb — not blobs
             // here — so `hunks_between` cannot hydrate them; synthesize the
-            // `Subproject commit <sha>` pseudo-hunk instead (monorepo#1739).
-            intent_git::diff::gitlink_hunks(fd.old_blob.as_deref(), fd.new_blob.as_deref())
+            // `Subproject commit <sha>` pseudo-hunk instead (monorepo#1739),
+            // from the pin side(s) only.
+            intent_git::diff::gitlink_hunks(fd.gitlink_old_sha(), fd.gitlink_new_sha())
         } else if fd.is_binary {
             Vec::new()
         } else {

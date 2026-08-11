@@ -5984,6 +5984,141 @@ async fn wss_git_show_file_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Gitlink (submodule) wire shapes over WSS (monorepo#1739): `git.status`
+/// carries the additive `mode`/`oldSha`/`newSha` fields on the gitlink entry
+/// only, `git.changes` mirrors the same list, and `git.diffs` emits the
+/// synthesized one-line `Subproject commit <sha>` pseudo-hunk for the staged
+/// pin change.
+#[tokio::test]
+async fn wss_git_gitlink_status_and_diffs_wire_shape() {
+    let srv = start(WsOptions::default()).await;
+
+    let repo_dir = test_tempdir("intentd-wssgl-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    // Commit a gitlink pin, then stage a bump to a new pin (both via
+    // plumbing — the pin commits need not exist in this odb).
+    let old_pin = "7257a190564088376227525989c4994e46082ad1";
+    let new_pin = "7908777602d4e96f13c663c8a70a617163f38413";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{old_pin},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{new_pin},sub"),
+    ]);
+    // A plain unstaged edit alongside, to assert regular files stay bare.
+    std::fs::write(repo.join("seed.txt"), "seed\nedited\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitlink WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // git.status: the gitlink entry carries mode/oldSha/newSha; the regular
+    // file entry omits all three (additive, backward-compatible).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.status","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    let sub = files
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .expect("gitlink entry");
+    assert_eq!(sub["status"], "M");
+    assert_eq!(sub["staged"], true);
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+    let seed = files
+        .iter()
+        .find(|f| f["path"] == "seed.txt")
+        .expect("regular entry");
+    for k in ["mode", "oldSha", "newSha"] {
+        assert!(seed.get(k).is_none(), "regular file must omit {k}");
+    }
+
+    // git.changes mirrors the same list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let sub = resp["result"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .cloned()
+        .expect("gitlink entry");
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+
+    // git.diffs (staged): the gitlink delta yields the synthesized
+    // `Subproject commit <sha>` pseudo-hunk.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","staged":true,"path":"sub"}}}}"#
+        ),
+    )
+    .await;
+    let entries = resp["result"].as_array().expect("diff entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "sub");
+    let hunks = entries[0]["hunks"].as_array().expect("hunks");
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(
+        hunks[0],
+        serde_json::json!({
+            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+            "lines": [
+                { "type": "Deletion", "content": format!("Subproject commit {old_pin}\n"), "oldNumber": 1 },
+                { "type": "Addition", "content": format!("Subproject commit {new_pin}\n"), "newNumber": 1 },
+            ],
+        })
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `note.saveAsset` over WSS (PROTOCOL §5.2 — additive asset write): the write
 /// returns `{ assetId, path, url }` and the asset round-trips back through
 /// `note.readAsset`; a missing `data` param is -32602.
