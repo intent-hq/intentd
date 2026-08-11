@@ -23472,6 +23472,38 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         Error::InvalidParams(msg) => assert!(msg.contains(&ghost.0), "{msg}"),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
+
+    // Single-task-only params are rejected, not silently dropped.
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do it my way".into()),
+                ..batch_input(&[&note_id], None)
+            },
+            None,
+        )
+        .await
+        .expect_err("agentInstructions rejected in batch mode");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("agentInstructions"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                force: Some(true),
+                ..batch_input(&[&note_id], None)
+            },
+            None,
+        )
+        .await
+        .expect_err("force rejected in batch mode");
+    match &err {
+        Error::InvalidParams(msg) => assert!(msg.contains("force"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
 }
 
 /// The full batch shape: ready task starts (agent created + assigned),

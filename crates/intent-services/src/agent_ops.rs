@@ -5855,21 +5855,43 @@ impl Services {
                     .to_string(),
             ));
         }
-        // Depth guard up front (the same check the single-task path runs) so
-        // a rejection is one clear error before any child is created, not N
+        // Single-task-only params are rejected rather than silently dropped:
+        // `agentInstructions` addresses ONE child's first message (each batch
+        // child resolves its own from its task note), and `force` overrides
+        // the occupancy gate that batch mode deliberately maps to `skipped`.
+        if input.agent_instructions.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: agentInstructions is not supported with tasks — each started task's first message resolves from its own task note".to_string(),
+            ));
+        }
+        if input.force == Some(true) {
+            return Err(Error::InvalidParams(
+                "agent.delegate: force is not supported with tasks — occupied tasks classify as skipped (use the single-task form to force a second agent)".to_string(),
+            ));
+        }
+        // Depth + watch-scope guards up front (the same checks the
+        // single-task path runs before any side-effectful work) so a
+        // rejection is one clear error before any child is created, not N
         // identical per-task failures.
         if let Some(parent) = &parent_agent_id {
-            let parent_depth = self
-                .store
-                .get_agent_session(parent)
-                .await
-                .ok()
+            let parent_session = self.store.get_agent_session(parent).await.ok();
+            let parent_depth = parent_session
+                .as_ref()
                 .and_then(|s| s.delegation_depth)
                 .unwrap_or(0);
             if parent_depth >= MAX_DELEGATION_DEPTH {
                 return Err(Error::InvalidParams(format!(
                     "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
                 )));
+            }
+            if let Some(session) = parent_session
+                .as_ref()
+                .filter(|s| s.status != AgentStatus::Deleted)
+            {
+                crate::agent_subscriptions::check_watch_scope(
+                    &session.workspace_id,
+                    &workspace_id,
+                )?;
             }
         }
 
@@ -5922,7 +5944,6 @@ impl Services {
 
         let greedy = input.greedy.unwrap_or(false);
         let classified = classify_batch_tasks(&requested, &snaps, greedy);
-        let unlocked = project_unlock_plan(&classified, &snaps);
 
         // Delegate the start subset through the unchanged single-task path.
         // A per-task failure becomes an `error` disposition rather than
@@ -6029,6 +6050,11 @@ impl Services {
             rows.push(row);
         }
 
+        // Project the unlock plan from what ACTUALLY started (an errored
+        // start never settles) plus every live-agent task in the workspace —
+        // requested or not — since any of those settling can release a hold.
+        let unlocked = project_unlock_plan(&classified, &snaps, &started_ids);
+
         let held_count = rows
             .iter()
             .filter(|r| {
@@ -6041,7 +6067,7 @@ impl Services {
             if held_count == 0 {
                 "Nothing is held; no re-call needed beyond the normal completion wakes.".to_string()
             } else {
-                "Held tasks are not unlocked by the started/running set settling alone (unmet dependencies outside it, or cancelled/missing dependencies needing a decision). Resolve those, then re-call agent.delegate.".to_string()
+                "Held tasks are not unlocked by the started/running set settling alone (dependencies outside it that are incomplete, cancelled, or missing — possibly needing a decision — or conflicts with tasks that are not settling). Resolve those, then re-call agent.delegate.".to_string()
             }
         } else {
             format!(

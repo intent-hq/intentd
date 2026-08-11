@@ -2784,9 +2784,11 @@ pub struct AgentDelegateInput {
     pub force: Option<bool>,
     /// Batch form (PROTOCOL §5.5): a list of task-note ids to classify and
     /// start together. Mutually exclusive with `taskNoteId`/`noteId`/
-    /// `taskText`; when present the result enumerates every listed task with
-    /// its disposition (`started` / `held:*` / `skipped`) plus the unlock
-    /// plan. Single-task calls (this field absent) behave exactly as before.
+    /// `taskText`, and the single-task-only `agentInstructions`/`force` are
+    /// rejected alongside it; when present the result enumerates every listed
+    /// task with its disposition (`started` / `held:*` / `skipped`) plus the
+    /// unlock plan. Single-task calls (this field absent) behave exactly as
+    /// before.
     pub tasks: Option<Vec<NoteId>>,
     /// Batch-only conflict policy (default false): `false` holds a task whose
     /// `conflictsWith` intersects the running/starting set; `true` starts it

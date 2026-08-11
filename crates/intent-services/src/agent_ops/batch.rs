@@ -164,6 +164,11 @@ pub(crate) fn classify_batch_tasks(
 
 /// Project the unlock plan: which of the held tasks become startable once the
 /// currently started/running set settles (their statuses flip to `complete`).
+/// `started` is the set of tasks that ACTUALLY started (post-delegation, so a
+/// start whose delegation errored never counts as settling); on top of it,
+/// EVERY workable task with a live assigned agent settles in the simulation —
+/// requested or not — because a running non-requested task holding a
+/// requested one via `conflictsWith` releases it at exactly that settlement.
 /// Pure re-classification over the simulated snapshot — no state is written;
 /// the caller is expected to re-call `agent.delegate` at settlement, which
 /// recomputes this for real. Held-on-deps tasks whose unmet deps include a
@@ -172,18 +177,16 @@ pub(crate) fn classify_batch_tasks(
 pub(crate) fn project_unlock_plan(
     classified: &[(String, BatchDisposition)],
     snaps: &HashMap<String, BatchTaskSnap>,
+    started: &[String],
 ) -> Vec<String> {
+    let started_set: HashSet<&str> = started.iter().map(|s| s.as_str()).collect();
     let mut simulated = snaps.clone();
-    for (id, disposition) in classified {
-        let settles = matches!(
-            disposition,
-            BatchDisposition::Start { .. } | BatchDisposition::SkippedAlreadyRunning { .. }
-        );
-        if settles {
-            if let Some(snap) = simulated.get_mut(id) {
-                snap.status = TaskStatus::Complete;
-                snap.live_agent = None;
-            }
+    for (id, snap) in simulated.iter_mut() {
+        let running = snap.live_agent.is_some()
+            && !matches!(snap.status, TaskStatus::Complete | TaskStatus::Cancelled);
+        if started_set.contains(id.as_str()) || running {
+            snap.status = TaskStatus::Complete;
+            snap.live_agent = None;
         }
     }
     let held: Vec<String> = classified
@@ -350,7 +353,7 @@ mod tests {
         snaps.insert("dead".into(), snap(TaskStatus::Cancelled, &[], &[]));
         snaps.insert("t4".into(), snap(TaskStatus::NotStarted, &["dead"], &[]));
         let classified = classify_batch_tasks(&ids(&["t1", "t2", "t3", "t4"]), &snaps, false);
-        let unlocked = project_unlock_plan(&classified, &snaps);
+        let unlocked = project_unlock_plan(&classified, &snaps, &ids(&["t1"]));
         assert_eq!(unlocked, vec!["t2".to_string(), "t3".to_string()]);
     }
 
@@ -363,7 +366,41 @@ mod tests {
         );
         snaps.insert("t".into(), snap(TaskStatus::NotStarted, &["busy"], &[]));
         let classified = classify_batch_tasks(&ids(&["busy", "t"]), &snaps, false);
-        let unlocked = project_unlock_plan(&classified, &snaps);
+        let unlocked = project_unlock_plan(&classified, &snaps, &[]);
         assert_eq!(unlocked, vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn unlock_plan_settles_running_tasks_outside_the_batch() {
+        // A non-requested running task holds a requested one via conflict;
+        // its settlement is exactly what unlocks the held task, so the plan
+        // must name it even though `busy` never appears in `classified`.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "busy".into(),
+            running(snap(TaskStatus::InProgress, &[], &["t"])),
+        );
+        snaps.insert("t".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        let classified = classify_batch_tasks(&ids(&["t"]), &snaps, false);
+        assert_eq!(
+            classified[0].1,
+            BatchDisposition::HeldOnConflict {
+                conflicts_with: vec!["busy".into()]
+            }
+        );
+        let unlocked = project_unlock_plan(&classified, &snaps, &[]);
+        assert_eq!(unlocked, vec!["t".to_string()]);
+    }
+
+    #[test]
+    fn unlock_plan_ignores_starts_that_failed_to_delegate() {
+        // t2 depends on t1; t1 classified Start but its delegation errored
+        // (t1 absent from `started`), so t2 is NOT advertised as unlocked.
+        let mut snaps = HashMap::new();
+        snaps.insert("t1".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("t2".into(), snap(TaskStatus::NotStarted, &["t1"], &[]));
+        let classified = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps, false);
+        let unlocked = project_unlock_plan(&classified, &snaps, &[]);
+        assert_eq!(unlocked, Vec::<String>::new());
     }
 }

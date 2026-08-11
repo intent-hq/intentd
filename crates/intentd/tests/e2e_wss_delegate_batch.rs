@@ -173,7 +173,9 @@ async fn connect_ws(
 }
 
 /// One WSS JSON-RPC round-trip, returning the raw envelope (caller checks
-/// `error`/`result` itself).
+/// `error`/`result` itself). Asserts the JSON-RPC 2.0 response envelope
+/// shape per PROTOCOL.md §1: `jsonrpc: "2.0"`, the echoed `id`, and exactly
+/// one of `result` / `error`.
 async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -190,6 +192,12 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], json!("2.0"), "rpc {method} envelope: {v}");
+                    let obj = v.as_object().expect("response object");
+                    assert!(
+                        obj.contains_key("result") ^ obj.contains_key("error"),
+                        "rpc {method} must carry exactly one of result/error: {v}"
+                    );
                     return v;
                 }
             }
