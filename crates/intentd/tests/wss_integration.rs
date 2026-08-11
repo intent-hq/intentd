@@ -7488,3 +7488,301 @@ fn free_port() -> u16 {
         .expect("addr")
         .port()
 }
+
+// ---------------------------------------------------------------------------
+// RFC 7692 permessage-deflate negotiation on the WSS listener (monorepo#1971).
+// ---------------------------------------------------------------------------
+
+/// A transparent [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] wrapper
+/// that counts the bytes crossing the underlying socket in each direction.
+/// Installed on the raw TCP stream *beneath* TLS, so the counts reflect real
+/// on-the-wire traffic (TLS records included).
+struct CountingStream<S> {
+    inner: S,
+    read: Arc<std::sync::atomic::AtomicUsize>,
+    written: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            self.read.fetch_add(
+                buf.filled().len() - before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.written
+                .fetch_add(*n, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Byte counters for one instrumented connection: (bytes read, bytes written)
+/// at the TCP layer.
+type WireCounters = (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+/// An instrumented authenticated WSS connection: TCP → [`CountingStream`] →
+/// pinned TLS → WebSocket upgrade, optionally offering permessage-deflate.
+/// Returns the socket, the handshake response (for `Sec-WebSocket-Extensions`
+/// assertions), and the wire counters.
+async fn connect_ws_counting(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    offer_deflate: bool,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<CountingStream<TcpStream>>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+    WireCounters,
+) {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.expect("tcp");
+    let _ = tcp.set_nodelay(true);
+    let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = CountingStream {
+        inner: tcp,
+        read: read.clone(),
+        written: written.clone(),
+    };
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, counted)
+        .await
+        .expect("tls connect");
+    let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    if offer_deflate {
+        ws_config.extensions.permessage_deflate = Some(
+            tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default(),
+        );
+    }
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, resp) = tokio_tungstenite::client_async_with_config(url, tls, Some(ws_config))
+        .await
+        .expect("ws upgrade");
+    (ws, resp, (read, written))
+}
+
+/// Drive several JSON-RPC frames over an already-open socket, returning one
+/// parsed response per frame (same shape as [`wss_session`], generic over the
+/// instrumented stream).
+async fn drive_frames<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    frames: Vec<String>,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = Vec::new();
+    for frame in frames {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    out.push(serde_json::from_str(&text).expect("json"));
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    out
+}
+
+/// One draft round-trip carrying `payload` over an instrumented connection:
+/// `client.hello` → `workspace.create` → `drafts.set` → `drafts.get`. Returns
+/// the text echoed back by `drafts.get`.
+async fn draft_round_trip<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    client_id: &str,
+    payload: &str,
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = drive_frames(
+        ws,
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"client.hello","params":{{"clientId":"{client_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.create","params":{{"title":"Deflate {client_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let ws_id = resp[1]["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let set = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "drafts.set",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate", "text": payload }
+    });
+    let get = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "drafts.get",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate" }
+    });
+    let resp = drive_frames(ws, vec![set.to_string(), get.to_string()]).await;
+    assert_eq!(resp[0]["result"]["ok"], true, "drafts.set: {}", resp[0]);
+    resp[1]["result"]["text"]
+        .as_str()
+        .expect("draft text")
+        .to_string()
+}
+
+/// E2E (monorepo#1971): a client offering `permessage-deflate` negotiates
+/// compression on the real WSS transport — the 101 response echoes the agreed
+/// extension and a highly compressible JSON payload is measurably smaller on
+/// the wire than the same payload over a non-offering control connection,
+/// which itself sees no `Sec-WebSocket-Extensions` header and identical
+/// payload semantics (today's behavior).
+#[tokio::test]
+async fn wss_deflate_negotiation_compresses_on_the_wire() {
+    let srv = start(WsOptions::default()).await;
+    // ~128 KiB of highly compressible text, well past any handshake noise.
+    let payload = "intentd permessage-deflate ".repeat(5000);
+
+    // Deflate-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), true).await;
+    let agreed = resp
+        .headers()
+        .get("sec-websocket-extensions")
+        .expect("server echoes the negotiated extension")
+        .to_str()
+        .expect("ascii header");
+    assert!(
+        agreed.starts_with("permessage-deflate"),
+        "negotiated header names the extension: {agreed}"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-deflate", &payload).await;
+    assert_eq!(
+        echoed, payload,
+        "payload survives the compressed round-trip intact"
+    );
+    let _ = ws.close(None).await;
+    let deflate_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let deflate_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Control: identical session over a non-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), false).await;
+    assert!(
+        resp.headers().get("sec-websocket-extensions").is_none(),
+        "no offer ⇒ no Sec-WebSocket-Extensions in the 101 response"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-plain", &payload).await;
+    assert_eq!(echoed, payload, "control round-trip intact");
+    let _ = ws.close(None).await;
+    let plain_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let plain_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The compressible payload dominates both directions (~128 KiB each way
+    // uncompressed); compression must shrink the wire traffic dramatically.
+    // "< half" is a deliberately loose bound — in practice it is >90% smaller.
+    assert!(
+        deflate_read < plain_read / 2,
+        "server→client traffic compressed: deflate={deflate_read}B plain={plain_read}B"
+    );
+    assert!(
+        deflate_written < plain_written / 2,
+        "client→server traffic compressed: deflate={deflate_written}B plain={plain_written}B"
+    );
+    srv.ws.stop().await;
+}
+
+/// E2E control (monorepo#1971): a client that offers an unacceptable
+/// extension set is declined per RFC 7692 §7 — no `Sec-WebSocket-Extensions`
+/// in the 101 response — and gets a clean uncompressed connection with a
+/// working JSON-RPC round-trip, byte-identical behavior to a client that
+/// never offered.
+#[tokio::test]
+async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
+    let srv = start(WsOptions::default()).await;
+
+    // Hand-rolled upgrade with an offer the server must decline (unknown
+    // parameter, RFC 7692 §7). `tls_connect` + raw HTTP keeps the client free
+    // to send an arbitrary header the fork's client API would never produce.
+    let mut tls = tls_connect(srv.port, srv.cfg.clone()).await;
+    let req = format!(
+        "GET /ws?token={TOKEN} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; parameter-from-the-future=3\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.expect("write upgrade");
+    tls.flush().await.expect("flush");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(
+            tls.read(&mut byte).await.expect("read head") == 1,
+            "connection closed before 101 head"
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "declined offer still upgrades: {head}"
+    );
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "declined offer ⇒ no extensions header in the 101 response: {head}"
+    );
+
+    // The upgraded socket is a plain uncompressed WebSocket: a JSON-RPC
+    // round-trip behaves exactly as today.
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        tls,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{}}"#.to_string()],
+    )
+    .await;
+    assert!(
+        resp[0]["result"]["workspaces"].is_array(),
+        "plain round-trip works after the declined offer: {}",
+        resp[0]
+    );
+    let _ = ws.close(None).await;
+    srv.ws.stop().await;
+}
