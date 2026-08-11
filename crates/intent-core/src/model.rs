@@ -2065,6 +2065,14 @@ pub const PENDING_QUESTIONS_MESSAGE_ID_KEY: &str = "pendingQuestionsMessageId";
 /// [`AgentSession::last_seen_message_id`].
 pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 
+/// Metadata key under which the initial-agent flag is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.1/§5.5): stamped `true` by the
+/// daemon's `workspace.create` initial-agent orchestration so clients can
+/// classify the workspace's coordinator. No schema migration — the flag rides
+/// the existing free-form `metadata` column and survives daemon restarts.
+/// Read back by [`AgentSession::is_initial_agent`].
+pub const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
+
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5,
 /// question hold). `User` marks the FE `agent.sendMessage` RPC — the ONLY
 /// user-originated entry point — which always delivers immediately; it
@@ -2321,6 +2329,19 @@ impl AgentSession {
             .and_then(serde_json::Value::as_str)
             .filter(|s| !s.is_empty())
     }
+
+    /// The initial-agent flag persisted under [`IS_INITIAL_AGENT_KEY`] in the
+    /// session's free-form `metadata`: `true` only when the metadata is an
+    /// object carrying the JSON boolean `true` under that key (any other
+    /// value — absent, `false`, or non-boolean — reads as `false`). Stamped
+    /// by the daemon's `workspace.create` initial-agent orchestration.
+    pub fn is_initial_agent(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(IS_INITIAL_AGENT_KEY))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
@@ -2379,6 +2400,12 @@ pub struct AgentMetadata {
     /// after it on conversation entry. Omitted when nothing was marked seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_message_id: Option<String>,
+    /// Initial-agent flag (PROTOCOL §5.1/§5.5): present as `true` only when
+    /// the raw session metadata carries the daemon-stamped
+    /// [`IS_INITIAL_AGENT_KEY`] boolean `true` (the `workspace.create`
+    /// initial-agent orchestration). Omitted otherwise — never `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_initial_agent: Option<bool>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -2551,6 +2578,7 @@ impl AgentLite {
         let dismissed_questions_message_id =
             session.dismissed_questions_message_id().map(str::to_string);
         let last_seen_message_id = session.last_seen_message_id().map(str::to_string);
+        let is_initial_agent = session.is_initial_agent().then_some(true);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -2568,6 +2596,7 @@ impl AgentLite {
             sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
             last_seen_message_id,
+            is_initial_agent,
         };
         Self {
             id: session.id,
@@ -4092,6 +4121,7 @@ mod tests {
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
                 LAST_SEEN_MESSAGE_ID_KEY: "msg-seen",
+                IS_INITIAL_AGENT_KEY: true,
             })),
             stop_reason: None,
             stop_reason_timestamp: None,
@@ -4118,6 +4148,8 @@ mod tests {
         assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
         // The per-conversation seen marker is lifted the same way.
         assert_eq!(v["metadata"]["lastSeenMessageId"], "msg-seen");
+        // The daemon-stamped initial-agent flag is lifted the same way.
+        assert_eq!(v["metadata"]["isInitialAgent"], true);
         // The persisted session value is served, not a hard-coded `false`
         // (G-A1/P3-1.2c).
         assert_eq!(v["metadata"]["isBackground"], true);
@@ -4134,6 +4166,78 @@ mod tests {
         assert_eq!(v["lastMessageRole"], "user");
         assert_eq!(v["lastMessageId"], "msg-last");
         assert_eq!(v["lastActivity"], "t1");
+    }
+
+    /// `metadata.isInitialAgent` is presence-detected: omitted from the
+    /// `AgentLite` metadata projection when the raw session metadata lacks the
+    /// key, and equally omitted when the key is present but not the JSON
+    /// boolean `true` (`false` or a non-boolean value) — never `false`, never
+    /// `null` (PROTOCOL §5.5).
+    #[test]
+    fn agent_lite_is_initial_agent_omitted_unless_true() {
+        let session = |metadata: Option<serde_json::Value>| AgentSession {
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        let project = |metadata: Option<serde_json::Value>| {
+            let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
+            serde_json::to_value(&lite).unwrap()
+        };
+
+        // No metadata at all, key absent, `false`, and non-boolean values all
+        // omit the key entirely.
+        for metadata in [
+            None,
+            Some(json!({})),
+            Some(json!({ IS_INITIAL_AGENT_KEY: false })),
+            Some(json!({ IS_INITIAL_AGENT_KEY: "true" })),
+        ] {
+            let v = project(metadata.clone());
+            assert!(
+                v["metadata"].get("isInitialAgent").is_none(),
+                "expected isInitialAgent omitted for metadata {metadata:?}: {v}"
+            );
+        }
+
+        // Only the JSON boolean `true` surfaces the flag.
+        let v = project(Some(json!({ IS_INITIAL_AGENT_KEY: true })));
+        assert_eq!(v["metadata"]["isInitialAgent"], true);
     }
 
     /// `AgentSession` serializes to the camelCase `agent-session.ts` wire shape:

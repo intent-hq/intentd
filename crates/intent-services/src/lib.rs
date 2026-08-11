@@ -11632,10 +11632,10 @@ impl WorkspaceApi for Services {
                         // `instruction-service.ts` prompt-cache `':initial'`
                         // suffix, `agent-persistence.ts`) uses to classify the
                         // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON — the strict
-                        // `AgentLite.metadata` projection does not surface them
-                        // yet (future work if the daemon-only wire path grows
-                        // a consumer). The caller's metadata object is
+                        // the raw `AgentSession.metadata` JSON; the strict
+                        // `AgentLite.metadata` projection surfaces
+                        // `isInitialAgent` (presence-detected, `true`-only —
+                        // PROTOCOL §5.5). The caller's metadata object is
                         // forwarded as-is; like agent.create, only the
                         // harvested gap fields persist today (P2-12a) —
                         // `behaviorPrompt` has no session column and the
