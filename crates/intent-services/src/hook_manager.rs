@@ -1128,9 +1128,7 @@ impl Services {
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
                     self.persist_hook_state(hook, state).await?;
-                    self.store
-                        .update_hook_state(&hook.hook_id, HookState::Expired)
-                        .await?;
+                    self.store.expire_hook(&hook.hook_id).await?;
                     hook.state = HookState::Expired;
                     hook.last_run_at = Some(last_run_at);
                     hook.next_run_at = None;
@@ -1195,9 +1193,7 @@ impl Services {
                     // before emitting.
                     let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
                     if expired {
-                        self.store
-                            .update_hook_state(&hook.hook_id, HookState::Expired)
-                            .await?;
+                        self.store.expire_hook(&hook.hook_id).await?;
                         hook.state = HookState::Expired;
                         hook.next_run_at = None;
                     } else {
@@ -1362,15 +1358,8 @@ impl Services {
                 tracing::warn!(hook = %hook.hook_id.0, error = %e, "expiry state re-read failed");
             }
         }
-        if let Err(e) = self
-            .store
-            .update_hook_state(&hook.hook_id, HookState::Expired)
-            .await
-        {
-            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expired state");
-        }
-        if let Err(e) = self.store.update_hook_next_run(&hook.hook_id, None).await {
-            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to clear hook nextRunAt");
+        if let Err(e) = self.store.expire_hook(&hook.hook_id).await {
+            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expiry");
         }
         hook.state = HookState::Expired;
         hook.next_run_at = None;
@@ -3640,15 +3629,17 @@ mod tests {
     #[tokio::test]
     async fn hook_expires_during_sleep_and_wakes_owner() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Deadline 300ms out, inter-run delay 10s: the scheduler's expiry arm
-        // must win the select and expire the hook without another run.
+        // Deadline 3s out (wide enough that a loaded host cannot burn
+        // through it between insert and rehydrate — monorepo#1358), inter-run
+        // delay 10 minutes: the scheduler's expiry arm must win the select
+        // and expire the hook without another run.
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws.clone(),
             agent_id: owner.clone(),
             name: "short-ttl".to_string(),
             code: "return { dispatch: false };".to_string(),
-            delay_ms: 10_000,
+            delay_ms: 600_000,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -3657,7 +3648,7 @@ mod tests {
             last_error: None,
             last_logs: None,
             last_state: None,
-            expires_at: Some(next_run_at_iso(300)),
+            expires_at: Some(next_run_at_iso(3_000)),
             perpetual: false,
             dispatch_count: 0,
         };
