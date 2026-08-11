@@ -37,6 +37,7 @@ mod settings_repo;
 mod stop_redelivery_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
+mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
 mod workspace_context_repo;
@@ -59,6 +60,7 @@ pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use stop_redelivery_repo::StopRedeliveryRow;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
+pub use transfer_repo::TRANSFER_TABLES;
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 

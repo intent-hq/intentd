@@ -60,10 +60,14 @@
 //! `file.placeAttachment` router method (additive; §5.9, monorepo#1948):
 //! daemon-mediated attachment placement into the git-ignored
 //! `.intent/attachments/` workspace directory with collision-safe naming —
-//! 273 router methods, 312 total.
+//! 273 router methods, 312 total. Version 6.6 adds `workspace.transfer.plan`
+//! (additive; §5.1): read-only transfer preview — the versioned export
+//! manifest (tables, assets, git summary) plus the size estimate (DB rows +
+//! assets + estimated git bundle) and pre-flight warnings — 274 router
+//! methods, 313 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.5";
+pub const PROTOCOL_VERSION: &str = "6.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

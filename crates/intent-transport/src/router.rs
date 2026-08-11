@@ -369,6 +369,14 @@ async fn dispatch(
             let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
             Ok(result)
         }
+        "workspace.transfer.plan" => {
+            let id = require_workspace_id(params)?;
+            let plan = api
+                .workspace_transfer_plan(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "plan": plan }))
+        }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
             let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;
