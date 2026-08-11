@@ -1870,9 +1870,17 @@ impl Services {
             // monorepo#1016: annotate a suspected stall (idle, no report,
             // assigned task still incomplete) on the recorded line + event
             // data. Best-effort — lookup failures fail open.
-            let stall = match session.as_ref() {
-                Some(s) => self.stall_suspicion_for_session(s).await,
-                None => None,
+            // monorepo#1898: an emit-time payload carrying the report means
+            // the child DID report — suppress the suspicion even if the
+            // re-read session's persisted report was cleared since, so the
+            // recorded line/flag can never contradict its `Report:` clause.
+            let stall = if crate::event_carries_report(event_data) {
+                None
+            } else {
+                match session.as_ref() {
+                    Some(s) => self.stall_suspicion_for_session(s).await,
+                    None => None,
+                }
             };
             let attention = session.as_ref().map(|s| {
                 (
