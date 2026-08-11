@@ -2191,10 +2191,11 @@ async fn dispatch(
         "github.branches.list" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
+            let prefix = opt_str(params, "prefix");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_branches_list(owner, repo, limit, next_token)
+                .github_branches_list(owner, repo, prefix, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

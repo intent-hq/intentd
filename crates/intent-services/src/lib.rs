@@ -19598,6 +19598,7 @@ impl WorkspaceApi for Services {
         &self,
         owner: String,
         repo: String,
+        prefix: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -19605,11 +19606,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
+            // A blank/whitespace `prefix` keeps the unfiltered listing
+            // (parity with the trimmed, blanks-dropped search queries).
+            let prefix = prefix
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_remote_branches(
                     &owner,
                     &repo,
+                    prefix.as_deref(),
                     intent_sourcecontrol::PageParams { limit, cursor },
                 )
                 .await

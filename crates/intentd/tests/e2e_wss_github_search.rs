@@ -174,10 +174,13 @@ fn sample_issue() -> Issue {
 /// services layer hands to the engine so tests can assert the wire `query` /
 /// `nextToken` landed on `search` / `cursor`, and returns one PR / issue with
 /// a fixed `next_cursor` (`"2"`) so `nextToken` round-trips on the response.
+/// Branch listings record the `(prefix, cursor)` pair the engine saw so the
+/// `github.branches.list` `prefix` threading is assertable end-to-end.
 #[derive(Default)]
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,
+    branch_queries: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
 #[async_trait]
@@ -214,9 +217,27 @@ impl SourceControl for RecordingForge {
         &self,
         _: &str,
         _: &str,
-        _: PageParams,
+        prefix: Option<&str>,
+        page: PageParams,
     ) -> ScResult<Page<Branch>> {
-        unimplemented!()
+        self.branch_queries
+            .lock()
+            .unwrap()
+            .push((prefix.map(str::to_string), page.cursor.clone()));
+        let all = ["main", "feature/login", "feature/logout"];
+        let items = all
+            .iter()
+            .filter(|n| prefix.is_none_or(|p| n.starts_with(p)))
+            .map(|n| Branch {
+                name: (*n).into(),
+                commit_sha: None,
+                protected: false,
+            })
+            .collect();
+        Ok(Page {
+            items,
+            next_cursor: Some("2".into()),
+        })
     }
     async fn get_file_content(
         &self,
@@ -584,5 +605,63 @@ async fn issues_search_rejects_pr_only_review_requested_filter() {
     assert_eq!(
         pr_queries[0].involvement,
         Some(PrInvolvement::ReviewRequested)
+    );
+}
+
+/// `github.branches.list` with an optional `prefix`: the wire `prefix`
+/// reaches the engine and narrows the branch names, the `nextToken` cursor
+/// round-trips onto the engine cursor, and the no-prefix (or blank-prefix)
+/// call keeps the pre-existing unfiltered listing (`prefix: None`).
+#[tokio::test]
+async fn branches_list_forwards_optional_prefix() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    // Prefixed: filtered names + the encoded engine next_cursor ("2").
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.branches.list",
+        json!({
+            "owner": "o", "repo": "r", "prefix": "feature/",
+            "nextToken": wire_next_token("3"),
+        }),
+    )
+    .await;
+    assert_eq!(r["branches"], json!(["feature/login", "feature/logout"]));
+    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+
+    // No prefix and a blank prefix both reach the engine as `None`.
+    let r2 = wss_rpc(
+        &mut ws,
+        2,
+        "github.branches.list",
+        json!({ "owner": "o", "repo": "r" }),
+    )
+    .await;
+    assert_eq!(
+        r2["branches"],
+        json!(["main", "feature/login", "feature/logout"])
+    );
+    let r3 = wss_rpc(
+        &mut ws,
+        3,
+        "github.branches.list",
+        json!({ "owner": "o", "repo": "r", "prefix": "   " }),
+    )
+    .await;
+    assert_eq!(
+        r3["branches"],
+        json!(["main", "feature/login", "feature/logout"])
+    );
+
+    let queries = fx.forge.branch_queries.lock().unwrap();
+    assert_eq!(
+        *queries,
+        vec![
+            (Some("feature/".to_string()), Some("3".to_string())),
+            (None, None),
+            (None, None),
+        ]
     );
 }
