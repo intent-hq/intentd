@@ -674,6 +674,20 @@ async fn wss_system_status_includes_capacity_version_uptime() {
         r["memoryBytes"].as_u64().unwrap() > 0,
         "memoryBytes > 0: {r}"
     );
+    // Routing fields (additive): localIps is a string array (may be empty on
+    // hosts with no routable interface), hostname is a non-empty string.
+    let local_ips = r["localIps"].as_array().expect("localIps is array");
+    assert!(
+        local_ips.iter().all(Value::is_string),
+        "localIps entries are strings: {r}"
+    );
+    assert!(
+        !r["hostname"]
+            .as_str()
+            .expect("hostname is string")
+            .is_empty(),
+        "hostname non-empty: {r}"
+    );
 }
 
 #[tokio::test]

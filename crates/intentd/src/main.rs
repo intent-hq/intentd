@@ -18,9 +18,10 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds_with_reverse,
-    AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl,
-    SystemStatus, TokenStore, WsApiServer, WsOptions,
+    collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
+    local_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
+    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
+    WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -1845,6 +1846,11 @@ impl SystemControl for DaemonControl {
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
+            // Alternative routes for remote clients: same sources as
+            // `server.pairingInfo`, so a remote caller can refresh its
+            // stored host list from `system.status` alone.
+            local_ips: collect_local_ips(),
+            hostname: local_hostname(),
             cpu_percent,
             memory_bytes,
         }
