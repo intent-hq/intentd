@@ -73,7 +73,9 @@ fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
 /// Concurrent calls for the same `url` share one child and its outcome
 /// (single-flight, monorepo#1926); the joiners' `token`s are ignored in
 /// favor of the flight leader's. Callers resolve the token identically per
-/// URL, so this cannot swap credentials across users.
+/// URL — a token rotated mid-flight only affects that one shared read,
+/// which retires immediately — so this cannot swap credentials across
+/// users.
 pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
     let owned_url = url.to_string();
     let token = token.map(str::to_owned);
@@ -371,15 +373,27 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let spawns = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let spawns = Arc::clone(&spawns);
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&entered);
             tasks.push(tokio::spawn(async move {
+                // No await point separates this increment from the registry
+                // join inside `single_flight` — both run in the same poll —
+                // so once the gate below sees 8, every caller has joined
+                // (or is a few instructions from the map lock, which it
+                // reaches long before the driver's cross-pool retirement).
+                entered.fetch_add(1, Ordering::SeqCst);
                 single_flight("flight-shared", move || {
                     spawns.fetch_add(1, Ordering::SeqCst);
-                    // Hold the flight open long enough for every caller to
-                    // join it before it retires.
-                    std::thread::sleep(Duration::from_millis(200));
+                    // Hold the flight open until every caller has entered
+                    // `single_flight`, instead of assuming a fixed sleep
+                    // outlasts task scheduling.
+                    while gate.load(Ordering::SeqCst) < 8 {
+                        std::thread::yield_now();
+                    }
                     Ok(RemoteBranches {
                         branches: vec!["main".to_string()],
                         default_branch: Some("main".to_string()),
@@ -455,14 +469,25 @@ mod tests {
     /// same flight (its own `work` never runs) instead of re-spawning.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_caller_does_not_respawn() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let spawns = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
+
         let leader_spawns = Arc::clone(&spawns);
+        let leader_started = Arc::clone(&started);
+        let leader_gate = Arc::clone(&joined);
         let leader = tokio::spawn(async move {
             single_flight("flight-cancel", move || {
                 leader_spawns.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(300));
+                leader_started.store(true, Ordering::SeqCst);
+                // Hold the flight open until the post-cancellation joiner
+                // has entered `single_flight`, instead of assuming a fixed
+                // sleep outlasts task scheduling.
+                while !leader_gate.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
                 Ok(RemoteBranches {
                     branches: vec!["from-leader".to_string()],
                     default_branch: None,
@@ -470,21 +495,42 @@ mod tests {
             })
             .await
         });
-        // Let the driver start its child, then cancel the caller mid-flight.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the driver's child to actually start, then cancel the
+        // caller mid-flight.
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
         leader.abort();
         assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            in_flight().lock().unwrap().contains_key("flight-cancel"),
+            "the flight must survive its starting caller's cancellation"
+        );
 
         let joiner_spawns = Arc::clone(&spawns);
+        let joiner_gate = Arc::clone(&joined);
         let r = single_flight("flight-cancel", move || {
             joiner_spawns.fetch_add(1, Ordering::SeqCst);
             Ok(RemoteBranches {
                 branches: vec!["from-joiner".to_string()],
                 default_branch: None,
             })
+        });
+        // The joiner future joins the surviving flight on its first poll
+        // (the registry lookup precedes any await); only then release the
+        // gate so the flight can complete.
+        let mut r = std::pin::pin!(r);
+        let first_poll_pending = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            std::task::Poll::Ready(r.as_mut().poll(cx).is_pending())
         })
-        .await
-        .expect("joined flight result");
+        .await;
+        assert!(
+            first_poll_pending,
+            "the joiner must be waiting on the shared flight"
+        );
+        joiner_gate.store(true, Ordering::SeqCst);
+        let r = r.await.expect("joined flight result");
         assert_eq!(
             r.branches,
             vec!["from-leader"],
