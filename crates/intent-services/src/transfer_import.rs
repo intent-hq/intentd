@@ -341,7 +341,17 @@ impl Services {
             .workspaces_root
             .clone()
             .unwrap_or_else(crate::default_workspaces_root);
-        let outcome = transform_rows(rows, &workspace_id, &target_root, &now_iso())?;
+        let mut outcome = transform_rows(rows, &workspace_id, &target_root, &now_iso())?;
+
+        // Materialize the git payload BEFORE the rows land, so the seam can
+        // rewrite the transformed workspace/sandbox rows to the target
+        // checkout (repository_path, checkout_mode, sandbox paths, dropped
+        // sandboxes) and the apply()'d versions are what the store commits.
+        // An error fails the commit: disk materialization is all-or-nothing,
+        // no rows have landed, and the staging session survives for retry or
+        // abort.
+        self.materialize_imported_git(&workspace_id, &extracted_dir, &mut outcome.rows)
+            .await?;
 
         let imported_rows = self.store.transfer_import_rows(&outcome.rows).await?;
 
@@ -350,16 +360,6 @@ impl Services {
         // workspace; failures are logged, never surfaced as a failed import.
         self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
             .await;
-        if let Err(e) = self
-            .materialize_imported_git(&workspace_id, &extracted_dir)
-            .await
-        {
-            tracing::warn!(
-                workspace = %workspace_id.0,
-                error = %e,
-                "imported git materialization failed — workspace rows are live, repository must be re-provisioned manually"
-            );
-        }
 
         let rehydrated = self.rehydrate_after_import().await;
 
@@ -414,14 +414,23 @@ impl Services {
 
     /// Materialization seam for the imported git payload (`git/repo.bundle` +
     /// `git/refs.json` under `extracted_dir`): clone/fetch from the bundle,
-    /// provision the worktree and sandboxes, unwind WIP snapshots. Currently
-    /// a stub — the target-git-materialization task replaces this body; row
-    /// import is already durable when it runs, and its failure is surfaced as
-    /// a warning by the caller, never a failed import.
+    /// provision the checkout and sandboxes, unwind WIP snapshots. Runs
+    /// BEFORE the store insert with the transformed rows passed mutably, so
+    /// the implementation can apply `MaterializedGit`-style row rewrites
+    /// (workspace `repository_path` → the new checkout, `worktree_path`
+    /// cleared, `checkout_mode` → direct, `base_commit_sha` backfill, sandbox
+    /// path rewrites, dropping sandbox rows whose branch is absent from the
+    /// bundle) and the apply()'d versions are what land in the store.
+    /// Currently a stub — the target-git-materialization task replaces this
+    /// body with a call to `transfer_materialize::materialize_workspace_git`.
+    /// An error fails the commit: materialization is all-or-nothing on disk,
+    /// no rows have been inserted, and the staging session survives for retry
+    /// or abort.
     async fn materialize_imported_git(
         &self,
         workspace_id: &WorkspaceId,
         extracted_dir: &Path,
+        _rows: &mut [(String, Vec<serde_json::Value>)],
     ) -> Result<()> {
         let bundle = extracted_dir.join("git").join("repo.bundle");
         if !bundle.exists() {
