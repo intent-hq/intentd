@@ -20,11 +20,11 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use intent_core::{Error, Result};
-use tokio::sync::OnceCell as AsyncOnceCell;
+use tokio::sync::watch;
 
 use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::repo_cache::GIT_POLL;
@@ -45,16 +45,21 @@ pub struct RemoteBranches {
     pub default_branch: Option<String>,
 }
 
-/// A shared in-flight ls-remote: concurrent callers for the same URL await
-/// the same cell. The error side is the flattened message (`Error` is not
-/// `Clone`); every producer here builds `Error::Internal`, so nothing is
+/// A shared in-flight ls-remote's outcome slot: `None` while the child runs,
+/// `Some` once it lands. The error side is the flattened message (`Error` is
+/// not `Clone`); every producer here builds `Error::Internal`, so nothing is
 /// lost re-wrapping on the way out.
-type Flight = Arc<AsyncOnceCell<std::result::Result<RemoteBranches, String>>>;
+type FlightOutcome = Option<std::result::Result<RemoteBranches, String>>;
+
+/// A caller's handle on a shared in-flight ls-remote: concurrent callers for
+/// the same URL await the same watch channel, fed by one detached driver
+/// task.
+type Flight = watch::Receiver<FlightOutcome>;
 
 /// Process-global in-flight registry, keyed by remote URL (one URL per
-/// `owner/repo` slot). Entries live only for the duration of a flight —
-/// completed flights are removed so the next cold-cache call runs fresh
-/// (outcomes are never cached, only shared while in flight).
+/// `owner/repo` slot). Entries live only for the duration of a flight — the
+/// driver retires its entry before publishing, so the next cold-cache call
+/// runs fresh (outcomes are never cached, only shared while in flight).
 fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
     static FLIGHTS: OnceLock<Mutex<HashMap<String, Flight>>> = OnceLock::new();
     FLIGHTS.get_or_init(Default::default)
@@ -79,40 +84,71 @@ pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<Remote
 }
 
 /// Run `work` (one blocking ls-remote, one child process) on the blocking
-/// pool, deduping concurrent callers per `key`: the first caller in wins the
-/// [`AsyncOnceCell`] init and runs `work`; callers arriving while the flight
-/// is in the registry await the same cell and share the outcome. The
-/// completed flight is then retired so later calls start fresh.
+/// pool, deduping concurrent callers per `key`: the first caller in spawns a
+/// detached driver task that runs `work` and publishes the outcome; callers
+/// arriving while the flight is in the registry await the same channel and
+/// share the outcome. The driver retires the flight before publishing, so
+/// later calls start fresh.
+///
+/// The driver is detached deliberately: a cancelled caller (e.g. an RPC
+/// disconnect) only drops its receiver, never the driver, so the one child
+/// runs to completion and later callers keep joining it instead of
+/// re-spawning their own.
 async fn single_flight<F>(key: &str, work: F) -> Result<RemoteBranches>
 where
     F: FnOnce() -> Result<RemoteBranches> + Send + 'static,
 {
-    let flight = {
+    let mut flight = {
         let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
-        map.entry(key.to_string()).or_default().clone()
-    };
-    let outcome = flight
-        .get_or_init(|| async {
-            let joined = tokio::task::spawn_blocking(work)
-                .await
-                .map_err(|e| Error::Internal(format!("ls-remote task failed: {e}")));
-            match joined {
-                Ok(Ok(branches)) => Ok(branches),
-                // Flatten to the message for the Clone-able shared cell;
-                // re-wrapped as `Error::Internal` on the way out.
-                Ok(Err(e)) | Err(e) => Err(flatten_internal(e)),
-            }
-        })
-        .await
-        .clone();
-    // Retire the completed flight — but only this one: a fresh flight may
-    // already occupy the slot if another caller arrived after completion.
-    {
-        let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
-        if map.get(key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
-            map.remove(key);
+        if let Some(flight) = map.get(key) {
+            flight.clone()
+        } else {
+            let (tx, rx) = watch::channel(None);
+            map.insert(key.to_string(), rx.clone());
+            let key = key.to_string();
+            tokio::spawn(async move {
+                let joined = tokio::task::spawn_blocking(work)
+                    .await
+                    .map_err(|e| Error::Internal(format!("ls-remote task failed: {e}")));
+                let outcome = match joined {
+                    Ok(Ok(branches)) => Ok(branches),
+                    // Flatten to the message for the Clone-able shared
+                    // channel; re-wrapped as `Error::Internal` on the way
+                    // out.
+                    Ok(Err(e)) | Err(e) => Err(flatten_internal(e)),
+                };
+                // Retire before publishing so the registry never holds a
+                // completed flight. This driver is the only remover, and the
+                // entry stays occupied until here, so the guard can only
+                // miss on a driver that already panicked and was cleaned up
+                // by its waiters.
+                {
+                    let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+                    if map
+                        .get(&key)
+                        .is_some_and(|f| f.same_channel(&tx.subscribe()))
+                    {
+                        map.remove(&key);
+                    }
+                }
+                let _ = tx.send(Some(outcome));
+            });
+            rx
         }
-    }
+    };
+    let published = flight.wait_for(|o| o.is_some()).await.map(|o| o.clone());
+    let outcome = match published {
+        Ok(published) => published.expect("guarded by wait_for"),
+        // The driver vanished without publishing (panic). Evict the dead
+        // flight so later callers do not join it, then surface the failure.
+        Err(_) => {
+            let mut map = in_flight().lock().expect("ls-remote flight map poisoned");
+            if map.get(key).is_some_and(|f| f.same_channel(&flight)) {
+                map.remove(key);
+            }
+            return Err(Error::Internal("ls-remote flight abandoned".to_string()));
+        }
+    };
     outcome.map_err(Error::Internal)
 }
 
@@ -236,6 +272,8 @@ fn parse_ls_remote(stdout: &str) -> RemoteBranches {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     const OID: &str = "7a55d963f474da36b4416b3acbede60075c91b4b";
@@ -409,6 +447,50 @@ mod tests {
             !in_flight().lock().unwrap().contains_key("flight-error"),
             "failed flight must leave the registry"
         );
+    }
+
+    /// A cancelled caller — even the one that started the flight — does not
+    /// break the single-flight: the detached driver runs the child to
+    /// completion, and a caller arriving after the cancellation joins the
+    /// same flight (its own `work` never runs) instead of re-spawning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_caller_does_not_respawn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let leader_spawns = Arc::clone(&spawns);
+        let leader = tokio::spawn(async move {
+            single_flight("flight-cancel", move || {
+                leader_spawns.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(RemoteBranches {
+                    branches: vec!["from-leader".to_string()],
+                    default_branch: None,
+                })
+            })
+            .await
+        });
+        // Let the driver start its child, then cancel the caller mid-flight.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+
+        let joiner_spawns = Arc::clone(&spawns);
+        let r = single_flight("flight-cancel", move || {
+            joiner_spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(RemoteBranches {
+                branches: vec!["from-joiner".to_string()],
+                default_branch: None,
+            })
+        })
+        .await
+        .expect("joined flight result");
+        assert_eq!(
+            r.branches,
+            vec!["from-leader"],
+            "the joiner must share the surviving flight, not run its own work"
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "must spawn exactly once");
     }
 
     /// Distinct keys never contend: concurrent calls for different URLs each
