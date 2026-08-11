@@ -9801,6 +9801,63 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let decoded;
+            let source = match (&data, &source_path) {
+                (Some(b64), None) => {
+                    let payload = note_ops::strip_data_url_prefix(b64);
+                    decoded = base64::engine::general_purpose::STANDARD
+                        .decode(payload.trim())
+                        .map_err(|e| {
+                            Error::InvalidParams(format!("invalid base64 attachment data: {e}"))
+                        })?;
+                    file_ops::AttachmentSource::Bytes(&decoded)
+                }
+                (None, Some(src)) => {
+                    // Same-host FE fast path: copy a host-local file without
+                    // routing its bytes through the wire (streamed by
+                    // `fs::copy`, never buffered — the file may exceed the
+                    // transport cap by design). Absolute paths only — a
+                    // relative path would silently resolve against the
+                    // daemon's CWD.
+                    if !std::path::Path::new(src).is_absolute() {
+                        return Err(Error::InvalidParams(format!(
+                            "sourcePath must be absolute: {src}"
+                        )));
+                    }
+                    file_ops::AttachmentSource::CopyFrom(std::path::Path::new(src))
+                }
+                _ => {
+                    return Err(Error::InvalidParams(
+                        "exactly one of data or sourcePath is required".to_string(),
+                    ))
+                }
+            };
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            if root.is_empty() {
+                return Err(Error::Internal(
+                    "workspace has no resolved filesystem root".to_string(),
+                ));
+            }
+            // The exclusion contract (monorepo#1948) rides on the default
+            // `.intent/.gitignore` (ignore everything except config.json), so
+            // make sure the directory + gitignore exist before placing.
+            // `place_attachment` additionally drops an ignore-all `.gitignore`
+            // inside `attachments/` to cover repos with a customized
+            // `.intent/.gitignore`.
+            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
+            file_ops::place_attachment(&root, &file_name, source)
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         workspace_id: WorkspaceId,
