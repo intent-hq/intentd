@@ -3373,6 +3373,13 @@ impl Services {
         // the external-cancel call into this function) — or the PR monitor's
         // own poll loop wake — synthesizes the completion later.
         //
+        // monorepo#1945: bypassed when the session carries a non-empty
+        // persisted completionReport — the agent explicitly declared its
+        // completion, so the synthesized idle below (which stamps the
+        // report) must deliver despite the armed hooks/monitors, mirroring
+        // the live delivery pass's report bypass. A session-read failure
+        // reads as no report (conservative: defer as before).
+        //
         // monorepo#1483: hook/pr-monitor deferral is scoped to the agent's
         // settlement AS A CHILD (the synthesized watch delivery below); the
         // agent is queue-idle here (empty queue, no worker in flight), so its
@@ -3383,10 +3390,19 @@ impl Services {
         if !self.active_hooks_for_agent(child_id).await.is_empty()
             || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
         {
-            if let Some(gid) = self.seal_group_for_parent(child_id).await {
-                Box::pin(self.try_fire_group(&gid)).await;
+            let completion_reported = self
+                .store
+                .get_agent_session(child_id)
+                .await
+                .ok()
+                .and_then(|s| s.completion_report)
+                .is_some_and(|r| !r.is_empty());
+            if !completion_reported {
+                if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                    Box::pin(self.try_fire_group(&gid)).await;
+                }
+                return;
             }
-            return;
         }
         // Consume the marker only after the guards pass; losing this take to
         // a concurrent mutation path means that path owns the redelivery.
@@ -3422,15 +3438,14 @@ impl Services {
             data["report"] = serde_json::Value::String(report);
         }
         // Idle-visibility: the synthesized idle carries the same
-        // `waitingOnHooks` stamp as a real `agent:idle` emit — always empty
-        // (omitted) here, since the active-hooks guard above deferred when
-        // any hook was still active; kept for shape parity with the live
-        // emit sites should a hook be scheduled in the window.
+        // `waitingOnHooks` stamp as a real `agent:idle` emit — empty
+        // (omitted) here unless the monorepo#1945 report bypass passed the
+        // active-hooks guard above (or a hook was scheduled in the window),
+        // matching the live emit sites' shape.
         self.annotate_waiting_on_hooks(child_id, &mut data).await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
-        // shape-parity stamp — always empty (omitted) here, since the
-        // active-pr-monitors guard above deferred when any monitor was still
-        // active.
+        // shape-parity stamp — empty (omitted) here unless the report bypass
+        // passed the active-pr-monitors guard above.
         self.annotate_waiting_on_pr_monitors(child_id, &mut data)
             .await;
         // Archived-workspace suppression hint: same `workspaceArchived`
@@ -3594,6 +3609,22 @@ impl Services {
         // wake, but the window shrinks from emit→delivery to check→wake.)
         let queue_interim = event.event_type == AGENT_IDLE
             && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
+        // monorepo#1945: an `agent:idle` carrying a non-empty
+        // completionReport (stamped by every idle emit site from the
+        // session's persisted report, set exclusively by
+        // `agent.reportToParent`) is the child's EXPLICIT completion signal —
+        // it settles like a regular idle, bypassing the hook- and
+        // pr-monitor-waiting deferrals below. The still-armed monitor/hook is
+        // a courtesy watch, not pending work (the motivating case: "PR ready
+        // to merge — monitor stays armed for late comments", where the merge
+        // decision belongs to the parent the withheld wake was supposed to
+        // inform). Settlement never cancels the monitor/hook: a later fire
+        // still wakes the (settled) child normally. Aligns the live path
+        // with the rehydration `is_idle_and_genuinely_complete` predicate,
+        // which always required the report. Reports are cleared at each
+        // turn's start, so a stamp always reflects the turn that just ended.
+        let completion_reported =
+            event.event_type == AGENT_IDLE && event_completion_report(&event.data).is_some();
         // Idle-visibility deferral: probe the hook store LIVE (not the
         // emit-time `waitingOnHooks` stamp — a hook that settled between
         // emit and delivery must not defer). Probed even when the idle is
@@ -3601,6 +3632,7 @@ impl Services {
         // hook classification independently (an interim idle still records
         // for groups; a hook-waiting one must not).
         let hook_waiting = event.event_type == AGENT_IDLE
+            && !completion_reported
             && !self.active_hooks_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (unified external-wait, mirrors
         // `hook_waiting` exactly): an `agent:idle` for a child that owns
@@ -3609,6 +3641,7 @@ impl Services {
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
         let pr_monitor_waiting = event.event_type == AGENT_IDLE
+            && !completion_reported
             && !self.active_pr_monitors_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
@@ -7735,6 +7768,19 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| event.actor.id.clone())
+}
+
+/// Extract a non-empty completion report from `agent:idle` event data —
+/// `completionReport` (canonical), falling back to the legacy `report` key
+/// (the same dual-key contract as [`format_completion_wake`]). Present only
+/// when the child persisted a report via `agent.reportToParent` during the
+/// turn that just ended (reports are cleared at turn start), so it is the
+/// explicit-completion signal behind the monorepo#1945 deferral bypass.
+pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 /// Snapshot classification one [`Services::deliver_completion_to_watches`]

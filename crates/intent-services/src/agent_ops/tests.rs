@@ -11362,14 +11362,15 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
         .expect("register watch");
         wait_for_persisted_watches(&svc, 1).await;
         // The child looks genuinely complete by the STAB-108 predicate
-        // (Completed + report) — only its active hook defers the refire.
+        // (Completed; deliberately NO completion report — monorepo#1945: a
+        // report-carrying idle bypasses this deferral and refires) — only
+        // its active hook defers the refire.
         let mut s = svc
             .store()
             .get_agent_session(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
-        s.completion_report = Some("waiting on my hook".into());
         svc.store()
             .update_agent_session(&ws, &s)
             .await
@@ -11472,15 +11473,15 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
         .expect("register watch");
         wait_for_persisted_watches(&svc, 1).await;
         // The child looks genuinely complete by the STAB-108 predicate
-        // (Completed + report) — only its active PR monitor defers the
-        // refire.
+        // (Completed; deliberately NO completion report — monorepo#1945: a
+        // report-carrying idle bypasses this deferral and refires) — only
+        // its active PR monitor defers the refire.
         let mut s = svc
             .store()
             .get_agent_session(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
-        s.completion_report = Some("waiting on my PR".into());
         svc.store()
             .update_agent_session(&ws, &s)
             .await
@@ -13280,6 +13281,346 @@ async fn pr_monitor_waiting_child_settlement_still_deferred_after_seal() {
     );
     assert!(svc.delegation_group_for_parent(&parent).is_none());
     assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
+/// monorepo#1945 regression: a grouped child whose terminal idle carries a
+/// completionReport (set via `agent.reportToParent`) settles its after_all
+/// group DESPITE owning an active PR monitor — the report is the child's
+/// explicit completion signal, so the pr-monitor-waiting deferral must not
+/// starve the parent's aggregated wake (the merge decision the withheld wake
+/// was supposed to inform). Settlement must NOT retire the monitor: it stays
+/// armed for late PR activity.
+#[tokio::test]
+async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    seed_active_pr_monitor(&svc, &ws, &child, 1004).await;
+
+    // Parent idles: seals the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert!(
+        svc.delegation_group_for_parent(&parent)
+            .expect("group open")
+            .sealed
+    );
+
+    // The child reports (grouped: no immediate wake) and its terminal idle
+    // carries the persisted completionReport, mirroring the live emit sites.
+    let report = "PR #1004 ready to merge; monitor stays armed for late comments";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        0,
+        "grouped report defers to the aggregated wake"
+    );
+    let mut data = json!({
+        "agentId": child.0,
+        "completionReport": report,
+        "report": report,
+    });
+    svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
+    assert!(data.get("waitingOnPrMonitors").is_some(), "stamped: {data}");
+    svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+        .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake fires despite the active PR monitor"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("PR #1004 ready to merge"), "{text}");
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert_eq!(
+        svc.active_pr_monitors_for_agent(&child).await.len(),
+        1,
+        "settlement leaves the monitor armed"
+    );
+}
+
+/// monorepo#1945, hook variant: a grouped child whose terminal idle carries a
+/// completionReport settles its after_all group despite owning an active
+/// background hook, and settlement leaves the hook armed.
+#[tokio::test]
+async fn completion_report_idle_settles_group_despite_active_hook() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = delegate_after_all(&svc, &ws, &parent).await;
+    seed_active_hook(&svc, &ws, &child, "late-comment-watch").await;
+
+    // Parent idles: seals the group.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+
+    let report = "task done; hook keeps watching for late comments";
+    svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
+        .await
+        .expect("report");
+    let mut data = json!({
+        "agentId": child.0,
+        "completionReport": report,
+        "report": report,
+    });
+    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
+    svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+        .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "aggregated wake fires despite the active hook"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("task done"), "{text}");
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert_eq!(
+        svc.active_hooks_for_agent(&child).await.len(),
+        1,
+        "settlement leaves the hook armed"
+    );
+}
+
+/// monorepo#1945, ungrouped watch path: a watched child's idle carrying a
+/// completionReport delivers the completion wake and retires the watch
+/// despite an active PR monitor — and the monitor stays armed.
+#[tokio::test]
+async fn completion_report_idle_fires_ungrouped_watch_despite_active_monitor() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({
+            "agentId": child.0,
+            "completionReport": "shipped it; monitor stays armed",
+            "report": "shipped it; monitor stays armed",
+        }),
+    ))
+    .await;
+
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "completion wake delivers despite the active monitor"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(text.contains("shipped it"), "{text}");
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "watch retires at the report-carrying completion"
+    );
+    assert_eq!(
+        svc.active_pr_monitors_for_agent(&child).await.len(),
+        1,
+        "delivery leaves the monitor armed"
+    );
+}
+
+/// monorepo#1945, pre-publish record path: the durable-before-observable
+/// group record bypasses BOTH external-wait deferrals (hook + PR monitor)
+/// when the idle event data carries a completionReport, and leaves the hook
+/// and monitor armed.
+#[tokio::test]
+async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report() {
+    let (_t, svc, ws) = setup().await;
+    let p = create_agent(&svc, &ws, "P").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let gid = svc.get_or_create_delegation_group(&ws, &p);
+    svc.enroll_child_in_group(&gid, &b);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        p.clone(),
+        "P".into(),
+        b.clone(),
+        Some(gid.clone()),
+    )
+    .expect("grouped watch");
+    seed_active_pr_monitor(&svc, &ws, &b, 7).await;
+    seed_active_hook(&svc, &ws, &b, "late-comment-watch").await;
+    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    s.completion_report = Some("done".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("persist report");
+
+    let mut data = json!({ "agentId": b.0, "completionReport": "done", "report": "done" });
+    svc.annotate_waiting_on_hooks(&b, &mut data).await;
+    svc.annotate_waiting_on_pr_monitors(&b, &mut data).await;
+    svc.record_group_completion_pre_publish(&ws, &b, &data)
+        .await;
+
+    let group = svc.delegation_group_for_parent(&p).expect("group exists");
+    assert!(
+        group.completed_agent_ids.contains(&b),
+        "report-carrying idle records despite hook + monitor deferrals"
+    );
+    assert_eq!(svc.active_hooks_for_agent(&b).await.len(), 1);
+    assert_eq!(svc.active_pr_monitors_for_agent(&b).await.len(), 1);
+}
+
+/// monorepo#1945, group-rehydration path: a RuntimeIdle child with a
+/// persisted completionReport and an active PR monitor IS recorded at
+/// rehydration — the sealed group fires instead of starving until the
+/// monitor terminates; the persisted monitor row stays active.
+#[tokio::test]
+async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (p, b) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let p = create_agent(&svc, &ws, "P").await;
+        let b = create_agent(&svc, &ws, "B").await;
+        svc.app_agents_wait_op(
+            ws.clone(),
+            p.clone(),
+            vec![b.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all");
+        wait_for_persisted_watches(&svc, 1).await;
+        // Wait for the group row to persist (the upsert is spawned).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list persisted groups");
+            if !rows.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        seed_active_pr_monitor(&svc, &ws, &b, 1009).await;
+        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("PR #1009 ready to merge".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark B");
+        (p, b)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate groups");
+    assert_eq!(loaded, 1, "group rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &p).await,
+        1,
+        "aggregated wake fires at rehydration despite the active monitor"
+    );
+    let text = parent_messages_text(&restarted, &p).await;
+    assert!(text.contains("PR #1009 ready to merge"), "{text}");
+    assert!(restarted.delegation_group_for_parent(&p).is_none());
+    assert_eq!(
+        restarted.active_pr_monitors_for_agent(&b).await.len(),
+        1,
+        "rehydration settlement leaves the monitor row active"
+    );
+}
+
+/// monorepo#1945, watch-rehydration path: a rehydrated watch on a child that
+/// is RuntimeIdle with a persisted completionReport and an active PR monitor
+/// DOES refire at boot — the report bypasses the pr-monitor-waiting deferral,
+/// and the monitor row stays active.
+#[tokio::test]
+async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        seed_active_pr_monitor(&svc, &ws, &child, 77).await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        let mut s = svc
+            .store()
+            .get_agent_session(&child)
+            .await
+            .expect("child session");
+        s.status = intent_core::AgentStatus::RuntimeIdle;
+        s.completion_report = Some("PR ready; monitor armed".into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark child");
+        (parent, child)
+    }; // simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated");
+    assert_eq!(
+        parent_message_count(&restarted, &parent).await,
+        1,
+        "synthetic wake fires at boot despite the active monitor"
+    );
+    let text = parent_messages_text(&restarted, &parent).await;
+    assert!(text.contains("PR ready; monitor armed"), "{text}");
+    assert!(
+        restarted.find_watches_for_child(&child).is_empty(),
+        "reconciled watch consumed"
+    );
+    assert_eq!(
+        restarted.active_pr_monitors_for_agent(&child).await.len(),
+        1,
+        "boot settlement leaves the monitor row active"
+    );
 }
 
 /// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
