@@ -31,6 +31,8 @@ impl FakeControl {
                 max_agents: 20,
                 version: "0.1.0".to_string(),
                 uptime_seconds: 123,
+                local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
+                hostname: "studio.local".to_string(),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
             },
@@ -116,6 +118,8 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
+    assert_eq!(local["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(local["hostname"], "studio.local");
     assert_eq!(local["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
@@ -124,6 +128,10 @@ fn status_json_local_vs_remote_locality() {
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
     assert_eq!(remote["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
+    // The routing fields are served to remote callers too — that is the point:
+    // an authenticated WSS client refreshes its host list from system.status.
+    assert_eq!(remote["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(remote["hostname"], "studio.local");
 }
 
 #[test]
@@ -142,6 +150,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         max_agents: 8,
         version: "0.1.0".to_string(),
         uptime_seconds: 456,
+        local_ips: Vec::new(),
+        hostname: "intent".to_string(),
         cpu_percent: 0.0,
         memory_bytes: 0,
     };
@@ -149,6 +159,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert_eq!(v["transports"], json!(["uds"]));
     assert_eq!(v["port"], Value::Null);
     assert_eq!(v["fingerprint"], Value::Null);
+    // No routable interfaces still yields an (empty) array, never null.
+    assert_eq!(v["localIps"], json!([]));
+    assert_eq!(v["hostname"], "intent");
 }
 
 #[tokio::test]

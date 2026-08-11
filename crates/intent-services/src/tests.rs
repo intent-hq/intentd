@@ -5387,7 +5387,8 @@ mod change_event_parity {
 
         // Deleting a *complete* dep also moves dependents' unmetDependsOn
         // (missing = unmet), so the dependent is re-announced after the
-        // `note:deleted` (monorepo#1979).
+        // `note:deleted` (monorepo#1979). The deleted note is depended on, so
+        // the ready-set recompute (monorepo#1981) lands in between.
         h.services
             .delete_note(h.ws.clone(), intent_core::NoteId::from("dep-b"), None)
             .await
@@ -5396,8 +5397,214 @@ mod change_event_parity {
         assert_envelope(&ev, &h.ws.0, "note:deleted");
         assert_eq!(ev["data"]["noteId"], json!("dep-b"));
         let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep-b", "reason": "note-deleted" })
+        );
+        let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:updated");
         assert_eq!(ev["data"]["noteId"], json!("gated"));
+    }
+
+    /// monorepo#1981: a `task.setRelations` write that changes `dependsOn`
+    /// recomputes + emits `task:ready-tasks-changed` with the additive
+    /// `triggeredBy: { noteId, reason: "relations-changed" }` variant (no
+    /// status fields). Adding an edge un-readies a task; clearing it readies
+    /// the task again; a conflictsWith-only write does not emit.
+    #[tokio::test]
+    async fn set_relations_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [mk("task-a", 0), mk("task-b", 1)] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Adding a dependsOn edge onto incomplete task-a un-readies task-b.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                Some(vec![intent_core::NoteId::from("task-a")]),
+                None,
+            )
+            .await
+            .expect("setRelations add edge");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "task-b", "reason": "relations-changed" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
+
+        // Clearing the edge readies task-b again.
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                Some(vec![]),
+                None,
+            )
+            .await
+            .expect("setRelations clear edge");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a", "task-b"]));
+        assert_eq!(ev["data"]["triggeredBy"]["reason"], "relations-changed");
+
+        // A conflictsWith-only change emits note:updated but NO ready-set
+        // recompute (dependsOn unchanged → readiness predicate unchanged).
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                None,
+                Some(vec![intent_core::NoteId::from("task-a")]),
+            )
+            .await
+            .expect("setRelations conflicts only");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
+    /// monorepo#1981: a same-status `task.markAsTask` re-mark that replaces
+    /// `dependsOn` takes the same `relations-changed` recompute as
+    /// `task.setRelations` (no status-shaped emission runs on that arm). A
+    /// same-status re-mark with omitted relation params emits no recompute.
+    #[tokio::test]
+    async fn same_status_remark_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [mk("task-a", 0), mk("task-b", 1)] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Same-status re-mark that adds a dependsOn edge onto incomplete
+        // task-a → task-b drops out of the ready set, announced with the
+        // `relations-changed` trigger.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                Some(vec![intent_core::NoteId::from("task-a")]),
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark with deps");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "task-b", "reason": "relations-changed" })
+        );
+
+        // Same-status re-mark with omitted relation params keeps the deps →
+        // note:updated only, no recompute.
+        let events_before = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events_before, "task:ready-tasks-changed").len(), 0);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark without deps");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
+    /// monorepo#1981: deleting a task note that other tasks dependOn
+    /// recomputes + emits `task:ready-tasks-changed` with
+    /// `triggeredBy: { noteId, reason: "note-deleted" }` — a dangling edge
+    /// counts as unmet, so deleting a `complete` dep un-readies its
+    /// dependents. Deleting a task note nobody depends on emits no recompute.
+    #[tokio::test]
+    async fn deleting_depended_on_note_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("dep", TaskStatus::Complete, vec![], 0),
+            mk("gated", TaskStatus::NotStarted, vec!["dep"], 1),
+            mk("loner", TaskStatus::NotStarted, vec![], 2),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Deleting `loner` (no dependents) → note:deleted only, no recompute.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("loner"), None)
+            .await
+            .expect("delete loner");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+
+        // Deleting `dep` (complete, satisfied gated's edge) → the dangling
+        // edge is unmet, so `gated` drops out of the ready set.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep"), None)
+            .await
+            .expect("delete dep");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!([]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep", "reason": "note-deleted" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
     }
 
     #[tokio::test]
