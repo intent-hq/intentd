@@ -5387,7 +5387,8 @@ mod change_event_parity {
 
         // Deleting a *complete* dep also moves dependents' unmetDependsOn
         // (missing = unmet), so the dependent is re-announced after the
-        // `note:deleted` (monorepo#1979).
+        // `note:deleted` (monorepo#1979). The deleted note is depended on, so
+        // the ready-set recompute (monorepo#1981) lands in between.
         h.services
             .delete_note(h.ws.clone(), intent_core::NoteId::from("dep-b"), None)
             .await
@@ -5395,6 +5396,12 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:deleted");
         assert_eq!(ev["data"]["noteId"], json!("dep-b"));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep-b", "reason": "note-deleted" })
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:updated");
         assert_eq!(ev["data"]["noteId"], json!("gated"));
@@ -5471,6 +5478,75 @@ mod change_event_parity {
             )
             .await
             .expect("setRelations conflicts only");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
+    /// monorepo#1981: a same-status `task.markAsTask` re-mark that replaces
+    /// `dependsOn` takes the same `relations-changed` recompute as
+    /// `task.setRelations` (no status-shaped emission runs on that arm). A
+    /// same-status re-mark with omitted relation params emits no recompute.
+    #[tokio::test]
+    async fn same_status_remark_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [mk("task-a", 0), mk("task-b", 1)] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Same-status re-mark that adds a dependsOn edge onto incomplete
+        // task-a → task-b drops out of the ready set, announced with the
+        // `relations-changed` trigger.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                Some(vec![intent_core::NoteId::from("task-a")]),
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark with deps");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "task-b", "reason": "relations-changed" })
+        );
+
+        // Same-status re-mark with omitted relation params keeps the deps →
+        // note:updated only, no recompute.
+        let events_before = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events_before, "task:ready-tasks-changed").len(), 0);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark without deps");
         let events = drain_events(&mut sub).await;
         assert_eq!(of_type(&events, "note:updated").len(), 1);
         assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);

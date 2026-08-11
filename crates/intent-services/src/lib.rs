@@ -15289,19 +15289,13 @@ impl WorkspaceApi for Services {
             .await;
             if let Some(task) = &note.metadata.task {
                 let remaining = store.list_notes(&workspace_id).await?;
-                // Deleting a *complete* task flips its dependents' computed
-                // unmetDependsOn from met to unmet (missing = unmet), so
-                // re-announce them for subscriber refetch (monorepo#1979).
-                // Other statuses were already unmet — no projection change.
-                if task.status == TaskStatus::Complete {
-                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &remaining)
-                        .await;
-                }
-                // Deleting a task note other tasks dependOn also moves the
+                // Deleting a task note other tasks dependOn moves the
                 // readiness predicate — a dangling `dependsOn` edge counts as
                 // unmet, so deleting a previously-`complete` dep flips its
                 // dependents out of the ready set (monorepo#1981). Recompute +
-                // broadcast with the `reason: "note-deleted"` trigger variant.
+                // broadcast with the `reason: "note-deleted"` trigger variant,
+                // before the dependent re-announce below (same ordering as the
+                // status-transition path).
                 let depended_on = remaining.iter().any(|n| {
                     n.metadata
                         .task
@@ -15321,6 +15315,13 @@ impl WorkspaceApi for Services {
                         ),
                     )
                     .await;
+                }
+                // Deleting a *complete* task flips its dependents' computed
+                // unmetDependsOn from met to unmet (missing = unmet), so
+                // re-announce them for subscriber refetch (monorepo#1979).
+                // Other statuses were already unmet — no projection change.
+                if task.status == TaskStatus::Complete {
+                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &remaining).await;
                 }
                 // Deleting a task note can move the derived displayStatus
                 // rollup (§6.5), e.g. removing the last open spec-child task.
@@ -15906,6 +15907,14 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             let previous_status = note.metadata.task.as_ref().map(|t| t.status);
+            // A re-mark that replaces an existing task's `dependsOn` moves the
+            // readiness predicate exactly like `task.setRelations`; capture
+            // whether it actually changed so the same-status arm below can
+            // recompute (monorepo#1981).
+            let depends_on_changed = match (&note.metadata.task, &depends_on) {
+                (Some(existing), Some(deps)) => existing.depends_on != *deps,
+                _ => false,
+            };
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
@@ -16021,7 +16030,27 @@ impl WorkspaceApi for Services {
                         .await;
                     }
                 }
-                Some(_) => {}
+                // Same-status re-mark: no status-shaped emission ran, so a
+                // `dependsOn` replace would otherwise leave ready-set
+                // subscribers stale. Same recompute + `relations-changed`
+                // trigger as `task.setRelations` (monorepo#1981).
+                Some(_) => {
+                    if depends_on_changed {
+                        let all = store.list_notes(&note.workspace_id).await?;
+                        let ready_task_ids = compute_ready_task_ids(&all);
+                        publish_event(
+                            &services.event_bus,
+                            ready_tasks_changed_reason_event(
+                                &note.workspace_id,
+                                ready_task_ids,
+                                &note.id,
+                                "relations-changed",
+                                &now_iso(),
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
             // Marking a note as a task (or moving its status) can move the
             // derived displayStatus rollup (§6.5).
