@@ -23583,12 +23583,20 @@ async fn batch_delegate_conflicts_hold_unless_greedy() {
         .agent_delegate_op(ws.clone(), batch_input(&[&a, &b], None), None)
         .await
         .expect("batch");
-    assert_eq!(row_for(&resp, &a)["disposition"], "started");
-    let rb = row_for(&resp, &b);
-    assert_eq!(rb["disposition"], "held:conflict");
-    assert_eq!(rb["conflictsWith"], json!([a.0]));
-    assert!(rb["reason"].as_str().unwrap().contains("greedy"), "{rb}");
-    assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([b.0]));
+    // Neither has estimates or dependents, so the critical-path tie breaks
+    // on task id: exactly one of the pair starts and the other holds
+    // naming it.
+    let (started, held) = if row_for(&resp, &a)["disposition"] == "started" {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    assert_eq!(row_for(&resp, started)["disposition"], "started", "{resp}");
+    let rh = row_for(&resp, held);
+    assert_eq!(rh["disposition"], "held:conflict", "{resp}");
+    assert_eq!(rh["conflictsWith"], json!([started.0]));
+    assert!(rh["reason"].as_str().unwrap().contains("greedy"), "{rh}");
+    assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([held.0]));
 
     // Fresh pair under greedy=true: both start; the overlapping one names
     // the pair and warns about rebases.

@@ -108,6 +108,7 @@ mod settings;
 mod settings_registry;
 mod shell;
 pub mod stack_sample;
+mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
 mod transfer;
