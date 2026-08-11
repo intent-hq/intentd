@@ -5696,13 +5696,16 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// Wire `prMonitor.flush`: deliver a monitor's pending consolidated wake
     /// now, bypassing the remaining debounce window. A no-op
-    /// (`{ ok: true, flushed: false }`) when nothing is pending.
+    /// (`{ ok: true, flushed: false }`) when nothing is pending. With
+    /// `check: true`, the daemon first re-polls the monitor on demand so the
+    /// flush covers changes the poll loop has not seen yet.
     fn pr_monitor_flush_pending(
         &self,
         workspace_id: WorkspaceId,
         monitor_id: PrMonitorId,
+        check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, monitor_id);
+        let _ = (workspace_id, monitor_id, check);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::pr_monitor_flush_pending not implemented".to_string(),

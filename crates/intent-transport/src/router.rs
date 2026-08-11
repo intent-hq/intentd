@@ -3271,9 +3271,14 @@ async fn dispatch(
         "prMonitor.flush" => {
             let ws = require_ws_note(params)?;
             let monitor_id = require_str_param(params, "monitorId")?;
-            api.pr_monitor_flush_pending(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
-                .await
-                .map_err(domain_to_rpc)
+            let check = opt_bool_strict(params, "check")?.unwrap_or(false);
+            api.pr_monitor_flush_pending(
+                ws,
+                intent_core::PrMonitorId::from(monitor_id.as_str()),
+                check,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "rules.list" => {
             // Optional workspaceId: present → include the workspace's read-only
