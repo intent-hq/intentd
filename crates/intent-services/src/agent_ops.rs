@@ -760,10 +760,20 @@ impl QueuedMessage {
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
 /// quarantine park, append-failure auto-queue) still deliver the preempted
 /// message ahead of the interrupt message when the entry drains.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializes to camelCase JSON as the durable `agent_stop_redelivery.payload`
+/// shape (intent-hq/monorepo#1899): the zero-output stop-redelivery arm mirrors
+/// the in-memory payload write-through so it survives a daemon restart. The
+/// fields take `#[serde(default)]` so older payloads missing a later field
+/// still rehydrate.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
     pub image_blocks: Option<Value>,
+    #[serde(default)]
     pub file_blocks: Option<Value>,
 }
 
