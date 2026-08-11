@@ -116,6 +116,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Internal error".to_string(),
             data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
         },
+        // `git.showFile` on a non-blob tree entry (gitlink / tree): -32602
+        // with machine-readable `data = { code: "not-a-file", path, mode }`
+        // so clients can route submodule pins to a dedicated presentation
+        // instead of matching on prose (monorepo#1739).
+        ref e @ Error::NotAFile { ref path, ref mode } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "not-a-file", "path": path, "mode": mode })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -348,8 +357,33 @@ async fn dispatch(
         }
         "workspace.delete" => {
             let id = require_workspace_id(params)?;
-            api.delete_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            // Delete grace window (§5.1): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .schedule_workspace_delete(id, undo_delay_ms)
+                    .await
+                    .map_err(workspace_err)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                api.delete_workspace(id).await.map_err(workspace_err)?;
+                Ok(json!({ "success": true }))
+            }
+        }
+        "workspace.cancelDelete" => {
+            let id = require_workspace_id(params)?;
+            let cancelled = api
+                .cancel_workspace_delete(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "cancelled": cancelled }))
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
@@ -1567,11 +1601,37 @@ async fn dispatch(
         "agent.delete" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            let result = api
-                .agent_delete(agent_id, ws)
+            // Delete grace window (§5.5): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .agent_schedule_delete(agent_id, ws, undo_delay_ms)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                let result = api
+                    .agent_delete(agent_id, ws)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(result)
+            }
+        }
+        "agent.cancelDelete" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let cancelled = api
+                .agent_cancel_delete(agent_id, ws)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(result)
+            Ok(json!({ "cancelled": cancelled }))
         }
         "agent.retry" => {
             let agent_id = require_agent_id(params)?;

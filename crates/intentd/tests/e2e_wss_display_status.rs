@@ -403,6 +403,7 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -769,6 +770,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 

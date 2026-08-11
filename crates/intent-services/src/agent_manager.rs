@@ -8735,6 +8735,7 @@ mod role_reminder_tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -8783,6 +8784,7 @@ mod role_reminder_tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -10621,6 +10623,7 @@ mod agent_retry_tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
             task_stats: None,
         }
     }
@@ -10666,6 +10669,7 @@ mod agent_retry_tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 

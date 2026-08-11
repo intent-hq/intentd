@@ -67,6 +67,16 @@ pub enum Error {
     #[error("internal error: {detail}")]
     VoiceNotConfigured { detail: String },
 
+    /// A `git.showFile` path resolves to a non-blob tree entry (a `160000`
+    /// gitlink / submodule pin, or a `040000` tree), so there is no file
+    /// content to return. Surfaces as `-32602` with machine-readable
+    /// `error.data = { code: "not-a-file", path, mode }` so clients can route
+    /// gitlink entries to a dedicated presentation instead of matching on an
+    /// opaque "Internal error" (monorepo#1739). `mode` is the octal tree-entry
+    /// mode string (e.g. `"160000"`).
+    #[error("invalid params: path is not a file at this ref: {path} (mode {mode})")]
+    NotAFile { path: String, mode: String },
+
     /// The TCP (WSS) listener is not running, so `pairing.getInfo` has no
     /// port to embed in the pairing payload. Surfaces as `-32603` with the
     /// same human message as the previous `Unsupported` shape plus
@@ -132,7 +142,8 @@ impl Error {
             Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)
-            | Error::BaseRefUnresolvable { .. } => -32602,
+            | Error::BaseRefUnresolvable { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
