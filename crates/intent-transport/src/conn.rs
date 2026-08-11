@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::browser;
 use crate::client;
+use crate::conflate::{self, ChatItem, ConflationBuffer, Enqueue, EventItem};
 use crate::control::{self, SystemControl};
 use crate::drafts;
 use crate::events::{self, FastPath};
@@ -91,6 +92,13 @@ impl OutboundSender {
     /// latency-critical frames (the reverse-RPC channel).
     pub(crate) fn priority_sender(&self) -> mpsc::Sender<String> {
         self.priority.clone()
+    }
+
+    /// The bulk-lane sender for the subscription forwarders, which only ever
+    /// send bulk frames and need `reserve` / `try_reserve` on the lane for
+    /// backpressure conflation (see [`crate::conflate`]).
+    pub(crate) fn bulk_sender(&self) -> mpsc::Sender<String> {
+        self.bulk.clone()
     }
 }
 
@@ -642,16 +650,85 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// Forward filtered events from one bus subscription to the connection's
 /// outbound queue (bulk lane) as `events.event` notifications until the bus
 /// or connection closes. Aborted by [`ConnSub`] on unsubscribe / disconnect.
+///
+/// Under backpressure (the bulk lane is full) the high-volume transient
+/// types are conflated per key instead of blocking (see [`crate::conflate`]):
+/// latest-wins for `agent:stream:activity` / `file:*`, byte-concat for
+/// `terminal:data`. Non-conflatable events act as barriers — the buffer is
+/// flushed first (a conflated frame always lands before its stream's terminal
+/// event, e.g. `terminal:exit`), then the barrier blocks as before. With no
+/// congestion the buffer stays empty and every frame passes straight through.
 async fn forward_subscription(
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
-    while let Some(batch) = subscription.recv().await {
-        for event in batch {
-            let frame = events::build_event_notification(&subscription_id, &event);
-            if out_tx.send_bulk(frame).await.is_err() {
-                return;
+    // Everything this forwarder emits travels on the bulk lane; conflation
+    // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
+    let out_tx = out_tx.bulk_sender();
+    let mut buffer: ConflationBuffer<EventItem> = ConflationBuffer::new();
+    loop {
+        tokio::select! {
+            biased;
+            // Drain a buffered conflated frame as soon as the lane has room.
+            permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
+                Ok(permit) => {
+                    if let Some(item) = buffer.pop() {
+                        permit.send(item.into_frame(&subscription_id));
+                    }
+                }
+                Err(_) => return,
+            },
+            maybe = subscription.recv() => {
+                let Some(batch) = maybe else {
+                    // Bus closed: flush anything still pending, then stop.
+                    let _ = buffer
+                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                        .await;
+                    return;
+                };
+                for event in batch {
+                    match conflate::event_key(&event) {
+                        Some(key) => {
+                            let item = EventItem::new(&key, event);
+                            let sid = &subscription_id;
+                            match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
+                                item.into_frame(sid)
+                            }) {
+                                Enqueue::Closed => return,
+                                Enqueue::Sent | Enqueue::Buffered => {}
+                                // Buffer at capacity (too many distinct keys /
+                                // bytes pending): fall back to the original
+                                // blocking backpressure — flush, then send.
+                                Enqueue::Overflow(item) => {
+                                    if !buffer
+                                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                        .await
+                                    {
+                                        return;
+                                    }
+                                    if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // Barrier: flush conflated frames first, then block.
+                            if !buffer
+                                .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                .await
+                            {
+                                return;
+                            }
+                            let frame =
+                                events::build_event_notification(&subscription_id, &event);
+                            if out_tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -906,10 +983,13 @@ async fn forward_chat_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
+    // Everything this forwarder emits travels on the bulk lane; conflation
+    // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
+    let out_tx = out_tx.bulk_sender();
     let snapshot =
         subscriptions::chat_snapshot(api.as_ref(), &agent_id, since_message_id.as_deref()).await;
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
-    if out_tx.send_bulk(frame).await.is_err() {
+    if out_tx.send(frame).await.is_err() {
         return;
     }
     let mut state = subscriptions::ChatDeltaState::new(&agent_id);
@@ -917,19 +997,100 @@ async fn forward_chat_subscription(
     // seed the delta state from it so the next chunk continues the streamed text
     // (full-text deltas) instead of restarting from empty.
     state.seed_from_snapshot(&snapshot);
+    // Backpressure conflation (see `crate::conflate`): built chunk deltas are
+    // conflatable latest-wins per block — each carries the FULL accumulated
+    // text (D2), so the newest supersedes. The buffer sits post-state (the
+    // mapper consumed every event in order) and pre-seq: `seq` is assigned
+    // only when a frame actually goes out, staying contiguous. Every other
+    // delta (tool calls, `stream:end` reconcile, message rows) is a barrier
+    // that flushes the buffer first, so a conflated chunk always lands before
+    // its turn's terminal frame.
+    let mut buffer: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     let mut seq: u64 = 1;
-    while let Some(batch) = subscription.recv().await {
-        for event in batch {
-            // Cross-agent isolation: only this agent's stream events belong to
-            // this subscription.
-            if event.session_id.as_deref() != Some(agent_id.as_str()) {
-                continue;
-            }
-            if let Some(delta) = state.delta(api.as_ref(), &event).await {
-                let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
-                seq += 1;
-                if out_tx.send_bulk(frame).await.is_err() {
+    loop {
+        tokio::select! {
+            biased;
+            // Drain a buffered conflated delta as soon as the lane has room.
+            permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
+                Ok(permit) => {
+                    if let Some(item) = buffer.pop() {
+                        permit.send(item.into_frame(&subscription_id, seq));
+                        seq += 1;
+                    }
+                }
+                Err(_) => return,
+            },
+            maybe = subscription.recv() => {
+                let Some(batch) = maybe else {
+                    let _ = buffer
+                        .drain_all(&out_tx, |item| {
+                            let frame = item.into_frame(&subscription_id, seq);
+                            seq += 1;
+                            frame
+                        })
+                        .await;
                     return;
+                };
+                for event in batch {
+                    // Cross-agent isolation: only this agent's stream events
+                    // belong to this subscription.
+                    if event.session_id.as_deref() != Some(agent_id.as_str()) {
+                        continue;
+                    }
+                    let conflatable = conflate::chat_event_conflatable(&event);
+                    let Some(delta) = state.delta(api.as_ref(), &event).await else {
+                        continue;
+                    };
+                    if conflatable {
+                        if let Some((key, item)) = ChatItem::from_delta(&delta) {
+                            let (sid, s) = (&subscription_id, &mut seq);
+                            match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
+                                let frame = item.into_frame(sid, *s);
+                                *s += 1;
+                                frame
+                            }) {
+                                Enqueue::Closed => return,
+                                Enqueue::Sent | Enqueue::Buffered => continue,
+                                // Buffer at capacity: fall back to the
+                                // original blocking backpressure — flush,
+                                // then send this delta at the next seq.
+                                Enqueue::Overflow(item) => {
+                                    let drained = buffer
+                                        .drain_all(&out_tx, |item| {
+                                            let frame = item.into_frame(&subscription_id, seq);
+                                            seq += 1;
+                                            frame
+                                        })
+                                        .await;
+                                    if !drained {
+                                        return;
+                                    }
+                                    let frame = item.into_frame(&subscription_id, seq);
+                                    seq += 1;
+                                    if out_tx.send(frame).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Barrier: flush conflated deltas first, then block.
+                    let drained = buffer
+                        .drain_all(&out_tx, |item| {
+                            let frame = item.into_frame(&subscription_id, seq);
+                            seq += 1;
+                            frame
+                        })
+                        .await;
+                    if !drained {
+                        return;
+                    }
+                    let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
+                    seq += 1;
+                    if out_tx.send(frame).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
