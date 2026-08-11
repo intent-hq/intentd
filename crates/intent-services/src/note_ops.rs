@@ -273,6 +273,9 @@ pub fn parse_tasks(content: &str) -> Vec<NoteTaskRow> {
                 status: status.to_string(),
                 task_note_id: task_note_id.clone(),
                 linked_task_note_id: task_note_id,
+                depends_on: Vec::new(),
+                conflicts_with: Vec::new(),
+                unmet_depends_on: Vec::new(),
             })
         })
         .collect()

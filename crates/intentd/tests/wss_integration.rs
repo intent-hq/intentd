@@ -1055,6 +1055,140 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
     srv.ws.stop().await;
 }
 
+/// intent-hq/monorepo#1897 over the real WSS wire: a ready-to-send queue
+/// entry older than the stale-queue threshold on an idle agent surfaces as a
+/// `stale-queue-entry` stuck-risk in the `agent.diagnostics` response —
+/// `stuckRisks` names the agent and oldest entry, `summary.stuckRisks` counts
+/// it, and the `text` rendering mentions it. The stale entry is seeded via
+/// the durable queue snapshot + rehydration path (the same path a daemon
+/// restart uses), so the wire read reflects the live in-memory queue.
+#[tokio::test]
+async fn wss_agent_diagnostics_flags_stale_queue_entry() {
+    let dir = test_tempdir("intentd-wss-stalequeue-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    // Keep a concrete handle (Services is Clone over shared internals) so the
+    // test can rehydrate the seeded queue into the same live registry the
+    // WSS listener serves from.
+    let services_handle = services.clone();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let mut opts = WsOptions {
+        base_port: 0,
+        ..WsOptions::default()
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = server.start().await.expect("start");
+
+    let created_ws = wss_call(
+        port,
+        cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Stale Queue"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Stale Queue Target"}}}}"#
+    );
+    let created = wss_call(port, cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+
+    // Seed one backdated and one fresh ready-to-send entry through the
+    // durable snapshot, then rehydrate into the live in-memory registry.
+    let stale_at = "2020-01-01T00:00:00Z";
+    let fresh_at = now_iso();
+    let row = |id: &str, position: i64, queued_at: &str| intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position,
+        payload: serde_json::json!({
+            "id": id,
+            "content": "undelivered wake",
+            "queuedAt": queued_at,
+        }),
+        created_at: queued_at.into(),
+        turn_id: id.into(),
+    };
+    store
+        .replace_agent_queue(
+            &agent,
+            &[
+                row("qmsg-stale", 0, stale_at),
+                row("qmsg-fresh", 1, &fresh_at),
+            ],
+        )
+        .await
+        .expect("seed queue");
+    let rehydrated = services_handle
+        .rehydrate_agent_queues()
+        .await
+        .expect("rehydrate queues");
+    assert_eq!(rehydrated, 2, "both seeded entries rehydrated");
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(port, cfg.clone(), &diag_frame).await;
+    assert_eq!(diag["jsonrpc"], Value::String("2.0".into()), "{diag}");
+    assert_eq!(diag["id"], Value::from(3), "{diag}");
+    let d = &diag["result"]["diagnostics"];
+    let risks = d["stuckRisks"].as_array().expect("stuckRisks array");
+    let risk = risks
+        .iter()
+        .find(|r| r["type"] == serde_json::json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk on the wire");
+    assert_eq!(risk["severity"], Value::String("warning".into()), "{risk}");
+    assert_eq!(risk["agentId"], Value::String(agent_id.clone()), "{risk}");
+    assert_eq!(
+        risk["entryId"],
+        Value::String("qmsg-stale".into()),
+        "{risk}"
+    );
+    assert_eq!(
+        risk["count"],
+        Value::from(1),
+        "fresh entry excluded: {risk}"
+    );
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "{risk}"
+    );
+    assert_eq!(
+        d["summary"]["stuckRisks"],
+        Value::from(risks.len()),
+        "summary counts the risks: {d}"
+    );
+    let text = diag["result"]["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    server.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
@@ -4328,6 +4462,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -5891,6 +6026,16 @@ async fn wss_git_show_file_round_trip() {
     std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "second"]);
+    // Commit a gitlink (submodule pin) via plumbing — the pin commit need not
+    // exist in this odb, exactly like a real submodule bump (monorepo#1739).
+    let pin_sha = "7257a190564088376227525989c4994e46082ad1";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{pin_sha},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
 
     let create_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS showFile WS","worktreePath":"{}","path":"{}"}}}}"#,
@@ -5903,7 +6048,8 @@ async fn wss_git_show_file_round_trip() {
         .expect("ws id")
         .to_string();
 
-    // Content at HEAD and at the parent revision.
+    // Content at HEAD and at an earlier revision (HEAD~2 — before the
+    // "second" edit; HEAD^ is the gitlink-less "second" commit).
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5917,7 +6063,7 @@ async fn wss_git_show_file_round_trip() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD^"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD~2"}}}}"#
         ),
     )
     .await;
@@ -5933,6 +6079,22 @@ async fn wss_git_show_file_round_trip() {
     )
     .await;
     assert_eq!(resp["result"]["content"], "");
+
+    // Gitlink (submodule pin) path → typed -32602 with
+    // `data = { code: "not-a-file", path, mode }` (monorepo#1739).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"sub","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "not-a-file", "path": "sub", "mode": "160000" })
+    );
 
     // Unresolvable ref → -32603; missing ref param → -32602 (PROTOCOL §9).
     let resp = wss_call(
@@ -5953,6 +6115,141 @@ async fn wss_git_show_file_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// Gitlink (submodule) wire shapes over WSS (monorepo#1739): `git.status`
+/// carries the additive `mode`/`oldSha`/`newSha` fields on the gitlink entry
+/// only, `git.changes` mirrors the same list, and `git.diffs` emits the
+/// synthesized one-line `Subproject commit <sha>` pseudo-hunk for the staged
+/// pin change.
+#[tokio::test]
+async fn wss_git_gitlink_status_and_diffs_wire_shape() {
+    let srv = start(WsOptions::default()).await;
+
+    let repo_dir = test_tempdir("intentd-wssgl-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    // Commit a gitlink pin, then stage a bump to a new pin (both via
+    // plumbing — the pin commits need not exist in this odb).
+    let old_pin = "7257a190564088376227525989c4994e46082ad1";
+    let new_pin = "7908777602d4e96f13c663c8a70a617163f38413";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{old_pin},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{new_pin},sub"),
+    ]);
+    // A plain unstaged edit alongside, to assert regular files stay bare.
+    std::fs::write(repo.join("seed.txt"), "seed\nedited\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitlink WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // git.status: the gitlink entry carries mode/oldSha/newSha; the regular
+    // file entry omits all three (additive, backward-compatible).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.status","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    let sub = files
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .expect("gitlink entry");
+    assert_eq!(sub["status"], "M");
+    assert_eq!(sub["staged"], true);
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+    let seed = files
+        .iter()
+        .find(|f| f["path"] == "seed.txt")
+        .expect("regular entry");
+    for k in ["mode", "oldSha", "newSha"] {
+        assert!(seed.get(k).is_none(), "regular file must omit {k}");
+    }
+
+    // git.changes mirrors the same list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let sub = resp["result"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .cloned()
+        .expect("gitlink entry");
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+
+    // git.diffs (staged): the gitlink delta yields the synthesized
+    // `Subproject commit <sha>` pseudo-hunk.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","staged":true,"path":"sub"}}}}"#
+        ),
+    )
+    .await;
+    let entries = resp["result"].as_array().expect("diff entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "sub");
+    let hunks = entries[0]["hunks"].as_array().expect("hunks");
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(
+        hunks[0],
+        serde_json::json!({
+            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+            "lines": [
+                { "type": "Deletion", "content": format!("Subproject commit {old_pin}\n"), "oldNumber": 1 },
+                { "type": "Addition", "content": format!("Subproject commit {new_pin}\n"), "newNumber": 1 },
+            ],
+        })
+    );
 
     srv.ws.stop().await;
 }
@@ -6807,6 +7104,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),
@@ -7042,6 +7340,143 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
     srv.ws.stop().await;
 }
 
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1):
+/// the result carries `{ plan }` with the versioned manifest (formatVersion,
+/// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
+/// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
+/// never listed; unknown workspace ids map to `-32602 Workspace not found`.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Transfer"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let manifest = &plan["manifest"];
+    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert!(
+        manifest["creatingIntentdVersion"].is_string(),
+        "manifest records the creating daemon version: {resp}"
+    );
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
+    let tables = manifest["tables"].as_array().expect("tables array");
+    assert!(
+        tables.iter().any(|t| t["name"] == "workspace"
+            && t["rowCount"] == 1
+            && t["approxBytes"].as_i64().unwrap_or(0) > 0),
+        "workspace row is counted with a byte estimate: {resp}"
+    );
+    assert!(
+        tables.iter().all(|t| t["name"] != "event"),
+        "event log is excluded from the manifest: {resp}"
+    );
+    assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(total, db + assets + bundle, "size breakdown sums: {resp}");
+    assert!(plan["warnings"].is_array(), "{resp}");
+
+    // Unknown workspace → the standard workspace-not-found mapping.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Workspace not found", "{resp}");
+
+    srv.ws.stop().await;
+}
+
+/// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
+/// monorepo#1948): a base64 payload lands in the workspace's
+/// `.intent/attachments/` directory and the response carries the
+/// workspace-relative `{ ok, path, fileName, size }`; a same-name re-place
+/// answers a collision-suffixed name; the `.intent/.gitignore` exclusion file
+/// is ensured; and the exactly-one-of `data`/`sourcePath` violation is the
+/// documented `-32602`.
+#[tokio::test]
+async fn wss_file_place_attachment_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-placeatt-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "ok": true,
+            "path": ".intent/attachments/trace.har",
+            "fileName": "trace.har",
+            "size": 26
+        }),
+        "result: {resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
+        b"oversized attachment bytes"
+    );
+    // The exclusion contract: the default `.intent/.gitignore` (ignore
+    // everything except config.json) was ensured on the way.
+    let gitignore =
+        std::fs::read_to_string(root.join(".intent/.gitignore")).expect("gitignore ensured");
+    assert!(gitignore.contains("*"), "gitignore content: {gitignore}");
+
+    // Same name again → collision-suffixed `trace-2.har`.
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    assert_eq!(resp2["result"]["fileName"], "trace-2.har", "{resp2}");
+    assert_eq!(
+        resp2["result"]["path"], ".intent/attachments/trace-2.har",
+        "{resp2}"
+    );
+
+    // Neither `data` nor `sourcePath` → -32602.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"x.bin"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
@@ -7052,4 +7487,302 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("addr")
         .port()
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7692 permessage-deflate negotiation on the WSS listener (monorepo#1971).
+// ---------------------------------------------------------------------------
+
+/// A transparent [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] wrapper
+/// that counts the bytes crossing the underlying socket in each direction.
+/// Installed on the raw TCP stream *beneath* TLS, so the counts reflect real
+/// on-the-wire traffic (TLS records included).
+struct CountingStream<S> {
+    inner: S,
+    read: Arc<std::sync::atomic::AtomicUsize>,
+    written: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            self.read.fetch_add(
+                buf.filled().len() - before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.written
+                .fetch_add(*n, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Byte counters for one instrumented connection: (bytes read, bytes written)
+/// at the TCP layer.
+type WireCounters = (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+/// An instrumented authenticated WSS connection: TCP → [`CountingStream`] →
+/// pinned TLS → WebSocket upgrade, optionally offering permessage-deflate.
+/// Returns the socket, the handshake response (for `Sec-WebSocket-Extensions`
+/// assertions), and the wire counters.
+async fn connect_ws_counting(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    offer_deflate: bool,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<CountingStream<TcpStream>>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+    WireCounters,
+) {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.expect("tcp");
+    let _ = tcp.set_nodelay(true);
+    let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = CountingStream {
+        inner: tcp,
+        read: read.clone(),
+        written: written.clone(),
+    };
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, counted)
+        .await
+        .expect("tls connect");
+    let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    if offer_deflate {
+        ws_config.extensions.permessage_deflate = Some(
+            tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default(),
+        );
+    }
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, resp) = tokio_tungstenite::client_async_with_config(url, tls, Some(ws_config))
+        .await
+        .expect("ws upgrade");
+    (ws, resp, (read, written))
+}
+
+/// Drive several JSON-RPC frames over an already-open socket, returning one
+/// parsed response per frame (same shape as [`wss_session`], generic over the
+/// instrumented stream).
+async fn drive_frames<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    frames: Vec<String>,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = Vec::new();
+    for frame in frames {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    out.push(serde_json::from_str(&text).expect("json"));
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    out
+}
+
+/// One draft round-trip carrying `payload` over an instrumented connection:
+/// `client.hello` → `workspace.create` → `drafts.set` → `drafts.get`. Returns
+/// the text echoed back by `drafts.get`.
+async fn draft_round_trip<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    client_id: &str,
+    payload: &str,
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = drive_frames(
+        ws,
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"client.hello","params":{{"clientId":"{client_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.create","params":{{"title":"Deflate {client_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let ws_id = resp[1]["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let set = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "drafts.set",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate", "text": payload }
+    });
+    let get = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "drafts.get",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate" }
+    });
+    let resp = drive_frames(ws, vec![set.to_string(), get.to_string()]).await;
+    assert_eq!(resp[0]["result"]["ok"], true, "drafts.set: {}", resp[0]);
+    resp[1]["result"]["text"]
+        .as_str()
+        .expect("draft text")
+        .to_string()
+}
+
+/// E2E (monorepo#1971): a client offering `permessage-deflate` negotiates
+/// compression on the real WSS transport — the 101 response echoes the agreed
+/// extension and a highly compressible JSON payload is measurably smaller on
+/// the wire than the same payload over a non-offering control connection,
+/// which itself sees no `Sec-WebSocket-Extensions` header and identical
+/// payload semantics (today's behavior).
+#[tokio::test]
+async fn wss_deflate_negotiation_compresses_on_the_wire() {
+    let srv = start(WsOptions::default()).await;
+    // ~128 KiB of highly compressible text, well past any handshake noise.
+    let payload = "intentd permessage-deflate ".repeat(5000);
+
+    // Deflate-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), true).await;
+    let agreed = resp
+        .headers()
+        .get("sec-websocket-extensions")
+        .expect("server echoes the negotiated extension")
+        .to_str()
+        .expect("ascii header");
+    assert!(
+        agreed.starts_with("permessage-deflate"),
+        "negotiated header names the extension: {agreed}"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-deflate", &payload).await;
+    assert_eq!(
+        echoed, payload,
+        "payload survives the compressed round-trip intact"
+    );
+    let _ = ws.close(None).await;
+    let deflate_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let deflate_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Control: identical session over a non-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), false).await;
+    assert!(
+        resp.headers().get("sec-websocket-extensions").is_none(),
+        "no offer ⇒ no Sec-WebSocket-Extensions in the 101 response"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-plain", &payload).await;
+    assert_eq!(echoed, payload, "control round-trip intact");
+    let _ = ws.close(None).await;
+    let plain_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let plain_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The compressible payload dominates both directions (~128 KiB each way
+    // uncompressed); compression must shrink the wire traffic dramatically.
+    // "< half" is a deliberately loose bound — in practice it is >90% smaller.
+    assert!(
+        deflate_read < plain_read / 2,
+        "server→client traffic compressed: deflate={deflate_read}B plain={plain_read}B"
+    );
+    assert!(
+        deflate_written < plain_written / 2,
+        "client→server traffic compressed: deflate={deflate_written}B plain={plain_written}B"
+    );
+    srv.ws.stop().await;
+}
+
+/// E2E control (monorepo#1971): a client that offers an unacceptable
+/// extension set is declined per RFC 7692 §7 — no `Sec-WebSocket-Extensions`
+/// in the 101 response — and gets a clean uncompressed connection with a
+/// working JSON-RPC round-trip, byte-identical behavior to a client that
+/// never offered.
+#[tokio::test]
+async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
+    let srv = start(WsOptions::default()).await;
+
+    // Hand-rolled upgrade with an offer the server must decline (unknown
+    // parameter, RFC 7692 §7). `tls_connect` + raw HTTP keeps the client free
+    // to send an arbitrary header the fork's client API would never produce.
+    let mut tls = tls_connect(srv.port, srv.cfg.clone()).await;
+    let req = format!(
+        "GET /ws?token={TOKEN} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; parameter-from-the-future=3\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.expect("write upgrade");
+    tls.flush().await.expect("flush");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(
+            tls.read(&mut byte).await.expect("read head") == 1,
+            "connection closed before 101 head"
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "declined offer still upgrades: {head}"
+    );
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "declined offer ⇒ no extensions header in the 101 response: {head}"
+    );
+
+    // The upgraded socket is a plain uncompressed WebSocket: a JSON-RPC
+    // round-trip behaves exactly as today.
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        tls,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{}}"#.to_string()],
+    )
+    .await;
+    assert!(
+        resp[0]["result"]["workspaces"].is_array(),
+        "plain round-trip works after the declined offer: {}",
+        resp[0]
+    );
+    let _ = ws.close(None).await;
+    srv.ws.stop().await;
 }

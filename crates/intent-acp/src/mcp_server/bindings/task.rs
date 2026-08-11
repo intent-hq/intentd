@@ -40,6 +40,8 @@ pub(crate) const PRELUDE: &str = r#"
             host({ method: 'task.getMyTask', args: { taskNoteId } }),
         markAsTask: (noteId, status, options) =>
             host({ method: 'task.markAsTask', args: { noteId, status, ...(options || {}) } }),
+        setRelations: (noteId, options) =>
+            host({ method: 'task.setRelations', args: { noteId, ...(options || {}) } }),
         convertBlocks: (noteId) =>
             host({ method: 'task.convertBlocks', args: { noteId } }),
         createPrerequisite: (dependentNoteId, title, options) =>
@@ -65,6 +67,7 @@ pub(crate) async fn dispatch(
         "update" => update(api, ws, args).await,
         "getMyTask" => get_my_task(api, ws, args).await,
         "markAsTask" => mark_as_task(api, ws, caller_agent_id, args).await,
+        "setRelations" => set_relations(api, ws, args).await,
         "convertBlocks" => convert_blocks(api, ws, caller_agent_id, args).await,
         "createPrerequisite" => create_prerequisite(api, ws, caller_agent_id, args).await,
         "assignAgent" => assign_agent(api, ws, args).await,
@@ -182,6 +185,8 @@ async fn mark_as_task(
     }
     let acceptance_criteria = opt_vec_str(args, "acceptanceCriteria").unwrap_or_default();
     let effort = opt_str(args, "effort");
+    let depends_on = opt_note_ids(args, "dependsOn");
+    let conflicts_with = opt_note_ids(args, "conflictsWith");
     let r = api
         .mark_as_task(
             ws.clone(),
@@ -189,6 +194,8 @@ async fn mark_as_task(
             status.clone(),
             acceptance_criteria,
             effort,
+            depends_on,
+            conflicts_with,
             caller_agent_id.cloned(),
         )
         .await
@@ -197,6 +204,29 @@ async fn mark_as_task(
     // canonical `TaskMarkAsTaskResult` verbatim (which already carries those
     // three plus the parsed `TaskStatus`). Both shapes stay in sync via serde.
     serde_json::to_value(r).map_err(|e| e.to_string())
+}
+
+async fn set_relations(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let note_id = req_str(args, "noteId").map_err(|_| "Note ID is required".to_string())?;
+    let r = api
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from_string(&note_id),
+            opt_note_ids(args, "dependsOn"),
+            opt_note_ids(args, "conflictsWith"),
+        )
+        .await
+        .map_err(map_err)?;
+    serde_json::to_value(r).map_err(|e| e.to_string())
+}
+
+/// Optional note-id-array arg — `opt_vec_str` mapped into `NoteId`s.
+fn opt_note_ids(args: &Value, key: &str) -> Option<Vec<NoteId>> {
+    opt_vec_str(args, key).map(|ids| ids.into_iter().map(NoteId::from_string).collect())
 }
 
 async fn convert_blocks(

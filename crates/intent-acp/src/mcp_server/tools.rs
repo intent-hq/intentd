@@ -198,7 +198,8 @@ API:
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
-  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort.
+  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
+  ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle are rejected with the cycle named.
   ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.
@@ -418,7 +419,8 @@ API:
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
-  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort.
+  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
+  ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle are rejected with the cycle named.
   ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.

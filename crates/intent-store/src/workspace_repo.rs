@@ -672,5 +672,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         checkout_mode,
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,
+        pending_delete_at: None,
     })
 }

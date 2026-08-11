@@ -1828,6 +1828,7 @@ mod mcp_tests {
                     assigned_agents: task.assigned_agent_ids.clone(),
                     task_metadata: task,
                     rev: 3,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -5243,6 +5244,7 @@ mod workspace_api_tool_tests {
                 display_status: None,
                 checkout_mode: None,
                 disk_usage: None,
+                pending_delete_at: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
         }
@@ -6035,6 +6037,9 @@ mod wsapi3_bindings_tests {
                     status: "todo".to_string(),
                     task_note_id: None,
                     linked_task_note_id: None,
+                    depends_on: Vec::new(),
+                    conflicts_with: Vec::new(),
+                    unmet_depends_on: Vec::new(),
                 }])
             })
         }
@@ -6314,6 +6319,7 @@ mod wsapi3_bindings_tests {
                     subtasks: Vec::new(),
                     assigned_agents: Vec::new(),
                     rev: 1,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -6325,6 +6331,8 @@ mod wsapi3_bindings_tests {
             status: String,
             acceptance_criteria: Vec<String>,
             effort: Option<String>,
+            _depends_on: Option<Vec<NoteId>>,
+            _conflicts_with: Option<Vec<NoteId>>,
             _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
             self.mark_as_task_calls.lock().unwrap().push((
@@ -7765,6 +7773,7 @@ mod wsapi4_bindings_tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -7782,6 +7791,7 @@ mod wsapi4_bindings_tests {
                 sandbox_branch: None,
                 dismissed_questions_message_id: None,
                 last_seen_message_id: None,
+                is_initial_agent: None,
             },
         }
     }
@@ -8852,6 +8862,7 @@ mod workspace_api_output_limit_tests {
                     display_status: None,
                     checkout_mode: None,
                     disk_usage: None,
+                    pending_delete_at: None,
                 })
             })
         }

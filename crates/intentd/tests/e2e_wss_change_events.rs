@@ -424,6 +424,315 @@ async fn workspace_delete_emits_workspace_deleted_over_wss() {
     assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
 }
 
+/// End-to-end delete grace window over WSS (PROTOCOL §5.1): `workspace.delete`
+/// with `undoDelayMs > 0` answers `{ success, scheduled, deleteAt }` and emits
+/// `workspace:delete-scheduled`; while pending the row is still served by
+/// `workspace.get` / `workspace.list` carrying `pendingDeleteAt`;
+/// `workspace.cancelDelete` answers `{ cancelled: true }`, emits
+/// `workspace:delete-cancelled`, and clears the projection; a re-run with a
+/// short window commits for real (`workspace:deleted`), after which a late
+/// cancel answers the race-safe `{ cancelled: false }`.
+#[tokio::test]
+async fn workspace_delete_grace_window_schedule_cancel_commit_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "GraceWindow", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": [
+                "workspace:delete-scheduled",
+                "workspace:delete-cancelled",
+                "workspace:deleted",
+            ],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Schedule with a window long enough to observe the pending state.
+    let scheduled = wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id, "undoDelayMs": 30_000 }),
+    )
+    .await;
+    assert_eq!(scheduled["success"], json!(true), "{scheduled}");
+    assert_eq!(scheduled["scheduled"], json!(true), "{scheduled}");
+    let delete_at = scheduled["deleteAt"]
+        .as_str()
+        .expect("deleteAt")
+        .to_string();
+    assert!(!delete_at.is_empty());
+
+    let evt = next_event(&mut sub, &["workspace:delete-scheduled"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": ws_id, "deleteAt": delete_at })
+    );
+
+    // Idempotent re-schedule: same deadline back, no new window.
+    let again = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id, "undoDelayMs": 30_000 }),
+    )
+    .await;
+    assert_eq!(again["deleteAt"], json!(delete_at), "{again}");
+
+    // Pending row is still served, carrying `pendingDeleteAt` (presence-
+    // detected additive field).
+    let got = wss_rpc(
+        &mut rpc,
+        4,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        got["workspace"]["pendingDeleteAt"],
+        json!(delete_at),
+        "{got}"
+    );
+    let listed = wss_rpc(&mut rpc, 5, "workspace.list", json!({})).await;
+    let row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == json!(ws_id))
+        .expect("pending row still listed")
+        .clone();
+    assert_eq!(row["pendingDeleteAt"], json!(delete_at), "{row}");
+
+    // Cancel within the window: `{ cancelled: true }` + event + projection
+    // cleared.
+    let cancelled = wss_rpc(
+        &mut rpc,
+        6,
+        "workspace.cancelDelete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(cancelled, json!({ "cancelled": true }), "{cancelled}");
+    let evt = next_event(&mut sub, &["workspace:delete-cancelled"], 10).await;
+    assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
+    let got = wss_rpc(
+        &mut rpc,
+        7,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        got["workspace"].get("pendingDeleteAt").is_none(),
+        "pendingDeleteAt omitted after cancel: {got}"
+    );
+
+    // Re-schedule with a short window and let it commit: the daemon-owned
+    // timer runs the immediate-delete cascade (`workspace:deleted`).
+    let scheduled = wss_rpc(
+        &mut rpc,
+        8,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id, "undoDelayMs": 250 }),
+    )
+    .await;
+    assert_eq!(scheduled["scheduled"], json!(true), "{scheduled}");
+    let evt = next_event(&mut sub, &["workspace:deleted"], 15).await;
+    assert_eq!(evt["data"], json!({ "workspaceId": ws_id }));
+
+    // Cancel after commit: the race-safe non-error `{ cancelled: false }`.
+    let late = wss_rpc(
+        &mut rpc,
+        9,
+        "workspace.cancelDelete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(late, json!({ "cancelled": false }), "{late}");
+}
+
+/// End-to-end agent delete grace window over WSS (PROTOCOL §5.5):
+/// `agent.delete` with `undoDelayMs > 0` answers `{ success, scheduled,
+/// deleteAt }` and emits `agent:delete-scheduled`; while pending the session
+/// is still served by `agent.get` / `agent.list` / `agent.getSession`
+/// carrying `pendingDeleteAt` (and is NOT stopped); `agent.cancelDelete`
+/// answers `{ cancelled: true }`, emits `agent:delete-cancelled`, and clears
+/// the projection; a re-run with a short window commits for real
+/// (`agent:deleted`), after which a late cancel answers the race-safe
+/// `{ cancelled: false }`.
+#[tokio::test]
+async fn agent_delete_grace_window_schedule_cancel_commit_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "AgentGrace", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Grace Agent" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": [
+                "agent:delete-scheduled",
+                "agent:delete-cancelled",
+                "agent:deleted",
+            ],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Schedule with a window long enough to observe the pending state.
+    let scheduled = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.delete",
+        json!({ "agentId": agent_id, "workspaceId": ws_id, "undoDelayMs": 30_000 }),
+    )
+    .await;
+    assert_eq!(scheduled["success"], json!(true), "{scheduled}");
+    assert_eq!(scheduled["scheduled"], json!(true), "{scheduled}");
+    let delete_at = scheduled["deleteAt"]
+        .as_str()
+        .expect("deleteAt")
+        .to_string();
+    assert!(!delete_at.is_empty());
+
+    let evt = next_event(&mut sub, &["agent:delete-scheduled"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "agentId": agent_id, "workspaceId": ws_id, "deleteAt": delete_at })
+    );
+
+    // Idempotent re-schedule: same deadline back, no new window.
+    let again = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.delete",
+        json!({ "agentId": agent_id, "workspaceId": ws_id, "undoDelayMs": 30_000 }),
+    )
+    .await;
+    assert_eq!(again["deleteAt"], json!(delete_at), "{again}");
+
+    // Pending session is still served, carrying `pendingDeleteAt`
+    // (presence-detected additive field) on all three projections.
+    let got = wss_rpc(&mut rpc, 4, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(got["agent"]["pendingDeleteAt"], json!(delete_at), "{got}");
+    let listed = wss_rpc(&mut rpc, 5, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let row = listed["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("pending row still listed")
+        .clone();
+    assert_eq!(row["pendingDeleteAt"], json!(delete_at), "{row}");
+    let session = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getSession",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["pendingDeleteAt"],
+        json!(delete_at),
+        "{session}"
+    );
+
+    // Cancel within the window: `{ cancelled: true }` + event + projection
+    // cleared.
+    let cancelled = wss_rpc(
+        &mut rpc,
+        7,
+        "agent.cancelDelete",
+        json!({ "agentId": agent_id, "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(cancelled, json!({ "cancelled": true }), "{cancelled}");
+    let evt = next_event(&mut sub, &["agent:delete-cancelled"], 10).await;
+    assert_eq!(
+        evt["data"],
+        json!({ "agentId": agent_id, "workspaceId": ws_id })
+    );
+    let got = wss_rpc(&mut rpc, 8, "agent.get", json!({ "agentId": agent_id })).await;
+    assert!(
+        got["agent"].get("pendingDeleteAt").is_none(),
+        "pendingDeleteAt omitted after cancel: {got}"
+    );
+
+    // Re-schedule with a short window and let it commit: the daemon-owned
+    // timer runs the immediate-delete cascade (`agent:deleted`).
+    let scheduled = wss_rpc(
+        &mut rpc,
+        9,
+        "agent.delete",
+        json!({ "agentId": agent_id, "workspaceId": ws_id, "undoDelayMs": 250 }),
+    )
+    .await;
+    assert_eq!(scheduled["scheduled"], json!(true), "{scheduled}");
+    let evt = next_event(&mut sub, &["agent:deleted"], 15).await;
+    assert_eq!(evt["data"], json!({ "agentId": agent_id }));
+
+    // Cancel after commit: the race-safe non-error `{ cancelled: false }`.
+    let late = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.cancelDelete",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(late, json!({ "cancelled": false }), "{late}");
+}
+
 /// End-to-end TASKFLOW-1 flow over WSS: authoring a note whose content holds
 /// an `@@@task` block auto-converts the fence into a linked child task note
 /// (fence-free parent + `note:created` for the child + `note:updated` for the
@@ -2494,5 +2803,222 @@ async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
         archived["status"],
         json!("Archived"),
         "snapshot includes archived workspaces with their status: {archived}"
+    );
+}
+
+/// End-to-end `task.setRelations` over WSS (PROTOCOL.md §5.4): relation writes
+/// round-trip `dependsOn`/`conflictsWith` (echoed normalized in the result and
+/// visible in `task.getMyTask` / `task.list` with the computed
+/// `unmetDependsOn`), emit `note:updated` for subscriber refetch, and reject
+/// invalid writes — a `dependsOn` closing a cycle (error names the cycle
+/// path), self-edges, and non-task ids. `task.markAsTask` accepts the same
+/// relation params.
+#[tokio::test]
+async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Relations", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Three spec-child task notes: a (complete), b (in_progress), c.
+    let mut task_ids = Vec::new();
+    for (i, (title, status)) in [
+        ("Alpha", "complete"),
+        ("Beta", "in_progress"),
+        ("Gamma", "not_started"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = i as i64 * 2 + 2;
+        let created = wss_rpc(
+            &mut rpc,
+            id,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": title, "content": "body", "parentId": "spec" }),
+        )
+        .await;
+        let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+        wss_rpc(
+            &mut rpc,
+            id + 1,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": status }),
+        )
+        .await;
+        task_ids.push(note_id);
+    }
+    let (a, b, c) = (
+        task_ids[0].clone(),
+        task_ids[1].clone(),
+        task_ids[2].clone(),
+    );
+
+    // Drain the setup emissions (each markAsTask queued a `note:updated`,
+    // ending with c's) so the next `note:updated` for c observed below is
+    // unambiguously the `task.setRelations` write's.
+    loop {
+        let evt = next_event(&mut sub, &["note:updated"], 10).await;
+        if evt["data"]["noteId"] == json!(c) {
+            break;
+        }
+    }
+
+    // Write relations on c: dependsOn [a, b, a] (dedup) + conflictsWith [b].
+    let set = wss_rpc(
+        &mut rpc,
+        10,
+        "task.setRelations",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": c,
+            "dependsOn": [a, b, a],
+            "conflictsWith": [b],
+        }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "setRelations: {set}");
+    assert_eq!(set["noteId"], json!(c));
+    assert_eq!(set["dependsOn"], json!([a, b]), "deduped: {set}");
+    assert_eq!(set["conflictsWith"], json!([b]));
+
+    // Relation write emits `note:updated` for the task note (§6.5). The
+    // setup emissions were drained above, so this is the write's own event.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(c),
+        "setRelations note:updated: {evt}"
+    );
+
+    // getMyTask carries the stored relations + computed unmetDependsOn (the
+    // complete dep `a` is met, `b` is not).
+    let mine = wss_rpc(
+        &mut rpc,
+        11,
+        "task.getMyTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": c }),
+    )
+    .await;
+    assert_eq!(mine["taskMetadata"]["dependsOn"], json!([a, b]));
+    assert_eq!(mine["taskMetadata"]["conflictsWith"], json!([b]));
+    assert_eq!(mine["unmetDependsOn"], json!([b]), "getMyTask: {mine}");
+
+    // task.list rows project the same fields. The notes above are children of
+    // `spec` but unlinked from its body, so the backward-compat fallback
+    // (no spec links → all direct task children) applies.
+    let listed = wss_rpc(&mut rpc, 12, "task.list", json!({ "workspaceId": ws_id })).await;
+    let row = listed["tasks"]
+        .as_array()
+        .expect("tasks array")
+        .iter()
+        .find(|t| t["id"] == json!(c))
+        .expect("task c row")
+        .clone();
+    assert_eq!(row["dependsOn"], json!([a, b]), "task.list row: {row}");
+    assert_eq!(row["conflictsWith"], json!([b]));
+    assert_eq!(row["unmetDependsOn"], json!([b]));
+    // Relation-less rows omit the fields entirely (additive wire shape).
+    let row_a = listed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == json!(a))
+        .expect("task a row");
+    assert!(row_a.get("dependsOn").is_none(), "omitted: {row_a}");
+
+    // Closing the cycle b → c → b is rejected with the cycle path named.
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        13,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": b, "dependsOn": [c] }),
+    )
+    .await;
+    assert_eq!(err["error"]["code"], json!(-32603), "cycle: {err}");
+    let detail = err["error"]["data"].as_str().expect("cycle error detail");
+    assert!(detail.contains("cycle"), "cycle rejection: {err}");
+    assert!(
+        detail.contains(&format!("{b} -> {c} -> {b}")),
+        "cycle path named: {detail}"
+    );
+
+    // Self-edge and non-task ids are rejected.
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        14,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": c, "dependsOn": [c] }),
+    )
+    .await;
+    assert!(
+        err["error"]["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cannot reference the task itself"),
+        "self-edge: {err}"
+    );
+    let err = wss_rpc_envelope(
+        &mut rpc,
+        15,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": c, "conflictsWith": ["ghost"] }),
+    )
+    .await;
+    assert!(
+        err["error"]["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a task note"),
+        "non-task id: {err}"
+    );
+
+    // markAsTask accepts the relation params on an existing task (b dependsOn
+    // a is acyclic) and getMyTask reflects them.
+    wss_rpc(
+        &mut rpc,
+        16,
+        "task.markAsTask",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": b,
+            "status": "in_progress",
+            "dependsOn": [a],
+        }),
+    )
+    .await;
+    let mine = wss_rpc(
+        &mut rpc,
+        17,
+        "task.getMyTask",
+        json!({ "workspaceId": ws_id, "taskNoteId": b }),
+    )
+    .await;
+    assert_eq!(mine["taskMetadata"]["dependsOn"], json!([a]));
+    assert!(
+        mine.get("unmetDependsOn").is_none(),
+        "complete dep is met (field omitted): {mine}"
     );
 }
