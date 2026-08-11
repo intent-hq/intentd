@@ -179,9 +179,14 @@ fn materialize_inner(
     }
 
     // Same naming as `workspace.create` provisioning: display name from the
-    // row (falling back to the source path basename), slugified for the
-    // folder. `ws.repository_path` still holds the SOURCE path here — the
-    // caller rewrites it via [`MaterializedGit::apply`] after success.
+    // row (falling back to the source path basename), slugified with
+    // `worktree_folder_slug`. (Live sandbox re-provisioning slugifies with
+    // `sandbox_ops::repo_slug_from_workspace`, which differs on edge cases —
+    // intentional: rows store absolute paths, so a later re-provision naming
+    // its folder differently is harmless, and the checkout and its sandboxes
+    // sharing ONE slug matters more here.) `ws.repository_path` still holds
+    // the SOURCE path — the caller rewrites it via [`MaterializedGit::apply`]
+    // after success.
     let repo_name = crate::known_repo_name(
         ws.repository_name.as_deref(),
         ws.repository_path.as_deref().unwrap_or(""),
@@ -201,6 +206,11 @@ fn materialize_inner(
     //    self-contained (full history, no prerequisites) so this needs no
     //    other remote; the whole pack lands in the object store, which is
     //    what makes the later base/sandbox ref fetches cheap.
+    //    GIT_LFS_SKIP_SMUDGE: bundles carry LFS pointer blobs, not LFS
+    //    objects, and this temporary origin is the bundle path — the smudge
+    //    filter would fail on any target without a populated LFS cache.
+    //    Skipping it leaves pointer files in the worktree; a later
+    //    `git lfs pull` against the real remote hydrates them.
     created.push(checkout_dir.clone());
     run_git(&ws_dir, |cmd| {
         cmd.arg("clone")
@@ -208,7 +218,8 @@ fn materialize_inner(
             .arg("-b")
             .arg(&refs.workspace_branch)
             .arg(bundle)
-            .arg(&checkout_dir);
+            .arg(&checkout_dir)
+            .env("GIT_LFS_SKIP_SMUDGE", "1");
     })
     .map_err(|e| Error::Internal(format!("clone from transfer bundle failed: {e}")))?;
 
@@ -266,8 +277,30 @@ fn materialize_inner(
         };
         let agent_dir = ws_dir.join("sandboxes").join(&sb.agent_id.0);
         let sandbox_path = agent_dir.join(crate::worktree_folder_slug(&repo_name));
-        created.push(agent_dir.clone());
-        provision_sandbox_from_bundle(&checkout_dir, bundle, &agent_dir, &sandbox_path, entry)?;
+        // Only track for rollback what THIS call creates: a pre-existing
+        // agent dir must never be recursively deleted by a later failure, so
+        // in that case track just the sandbox path — which must not itself
+        // pre-exist (same guard as the checkout dir above).
+        if agent_dir.exists() {
+            if sandbox_path.exists() {
+                return Err(Error::Internal(format!(
+                    "materialize sandbox target already exists: {}",
+                    sandbox_path.display()
+                )));
+            }
+            created.push(sandbox_path.clone());
+        } else {
+            created.push(agent_dir.clone());
+        }
+        provision_sandbox_from_bundle(
+            &checkout_dir,
+            bundle,
+            &agent_dir,
+            &sandbox_path,
+            entry,
+            &refs.workspace_branch,
+            refs.workspace_wip_commit_sha.is_some(),
+        )?;
         materialized.push(MaterializedSandbox {
             agent_id: sb.agent_id.0.clone(),
             branch: entry.branch.clone(),
@@ -295,19 +328,27 @@ fn materialize_inner(
 /// Provision one sandbox: CoW-clone the (still clean) workspace checkout when
 /// the filesystem supports it, else a plain local `git clone`; then fetch the
 /// sandbox branch from the bundle, check it out, and unwind its WIP snapshot.
+/// The sandbox's local copy of the workspace branch is reset off the WIP
+/// sentinel (the clone happened while the checkout was still at the sentinel
+/// tip; only the workspace checkout gets the later unwind).
+#[allow(clippy::too_many_arguments)]
 fn provision_sandbox_from_bundle(
     checkout_dir: &Path,
     bundle: &str,
     agent_dir: &Path,
     sandbox_path: &Path,
     entry: &crate::transfer_git::SandboxBundleRef,
+    workspace_branch: &str,
+    workspace_has_wip: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(agent_dir)
         .map_err(|e| Error::Internal(format!("create sandbox parent dir failed: {e}")))?;
 
     // CoW first (same preference as source-side provisioning), degrading to
     // a plain local clone — hardlinked objects, so still cheap — when the
-    // probe or the clone itself reports Unsupported.
+    // probe or the clone itself reports Unsupported. `sandbox_path` never
+    // pre-exists (the caller rejects that), so the failure cleanup below can
+    // only remove what this cow_clone partially created.
     let cow = matches!(
         cow_probe(checkout_dir, agent_dir),
         Ok(CowSupport::Supported)
@@ -329,7 +370,8 @@ fn provision_sandbox_from_bundle(
             cmd.arg("clone")
                 .arg("--quiet")
                 .arg(checkout_dir)
-                .arg(sandbox_path);
+                .arg(sandbox_path)
+                .env("GIT_LFS_SKIP_SMUDGE", "1");
         })
         .map_err(|e| Error::Internal(format!("sandbox clone failed: {e}")))?;
         // Drop the origin pointing at the workspace checkout: sandboxes on
@@ -349,9 +391,31 @@ fn provision_sandbox_from_bundle(
     })
     .map_err(|e| Error::Internal(format!("fetch sandbox branch from bundle failed: {e}")))?;
     run_git(sandbox_path, |cmd| {
-        cmd.arg("checkout").arg("--quiet").arg(&entry.branch);
+        cmd.arg("checkout")
+            .arg("--quiet")
+            .arg(&entry.branch)
+            .env("GIT_LFS_SKIP_SMUDGE", "1");
     })
     .map_err(|e| Error::Internal(format!("checkout sandbox branch failed: {e}")))?;
+
+    // The clone was taken at the sentinel tip, so the sandbox's local
+    // workspace branch points at the WIP snapshot commit — a tip that is
+    // unreachable from canonical refs once the workspace unwinds (it would
+    // trip `audit_diverged_sandbox_branches` on every merge-back). Reset it
+    // to the sentinel's parent, the same tip the workspace unwind restores.
+    if workspace_has_wip && workspace_branch != entry.branch {
+        run_git(sandbox_path, |cmd| {
+            cmd.arg("branch")
+                .arg("--force")
+                .arg(workspace_branch)
+                .arg(format!("refs/heads/{workspace_branch}^"));
+        })
+        .map_err(|e| {
+            Error::Internal(format!(
+                "reset sandbox workspace branch off the WIP sentinel failed: {e}"
+            ))
+        })?;
+    }
 
     let tip = head_sha(sandbox_path)?;
     if tip != entry.head_sha {
@@ -698,6 +762,23 @@ mod tests {
         );
         assert!(out.skipped_agent_ids.is_empty());
 
+        // The sandbox's local workspace branch must not point at the WIP
+        // sentinel (the clone was taken at the sentinel tip; it gets reset
+        // to the unwound tip).
+        {
+            let r = git2::Repository::open(&msb.path).unwrap();
+            let ws_branch_tip = r
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            assert_eq!(
+                ws_branch_tip.id().to_string(),
+                feature_tip,
+                "sandbox workspace branch reset off the WIP sentinel"
+            );
+        }
+
         // apply(): rows rewritten to target paths.
         let mut ws_row = ws.clone();
         let mut sb_rows = vec![sb];
@@ -824,6 +905,78 @@ mod tests {
             fs::read_to_string(existing.join("keep.txt")).unwrap(),
             "keep\n",
             "pre-existing directory untouched"
+        );
+    }
+
+    /// A pre-existing `sandboxes/<agentId>` directory must survive rollback:
+    /// only what THIS call creates inside it (the sandbox checkout) may be
+    /// removed on failure, and a pre-existing sandbox checkout path is
+    /// rejected outright.
+    #[test]
+    fn rollback_preserves_preexisting_agent_dir() {
+        let src = tempfile::TempDir::new().unwrap();
+        let repo = src.path().join("source-repo");
+        init_repo(&repo);
+        let ws = workspace_for_repo(&repo);
+
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sb_src = src.path().join("sandbox");
+        make_sandbox_clone(&repo, &sb_src, &branch);
+        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
+
+        let staging = src.path().join("staging");
+        let (bundle_path, mut refs) =
+            create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+
+        // Pre-existing agent dir with unrelated content on the target.
+        let target = tempfile::TempDir::new().unwrap();
+        let agent_dir = target
+            .path()
+            .join(&ws.id.0)
+            .join("sandboxes")
+            .join(&agent.0);
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("precious.txt"), "precious\n").unwrap();
+
+        // Force a failure AFTER the sandbox is provisioned: corrupt the
+        // sandbox head so its tip check fails.
+        refs.sandboxes[0].head_sha = "0".repeat(40);
+
+        let err = materialize_workspace_git_blocking(
+            &bundle_path,
+            &refs,
+            &ws,
+            std::slice::from_ref(&sb),
+            target.path(),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("precious.txt")).unwrap(),
+            "precious\n",
+            "pre-existing agent dir content survives rollback"
+        );
+        assert!(
+            !agent_dir.join("test-repo").exists(),
+            "the sandbox checkout this call created was rolled back"
+        );
+
+        // A pre-existing sandbox checkout path is rejected without touching it.
+        let sandbox_checkout = agent_dir.join("test-repo");
+        fs::create_dir_all(&sandbox_checkout).unwrap();
+        fs::write(sandbox_checkout.join("keep.txt"), "keep\n").unwrap();
+        let err = materialize_workspace_git_blocking(
+            &bundle_path,
+            &refs,
+            &ws,
+            std::slice::from_ref(&sb),
+            target.path(),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            fs::read_to_string(sandbox_checkout.join("keep.txt")).unwrap(),
+            "keep\n",
+            "pre-existing sandbox checkout untouched"
         );
     }
 
