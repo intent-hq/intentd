@@ -20491,6 +20491,136 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     assert_eq!(metadata["stallSuspected"], json!(true), "meta: {metadata}");
 }
 
+/// monorepo#1898: a task note in `review_required` means the child explicitly
+/// reported completion (reportToParent's TASK-B transition) — an idle with no
+/// persisted report must NOT get the "may have stalled" annotation.
+#[tokio::test]
+async fn stall_annotation_skipped_when_task_review_required() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Reported task", "review_required").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "wrapped up" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(!text.contains(STALL_MARKER), "clean wake: {text}");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no stall flag: {metadata}"
+    );
+}
+
+/// monorepo#1898: even when the stall predicate fires (task still
+/// `in_progress`, no PERSISTED report), a wake whose text rendered a
+/// `Report:` clause from the EVENT payload must not carry the contradictory
+/// "No completion report … may have stalled" tail — in both the standalone
+/// wake and the grouped after_all per-child line.
+#[tokio::test]
+async fn stall_tail_never_contradicts_rendered_report() {
+    let (_t, svc, ws) = setup().await;
+
+    // Standalone completion wake.
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Racy task", "in_progress").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "event-only report" }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains("event-only report"),
+        "report rendered: {text}"
+    );
+    assert!(
+        !text.contains(STALL_MARKER),
+        "no contradictory tail after a Report: clause: {text}"
+    );
+
+    // Grouped after_all per-child line.
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let grouped = create_agent(&svc, &ws, "Grouped").await;
+    link_task_note(&svc, &ws, &grouped, "Racy grouped task", "in_progress").await;
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![grouped.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &grouped,
+        json!({ "agentId": grouped.0, "completionReport": "grouped event report" }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains("grouped event report"),
+        "report rendered: {text}"
+    );
+    assert!(
+        !text.contains(STALL_MARKER),
+        "no contradictory tail on the per-child line: {text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Question hold: `question_hold_active` derivation + `agent.dismissQuestions`
 // ---------------------------------------------------------------------------
