@@ -1893,6 +1893,7 @@ fn map_session_row_with_system_prompt(
         stop_reason_timestamp: col(row, "stop_reason_timestamp")?,
         // Derived on emit by the service layer (monorepo#940); never persisted.
         session_corrupted: false,
+        pending_delete_at: None,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         sandbox_id: col(row, "sandbox_id")?,
@@ -2857,6 +2858,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -2972,6 +2974,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -3128,6 +3131,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -4596,6 +4600,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session)
@@ -4754,6 +4759,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -5039,6 +5045,7 @@ mod tests {
                 stop_reason: None,
                 stop_reason_timestamp: None,
                 session_corrupted: false,
+                pending_delete_at: None,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }

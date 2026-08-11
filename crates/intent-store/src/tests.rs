@@ -3213,6 +3213,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,

@@ -6942,6 +6942,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),

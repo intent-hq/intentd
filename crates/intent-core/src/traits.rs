@@ -1912,6 +1912,45 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Schedule an agent-session deletion after a grace window (PROTOCOL
+    /// §5.5): registers an in-memory pending deletion with deadline
+    /// `now + undo_delay_ms` (clamped to the 60s cap) and returns the ISO
+    /// `deleteAt` deadline. Scheduling does NOT stop the agent — the commit
+    /// performs the ordinary [`WorkspaceApi::agent_delete`] (which does).
+    /// Re-scheduling while pending is idempotent (returns the existing
+    /// deadline). Never persisted — a daemon restart drops the pending
+    /// deletion.
+    fn agent_schedule_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (agent_id, workspace_id, undo_delay_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_schedule_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.cancelDelete`: cancel a pending agent-session deletion
+    /// (PROTOCOL §5.5). Returns `true` when a pending deletion was cancelled,
+    /// `false` when nothing was pending (already committed, or never
+    /// scheduled) — a non-error, race-safe outcome.
+    fn agent_cancel_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_cancel_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a): resume the
     /// newest live/resumable agent assigned to the task, or create + assign a
     /// new one — inheriting specialist/model from the most-recent previous

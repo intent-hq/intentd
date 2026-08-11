@@ -311,6 +311,7 @@ async fn interrupted_agents_persisted_across_restart() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session)

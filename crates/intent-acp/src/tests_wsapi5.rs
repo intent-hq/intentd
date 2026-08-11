@@ -762,6 +762,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         metadata: AgentMetadata {
             is_background: false,
             specialist: None,

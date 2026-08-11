@@ -1219,6 +1219,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -1354,6 +1355,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1507,6 +1509,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1642,6 +1645,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1746,6 +1750,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1828,6 +1833,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

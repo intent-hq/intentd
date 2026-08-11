@@ -64,13 +64,18 @@
 //! (additive; §5.1): read-only transfer preview — the versioned export
 //! manifest (tables, assets, git summary) plus the size estimate (DB rows +
 //! assets + estimated git bundle) and pre-flight warnings — 274 router
-//! methods, 313 total. Version 6.7 adds the workspace delete
-//! grace window (additive; §5.1): the optional `undoDelayMs` param on
-//! `workspace.delete` (schedules an in-memory pending deletion, returning
-//! `{ success, scheduled, deleteAt }`), the `workspace.cancelDelete` router
-//! method, the `workspace:delete-scheduled` / `workspace:delete-cancelled`
-//! events (§6.5), and the optional `pendingDeleteAt` field on `Workspace`
-//! rows — 275 router methods, 314 total.
+//! methods, 313 total. Version 6.7 adds the delete grace window
+//! (additive; §5.1 / §5.5): the optional `undoDelayMs` param on
+//! `workspace.delete` and `agent.delete` (schedules an in-memory pending
+//! deletion, returning `{ success, scheduled, deleteAt }`), the
+//! `workspace.cancelDelete` / `agent.cancelDelete` router methods, the
+//! `workspace:delete-scheduled` / `workspace:delete-cancelled` and
+//! `agent:delete-scheduled` / `agent:delete-cancelled` events (§6.5), and
+//! the optional `pendingDeleteAt` field on `Workspace` rows and the
+//! `AgentLite` / `AgentSession` projections. Scheduling an agent delete
+//! does NOT stop the agent (the deadline commit does), and a workspace
+//! delete — immediate or committed-from-pending — supersedes pending agent
+//! deletes inside it — 276 router methods, 315 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
 pub const PROTOCOL_VERSION: &str = "6.7";

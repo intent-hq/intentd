@@ -244,6 +244,42 @@ impl WorkspaceApi for FakeApi {
             Ok(id.as_str() == "pending")
         })
     }
+    fn agent_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+    fn agent_schedule_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(format!("2026-01-01T00:00:{:02}Z", undo_delay_ms / 1000))
+        })
+    }
+    fn agent_cancel_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            // "agent-pending" has a scheduled deletion; anything else reports
+            // the race-safe non-error `false`.
+            Ok(agent_id.0 == "agent-pending")
+        })
+    }
     fn archive_workspace(
         &self,
         id: WorkspaceId,
@@ -2618,6 +2654,84 @@ async fn workspace_cancel_delete_returns_cancelled_flag() {
         serde_json::json!({ "cancelled": false }),
         "{v}"
     );
+}
+
+/// `undoDelayMs: 0` (and explicit `null`) keep the immediate agent-delete
+/// result byte-identical (§5.5): bare `{ success: true }`, no
+/// `scheduled`/`deleteAt`.
+#[tokio::test]
+async fn agent_delete_zero_or_null_undo_delay_is_immediate() {
+    for params in [
+        r#"{"agentId":"agent-1","undoDelayMs":0}"#,
+        r#"{"agentId":"agent-1","undoDelayMs":null}"#,
+        r#"{"agentId":"agent-1"}"#,
+    ] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"], serde_json::json!({ "success": true }), "{v}");
+    }
+}
+
+/// `undoDelayMs > 0` schedules the agent delete grace window (§5.5): the
+/// result carries `scheduled: true` plus the ISO `deleteAt` deadline from
+/// the API.
+#[tokio::test]
+async fn agent_delete_with_undo_delay_returns_scheduled_shape() {
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{"agentId":"agent-1","undoDelayMs":15000}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "deleteAt": "2026-01-01T00:00:15Z",
+        }),
+        "{v}"
+    );
+}
+
+/// A non-integer `undoDelayMs` on `agent.delete` is `-32602` (negative
+/// numbers and strings both fail `as_u64`).
+#[tokio::test]
+async fn agent_delete_invalid_undo_delay_is_minus_32602() {
+    for bad in [r#""soon""#, "-1", "1.5", "true"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{{"agentId":"agent-1","undoDelayMs":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "undoDelayMs={bad}: {v}");
+    }
+}
+
+/// `agent.cancelDelete` returns `{ cancelled: bool }` (§5.5): `true` when a
+/// pending deletion was cancelled, `false` otherwise — a non-error, race-safe
+/// outcome (never `-32602`/`-32603` for "nothing pending"). `agentId` is
+/// required.
+#[tokio::test]
+async fn agent_cancel_delete_returns_cancelled_flag() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.cancelDelete","params":{"agentId":"agent-pending"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "cancelled": true }), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.cancelDelete","params":{"agentId":"agent-1","workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "cancelled": false }),
+        "{v}"
+    );
+
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.cancelDelete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
 }
 
 /// `workspace.archive` and `workspace.unarchive` return the updated

@@ -770,6 +770,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 

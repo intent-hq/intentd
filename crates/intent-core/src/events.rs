@@ -31,6 +31,14 @@ pub const AGENT_MESSAGE: &str = "agent:message";
 // Agent interaction events (agent-to-agent communication).
 pub const AGENT_CREATED: &str = "agent:created";
 pub const AGENT_DELETED: &str = "agent:deleted";
+// Delete grace window (PROTOCOL §5.5): an `agent.delete` with
+// `undoDelayMs > 0` schedules an in-memory pending deletion instead of
+// committing immediately. Self-sufficient payloads: `delete-scheduled`
+// carries `{ agentId, workspaceId, deleteAt }` (the ISO commit deadline)
+// and `delete-cancelled` carries `{ agentId, workspaceId }` so clients
+// flip the pending state without a follow-up read.
+pub const AGENT_DELETE_SCHEDULED: &str = "agent:delete-scheduled";
+pub const AGENT_DELETE_CANCELLED: &str = "agent:delete-cancelled";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
 pub const AGENT_UPDATED: &str = "agent:updated";
@@ -405,6 +413,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_MESSAGE,
     AGENT_CREATED,
     AGENT_DELETED,
+    AGENT_DELETE_SCHEDULED,
+    AGENT_DELETE_CANCELLED,
     AGENT_RESTORED,
     AGENT_RENAMED,
     AGENT_UPDATED,
