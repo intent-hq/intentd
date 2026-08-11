@@ -2791,8 +2791,9 @@ pub struct AgentDelegateInput {
     /// before.
     pub tasks: Option<Vec<NoteId>>,
     /// Batch-only conflict policy (default false): `false` holds a task whose
-    /// `conflictsWith` intersects the running/starting set; `true` starts it
-    /// anyway and names the conflict pairs in the result.
+    /// `conflictsWith` intersects the running/starting set, admitting
+    /// startable tasks in effort-weighted critical-path priority order;
+    /// `true` starts it anyway and names the conflict pairs in the result.
     pub greedy: Option<bool>,
 }
 
