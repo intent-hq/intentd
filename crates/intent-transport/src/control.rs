@@ -52,6 +52,12 @@ pub struct SystemStatus {
     pub version: String,
     /// Uptime in seconds since daemon start.
     pub uptime_seconds: u64,
+    /// Non-loopback IPv4 addresses the host is reachable on (same source as
+    /// `server.pairingInfo` — `collect_local_ips`), so an authenticated remote
+    /// client can discover alternative routes to the daemon.
+    pub local_ips: Vec<String>,
+    /// Local OS hostname (same source as `server.pairingInfo`).
+    pub hostname: String,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
@@ -191,6 +197,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "cpuPercent": status.cpu_percent,
         "memoryBytes": status.memory_bytes,
         "fingerprint": status.fingerprint,
+        "localIps": status.local_ips,
+        "hostname": status.hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "host": {
             "os": status.os,
