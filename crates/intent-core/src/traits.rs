@@ -176,6 +176,68 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.export.start`: stop the workspace's agents and build the
+    /// transfer zip archive on a background task (PROTOCOL §5.1); progress
+    /// and outcome travel on `workspace:transfer:progress` / `:ready` /
+    /// `:failed` events. Returns `{ exportId, maxChunkBytes }` immediately.
+    fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_export_start not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.export.read`: serve one seq-numbered base64 chunk of a
+    /// ready export archive; idempotent per seq (PROTOCOL §5.1). Returns
+    /// `{ exportId, seq, totalChunks, data }`.
+    fn workspace_export_read(
+        &self,
+        export_id: String,
+        seq: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (export_id, seq);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_export_read not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.export.finalize`: settle the source after a successful
+    /// relay — unwind WIP snapshots, delete staging, apply the optional
+    /// final status message, and archive the workspace when requested
+    /// (PROTOCOL §5.1). Returns `{ exportId, finalized, workspace }`.
+    fn workspace_export_finalize(
+        &self,
+        export_id: String,
+        archive_source: bool,
+        final_status_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (export_id, archive_source, final_status_message);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_export_finalize not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.export.abort`: cancel an export — staging deleted, WIP
+    /// snapshots unwound, workspace left usable (agents stay stopped);
+    /// idempotent (PROTOCOL §5.1). Returns `{ exportId, aborted }`.
+    fn workspace_export_abort(
+        &self,
+        export_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = export_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_export_abort not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is
