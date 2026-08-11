@@ -3268,6 +3268,113 @@ async fn ready_tasks_recompute_on_relations_write_and_deletion_over_wss() {
     assert_eq!(evt["data"]["readyTaskIds"], json!([]), "ready: {evt}");
 }
 
+/// End-to-end ready-set recompute on task-note deletion (PROTOCOL.md §6.5,
+/// monorepo#2006) over WSS: deleting a task note that is itself in the ready
+/// set emits `task:ready-tasks-changed` with the deleted id gone from
+/// `readyTaskIds`, and deleting the last incomplete task child of a parent
+/// emits the recompute with the parent now present — both with the
+/// `triggeredBy: { noteId, reason: "note-deleted" }` variant.
+#[tokio::test]
+async fn ready_tasks_recompute_on_task_note_delete_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "DeleteRecompute", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:ready-tasks-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // A root-level parent task, its single incomplete child, and a
+    // free-standing ready task.
+    let mk = |rpc_id: i64, title: &str, parent: Option<&str>| {
+        let mut params = json!({ "workspaceId": ws_id, "title": title, "content": "body" });
+        if let Some(p) = parent {
+            params["parentId"] = json!(p);
+        }
+        (rpc_id, params)
+    };
+    let mut ids = Vec::new();
+    let (id, params) = mk(2, "Parent", None);
+    let created = wss_rpc(&mut rpc, id, "note.create", params).await;
+    let parent = created["note"]["id"].as_str().expect("note id").to_string();
+    ids.push(parent.clone());
+    for (i, title) in ["Child", "Loner"].iter().enumerate() {
+        let (id, params) = mk(
+            4 + i as i64 * 2,
+            title,
+            (*title == "Child").then_some(parent.as_str()),
+        );
+        let created = wss_rpc(&mut rpc, id, "note.create", params).await;
+        ids.push(created["note"]["id"].as_str().expect("note id").to_string());
+    }
+    for (i, note_id) in ids.iter().enumerate() {
+        wss_rpc(
+            &mut rpc,
+            10 + i as i64,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
+        )
+        .await;
+    }
+    let (child, loner) = (ids[1].clone(), ids[2].clone());
+
+    // Deleting the ready `loner` announces the recompute without its id
+    // (only `child` remains ready — `parent` is blocked by its open child).
+    let del = wss_rpc(
+        &mut rpc,
+        20,
+        "note.delete",
+        json!({ "workspaceId": ws_id, "noteId": loner }),
+    )
+    .await;
+    assert_eq!(del["ok"], json!(true), "delete loner: {del}");
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": loner, "reason": "note-deleted" }),
+        "loner trigger: {evt}"
+    );
+    assert_eq!(evt["data"]["readyTaskIds"], json!([child]), "ready: {evt}");
+    assert!(evt["data"]["computedAt"].is_string(), "computedAt: {evt}");
+
+    // Deleting the last incomplete child satisfies the tree rule, so the
+    // parent ENTERS the ready set.
+    let del = wss_rpc(
+        &mut rpc,
+        21,
+        "note.delete",
+        json!({ "workspaceId": ws_id, "noteId": child }),
+    )
+    .await;
+    assert_eq!(del["ok"], json!(true), "delete child: {del}");
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": child, "reason": "note-deleted" }),
+        "child trigger: {evt}"
+    );
+    assert_eq!(evt["data"]["readyTaskIds"], json!([parent]), "ready: {evt}");
+}
+
 /// End-to-end tree-relative `dependsOn` rejection (PROTOCOL.md §5.4,
 /// monorepo#1982) over WSS: a `dependsOn` edge naming a tree ancestor or
 /// descendant of the task — the permanent mutual readiness block — is

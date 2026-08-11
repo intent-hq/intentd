@@ -5556,7 +5556,9 @@ mod change_event_parity {
     /// recomputes + emits `task:ready-tasks-changed` with
     /// `triggeredBy: { noteId, reason: "note-deleted" }` — a dangling edge
     /// counts as unmet, so deleting a `complete` dep un-readies its
-    /// dependents. Deleting a task note nobody depends on emits no recompute.
+    /// dependents. Deleting a **ready** task itself also moves the set
+    /// (monorepo#2006), while a delete that provably cannot move it (a
+    /// terminal task nobody depends on) still emits no recompute.
     #[tokio::test]
     async fn deleting_depended_on_note_recomputes_ready_set() {
         let h = harness().await;
@@ -5574,19 +5576,38 @@ mod change_event_parity {
             mk("dep", TaskStatus::Complete, vec![], 0),
             mk("gated", TaskStatus::NotStarted, vec!["dep"], 1),
             mk("loner", TaskStatus::NotStarted, vec![], 2),
+            mk("done-loner", TaskStatus::Complete, vec![], 3),
         ] {
             h.store.insert_note(&n).await.expect("insert note");
         }
 
-        // Deleting `loner` (no dependents) → note:deleted only, no recompute.
+        // Deleting `done-loner` (terminal, no dependents, no children) cannot
+        // move the ready set → note:deleted only, no recompute.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("done-loner"), None)
+            .await
+            .expect("delete done-loner");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+
+        // Deleting `loner` (nobody depends on it, but it IS in the ready set)
+        // → its id silently leaving the set is announced (monorepo#2006).
         let mut sub = subscribe(&h);
         h.services
             .delete_note(h.ws.clone(), intent_core::NoteId::from("loner"), None)
             .await
             .expect("delete loner");
-        let events = drain_events(&mut sub).await;
-        assert_eq!(of_type(&events, "note:deleted").len(), 1);
-        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["gated"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "loner", "reason": "note-deleted" })
+        );
 
         // Deleting `dep` (complete, satisfied gated's edge) → the dangling
         // edge is unmet, so `gated` drops out of the ready set.
@@ -5603,6 +5624,65 @@ mod change_event_parity {
         assert_eq!(
             ev["data"]["triggeredBy"],
             json!({ "noteId": "dep", "reason": "note-deleted" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
+    }
+
+    /// monorepo#2006: deleting the last incomplete task child of a parent
+    /// satisfies the tree rule (all task children `complete`), so the parent
+    /// ENTERS the ready set — announced with the `note-deleted` trigger and
+    /// the parent present in `readyTaskIds`. Deleting a plain (non-task) note
+    /// never emits a recompute.
+    #[tokio::test]
+    async fn deleting_last_incomplete_child_readies_parent() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent", TaskStatus::NotStarted, None, 0),
+            mk("done-child", TaskStatus::Complete, Some("parent"), 1),
+            mk("open-child", TaskStatus::InProgress, Some("parent"), 2),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+        h.store
+            .insert_note(&note(&h.ws, "plain", "not a task"))
+            .await
+            .expect("insert plain note");
+
+        // Deleting a plain note → note:deleted only, no recompute.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("plain"), None)
+            .await
+            .expect("delete plain");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+
+        // Deleting `open-child` (the last incomplete child) both removes it
+        // from the ready set and readies `parent`.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("open-child"), None)
+            .await
+            .expect("delete open-child");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "open-child", "reason": "note-deleted" })
         );
         assert!(ev["data"]["computedAt"].is_string());
     }
