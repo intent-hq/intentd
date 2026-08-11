@@ -7899,6 +7899,133 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// intent-hq/monorepo#1897: a ready-to-send queue entry older than
+/// `STALE_QUEUE_ENTRY_AFTER_MS` on an agent that is not actively responding
+/// raises a `stale-queue-entry` stuck risk naming the agent and the oldest
+/// entry; fresh entries, actively-responding agents, and entries under edit
+/// stay silent.
+#[tokio::test]
+async fn diagnostics_flags_stale_undelivered_queue_entry() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Idle").await;
+
+    // Fresh entry on a non-running agent: below the age threshold, no risk.
+    svc.enqueue_message(&target, "old".into(), None, None, None, None, false);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics fresh");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "fresh entry must not be flagged: {result}"
+    );
+
+    // Backdate the first entry past the threshold and add a second fresh
+    // entry: the risk fires naming the agent and the stale entry only.
+    let entry_id = {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        q[0].queued_at = "2020-01-01T00:00:00Z".into();
+        q[0].id.clone()
+    };
+    svc.enqueue_message(&target, "fresh".into(), None, None, None, None, false);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics stale");
+    let risk = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+    assert_eq!(risk["agentId"], json!(target.0), "risk: {risk}");
+    assert_eq!(risk["entryId"], json!(entry_id), "risk: {risk}");
+    assert_eq!(risk["count"], json!(1), "risk: {risk}");
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "risk: {risk}"
+    );
+    let text = result["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    // An actively-responding (non-stale) agent legitimately holds its queue
+    // until the turn ends: no risk even with the old entry.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = now_iso();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark responding");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics responding");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "responding agent must not be flagged: {result}"
+    );
+
+    // A stale-responding agent is NOT actively draining — the risk returns.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = "2020-01-01T00:00:00Z".into();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark stale responding");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics stale responding");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .any(|r| r["type"] == json!("stale-queue-entry")),
+        "stale-responding agent must be flagged: {result}"
+    );
+
+    // An old entry under edit is intentionally held by the drain — with only
+    // it and a fresh entry ready, nothing is flagged.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        guard.get_mut(&target).expect("queue")[0].editing = true;
+    }
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics editing");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "editing entry must not be flagged: {result}"
+    );
+}
+
 /// monorepo#947: deleting a workspace drops its event subscriptions — the
 /// live registry entries (delivery tasks aborted) and the persisted rows —
 /// while subscriptions scoped to other workspaces survive.

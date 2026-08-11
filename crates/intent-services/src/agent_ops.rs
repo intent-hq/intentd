@@ -23,6 +23,15 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Age past which an undelivered ready-to-send queue entry on an agent that is
+/// not actively running counts as a `stale-queue-entry` stuck-risk in
+/// `agent.diagnostics` (intent-hq/monorepo#1897): during the monorepo#1791
+/// incident a settlement wake sat undelivered at position 0 for ~13 minutes on
+/// an idle agent while diagnostics reported zero stuck risks. Five minutes is
+/// comfortably past any normal drain latency (drains trigger in seconds) while
+/// catching a wedged queue well before the incident's timescale.
+const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -6631,6 +6640,10 @@ impl Services {
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
     /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// A queue whose ready-to-send entries have sat undelivered past
+    /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
+    /// responding raises a `stale-queue-entry` stuck-risk
+    /// (intent-hq/monorepo#1897).
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -7018,6 +7031,61 @@ impl Services {
                 }
                 stuck_risks.push(Value::Object(risk));
             }
+        }
+        // Stale undelivered queue entries (intent-hq/monorepo#1897): a
+        // ready-to-send entry older than [`STALE_QUEUE_ENTRY_AFTER_MS`] whose
+        // target agent is not actively responding should have drained long
+        // ago — surface it instead of leaving the wake invisible. Entries
+        // under edit are excluded (the drain skips them by design), as are
+        // entries whose `queuedAt` fails to parse. An actively-responding,
+        // non-stale agent legitimately holds its queue until the turn ends.
+        for q in &queues {
+            let aid = q["agentId"].as_str().unwrap_or_default();
+            let actively_responding = session_by_id.get(aid).is_some_and(|s| {
+                agent_status_wire(s.status) == Some("responding")
+                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+            });
+            if actively_responding {
+                continue;
+            }
+            let stale: Vec<(&str, i64)> = q["entries"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e["editing"].as_bool() != Some(true))
+                        .filter_map(|e| {
+                            let queued_at = e["queuedAt"].as_str()?;
+                            parse_iso(queued_at)?;
+                            let age = age_ms(now_ms, queued_at);
+                            if age > STALE_QUEUE_ENTRY_AFTER_MS {
+                                Some((e["id"].as_str().unwrap_or_default(), age))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
+                continue;
+            };
+            let status = session_by_id
+                .get(aid)
+                .and_then(|s| agent_status_wire(s.status))
+                .unwrap_or("unknown");
+            stuck_risks.push(json!({
+                "type": "stale-queue-entry",
+                "severity": "warning",
+                "message": format!(
+                    "Agent {aid} ({status}) has {} undelivered queued message(s); oldest entry {oldest_id} queued {oldest_age}ms ago",
+                    stale.len(),
+                ),
+                "agentId": aid,
+                "entryId": oldest_id,
+                "ageMs": oldest_age,
+                "count": stale.len(),
+            }));
         }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {
