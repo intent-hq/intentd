@@ -1619,12 +1619,15 @@ impl AgentManager {
                 rules_config = Some(TempConfigFile { path });
                 // Persist the assembled systemPrompt on the session so
                 // `agent.getSession` can return it without re-assembly.
-                let mut updated_session = session;
-                updated_session.system_prompt = Some(prompt);
+                // Narrow write (system_prompt only): persisting the session
+                // snapshot read at the top of this function through the
+                // full-row `update_agent_session` silently reverted a
+                // concurrent `agent.setModel` landing inside the spawn window,
+                // so the next turn never saw the switch (monorepo#1936).
                 if let Err(e) = self
                     .services
                     .store
-                    .update_agent_session(&workspace_id, &updated_session)
+                    .set_agent_session_system_prompt(&workspace_id, &agent_id, &prompt)
                     .await
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "failed to persist system_prompt on session");
