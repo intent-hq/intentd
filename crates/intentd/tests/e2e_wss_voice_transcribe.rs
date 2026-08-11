@@ -293,6 +293,7 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         cow_supported: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     fx.store.insert_workspace(&ws).await.expect("seed ws");
     id

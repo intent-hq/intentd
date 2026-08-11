@@ -254,6 +254,14 @@ pub struct Workspace {
     /// directory (remote / skip-isolation / chief).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<WorkspaceDiskUsage>,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.1): set on
+    /// `workspace.list` / `workspace.get` rows while a `workspace.delete`
+    /// grace window (`undoDelayMs > 0`) is running, so clients can render or
+    /// hide the row as they choose. Never persisted — a daemon restart drops
+    /// the pending deletion and the field disappears. Omitted (not `null`)
+    /// when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -352,6 +360,7 @@ pub fn chief_workspace() -> Workspace {
         cow_supported: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -2267,6 +2276,15 @@ pub struct AgentSession {
     /// the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.getSession` reads while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session. NOT persisted — the
+    /// service layer overlays it on read from the in-memory registry, and a
+    /// daemon restart drops the pending deletion (the session survives and
+    /// the field disappears). Omitted (not `null`) when no deletion is
+    /// pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2560,6 +2578,16 @@ pub struct AgentLite {
     /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.list` / `agent.get` rows while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session, so clients can render
+    /// or hide the row as they choose. Never persisted — overlaid by the
+    /// service projection from the in-memory registry (stays `None` in
+    /// [`AgentLite::from_session`], which has no runtime context); a daemon
+    /// restart drops the pending deletion and the field disappears. Omitted
+    /// (not `null`) when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
     pub metadata: AgentMetadata,
 }
 
@@ -2637,6 +2665,7 @@ impl AgentLite {
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
+            pending_delete_at: session.pending_delete_at,
             metadata,
         }
     }
@@ -3585,6 +3614,7 @@ mod tests {
             cow_supported: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -4140,6 +4170,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -4223,6 +4254,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -4302,6 +4334,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

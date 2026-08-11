@@ -82,6 +82,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -3212,6 +3213,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -4977,6 +4979,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     display_status: None,
                     checkout_mode: None,
                     disk_usage: None,
+                    pending_delete_at: None,
                 };
                 store.insert_workspace(&workspace).await
             })

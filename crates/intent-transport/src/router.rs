@@ -357,8 +357,33 @@ async fn dispatch(
         }
         "workspace.delete" => {
             let id = require_workspace_id(params)?;
-            api.delete_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            // Delete grace window (§5.1): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .schedule_workspace_delete(id, undo_delay_ms)
+                    .await
+                    .map_err(workspace_err)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                api.delete_workspace(id).await.map_err(workspace_err)?;
+                Ok(json!({ "success": true }))
+            }
+        }
+        "workspace.cancelDelete" => {
+            let id = require_workspace_id(params)?;
+            let cancelled = api
+                .cancel_workspace_delete(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "cancelled": cancelled }))
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
@@ -1576,11 +1601,37 @@ async fn dispatch(
         "agent.delete" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            let result = api
-                .agent_delete(agent_id, ws)
+            // Delete grace window (§5.5): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .agent_schedule_delete(agent_id, ws, undo_delay_ms)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                let result = api
+                    .agent_delete(agent_id, ws)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(result)
+            }
+        }
+        "agent.cancelDelete" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let cancelled = api
+                .agent_cancel_delete(agent_id, ws)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(result)
+            Ok(json!({ "cancelled": cancelled }))
         }
         "agent.retry" => {
             let agent_id = require_agent_id(params)?;
