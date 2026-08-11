@@ -52,33 +52,37 @@ impl PendingDeletes {
             .map(|p| p.delete_at.clone())
     }
 
-    /// Register a pending deletion. `spawn` receives the minted generation
-    /// token and must return the timer task that will present it to
-    /// [`PendingDeletes::claim`] at fire time. The spawn runs under the
-    /// registry lock, so a (pathologically fast) timer cannot observe the
-    /// map before its own entry is inserted. Any previously pending entry
-    /// for the same key is replaced and its timer aborted — callers enforce
-    /// the idempotent re-schedule by checking [`PendingDeletes::deadline`]
-    /// first.
+    /// Register a pending deletion unless one is already pending for `key`.
+    /// The idempotent re-schedule check runs under the registry lock, so
+    /// concurrent schedules for the same key cannot each arm a timer: the
+    /// loser observes the winner's entry and gets its deadline back as
+    /// `Some(existing)` without `spawn` ever running. `None` means the
+    /// entry was newly armed with the supplied `delete_at`. `spawn`
+    /// receives the minted generation token and must return the timer task
+    /// that will present it to [`PendingDeletes::claim`] at fire time; it
+    /// runs under the registry lock, so a (pathologically fast) timer
+    /// cannot observe the map before its own entry is inserted.
     pub(crate) fn schedule(
         &self,
         key: String,
         delete_at: String,
         spawn: impl FnOnce(u64) -> tokio::task::JoinHandle<()>,
-    ) {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+    ) -> Option<String> {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&key) {
+            return Some(existing.delete_at.clone());
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let handle = spawn(generation);
-        if let Some(prev) = map.insert(
+        map.insert(
             key,
             Pending {
                 delete_at,
                 generation,
                 handle,
             },
-        ) {
-            prev.handle.abort();
-        }
+        );
+        None
     }
 
     /// Timer-side claim at fire time: removes the entry only when it still

@@ -2862,45 +2862,48 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        // Idempotent re-schedule (§5.5): a window already running keeps its
-        // original deadline.
-        if let Some(existing) = self.pending_agent_deletes.deadline(agent_id.0.as_str()) {
-            return Ok(existing);
-        }
         let delay_ms = crate::delete_grace::clamp_undo_delay_ms(undo_delay_ms);
         let delete_at = intent_core::iso_ms_from_now(delay_ms);
         let key = agent_id.0.clone();
         let timer_services = self.clone();
         let timer_id = agent_id.clone();
         let timer_ws = session_ws.clone();
-        self.pending_agent_deletes
-            .schedule(key, delete_at.clone(), move |generation| {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    // Claim-or-abstain: only the timer that still owns the
-                    // entry commits. A cancel or an immediate delete that
-                    // raced ahead removed/superseded the entry — do nothing.
-                    if !timer_services
-                        .pending_agent_deletes
-                        .claim(timer_id.0.as_str(), generation)
-                    {
-                        return;
-                    }
-                    // Commit via the existing immediate-delete cascade (same
-                    // events). Best-effort: the caller is long gone, so a
-                    // failure is logged, not surfaced.
-                    if let Err(e) = timer_services
-                        .agent_delete_op(timer_id.clone(), Some(timer_ws))
-                        .await
-                    {
-                        tracing::warn!(
-                            agent = %timer_id.0,
-                            error = %e,
-                            "scheduled agent delete failed at commit"
-                        );
-                    }
+        // Idempotent re-schedule (§5.5): the registry arms the timer only
+        // when nothing is pending for this key — the check runs under the
+        // registry lock, so concurrent schedules converge on one deadline
+        // and only the arming call emits `agent:delete-scheduled`.
+        if let Some(existing) =
+            self.pending_agent_deletes
+                .schedule(key, delete_at.clone(), move |generation| {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        // Claim-or-abstain: only the timer that still owns the
+                        // entry commits. A cancel or an immediate delete that
+                        // raced ahead removed/superseded the entry — do nothing.
+                        if !timer_services
+                            .pending_agent_deletes
+                            .claim(timer_id.0.as_str(), generation)
+                        {
+                            return;
+                        }
+                        // Commit via the existing immediate-delete cascade (same
+                        // events). Best-effort: the caller is long gone, so a
+                        // failure is logged, not surfaced.
+                        if let Err(e) = timer_services
+                            .agent_delete_op(timer_id.clone(), Some(timer_ws))
+                            .await
+                        {
+                            tracing::warn!(
+                                agent = %timer_id.0,
+                                error = %e,
+                                "scheduled agent delete failed at commit"
+                            );
+                        }
+                    })
                 })
-            });
+        {
+            return Ok(existing);
+        }
         crate::publish_event(
             &self.event_bus,
             crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
@@ -2912,30 +2915,35 @@ impl Services {
     /// `agent.cancelDelete` (PROTOCOL §5.5): cancel a pending agent-session
     /// deletion. `true` when something was pending (emits
     /// `agent:delete-cancelled`), `false` otherwise (already committed, or
-    /// never scheduled) — the non-error, race-safe outcome.
+    /// never scheduled) — the non-error, race-safe outcome. A caller-declared
+    /// workspace mismatch is rejected as `NotFound` BEFORE touching the
+    /// registry, mirroring `agent_delete_op`/`agent_schedule_delete_op`, so
+    /// a stale or cross-workspace scoped cancel cannot remove another
+    /// workspace's pending deletion.
     pub(crate) async fn agent_cancel_delete_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<bool> {
+        let session_ws = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(summary) => summary.workspace_id,
+            // Row already gone: the deletion committed (or the session never
+            // existed) — nothing pending, the race-safe non-error outcome.
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if let Some(ws) = workspace_id.as_ref() {
+            if session_ws != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
         let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
         if cancelled {
-            // Workspace-scope the emit off the surviving row; fall back to
-            // the caller-declared workspace if the row read races the commit.
-            let session_ws = self
-                .store
-                .get_agent_session_summary(&agent_id)
-                .await
-                .ok()
-                .map(|s| s.workspace_id)
-                .or(workspace_id);
-            if let Some(ws) = session_ws {
-                crate::publish_event(
-                    &self.event_bus,
-                    crate::agent_delete_cancelled_event(&ws, &agent_id),
-                )
-                .await;
-            }
+            crate::publish_event(
+                &self.event_bus,
+                crate::agent_delete_cancelled_event(&session_ws, &agent_id),
+            )
+            .await;
         }
         Ok(cancelled)
     }

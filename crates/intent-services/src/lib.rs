@@ -12858,17 +12858,16 @@ impl WorkspaceApi for Services {
             // unknown workspace is the standard `NotFound` error, not a
             // timer that fails later.
             store.get_workspace(&id).await?;
-            // Idempotent re-schedule (§5.1): a window already running keeps
-            // its original deadline.
-            if let Some(existing) = services.pending_workspace_deletes.deadline(id.as_str()) {
-                return Ok(existing);
-            }
             let delay_ms = delete_grace::clamp_undo_delay_ms(undo_delay_ms);
             let delete_at = intent_core::iso_ms_from_now(delay_ms);
             let key = id.as_str().to_string();
             let timer_services = services.clone();
             let timer_id = id.clone();
-            services.pending_workspace_deletes.schedule(
+            // Idempotent re-schedule (§5.1): the registry arms the timer only
+            // when nothing is pending for this key — the check runs under the
+            // registry lock, so concurrent schedules converge on one deadline
+            // and only the arming call emits `workspace:delete-scheduled`.
+            if let Some(existing) = services.pending_workspace_deletes.schedule(
                 key,
                 delete_at.clone(),
                 move |generation| {
@@ -12896,7 +12895,9 @@ impl WorkspaceApi for Services {
                         }
                     })
                 },
-            );
+            ) {
+                return Ok(existing);
+            }
             publish_event(&bus, workspace_delete_scheduled_event(&id, &delete_at)).await;
             Ok(delete_at)
         })

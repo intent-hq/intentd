@@ -24475,6 +24475,37 @@ mod delete_grace_window {
             "cleanup"
         );
     }
+
+    /// Registry-level atomicity: the idempotent re-schedule check runs
+    /// under the registry lock — a second schedule for the same key returns
+    /// the existing deadline and never runs its spawn, so concurrent
+    /// schedules cannot arm competing timers.
+    #[tokio::test]
+    async fn registry_schedule_is_atomically_idempotent() {
+        let reg = crate::delete_grace::PendingDeletes::default();
+        let first = reg.schedule(
+            "k".to_string(),
+            "2026-01-01T00:00:00.000Z".to_string(),
+            |_| tokio::spawn(async {}),
+        );
+        assert_eq!(first, None, "first schedule arms the entry");
+        let second = reg.schedule(
+            "k".to_string(),
+            "2026-02-02T00:00:00.000Z".to_string(),
+            |_| panic!("spawn must not run while an entry is already pending"),
+        );
+        assert_eq!(
+            second.as_deref(),
+            Some("2026-01-01T00:00:00.000Z"),
+            "loser gets the winner's deadline back"
+        );
+        assert_eq!(
+            reg.deadline("k").as_deref(),
+            Some("2026-01-01T00:00:00.000Z"),
+            "original entry untouched"
+        );
+        assert!(reg.cancel("k"), "single pending entry");
+    }
 }
 
 /// Agent delete grace window (§5.5): `agent_schedule_delete_op` /
@@ -24913,6 +24944,41 @@ mod agent_delete_grace_window {
         assert!(
             !seen.iter().any(|e| e["type"] == "agent:delete-cancelled"),
             "supersession emits no per-agent cancel event: {seen:?}"
+        );
+    }
+
+    /// Scope guard: a caller-declared workspace mismatch on
+    /// `agent.cancelDelete` is rejected as `NotFound` BEFORE touching the
+    /// registry — the pending deletion survives and a correctly scoped
+    /// cancel still works afterward.
+    #[tokio::test]
+    async fn cross_workspace_cancel_is_not_found_and_keeps_window() {
+        let h = harness().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        assert!(matches!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), Some(WorkspaceId::new()))
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let got = h
+            .services
+            .agent_get_op(h.agent.clone(), None)
+            .await
+            .expect("get");
+        assert!(
+            got.pending_delete_at.is_some(),
+            "window survives the rejected cross-workspace cancel"
+        );
+        assert!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), Some(h.ws.clone()))
+                .await
+                .expect("scoped cancel"),
+            "correctly scoped cancel succeeds"
         );
     }
 }
