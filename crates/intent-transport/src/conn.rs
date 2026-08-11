@@ -31,9 +31,18 @@ use crate::router::{check_envelope, handle_message, EnvelopeCheck};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
-/// Capacity of each per-connection outbound frame lane (responses + pushed
-/// notifications are serialized through one writer so they never interleave).
-pub(crate) const OUTBOUND_CAPACITY: usize = 256;
+/// Capacity of the per-connection **priority** outbound lane (RPC responses,
+/// error frames, reverse-RPC requests). Deliberately larger than
+/// [`BULK_CAPACITY`]: a saturated bulk lane must not be able to starve
+/// latency-critical frames of queue headroom, so response/reverse-RPC bursts
+/// only feel backpressure after 4x the bulk depth.
+pub(crate) const PRIORITY_CAPACITY: usize = 1024;
+
+/// Capacity of the per-connection **bulk** outbound lane (`events.event`
+/// notifications, `subscription.push` frames). Kept small so a slow consumer
+/// applies backpressure to event forwarders early, while the priority lane
+/// stays open for responses.
+pub(crate) const BULK_CAPACITY: usize = 256;
 
 /// Per-connection outbound frame queue, split into two lanes:
 ///
@@ -138,11 +147,11 @@ impl OutboundReceiver {
     }
 }
 
-/// Build one connection's two-lane outbound queue
-/// ([`OUTBOUND_CAPACITY`] frames per lane).
+/// Build one connection's two-lane outbound queue ([`PRIORITY_CAPACITY`] /
+/// [`BULK_CAPACITY`] frames).
 pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
-    let (priority_tx, priority_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
-    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<String>(PRIORITY_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(BULK_CAPACITY);
     (
         OutboundSender {
             priority: priority_tx,
