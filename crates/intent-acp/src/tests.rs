@@ -5742,6 +5742,96 @@ mod workspace_api_tool_tests {
             );
         }
     }
+
+    // ---- sub-agent question gating (description / prelude / dispatch) ------
+
+    #[tokio::test]
+    async fn sub_agent_description_prunes_question_docs() {
+        // Layer (a): a sub-agent bridge must not advertise ws.app.question.*
+        // in its description (index entry and doc line both pruned), while
+        // the rest of the surface stays advertised.
+        let srv = server("amber-forest", None).with_sub_agent(true);
+        let resp = srv
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("ws.app.question."),
+            "sub-agent description still advertises ws.app.question.*"
+        );
+        assert!(
+            desc.contains("ws.note.read(") && desc.contains("ws.agent.requestDiscussion("),
+            "un-gated surface must stay advertised"
+        );
+
+        // A top-level bridge stays byte-identical to the static const.
+        let top = server("amber-forest", None).with_sub_agent(false);
+        let resp = top
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let desc = resp["result"]["tools"][0]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            crate::mcp_server::WORKSPACE_API_DESCRIPTION,
+            "top-level tools/list description must be byte-identical to the static const"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_prelude_omits_question_installer() {
+        // Layer (b): ws.app.question is not installed, so touching it fails
+        // with the clear namespace-missing TypeError; the rest of ws.app.*
+        // and the attention-request bindings stay installed.
+        let srv = server("amber-forest", None).with_sub_agent(true);
+        let resp = call_workspace_api(
+            &srv,
+            "return { q: typeof ws.app.question, w: typeof ws.app.workspaces, rd: typeof ws.agent.requestDiscussion };",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["q"], json!("undefined"));
+        assert_eq!(body["w"], json!("object"));
+        assert_eq!(body["rd"], json!("function"));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_dispatch_denies_question_ask_with_redirect() {
+        // Layer (c): a raw `host({...})` frame cannot bypass the pruned
+        // prelude — dispatch denies it with the top-level-only redirect
+        // error (NOT the misleading "disabled in settings").
+        let srv = server("amber-forest", None).with_sub_agent(true);
+        let resp = call_workspace_api(
+            &srv,
+            "return await host({ method: 'app.question.ask', args: { question: { header: 'h', question: 'q', options: [{label:'a'},{label:'b'}] } } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = tool_text(&resp);
+        assert!(
+            text.contains("only available to top-level agents")
+                && text.contains("ws.agent.requestDiscussion")
+                && text.contains("ws.agent.reportToParent"),
+            "expected top-level-only redirect denial, got: {text}"
+        );
+        assert!(
+            !text.contains("disabled in settings"),
+            "sub-agent denial must not masquerade as a settings gate: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_gate_leaves_other_namespaces_alone() {
+        // The sub-agent flag prunes ONLY ws.app.question.* — un-gated
+        // namespaces still dispatch on the same bridge.
+        let srv = server("amber-forest", Some("/tmp/amber-forest")).with_sub_agent(true);
+        let resp = call_workspace_api(&srv, "return await ws.workspace.info();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+        assert_eq!(body["id"], json!("amber-forest"));
+    }
 }
 
 /// WSAPI-3 per-namespace bindings: `ws.note.*`, `ws.task.*`, `ws.comment.*`,
@@ -7725,6 +7815,7 @@ mod wsapi4_bindings_tests {
                 sandbox_branch: None,
                 dismissed_questions_message_id: None,
                 last_seen_message_id: None,
+                is_initial_agent: None,
             },
         }
     }

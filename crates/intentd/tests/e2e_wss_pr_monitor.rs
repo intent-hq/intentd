@@ -225,6 +225,7 @@ impl SourceControl for StubForge {
         &self,
         _: &str,
         _: &str,
+        _: Option<&str>,
         _: PageParams,
     ) -> ScResult<Page<Branch>> {
         unsupported("list_remote_branches")
@@ -1022,6 +1023,109 @@ async fn active_monitor_promotes_display_status_over_wss() {
         row["displayStatus"],
         json!(demoted),
         "workspace.list settles at the demoted status: {row}"
+    );
+}
+
+/// `workspace.archive` over the wire cancels the workspace's ACTIVE PR
+/// monitors (intent-hq/monorepo#1828): the archive sweep persists the row as
+/// `cancelled`, emits `prMonitor:cancelled`, wakes the owner with an
+/// archive-specific notice, and the `workspace:displayStatus-changed`
+/// demotion fires so an archived workspace never serves `in_progress` off a
+/// stale monitor signal. The sweep runs on a detached tail after the archive
+/// RPC returns, so assertions ride the subscribed events.
+#[tokio::test]
+async fn archive_over_wss_cancels_active_monitors_and_demotes_display_status() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+
+    // Baseline read seeds the last-observed cache so the promotion below is
+    // a real transition that emits.
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle", "baseline: {got}");
+
+    // Subscriber registered BEFORE the transitions so we miss nothing.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["prMonitor:cancelled", "workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Registration (via the service surface the `ws.pr.monitor` binding
+    // calls) promotes the rollup.
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    assert_eq!(evt["data"]["displayStatus"], "in_progress", "{evt}");
+
+    // Archive over the wire — the FE path (PROTOCOL §5 `workspace.archive`).
+    let archived = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.archive",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(archived["workspace"]["archived"], true, "{archived}");
+
+    // The detached archive sweep cancels the monitor and demotes the rollup.
+    let evt = next_event(&mut sub, "prMonitor:cancelled").await;
+    assert_eq!(evt["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert_eq!(evt["data"]["state"], "cancelled");
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
+    let demoted = evt["data"]["displayStatus"].as_str().expect("status");
+    assert!(
+        demoted != "in_progress" && demoted != "needs_attention",
+        "the archive sweep demotes without raising attention: {evt}"
+    );
+
+    // Cancelled rows leave the list surface, and the owner learned why.
+    let listed = wss_rpc(
+        &mut rpc,
+        4,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(
+        listed,
+        json!({ "monitors": [] }),
+        "no active monitors survive the archive sweep"
+    );
+    assert!(
+        owner_messages(&fx).await.contains("workspace was archived"),
+        "the archive sweep notifies the owning agent"
+    );
+
+    // The archived workspace's read path settles off `in_progress`.
+    let got = wss_rpc(
+        &mut rpc,
+        5,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["archived"], true);
+    assert_eq!(
+        got["workspace"]["displayStatus"],
+        json!(demoted),
+        "workspace.get settles at the demoted status: {got}"
     );
 }
 

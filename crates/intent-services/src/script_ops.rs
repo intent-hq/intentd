@@ -379,10 +379,10 @@ impl ScriptManager {
                         let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                         if let Some(repo_scripts) = repo_config.scripts {
                             let now = now_iso();
-                            for repo_script in repo_scripts {
-                                let script_id = uuid::Uuid::new_v4().to_string();
-                                let script = Script {
-                                    id: script_id.clone(),
+                            let scripts: Vec<Script> = repo_scripts
+                                .into_iter()
+                                .map(|repo_script| Script {
+                                    id: uuid::Uuid::new_v4().to_string(),
                                     workspace_id: workspace_id.to_string(),
                                     name: repo_script.name,
                                     command: repo_script.command,
@@ -413,20 +413,27 @@ impl ScriptManager {
                                     auto_start: repo_script.auto_start,
                                     created_at: now.clone(),
                                     updated_at: None,
-                                };
-                                // Persist and register
-                                self.store.upsert_script(&script).await?;
-                                self.scripts.lock().unwrap().insert(
-                                    (workspace_id.clone(), script_id),
-                                    ManagedScript {
-                                        def: script,
-                                        state: ScriptRuntimeState::default(),
-                                        pty_id: None,
-                                        stopped_by_user: false,
-                                        supervisor: None,
-                                        generation: next_generation(),
-                                    },
-                                );
+                                })
+                                .collect();
+                            // Persist in one batched upsert — one INSERT per
+                            // script here tripped the per-dispatch statement
+                            // budget (intent-hq/monorepo#1778) — then register.
+                            self.store.upsert_scripts(&scripts).await?;
+                            {
+                                let mut guard = self.scripts.lock().unwrap();
+                                for script in scripts {
+                                    guard.insert(
+                                        (workspace_id.clone(), script.id.clone()),
+                                        ManagedScript {
+                                            def: script,
+                                            state: ScriptRuntimeState::default(),
+                                            pty_id: None,
+                                            stopped_by_user: false,
+                                            supervisor: None,
+                                            generation: next_generation(),
+                                        },
+                                    );
+                                }
                             }
                             // Re-read scripts after bootstrapping
                             let guard = self.scripts.lock().unwrap();

@@ -20,7 +20,8 @@
 //! the negative entry but still single-flights.
 //!
 //! The registry lists every provider with a daemon-side model source: auggie
-//! (rich CLI fetch), cortex (feature-code-gated static catalog), the
+//! (rich CLI fetch), cortex (empty catalog — the provider CLI owns model
+//! selection), the
 //! ACP-probe sources (claude-code/codex/pi/droid), the native-CLI sources
 //! (opencode, grok), and the HTTP-fetch source (unsloth) via
 //! [`crate::provider_models`].
@@ -88,31 +89,22 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// cortex source: feature-code-gated catalog. The gate is closed whenever
-/// the provider config demands an env var that is unset or a feature code
-/// (the daemon stores no feature-code enablement, so a configured code
-/// always gates — today's cortex config always takes this path); closed
-/// means an empty list + warning (mirroring the reference FE's
-/// default-deny). Cortex has no dynamic model discovery (and the static tier
-/// catalog is retired), so an open gate also serves an empty list — the
-/// provider CLI owns model selection.
+/// cortex source: registry-gated catalog. The gate is open by default —
+/// cortex's config demands no env var or feature code (un-gated,
+/// monorepo#1902) — but the check stays wired through
+/// [`intent_providers::gated_reason`] (the single gate shared with
+/// `providers.catalog` and discovery's `gatedOff`) so a future gating field
+/// re-closes it; closed means an empty list + warning (mirroring the
+/// reference FE's default-deny). Cortex has no dynamic model discovery (and
+/// the static tier catalog is retired), so an open gate also serves an empty
+/// list — the provider CLI owns model selection.
 fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         // A missing provider config is treated as gated (explicit default-deny),
         // not as an open gate.
         let gated = match intent_providers::find_provider("cortex") {
             None => Some("provider config missing".to_string()),
-            Some(cfg) => {
-                if let Some(var) = cfg
-                    .requires_env_var
-                    .filter(|v| std::env::var_os(v).is_none())
-                {
-                    Some(format!("requires env var {var}"))
-                } else {
-                    cfg.requires_feature_code
-                        .map(|code| format!("requires feature code {code}"))
-                }
-            }
+            Some(cfg) => intent_providers::gated_reason(cfg),
         };
         ModelFetchResult {
             models: Some(Vec::new()),

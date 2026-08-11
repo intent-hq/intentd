@@ -684,16 +684,18 @@ fn dismissal_metadata(dismissed_mid: &str) -> Value {
 ///    — spec §Decisions: interrupts are held too, no exceptions), and NO
 ///    user row reaches the asker's transcript. `agent:queue:updated` carries
 ///    the held snapshot in interrupt-first order.
-/// 3. The user sends an UNTAGGED message first: user origin is never held so
-///    it delivers immediately and drives a turn, but it carries no answer tag,
-///    so the persisted pending-questions marker survives it — the held entries
-///    are STILL parked after that turn ends (pendingness is not superseded by
-///    an unrelated user message or by the agent's own later turn).
+/// 3. The user sends an UNTAGGED message: user origin is never held, but with
+///    a parked backlog it converts to a user-origin enqueue + drain kick
+///    (monorepo#1791 — FIFO restore): the flush delivers the held entries and
+///    the user message in ONE combined turn, transcript order urgent
+///    (interrupt-first) → normal → plain, queue empty after. It carries no
+///    answer tag, so the persisted pending-questions marker SURVIVES the
+///    combined turn (pendingness is not superseded by an unrelated user
+///    message or by the agent's own later turn).
 /// 4. The user then answers via `agent.sendMessage`, tagged with
 ///    `messageMetadata { type: "question_answers", answeredQuestionsMessageId }`
-///    — the tag clears the marker so the hold flips false, and the queue
-///    drains interrupt-first: transcript order is plain → answer → urgent →
-///    normal, queue empty at the end.
+///    — the queue is already empty so the answer delivers directly, and the
+///    tag clears the marker so the hold flips false.
 #[tokio::test]
 async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let Some(script) = gate("WSS question-hold user-answer E2E") else {
@@ -868,10 +870,14 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
         "held messages must NOT reach the transcript while the hold is active: {messages:?}"
     );
 
-    // ---- (3) A plain user message delivers but does NOT release the hold ----
-    // User origin is never held, so it drives a turn; carrying no answer tag,
-    // the persisted pending-questions marker survives both it and the turn it
-    // starts, so the parked entries stay parked.
+    // ---- (3) A plain user message drains the parked backlog FIFO ----
+    // User origin is never held — and with a parked backlog the send
+    // converts to a user-origin enqueue + drain kick (monorepo#1791): the
+    // batch flush delivers the held entries and the user message in ONE
+    // combined turn (drain order: urgent interrupt-first → normal → plain),
+    // so newer user messages can no longer bypass an older parked wake.
+    // Carrying no answer tag, the persisted pending-questions marker
+    // survives the combined turn.
     let plain = wss_rpc(
         &mut rpc,
         "agent.sendMessage",
@@ -884,43 +890,66 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     .await;
     assert_eq!(plain["success"], true, "plain user send ok: {plain}");
     assert_eq!(
-        plain["queued"], false,
-        "user sends are NEVER held, tagged or not: {plain}"
+        plain["queued"], true,
+        "user send with a parked backlog converts to enqueue + flush: {plain}"
     );
     assert!(
         plain.get("heldForQuestions").is_none(),
         "user send bypasses the hold gate: {plain}"
     );
-    await_stream_end(&mut sub, &asker_id).await;
 
-    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
-    let queue = q["queue"].as_array().expect("queue array");
-    assert_eq!(
-        queue.len(),
-        2,
-        "held entries survive an untagged user message and its turn: {queue:?}"
-    );
-    let conv = wss_rpc(
-        &mut rpc,
-        "agent.getConversation",
-        json!({ "workspaceId": ws_id, "agentId": asker_id }),
-    )
+    // The combined flush turn delivers all three user rows.
+    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "combined flush drained", |m| {
+        user_row_index(m, PLAIN_USER_TEXT).is_some()
+            && user_row_index(m, HELD_NORMAL).is_some()
+            && user_row_index(m, HELD_URGENT).is_some()
+    })
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
+    let plain_idx = user_row_index(messages, PLAIN_USER_TEXT).expect("plain row");
+    let urgent_idx = user_row_index(messages, HELD_URGENT).expect("urgent row");
+    let normal_idx = user_row_index(messages, HELD_NORMAL).expect("normal row");
     assert!(
-        user_row_index(messages, PLAIN_USER_TEXT).is_some(),
-        "the plain user row DID reach the transcript: {messages:?}"
+        urgent_idx < normal_idx && normal_idx < plain_idx,
+        "drain order urgent (interrupt-first) -> normal -> plain (FIFO, \
+         monorepo#1791): urgent={urgent_idx} normal={normal_idx} plain={plain_idx}"
     );
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
     assert!(
-        user_row_index(messages, HELD_NORMAL).is_none()
-            && user_row_index(messages, HELD_URGENT).is_none(),
-        "held messages stay parked while the questions are still pending: {messages:?}"
+        q["queue"].as_array().expect("queue array").is_empty(),
+        "parked entries rode the user-led flush turn: {q}"
     );
 
-    // ---- (4) The user answer delivers immediately and releases the hold ----
+    // The hold survived the untagged combined turn: a LATER automatic send
+    // still parks.
+    let held_again = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": sender_id,
+            "content": format!("message the asker {SEND_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        held_again["success"], true,
+        "re-send kickoff ok: {held_again}"
+    );
+    await_stream_end(&mut sub, &sender_id).await;
+    let q = wss_rpc(&mut rpc, "agent.getQueue", json!({ "agentId": asker_id })).await;
+    assert_eq!(
+        q["queue"].as_array().expect("queue array").len(),
+        1,
+        "hold survives an untagged user message — later automatic sends still park: {q}"
+    );
+
+    // ---- (4) The user answer releases the hold and drains the backlog ----
     // The wizard tags the answer with `messageMetadata { type:
     // "question_answers", answeredQuestionsMessageId }` — the structured tag
-    // (never the text) is what resolves the persisted pending marker.
+    // (never the text) is what resolves the persisted pending marker. With
+    // the re-parked entry waiting, the answer also converts to enqueue +
+    // flush, delivering both in one combined turn.
     let answered = wss_rpc(
         &mut rpc,
         "agent.sendMessage",
@@ -936,26 +965,24 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     )
     .await;
     assert_eq!(answered["success"], true, "answer ok: {answered}");
-    assert_eq!(
-        answered["queued"], false,
-        "user answer is NEVER held — delivers immediately: {answered}"
+    assert!(
+        answered.get("heldForQuestions").is_none(),
+        "user answer is never held: {answered}"
     );
 
-    // The hold flips false at answer-turn end and the drain delivers both
-    // held entries (interrupt-first). Poll until both landed as user rows.
-    let conv = await_conversation(&mut rpc, &ws_id, &asker_id, "held messages drained", |m| {
-        user_row_index(m, HELD_NORMAL).is_some() && user_row_index(m, HELD_URGENT).is_some()
-    })
+    // The answer lands, the marker clears, and the queue fully drains.
+    let conv = await_conversation(
+        &mut rpc,
+        &ws_id,
+        &asker_id,
+        "answer + backlog drained",
+        |m| user_row_index(m, ANSWER_TEXT).is_some(),
+    )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
-    let plain_idx = user_row_index(messages, PLAIN_USER_TEXT).expect("plain row");
-    let answer_idx = user_row_index(messages, ANSWER_TEXT).expect("answer row");
-    let urgent_idx = user_row_index(messages, HELD_URGENT).expect("urgent row");
-    let normal_idx = user_row_index(messages, HELD_NORMAL).expect("normal row");
     assert!(
-        plain_idx < answer_idx && answer_idx < urgent_idx && urgent_idx < normal_idx,
-        "drain order plain -> answer -> urgent (interrupt-first) -> normal: \
-         plain={plain_idx} answer={answer_idx} urgent={urgent_idx} normal={normal_idx}"
+        user_row_index(messages, ANSWER_TEXT).is_some(),
+        "answer row landed: {messages:?}"
     );
 
     // Queue fully drained.

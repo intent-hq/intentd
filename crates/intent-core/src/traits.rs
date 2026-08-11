@@ -3403,14 +3403,18 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.branches.list`: a repository's remote branch names
     /// (`GET /repos/{owner}/{repo}/branches`) → `{ branches: string[], nextToken }`.
+    /// A non-empty `prefix` narrows the listing server-side to branch names
+    /// starting with it (`GET /git/matching-refs/heads/{prefix}`); absent or
+    /// blank keeps the unfiltered listing.
     fn github_branches_list(
         &self,
         owner: String,
         repo: String,
+        prefix: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, limit, next_token);
+        let _ = (owner, repo, prefix, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_branches_list not implemented".to_string(),
@@ -4099,6 +4103,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::system_capabilities not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `debug.sampleStacks`: capture a point-in-time sample of the daemon's
+    /// own thread stacks over a short window and return the rendered text
+    /// report — `{ report, durationMs, frequencyHz, sampleCount,
+    /// distinctStacks }` (PROTOCOL §5.43, monorepo#1755). Both params are
+    /// optional and clamped server-side (`durationMs` 100–10000, default
+    /// 1000; `frequencyHz` 1–250, default 99). Unix-only; other platforms
+    /// return `Error::Unsupported`. Daemon-global — no `workspaceId`.
+    fn debug_sample_stacks(
+        &self,
+        duration_ms: Option<i64>,
+        frequency_hz: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (duration_ms, frequency_hz);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::debug_sample_stacks not implemented".to_string(),
             ))
         })
     }
@@ -5211,6 +5235,32 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_stat not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.placeAttachment`: place an attachment payload into the
+    /// workspace's `.intent/attachments/` directory with a collision-safe
+    /// name and return `{ ok, path, fileName, size }` where `path` is
+    /// workspace-relative and `size` is the placed byte length
+    /// (PROTOCOL §5.9; intent-hq/monorepo#1948). Exactly one of `data`
+    /// (base64 payload, `data:` URL prefix tolerated) or `source_path`
+    /// (absolute host-local file to copy — the daemon and caller share the
+    /// host) must be provided; anything else is `Error::InvalidParams`
+    /// (→ `-32602`). The directory is covered by the default
+    /// `.intent/.gitignore`, so placed files never reach git tracking,
+    /// auto-commit, or attribution.
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_name, data, source_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_place_attachment not implemented".to_string(),
             ))
         })
     }

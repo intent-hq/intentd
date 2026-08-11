@@ -59,6 +59,7 @@ mod complete_ops;
 mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
+mod create_progress;
 mod discovery_cache;
 mod disk_usage;
 mod drafts;
@@ -106,6 +107,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+pub mod stack_sample;
 mod terminal_ops;
 pub mod tool_block;
 mod unsloth_server;
@@ -237,6 +239,12 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override for the remote URL base the
+    /// `github.branches.listCached` ls-remote fallback targets. Production
+    /// composition leaves this `None` (`https://github.com`); tests point it
+    /// at a `file://` directory of `<owner>/<repo>.git` fixtures so the
+    /// fallback path never touches the network.
+    branches_ls_remote_base: Option<String>,
     /// Test-only override for npx discovery on the one-shot ACP route
     /// (`agent.completeOnce` §5.32). Outer `None` (production) resolves via
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
@@ -675,6 +683,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            branches_ls_remote_base: None,
             one_shot_npx: None,
             auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
@@ -2365,6 +2374,15 @@ impl Services {
         self
     }
 
+    /// Override the remote URL base the `github.branches.listCached`
+    /// ls-remote fallback targets (production: `https://github.com`). Tests
+    /// point it at a `file://` directory of `<owner>/<repo>.git` fixtures so
+    /// the fallback path never touches the network.
+    pub fn with_branches_ls_remote_base(mut self, base: String) -> Self {
+        self.branches_ls_remote_base = Some(base);
+        self
+    }
+
     /// Pin npx discovery for the one-shot ACP route (`agent.completeOnce`
     /// §5.32). `None` simulates a host without npx — unreachable through the
     /// real `find_npx` on any machine with node installed — so the
@@ -3446,6 +3464,13 @@ impl Services {
         // the external-cancel call into this function) — or the PR monitor's
         // own poll loop wake — synthesizes the completion later.
         //
+        // monorepo#1945: bypassed when the session carries a non-empty
+        // persisted completionReport — the agent explicitly declared its
+        // completion, so the synthesized idle below (which stamps the
+        // report) must deliver despite the armed hooks/monitors, mirroring
+        // the live delivery pass's report bypass. A session-read failure
+        // reads as no report (conservative: defer as before).
+        //
         // monorepo#1483: hook/pr-monitor deferral is scoped to the agent's
         // settlement AS A CHILD (the synthesized watch delivery below); the
         // agent is queue-idle here (empty queue, no worker in flight), so its
@@ -3456,10 +3481,19 @@ impl Services {
         if !self.active_hooks_for_agent(child_id).await.is_empty()
             || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
         {
-            if let Some(gid) = self.seal_group_for_parent(child_id).await {
-                Box::pin(self.try_fire_group(&gid)).await;
+            let completion_reported = self
+                .store
+                .get_agent_session(child_id)
+                .await
+                .ok()
+                .and_then(|s| s.completion_report)
+                .is_some_and(|r| !r.is_empty());
+            if !completion_reported {
+                if let Some(gid) = self.seal_group_for_parent(child_id).await {
+                    Box::pin(self.try_fire_group(&gid)).await;
+                }
+                return;
             }
-            return;
         }
         // Consume the marker only after the guards pass; losing this take to
         // a concurrent mutation path means that path owns the redelivery.
@@ -3495,16 +3529,20 @@ impl Services {
             data["report"] = serde_json::Value::String(report);
         }
         // Idle-visibility: the synthesized idle carries the same
-        // `waitingOnHooks` stamp as a real `agent:idle` emit — always empty
-        // (omitted) here, since the active-hooks guard above deferred when
-        // any hook was still active; kept for shape parity with the live
-        // emit sites should a hook be scheduled in the window.
+        // `waitingOnHooks` stamp as a real `agent:idle` emit — empty
+        // (omitted) here unless the monorepo#1945 report bypass passed the
+        // active-hooks guard above (or a hook was scheduled in the window),
+        // matching the live emit sites' shape.
         self.annotate_waiting_on_hooks(child_id, &mut data).await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
-        // shape-parity stamp — always empty (omitted) here, since the
-        // active-pr-monitors guard above deferred when any monitor was still
-        // active.
+        // shape-parity stamp — empty (omitted) here unless the report bypass
+        // passed the active-pr-monitors guard above.
         self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+            .await;
+        // Archived-workspace suppression hint: same `workspaceArchived`
+        // stamp as the live idle emit sites (omitted when the workspace is
+        // not archived).
+        self.annotate_workspace_archived(&session.workspace_id, &mut data)
             .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -3662,6 +3700,22 @@ impl Services {
         // wake, but the window shrinks from emit→delivery to check→wake.)
         let queue_interim = event.event_type == AGENT_IDLE
             && (self.has_ready_to_send(child_id) || self.agent_is_busy(child_id.clone()));
+        // monorepo#1945: an `agent:idle` carrying a non-empty
+        // completionReport (stamped by every idle emit site from the
+        // session's persisted report, set exclusively by
+        // `agent.reportToParent`) is the child's EXPLICIT completion signal —
+        // it settles like a regular idle, bypassing the hook- and
+        // pr-monitor-waiting deferrals below. The still-armed monitor/hook is
+        // a courtesy watch, not pending work (the motivating case: "PR ready
+        // to merge — monitor stays armed for late comments", where the merge
+        // decision belongs to the parent the withheld wake was supposed to
+        // inform). Settlement never cancels the monitor/hook: a later fire
+        // still wakes the (settled) child normally. Aligns the live path
+        // with the rehydration `is_idle_and_genuinely_complete` predicate,
+        // which always required the report. Reports are cleared at each
+        // turn's start, so a stamp always reflects the turn that just ended.
+        let completion_reported =
+            event.event_type == AGENT_IDLE && event_completion_report(&event.data).is_some();
         // Idle-visibility deferral: probe the hook store LIVE (not the
         // emit-time `waitingOnHooks` stamp — a hook that settled between
         // emit and delivery must not defer). Probed even when the idle is
@@ -3669,6 +3723,7 @@ impl Services {
         // hook classification independently (an interim idle still records
         // for groups; a hook-waiting one must not).
         let hook_waiting = event.event_type == AGENT_IDLE
+            && !completion_reported
             && !self.active_hooks_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (unified external-wait, mirrors
         // `hook_waiting` exactly): an `agent:idle` for a child that owns
@@ -3677,6 +3732,7 @@ impl Services {
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
         let pr_monitor_waiting = event.event_type == AGENT_IDLE
+            && !completion_reported
             && !self.active_pr_monitors_for_agent(child_id).await.is_empty();
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
@@ -3750,7 +3806,12 @@ impl Services {
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
         // failures fail open (no annotation); the wake always proceeds.
-        let stall = if watches.is_empty() {
+        // monorepo#1898: an event payload carrying a report (copied from the
+        // session at emit time) means the child DID report — suppress the
+        // suspicion entirely (text AND `stallSuspected` metadata) even if the
+        // persisted report was cleared since, so the machine-readable flag
+        // can never contradict the rendered `Report:` clause.
+        let stall = if watches.is_empty() || event_carries_report(&event.data) {
             None
         } else {
             self.stall_suspicion_for_completion(child_id, &event.event_type)
@@ -8650,6 +8711,19 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .or_else(|| event.actor.id.clone())
 }
 
+/// Extract a non-empty completion report from `agent:idle` event data —
+/// `completionReport` (canonical), falling back to the legacy `report` key
+/// (the same dual-key contract as [`format_completion_wake`]). Present only
+/// when the child persisted a report via `agent.reportToParent` during the
+/// turn that just ended (reports are cleared at turn start), so it is the
+/// explicit-completion signal behind the monorepo#1945 deferral bypass.
+pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
 /// Snapshot classification one [`Services::deliver_completion_to_watches`]
 /// pass took for an `agent:idle` event (both flags are always `false` for
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
@@ -8835,6 +8909,19 @@ fn replace_uuid_tokens(text: &str) -> String {
     out
 }
 
+/// monorepo#1898: does this completion event's payload carry a non-empty
+/// completion report (`completionReport`, canonical, or the legacy `report`
+/// key)? The report is copied from the session at emit time, so a carrying
+/// event means the child DID report — used to suppress the stall suspicion
+/// (text and `stallSuspected` metadata) even when the persisted session
+/// report was cleared after emit.
+pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| !r.is_empty())
+}
+
 /// Build a concise, human-readable wake string describing a child agent's
 /// completion for its parent. A minimal port of the TS formatEventNotification
 /// intent: it names the child, the completion kind, and any completion
@@ -8863,6 +8950,7 @@ fn format_completion_wake(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = event
         .data
         .get("completionReport")
@@ -8871,6 +8959,7 @@ fn format_completion_wake(
         .filter(|s| !s.is_empty())
     {
         msg.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -8888,8 +8977,14 @@ fn format_completion_wake(
     if let Some(sandbox) = format_sandbox_outcome_suffix(&event.data) {
         msg.push_str(&sandbox);
     }
+    // monorepo#1898: the stall suspicion and the report can come from
+    // different session reads, so the tail is derived from what was actually
+    // rendered — a wake carrying a `Report:` clause never gets the
+    // contradictory "No completion report … may have stalled" suffix.
     if let Some(stall) = stall {
-        msg.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            msg.push_str(&stall.annotation_suffix());
+        }
     }
     msg
 }
@@ -8964,6 +9059,7 @@ pub(crate) fn format_group_child_line(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut line = format!("- {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = completion_report
         .or_else(|| {
             event
@@ -8975,6 +9071,7 @@ pub(crate) fn format_group_child_line(
         .filter(|r| !r.is_empty())
     {
         line.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -9015,8 +9112,13 @@ pub(crate) fn format_group_child_line(
             .unwrap_or("");
         line.push_str(&format!(" {verb}: {reason}"));
     }
+    // monorepo#1898: same consistency guard as `format_completion_wake` —
+    // never append the "No completion report" tail to a line that already
+    // rendered a `Report:` clause.
     if let Some(stall) = stall {
-        line.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            line.push_str(&stall.annotation_suffix());
+        }
     }
     line
 }
@@ -9060,9 +9162,10 @@ impl StallSuspicion {
 impl Services {
     /// Evaluate the monorepo#1016 stall predicate for a child completion:
     /// `agent:idle` AND no persisted completion report AND the session has an
-    /// assigned task note whose status is not complete/cancelled. Every store
-    /// failure fails OPEN (returns `None`) — annotation is best-effort and
-    /// must never block, delay, or drop a wake.
+    /// assigned task note whose status is not complete/cancelled/
+    /// review_required (monorepo#1898). Every store failure fails OPEN
+    /// (returns `None`) — annotation is best-effort and must never block,
+    /// delay, or drop a wake.
     pub(crate) async fn stall_suspicion_for_completion(
         &self,
         child_id: &AgentId,
@@ -9095,7 +9198,18 @@ impl Services {
             .await
             .ok()?;
         let task = note.metadata.task.as_ref()?;
-        if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+        // `review_required` is excluded alongside the terminal statuses
+        // (monorepo#1898): it is set by the child's explicit completion
+        // signal (`agent.reportToParent`'s TASK-B transition), so the child
+        // finished and awaits review — "may have stalled rather than
+        // finished" would contradict it. Incident shape (monorepo#1791): a
+        // child reports (task → review_required), a later turn clears the
+        // persisted report (`clear_completion_report_if_present`), and the
+        // final idle would otherwise get the self-contradictory stall tail.
+        if matches!(
+            task.status,
+            TaskStatus::Complete | TaskStatus::Cancelled | TaskStatus::ReviewRequired
+        ) {
             return None;
         }
         let task_status = serde_json::to_value(task.status)
@@ -10066,6 +10180,14 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn debug_sample_stacks(
+        &self,
+        duration_ms: Option<i64>,
+        frequency_hz: Option<i64>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { stack_sample::sample_stacks(duration_ms, frequency_hz).await })
+    }
+
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
     }
@@ -10885,6 +11007,63 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let decoded;
+            let source = match (&data, &source_path) {
+                (Some(b64), None) => {
+                    let payload = note_ops::strip_data_url_prefix(b64);
+                    decoded = base64::engine::general_purpose::STANDARD
+                        .decode(payload.trim())
+                        .map_err(|e| {
+                            Error::InvalidParams(format!("invalid base64 attachment data: {e}"))
+                        })?;
+                    file_ops::AttachmentSource::Bytes(&decoded)
+                }
+                (None, Some(src)) => {
+                    // Same-host FE fast path: copy a host-local file without
+                    // routing its bytes through the wire (streamed by
+                    // `fs::copy`, never buffered — the file may exceed the
+                    // transport cap by design). Absolute paths only — a
+                    // relative path would silently resolve against the
+                    // daemon's CWD.
+                    if !std::path::Path::new(src).is_absolute() {
+                        return Err(Error::InvalidParams(format!(
+                            "sourcePath must be absolute: {src}"
+                        )));
+                    }
+                    file_ops::AttachmentSource::CopyFrom(std::path::Path::new(src))
+                }
+                _ => {
+                    return Err(Error::InvalidParams(
+                        "exactly one of data or sourcePath is required".to_string(),
+                    ))
+                }
+            };
+            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            if root.is_empty() {
+                return Err(Error::Internal(
+                    "workspace has no resolved filesystem root".to_string(),
+                ));
+            }
+            // The exclusion contract (monorepo#1948) rides on the default
+            // `.intent/.gitignore` (ignore everything except config.json), so
+            // make sure the directory + gitignore exist before placing.
+            // `place_attachment` additionally drops an ignore-all `.gitignore`
+            // inside `attachments/` to cover repos with a customized
+            // `.intent/.gitignore`.
+            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
+            file_ops::place_attachment(&root, &file_name, source)
+        })
+    }
+
     fn primitive_add_reference(
         &self,
         workspace_id: WorkspaceId,
@@ -11426,6 +11605,29 @@ impl WorkspaceApi for Services {
 
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
+            // Unified provisioning progress (PROTOCOL §5.1): when the request
+            // carries a `progressId`, the closure below stashes its reporter
+            // here so the wrapper can emit the exactly-one terminal
+            // `git:clone:done` for every outcome — success or failure, in
+            // every checkout mode. Stays empty on idempotent replays (the
+            // closure never runs) and for requests without a `progressId`.
+            let progress_slot: std::sync::Arc<
+                std::sync::Mutex<Option<std::sync::Arc<create_progress::CreateProgress>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let progress_slot_op = progress_slot.clone();
+            // Kept at the wrapper so a failure BEFORE the closure arms the
+            // slot (idempotency-store read/decode error, or an early config
+            // error inside the closure such as an invalid
+            // `workspace.worktreesLocation`) still gets its terminal
+            // `ok:false` done below — no workspace id exists yet on those
+            // paths, so that frame publishes under the empty sentinel id.
+            let wrapper_progress_id = input
+                .progress_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let wrapper_bus = bus.clone();
             let result = with_idempotency(
                 &store,
                 "",
@@ -11471,6 +11673,19 @@ impl WorkspaceApi for Services {
                     if let Some(p) = input.clone_path.as_deref() {
                         input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
+                    // Unified provisioning progress (PROTOCOL §5.1): a
+                    // client-supplied `progressId` arms a per-create reporter
+                    // that echoes the id on every `git:clone:*` frame,
+                    // normalizes percent to one non-decreasing 0–100 scale
+                    // across all provisioning modes, and hands terminal-done
+                    // ownership to the wrapper around this closure. Absent
+                    // (or with no bus wired) every event path stays legacy.
+                    let progress_id = input
+                        .progress_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
@@ -11484,6 +11699,21 @@ impl WorkspaceApi for Services {
                     // directory reflects intent and deleted ids are never
                     // recycled.
                     let id = derive_workspace_id(&store, &input, &workspaces_root).await;
+                    let progress = progress_id.and_then(|pid| {
+                        bus.clone().map(|b| {
+                            std::sync::Arc::new(create_progress::CreateProgress::new(
+                                b,
+                                id.clone(),
+                                pid,
+                            ))
+                        })
+                    });
+                    if let Some(reporter) = progress.clone() {
+                        *progress_slot_op.lock().unwrap() = Some(reporter.clone());
+                        reporter
+                            .milestone("starting", 0, "Preparing workspace...")
+                            .await;
+                    }
                     // Clone orchestration (PROTOCOL §5.1): when `githubUrl` is
                     // set and `repositoryPath` is not already a local git
                     // repo, clone it *before* branch naming so the branch
@@ -11565,34 +11795,82 @@ impl WorkspaceApi for Services {
                                 // a terminal done. Checkout provisioning
                                 // below is local-only, matching the legacy
                                 // flow where worktree provisioning runs
-                                // after `git:clone:done`.
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::progress_event(
-                                        &id,
-                                        &request_id,
-                                        "starting",
-                                        0,
-                                        "Preparing repository cache...",
-                                    ),
-                                )
-                                .await;
+                                // after `git:clone:done`. With a reporter
+                                // armed the frames route through it instead
+                                // (new `cache` phase, unified percent, no
+                                // terminal frames here — the wrapper owns
+                                // the exactly-one done).
+                                match progress.as_deref() {
+                                    Some(reporter) => {
+                                        reporter
+                                            .milestone(
+                                                "cache",
+                                                5,
+                                                "Preparing repository cache...",
+                                            )
+                                            .await;
+                                    }
+                                    None => {
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::progress_event(
+                                                &id,
+                                                &request_id,
+                                                "starting",
+                                                0,
+                                                "Preparing repository cache...",
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 let token = github_git_token_for_url(
                                     services.settings_registry.as_deref(),
                                     url,
                                 )
                                 .await;
                                 let cache_root = workspaces_root.join(".repo-cache");
-                                let cache_path = match intent_git::repo_cache::ensure_cached_repo(
-                                    &cache_root,
-                                    url,
-                                    &owner,
-                                    &name,
-                                    token.as_deref(),
-                                )
-                                .await
-                                {
+                                // Real streaming progress for the ensure: the
+                                // callback forwards raw git output to a pump
+                                // task that parses it (submodule-aware) and
+                                // reports on the unified scale. Await the pump
+                                // after the ensure so buffered frames flush
+                                // before the "cache ready" milestone.
+                                let (ensure_progress, ensure_pump) = match progress.clone() {
+                                    Some(reporter) => {
+                                        let (cb, pump) =
+                                            create_progress::cache_ensure_reporter(reporter);
+                                        (Some(cb), Some(pump))
+                                    }
+                                    None => (None, None),
+                                };
+                                let ensure_result =
+                                    intent_git::repo_cache::ensure_cached_repo_with_progress(
+                                        &cache_root,
+                                        url,
+                                        &owner,
+                                        &name,
+                                        token.as_deref(),
+                                        ensure_progress,
+                                    )
+                                    .await;
+                                if let Some(pump) = ensure_pump {
+                                    // Bounded: on the ensure's timeout path a
+                                    // lingering grandchild (e.g.
+                                    // git-remote-https) can hold the pipe —
+                                    // and thus a callback clone — open
+                                    // indefinitely; don't let it delay error
+                                    // surfacing (buffered frames only matter
+                                    // cosmetically there).
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        pump,
+                                    )
+                                    .await;
+                                }
+                                let cache_path = match ensure_result {
                                     Ok(path) => path,
                                     Err(e) => {
                                         // Legacy-clone parity: redact any
@@ -11610,42 +11888,69 @@ impl WorkspaceApi for Services {
                                         let error_code = (category
                                             != intent_core::CloneErrorCategory::Other)
                                             .then_some(category);
-                                        clone_ops::publish(
-                                            &bus_ref,
-                                            &id,
-                                            clone_ops::done_event(
+                                        // Reporter-armed creates defer the
+                                        // terminal done to the wrapper (which
+                                        // sees this same CloneFailed error).
+                                        if progress.is_none() {
+                                            clone_ops::publish(
+                                                &bus_ref,
                                                 &id,
-                                                &request_id,
-                                                false,
-                                                Some(&detail),
-                                                error_code,
-                                            ),
-                                        )
-                                        .await;
+                                                clone_ops::done_event(
+                                                    &id,
+                                                    &request_id,
+                                                    false,
+                                                    Some(&detail),
+                                                    error_code,
+                                                    None,
+                                                ),
+                                            )
+                                            .await;
+                                        }
                                         return Err(Error::CloneFailed {
                                             category,
                                             detail,
                                         });
                                     }
                                 };
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::progress_event(
-                                        &id,
-                                        &request_id,
-                                        "checkout",
-                                        90,
-                                        "Repository cache ready",
-                                    ),
-                                )
-                                .await;
-                                clone_ops::publish(
-                                    &bus_ref,
-                                    &id,
-                                    clone_ops::done_event(&id, &request_id, true, None, None),
-                                )
-                                .await;
+                                match progress.as_deref() {
+                                    Some(reporter) => {
+                                        reporter
+                                            .milestone(
+                                                "cache",
+                                                create_progress::CLONE_SEGMENT_END,
+                                                "Repository cache ready",
+                                            )
+                                            .await;
+                                    }
+                                    None => {
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::progress_event(
+                                                &id,
+                                                &request_id,
+                                                "checkout",
+                                                90,
+                                                "Repository cache ready",
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                        clone_ops::publish(
+                                            &bus_ref,
+                                            &id,
+                                            clone_ops::done_event(
+                                                &id,
+                                                &request_id,
+                                                true,
+                                                None,
+                                                None,
+                                                None,
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -11722,6 +12027,11 @@ impl WorkspaceApi for Services {
                                 target_path: target.clone(),
                                 token,
                                 bus: bus_ref,
+                                progress: progress.clone(),
+                                // Workspace checkouts should land with
+                                // populated submodules, like the cache
+                                // hydration path (decision 2026-08-10).
+                                recurse_submodules: true,
                             })
                             .await
                             .map_err(|failure| Error::CloneFailed {
@@ -11916,16 +12226,16 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    // Setup script write (§5.25 repo-config sole source of truth):
-                    // when an explicit non-empty `setupScript` is provided, write it
-                    // into the repo config; otherwise leave the repo config alone
-                    // (the existing `setupScript` key, if any, remains readable).
-                    // The workspace DB row's `setup_script` column is retired from
-                    // the write path — it stays NULL (wire compat) and the read path
-                    // (§5.25) routes through the repo config with a legacy fallback.
-                    // Stash explicit setupScript for write AFTER worktree provisioning
-                    // (must land in the workspace's worktree, not the repo root, to be
-                    // visible as a committable change in the workspace).
+                    // Setup script param is execute-only (§5.1): an explicit
+                    // non-empty `setupScript` executes as supplied for this create
+                    // (taking precedence over the committed repo-config script) but
+                    // is never persisted — no repo-config merge-write, no DB
+                    // `setup_script` write. Explicit persistence stays with
+                    // `workspace.saveSetupScript` / `repoConfig.*`. The workspace
+                    // DB row's `setup_script` column stays NULL (wire compat) and
+                    // the read path (§5.25) routes through the repo config with a
+                    // legacy fallback. Stash the explicit script for the execution
+                    // spawn AFTER worktree provisioning.
                     let explicit_setup_script = input.setup_script.clone().filter(|s| !s.is_empty());
                     let mut ws = Workspace {
                         id,
@@ -12072,17 +12382,63 @@ impl WorkspaceApi for Services {
                                     intent_core::CheckoutMode::Direct
                                 }
                             };
+                            // Provisioning milestone on the unified scale
+                            // (85–100 segment): the copy/checkout is the
+                            // slow local step between the cache ensure and
+                            // the row insert.
+                            if let Some(reporter) = progress.as_deref() {
+                                match mode {
+                                    intent_core::CheckoutMode::Cow => {
+                                        reporter
+                                            .milestone("cow-copy", 88, "Copying repository...")
+                                            .await
+                                    }
+                                    _ => {
+                                        reporter
+                                            .milestone(
+                                                "checkout",
+                                                88,
+                                                "Checking out repository...",
+                                            )
+                                            .await
+                                    }
+                                }
+                            }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
+                            let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
                                 let url = hydration_url.clone();
+                                let progress = provision_progress.clone();
                                 async move {
                                     let lock_cache = cache.clone();
-                                    intent_git::repo_cache::with_cache_lock_blocking(
+                                    // Direct hydration streams its submodule
+                                    // population through the reporter (the
+                                    // update's `--progress` output, mapped
+                                    // into the provisioning tail); the pump
+                                    // is awaited after the blocking work so
+                                    // buffered frames flush in order.
+                                    let (sub_chunk, sub_pump) = match (
+                                        mode,
+                                        progress,
+                                    ) {
+                                        (
+                                            intent_core::CheckoutMode::Direct,
+                                            Some(reporter),
+                                        ) => {
+                                            let (cb, pump) =
+                                                create_progress::submodule_hydration_reporter(
+                                                    reporter,
+                                                );
+                                            (Some(cb), Some(pump))
+                                        }
+                                        _ => (None, None),
+                                    };
+                                    let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
                                         move || match mode {
                                             intent_core::CheckoutMode::Cow => {
@@ -12114,12 +12470,13 @@ impl WorkspaceApi for Services {
                                                 Ok(sha)
                                             }
                                             intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout(
+                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
                                                     &cache,
                                                     &checkout,
                                                     &url,
                                                     &branch,
                                                     base_ref.as_deref(),
+                                                    sub_chunk,
                                                 )
                                             }
                                             intent_core::CheckoutMode::Worktree => {
@@ -12130,7 +12487,18 @@ impl WorkspaceApi for Services {
                                             }
                                         },
                                     )
-                                    .await
+                                    .await;
+                                    if let Some(pump) = sub_pump {
+                                        // Bounded for the same reason as the
+                                        // ensure pump: a lingering grandchild
+                                        // can hold the callback open.
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            pump,
+                                        )
+                                        .await;
+                                    }
+                                    result
                                 }
                             };
                             let sha = match provision(mode).await {
@@ -12185,6 +12553,18 @@ impl WorkspaceApi for Services {
                                 && !has_worktree
                                 && repo_dir.join(".git").exists()
                             {
+                                // Direct-mode milestone (unified scale): the
+                                // branch checkout is the only provisioning
+                                // step on this fast path.
+                                if let Some(reporter) = progress.as_deref() {
+                                    reporter
+                                        .milestone(
+                                            "checkout",
+                                            50,
+                                            "Checking out workspace branch...",
+                                        )
+                                        .await;
+                                }
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
                                 let repo = repo_dir.clone();
@@ -12359,6 +12739,34 @@ impl WorkspaceApi for Services {
                                 } else {
                                     intent_core::CheckoutMode::Worktree
                                 };
+                                // Local-repo provisioning milestone (unified
+                                // scale): the CoW copy / worktree add is the
+                                // dominant step of a local create, so it sits
+                                // mid-scale (no clone segment ran before it;
+                                // after a network clone the monotonic clamp
+                                // lifts it to the 85+ tail automatically).
+                                if let Some(reporter) = progress.as_deref() {
+                                    match mode {
+                                        intent_core::CheckoutMode::Cow => {
+                                            reporter
+                                                .milestone(
+                                                    "cow-copy",
+                                                    30,
+                                                    "Copying repository (CoW)...",
+                                                )
+                                                .await
+                                        }
+                                        _ => {
+                                            reporter
+                                                .milestone(
+                                                    "worktree",
+                                                    30,
+                                                    "Creating linked worktree...",
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
                                 let provision = |mode: intent_core::CheckoutMode| {
                                     let name = name.clone();
                                     let branch = branch.clone();
@@ -12555,6 +12963,15 @@ impl WorkspaceApi for Services {
                             }
                         }
                     }
+                    // Provisioning is done in every mode; the remaining work
+                    // (row insert, spec seed, initial agent) is fast local
+                    // bookkeeping — the unified scale's last milestone before
+                    // the wrapper's terminal `complete 100` + done.
+                    if let Some(reporter) = progress.as_deref() {
+                        reporter
+                            .milestone("finalizing", 95, "Finalizing workspace...")
+                            .await;
+                    }
                     // Mirror-at-creation (spec Diagnosis §3b): persist the
                     // global `git.autoCommit` as the workspace's own override
                     // in the same INSERT so later global changes don't
@@ -12563,41 +12980,6 @@ impl WorkspaceApi for Services {
                     store
                         .insert_workspace_with_auto_commit(&ws, Some(global_auto_commit))
                         .await?;
-                    // Write explicit setupScript to the workspace's worktree (AFTER provisioning
-                    // so git_ops::worktree_path resolves correctly). Must land as a committable
-                    // change in the workspace, visible in the workspace's diff view.
-                    // Best-effort — a failure warns and continues (matches post-insert pattern
-                    // for other filesystem operations like .workspace/workspace.json).
-                    if let Some(explicit) = explicit_setup_script {
-                        // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
-                        // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
-                        match git_ops::worktree_path(&ws) {
-                            Some(repo_path) => {
-                                let mut repo_config =
-                                    crate::repo_config::read_repo_config(&repo_path).await;
-                                // Only write if the script differs (no-op when identical).
-                                if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
-                                    repo_config.setup_script = Some(explicit.clone());
-                                    if let Err(e) =
-                                        crate::repo_config::write_repo_config(&repo_path, repo_config)
-                                            .await
-                                    {
-                                        tracing::warn!(
-                                            workspace = %ws.id.as_str(),
-                                            error = %e,
-                                            "workspace.create: failed to write explicit setupScript to repo config"
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                tracing::warn!(
-                                    workspace = %ws.id.as_str(),
-                                    "workspace.create: cannot persist setupScript; worktreePath and repositoryPath both empty"
-                                );
-                            }
-                        }
-                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -12680,10 +13062,10 @@ impl WorkspaceApi for Services {
                         // `instruction-service.ts` prompt-cache `':initial'`
                         // suffix, `agent-persistence.ts`) uses to classify the
                         // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON — the strict
-                        // `AgentLite.metadata` projection does not surface them
-                        // yet (future work if the daemon-only wire path grows
-                        // a consumer). The caller's metadata object is
+                        // the raw `AgentSession.metadata` JSON; the strict
+                        // `AgentLite.metadata` projection surfaces
+                        // `isInitialAgent` (presence-detected, `true`-only —
+                        // PROTOCOL §5.5). The caller's metadata object is
                         // forwarded as-is; like agent.create, only the
                         // harvested gap fields persist today (P2-12a) —
                         // `behaviorPrompt` has no session column and the
@@ -12803,8 +13185,9 @@ impl WorkspaceApi for Services {
                         initial_agent = created.get("agent").cloned();
                     }
                     // Execute the workspace setup script (fire-and-forget): after worktree
-                    // provisioning and repo-config write, read the effective setup script
-                    // (explicit request param > repo config) and run it in a "Setup" terminal.
+                    // provisioning, resolve the effective setup script (explicit request
+                    // param > repo config > legacy DB row) and run it in a "Setup" terminal.
+                    // The explicit param is execute-only — it is never persisted (§5.1).
                     // Execution is non-blocking (tokio::spawn) and must never fail the create.
                     // Skipped when skipWorktree or no worktree was provisioned.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
@@ -12831,22 +13214,26 @@ impl WorkspaceApi for Services {
                         let legacy_script = ws.setup_script.clone();
                         let worktree_for_read = worktree_path_buf.clone();
                         tokio::spawn(async move {
-                            // Read effective setup script (repo config with legacy DB fallback).
-                            let repo_config =
-                                crate::repo_config::read_repo_config(&worktree_for_read).await;
-                            let effective_script = repo_config
-                                .setup_script
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    legacy_script.as_ref().and_then(|ss| {
-                                        let script = ss.script.trim();
-                                        if script.is_empty() {
-                                            None
-                                        } else {
-                                            Some(script.to_string())
-                                        }
-                                    })
-                                });
+                            // Resolve the effective setup script: the explicit param wins
+                            // for this create; an omitted param falls back to the
+                            // worktree-first repo-config read, then the legacy DB row.
+                            let effective_script = match explicit_setup_script {
+                                Some(explicit) => Some(explicit),
+                                None => crate::repo_config::read_repo_config(&worktree_for_read)
+                                    .await
+                                    .setup_script
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        legacy_script.as_ref().and_then(|ss| {
+                                            let script = ss.script.trim();
+                                            if script.is_empty() {
+                                                None
+                                            } else {
+                                                Some(script.to_string())
+                                            }
+                                        })
+                                    }),
+                            };
                             let script = match effective_script {
                                 Some(s) => s,
                                 None => return, // No script to execute
@@ -13015,6 +13402,45 @@ impl WorkspaceApi for Services {
                 },
             )
             .await;
+
+            // Terminal frame ownership (PROTOCOL §5.1): when the create armed
+            // a progress reporter, exactly one `git:clone:done` is emitted
+            // here — `ok:true` after any successful create, `ok:false`
+            // carrying the sanitized detail (+ machine-readable category for
+            // classified clone failures) on any error, in every checkout
+            // mode. The slot stays empty on idempotent replays (the closure
+            // never runs; nothing is emitted — the cached success result is
+            // the answer) and on `progressId`-less requests. A FAILURE that
+            // never armed the slot (idempotency-store read/decode error, or
+            // an early config error such as an invalid
+            // `workspace.worktreesLocation`) synthesizes a sentinel-scoped
+            // reporter so a `progressId` create's error path always closes
+            // the stream with its `ok:false` done.
+            let mut reporter = progress_slot.lock().unwrap().take();
+            if reporter.is_none() && result.is_err() {
+                if let (Some(pid), Some(b)) = (&wrapper_progress_id, &wrapper_bus) {
+                    reporter = Some(std::sync::Arc::new(create_progress::CreateProgress::new(
+                        b.clone(),
+                        WorkspaceId::from_string(String::new()),
+                        pid.clone(),
+                    )));
+                }
+            }
+            if let Some(reporter) = reporter {
+                match &result {
+                    Ok(_) => reporter.done_ok().await,
+                    Err(Error::CloneFailed { category, detail }) => {
+                        let error_code = (*category != intent_core::CloneErrorCategory::Other)
+                            .then_some(*category);
+                        reporter.done_err(detail, error_code).await;
+                    }
+                    Err(e) => {
+                        reporter
+                            .done_err(&clone_ops::redact_credentials(&e.to_string()), None)
+                            .await;
+                    }
+                }
+            }
 
             // Log workspace.create failures at WARN so they are diagnosable
             // (STAB-68: iOS saw -32603 with no daemon-side log evidence).
@@ -13758,6 +14184,14 @@ impl WorkspaceApi for Services {
                 // turn spawned) — the same reason the interrupt sweep above
                 // runs post-persist.
                 this.cancel_workspace_hooks(&id).await;
+                // Cancel every ACTIVE PR monitor the same way
+                // (intent-hq/monorepo#1828): state persisted to `cancelled`,
+                // `prMonitor:cancelled` emitted, owner woken with a notice
+                // that parks behind the same archived gate. Unarchive does
+                // NOT resurrect cancelled monitors. Without this sweep an
+                // archived workspace's displayStatus rollup reads
+                // `in_progress` indefinitely off the active-monitor signal.
+                this.cancel_workspace_pr_monitors(&id).await;
                 // Derive `lastActivity` (§9.1) so archive callers get the
                 // authoritative wire shape without a follow-up `workspace.get`,
                 // and persist it through the scoped monotonic write
@@ -18095,6 +18529,10 @@ impl WorkspaceApi for Services {
                     target_path: spawn_target,
                     token,
                     bus,
+                    progress: None,
+                    // Standalone `git.clone` keeps its historical plain
+                    // (non-recursive) clone.
+                    recurse_submodules: false,
                 });
             });
             Ok(serde_json::json!({
@@ -20611,6 +21049,7 @@ impl WorkspaceApi for Services {
         &self,
         owner: String,
         repo: String,
+        prefix: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -20618,11 +21057,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
+            // A blank/whitespace `prefix` keeps the unfiltered listing
+            // (parity with the trimmed, blanks-dropped search queries).
+            let prefix = prefix
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty());
             let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_remote_branches(
                     &owner,
                     &repo,
+                    prefix.as_deref(),
                     intent_sourcecontrol::PageParams { limit, cursor },
                 )
                 .await
@@ -20647,12 +21092,15 @@ impl WorkspaceApi for Services {
             .configured_worktrees_location()
             .or_else(|| self.workspaces_root.clone())
             .unwrap_or_else(default_workspaces_root);
+        let registry = self.settings_registry.clone();
+        let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
             let cache_root = cache_parent.join(".repo-cache");
             match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
                 Some(cached) => {
                     let mut result = serde_json::json!({
                         "cached": true,
+                        "source": "cache",
                         "branches": cached.branches,
                     });
                     // `defaultBranch` is optional on the wire: omitted (not
@@ -20662,10 +21110,41 @@ impl WorkspaceApi for Services {
                     }
                     Ok(result)
                 }
-                None => Ok(serde_json::json!({
-                    "cached": false,
-                    "branches": [],
-                })),
+                // Cold cache: fall back to one `git ls-remote` against the
+                // GitHub remote (monorepo#1955) — one child process, one
+                // round-trip, token offered via env exactly like the clone
+                // pipeline. Any failure (offline, missing repo, no access)
+                // folds to the pre-fallback `{ cached: false, branches: [] }`
+                // — this method never errors for the FE seam.
+                None => {
+                    let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
+                    let url = format!("{base}/{owner}/{repo}.git");
+                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                    match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+                        Ok(remote) => {
+                            let mut result = serde_json::json!({
+                                "cached": false,
+                                "source": "ls-remote",
+                                "branches": remote.branches,
+                            });
+                            if let Some(default) = remote.default_branch {
+                                result["defaultBranch"] = serde_json::Value::String(default);
+                            }
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                owner = %owner,
+                                repo = %repo,
+                                "branches.listCached ls-remote fallback failed: {e}"
+                            );
+                            Ok(serde_json::json!({
+                                "cached": false,
+                                "branches": [],
+                            }))
+                        }
+                    }
+                }
             }
         })
     }

@@ -45,7 +45,8 @@ pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
 // `workspace_api` tool installs, so the two environments cannot drift.
 pub use bindings::prelude as bindings_prelude;
 pub use bindings::prelude_for as bindings_prelude_for;
-pub use dispatch::{make_workspace_host, make_workspace_host_for};
+pub use bindings::prelude_for_bridge as bindings_prelude_for_bridge;
+pub use dispatch::{make_workspace_host, make_workspace_host_for, make_workspace_host_for_bridge};
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -101,6 +102,13 @@ pub struct WorkspaceMcpServer {
     /// microVM-workspace bridges, captured at bridge creation like
     /// `agent_features` (a settings change applies to new sessions only).
     microvm_hints: Option<tools::MicrovmSpawnHints>,
+    /// Whether this server front-doors a sub-agent (a session with a
+    /// `parent_agent_id` or `is_background`), captured once at bridge
+    /// creation like `agent_features`. Sub-agents don't own a user-facing
+    /// chat turn, so `ws.app.question.*` is pruned from their description
+    /// and prelude and denied at dispatch with a redirect to the
+    /// attention-request methods. Defaults to `false` (top-level).
+    is_sub_agent: bool,
 }
 
 impl WorkspaceMcpServer {
@@ -121,6 +129,7 @@ impl WorkspaceMcpServer {
             cow_capable: true,
             specialist_model_options: Vec::new(),
             microvm_hints: None,
+            is_sub_agent: false,
         }
     }
 
@@ -207,6 +216,16 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Mark this bridge as serving a sub-agent (the spawn-time wiring point —
+    /// derived once at bridge creation from the session:
+    /// `parent_agent_id.is_some() || is_background`). Sub-agent bridges prune
+    /// `ws.app.question.*` from the tool description and JS prelude and deny
+    /// it at dispatch with a redirect to the attention-request methods.
+    pub fn with_sub_agent(mut self, is_sub_agent: bool) -> Self {
+        self.is_sub_agent = is_sub_agent;
+        self
+    }
+
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds.
@@ -218,6 +237,21 @@ impl WorkspaceMcpServer {
     /// Whether `name` is denied for this agent.
     pub fn is_denied(&self, name: &str) -> bool {
         self.denylist.contains(name)
+    }
+
+    /// The `[agentFeatures]` toggles as they apply to THIS bridge: a
+    /// sub-agent bridge sees `structuredQuestions` forced off, so the
+    /// description and prelude layers prune `ws.app.question.*` through the
+    /// exact same machinery as the settings toggle (the surfaces cannot
+    /// drift). The dispatch layer additionally checks `is_sub_agent` FIRST,
+    /// so a raw `host({...})` frame gets the explicit top-level-only
+    /// redirect error rather than a misleading "disabled in settings".
+    fn effective_agent_features(&self) -> AgentFeaturesSettings {
+        let mut features = self.agent_features.clone();
+        if self.is_sub_agent {
+            features.structured_questions = false;
+        }
+        features
     }
 
     /// The tool definitions exposed to this agent (full registry minus denylist).
@@ -262,14 +296,15 @@ impl WorkspaceMcpServer {
             .iter()
             .map(|t| {
                 // `workspace_api` gets its description assembled per-bridge so
-                // `[agentFeatures]` toggles captured at creation prune the
-                // disabled surface and specialist `modelOptions` extend the
-                // delegate docs; with all defaults on (and no options) the
+                // `[agentFeatures]` toggles captured at creation (with the
+                // sub-agent question gate folded in) prune the disabled
+                // surface and specialist `modelOptions` extend the delegate
+                // docs; with all defaults on (and no options, top-level) the
                 // assembled text is the static const unchanged.
                 let description = if t.name == "workspace_api" {
                     tools::workspace_api_description_with_model_options(
                         self.is_chief,
-                        &self.agent_features,
+                        &self.effective_agent_features(),
                         self.cow_capable,
                         &self.specialist_model_options,
                         self.microvm_hints.as_ref(),

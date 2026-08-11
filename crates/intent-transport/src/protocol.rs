@@ -50,17 +50,28 @@
 //! event category — 270 router methods, 307 total. Version 6.2 adds
 //! `github.branches.listCached` (additive; §5.27): branch names read from
 //! the daemon's local repo cache with no network I/O — 271 router methods,
-//! 308 total. Version 6.3 adds the execution-environment surface (additive;
-//! §5.35, §5.1, §5.5b): the `sandbox.profiles.list` /
-//! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
-//! router methods, the `system.capabilities.microvmSupported` field (§5.7),
-//! the `workspace.create` `executionEnvironment` param with the persisted
+//! 308 total. Version 6.3 adds `debug.sampleStacks` (additive; §5.43,
+//! monorepo#1755): a point-in-time sample of the daemon's own thread stacks
+//! rendered as a human-readable text report — 272 router methods, 309 total.
+//! Version 6.4 adds the `host.checkNode` and `host.checkGh` fast-path methods
+//! (additive; §5.14, monorepo#1891): uncached node/gh detection mirroring
+//! `host.checkGit` (`{ available, version?, path? }`) so a fresh install is
+//! seen immediately — 272 router methods, 311 total. Version 6.5 adds the
+//! `file.placeAttachment` router method (additive; §5.9, monorepo#1948):
+//! daemon-mediated attachment placement into the git-ignored
+//! `.intent/attachments/` workspace directory with collision-safe naming —
+//! 273 router methods, 312 total. Version 6.6 adds the
+//! execution-environment surface (additive; §5.35, §5.1, §5.5b): the
+//! `sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
+//! `sandbox.image.check` router methods, the
+//! `system.capabilities.microvmSupported` field (§5.7), the
+//! `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9) — 275 router methods, 312 total.
+//! error payloads (§9) — 277 router methods, 316 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.3";
+pub const PROTOCOL_VERSION: &str = "6.6";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

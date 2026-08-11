@@ -1206,6 +1206,40 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the assembled system prompt (the spawn path): a narrow write
+    /// of `system_prompt` only. The spawn path previously persisted its
+    /// long-held session snapshot through the full-row
+    /// [`Store::update_agent_session`], silently reverting a concurrent
+    /// `agent.setModel` that landed between the spawn's session read and the
+    /// prompt persist — the lost update behind the flaky respawn e2e
+    /// (monorepo#1936). Unlike sibling narrow writers, this deliberately does
+    /// NOT bump `updated_at`: that timestamp belongs to the concurrent
+    /// `agent.setModel` write this call must not stomp. Scoped to
+    /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
+    /// or the workspace does not match.
+    pub async fn set_agent_session_system_prompt(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        system_prompt: &str,
+    ) -> Result<()> {
+        let rows =
+            sqlx::query("UPDATE agent_session SET system_prompt=? WHERE id=? AND workspace_id=?")
+                .bind(system_prompt)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("set agent session system prompt failed: {e}"))
+                })?
+                .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Persist a metadata change: a narrow write of `metadata` and
     /// `updated_at` only. Callers that load a session via the summary
     /// projection (no `system_prompt` — see [`SESSION_SUMMARY_COLUMNS`]) must
@@ -4857,6 +4891,74 @@ mod tests {
             "acp session id untouched"
         );
         assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+    }
+
+    /// monorepo#1936 regression: the spawn path's system-prompt persist is a
+    /// narrow write, so an `agent.setModel` that lands between the spawn's
+    /// session read and the prompt persist survives — the prompt write must
+    /// not revert `model`/`provider` (or touch `updated_at`/other columns).
+    #[tokio::test]
+    async fn set_agent_session_system_prompt_preserves_concurrent_model_switch() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-sysprompt".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("mock".to_string());
+        session.model = Some("auggie:sonnet4.5".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Wrong workspace → NotFound, nothing written.
+        let err = store
+            .set_agent_session_system_prompt(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                "prompt",
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.system_prompt, None);
+
+        // A model switch lands mid-spawn (after the spawn path read its
+        // session snapshot)…
+        let switched_at = now_iso();
+        store
+            .set_agent_session_model(
+                &ws_id,
+                &agent_id,
+                "auggie:haiku",
+                Some("mock"),
+                &switched_at,
+            )
+            .await
+            .expect("model switch");
+
+        // …then the spawn path persists the assembled prompt. The switch
+        // must survive.
+        store
+            .set_agent_session_system_prompt(&ws_id, &agent_id, "assembled prompt")
+            .await
+            .expect("persist system prompt");
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.system_prompt.as_deref(), Some("assembled prompt"));
+        assert_eq!(
+            after.model.as_deref(),
+            Some("auggie:haiku"),
+            "concurrent setModel must not be reverted by the prompt persist"
+        );
+        assert_eq!(after.provider.as_deref(), Some("mock"));
+        assert_eq!(after.updated_at, switched_at, "updated_at untouched");
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
     }
 
     #[tokio::test]

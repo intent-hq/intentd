@@ -7287,21 +7287,20 @@ mod pr {
             &self,
             _: &str,
             _: &str,
+            prefix: Option<&str>,
             _: PageParams,
         ) -> ScResult<Page<Branch>> {
+            let items = ["main", "dev"]
+                .iter()
+                .filter(|n| prefix.is_none_or(|p| n.starts_with(p)))
+                .map(|n| Branch {
+                    name: (*n).into(),
+                    commit_sha: None,
+                    protected: false,
+                })
+                .collect();
             Ok(Page {
-                items: vec![
-                    Branch {
-                        name: "main".into(),
-                        commit_sha: None,
-                        protected: false,
-                    },
-                    Branch {
-                        name: "dev".into(),
-                        commit_sha: None,
-                        protected: false,
-                    },
-                ],
+                items,
                 next_cursor: None,
             })
         }
@@ -7861,11 +7860,41 @@ mod pr {
     async fn github_branches_list_returns_names_and_null_next_token() {
         let (_t, svc) = github_svc().await;
         let v = svc
-            .github_branches_list("octocat".into(), "hello".into(), None, None)
+            .github_branches_list("octocat".into(), "hello".into(), None, None, None)
             .await
             .expect("branches");
         assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
         assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_branches_list_threads_prefix_and_drops_blank() {
+        let (_t, svc) = github_svc().await;
+        // A non-empty prefix reaches the engine and narrows the listing.
+        let v = svc
+            .github_branches_list(
+                "octocat".into(),
+                "hello".into(),
+                Some("de".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("branches");
+        assert_eq!(v["branches"], serde_json::json!(["dev"]));
+
+        // Blank / whitespace prefixes fold to the unfiltered listing.
+        let v = svc
+            .github_branches_list(
+                "octocat".into(),
+                "hello".into(),
+                Some("   ".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("branches");
+        assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
     }
 
     #[tokio::test]
@@ -19210,6 +19239,117 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
+    /// lands in `.intent/attachments/` with a workspace-relative result path,
+    /// the `.intent/.gitignore` exclusion is ensured on the way, param
+    /// validation surfaces as `Error::InvalidParams` (→ `-32602`), and the
+    /// placed file is invisible to `git status` (monorepo#1948).
+    #[tokio::test]
+    async fn file_place_attachment_places_excluded_from_git() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let dir = std::env::temp_dir().join(format!("intentd-placeatt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        // Base64 placement (data: URL prefix tolerated).
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"attached bytes");
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "big.har".to_string(),
+                Some(format!("data:application/json;base64,{b64}")),
+                None,
+            )
+            .await
+            .expect("place");
+        assert_eq!(
+            placed,
+            serde_json::json!({
+                "ok": true,
+                "path": ".intent/attachments/big.har",
+                "fileName": "big.har",
+                "size": 14
+            })
+        );
+        assert_eq!(
+            std::fs::read(dir.join(".intent/attachments/big.har")).unwrap(),
+            b"attached bytes"
+        );
+
+        // The default `.intent/.gitignore` was ensured, and git reports the
+        // placed file as ignored (the exclusion contract).
+        assert!(dir.join(".intent/.gitignore").exists());
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert!(repo
+            .is_path_ignored(std::path::Path::new(".intent/attachments/big.har"))
+            .unwrap());
+
+        // Edge case: an attachment literally named `config.json` stays
+        // ignored — the `!config.json` negation in `.intent/.gitignore`
+        // cannot re-include it because git never descends into the excluded
+        // `attachments/` directory, and the nested ignore-all
+        // `attachments/.gitignore` covers customized `.intent/.gitignore`s.
+        let cfg = svc
+            .file_place_attachment(
+                ws.clone(),
+                "config.json".to_string(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
+                None,
+            )
+            .await
+            .expect("place config.json");
+        assert_eq!(
+            cfg["path"],
+            serde_json::json!(".intent/attachments/config.json")
+        );
+        assert!(repo
+            .is_path_ignored(std::path::Path::new(".intent/attachments/config.json"))
+            .unwrap());
+
+        // sourcePath placement (same-host copy) collides into `-2`.
+        let src = dir.join("local-source.har");
+        std::fs::write(&src, b"from disk").unwrap();
+        let placed2 = svc
+            .file_place_attachment(
+                ws.clone(),
+                "big.har".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+            )
+            .await
+            .expect("place from sourcePath");
+        assert_eq!(placed2["fileName"], serde_json::json!("big-2.har"));
+        assert_eq!(
+            std::fs::read(dir.join(".intent/attachments/big-2.har")).unwrap(),
+            b"from disk"
+        );
+
+        // Param validation: none / both / bad base64 / relative sourcePath.
+        for (data, source_path) in [
+            (None, None),
+            (Some("aGk=".to_string()), Some("/tmp/x".to_string())),
+            (Some("!!!not-base64!!!".to_string()), None),
+            (None, Some("relative/path.txt".to_string())),
+        ] {
+            let res = svc
+                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path)
+                .await;
+            assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
@@ -21371,6 +21511,519 @@ mod clone_orchestration {
             "repo cache survives workspace deletion"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Unified provisioning progress (PROTOCOL §5.1): a client-supplied
+    // `progressId` is echoed on every `git:clone:*` frame the create emits,
+    // percent is normalized to one non-decreasing 0–100 series across all
+    // checkout modes, paths that streamed nothing emit milestones, and
+    // exactly one terminal `git:clone:done` closes every create.
+    // -----------------------------------------------------------------------
+
+    /// Drain the subscription and return the full `git:clone:*` events.
+    async fn drain_clone_frames(sub: &mut crate::Subscription) -> Vec<intent_core::Event> {
+        let mut frames = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        {
+            for ev in batch {
+                if ev.event_type.starts_with("git:clone:") {
+                    frames.push(ev);
+                }
+            }
+        }
+        frames
+    }
+
+    /// Shared assertions for a successful `progressId` create: every frame
+    /// echoes the id, progress percent never decreases and ends at
+    /// `complete 100`, and exactly one terminal done (`ok:true`) closes the
+    /// stream (≥2 progress frames per the milestone contract).
+    fn assert_progress_stream(frames: &[intent_core::Event], progress_id: &str) {
+        assert!(!frames.is_empty(), "create emitted git:clone frames");
+        for f in frames {
+            assert_eq!(
+                f.data["progressId"].as_str(),
+                Some(progress_id),
+                "every frame echoes progressId: {:?}",
+                f.data
+            );
+        }
+        let progress: Vec<&intent_core::Event> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+            .collect();
+        assert!(
+            progress.len() >= 2,
+            "at least two progress frames: {progress:?}"
+        );
+        let mut last = 0i64;
+        for f in &progress {
+            let pct = f.data["percent"].as_i64().expect("percent");
+            assert!(
+                pct >= last,
+                "percent non-decreasing: {pct} after {last} ({:?})",
+                f.data
+            );
+            last = pct;
+        }
+        let final_progress = progress.last().unwrap();
+        assert_eq!(final_progress.data["phase"], "complete");
+        assert_eq!(final_progress.data["percent"], 100);
+        let dones: Vec<&intent_core::Event> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:done")
+            .collect();
+        assert_eq!(dones.len(), 1, "exactly one terminal done: {dones:?}");
+        assert_eq!(dones[0].data["ok"], true);
+        assert_eq!(
+            frames.last().unwrap().event_type,
+            "git:clone:done",
+            "done is the terminal frame"
+        );
+    }
+
+    /// Worktree mode (local repo, isolation on): milestones stream with the
+    /// echoed `progressId` — worktree provisioning, finalizing, complete —
+    /// and one terminal done, on a path that emitted nothing before.
+    #[tokio::test]
+    async fn progress_id_worktree_create_streams_milestones() {
+        let repo = seed_repo("intentd-prog-wt-src");
+        let root = unique_dir("intentd-prog-wt-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo.0.to_string_lossy().to_string()),
+                    progress_id: Some("prog-wt-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-wt-1");
+        let phases: Vec<&str> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+            .filter_map(|f| f.data["phase"].as_str())
+            .collect();
+        assert!(
+            phases.contains(&"worktree"),
+            "worktree milestone emitted: {phases:?}"
+        );
+        assert!(
+            phases.contains(&"finalizing"),
+            "finalizing milestone emitted: {phases:?}"
+        );
+        // Frames are published under the new workspace id.
+        assert!(frames.iter().all(|f| f.workspace_id == ws.id));
+    }
+
+    /// Direct mode (`isNewRepo`): the daemon-initialized repo path streams
+    /// checkout + finalizing milestones and one terminal done.
+    #[tokio::test]
+    async fn progress_id_new_repo_direct_streams_milestones() {
+        let root = unique_dir("intentd-prog-direct-root");
+        let repo_dir = unique_dir("intentd-prog-direct-repo");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    progress_id: Some("prog-direct-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-direct-1");
+        let phases: Vec<&str> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+            .filter_map(|f| f.data["phase"].as_str())
+            .collect();
+        assert!(
+            phases.contains(&"checkout"),
+            "checkout milestone emitted: {phases:?}"
+        );
+    }
+
+    /// Network clone (explicit `clonePath`): the stderr-parsed clone frames
+    /// route through the reporter — normalized into the 0–85 clone segment,
+    /// echoing `progressId` — and the provisioning tail + terminal done come
+    /// from the create (not the clone), still exactly once.
+    #[tokio::test]
+    async fn progress_id_network_clone_normalizes_and_defers_done() {
+        let source = seed_repo("intentd-prog-clone-src");
+        let root = unique_dir("intentd-prog-clone-root");
+        let target = unique_dir("intentd-prog-clone-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.create_workspace(
+            WorkspaceCreate {
+                github_url: Some(url),
+                clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                progress_id: Some("prog-net-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create");
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-net-1");
+        // The clone's own frames stay within the 0–85 clone segment; only
+        // the create's provisioning tail exceeds it.
+        for f in frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+        {
+            let phase = f.data["phase"].as_str().unwrap();
+            let pct = f.data["percent"].as_i64().unwrap();
+            if matches!(
+                phase,
+                "starting" | "counting" | "compressing" | "receiving" | "resolving"
+            ) {
+                assert!(pct <= 85, "clone frames capped at 85: {phase} {pct}");
+            }
+        }
+    }
+
+    /// Cache hydration (`githubUrl` without `clonePath`): the cache + copy
+    /// milestones stream through the reporter with one terminal done.
+    #[tokio::test]
+    async fn progress_id_cache_hydration_streams_milestones() {
+        let source = seed_repo("intentd-prog-hydrate-src");
+        let root = unique_dir("intentd-prog-hydrate-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.create_workspace(
+            WorkspaceCreate {
+                github_url: Some(url),
+                progress_id: Some("prog-hyd-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create");
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-hyd-1");
+        let phases: Vec<&str> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+            .filter_map(|f| f.data["phase"].as_str())
+            .collect();
+        assert!(
+            phases.contains(&"cache"),
+            "cache milestone emitted: {phases:?}"
+        );
+        assert!(
+            phases.contains(&"cow-copy") || phases.contains(&"checkout"),
+            "copy/checkout milestone emitted: {phases:?}"
+        );
+    }
+
+    /// A failed create with a `progressId` still ends the stream with exactly
+    /// one terminal done (`ok:false` + sanitized error), echoing the id.
+    #[tokio::test]
+    async fn progress_id_failed_clone_emits_one_done_err() {
+        let root = unique_dir("intentd-prog-fail-root");
+        let target = unique_dir("intentd-prog-fail-target");
+        let clone_dir: PathBuf = target.0.join("checkout");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let missing = format!("/does/not/exist/{}.git", uuid::Uuid::new_v4());
+        svc.create_workspace(
+            WorkspaceCreate {
+                github_url: Some(format!("file://{missing}")),
+                clone_path: Some(clone_dir.to_string_lossy().to_string()),
+                progress_id: Some("prog-fail-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("create must fail");
+
+        let frames = drain_clone_frames(&mut sub).await;
+        let dones: Vec<&intent_core::Event> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:done")
+            .collect();
+        assert_eq!(dones.len(), 1, "exactly one terminal done: {dones:?}");
+        assert_eq!(dones[0].data["ok"], false);
+        assert_eq!(dones[0].data["progressId"].as_str(), Some("prog-fail-1"));
+        assert!(
+            dones[0].data["error"].as_str().is_some(),
+            "done carries the sanitized error detail"
+        );
+    }
+
+    /// Idempotent replays emit nothing: repeating an identical
+    /// `workspace.create` with the same `idempotency_key` + `progressId`
+    /// returns the cached result without re-running provisioning, so no
+    /// `git:clone:*` frames (progress OR done) are re-emitted.
+    #[tokio::test]
+    async fn progress_id_idempotent_replay_emits_nothing() {
+        let repo = seed_repo("intentd-prog-idem-src");
+        let root = unique_dir("intentd-prog-idem-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+
+        let input = WorkspaceCreate {
+            repository_path: Some(repo.0.to_string_lossy().to_string()),
+            progress_id: Some("prog-idem-1".to_string()),
+            ..Default::default()
+        };
+        let key = Some("idem-key-prog-1".to_string());
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let first = svc
+            .create_workspace(input.clone(), key.clone())
+            .await
+            .expect("first create");
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(!frames.is_empty(), "first create streams frames");
+
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let replay = svc
+            .create_workspace(input, key)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(
+            replay.workspace.id, first.workspace.id,
+            "replay returns the cached result"
+        );
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(
+            frames.is_empty(),
+            "idempotent replay emits no git:clone frames: {frames:?}"
+        );
+    }
+
+    /// Pinned CoW coverage (probe-gated like the checkout-mode tests): with
+    /// `workspace.cowIsolation` on and a CoW-capable filesystem, the local
+    /// create streams the `cow-copy 30` milestone (not `worktree`) with the
+    /// echoed `progressId` and one terminal done.
+    #[tokio::test]
+    async fn progress_id_cow_create_streams_cow_copy_milestone() {
+        let repo = seed_repo("intentd-prog-cow-src");
+        let root = unique_dir("intentd-prog-cow-root");
+        if intent_git::cow_probe(&repo.0, &root.0).unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let cfg_dir = unique_dir("intentd-prog-cow-conf");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(cfg_dir.0.join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.cowIsolation".to_string(),
+                serde_json::json!(true),
+            )])
+            .expect("set cowIsolation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo.0.to_string_lossy().to_string()),
+                    progress_id: Some("prog-cow-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow),
+            "pinned CoW checkout"
+        );
+
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-cow-1");
+        let cow = frames
+            .iter()
+            .find(|f| f.data["phase"] == "cow-copy")
+            .expect("cow-copy milestone emitted");
+        assert_eq!(cow.data["percent"], 30, "local CoW copy sits mid-scale");
+        assert!(
+            !frames.iter().any(|f| f.data["phase"] == "worktree"),
+            "no worktree milestone on the CoW path: {frames:?}"
+        );
+    }
+
+    /// The terminal-done contract holds for pre-derivation configuration
+    /// failures: an invalid `workspace.worktreesLocation` (relative path)
+    /// errors the create before a workspace id exists, yet a supplied
+    /// `progressId` still gets exactly one `git:clone:done { ok:false }`.
+    #[tokio::test]
+    async fn progress_id_early_config_error_emits_done_err() {
+        let root = unique_dir("intentd-prog-cfg-root");
+        let repo = seed_repo("intentd-prog-cfg-src");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let cfg_dir = unique_dir("intentd-prog-cfg-conf");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(cfg_dir.0.join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!("relative/not-absolute"),
+            )])
+            .expect("apply worktreesLocation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(repo.0.to_string_lossy().to_string()),
+                progress_id: Some("prog-cfg-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("relative worktreesLocation must fail the create");
+
+        let frames = drain_clone_frames(&mut sub).await;
+        let dones: Vec<&intent_core::Event> = frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:done")
+            .collect();
+        assert_eq!(dones.len(), 1, "exactly one terminal done: {frames:?}");
+        assert_eq!(dones[0].data["ok"], false);
+        assert_eq!(dones[0].data["progressId"].as_str(), Some("prog-cfg-1"));
+        assert!(
+            dones[0].data["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worktreesLocation"),
+            "done carries the config-error detail: {:?}",
+            dones[0].data
+        );
+    }
+
+    /// Rollback safety: without a `progressId`, a local-repo create emits no
+    /// `git:clone:*` frames at all (legacy behavior), and legacy clone paths
+    /// carry no `progressId` key.
+    #[tokio::test]
+    async fn no_progress_id_keeps_legacy_event_behavior() {
+        let repo = seed_repo("intentd-prog-legacy-src");
+        let root = unique_dir("intentd-prog-legacy-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(repo.0.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create");
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(
+            frames.is_empty(),
+            "no git:clone frames without progressId on a local create: {frames:?}"
+        );
+
+        // Legacy hydration (no progressId) still streams its historic frames
+        // without a `progressId` key.
+        let source = seed_repo("intentd-prog-legacy-hyd-src");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        svc.create_workspace(
+            WorkspaceCreate {
+                github_url: Some(format!("file://{}", source.0.to_string_lossy())),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("hydrating create");
+        let frames = drain_clone_frames(&mut sub).await;
+        assert!(!frames.is_empty(), "legacy hydration still streams frames");
+        assert!(
+            frames.iter().all(|f| f.data.get("progressId").is_none()),
+            "legacy frames carry no progressId key: {frames:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -22887,7 +23540,7 @@ mod last_activity_events {
 /// unread. On a session-load error the gate FAILS OPEN (raise anyway).
 #[cfg(test)]
 mod turn_end_unread_gate {
-    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId, WorkspaceStatus};
     use intent_store::Store;
 
     use super::{workspace, TempDb};
@@ -22918,7 +23571,7 @@ mod turn_end_unread_gate {
         }
     }
 
-    fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+    pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
             id: agent_id.clone(),
             workspace_id: ws.clone(),
@@ -23043,6 +23696,207 @@ mod turn_end_unread_gate {
         assert!(
             should_raise_turn_end_unread(&h.services, &agent_id).await,
             "the gate fails open on a genuine store error"
+        );
+    }
+
+    /// A top-level foreground agent finishing its drain in an ARCHIVED
+    /// workspace must NOT raise the blue dot: the user parked the
+    /// workspace, so turn ends there stay quiet until unarchive.
+    #[tokio::test]
+    async fn archived_workspace_skips_raise() {
+        let h = harness().await;
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.status = WorkspaceStatus::Archived;
+        row.archived = true;
+        h.store
+            .insert_workspace(&row)
+            .await
+            .expect("seed archived workspace");
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &ws))
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an archived workspace must not get the turn-end blue dot"
+        );
+    }
+
+    /// A workspace-read failure FAILS OPEN (raise anyway), same rationale
+    /// as the session-read fault: a missed blue dot for a real top-level
+    /// turn is worse than a spurious one on a rare store fault.
+    #[tokio::test]
+    async fn workspace_error_fails_open() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+        sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+            .execute(h.store.write_pool())
+            .await
+            .expect("rename workspace table");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "the archived gate fails open on a workspace store error"
+        );
+    }
+}
+
+/// Regression tests for the `workspaceArchived` `agent:idle` suppression
+/// hint: `annotate_workspace_archived` stamps `workspaceArchived: true` iff
+/// the workspace row's status is `Archived` — omitted when active (absent ≠
+/// present-false, additive) and omitted on a failed workspace read — and
+/// `publish_harness_wake_idle` carries the stamp end-to-end on the emitted
+/// event (the prompt-turn idle stamps through the same helper).
+#[cfg(test)]
+mod idle_workspace_archived_stamp {
+    use std::time::Duration;
+
+    use intent_core::events::AGENT_IDLE;
+    use intent_core::{AgentId, WorkspaceId, WorkspaceStatus};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+    use tokio::time::timeout;
+
+    use super::turn_end_unread_gate::session;
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+        }
+    }
+
+    /// Seed a workspace row; `archived` controls the lifecycle status.
+    async fn seed_workspace(h: &Harness, archived: bool) -> WorkspaceId {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        if archived {
+            row.status = WorkspaceStatus::Archived;
+            row.archived = true;
+        }
+        h.store
+            .insert_workspace(&row)
+            .await
+            .expect("seed workspace");
+        ws
+    }
+
+    #[tokio::test]
+    async fn stamps_true_when_archived() {
+        let h = harness().await;
+        let ws = seed_workspace(&h, true).await;
+        let mut data = json!({});
+        h.services.annotate_workspace_archived(&ws, &mut data).await;
+        assert_eq!(
+            data["workspaceArchived"],
+            json!(true),
+            "archived workspace stamps workspaceArchived: true"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_when_active() {
+        let h = harness().await;
+        let ws = seed_workspace(&h, false).await;
+        let mut data = json!({});
+        h.services.annotate_workspace_archived(&ws, &mut data).await;
+        assert!(
+            data.get("workspaceArchived").is_none(),
+            "an active workspace omits the field entirely: {data}"
+        );
+    }
+
+    /// Best-effort: a failed workspace read (missing row) omits the field
+    /// rather than erroring or stamping false.
+    #[tokio::test]
+    async fn omitted_on_workspace_read_failure() {
+        let h = harness().await;
+        let missing = WorkspaceId::new();
+        let mut data = json!({});
+        h.services
+            .annotate_workspace_archived(&missing, &mut data)
+            .await;
+        assert!(
+            data.get("workspaceArchived").is_none(),
+            "a workspace read failure omits the field: {data}"
+        );
+    }
+
+    fn subscribe_idle(h: &Harness, ws: &WorkspaceId) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            event_types: vec![AGENT_IDLE.to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_idle(sub: &mut Subscription) -> Value {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("agent:idle delivered")
+            .expect("subscription open");
+        assert!(!batch.is_empty());
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    /// The harness-wake idle emit carries the stamp end-to-end: present
+    /// (`true`) for an archived workspace, absent for an active one.
+    #[tokio::test]
+    async fn harness_wake_idle_carries_stamp() {
+        let h = harness().await;
+
+        let archived_ws = seed_workspace(&h, true).await;
+        let archived_agent = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&archived_agent, &archived_ws))
+            .await
+            .expect("insert archived-ws session");
+        let mut sub = subscribe_idle(&h, &archived_ws);
+        h.services
+            .publish_harness_wake_idle(&archived_agent, &archived_ws)
+            .await;
+        let ev = recv_idle(&mut sub).await;
+        assert_eq!(ev["type"], AGENT_IDLE);
+        assert_eq!(
+            ev["data"]["workspaceArchived"],
+            json!(true),
+            "archived-workspace idle carries workspaceArchived: true: {ev}"
+        );
+
+        let active_ws = seed_workspace(&h, false).await;
+        let active_agent = AgentId::new();
+        h.store
+            .insert_agent_session(&session(&active_agent, &active_ws))
+            .await
+            .expect("insert active-ws session");
+        let mut sub = subscribe_idle(&h, &active_ws);
+        h.services
+            .publish_harness_wake_idle(&active_agent, &active_ws)
+            .await;
+        let ev = recv_idle(&mut sub).await;
+        assert!(
+            ev["data"].get("workspaceArchived").is_none(),
+            "active-workspace idle omits workspaceArchived: {ev}"
         );
     }
 }

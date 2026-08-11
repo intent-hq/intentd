@@ -271,7 +271,7 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -492,7 +492,7 @@ API:
   ws.hook.cancel(hookId) → { ok, hook }  // Stop one of YOUR OWN active hooks. Hooks are agent-owned: cancelling a hook whose `agentId` is another agent is rejected with an error naming the owner — check `agentId` from `ws.hook.list()` before cancelling, and ask the owning agent instead.
   ws.hook.runNow(hookId) → { ok, hookId }  // Trigger an immediate run of an active hook; its inter-run timer resets after the run.
 
-  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `snapshot`, and capture/trace actions.
+  ws.browser.exec(actions, tabId?) → result | results[]  // Chrome DevTools browser automation. Each action is an object with an `action` field; common actions include `listTabs`, `focusTab`, `getAccessibilityTree`, `screenshot`, `evaluate`, `navigate`, `openTab`, `closeTab` (requires an explicit `tabId`; no default-tabId fallback), `snapshot`, and capture/trace actions.
     Single-action calls return one result; multiple actions return an array. Use `ws.browser.docs("overview"|"capture"|"examples")` for the full action reference, `waitFor` options, and longer examples.
   ws.browser.docs(topic) → string  // Browser API docs. Topics include `overview`, `capture`, and `examples`.
 
@@ -803,10 +803,13 @@ pub(super) fn help_index(is_chief: bool, features: &AgentFeaturesSettings) -> St
 /// `"ws.pr"`, `"pr.*"`, and nested names like `"app.question"`; `"help"`
 /// resolves to the `ws.help(...)` entry itself. Errors name the disabling
 /// `[agentFeatures]` toggle for gated-off namespaces and list the available
-/// namespaces for unknown ones.
+/// namespaces for unknown ones — except `app.question` on a sub-agent bridge
+/// (whose effective features force `structuredQuestions` off), where the
+/// honest reason is the top-level-only rule, not a settings toggle.
 pub(super) fn help_namespace(
     is_chief: bool,
     features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
     namespace: &str,
 ) -> Result<String, String> {
     let ns = namespace
@@ -838,10 +841,19 @@ pub(super) fn help_namespace(
             return Ok(lines.join("\n"));
         }
         let gate = format!("ws.{ns}.");
-        if let Some((_, feature)) = gated_prefixes(features)
+        if let Some((prefix, feature)) = gated_prefixes(features)
             .into_iter()
             .find(|(prefix, _)| gate.starts_with(prefix) || prefix.starts_with(&gate))
         {
+            // Sub-agent question gate FIRST, matching the dispatch layer: a
+            // sub-agent bridge's effective features force `structuredQuestions`
+            // off, which would otherwise misattribute the pruning to settings.
+            if is_sub_agent && prefix == "ws.app.question." {
+                return Err(format!(
+                    "namespace `{ns}` — {}",
+                    super::dispatch::SUB_AGENT_QUESTION_DENIED
+                ));
+            }
             return Err(format!(
                 "namespace `{ns}` is disabled in settings ({feature} = false)"
             ));
@@ -1463,7 +1475,7 @@ mod tests {
             (true, WORKSPACE_API_DESCRIPTION_CHIEF),
         ] {
             for ns in index_namespaces(desc) {
-                let docs = help_namespace(is_chief, &features, &ns)
+                let docs = help_namespace(is_chief, &features, false, &ns)
                     .unwrap_or_else(|e| panic!("chief={is_chief}: help({ns}) errored: {e}"));
                 assert!(
                     docs.lines()
@@ -1478,13 +1490,16 @@ mod tests {
             }
         }
         // Forgiving spellings resolve to the same segment.
-        let plain = help_namespace(false, &features, "pr").unwrap();
+        let plain = help_namespace(false, &features, false, "pr").unwrap();
         for alias in ["ws.pr", "pr.*", " pr. "] {
-            assert_eq!(help_namespace(false, &features, alias).unwrap(), plain);
+            assert_eq!(
+                help_namespace(false, &features, false, alias).unwrap(),
+                plain
+            );
         }
         // `help` resolves to the ws.help entry itself (documented as a call,
         // not a dotted namespace).
-        let help_docs = help_namespace(false, &features, "help").unwrap();
+        let help_docs = help_namespace(false, &features, false, "help").unwrap();
         assert!(
             help_docs.trim_start().starts_with("ws.help(namespace?)"),
             "help(help) should return the ws.help entry, got: {help_docs}"
@@ -1499,12 +1514,13 @@ mod tests {
             host_exec: false,
             ..AgentFeaturesSettings::default()
         };
-        let err = help_namespace(false, &features, "host").unwrap_err();
+        let err = help_namespace(false, &features, false, "host").unwrap_err();
         assert!(
             err.contains("agentFeatures.hostExec"),
             "gated error must name the toggle: {err}"
         );
-        let err = help_namespace(false, &AgentFeaturesSettings::default(), "nope").unwrap_err();
+        let err =
+            help_namespace(false, &AgentFeaturesSettings::default(), false, "nope").unwrap_err();
         assert!(err.contains("unknown namespace `nope`"), "{err}");
         assert!(
             err.contains("note"),
@@ -1515,10 +1531,41 @@ mod tests {
             "unknown error lists `help` as available: {err}"
         );
         // Chief-only namespaces are unknown to base workspaces.
+        assert!(help_namespace(
+            false,
+            &AgentFeaturesSettings::default(),
+            false,
+            "app.workspaces"
+        )
+        .is_err());
+        assert!(help_namespace(
+            true,
+            &AgentFeaturesSettings::default(),
+            false,
+            "app.workspaces"
+        )
+        .is_ok());
+    }
+
+    // A sub-agent bridge's help("app.question") names the top-level-only
+    // rule, never the settings toggle its effective features force off; when
+    // the toggle is GENUINELY off, the settings error stands for every caller.
+    #[test]
+    fn help_namespace_sub_agent_question_error_names_top_level_rule() {
+        let forced_off = AgentFeaturesSettings {
+            structured_questions: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let err = help_namespace(false, &forced_off, true, "app.question").unwrap_err();
         assert!(
-            help_namespace(false, &AgentFeaturesSettings::default(), "app.workspaces").is_err()
+            err.contains("only available to top-level agents")
+                && err.contains("ws.agent.requestDiscussion"),
+            "{err}"
         );
-        assert!(help_namespace(true, &AgentFeaturesSettings::default(), "app.workspaces").is_ok());
+        assert!(!err.contains("disabled in settings"), "{err}");
+        // Genuine settings-off on a top-level bridge keeps the toggle error.
+        let err = help_namespace(false, &forced_off, false, "app.question").unwrap_err();
+        assert!(err.contains("agentFeatures.structuredQuestions"), "{err}");
     }
 
     // ---- [agentFeatures] segment-assembly tests ----------------------------

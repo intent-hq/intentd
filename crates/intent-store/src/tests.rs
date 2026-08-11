@@ -99,7 +99,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93
+            91, 92, 93, 94
         ]
     );
     assert_eq!(
@@ -109,7 +109,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93
+            91, 92, 93, 94
         ]
     );
 }
@@ -4688,6 +4688,55 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_bulk_upsert_round_trip_replace_and_chunking() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // An empty slice is a no-op, not an error.
+    store.upsert_scripts(&[]).await.expect("empty upsert");
+    assert!(store.list_all_scripts().await.expect("list").is_empty());
+
+    // 2100 scripts cross the 2048-rows-per-statement chunk boundary; every
+    // field round-trips, including the JSON env map and sparse optionals.
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("PORT".to_string(), "3000".to_string());
+    let scripts: Vec<intent_core::Script> = (0..2100)
+        .map(|i| intent_core::Script {
+            id: format!("s-{i}"),
+            workspace_id: "ws-1".to_string(),
+            name: format!("script {i}"),
+            command: format!("echo {i}"),
+            cwd: (i % 2 == 0).then(|| "web".to_string()),
+            env: (i % 2 == 0).then(|| env.clone()),
+            mode: intent_core::ScriptMode::Command,
+            category: (i % 2 == 0).then(|| "dev".to_string()),
+            source: "user".to_string(),
+            auto_start: (i % 2 == 0).then_some(true),
+            created_at: now_iso(),
+            updated_at: None,
+        })
+        .collect();
+    store.upsert_scripts(&scripts).await.expect("bulk insert");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 2100);
+    for script in &scripts {
+        assert!(listed.contains(script), "missing {}", script.id);
+    }
+
+    // Bulk upsert on existing ids replaces the rows (no duplicates).
+    let mut renamed = scripts.clone();
+    for script in &mut renamed {
+        script.name = format!("{} v2", script.name);
+    }
+    store.upsert_scripts(&renamed).await.expect("bulk replace");
+    let listed = store.list_all_scripts().await.expect("list");
+    assert_eq!(listed.len(), 2100);
+    for script in &renamed {
+        assert!(listed.contains(script), "missing replaced {}", script.id);
+    }
 }
 
 #[tokio::test]

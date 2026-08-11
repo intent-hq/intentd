@@ -3991,6 +3991,490 @@ async fn stop_with_empty_live_turn_persists_empty_interrupted_row() {
     );
 }
 
+/// Regression for intent-hq/monorepo#1757: a plain `agent.stop` (keep-alive
+/// `UserStop` interrupt) landing on a ZERO-output turn drops the turn's user
+/// message provider-side (`session/cancel` discards the in-flight prompt),
+/// so the NEXT plain follow-up send must redeliver the stopped message's
+/// text AND attachments ahead of the follow-up content in ONE
+/// `session/prompt` — same combined-delivery semantics as the
+/// interrupt-priority preemption path (monorepo#1014). The transcript is
+/// untouched (prompt-only redelivery, no duplicate user rows).
+#[tokio::test]
+async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachments() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-redeliver"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-stop-redeliver")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    // The in-flight turn's user message (text + image attachment) is already
+    // persisted; the live-turn slot is open with ZERO streamed blocks.
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .set_live_turn(&id, "msg-stop-redeliver", Vec::new());
+
+    assert!(
+        mgr.interrupt(&id).await,
+        "keep-alive stop finds the live agent"
+    );
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the keep-alive stop"
+    );
+
+    // Plain follow-up send (NOT interrupt-priority — the agent is idle now).
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+
+    // The follow-up turn's `session/prompt` carries the stopped message's
+    // text ahead of the follow-up text, plus its image attachment.
+    let mut prompt_params = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                prompt_params = Some(params.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let params = prompt_params.expect("session/prompt sent for the follow-up turn");
+    let blocks = params["prompt"].as_array().expect("prompt blocks");
+    let prompt_text = blocks
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first_pos = prompt_text
+        .find("first with screenshot")
+        .expect("follow-up prompt redelivers the stopped message's text");
+    let follow_pos = prompt_text
+        .find("follow-up")
+        .expect("follow-up prompt carries its own content");
+    assert!(
+        first_pos < follow_pos,
+        "stopped message precedes the follow-up: {prompt_text:?}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+        "follow-up prompt redelivers the stopped message's image attachment: {blocks:?}"
+    );
+
+    // Prompt-only redelivery: the transcript keeps exactly the two user rows
+    // (stopped message + follow-up) — nothing re-appended.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        2,
+        "no duplicate user rows appended: {messages:?}"
+    );
+}
+
+/// Companion gate: a `agent.stop` landing on a turn that already STREAMED
+/// output must NOT redeliver the stopped message on the follow-up turn — the
+/// provider saw the message (it produced output for it), so redelivery would
+/// duplicate context and risk re-running side effects.
+#[tokio::test]
+async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-progress"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-stop-progress")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "first with screenshot" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // The turn streamed a block before the stop → the provider received and
+    // acted on the message.
+    mgr.services.set_live_turn(
+        &id,
+        "msg-stop-progress",
+        vec![json!({ "type": "text", "id": "msg-stop-progress:0", "text": "partial…" })],
+    );
+
+    assert!(
+        mgr.interrupt(&id).await,
+        "keep-alive stop finds the live agent"
+    );
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+
+    let mut prompt_text = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                let text = params["prompt"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == json!("text"))
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompt_text = Some(text);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let prompt_text = prompt_text.expect("session/prompt sent for the follow-up turn");
+    assert!(
+        !prompt_text.contains("first with screenshot"),
+        "a progressed (output-producing) stopped turn is NOT redelivered: {prompt_text:?}"
+    );
+    assert!(prompt_text.contains("follow-up"));
+}
+
+/// Spawn-window fallback: a user stop landing with no `acpSessionId` yet
+/// falls back to the hard kill path — the redelivery payload must still be
+/// armed (post-`stop`, which clears stale per-agent flags) so the next turn
+/// redelivers the stopped message's text + attachments.
+#[tokio::test]
+async fn stop_fallback_kill_path_arms_redelivery_for_next_turn() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-fb"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    // NO acpSessionId → `interrupt` falls back to the kill path.
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.set_live_turn(&id, "msg-stop-fb", Vec::new());
+
+    assert!(mgr.interrupt(&id).await, "fallback stop finds the agent");
+
+    let armed = mgr.stop_redelivery.lock().unwrap().get(&id).cloned();
+    let armed = armed.expect("zero-output fallback stop arms the redelivery payload");
+    assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    assert_eq!(
+        armed.image_blocks,
+        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+    );
+    assert!(armed.file_blocks.is_none());
+}
+
+/// A second [`AgentManager`] over the SAME store, standing in for the daemon
+/// process that replaces the stopped one in the restart regression tests.
+fn restarted_manager(mgr: &AgentManager) -> AgentManager {
+    let store = mgr.services.store.clone();
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store).with_event_bus(bus.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    AgentManager::new(services, sink, 8)
+}
+
+/// Drive a zero-output user stop that arms the redelivery payload (the
+/// spawn-window fallback path — no `acpSessionId`), shared by the
+/// persistence regression tests below.
+async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    seed_agent(mgr, ws, id).await;
+    track(mgr, id);
+    assert!(mgr.try_begin(id, ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            id,
+            "user",
+            &json!([
+                { "type": "text", "text": "first with screenshot" },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .set_live_turn(id, "msg-stop-persist", Vec::new());
+    assert!(mgr.interrupt(id).await, "fallback stop finds the agent");
+    assert!(
+        mgr.stop_redelivery.lock().unwrap().contains_key(id),
+        "zero-output fallback stop arms the redelivery payload"
+    );
+}
+
+/// Regression for intent-hq/monorepo#1899: the armed zero-output
+/// stop-redelivery payload is mirrored to the store, survives a daemon
+/// restart (graceful shutdown → fresh manager over the same store →
+/// rehydration), and the follow-up turn on the NEW manager still redelivers
+/// the stopped message's text + attachments — then clears the persisted row
+/// so a second restart cannot redeliver it again.
+#[tokio::test]
+async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-restart"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // The arm wrote through to the durable mirror.
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(rows.len(), 1, "armed payload persisted: {rows:?}");
+    assert_eq!(rows[0].agent_id, id);
+    assert_eq!(rows[0].payload["content"], json!("first with screenshot"));
+
+    // Graceful daemon shutdown must NOT clear the persisted row.
+    mgr.shutdown().await;
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(
+        rows.len(),
+        1,
+        "graceful shutdown preserves the persisted payload: {rows:?}"
+    );
+
+    // "Restart": a fresh manager over the same store rehydrates the payload.
+    let mgr2 = Arc::new(restarted_manager(&mgr));
+    let rehydrated = mgr2
+        .rehydrate_stop_redeliveries()
+        .await
+        .expect("rehydrate stop redeliveries");
+    assert_eq!(rehydrated, 1);
+    let armed = mgr2.stop_redelivery.lock().unwrap().get(&id).cloned();
+    let armed = armed.expect("rehydrated payload lands in the in-memory map");
+    assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    assert_eq!(
+        armed.image_blocks,
+        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+    );
+
+    // Follow-up send on the restarted manager: the prompt redelivers the
+    // stopped message's text ahead of the follow-up, plus its attachment.
+    let (_agent, log) = track_mock_agent_with_log(&mgr2, &id, false);
+    let result = mgr2
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("follow-up send");
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "idle agent streams: {result}"
+    );
+    let mut prompt_params = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                prompt_params = Some(params.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let params = prompt_params.expect("session/prompt sent for the follow-up turn");
+    let blocks = params["prompt"].as_array().expect("prompt blocks");
+    let prompt_text = blocks
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first_pos = prompt_text
+        .find("first with screenshot")
+        .expect("restarted follow-up redelivers the stopped message's text");
+    let follow_pos = prompt_text
+        .find("follow-up")
+        .expect("follow-up prompt carries its own content");
+    assert!(
+        first_pos < follow_pos,
+        "stopped message precedes the follow-up: {prompt_text:?}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+        "restarted follow-up redelivers the stopped message's image attachment: {blocks:?}"
+    );
+
+    // Consumption clears the durable mirror (async, from the worker task):
+    // a restart after the follow-up turn must not redeliver a second time.
+    let mut cleared = false;
+    for _ in 0..50 {
+        let rows = mgr2
+            .services
+            .store
+            .load_all_stop_redeliveries()
+            .await
+            .expect("load stop redeliveries");
+        if rows.is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(cleared, "consumed payload's persisted row is cleared");
+}
+
+/// Companion gate for intent-hq/monorepo#1899: a hard `agent.stop` landing
+/// while a payload is armed drops BOTH the in-memory payload and its durable
+/// mirror — a restart after the stop must not resurrect it.
+#[tokio::test]
+async fn hard_stop_clears_persisted_stop_redelivery() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-clear"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // Re-track (the fallback stop removed the handle) and hard-stop.
+    track(&mgr, &id);
+    assert!(mgr.stop(&id).await);
+
+    assert!(
+        !mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "hard stop drops the in-memory payload"
+    );
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert!(
+        rows.is_empty(),
+        "hard stop clears the persisted payload: {rows:?}"
+    );
+}
+
+/// Regression for the consume-gap race (intent-hq/monorepo#1899 review):
+/// `spawn_worker` removes the map entry synchronously but clears the durable
+/// row from the spawned (abortable) worker task. A hard stop landing in that
+/// gap sees no map entry, so it must sync the store UNCONDITIONALLY — a
+/// change-gated sync would skip the clear, leaving a stale row that a later
+/// restart rehydrates (double redelivery of an already-consumed message).
+#[tokio::test]
+async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-gap"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // Simulate the consume gap: the map entry is gone (spawn_worker removed
+    // it) but the durable row still exists (the worker task's clear never
+    // ran because the hard stop aborts it).
+    mgr.stop_redelivery.lock().unwrap().remove(&id);
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(rows.len(), 1, "stale persisted row set up: {rows:?}");
+
+    track(&mgr, &id);
+    assert!(mgr.stop(&id).await);
+
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert!(
+        rows.is_empty(),
+        "hard stop clears the stale persisted row even with no map entry: {rows:?}"
+    );
+}
+
 /// Shutdown-capture companion: a graceful daemon shutdown landing while the
 /// live-turn slot is open but EMPTY persists the empty interrupted row
 /// stamped `daemon_shutdown` (every interruption leaves a marker row).
@@ -10781,10 +11265,13 @@ mod question_hold_gates {
     }
 
     /// Automatic `send_message` parks in the queue with `heldForQuestions`
-    /// and never claims the in-flight slot; a User send passes through —
-    /// but a PLAIN user send does not RELEASE the hold: the automatic entry
-    /// stays parked across that turn, and only the answer-tagged send drains
-    /// it (the persistent-pendingness contract, spec §Decisions 1-3).
+    /// and never claims the in-flight slot; a User send passes through the
+    /// hold gate — and since monorepo#1791 a user send arriving while the
+    /// hold has PARKED entries converts to a user-origin enqueue + drain
+    /// kick, so the parked automatic backlog rides the user-led combined
+    /// flush turn FIFO instead of being bypassed. A plain user send still
+    /// does not RELEASE the hold (no answer tag): later automatic sends
+    /// keep parking until the answer-tagged send clears the marker.
     #[tokio::test]
     async fn automatic_send_held_user_send_not() {
         let script = mock_agent_script();
@@ -10821,10 +11308,12 @@ mod question_hold_gates {
         // Hold still active (no user row was appended).
         assert!(mgr.services.question_hold_active(&id).await);
 
-        // A PLAIN user-origin send is NOT held: it claims the slot and drives
-        // a real turn (mock provider). It carries no answer tag, so the
-        // pending-questions marker survives it — the automatic entry is still
-        // parked when the turn (and its end-of-turn drain) finishes.
+        // A PLAIN user-origin send is NOT held — but with a parked backlog
+        // it converts to a user-origin enqueue + drain kick (monorepo#1791):
+        // the batch flush delivers the parked automatic entry FIFO in the
+        // SAME combined turn as the user message instead of bypassing it.
+        // No answer tag rode along, so the pending-questions marker
+        // survives the combined turn.
         let plain = TurnOptions {
             origin: MessageOrigin::User,
             ..TurnOptions::default()
@@ -10845,29 +11334,76 @@ mod question_hold_gates {
             None,
             "user sends bypass the hold gate"
         );
-        assert_eq!(r["queued"], json!(false), "user send starts a turn");
+        assert_eq!(
+            r["queued"],
+            json!(true),
+            "user send with a parked backlog converts to enqueue + flush"
+        );
         timeout(Duration::from_secs(10), async {
             loop {
-                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("plain user turn completes");
+        .expect("combined flush turn completes");
         assert!(
             mgr.services.question_hold_active(&id).await,
             "a plain user message does not resolve the pending Q&A"
         );
-        assert_eq!(
-            mgr.services.queue_snapshot(&id).len(),
-            1,
-            "automatic entry stays parked across the user turn"
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "the parked automatic entry rode the user-led flush turn"
+        );
+        // FIFO: the older parked wake's user row precedes the newer user
+        // message's row in the transcript.
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row_idx = |needle: &str| {
+            messages.iter().position(|m| {
+                m.role == "user"
+                    && m.content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                    })
+            })
+        };
+        let wake_idx = row_idx("auto wake").expect("parked wake row landed");
+        let aside_idx = row_idx("unrelated aside").expect("user row landed");
+        assert!(
+            wake_idx < aside_idx,
+            "older parked wake drains FIFO ahead of the newer user message: \
+             wake={wake_idx} aside={aside_idx}"
         );
 
-        // The ANSWER releases the hold, and the worker's end-of-turn drain
-        // then delivers the parked automatic message.
+        // A LATER automatic send still parks — the hold is armed until the
+        // answer or dismissal.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake 2".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("second held send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+        assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
+
+        // The ANSWER releases the hold; with a parked backlog it converts to
+        // the same enqueue + flush, draining the parked wake alongside it.
         let answer = TurnOptions {
             origin: MessageOrigin::User,
             message_metadata: Some(answer_metadata(&asked)),
@@ -10894,6 +11430,191 @@ mod question_hold_gates {
             !mgr.services.question_hold_active(&id).await,
             "hold cleared"
         );
+    }
+
+    /// monorepo#1791 regression: an automatic `after_all` settlement wake
+    /// parked by the hold on an IDLE agent must not be bypassed by a newer
+    /// plain user message — the user send converts to a user-origin enqueue
+    /// and the flush delivers the wake FIFO in the same combined turn.
+    #[tokio::test]
+    async fn parked_settlement_wake_drains_with_newer_user_message() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr, _bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-qh-1791"), AgentId::from("a-qh-1791"));
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        arm_hold(&mgr, &ws, &id).await;
+
+        // The settlement wake (automatic) parks at position 0 on the idle
+        // agent — the monorepo#1791 incident shape.
+        let wake = "[WORKSPACE EVENTS] All 3 delegated child agent(s) settled";
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                wake.to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+
+        // The user's later "check" must NOT run past the parked wake.
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "check".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("check send");
+        assert_eq!(r["queued"], json!(true), "converted to enqueue + flush");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("combined turn completes");
+        assert!(
+            mgr.services.queue_snapshot(&id).is_empty(),
+            "settlement wake no longer stuck in the queue"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let row_idx = |needle: &str| {
+            messages.iter().position(|m| {
+                m.role == "user"
+                    && m.content.as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["text"].as_str().is_some_and(|t| t.contains(needle)))
+                    })
+            })
+        };
+        let wake_idx = row_idx("delegated child agent(s) settled").expect("wake row landed");
+        let check_idx = row_idx("check").expect("check row landed");
+        assert!(
+            wake_idx < check_idx,
+            "settlement wake delivered FIFO ahead of the newer user message: \
+             wake={wake_idx} check={check_idx}"
+        );
+    }
+
+    /// The monorepo#1791 conversion requires the `all` flush mode: without
+    /// batching no combined turn exists to carry the parked entries, so a
+    /// user send under hold stays a DIRECT send (documented bypass) and the
+    /// parked automatic entry stays parked — the pre-fix contract, pinned
+    /// here for the non-default `off` mode.
+    #[tokio::test]
+    async fn user_send_under_hold_stays_direct_when_flush_mode_off() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[("agents.flushQueuedMessages".to_string(), json!("off"))])
+            .expect("disable flush");
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+        let mgr = Arc::new(AgentManager::new(services, sink, 8));
+        let (ws, id) = (
+            WorkspaceId::from("ws-qh-1791-off"),
+            AgentId::from("a-qh-1791-off"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        arm_hold(&mgr, &ws, &id).await;
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "auto wake".to_string(),
+                None,
+                TurnOptions::default(),
+            )
+            .await
+            .expect("wake send");
+        assert_eq!(r["heldForQuestions"], json!(true));
+
+        let r = mgr
+            .clone()
+            .send_message(
+                id.clone(),
+                ws.clone(),
+                "check".to_string(),
+                None,
+                TurnOptions {
+                    origin: MessageOrigin::User,
+                    ..TurnOptions::default()
+                },
+            )
+            .await
+            .expect("check send");
+        assert_eq!(
+            r["queued"],
+            json!(false),
+            "no combined turn exists in `off` mode — the direct send stands"
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("direct turn completes");
+        let snapshot = mgr.services.queue_snapshot(&id);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "the automatic entry stays parked under the hold (no batch to ride)"
+        );
+        assert_eq!(snapshot[0]["content"], json!("auto wake"));
     }
 
     /// `try_drain_queue` refuses to drain while the hold is active, and

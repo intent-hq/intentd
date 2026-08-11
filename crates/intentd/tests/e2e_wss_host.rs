@@ -1481,6 +1481,34 @@ async fn host_provider_discovery_over_wss() {
             "only the pi row carries CLI verdict fields: {p}"
         );
     }
+    // cortex is un-gated (monorepo#1902): its row must carry no gatedOff.
+    // The env-var gate mechanism stays wire-covered by mock (the daemon env
+    // above sets no MOCK_AGENT_SCRIPT_PATH), which reports gatedOff and skips
+    // binary probing entirely (installed: false, no resolvedPath).
+    let cortex = providers
+        .iter()
+        .find(|p| p["id"] == "cortex")
+        .expect("cortex must be in the discovery payload");
+    assert!(
+        cortex.get("gatedOff").is_none(),
+        "cortex is un-gated and must omit gatedOff: {cortex}"
+    );
+    let mock = providers
+        .iter()
+        .find(|p| p["id"] == "mock")
+        .expect("mock must be in the discovery payload");
+    assert!(
+        mock["gatedOff"].is_string(),
+        "mock without MOCK_AGENT_SCRIPT_PATH must report gatedOff: {mock}"
+    );
+    assert_eq!(
+        mock["installed"], false,
+        "gated rows are never probed: {mock}"
+    );
+    assert!(
+        mock.get("resolvedPath").is_none(),
+        "gated rows carry no resolvedPath: {mock}"
+    );
 
     drop(daemon);
 }

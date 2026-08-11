@@ -82,6 +82,18 @@ pub enum Error {
     /// text unchanged from the pre-structured shape.
     #[error("internal error: {detail}")]
     VoiceNotConfigured { detail: String },
+
+    /// The TCP (WSS) listener is not running, so `pairing.getInfo` has no
+    /// port to embed in the pairing payload. Surfaces as `-32603` with the
+    /// same human message as the previous `Unsupported` shape plus
+    /// machine-readable `error.data = { code: "listener-down" }` so
+    /// `intentd pair` stops matching on prose (monorepo#1822).
+    #[error(
+        "unsupported: TCP listener is not running — ensure the WSS listener is enabled \
+         (server.wsApi.enabled) and started successfully (check daemon logs for bind \
+         errors, e.g. port already in use) before pairing"
+    )]
+    ListenerDown,
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -148,7 +160,7 @@ impl Error {
                 | CloneErrorCategory::Network
                 | CloneErrorCategory::Other => -32603,
             },
-            Error::Internal(_) | Error::VoiceNotConfigured { .. } => -32603,
+            Error::Internal(_) | Error::VoiceNotConfigured { .. } | Error::ListenerDown => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
             Error::ExecutionEnvironmentUnavailable { .. } => -32602,

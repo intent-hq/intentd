@@ -2258,10 +2258,11 @@ async fn dispatch(
         "github.branches.list" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
+            let prefix = opt_str(params, "prefix");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_branches_list(owner, repo, limit, next_token)
+                .github_branches_list(owner, repo, prefix, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2713,6 +2714,30 @@ async fn dispatch(
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "debug.sampleStacks" => {
+            // Point-in-time sample of the daemon's own thread stacks
+            // (PROTOCOL §5.43, monorepo#1755); no workspaceId — the daemon
+            // process is global. Both params are optional; out-of-range
+            // values are clamped in the service layer, but a present
+            // non-numeric value is a caller error.
+            for name in ["durationMs", "frequencyHz"] {
+                if params
+                    .get(name)
+                    .is_some_and(|v| !v.is_number() && !v.is_null())
+                {
+                    return Err(invalid_params(format!(
+                        "invalid params: {name} must be a number"
+                    )));
+                }
+            }
+            let duration_ms = opt_int(params, "durationMs");
+            let frequency_hz = opt_int(params, "frequencyHz");
+            let r = api
+                .debug_sample_stacks(duration_ms, frequency_hz)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "providers.catalog" => {
             // The static provider registry (monorepo#928); no params, no
             // workspaceId — the registry is compiled-in daemon data.
@@ -2991,6 +3016,17 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
             api.file_stat(ws, path).await.map_err(domain_to_rpc)
+        }
+        "file.placeAttachment" => {
+            // Exactly-one-of `data` / `sourcePath` is validated in the service
+            // (→ -32602); the router only enforces the always-required params.
+            let ws = require_ws_note(params)?;
+            let file_name = require_str_param(params, "fileName")?;
+            let data = opt_str(params, "data");
+            let source_path = opt_str(params, "sourcePath");
+            api.file_place_attachment(ws, file_name, data, source_path)
+                .await
+                .map_err(domain_to_rpc)
         }
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;

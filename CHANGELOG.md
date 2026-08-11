@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.7] - 2026-08-11
+
+### 🚀 Features
+
+- Suppress unread + notification signals for archived workspaces ([#1075](https://github.com/intent-hq/intentd/pull/1075))
+- *(cli)* Merge token into pair with labeled pairing output ([#1074](https://github.com/intent-hq/intentd/pull/1074))
+
+### 🐛 Bug Fixes
+
+- CompletionReport idle settles after_all group without retiring PR monitors/hooks ([#1079](https://github.com/intent-hq/intentd/pull/1079))
+
+### 📚 Documentation
+
+- Add closeTab to the browser.exec action-catalog help text ([#1077](https://github.com/intent-hq/intentd/pull/1077))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump whoami from 1.6.1 to 2.1.2 ([#964](https://github.com/intent-hq/intentd/pull/964))
+- Bump getrandom from 0.2.17 to 0.4.2 ([#962](https://github.com/intent-hq/intentd/pull/962))
+- Update Cargo.toml dependencies
+
+
+## [0.6.6] - 2026-08-10
+
+### 🚀 Features
+
+- Real streaming progress for cache ensure + submodules ([#1069](https://github.com/intent-hq/intentd/pull/1069))
+- Remove the cortex feature-code gate ([#1068](https://github.com/intent-hq/intentd/pull/1068))
+- Cancel active PR monitors in the workspace.archive sweep ([#1067](https://github.com/intent-hq/intentd/pull/1067))
+- Machine-readable listener-down discriminator on pairing.getInfo ([#1065](https://github.com/intent-hq/intentd/pull/1065))
+- Ls-remote fallback for github.branches.listCached ([#1072](https://github.com/intent-hq/intentd/pull/1072))
+
+### 🐛 Bug Fixes
+
+- Non-blocking cached-branch read during in-flight clone ([#1071](https://github.com/intent-hq/intentd/pull/1071))
+
+### 🧪 Testing
+
+- *(intentd)* WSS e2e for create-scoped progress frames ([#1073](https://github.com/intent-hq/intentd/pull/1073))
+
+
+## [0.6.5] - 2026-08-10
+
+### 🚀 Features
+
+- Add uncached host.checkNode and host.checkGh fast-path methods ([#1064](https://github.com/intent-hq/intentd/pull/1064))
+- ProgressId plumbing + unified provisioning progress for workspace.create ([#1062](https://github.com/intent-hq/intentd/pull/1062))
+- Gate ws.app.question.ask to top-level agents ([#1063](https://github.com/intent-hq/intentd/pull/1063))
+- Make workspace.create setupScript param execute-only (no config write) ([#1066](https://github.com/intent-hq/intentd/pull/1066))
+
+### 🐛 Bug Fixes
+
+- Redeliver a zero-output stopped turn's user message on the next turn ([#1058](https://github.com/intent-hq/intentd/pull/1058))
+- Drain parked automatic queue entries FIFO with user deliveries under a question hold ([#1059](https://github.com/intent-hq/intentd/pull/1059))
+
+
+## [0.6.4] - 2026-08-10
+
+### 🚀 Features
+
+- Add debug.sampleStacks RPC for in-process daemon stack sampling ([#1057](https://github.com/intent-hq/intentd/pull/1057))
+
+### 🐛 Bug Fixes
+
+- Spawn CLI auth probes with the enhanced PATH; treat exit 127 as probe failure ([#1056](https://github.com/intent-hq/intentd/pull/1056))
+- Exit quietly on EPIPE when a one-shot CLI's stdout pipe closes early ([#1055](https://github.com/intent-hq/intentd/pull/1055))
+- Batch script.list bootstrap persists to stay within SQL statement budget ([#1054](https://github.com/intent-hq/intentd/pull/1054))
+
+### 🧪 Testing
+
+- *(services)* Deterministic pause barrier for skills_watcher resume catch-up test ([#1053](https://github.com/intent-hq/intentd/pull/1053))
+- *(intentd)* Pure-liveness deadlines for settings live-reload e2e ([#1052](https://github.com/intent-hq/intentd/pull/1052))
+
+
 ## [0.6.3] - 2026-08-09
 
 ### 🚀 Features

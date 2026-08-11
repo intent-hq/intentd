@@ -191,6 +191,7 @@ impl SourceControl for RecordingForge {
         &self,
         _: &str,
         _: &str,
+        _: Option<&str>,
         _: PageParams,
     ) -> ScResult<Page<Branch>> {
         unimplemented!()

@@ -2660,11 +2660,58 @@ async fn wss_sandbox_image_check() {
     srv.ws.stop().await;
 }
 
+/// `debug.sampleStacks` (PROTOCOL §5.43, monorepo#1755): point-in-time
+/// sample of the daemon's own thread stacks — no workspaceId, both params
+/// optional and clamped server-side. Asserts the documented result shape
+/// (`report` non-empty string, echoed effective `durationMs`/`frequencyHz`,
+/// numeric `sampleCount`/`distinctStacks`) over the real WSS transport, plus
+/// the `-32602` caller error for a non-numeric param. Unix-only capture —
+/// these test hosts are Unix, so the success path is exercised directly.
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_debug_sample_stacks_returns_report() {
+    let srv = start(WsOptions::default()).await;
+
+    // durationMs below the 100ms floor is clamped, keeping the test fast.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"debug.sampleStacks","params":{"durationMs":1,"frequencyHz":99}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    let result = resp["result"].as_object().expect("result is an object");
+    let report = result["report"].as_str().expect("report is a string");
+    assert!(
+        report.contains("intentd stack sample"),
+        "report carries the header even with zero samples: {resp}"
+    );
+    assert_eq!(result["durationMs"], 100, "clamped to the 100ms floor");
+    assert_eq!(result["frequencyHz"], 99);
+    assert!(result["sampleCount"].is_number(), "sampleCount: {resp}");
+    assert!(
+        result["distinctStacks"].is_number(),
+        "distinctStacks: {resp}"
+    );
+
+    // A present non-numeric param is a caller error, not a silent default.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"debug.sampleStacks","params":{"durationMs":"long"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602, "non-numeric param: {resp}");
+
+    srv.ws.stop().await;
+}
+
 /// `providers.catalog` (monorepo#928): no params, no workspaceId — the
 /// provider registry is compiled-in daemon data. Asserts the documented
 /// result shape: one row per `ACP_PROVIDERS` entry in registry order,
 /// daemon-evaluated `visible` with the raw gating fields passed through
-/// (cortex's feature code always gates — default-deny), and no default
+/// (mock's env-var gate; cortex is un-gated — monorepo#1902), and no default
 /// designation or tier metadata anywhere in the payload.
 #[tokio::test]
 async fn wss_providers_catalog_round_trip() {
@@ -2728,13 +2775,15 @@ async fn wss_providers_catalog_round_trip() {
         );
     }
 
-    // Gating: cortex's feature code always gates (the daemon stores no
-    // feature-code enablement — default-deny), with the raw field passed
-    // through; ungated providers are visible.
+    // Gating: cortex is un-gated (monorepo#1902) — visible, with no gating
+    // fields on the row; ungated providers are visible.
     let cortex = &providers[3];
     assert_eq!(cortex["shortName"], "Cortex");
-    assert_eq!(cortex["visible"], Value::Bool(false));
-    assert_eq!(cortex["requiresFeatureCode"].as_str(), Some("cortex"));
+    assert_eq!(cortex["visible"], Value::Bool(true));
+    assert!(
+        cortex.get("requiresFeatureCode").is_none(),
+        "cortex must carry no requiresFeatureCode: {resp}"
+    );
     let auggie = &providers[0];
     assert_eq!(auggie["shortName"], "Auggie");
     assert_eq!(auggie["visible"], Value::Bool(true));
@@ -3254,7 +3303,8 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the empty
     // static fallback (`source: "static"` + warning, never an error); cortex
-    // is feature-code gated (empty list + warning under its own source tag).
+    // is un-gated (monorepo#1902) and serves an open-gate empty list with no
+    // warning under its own source tag.
     let srv = start(WsOptions::default()).await;
 
     let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
@@ -3297,13 +3347,11 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .expect("models")
         .is_empty());
     assert!(
-        resp["result"]["warning"]
-            .as_str()
-            .expect("warning")
-            .contains("Cortex"),
-        "{resp}"
+        resp["result"].get("warning").is_none(),
+        "open gate ⇒ no warning: {resp}"
     );
-    // Gated empty success is fresh, not stale: same exact key set.
+    // Open-gate empty success is fresh, not stale: exactly the documented
+    // keys, with no warning and no stale flag.
     let mut keys: Vec<_> = resp["result"]
         .as_object()
         .expect("result object")
@@ -3311,11 +3359,7 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .cloned()
         .collect();
     keys.sort();
-    assert_eq!(
-        keys,
-        ["models", "providerId", "source", "warning"],
-        "{resp}"
-    );
+    assert_eq!(keys, ["models", "providerId", "source"], "{resp}");
 
     // Legacy path with only `forceRefresh` (no providerId): still routes and
     // keeps the legacy shape. On a fresh daemon there is no last-good cache
@@ -4228,6 +4272,34 @@ async fn wss_host_status_override_forces_local() {
         resp["result"]["locality"], "local",
         "override forces local over WSS (§5.14)"
     );
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn wss_host_check_node_and_check_gh_answered_on_wss() {
+    // host.checkNode / host.checkGh (§5.14, protocol 6.4) ride the same
+    // cross-transport host.* fast-path as host.checkGit: always answered on
+    // WSS with `{ available: false }` or `{ available: true, version, path }`
+    // — never an RPC error.
+    let srv = start(WsOptions::default()).await;
+    for (id, frame) in [
+        (7, r#"{"jsonrpc":"2.0","id":7,"method":"host.checkNode"}"#),
+        (8, r#"{"jsonrpc":"2.0","id":8,"method":"host.checkGh"}"#),
+    ] {
+        let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+        assert_eq!(resp["id"], id);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert!(resp.get("error").is_none(), "never an RPC error");
+        let r = &resp["result"];
+        assert!(r["available"].is_boolean(), "available is always present");
+        if r["available"] == true {
+            assert!(r["version"].is_string());
+            assert!(r["path"].is_string());
+        } else {
+            assert!(r.get("version").is_none());
+            assert!(r.get("path").is_none());
+        }
+    }
     srv.ws.stop().await;
 }
 
@@ -7158,6 +7230,77 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
         serde_json::json!({ "code": "invalid-params" }),
         "missing param must carry the invalid-params discriminator: {resp}"
     );
+
+    srv.ws.stop().await;
+}
+
+/// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
+/// monorepo#1948): a base64 payload lands in the workspace's
+/// `.intent/attachments/` directory and the response carries the
+/// workspace-relative `{ ok, path, fileName, size }`; a same-name re-place
+/// answers a collision-suffixed name; the `.intent/.gitignore` exclusion file
+/// is ensured; and the exactly-one-of `data`/`sourcePath` violation is the
+/// documented `-32602`.
+#[tokio::test]
+async fn wss_file_place_attachment_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-placeatt-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "ok": true,
+            "path": ".intent/attachments/trace.har",
+            "fileName": "trace.har",
+            "size": 26
+        }),
+        "result: {resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
+        b"oversized attachment bytes"
+    );
+    // The exclusion contract: the default `.intent/.gitignore` (ignore
+    // everything except config.json) was ensured on the way.
+    let gitignore =
+        std::fs::read_to_string(root.join(".intent/.gitignore")).expect("gitignore ensured");
+    assert!(gitignore.contains("*"), "gitignore content: {gitignore}");
+
+    // Same name again → collision-suffixed `trace-2.har`.
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    assert_eq!(resp2["result"]["fileName"], "trace-2.har", "{resp2}");
+    assert_eq!(
+        resp2["result"]["path"], ".intent/attachments/trace-2.har",
+        "{resp2}"
+    );
+
+    // Neither `data` nor `sourcePath` → -32602.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"x.bin"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
 
     srv.ws.stop().await;
 }

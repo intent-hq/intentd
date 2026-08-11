@@ -211,8 +211,8 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let _ = server.await;
 }
 
-/// DoD test (b): workspace.create with repo setupScript and no request script -> workspace record has it;
-/// request-supplied script wins.
+/// DoD test (b): workspace.create with repo setupScript and no request script -> readable
+/// via getSetupScript; a request-supplied script is execute-only and never persisted.
 #[tokio::test]
 async fn test_workspace_create_setup_script_fallback() {
     let db = TempDb::new();
@@ -292,7 +292,7 @@ async fn test_workspace_create_setup_script_fallback() {
         "updatedAt should be present (file mtime)"
     );
 
-    // Test 2: request-supplied script is written to repo config
+    // Test 2: request-supplied script is execute-only — NOT written to repo config
     let repo2 = create_test_repo_with_config(r#"{"setupScript": "npm install"}"#);
     let repo_path2 = repo2.0.to_str().unwrap();
 
@@ -316,7 +316,8 @@ async fn test_workspace_create_setup_script_fallback() {
         "workspace DB row should not have setupScript"
     );
 
-    // getSetupScript should return the explicit request-supplied value
+    // getSetupScript should return the committed repo-config value — the
+    // explicit request param is execute-only and never persisted (§5.1).
     let get_resp2 = call(
         &mut wr,
         &mut reader,
@@ -327,13 +328,13 @@ async fn test_workspace_create_setup_script_fallback() {
     .await;
     assert_eq!(
         get_resp2["result"]["setupScript"]["script"],
-        json!("yarn install"),
-        "getSetupScript should return request-supplied value"
+        json!("npm install"),
+        "getSetupScript should return the committed repo config value, not the request param"
     );
     assert_eq!(
         get_resp2["result"]["setupScript"]["generatedBy"],
         json!("user"),
-        "generatedBy should be user for explicit scripts"
+        "generatedBy should be user for repo config scripts"
     );
     assert!(
         get_resp2["result"]["setupScript"]["updatedAt"].is_number(),

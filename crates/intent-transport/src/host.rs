@@ -29,10 +29,11 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
 }
 
 /// The `host.*` capability-probe methods, once classified. `Status` is the
-/// original host probe (§5.14); `CheckGit`/`ListDirectory`/`CreateDirectory`/
+/// original host probe (§5.14); `CheckGit`/`CheckNode`/`CheckGh`/
+/// `ListDirectory`/`CreateDirectory`/
 /// `DirectoryStatus`/`CheckAuggie`/`FindBinary`/`ToolAvailability`/`Env`/
 /// `FindApp`/`ListInstalledEditors` are additive host-services that let the FE
-/// delegate Git detection, repo-folder browsing/creation, auggie-binary
+/// delegate Git/Node/gh detection, repo-folder browsing/creation, auggie-binary
 /// discovery, generic binary
 /// resolution, a batch tool-availability probe, the daemon's PATH/environment,
 /// macOS `.app` bundle lookup, and the cross-platform editor catalog to the
@@ -40,6 +41,8 @@ pub fn resolve_is_local(transport_local: bool, override_local: Option<bool>) -> 
 pub(crate) enum HostMethod {
     Status,
     CheckGit,
+    CheckNode,
+    CheckGh,
     ListDirectory,
     CreateDirectory,
     DirectoryStatus,
@@ -101,6 +104,8 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
     let method = match method {
         "host.status" => HostMethod::Status,
         "host.checkGit" => HostMethod::CheckGit,
+        "host.checkNode" => HostMethod::CheckNode,
+        "host.checkGh" => HostMethod::CheckGh,
         "host.listDirectory" => HostMethod::ListDirectory,
         "host.createDirectory" => HostMethod::CreateDirectory,
         "host.directoryStatus" => HostMethod::DirectoryStatus,
@@ -162,7 +167,8 @@ pub(crate) fn host_status_json(
 /// Handle a classified `host.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `is_local` is the resolved
 /// locality of the serving connection (§5.14). The host-services methods
-/// (`checkGit`/`listDirectory`/`createDirectory`/`directoryStatus`/
+/// (`checkGit`/`checkNode`/`checkGh`/`listDirectory`/`createDirectory`/
+/// `directoryStatus`/
 /// `checkAuggie`/`findBinary`/`toolAvailability`/`env`/`findApp`/
 /// `listInstalledEditors`) run their
 /// filesystem / subprocess work on a blocking thread so the async runtime stays
@@ -201,6 +207,18 @@ pub(crate) async fn handle(
         }
         HostMethod::CheckGit => {
             let result = tokio::task::spawn_blocking(host_ops::check_git)
+                .await
+                .unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::CheckNode => {
+            let result = tokio::task::spawn_blocking(host_ops::check_node)
+                .await
+                .unwrap_or_else(|_| json!({ "available": false }));
+            success_frame(id_echo, result)
+        }
+        HostMethod::CheckGh => {
+            let result = tokio::task::spawn_blocking(host_ops::check_gh)
                 .await
                 .unwrap_or_else(|_| json!({ "available": false }));
             success_frame(id_echo, result)

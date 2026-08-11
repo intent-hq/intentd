@@ -228,6 +228,17 @@ pub(crate) struct CloneJob {
     /// environment only — never argv, never logged.
     pub token: Option<String>,
     pub bus: EventBus,
+    /// Unified `workspace.create` progress reporter (PROTOCOL §5.1). When
+    /// set, every frame routes through the reporter — stderr percentages are
+    /// normalized into the 0–85 clone segment of the create's unified scale,
+    /// carry the create's `progressId`, and NO terminal frames are emitted
+    /// here (the create wrapper owns the exactly-one `git:clone:done`).
+    /// `None` keeps the legacy standalone `git.clone` framing exactly.
+    pub progress: Option<std::sync::Arc<crate::create_progress::CreateProgress>>,
+    /// Clone with `--recurse-submodules` so the checkout lands with populated
+    /// submodule work trees. Set by the `workspace.create` explicit-`clonePath`
+    /// arm; the standalone `git.clone` RPC keeps its historical plain clone.
+    pub recurse_submodules: bool,
 }
 
 /// Kick off a streaming clone on a background task and return immediately. The
@@ -288,19 +299,76 @@ fn build_clone_command(
     target_path: &Path,
     token: Option<&str>,
     inherited_config_parameters: Option<&str>,
+    recurse_submodules: bool,
 ) -> Command {
     let mut cmd = Command::new("git");
     for (key, value) in intent_git::auth::scoped_credential_env(token, inherited_config_parameters)
     {
         cmd.env(key, value);
     }
-    cmd.arg("clone")
-        .arg("--progress")
-        .arg(url)
+    cmd.arg("clone").arg("--progress");
+    if recurse_submodules {
+        cmd.arg("--recurse-submodules");
+    }
+    cmd.arg(url)
         .arg(target_path)
         .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
         .env("GIT_TERMINAL_PROMPT", "0");
     cmd
+}
+
+/// How [`run_clone`] emits its frames: the legacy standalone `git.clone`
+/// framing (raw stderr percentages, terminal frames owned here), or a
+/// `workspace.create` reporter (normalized percentages + `progressId`,
+/// terminal frames owned by the create wrapper — see [`CloneJob::progress`]).
+#[derive(Clone)]
+enum ProgressSink {
+    Legacy {
+        bus: EventBus,
+        ws: WorkspaceId,
+        request_id: String,
+    },
+    Create(std::sync::Arc<crate::create_progress::CreateProgress>),
+}
+
+impl ProgressSink {
+    async fn progress(&self, phase: &str, percent: u32, message: &str) {
+        match self {
+            ProgressSink::Legacy {
+                bus,
+                ws,
+                request_id,
+            } => {
+                publish(
+                    bus,
+                    ws,
+                    progress_event(ws, request_id, phase, percent, message, None),
+                )
+                .await;
+            }
+            ProgressSink::Create(reporter) => {
+                reporter.clone_progress(phase, percent, message).await
+            }
+        }
+    }
+
+    /// Legacy-only terminal done; the create wrapper owns the terminal frame
+    /// when a reporter is active (exactly-one `git:clone:done` per create).
+    async fn done(&self, ok: bool, error: Option<&str>, error_code: Option<CloneErrorCategory>) {
+        if let ProgressSink::Legacy {
+            bus,
+            ws,
+            request_id,
+        } = self
+        {
+            publish(
+                bus,
+                ws,
+                done_event(ws, request_id, ok, error, error_code, None),
+            )
+            .await;
+        }
+    }
 }
 
 async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
@@ -311,16 +379,21 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         target_path,
         token,
         bus,
+        progress,
+        recurse_submodules,
     } = job;
     let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+    let sink = match progress {
+        Some(reporter) => ProgressSink::Create(reporter),
+        None => ProgressSink::Legacy {
+            bus,
+            ws,
+            request_id,
+        },
+    };
 
     // Initial "starting" frame (parity with the FE's first tick).
-    publish(
-        &bus,
-        &ws,
-        progress_event(&ws, &request_id, "starting", 0, "Starting clone..."),
-    )
-    .await;
+    sink.progress("starting", 0, "Starting clone...").await;
 
     // Ensure a target-parent exists so `git clone` doesn't fail on a fresh
     // workspace path. Not fatal if it already exists.
@@ -337,6 +410,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         &target_path,
         token.as_deref(),
         inherited_config_parameters.as_deref(),
+        recurse_submodules,
     );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -354,12 +428,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("git spawn failed: {e}");
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             return Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -371,12 +440,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         None => {
             let _ = child.kill().await;
             let msg = "git stderr not piped".to_string();
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             return Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -384,12 +448,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
     };
 
-    let bus_reader = bus.clone();
-    let ws_reader = ws.clone();
-    let request_id_reader = request_id.clone();
-    let reader_task = tokio::spawn(async move {
-        stream_stderr(stderr, bus_reader, ws_reader, request_id_reader).await
-    });
+    let sink_reader = sink.clone();
+    let reader_task = tokio::spawn(async move { stream_stderr(stderr, sink_reader).await });
 
     // Wait for the child under a hard timeout so a stalled clone never wedges
     // the daemon. On timeout, reap the process group and emit `ok:false`.
@@ -399,13 +459,8 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
 
     match wait_result {
         Ok(Ok(status)) if status.success() => {
-            publish(
-                &bus,
-                &ws,
-                progress_event(&ws, &request_id, "complete", 100, "Clone complete!"),
-            )
-            .await;
-            publish(&bus, &ws, done_event(&ws, &request_id, true, None, None)).await;
+            sink.progress("complete", 100, "Clone complete!").await;
+            sink.done(true, None, None).await;
             Ok(())
         }
         Ok(Ok(status)) => {
@@ -415,12 +470,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             };
             let redacted = redact_credentials(&msg);
             let category = classified(&redacted);
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&redacted), category),
-            )
-            .await;
+            sink.done(false, Some(&redacted), category).await;
             Err(CloneFailure {
                 category,
                 detail: redacted,
@@ -428,12 +478,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
         Ok(Err(e)) => {
             let msg = format!("git wait failed: {e}");
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), None),
-            )
-            .await;
+            sink.done(false, Some(&msg), None).await;
             Err(CloneFailure {
                 category: None,
                 detail: msg,
@@ -445,12 +490,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
             // per the clone failure taxonomy (PROTOCOL §9.1).
             let msg = "git clone timed out".to_string();
             let category = classified(&msg);
-            publish(
-                &bus,
-                &ws,
-                done_event(&ws, &request_id, false, Some(&msg), category),
-            )
-            .await;
+            sink.done(false, Some(&msg), category).await;
             Err(CloneFailure {
                 category,
                 detail: msg,
@@ -492,19 +532,14 @@ fn kill_group(pid: u32, sig: nix::sys::signal::Signal) {
 /// Parse `git clone --progress` stderr line-by-line and publish one
 /// `git:clone:progress` per matched phase transition. Returns the final chunk
 /// of stderr text (best-effort) so a non-zero exit can surface a useful error.
-async fn stream_stderr<R>(
-    stderr: R,
-    bus: EventBus,
-    ws: WorkspaceId,
-    request_id: String,
-) -> Option<String>
+async fn stream_stderr<R>(stderr: R, sink: ProgressSink) -> Option<String>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(stderr);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let mut last_phase = String::from("starting");
-    let mut last_percent: u32 = 0;
+    let mut parser = SubmoduleAwareParser::for_clone();
+    let mut last_frame: Option<(String, u32, String)> = None;
     let mut tail: String = String::new();
     loop {
         buf.clear();
@@ -516,16 +551,18 @@ where
             Err(_) => break,
         };
         let text = String::from_utf8_lossy(&buf[..n]);
-        for (phase, percent, message) in parse_progress(&text) {
-            if phase != last_phase || percent > last_percent {
-                last_phase = phase.to_string();
-                last_percent = percent;
-                publish(
-                    &bus,
-                    &ws,
-                    progress_event(&ws, &request_id, phase, percent, &message),
-                )
-                .await;
+        for (phase, percent, message) in parser.parse(&text) {
+            // Message-aware dedup: submodule frames advance by message
+            // ("Cloning submodules (N/M)") even when the aggregate percent
+            // holds still, and per-phase percents never move backwards.
+            let key = (phase.to_string(), percent, message.clone());
+            let emit = match &last_frame {
+                Some((lp, lpct, lmsg)) => *lp != key.0 || *lmsg != key.2 || percent > *lpct,
+                None => true,
+            };
+            if emit {
+                last_frame = Some(key);
+                sink.progress(phase, percent, &message).await;
             }
         }
         // Keep a bounded tail (~4KiB) of stderr for error messages.
@@ -610,14 +647,13 @@ where
     }
 }
 
-/// Ported from the FE's stderr regex table: match one canonical phase per line.
-fn parse_progress(text: &str) -> Vec<(&'static str, u32, String)> {
-    let mut out = Vec::new();
-    // Static regex-lite scanners keep the dep footprint at zero. Each rule
-    // returns (phase, percent, human_message).
-    if text.contains("Cloning into") {
-        out.push(("starting", 0, "Cloning repository...".to_string()));
-    }
+/// The percent-bearing phase rules, ported from the FE's stderr regex table
+/// (one canonical phase per line). [`SubmoduleAwareParser`] layers the
+/// "Cloning into" boundary / registration handling on top. Static regex-lite
+/// scanners keep the dep footprint at zero; each rule pushes
+/// `(phase, percent, human_message)`. `Updating files:` is git ≥2.29's
+/// spelling of the checkout phase.
+fn scan_phase_percents(text: &str, out: &mut Vec<(&'static str, u32, String)>) {
     if text.contains("Counting objects") {
         out.push(("counting", 0, "Counting objects...".to_string()));
     }
@@ -633,7 +669,218 @@ fn parse_progress(text: &str) -> Vec<(&'static str, u32, String)> {
     if let Some(pct) = percent_after(text, "Checking out files:") {
         out.push(("checkout", pct, format!("Checking out files: {pct}%")));
     }
-    out
+    if let Some(pct) = percent_after(text, "Updating files:") {
+        out.push(("checkout", pct, format!("Updating files: {pct}%")));
+    }
+}
+
+/// Local-completion cap: a submodule's own phases top out at this share of
+/// its slice, leaving headroom for submodules discovered later — nested
+/// submodules register mid-flight, after earlier ones may already have
+/// finished — so the aggregate percent never pins at 100 early (the
+/// downstream reporter clamps monotonically and would otherwise freeze).
+const SUBMODULE_LOCAL_CAP: u32 = 95;
+
+/// Stateful, submodule-aware progress parser over git's `--progress` stderr.
+///
+/// A `git clone --recurse-submodules --progress` stream interleaves the
+/// superproject clone with one nested clone per submodule, each announced by
+/// its own `Cloning into '<path>'...` boundary and preceded by
+/// `Submodule '<name>' (<url>) registered for path '<path>'` registrations.
+/// This parser keeps the superproject phases as-is and folds everything after
+/// the first boundary into one aggregated `submodules` phase whose percent is
+/// distributed across the registered submodules ("Cloning submodules (N/M)").
+///
+/// The aggregate percent is allocated forward-only: each submodule gets a
+/// slice of the *remaining* distance to 100 (sized by how many known
+/// submodules are left), and its own clone phases fill the slice up to
+/// [`SUBMODULE_LOCAL_CAP`]. The series is monotone by construction even when
+/// the total grows mid-flight (nested registrations), so late submodules
+/// always show forward movement instead of being pinned by the reporter's
+/// monotonic clamp.
+///
+/// [`SubmoduleAwareParser::for_submodule_update`] parses a standalone
+/// `git submodule update --init --recursive --force --progress` stream
+/// instead: every frame is submodule-scoped, and `Submodule path '<p>':
+/// checked out` completions drive an "Updating submodules (N)" counter for
+/// already-cloned modules that print no clone phases (each completion
+/// advances halfway through the remaining distance — the total is unknown).
+///
+/// Known limitation: in streamed cache runs, stdout ("checked out" lines)
+/// and stderr ("Cloning into" boundaries) are drained by independent
+/// threads, so cross-stream ordering into the parser is not guaranteed —
+/// counts in the message can momentarily mis-sequence; percents stay
+/// monotone regardless.
+pub(crate) struct SubmoduleAwareParser {
+    /// Every frame is submodule-scoped (no superproject clone in front).
+    submodules_only: bool,
+    /// The superproject's own "Cloning into" boundary has been consumed.
+    seen_superproject: bool,
+    /// Submodules registered so far ("registered for path" lines). Nested
+    /// submodules register during their parent's clone, so this can still
+    /// grow after cloning starts.
+    registered: usize,
+    /// Submodule clones started so far ("Cloning into" boundaries).
+    started: usize,
+    /// Submodules checked out so far ("Submodule path '…': checked out").
+    checked_out: usize,
+    /// Monotone floor of the aggregate percent: everything at or below is
+    /// spoken for by finished (or superseded) submodules.
+    base: u32,
+    /// The in-flight submodule's `(lo, hi)` share of the aggregate percent.
+    slice: Option<(u32, u32)>,
+}
+
+impl SubmoduleAwareParser {
+    /// Parser for a full `git clone [--recurse-submodules] --progress` stream.
+    pub(crate) fn for_clone() -> Self {
+        Self::new(false)
+    }
+
+    /// Parser for a `git submodule update … --progress` stream.
+    pub(crate) fn for_submodule_update() -> Self {
+        Self::new(true)
+    }
+
+    fn new(submodules_only: bool) -> Self {
+        Self {
+            submodules_only,
+            seen_superproject: false,
+            registered: 0,
+            started: 0,
+            checked_out: 0,
+            base: 0,
+            slice: None,
+        }
+    }
+
+    /// Whether frames are currently submodule-scoped.
+    fn in_submodules(&self) -> bool {
+        self.submodules_only || self.started > 0
+    }
+
+    /// The highest percent a slice may emit: its local cap point.
+    fn capped_top((lo, hi): (u32, u32)) -> u32 {
+        lo + (hi - lo) * SUBMODULE_LOCAL_CAP / 100
+    }
+
+    /// Open the next submodule's slice: seal any in-flight slice at its cap,
+    /// then give the new one an equal share of the remaining distance to 100
+    /// (counting known-but-unstarted registrations). Integer widths can
+    /// collapse to zero near 100 — the slice then pins at `base`, still
+    /// monotone.
+    fn open_slice(&mut self) {
+        if let Some(slice) = self.slice.take() {
+            self.base = Self::capped_top(slice);
+        }
+        let remaining = (self.registered.saturating_sub(self.started) + 1) as u32;
+        let width = (100 - self.base) / remaining;
+        self.slice = Some((self.base, self.base + width));
+    }
+
+    /// Position `local` (a 0–100 weighted clone-phase percent) inside the
+    /// in-flight slice, capped at [`SUBMODULE_LOCAL_CAP`] of it. With no
+    /// slice open (phases arriving outside a boundary), hold at `base`.
+    fn slice_percent(&self, local: u32) -> u32 {
+        match self.slice {
+            Some((lo, hi)) => lo + (hi - lo) * local.min(SUBMODULE_LOCAL_CAP) / 100,
+            None => self.base,
+        }
+    }
+
+    /// A module finished ("checked out" completion): seal the in-flight
+    /// slice at its cap, or — with no slice open (already-cloned modules
+    /// print no clone phases at all) — advance halfway through the remaining
+    /// distance, since the total is unknown. Returns the new floor.
+    fn complete_one(&mut self) -> u32 {
+        self.base = match self.slice.take() {
+            Some(slice) => Self::capped_top(slice),
+            None => self.base + (100 - self.base) / 2,
+        };
+        self.base
+    }
+
+    /// Human message for clone boundaries and phases: "Cloning submodules
+    /// (N)" or, when the registration count is known, "Cloning submodules
+    /// (N/M)". Update-mode completions format "Updating submodules (N)"
+    /// directly at the call site.
+    fn submodule_message(&self) -> String {
+        if self.registered > 0 {
+            let total = self.registered.max(self.started);
+            format!(
+                "Cloning submodules ({}/{})",
+                self.started.clamp(1, total),
+                total
+            )
+        } else {
+            format!("Cloning submodules ({})", self.started.max(1))
+        }
+    }
+
+    /// Parse one stderr chunk (any mix of `\r`/`\n`-separated lines) into
+    /// `(phase, percent, message)` frames.
+    pub(crate) fn parse(&mut self, text: &str) -> Vec<(&'static str, u32, String)> {
+        let mut out = Vec::new();
+        for line in text.split(['\r', '\n']) {
+            if !line.trim().is_empty() {
+                self.parse_line(line, &mut out);
+            }
+        }
+        out
+    }
+
+    fn parse_line(&mut self, line: &str, out: &mut Vec<(&'static str, u32, String)>) {
+        if line.contains("registered for path") {
+            self.registered += 1;
+            return;
+        }
+        if line.contains("Cloning into") {
+            if !self.submodules_only && !self.seen_superproject {
+                self.seen_superproject = true;
+                out.push(("starting", 0, "Cloning repository...".to_string()));
+            } else {
+                self.started += 1;
+                self.open_slice();
+                out.push((
+                    "submodules",
+                    self.slice_percent(0),
+                    self.submodule_message(),
+                ));
+            }
+            return;
+        }
+        // `git submodule update` prints one completion line per module
+        // ("Submodule path 'sub': checked out '<sha>'"); count them so
+        // already-cloned modules (no clone phases at all) still move the
+        // percent and message forward.
+        if self.submodules_only && line.contains("Submodule path") && line.contains("checked out") {
+            self.checked_out += 1;
+            let pct = self.complete_one();
+            out.push((
+                "submodules",
+                pct,
+                format!("Updating submodules ({})", self.checked_out),
+            ));
+            return;
+        }
+        let mut frames = Vec::new();
+        scan_phase_percents(line, &mut frames);
+        for (phase, pct, msg) in frames {
+            if self.in_submodules() {
+                // Weight the submodule's own clone phase into its slice of
+                // the aggregate percent.
+                let (lo, hi) = crate::create_progress::clone_phase_segment(phase);
+                let local = crate::create_progress::map_segment(lo, hi, pct);
+                out.push((
+                    "submodules",
+                    self.slice_percent(local),
+                    self.submodule_message(),
+                ));
+            } else {
+                out.push((phase, pct, msg));
+            }
+        }
+    }
 }
 
 /// Return the integer percent immediately after `label` in `text`, e.g. for
@@ -667,14 +914,29 @@ fn percent_after(text: &str, label: &str) -> Option<u32> {
 
 /// Shared with the `workspace.create` cache-hydration arm in `lib.rs`, which
 /// streams the same `git:clone:progress` / `git:clone:done` frames while
-/// hydrating from the repo cache instead of a network clone.
+/// hydrating from the repo cache instead of a network clone. `progress_id`
+/// is the client-supplied `workspace.create` correlation id (PROTOCOL §5.1):
+/// present only on create-scoped frames whose request carried one — the key
+/// is omitted entirely otherwise, so legacy consumers are unaffected.
 pub(crate) fn progress_event(
     workspace_id: &WorkspaceId,
     request_id: &str,
     phase: &str,
     percent: u32,
     message: &str,
+    progress_id: Option<&str>,
 ) -> NewEvent {
+    let mut data = json!({
+        "requestId": request_id,
+        "phase": phase,
+        "percent": percent,
+        "message": message,
+    });
+    if let Some(pid) = progress_id {
+        data.as_object_mut()
+            .unwrap()
+            .insert("progressId".to_string(), json!(pid));
+    }
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -684,12 +946,7 @@ pub(crate) fn progress_event(
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: json!({
-            "requestId": request_id,
-            "phase": phase,
-            "percent": percent,
-            "message": message,
-        }),
+        data,
     }
 }
 
@@ -699,12 +956,18 @@ pub(crate) fn done_event(
     ok: bool,
     error: Option<&str>,
     error_code: Option<CloneErrorCategory>,
+    progress_id: Option<&str>,
 ) -> NewEvent {
     let mut data = json!({ "requestId": request_id, "ok": ok });
     if let Some(err) = error {
         data.as_object_mut()
             .unwrap()
             .insert("error".to_string(), json!(err));
+    }
+    if let Some(pid) = progress_id {
+        data.as_object_mut()
+            .unwrap()
+            .insert("progressId".to_string(), json!(pid));
     }
     // Machine-readable failure category (monorepo#825/#826): present only on
     // classified failures so existing consumers of the `error` prose are
@@ -1121,6 +1384,7 @@ mod tests {
             Path::new("/tmp/x"),
             Some(token),
             None,
+            false,
         );
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -1179,6 +1443,7 @@ mod tests {
             Path::new("/tmp/x"),
             Some("tok"),
             Some("'foo.bar=baz'"),
+            false,
         );
         let params = cmd
             .as_std()
@@ -1204,6 +1469,7 @@ mod tests {
                 Path::new("/tmp/x"),
                 token,
                 None,
+                false,
             );
             let std_cmd = cmd.as_std();
             let args: Vec<String> = std_cmd
@@ -1238,6 +1504,7 @@ mod tests {
             false,
             Some("terminal prompts disabled"),
             classified("terminal prompts disabled"),
+            None,
         );
         assert_eq!(ev.data["errorCode"], json!("auth-required"));
         let ev = done_event(
@@ -1246,9 +1513,10 @@ mod tests {
             false,
             Some("weird failure"),
             classified("weird failure"),
+            None,
         );
         assert!(ev.data.get("errorCode").is_none());
-        let ev = done_event(&ws, "r3", true, None, None);
+        let ev = done_event(&ws, "r3", true, None, None, None);
         assert!(ev.data.get("errorCode").is_none());
         // The daemon's own timeout message classifies as `network`.
         assert_eq!(classified("git clone timed out"), Some(C::Network));
@@ -1256,13 +1524,135 @@ mod tests {
 
     #[test]
     fn parse_progress_matches_phases() {
-        let ph = parse_progress("Receiving objects:  45% (10/22)");
+        let mut parser = SubmoduleAwareParser::for_clone();
+        let ph = parser.parse("Receiving objects:  45% (10/22)");
         assert_eq!(ph.len(), 1);
         assert_eq!(ph[0].0, "receiving");
         assert_eq!(ph[0].1, 45);
-        let ch = parse_progress("Checking out files: 100% (1/1), done.");
+        let ch = parser.parse("Checking out files: 100% (1/1), done.");
         assert_eq!(ch[0].0, "checkout");
         assert_eq!(ch[0].1, 100);
+        // git ≥2.29 spells the checkout phase "Updating files:".
+        let uf = parser.parse("Updating files:  60% (3/5)");
+        assert_eq!(uf[0].0, "checkout");
+        assert_eq!(uf[0].1, 60);
+    }
+
+    /// A recursive clone stream: superproject phases pass through untouched;
+    /// everything after the first submodule "Cloning into" boundary becomes
+    /// the aggregated `submodules` phase, with the registration count carried
+    /// in the message and the percent distributed across submodule slices.
+    #[test]
+    fn submodule_aware_parser_detects_boundaries() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        // Superproject boundary + phases.
+        let f = parser.parse("Cloning into 'repo'...");
+        assert_eq!(
+            f,
+            vec![("starting", 0, "Cloning repository...".to_string())]
+        );
+        let f = parser.parse("Receiving objects:  50% (5/10)");
+        assert_eq!(f[0].0, "receiving");
+        assert_eq!(f[0].1, 50);
+        // Registrations announce M before any submodule clone starts.
+        assert!(parser
+            .parse("Submodule 'liba' (https://x/liba.git) registered for path 'liba'")
+            .is_empty());
+        assert!(parser
+            .parse("Submodule 'libb' (https://x/libb.git) registered for path 'libb'")
+            .is_empty());
+        // First submodule boundary: N/M in the message, percent at its
+        // slice's start. Two known submodules split the remaining 0..100
+        // evenly: slice 1 is 0..50.
+        let f = parser.parse("Cloning into '/tmp/repo/liba'...");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].1, 0);
+        assert_eq!(f[0].2, "Cloning submodules (1/2)");
+        // Its clone phases stay inside slice 1: a finished checkout tops the
+        // slice at its 95% local cap → 47.
+        let f = parser.parse("Checking out files: 100% (4/4), done.");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].1, 47);
+        assert_eq!(f[0].2, "Cloning submodules (1/2)");
+        // Second boundary seals slice 1 and opens slice 2 (47..100).
+        let f = parser.parse("Cloning into '/tmp/repo/libb'...");
+        assert_eq!(f[0].1, 47);
+        assert_eq!(f[0].2, "Cloning submodules (2/2)");
+        let f = parser.parse("Receiving objects: 100% (8/8), done.");
+        assert_eq!(f[0].0, "submodules");
+        // receiving tops at 70 of the local weight → 47 + 53*70/100 = 84.
+        assert_eq!(f[0].1, 84);
+    }
+
+    /// Multi-line chunks parse line-by-line: registrations and a boundary in
+    /// one chunk yield the boundary frame with the right count.
+    #[test]
+    fn submodule_aware_parser_handles_multiline_chunks() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        let chunk = "Cloning into 'repo'...\n\
+                     Submodule 'a' (https://x/a.git) registered for path 'a'\n\
+                     Cloning into '/tmp/repo/a'...\n";
+        let frames = parser.parse(chunk);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, "starting");
+        assert_eq!(frames[1].0, "submodules");
+        assert_eq!(frames[1].2, "Cloning submodules (1/1)");
+    }
+
+    /// Submodule-update mode: no superproject boundary — every frame is
+    /// submodule-scoped, and "checked out" completions advance the percent
+    /// (halfway through the remaining distance) and message for modules that
+    /// stream no clone phases at all.
+    #[test]
+    fn submodule_aware_parser_update_mode() {
+        let mut parser = SubmoduleAwareParser::for_submodule_update();
+        let f = parser.parse("Cloning into '/ws/repo/liba'...");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].2, "Cloning submodules (1)");
+        let f = parser.parse("Submodule path 'liba': checked out 'abc123'");
+        assert_eq!(f[0].0, "submodules");
+        assert_eq!(f[0].2, "Updating submodules (1)");
+        let first = f[0].1;
+        // A pre-cloned module with no clone boundary of its own still moves
+        // the percent forward.
+        let f = parser.parse("Submodule path 'libb': checked out 'def456'");
+        assert_eq!(f[0].2, "Updating submodules (2)");
+        assert!(f[0].1 > first, "{} !> {first}", f[0].1);
+        assert!(f[0].1 < 100);
+    }
+
+    /// Nested submodules can register mid-flight (during their parent's
+    /// clone); the total in the message grows and the aggregate percent stays
+    /// non-decreasing — the parent's finished slice is sealed below 100, so
+    /// late modules still show forward movement.
+    #[test]
+    fn submodule_aware_parser_nested_registration() {
+        let mut parser = SubmoduleAwareParser::for_clone();
+        parser.parse("Cloning into 'repo'...");
+        parser.parse("Submodule 'a' (https://x/a.git) registered for path 'a'");
+        let mut last = 0;
+        let mut check = |frames: Vec<(&'static str, u32, String)>| -> (u32, String) {
+            let (_, pct, msg) = frames.into_iter().next().expect("one frame");
+            assert!(pct >= last, "{pct} regressed below {last}");
+            last = pct;
+            (pct, msg)
+        };
+        let (_, msg) = check(parser.parse("Cloning into '/tmp/repo/a'..."));
+        assert_eq!(msg, "Cloning submodules (1/1)");
+        // `a` finishes its own clone phases before the nested module is known:
+        // the local cap keeps its slice sealed below 100.
+        let (pct, _) = check(parser.parse("Checking out files: 100% (2/2), done."));
+        assert!(pct < 100);
+        // A nested submodule registers while `a` clones, then starts — the
+        // denominator grows and its frames keep advancing past the parent's.
+        parser.parse("Submodule 'inner' (https://x/i.git) registered for path 'a/inner'");
+        let (_, msg) = check(parser.parse("Cloning into '/tmp/repo/a/inner'..."));
+        assert_eq!(msg, "Cloning submodules (2/2)");
+        let (start, _) = check(parser.parse("Receiving objects:  50% (1/2)"));
+        let (end, _) = check(parser.parse("Resolving deltas: 100% (3/3), done."));
+        assert!(end > start, "nested module shows forward movement");
+        assert!(end <= 100);
     }
 
     /// Spawn a shell that forks a `sleep 30` grandchild in the same process

@@ -1357,7 +1357,7 @@ impl Services {
         fallback_ws: &WorkspaceId,
     ) {
         use intent_core::AgentStatus;
-        let (event_type, event_ws, status_value) =
+        let (event_type, event_ws, status_value, completion_report) =
             match self.store.get_agent_session(child_id).await {
                 Ok(session) => {
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
@@ -1408,12 +1408,18 @@ impl Services {
                         return;
                     };
                     let status = serde_json::to_value(session.status).unwrap_or_default();
-                    (event_type, session.workspace_id, status)
+                    (
+                        event_type,
+                        session.workspace_id,
+                        status,
+                        session.completion_report,
+                    )
                 }
                 Err(intent_store::Error::NotFound(_)) => (
                     intent_core::events::AGENT_DELETED,
                     fallback_ws.clone(),
                     serde_json::json!("deleted"),
+                    None,
                 ),
                 Err(e) => {
                     tracing::warn!(
@@ -1429,11 +1435,18 @@ impl Services {
         });
         // Idle-visibility: a synthesized idle carries the same
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
-        // `agent:idle` emit (each omitted when the child owns none) and the
+        // `agent:idle` emit (each omitted when the child owns none), the
         // same emit-time `isWaitingForOtherAgents` flag (pending-watch
         // derivation with the shared `report_delivered` filter, no 2-cycle
-        // guard — matching the live emit sites).
+        // guard — matching the live emit sites), and the persisted
+        // completionReport under the same dual keys (canonical + legacy) —
+        // which is also what lets the delivery pass apply the monorepo#1945
+        // report bypass to a boot-time synthesized idle.
         if event_type == intent_core::events::AGENT_IDLE {
+            if let Some(report) = &completion_report {
+                data["completionReport"] = serde_json::Value::String(report.clone());
+                data["report"] = serde_json::Value::String(report.clone());
+            }
             self.annotate_waiting_on_hooks(child_id, &mut data).await;
             self.annotate_waiting_on_pr_monitors(child_id, &mut data)
                 .await;
@@ -1623,6 +1636,19 @@ impl Services {
                             session.attention_request_kind.as_deref(),
                             session.attention_request_reason.as_deref(),
                         );
+                        // monorepo#1945: a non-empty persisted
+                        // completion_report (set by `agent.reportToParent`)
+                        // is the child's explicit completion signal — it
+                        // records at rehydration regardless of active hooks
+                        // or PR monitors (which stay armed; resumed monitors
+                        // keep polling and can still wake the settled child
+                        // later). Mirrors the live-path bypass in
+                        // `deliver_completion_to_watches` /
+                        // `record_group_completion_pre_publish`.
+                        let completion_reported = session
+                            .completion_report
+                            .as_deref()
+                            .is_some_and(|r| !r.is_empty());
                         // Idle-visibility deferral: an idle child that still
                         // owns active background hooks has not settled — do
                         // NOT record it at rehydration; resumed hooks keep
@@ -1635,6 +1661,7 @@ impl Services {
                                 .annotate_waiting_on_hooks(&child_id, &mut data)
                                 .await
                                 .is_empty()
+                            && !completion_reported
                         {
                             continue;
                         }
@@ -1652,6 +1679,7 @@ impl Services {
                                 .annotate_waiting_on_pr_monitors(&child_id, &mut data)
                                 .await
                                 .is_empty()
+                            && !completion_reported
                         {
                             continue;
                         }
@@ -1774,6 +1802,17 @@ impl Services {
         agent_id: &AgentId,
         event_data: &serde_json::Value,
     ) {
+        // monorepo#1945: an idle whose event data carries a non-empty
+        // completionReport (stamped by the emit sites from the session's
+        // persisted report, set exclusively by `agent.reportToParent`) is
+        // the child's EXPLICIT completion signal — it records regardless of
+        // active hooks or PR monitors, which stay armed (a later fire still
+        // wakes the settled child normally). Without this bypass a child
+        // that reported and idled while holding a TTL-less PR monitor would
+        // starve its group forever (the monitor only terminates on the
+        // merge decision the withheld aggregated wake was meant to inform).
+        // The agent-waiting deferral below is NOT bypassed (monorepo#1468).
+        let completion_reported = crate::event_completion_report(event_data).is_some();
         // Idle-visibility deferral: a hook-waiting idle (the emit sites stamp
         // `waitingOnHooks` onto the data before calling here) is NOT the
         // child's settlement — it will run again when a hook dispatches,
@@ -1781,10 +1820,11 @@ impl Services {
         // must not be recorded yet. The genuine completion (post-hook idle,
         // failure, deletion, or the external-cancel redelivery) records
         // through this path or the watch-delivery grouped branch later.
-        if event_data
-            .get("waitingOnHooks")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|hooks| !hooks.is_empty())
+        if !completion_reported
+            && event_data
+                .get("waitingOnHooks")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|hooks| !hooks.is_empty())
         {
             return;
         }
@@ -1793,7 +1833,7 @@ impl Services {
         // settled — its group completion must not be recorded yet. Not
         // stamped onto `event_data` (internal classification only), so
         // probed live here, matching the agent-waiting check below.
-        if !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
+        if !completion_reported && !self.active_pr_monitors_for_agent(agent_id).await.is_empty() {
             return;
         }
         // Agent-waiting deferral (issue intent-hq/monorepo#1468): an idle
@@ -1830,9 +1870,17 @@ impl Services {
             // monorepo#1016: annotate a suspected stall (idle, no report,
             // assigned task still incomplete) on the recorded line + event
             // data. Best-effort — lookup failures fail open.
-            let stall = match session.as_ref() {
-                Some(s) => self.stall_suspicion_for_session(s).await,
-                None => None,
+            // monorepo#1898: an emit-time payload carrying the report means
+            // the child DID report — suppress the suspicion even if the
+            // re-read session's persisted report was cleared since, so the
+            // recorded line/flag can never contradict its `Report:` clause.
+            let stall = if crate::event_carries_report(event_data) {
+                None
+            } else {
+                match session.as_ref() {
+                    Some(s) => self.stall_suspicion_for_session(s).await,
+                    None => None,
+                }
             };
             let attention = session.as_ref().map(|s| {
                 (

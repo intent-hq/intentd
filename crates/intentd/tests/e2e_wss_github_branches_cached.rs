@@ -1,16 +1,21 @@
 //! WSS end-to-end for `github.branches.listCached` (PROTOCOL §5.27): listing
-//! branches from the daemon's local repo cache with no network I/O. Asserts
-//! the success envelope from a warm cache (`{ cached: true, branches,
-//! defaultBranch }` with sorted names and `HEAD` excluded), the graceful cold
-//! cache (`{ cached: false, branches: [] }`, no `defaultBranch` key), and the
-//! `-32602` invalid-params envelope for missing/invalid `owner`/`repo`.
+//! branches from the daemon's local repo cache, with a one-shot `git
+//! ls-remote` fallback on a cache miss. Asserts the success envelope from a
+//! warm cache (`{ cached: true, source: "cache", branches, defaultBranch }`
+//! with sorted names and `HEAD` excluded), the fallback envelope from a cold
+//! cache with a reachable remote (`{ cached: false, source: "ls-remote",
+//! branches, defaultBranch }`), the graceful cold cache with an unreachable
+//! remote (`{ cached: false, branches: [] }`, no `defaultBranch` key), and
+//! the `-32602` invalid-params envelope for missing/invalid `owner`/`repo`.
 //! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
 //! self-signed fingerprint (the production transport path). The cache is
 //! seeded through the production `ensure_cached_repo` path from a local
 //! `file://` origin — then its `origin` remote is retargeted at the matching
 //! github.com URL, since the reader only serves slots whose recorded origin
-//! is `github.com/<owner>/<repo>` — so the test never touches the network.
-//! Gated on `git` being on PATH; skips cleanly otherwise.
+//! is `github.com/<owner>/<repo>` — and the ls-remote fallback is pointed at
+//! a hermetic `file://` fixture base via `with_branches_ls_remote_base`, so
+//! the test never touches the network. Gated on `git` being on PATH; skips
+//! cleanly otherwise.
 
 #![cfg(unix)]
 
@@ -196,7 +201,9 @@ struct Fixture {
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services resolve the repo
-/// cache under a hermetic workspaces root.
+/// cache under a hermetic workspaces root, and whose ls-remote fallback
+/// targets `file://<dir>/remotes/<owner>/<repo>.git` — hermetic fixtures
+/// instead of github.com, so a cold-cache read never leaves the machine.
 async fn boot() -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-gh-brcached-{}", &short[..8]));
@@ -209,6 +216,7 @@ async fn boot() -> Fixture {
     let services = Arc::new(
         Services::new(store)
             .with_workspaces_root(workspaces_root.clone())
+            .with_branches_ls_remote_base(file_url(&dir.join("remotes")))
             .with_event_bus(bus.clone()),
     );
     let api: Arc<dyn WorkspaceApi> = services;
@@ -324,14 +332,53 @@ async fn list_cached_returns_branches_from_warm_cache() {
     )
     .await;
     assert_eq!(r["cached"], json!(true));
+    assert_eq!(r["source"], json!("cache"));
     assert_eq!(r["branches"], json!(["feature-x", "main"]));
     assert_eq!(r["defaultBranch"], json!("main"));
 }
 
-/// A cold cache is a graceful `{ cached: false, branches: [] }` with no
-/// `defaultBranch` key — never an error.
+/// A cold cache with a reachable remote falls back to one `git ls-remote`:
+/// `{ cached: false, source: "ls-remote", branches, defaultBranch }` with
+/// sorted names and the default branch from the remote's `HEAD` symref.
+#[tokio::test]
+async fn list_cached_cold_cache_falls_back_to_ls_remote() {
+    if !gate() {
+        return;
+    }
+    let fx = boot().await;
+    // Materialise the fixture the fallback URL resolves to:
+    // `<dir>/remotes/acme/widget.git` (a plain repo works as a file:// remote).
+    let remotes = fx.workspaces_root.parent().unwrap().join("remotes");
+    let repo = remotes.join("acme").join("widget.git");
+    std::fs::create_dir_all(&repo).expect("mkdir fixture remote");
+    run_git(&["init", "-q", "-b", "main"], &repo);
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    run_git(&["add", "a.txt"], &repo);
+    run_git(&["commit", "-q", "-m", "seed"], &repo);
+    run_git(&["branch", "feature-x"], &repo);
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let r = wss_rpc(
+        &mut ws,
+        1,
+        "github.branches.listCached",
+        json!({ "owner": "acme", "repo": "widget" }),
+    )
+    .await;
+    assert_eq!(r["cached"], json!(false));
+    assert_eq!(r["source"], json!("ls-remote"));
+    assert_eq!(r["branches"], json!(["feature-x", "main"]));
+    assert_eq!(r["defaultBranch"], json!("main"));
+}
+
+/// A cold cache whose remote is also unreachable stays the graceful
+/// `{ cached: false, branches: [] }` with no `defaultBranch` key — never an
+/// error.
 #[tokio::test]
 async fn list_cached_cold_cache_is_graceful() {
+    if !gate() {
+        return;
+    }
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
@@ -347,6 +394,10 @@ async fn list_cached_cold_cache_is_graceful() {
     assert!(
         r.get("defaultBranch").is_none(),
         "cold cache must omit defaultBranch: {r}"
+    );
+    assert!(
+        r.get("source").is_none(),
+        "failed fallback must omit source: {r}"
     );
 }
 

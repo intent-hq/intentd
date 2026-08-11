@@ -760,10 +760,20 @@ impl QueuedMessage {
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
 /// quarantine park, append-failure auto-queue) still deliver the preempted
 /// message ahead of the interrupt message when the entry drains.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializes to camelCase JSON as the durable `agent_stop_redelivery.payload`
+/// shape (intent-hq/monorepo#1899): the zero-output stop-redelivery arm mirrors
+/// the in-memory payload write-through so it survives a daemon restart. The
+/// fields take `#[serde(default)]` so older payloads missing a later field
+/// still rehydrate.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
     pub image_blocks: Option<Value>,
+    #[serde(default)]
     pub file_blocks: Option<Value>,
 }
 
@@ -8436,15 +8446,21 @@ impl Services {
     /// EVERY ready-to-send entry in stored order — which IS the drain order
     /// (interrupt-priority first, then FIFO); `editing: true` entries stay
     /// queued — so the drain can deliver them as one combined provider turn.
-    /// `user_origin_only` mirrors the question-hold contract: while the hold
-    /// is active only user-origin entries are eligible; automatic entries
-    /// stay parked. Returns `None` — leaving the queue untouched — unless at
-    /// least `min_ready` entries match, so callers keep the single-entry
-    /// drain path byte-for-byte when too few messages are waiting.
+    /// `require_user_origin` mirrors the question-hold contract
+    /// (monorepo#1791): while the hold is active the flush fires ONLY when a
+    /// ready user-origin entry is present — a user delivery is starting a
+    /// turn anyway, so the parked automatic entries ride along FIFO instead
+    /// of being bypassed by the newer user message; with NO user-origin
+    /// entry ready the whole batch is a no-op and automatic entries stay
+    /// parked (an automatic delivery must never start a turn over the
+    /// pending Q&A). Returns `None` — leaving the queue untouched — unless
+    /// at least `min_ready` entries are ready, so callers keep the
+    /// single-entry drain path byte-for-byte when too few messages are
+    /// waiting.
     pub(crate) fn dequeue_ready_batch(
         &self,
         agent_id: &AgentId,
-        user_origin_only: bool,
+        require_user_origin: bool,
         min_ready: usize,
     ) -> Option<Vec<QueuedMessage>> {
         let mut guard = self
@@ -8452,14 +8468,17 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
-        let eligible = |m: &QueuedMessage| !m.editing && (!user_origin_only || m.user_origin);
-        if queue.iter().filter(|m| eligible(m)).count() < min_ready {
+        let ready = |m: &QueuedMessage| !m.editing;
+        if require_user_origin && !queue.iter().any(|m| ready(m) && m.user_origin) {
+            return None;
+        }
+        if queue.iter().filter(|m| ready(m)).count() < min_ready {
             return None;
         }
         let mut drained = Vec::new();
         let mut i = 0;
         while i < queue.len() {
-            if eligible(&queue[i]) {
+            if ready(&queue[i]) {
                 drained.push(queue.remove(i));
             } else {
                 i += 1;
@@ -8505,26 +8524,28 @@ impl Services {
     }
 
     /// Mode-dispatching batch dequeue for `agents.flushQueuedMessages`: `All`
-    /// defers to [`Services::dequeue_ready_batch`] (every ready entry,
-    /// `user_origin_only` under an active hold); `SystemOnly` defers to
+    /// defers to [`Services::dequeue_ready_batch`] (every ready entry;
+    /// `require_user_origin` under an active hold — the flush fires only
+    /// when a user-origin entry is ready, carrying the parked automatic
+    /// entries along FIFO, monorepo#1791); `SystemOnly` defers to
     /// [`Services::dequeue_system_only_batch`] (system-origin entries
     /// anywhere in the queue) but NEVER batches while a hold is active
-    /// (`user_origin_only`) — the hold's release is a user-origin entry,
+    /// (`require_user_origin`) — the hold's release is a user-origin entry,
     /// which `SystemOnly` by definition excludes; `Off` always returns `None`
     /// so every caller falls through to the single-entry FIFO path.
     pub(crate) fn dequeue_flush_batch(
         &self,
         agent_id: &AgentId,
         mode: intent_core::FlushQueuedMessagesMode,
-        user_origin_only: bool,
+        require_user_origin: bool,
         min_ready: usize,
     ) -> Option<Vec<QueuedMessage>> {
         match mode {
             intent_core::FlushQueuedMessagesMode::All => {
-                self.dequeue_ready_batch(agent_id, user_origin_only, min_ready)
+                self.dequeue_ready_batch(agent_id, require_user_origin, min_ready)
             }
             intent_core::FlushQueuedMessagesMode::SystemOnly => {
-                if user_origin_only {
+                if require_user_origin {
                     None
                 } else {
                     self.dequeue_system_only_batch(agent_id, min_ready)

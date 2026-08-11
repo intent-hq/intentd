@@ -1,6 +1,7 @@
-//! WSS e2e test for setup script methods: workspace.create writes to repo config,
-//! workspace.saveSetupScript writes/reads via repo config, workspace.getSetupScript
-//! reads from repo config with DB fallback (per AGENTS.md testing gate requirement).
+//! WSS e2e test for setup script methods: workspace.create's setupScript param is
+//! execute-only (never persisted), workspace.saveSetupScript writes/reads via repo
+//! config, workspace.getSetupScript reads from repo config with DB fallback (per
+//! AGENTS.md testing gate requirement).
 
 #![cfg(unix)]
 
@@ -337,7 +338,12 @@ where
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn create_test_repo() -> PathBuf {
+/// Committed `.intent/config.json` content used by `create_test_repo` — tests
+/// assert byte-identity against this exact string after `workspace.create`.
+const COMMITTED_CONFIG: &str = r#"{"setupScript": "pnpm install"}"#;
+
+/// Create a git repo without any committed `.intent/config.json`.
+fn create_bare_test_repo() -> PathBuf {
     let repo_path = std::env::temp_dir().join(format!("setup-repo-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&repo_path).expect("create temp repo dir");
     let status = std::process::Command::new("git")
@@ -372,13 +378,15 @@ fn create_test_repo() -> PathBuf {
         .expect("git commit spawn");
     assert!(status.success(), "git commit failed");
 
+    repo_path
+}
+
+fn create_test_repo() -> PathBuf {
+    let repo_path = create_bare_test_repo();
+
     // Commit a setup script in .intent/config.json to test inheritance
     std::fs::create_dir_all(repo_path.join(".intent")).expect("create .intent dir");
-    std::fs::write(
-        repo_path.join(".intent/config.json"),
-        r#"{"setupScript": "pnpm install"}"#,
-    )
-    .expect("write config");
+    std::fs::write(repo_path.join(".intent/config.json"), COMMITTED_CONFIG).expect("write config");
     let status = std::process::Command::new("git")
         .args(["add", ".intent/config.json"])
         .current_dir(&repo_path)
@@ -395,9 +403,9 @@ fn create_test_repo() -> PathBuf {
     repo_path
 }
 
-/// WSS e2e coverage for setup script methods: workspace.create with setupScript writes
-/// to repo config (not DB), saveSetupScript writes repo config, getSetupScript reads from
-/// repo config with legacy DB fallback. Verifies the §5.25 "repo config sole source" contract.
+/// WSS e2e coverage for setup script methods: workspace.create's setupScript is
+/// execute-only (no repo-config write, no DB write), saveSetupScript writes repo config,
+/// getSetupScript reads from repo config with legacy DB fallback (§5.1 / §5.25).
 #[tokio::test]
 async fn setup_script_repo_config_sole_source() {
     let data_dir = temp_data_dir();
@@ -436,22 +444,21 @@ async fn setup_script_repo_config_sole_source() {
         "workspace DB row should not have setupScript"
     );
 
-    // Assert the config file exists in the NEW WORKTREE (not repo root).
-    // The worktree is provisioned under <data_dir>/workspaces/<workspace_id>/<repo_slug>.
+    // Regression (monorepo#1870): the explicit setupScript param is execute-only.
+    // The committed `.intent/config.json` in the new worktree must be byte-identical
+    // to the repo's committed content — workspace.create performs no config write.
     let workspace_path = create_resp["result"]["workspace"]["worktreePath"]
         .as_str()
         .expect("worktreePath should be set");
     let worktree_config_path = PathBuf::from(workspace_path).join(".intent/config.json");
     assert!(
         worktree_config_path.exists(),
-        "worktree config should exist"
+        "committed worktree config should exist"
     );
     let config_content = std::fs::read_to_string(&worktree_config_path).expect("read config");
-    let config_json: Value = serde_json::from_str(&config_content).expect("parse config");
     assert_eq!(
-        config_json["setupScript"],
-        json!("npm install"),
-        "worktree config should have the explicit setupScript"
+        config_content, COMMITTED_CONFIG,
+        "worktree config must be byte-identical to the committed content (no create-path write)"
     );
 
     // Get server fingerprint and connect via WSS
@@ -464,7 +471,8 @@ async fn setup_script_repo_config_sole_source() {
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(port, cfg).await;
 
-    // Test workspace.getSetupScript returns the repo-config value
+    // Test workspace.getSetupScript returns the committed repo-config value —
+    // NOT the explicit create param, which was execute-only.
     let get_resp = wss_rpc(
         &mut ws,
         10,
@@ -477,8 +485,8 @@ async fn setup_script_repo_config_sole_source() {
     assert_eq!(get_resp["id"], json!(10), "echoed id");
     assert_eq!(
         get_resp["result"]["setupScript"]["script"],
-        json!("npm install"),
-        "getSetupScript should return repo config value"
+        json!("pnpm install"),
+        "getSetupScript should return the committed repo config value, not the create param"
     );
     assert_eq!(
         get_resp["result"]["setupScript"]["generatedBy"],
@@ -576,7 +584,8 @@ async fn setup_script_repo_config_sole_source() {
 }
 
 /// WSS e2e coverage for setup script execution: workspace.create with setupScript
-/// runs it in the worktree, env vars are visible, failing script doesn't fail create.
+/// runs it in the worktree (taking precedence over the committed repo-config script)
+/// without persisting it, env vars are visible, failing script doesn't fail create.
 #[tokio::test]
 async fn setup_script_executes_on_create() {
     let data_dir = temp_data_dir();
@@ -661,7 +670,9 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     )
     .expect("release setup script");
 
-    // Poll for the marker file (script execution is fire-and-forget, may take a moment)
+    // Poll for the marker file (script execution is fire-and-forget, may take a moment).
+    // The marker appearing also proves the explicit param took precedence over the
+    // committed repo-config script ("pnpm install") — exactly one script executes.
     let marker_path = PathBuf::from(workspace_path).join(format!(".setup-ran-{}", test_run_id));
     let mut found = false;
     for _ in 0..100 {
@@ -672,6 +683,16 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(found, "setup script should have created marker file");
+
+    // Regression (monorepo#1870): executing the explicit script must not write it
+    // anywhere — the committed worktree config stays byte-identical.
+    let config_after_exec =
+        std::fs::read_to_string(PathBuf::from(workspace_path).join(".intent/config.json"))
+            .expect("read worktree config");
+    assert_eq!(
+        config_after_exec, COMMITTED_CONFIG,
+        "explicit setupScript must be execute-only; committed config must be untouched"
+    );
 
     // Verify env vars were set correctly
     let env_file_path =
@@ -781,6 +802,55 @@ exit 1
         "buffer should report exit code 1: {failed_buffer:?}"
     );
     await_terminal_omitted(&mut wss, 900, &workspace_id2, &failed_terminal_id).await;
+
+    // Regression (monorepo#1870), file-absent case: creating from a repo with NO
+    // committed .intent/config.json and an explicit setupScript must not create
+    // the config file — the script still executes.
+    let bare_repo_path = create_bare_test_repo();
+    let bare_run_id = Uuid::new_v4().simple().to_string();
+    let bare_script = format!(
+        r#"#!/bin/sh
+touch "${{WORKTREE_PATH}}/.setup-bare-ran-{}"
+"#,
+        bare_run_id
+    );
+    let create_resp_bare = wss_rpc(
+        &mut wss,
+        4,
+        "workspace.create",
+        json!({
+            "title": "test-setup-bare",
+            "repositoryPath": bare_repo_path.to_string_lossy(),
+            "setupScript": bare_script
+        }),
+    )
+    .await;
+    assert_eq!(create_resp_bare["jsonrpc"], json!("2.0"));
+    assert_eq!(create_resp_bare["id"], json!(4));
+    let bare_workspace_path = create_resp_bare["result"]["workspace"]["worktreePath"]
+        .as_str()
+        .expect("worktreePath should be set");
+    let bare_marker_path =
+        PathBuf::from(bare_workspace_path).join(format!(".setup-bare-ran-{}", bare_run_id));
+    let mut bare_marker_found = false;
+    for _ in 0..100 {
+        if bare_marker_path.exists() {
+            bare_marker_found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        bare_marker_found,
+        "explicit setup script should have executed in the bare-config workspace"
+    );
+    assert!(
+        !PathBuf::from(bare_workspace_path)
+            .join(".intent/config.json")
+            .exists(),
+        "workspace.create must not create .intent/config.json for an explicit setupScript"
+    );
+    let _ = std::fs::remove_dir_all(&bare_repo_path);
 
     // Test that skipWorktree workspace does not execute the script
     let skip_marker_id = Uuid::new_v4().simple().to_string();

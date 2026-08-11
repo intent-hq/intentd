@@ -440,15 +440,17 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
     );
     let archived_at = archived["workspace"]["archivedAt"].clone();
 
-    // The archive both emits the §6.5 workspace:updated delta AND interrupts
-    // the parked turn (terminal agent:stream:end with stopReason
-    // "interrupted" — the keep-alive interrupt signature, distinguishable
-    // from a normal turn end which carries no stopReason). Relative order of
-    // the two events is unspecified; collect both.
+    // The archive emits the §6.5 workspace:updated delta, interrupts the
+    // parked turn (terminal agent:stream:end with stopReason "interrupted"
+    // — the keep-alive interrupt signature, distinguishable from a normal
+    // turn end which carries no stopReason), AND fires the STAB-28
+    // interrupt-path agent:idle. Relative order of the events is
+    // unspecified; collect all three.
     let mut archive_delta = None;
     let mut interrupt_end = None;
+    let mut interrupt_idle = None;
     for _ in 0..50 {
-        if archive_delta.is_some() && interrupt_end.is_some() {
+        if archive_delta.is_some() && interrupt_end.is_some() && interrupt_idle.is_some() {
             break;
         }
         let frame = wss_event(&mut sub, 30).await;
@@ -459,6 +461,9 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
             }
             Some("agent:stream:end") => {
                 interrupt_end = Some(event["data"].clone());
+            }
+            Some("agent:idle") => {
+                interrupt_idle = Some(event["data"].clone());
             }
             _ => {}
         }
@@ -489,6 +494,26 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
     assert_eq!(
         interrupt_end["stopReason"], "interrupted",
         "archive interrupts (keep-alive), so stream:end carries stopReason: {interrupt_end}"
+    );
+
+    // The STAB-28 interrupt-path idle fires AFTER the archive persisted
+    // `Archived`, so it carries the additive `workspaceArchived: true`
+    // suppression hint per PROTOCOL.md §6.5 (notification clients stay
+    // quiet for parked workspaces without a follow-up workspace.get).
+    let interrupt_idle = interrupt_idle.expect("archive interrupt emitted agent:idle");
+    assert_eq!(
+        interrupt_idle["agentId"].as_str().unwrap_or_default(),
+        agent_id,
+        "interrupt-path idle names the interrupted agent: {interrupt_idle}"
+    );
+    assert_eq!(
+        interrupt_idle["reason"], "interrupted",
+        "interrupt-path idle carries reason interrupted: {interrupt_idle}"
+    );
+    assert_eq!(
+        interrupt_idle["workspaceArchived"],
+        json!(true),
+        "idle in an archived workspace carries workspaceArchived: true: {interrupt_idle}"
     );
 
     // Session preserved: agent.list still serves the session (not deleted)
@@ -598,5 +623,23 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
     assert!(
         saw_resume_end,
         "resumed turn emits its own terminal stream:end"
+    );
+
+    // The resumed turn's settlement idle fires in the now-Active workspace:
+    // `workspaceArchived` is OMITTED (absent, never `false`) per the
+    // additive-field convention in PROTOCOL.md §6.5.
+    let mut resume_idle = None;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:idle" {
+            resume_idle = Some(event["data"].clone());
+            break;
+        }
+    }
+    let resume_idle = resume_idle.expect("resumed turn emitted its settlement agent:idle");
+    assert!(
+        resume_idle.get("workspaceArchived").is_none(),
+        "active workspace omits workspaceArchived (absent, never false): {resume_idle}"
     );
 }
