@@ -198,6 +198,11 @@ impl Services {
 /// branches, via `git rev-list --disk-usage --objects`. An estimate only —
 /// the real bundle also snapshots dirty state as WIP commits and recompresses
 /// on pack — and degrades to 0 when git or the refs are unavailable.
+///
+/// Sandbox branches are resolved in the worktree repo, while the bundler
+/// (`transfer_git`) fetches each branch from its sandbox's own repo — so for
+/// CoW sandboxes whose branch exists only in the sandbox repo, the estimate
+/// may undercount those refs.
 fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
     let mut refs: Vec<String> = vec!["HEAD".to_string()];
     for branch in sandbox_branches {
