@@ -2809,12 +2809,26 @@ pub enum GitFileStatus {
 /// One entry in [`GitStatus::files`] (`{ path, status, staged }`), mirroring the
 /// TS `FileStatus`. A file with both staged and unstaged changes yields two
 /// entries (matching the TS `parseStatusOutput`).
+///
+/// Submodule (gitlink) entries additionally carry `mode: "160000"` plus the
+/// old/new pin SHAs (monorepo#1739) so a client can route them to a dedicated
+/// presentation without probing `git.showFile`. All three fields are omitted
+/// for regular file entries (additive, backward-compatible).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStatus {
     pub path: String,
     pub status: GitFileStatus,
     pub staged: bool,
+    /// Octal tree-entry mode string, present only for gitlinks (`"160000"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Pre-change submodule pin SHA (`None` for a newly added submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_sha: Option<String>,
+    /// Post-change submodule pin SHA (`None` for a deleted submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_sha: Option<String>,
 }
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
