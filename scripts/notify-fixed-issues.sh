@@ -31,6 +31,21 @@
 #                    back to ambient gh auth when unset)
 set -euo pipefail
 
+# Callers run this script fail-soft (continue-on-error), so an unexpected
+# set -e exit would otherwise be invisible (intent-hq/monorepo#1921). Log
+# where it died before the shell unwinds — as a ::error:: annotation under
+# GitHub Actions so it surfaces without opening the step log. -o errtrace
+# propagates the trap into functions and subshells.
+set -o errtrace
+on_err() {
+  local msg="notify-fixed-issues.sh: command failed (exit $1) at line $2: $3"
+  echo "error: $msg" >&2
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error::$msg"
+  fi
+}
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=true
