@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.7] - 2026-08-11
+
+### 🚀 Features
+
+- Suppress unread + notification signals for archived workspaces ([#1075](https://github.com/intent-hq/intentd/pull/1075))
+- *(cli)* Merge token into pair with labeled pairing output ([#1074](https://github.com/intent-hq/intentd/pull/1074))
+
+### 🐛 Bug Fixes
+
+- CompletionReport idle settles after_all group without retiring PR monitors/hooks ([#1079](https://github.com/intent-hq/intentd/pull/1079))
+
+### 📚 Documentation
+
+- Add closeTab to the browser.exec action-catalog help text ([#1077](https://github.com/intent-hq/intentd/pull/1077))
+
+### ⚙️ Miscellaneous Tasks
+
+- Bump whoami from 1.6.1 to 2.1.2 ([#964](https://github.com/intent-hq/intentd/pull/964))
+- Bump getrandom from 0.2.17 to 0.4.2 ([#962](https://github.com/intent-hq/intentd/pull/962))
+- Update Cargo.toml dependencies
+
+
 ## [0.6.6] - 2026-08-10
 
 ### 🚀 Features
