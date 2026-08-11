@@ -7854,6 +7854,290 @@ async fn wss_workspace_import_lifecycle() {
     srv.ws.stop().await;
 }
 
+/// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
+/// source-side export lifecycle over the real WSS transport. A subscriber
+/// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
+/// carrying the manifest + checksum; chunked reads reassemble to the exact
+/// archive bytes (checksum-verified — the same contract the FE relies on to
+/// relay into `workspace.import.begin`); finalize applies the final status
+/// message + archives the source; a second export session is then started
+/// and aborted idempotently.
+#[tokio::test]
+async fn wss_workspace_export_lifecycle() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    // Repo-less source workspace (skips the bundler, so no `git` needed).
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Export Source"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    // Subscribe BEFORE start so this connection sees the build's events.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:progress","workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub = loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // start → { exportId, maxChunkBytes } immediately.
+    let started = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.export.start","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export_id = started["result"]["exportId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("exportId: {started}"))
+        .to_string();
+    assert!(started["result"]["maxChunkBytes"].as_u64().unwrap() > 0);
+
+    // The subscriber sees ≥1 progress event and then the ready event whose
+    // payload carries everything workspace.import.begin needs.
+    let (saw_progress, ready) = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut saw_progress = false;
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] != "events.event" {
+                        continue;
+                    }
+                    let event = &v["params"]["event"];
+                    match event["type"].as_str() {
+                        Some("workspace:transfer:progress") => {
+                            assert_eq!(event["data"]["exportId"], export_id.as_str(), "{event}");
+                            assert!(event["data"]["stage"].is_string(), "{event}");
+                            saw_progress = true;
+                        }
+                        Some("workspace:transfer:ready") => {
+                            return (saw_progress, event.clone());
+                        }
+                        Some("workspace:transfer:failed") => {
+                            panic!("export failed: {event}");
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:transfer:ready");
+    assert!(saw_progress, "at least one progress event before ready");
+    let data = &ready["data"];
+    assert_eq!(data["exportId"], export_id.as_str(), "{ready}");
+    assert_eq!(data["manifest"]["workspaceId"], ws_id.as_str(), "{ready}");
+    let size = data["archiveSizeBytes"].as_u64().expect("size");
+    let sha = data["archiveSha256"].as_str().expect("sha").to_string();
+    let total_chunks = data["totalChunks"].as_u64().expect("totalChunks");
+    assert!(size > 0 && total_chunks >= 1);
+
+    // Chunked reads reassemble to the exact archive; seq 0 re-read is
+    // idempotent and an out-of-range seq is rejected with -32602.
+    let mut archive = Vec::new();
+    for seq in 0..total_chunks {
+        let chunk = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{seq}}}}}"#,
+                10 + seq
+            ),
+        )
+        .await;
+        assert_eq!(chunk["result"]["totalChunks"], total_chunks, "{chunk}");
+        archive.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(chunk["result"]["data"].as_str().expect("data"))
+                .expect("base64"),
+        );
+    }
+    assert_eq!(archive.len() as u64, size);
+    assert_eq!(format!("{:x}", Sha256::digest(&archive)), sha);
+    let reread = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":0}}}}"#
+        ),
+    )
+    .await;
+    assert!(reread["result"]["data"].is_string(), "{reread}");
+    let out_of_range = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{total_chunks}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(out_of_range["error"]["code"].as_i64(), Some(-32602));
+
+    // finalize with archiveSource + finalStatusMessage.
+    let finalized = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":32,"method":"workspace.export.finalize","params":{{"exportId":"{export_id}","archiveSource":true,"finalStatusMessage":"Transferred via WSS e2e"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(finalized["result"]["finalized"], true, "{finalized}");
+    assert_eq!(
+        finalized["result"]["workspace"]["status"], "Archived",
+        "{finalized}"
+    );
+    assert_eq!(
+        finalized["result"]["workspace"]["statusMessage"], "Transferred via WSS e2e",
+        "{finalized}"
+    );
+    // The session is retired: further reads are NotFound (-32603 internal
+    // taxonomy is not used here — NotFound maps to -32602 per §9).
+    let gone = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":33,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":0}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(gone["error"]["code"], -32602, "read after finalize: {gone}");
+    assert_eq!(
+        gone["error"]["data"]["code"], "not-found",
+        "read after finalize: {gone}"
+    );
+
+    // abort: ready session → true; retired/unknown → false (idempotent).
+    // (A Building session stays registered until the build task observes
+    // the abort flag, so wait for :ready to make the second abort's `false`
+    // deterministic.)
+    let ws2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":40,"method":"workspace.create","params":{"title":"WSS Export Abort"}}"#,
+    )
+    .await;
+    let ws2_id = ws2["result"]["workspace"]["id"].as_str().expect("id");
+    let mut sub2 = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub2.send(Message::Text(
+        format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws2_id}"}}}}"#
+        )
+        .into(),
+    ))
+    .await
+    .expect("send subscribe 2");
+    loop {
+        match sub2.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v.get("id") == Some(&serde_json::json!(101)) {
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let started2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":41,"method":"workspace.export.start","params":{{"workspaceId":"{ws2_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export2 = started2["result"]["exportId"].as_str().expect("exportId");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match sub2.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:transfer:ready"
+                    {
+                        return;
+                    }
+                    if v["params"]["event"]["type"] == "workspace:transfer:failed" {
+                        panic!("second export failed: {v}");
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub2.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for second export's ready event");
+    let aborted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"workspace.export.abort","params":{{"exportId":"{export2}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(aborted["result"]["aborted"], true, "{aborted}");
+    let again = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":43,"method":"workspace.export.abort","params":{{"exportId":"{export2}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(again["result"]["aborted"], false, "{again}");
+    // The aborted workspace is intact and still Active.
+    let get = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":44,"method":"workspace.get","params":{{"workspaceId":"{ws2_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(get["result"]["workspace"]["status"], "Active", "{get}");
+
+    srv.ws.stop().await;
+}
+
 /// `workspace.import.commit` with a git payload over the real WSS transport
 /// (§5.1): the archive carries `git/repo.bundle` + `git/refs.json` built by
 /// the export bundler from a dirty source repo. Commit materializes the

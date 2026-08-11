@@ -5034,8 +5034,8 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
     // Prime intent-core's process-wide login-shell PATH capture (OnceLock;
     // on Unix the first use spawns `$SHELL -ilc`, up to 5s — a no-op
     // elsewhere) so the requeued turn's `resolve_spawn` →
-    // `find_provider_binary` doesn't stall the 300ms event-collection gap
-    // window below. Called directly (not via `find_provider_binary`) so the
+    // `find_provider_binary` doesn't eat into the event-collection deadline
+    // below. Called directly (not via `find_provider_binary`) so the
     // priming can't short-circuit at an earlier resolution tier (e.g. an
     // installed `~/.augment/bin/auggie`), and via `spawn_blocking` so the
     // capture's blocking poll loop doesn't stall the test runtime's worker
@@ -5058,7 +5058,29 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
     assert_eq!(result["success"], json!(true));
     assert_eq!(result["queued"], json!(false));
 
+    // Collect until the requeued interrupt turn settles (its terminal
+    // `stream_complete` idle) instead of stopping on a fixed quiet gap: the
+    // settlement idle is published by the spawned turn worker, so under full
+    // parallel test load it can trail the preemption events by more than any
+    // fixed gap (monorepo#2007). Everything up to and including settlement is
+    // captured, so the suppression assertion below still sees any synthetic
+    // `interrupted` idle (that emit would precede settlement). A final short
+    // drain keeps the exactly-one-settlement-idle guard meaningful.
     let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let batch = tokio::time::timeout_at(deadline, sub.recv())
+            .await
+            .expect("settlement idle within the 10s collection deadline")
+            .expect("event bus stays open");
+        let settled = batch
+            .iter()
+            .any(|e| e.event_type == "agent:idle" && e.data["reason"] == json!("stream_complete"));
+        events.extend(batch);
+        if settled {
+            break;
+        }
+    }
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
