@@ -15280,6 +15280,15 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            // Snapshot the pre-delete note list for the ready-set comparison
+            // below: the `note_parent_set_null_on_delete` trigger clears each
+            // child's `parent_id` on delete, so the pre-delete tree cannot be
+            // reconstructed from the post-delete rows.
+            let before = if note.metadata.task.is_some() {
+                Some(store.list_notes(&workspace_id).await?)
+            } else {
+                None
+            };
             store
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
@@ -15302,12 +15311,12 @@ impl WorkspaceApi for Services {
                 // trigger variant, before the dependent re-announce below
                 // (same ordering as the status-transition path). Dependent
                 // deletes keep the #1981 always-emit contract; otherwise the
-                // pre/post ready sets are compared and a delete that provably
-                // cannot move the set (e.g. a terminal task nobody depends
-                // on) still emits no recompute. `compute_ready_task_ids`
-                // orders by peerOrder/createdAt — input order is irrelevant —
-                // so appending the deleted note reconstructs the pre-delete
-                // list and Vec equality is set equality.
+                // pre-delete ready set (computed from the snapshot taken
+                // before the store delete — see above) is compared with the
+                // post-delete set, and a delete that provably cannot move the
+                // set (e.g. a terminal task nobody depends on) still emits no
+                // recompute. `compute_ready_task_ids` orders by
+                // peerOrder/createdAt, so Vec equality is set equality.
                 let depended_on = remaining.iter().any(|n| {
                     n.metadata
                         .task
@@ -15315,11 +15324,10 @@ impl WorkspaceApi for Services {
                         .is_some_and(|t| t.depends_on.iter().any(|d| d == &note_id))
                 });
                 let ready_task_ids = compute_ready_task_ids(&remaining);
-                let ready_set_moved = depended_on || {
-                    let mut before = remaining.clone();
-                    before.push(note.clone());
-                    compute_ready_task_ids(&before) != ready_task_ids
-                };
+                let ready_set_moved = depended_on
+                    || before
+                        .as_deref()
+                        .is_none_or(|b| compute_ready_task_ids(b) != ready_task_ids);
                 if ready_set_moved {
                     publish_event(
                         &bus,

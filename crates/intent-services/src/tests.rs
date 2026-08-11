@@ -5687,6 +5687,43 @@ mod change_event_parity {
         assert!(ev["data"]["computedAt"].is_string());
     }
 
+    /// Regression (intentd#1121 review): deleting a NON-ready parent whose
+    /// incomplete child is (and stays) ready must NOT emit a recompute — the
+    /// ready set is `{child}` before and after. The store's
+    /// `note_parent_set_null_on_delete` trigger clears the child's
+    /// `parent_id`, so reconstructing the pre-delete tree from post-delete
+    /// rows made the parent look childless/ready and fired a spurious emit;
+    /// the pre-delete snapshot comparison avoids that.
+    #[tokio::test]
+    async fn deleting_non_ready_parent_with_ready_child_emits_no_recompute() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent", TaskStatus::NotStarted, None, 0),
+            mk("child", TaskStatus::InProgress, Some("parent"), 1),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("parent"), None)
+            .await
+            .expect("delete parent");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
     #[tokio::test]
     async fn comment_added_payload() {
         let h = harness().await;
