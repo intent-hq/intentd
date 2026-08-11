@@ -1333,11 +1333,14 @@ impl Services {
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an
-        // immediate, undebounced final wake.
+        // immediate, undebounced final wake. A lost guarded write inside
+        // (a concurrent flush/cancel won the row) skips the wake, and that
+        // outcome propagates so callers never report a delivery that did
+        // not happen.
         if fresh.is_terminal() {
-            self.complete_pr_monitor(&updated, &fresh).await?;
+            let delivered = self.complete_pr_monitor(&updated, &fresh).await?;
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
-            return Ok(true);
+            return Ok(delivered);
         }
         if updated.pending_changes.is_empty() {
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
@@ -1456,12 +1459,14 @@ impl Services {
     /// state, and deliver the immediate final wake. Its "Changes since the
     /// last report" section coalesces the same way as a change wake —
     /// `diff(baseline, final)` — so the journey to terminal never replays
-    /// intermediate transitions.
+    /// intermediate transitions. Returns whether the final wake was
+    /// delivered — `false` when a lost guarded write (a concurrent
+    /// flush/cancel/re-register moved the row) skipped it.
     async fn complete_pr_monitor(
         &self,
         monitor: &PrMonitor,
         snapshot: &PrMonitorSnapshot,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let changes = monitor
             .baseline_snapshot
             .as_deref()
@@ -1488,7 +1493,7 @@ impl Services {
         {
             // The row moved under us (concurrent flush/cancel/re-register);
             // skip the wake — the next tick re-detects the terminal state.
-            return Ok(());
+            return Ok(false);
         }
         if !self
             .store
@@ -1496,7 +1501,7 @@ impl Services {
             .await?
         {
             // A concurrent cancel won; it already delivered its own notice.
-            return Ok(());
+            return Ok(false);
         }
         let mut completed = monitor.clone();
         completed.state = PrMonitorState::Completed;
@@ -1516,7 +1521,7 @@ impl Services {
         // displayStatus (§6.5) — best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&completed.workspace_id)
             .await;
-        Ok(())
+        Ok(true)
     }
 
     /// Persist a failed poll's error without disturbing the baseline or the
