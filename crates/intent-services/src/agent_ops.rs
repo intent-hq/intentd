@@ -5924,6 +5924,10 @@ impl Services {
                     depends_on: task.depends_on.iter().map(|d| d.0.clone()).collect(),
                     conflicts_with: task.conflicts_with.iter().map(|c| c.0.clone()).collect(),
                     live_agent,
+                    effort_minutes: task
+                        .estimated_effort
+                        .as_deref()
+                        .and_then(crate::task_effort::parse_effort_minutes),
                 },
             );
         }
@@ -6063,7 +6067,7 @@ impl Services {
                     .is_some_and(|d| d.starts_with("held:"))
             })
             .count();
-        let unlock_message = if unlocked.is_empty() {
+        let mut unlock_message = if unlocked.is_empty() {
             if held_count == 0 {
                 "Nothing is held; no re-call needed beyond the normal completion wakes.".to_string()
             } else {
@@ -6075,16 +6079,32 @@ impl Services {
                 unlocked.join(", ")
             )
         };
+        // Effort-weighted critical-path estimate (response text only, no wake
+        // changes): surfaced only when at least one involved task carries a
+        // parseable estimate — otherwise the number is pure defaults.
+        let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
+        if let Some(minutes) = critical_path_minutes {
+            unlock_message.push_str(&format!(
+                " ~{minutes} min of serial work remains on the critical path."
+            ));
+        }
 
+        let mut unlock_plan = json!({
+            "unlockedBySettlement": unlocked,
+            "message": unlock_message,
+        });
+        if let Some(minutes) = critical_path_minutes {
+            unlock_plan
+                .as_object_mut()
+                .unwrap()
+                .insert("criticalPathMinutes".into(), json!(minutes));
+        }
         Ok(json!({
             "ok": true,
             "greedy": greedy,
             "tasks": rows,
             "startedTaskIds": started_ids,
-            "unlockPlan": {
-                "unlockedBySettlement": unlocked,
-                "message": unlock_message,
-            },
+            "unlockPlan": unlock_plan,
         }))
     }
 
