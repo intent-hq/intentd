@@ -81,10 +81,12 @@ pub(crate) struct CommentSubscribeParams {
 
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
 /// scoped by `agentId` (like the comment channel's `noteId`, NOT `workspaceId`);
-/// `replaceGroup` is optional.
+/// `replaceGroup` is optional. `sinceMessageId` (optional) requests a resumed
+/// seq-0 snapshot: only messages AFTER that id (§7.1 resume).
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
+    pub since_message_id: Option<String>,
     pub replace_group: Option<String>,
 }
 
@@ -210,7 +212,9 @@ pub(crate) fn parse_comment_subscribe_params(
 }
 
 /// Validate `chat.subscribe` params. A missing/empty `agentId` is a `-32602`
-/// error (the chat channel is per-agent, CS-0).
+/// error (the chat channel is per-agent, CS-0). `sinceMessageId` is optional:
+/// absent / `null` / empty string all mean "no resume" (standard snapshot,
+/// no `resumed` key); a present non-string value is a `-32602` error.
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
@@ -218,8 +222,15 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Err("agentId is required".to_string()),
     };
+    let since_message_id = match params.get("sinceMessageId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("sinceMessageId must be a string".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
+        since_message_id,
         replace_group: replace_group(params),
     })
 }
@@ -435,7 +446,20 @@ pub(crate) async fn channel_snapshot(
 /// when a client opens the chat. On a read error the snapshot degrades to an
 /// empty messages page rather than failing the subscription (matching
 /// [`channel_snapshot`]'s degrade-to-empty pattern).
-pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
+///
+/// **Resume (§7.1).** When `since_message_id` is provided, the same bounded
+/// newest page is read (still exactly ONE read — the resume is a post-filter,
+/// never a second fetch), then [`apply_resume_filter`] trims it: if the id is
+/// found in the page the snapshot carries only the messages AFTER it with
+/// `resumed: true`; otherwise (unknown / pruned / older than the bounded page)
+/// the full standard page is served with `resumed: false` so the client
+/// rehydrates. The live-turn merge and activity-flags overlay apply in both
+/// cases, after the filter, so an in-flight partial is never trimmed away.
+pub(crate) async fn chat_snapshot(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+    since_message_id: Option<&str>,
+) -> Value {
     let mut snapshot = match api
         .agent_get_conversation(agent_id.clone(), None, None, None, None)
         .await
@@ -449,6 +473,9 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
             "nextToken": Value::Null,
         }),
     };
+    if let Some(since) = since_message_id {
+        apply_resume_filter(&mut snapshot, since);
+    }
     if api.agent_is_busy(agent_id.clone()) {
         if let Some(live) = api.agent_live_turn(agent_id.clone()) {
             merge_live_turn(&mut snapshot, agent_id, &live);
@@ -466,6 +493,44 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
         }
     }
     snapshot
+}
+
+/// Trim a chat seq-0 snapshot to the messages AFTER `since` (§7.1 resume).
+///
+/// If `since` matches a message id in the bounded page, `messages` keeps only
+/// the rows after it and the snapshot gains `resumed: true`; `truncated` /
+/// `nextToken` are cleared (no gap exists — the client already holds
+/// everything up to `since`). If `since` is not in the page (unknown, pruned,
+/// or older than the bounded newest page — indistinguishable without a second
+/// read, and the bounded-read contract forbids one), the page is left intact
+/// and the snapshot gains `resumed: false`: the client must discard its cache
+/// and rehydrate from the standard snapshot. `totalMessages` stays the
+/// transcript-wide count in both cases (same semantics as the standard
+/// snapshot, where `messages.len()` already ≠ `totalMessages` when truncated).
+fn apply_resume_filter(snapshot: &mut Value, since: &str) {
+    let Some(obj) = snapshot.as_object_mut() else {
+        return;
+    };
+    let found_at = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .position(|m| m.get("id").and_then(Value::as_str) == Some(since))
+        });
+    match found_at {
+        Some(idx) => {
+            if let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.drain(..=idx);
+            }
+            obj.insert("resumed".to_string(), Value::Bool(true));
+            obj.insert("truncated".to_string(), Value::Bool(false));
+            obj.insert("nextToken".to_string(), Value::Null);
+        }
+        None => {
+            obj.insert("resumed".to_string(), Value::Bool(false));
+        }
+    }
 }
 
 /// Append the in-flight assistant message to a chat snapshot's `messages` page

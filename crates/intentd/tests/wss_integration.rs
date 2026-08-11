@@ -326,6 +326,47 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
+/// Send a `chat.subscribe` frame over a fresh WSS connection, wait for both
+/// the `{ subscriptionId }` response (matched on `id`) and the seq-0
+/// `subscription.push` snapshot, and return the snapshot object (§7.1).
+async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str, id: i64) -> Value {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("chat.subscribe frame timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == id {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let sub_resp = sub_resp.unwrap();
+    assert!(
+        sub_resp["result"]["subscriptionId"].as_str().is_some(),
+        "chat.subscribe returns subscriptionId: {sub_resp}"
+    );
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    snap["params"]["snapshot"].clone()
+}
+
 /// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
 /// `client_id` binding from `client.hello` persists across them (§16).
 async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> Vec<Value> {
@@ -6601,7 +6642,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
 /// `aroundMessageId` seek (centered page, `prevToken` walk newer, `-32602`
-/// on an unknown id), and the `chat.subscribe` seq-0 snapshot, all against
+/// on an unknown id), and the `chat.subscribe` seq-0 snapshot (standard,
+/// resumed via `sinceMessageId`, and the unknown-id fallback), all against
 /// one seeded 120-message session. Then the hydration regression at the wire
 /// level: with every row OLDER than the newest bounded page corrupted to
 /// non-JSON (which errors any path that decodes it — `agent.getSession`
@@ -6638,7 +6680,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
+    // Capture the id at seq 100 (inside the bounded newest page 70..=119) for
+    // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
+    let mut seq_100_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
@@ -6656,6 +6701,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .await
             .expect("append message")
             .id;
+        if i == 100 {
+            seq_100_message_id = newest_message_id.clone();
+        }
     }
 
     // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
@@ -6971,7 +7019,64 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         snapshot["nextToken"].as_str().is_some(),
         "truncated snapshot carries the older-pages cursor"
     );
+    assert!(
+        snapshot.get("resumed").is_none(),
+        "no sinceMessageId: snapshot carries no resumed key: {snapshot}"
+    );
     drop(sub);
+
+    // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
+    // bounded page yields only the messages AFTER it, `resumed: true`, and no
+    // older-pages cursor (the client already holds everything up to the id).
+    let resumed = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_100_message_id}"}}}}"#
+        ),
+        40,
+    )
+    .await;
+    let msgs = resumed["messages"].as_array().expect("resumed messages");
+    assert_eq!(
+        msgs.len(),
+        19,
+        "only rows after seq 100 (101..=119): {resumed}"
+    );
+    assert_eq!(msgs[0]["seq"], 101);
+    assert_eq!(msgs[18]["seq"], 119);
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["truncated"], false);
+    assert!(resumed["nextToken"].is_null(), "no gap cursor: {resumed}");
+    assert_eq!(
+        resumed["totalMessages"], 120,
+        "totalMessages stays the transcript-wide count"
+    );
+
+    // An unknown / pruned sinceMessageId falls back to the standard full
+    // bounded page with `resumed: false` — the client must rehydrate.
+    let fallback = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":41,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"msg-nope"}}}}"#
+        ),
+        41,
+    )
+    .await;
+    let msgs = fallback["messages"].as_array().expect("fallback messages");
+    assert_eq!(
+        msgs.len(),
+        50,
+        "full bounded page on unknown id: {fallback}"
+    );
+    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(fallback["resumed"], false);
+    assert_eq!(fallback["truncated"], true);
+    assert!(
+        fallback["nextToken"].as_str().is_some(),
+        "fallback keeps the older-pages cursor"
+    );
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
@@ -7745,6 +7850,191 @@ async fn wss_workspace_import_lifecycle() {
     )
     .await;
     assert_eq!(again["result"]["aborted"], false, "{again}");
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.import.commit` with a git payload over the real WSS transport
+/// (§5.1): the archive carries `git/repo.bundle` + `git/refs.json` built by
+/// the export bundler from a dirty source repo. Commit materializes the
+/// checkout under the daemon's workspaces root (WIP snapshot unwound — the
+/// dirty file restored, not committed), rewrites the stored workspace row
+/// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
+/// direct), and registers the checkout in `known_repo`. Skips when `git` is
+/// unavailable on PATH (the bundler shells out to it).
+#[tokio::test]
+async fn wss_workspace_import_commit_materializes_git() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping WSS git import E2E: git not available");
+        return;
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = "ws-wss-git-imported";
+    let t = "2026-08-11T00:00:00Z";
+
+    // Source repo: one commit on `main` plus an untracked file, so the
+    // bundle carries a WIP snapshot the import must unwind.
+    let src = test_tempdir("intentd-wss-import-git-src-");
+    let repo = src.path().join("source-repo");
+    {
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "Tester")
+                .env("GIT_AUTHOR_EMAIL", "t@e.dev")
+                .env("GIT_COMMITTER_NAME", "Tester")
+                .env("GIT_COMMITTER_EMAIL", "t@e.dev")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("seed file");
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "chore: init"]);
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").expect("wip file");
+    }
+
+    // Bundle the source exactly as the export orchestrator would.
+    let mut src_ws = fixture_workspace(&WorkspaceId(ws_id.to_string()));
+    src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
+    src_ws.repository_name = Some("test-repo".to_string());
+    let staging = src.path().join("staging");
+    let (bundle_path, refs) =
+        intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+            .expect("bundle");
+    assert!(
+        refs.workspace_wip_commit_sha.is_some(),
+        "source was dirty: {refs:?}"
+    );
+
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "workspaceId": ws_id,
+        "createdAt": t,
+        "tables": [],
+        "assets": [],
+        "git": { "hasRepository": true, "dirtyFiles": [], "sandboxBranches": [] }
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut buf);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("manifest.json", options).expect("manifest");
+    zip.write_all(manifest.to_string().as_bytes())
+        .expect("manifest bytes");
+    zip.start_file("rows/workspace.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": ws_id, "title": "WSS Git Imported", "branch": "main",
+                "status": "Active",
+                "repository_path": repo.to_string_lossy(),
+                "repository_name": "test-repo",
+                "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("workspace row");
+    zip.start_file("git/repo.bundle", options).expect("bundle");
+    zip.write_all(&std::fs::read(&bundle_path).expect("bundle bytes"))
+        .expect("bundle write");
+    zip.start_file("git/refs.json", options).expect("refs");
+    zip.write_all(serde_json::to_string(&refs).expect("refs json").as_bytes())
+        .expect("refs write");
+    zip.finish().expect("zip");
+    let archive = buf.into_inner();
+    let sha = format!("{:x}", Sha256::digest(&archive));
+
+    // begin → chunk → commit over the wire.
+    let begin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{},"archiveSha256":"{sha}"}}}}"#,
+            archive.len()
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&archive);
+    let chunk = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":0,"data":"{b64}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(chunk["result"]["seq"], 0, "{chunk}");
+    let committed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+
+    // The result's workspace payload carries the materialized checkout
+    // (PROTOCOL §5.1: the workspace envelope after import transforms).
+    let ws_payload = &committed["result"]["workspace"];
+    let checkout = srv
+        ._dir
+        .path()
+        .join("workspaces")
+        .join(ws_id)
+        .join("test-repo");
+    assert_eq!(
+        ws_payload["repositoryPath"].as_str(),
+        checkout.to_str(),
+        "{committed}"
+    );
+    assert!(ws_payload["worktreePath"].is_null(), "{committed}");
+    assert_eq!(ws_payload["checkoutMode"], "direct", "{committed}");
+
+    // On disk: checkout exists with the WIP snapshot unwound — the dirty
+    // file restored as uncommitted work.
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("README.md")).expect("committed file"),
+        "hello\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("wip.txt")).expect("wip file restored"),
+        "uncommitted\n"
+    );
+
+    // The checkout is registered in known_repo.
+    let known = srv.store.list_known_repos().await.expect("known repos");
+    assert!(
+        known
+            .iter()
+            .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
+        "checkout registered in known_repo: {known:?}"
+    );
 
     srv.ws.stop().await;
 }
