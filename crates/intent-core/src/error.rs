@@ -88,6 +88,15 @@ pub enum Error {
          errors, e.g. port already in use) before pairing"
     )]
     ListenerDown,
+
+    /// A `repo.warmCache` request was rejected because an opportunistic warm
+    /// is already in flight (global single-flight — at most one warm
+    /// daemon-wide). Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "warm-in-flight", owner, repo }` naming the repo
+    /// currently being warmed, so clients key off `error.data.code` instead
+    /// of prose. Deliberately not queued: the caller fires and forgets.
+    #[error("repo cache warm already in flight for {owner}/{repo}")]
+    WarmInFlight { owner: String, repo: String },
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -155,7 +164,10 @@ impl Error {
                 | CloneErrorCategory::Network
                 | CloneErrorCategory::Other => -32603,
             },
-            Error::Internal(_) | Error::VoiceNotConfigured { .. } | Error::ListenerDown => -32603,
+            Error::Internal(_)
+            | Error::VoiceNotConfigured { .. }
+            | Error::ListenerDown
+            | Error::WarmInFlight { .. } => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
         }

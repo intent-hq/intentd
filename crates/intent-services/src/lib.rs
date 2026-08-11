@@ -112,6 +112,8 @@ mod terminal_ops;
 pub mod tool_block;
 mod transfer;
 pub mod transfer_git;
+mod transfer_import;
+pub mod transfer_materialize;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -347,6 +349,14 @@ pub struct Services {
     /// call time: `$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces` (the
     /// FE's `WorkspaceConfig.WORKSPACES_BASE`). Tests inject a temp dir.
     workspaces_root: Option<PathBuf>,
+    /// Global single-flight flag for opportunistic `repo.warmCache` warms:
+    /// `Some((owner, repo))` while a warm is in flight, at most one
+    /// daemon-wide. A second call while set is rejected with
+    /// [`Error::WarmInFlight`] naming the repo being warmed — never queued.
+    /// Shared across clones so every handle observes the same slot.
+    /// `workspace.create` never consults this flag; its cache ensure
+    /// serializes on the per-repo cache lock inside `intent_git::repo_cache`.
+    warm_in_flight: Arc<Mutex<Option<(String, String)>>>,
     /// Per-request cancellation registry for `search.*` (§14.3). Keyed by
     /// `requestId`, it lets `search.cancel` abort an in-flight search. Shares
     /// its inner map across clones so a cancel observed by any handle reaches
@@ -670,6 +680,13 @@ pub struct Services {
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
     pending_agent_deletes: delete_grace::PendingDeletes,
+    /// In-flight staged workspace imports (`workspace.import.*`, keyed by
+    /// `importId`): manifest + staging paths + chunk cursor between `begin`
+    /// and `commit`/`abort`. Shared across clones so chunks arriving over any
+    /// connection append to the same staging file. In-memory only — a daemon
+    /// restart drops pending imports (staging dirs are swept lazily by the
+    /// next `begin`), and the FE simply restarts the upload.
+    transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -711,6 +728,7 @@ impl Services {
             workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
+            warm_in_flight: Arc::new(Mutex::new(None)),
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
@@ -766,6 +784,7 @@ impl Services {
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
+            transfer_imports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -5901,7 +5920,7 @@ static REPO_REGISTRY_SYNCED: std::sync::atomic::AtomicBool =
 /// Resolve a known-repo display name from an optional explicit name plus the
 /// repo path, mirroring TS `repositoryName || path.split('/').pop() || 'Unknown'`
 /// (an empty explicit name falls through to the basename).
-fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
+pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     if let Some(n) = explicit {
         if !n.is_empty() {
             return n.to_string();
@@ -6116,7 +6135,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
 /// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
 /// `"repo"` fallback.
-fn worktree_folder_slug(repo_name: &str) -> String {
+pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
@@ -10559,6 +10578,41 @@ impl WorkspaceApi for Services {
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
         Box::pin(async move { self.workspace_transfer_plan_op(id).await })
+    }
+
+    fn workspace_import_begin(
+        &self,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
+                .await
+        })
+    }
+
+    fn workspace_import_chunk(
+        &self,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_chunk_op(import_id, seq, data).await })
+    }
+
+    fn workspace_import_commit(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_commit_op(import_id).await })
+    }
+
+    fn workspace_import_abort(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_abort_op(import_id).await })
     }
 
     fn create_workspace(
@@ -17691,6 +17745,116 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let removed = store.remove_known_repo(&path).await?;
             Ok(serde_json::json!({ "removed": removed }))
+        })
+    }
+
+    fn repo_warm_cache(&self, github_url: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let registry = self.settings_registry.clone();
+        let warm_in_flight = self.warm_in_flight.clone();
+        let workspaces_root = self.workspaces_root.clone();
+        let worktrees_location = settings::worktrees_location(&self.effective_settings());
+        // Same startup-pin precedence as `workspace.create`, so the warm
+        // targets exactly the cache a subsequent create will hydrate from.
+        let workspaces_root_pinned = self
+            .settings_registry
+            .as_deref()
+            .and_then(|r| r.origin("workspaces.root"))
+            == Some(SettingOrigin::Flag);
+        Box::pin(async move {
+            let url = github_url.trim().to_string();
+            let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
+                return Err(Error::InvalidParams(format!(
+                    "githubUrl carries no owner/repo pair: {url}"
+                )));
+            };
+            // Reject segments the cache ensure would refuse anyway (same
+            // rules as repo_cache's validate_segment: path escapes, git
+            // option lookalikes) BEFORE claiming the single-flight slot, so
+            // a malformed URL can never block valid warms.
+            for (what, value) in [("owner", owner.as_str()), ("repo", repo.as_str())] {
+                let bad = value.is_empty()
+                    || value == "."
+                    || value == ".."
+                    || value.starts_with('-')
+                    || value.contains('/')
+                    || value.contains('\\')
+                    || value.contains('\0');
+                if bad {
+                    return Err(Error::InvalidParams(format!(
+                        "githubUrl carries an invalid {what} segment: {value:?}"
+                    )));
+                }
+            }
+            let cache_root = resolve_workspaces_parent(
+                workspaces_root,
+                workspaces_root_pinned,
+                &worktrees_location,
+            )?
+            .join(".repo-cache");
+            // RAII clear for the single-flight slot: `Drop` runs even when
+            // the detached task panics mid-ensure, so the flag can never
+            // leak into a permanently-busy state. Poisoned locks recover via
+            // `into_inner` — the guarded Option is trivially valid — so a
+            // panic while the tiny critical section is held cannot brick the
+            // method either.
+            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
+            impl Drop for WarmSlotClear {
+                fn drop(&mut self) {
+                    *self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+            }
+            // Global single-flight: claim the slot or reject immediately with
+            // the busy error naming the warm already in flight (never queue).
+            {
+                let mut slot = warm_in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some((o, r)) = slot.as_ref() {
+                    return Err(Error::WarmInFlight {
+                        owner: o.clone(),
+                        repo: r.clone(),
+                    });
+                }
+                *slot = Some((owner.clone(), repo.clone()));
+            }
+            let clear_on_drop = WarmSlotClear(warm_in_flight);
+            // Detached background warm: token resolution (bounded secrets /
+            // `gh` lookups) and the cache ensure both run off the RPC path.
+            // Deliberately silent — no `git:clone:*` frames, no events; a
+            // concurrent `workspace.create` for the same repo simply
+            // serializes behind this ensure on the per-repo cache lock.
+            let task_owner = owner.clone();
+            let task_repo = repo.clone();
+            tokio::spawn(async move {
+                let _clear_on_drop = clear_on_drop;
+                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                let result = intent_git::repo_cache::ensure_cached_repo(
+                    &cache_root,
+                    &url,
+                    &task_owner,
+                    &task_repo,
+                    token.as_deref(),
+                )
+                .await;
+                match result {
+                    Ok(path) => tracing::info!(
+                        owner = %task_owner,
+                        repo = %task_repo,
+                        path = %path.display(),
+                        "opportunistic repo cache warm completed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        owner = %task_owner,
+                        repo = %task_repo,
+                        error = %e,
+                        "opportunistic repo cache warm failed"
+                    ),
+                }
+            });
+            Ok(serde_json::json!({ "started": true, "owner": owner, "repo": repo }))
         })
     }
 

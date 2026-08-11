@@ -101,7 +101,8 @@ pub struct SandboxBundleRef {
 /// single sentinel-marked WIP commit on HEAD's branch. Returns the commit SHA,
 /// or `None` when the repository is clean. The pre-snapshot index tree is
 /// recorded as a commit-message trailer so [`unwind_wip`] restores the exact
-/// staged/unstaged split.
+/// staged/unstaged split, and anchored via an auxiliary second parent so it
+/// stays reachable inside a transfer bundle.
 pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
     let repo = git2::Repository::open(repo_path)
         .map_err(|e| Error::Internal(format!("open repo for WIP snapshot failed: {e}")))?;
@@ -140,9 +141,39 @@ pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
             .find_tree(tree_oid)
             .map_err(|e| Error::Internal(format!("find tree failed: {e}")))?;
         let sig = resolve_signature(&repo)?;
+        // Auxiliary anchor commit (no ref update): its only job is to make
+        // the pre-snapshot index tree REACHABLE from the WIP commit, so the
+        // tree travels inside a transfer bundle and `unwind_wip` on the
+        // import side can restore the exact staged/unstaged split. Without
+        // it the trailer OID would dangle in a bundle clone (bundles carry
+        // only objects reachable from their refs) and the unwind would
+        // degrade to everything-staged.
+        let index_tree = repo
+            .find_tree(orig_index_tree)
+            .map_err(|e| Error::Internal(format!("find pre-snapshot index tree failed: {e}")))?;
+        let anchor_oid = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "intent-transfer: index state anchor",
+                &index_tree,
+                &[&head_commit],
+            )
+            .map_err(|e| Error::Internal(format!("create index anchor commit failed: {e}")))?;
+        let anchor = repo
+            .find_commit(anchor_oid)
+            .map_err(|e| Error::Internal(format!("find index anchor commit failed: {e}")))?;
         let message = format!("{TRANSFER_WIP_SENTINEL}\n\n{INDEX_TREE_TRAILER} {orig_index_tree}");
-        repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&head_commit])
-            .map_err(|e| Error::Internal(format!("create WIP snapshot commit failed: {e}")))
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &message,
+            &tree,
+            &[&head_commit, &anchor],
+        )
+        .map_err(|e| Error::Internal(format!("create WIP snapshot commit failed: {e}")))
     })();
     match commit_result {
         Ok(oid) => Ok(Some(oid.to_string())),
@@ -475,7 +506,10 @@ fn fetch_local_ref(worktree: &Path, from_repo: &Path, src_ref: &str, dst_ref: &s
 
 /// Run a git subcommand in `dir` with prompts disabled; returns the trimmed
 /// stderr as the error string on non-zero exit.
-fn run_git(dir: &Path, configure: impl FnOnce(&mut Command)) -> std::result::Result<(), String> {
+pub(crate) fn run_git(
+    dir: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> std::result::Result<(), String> {
     let mut cmd = Command::new("git");
     configure(&mut cmd);
     let out = cmd

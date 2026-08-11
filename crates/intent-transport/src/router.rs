@@ -125,6 +125,18 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "not-a-file", "path": path, "mode": mode })),
         },
+        // Opportunistic warm rejected because one is already in flight:
+        // -32603 with machine-readable `data = { code: "warm-in-flight",
+        // owner, repo }` naming the repo currently being warmed, so the FE
+        // can stay silent without matching on prose.
+        ref e @ Error::WarmInFlight {
+            ref owner,
+            ref repo,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "warm-in-flight", "owner": owner, "repo": repo })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
@@ -410,6 +422,37 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "plan": plan }))
+        }
+        "workspace.import.begin" => {
+            let manifest = params
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_params("manifest is required"))?;
+            let archive_size_bytes = require_u64(params, "archiveSizeBytes")?;
+            let archive_sha256 = require_str_param(params, "archiveSha256")?;
+            api.workspace_import_begin(manifest, archive_size_bytes, archive_sha256)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.chunk" => {
+            let import_id = require_str_param(params, "importId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.workspace_import_chunk(import_id, seq, data)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.commit" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_commit(import_id)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.abort" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_abort(import_id)
+                .await
+                .map_err(workspace_err)
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
@@ -2033,6 +2076,18 @@ async fn dispatch(
             // `{ removed: bool }` (false when the path was not registered).
             let path = require_str_param(params, "path")?;
             let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "repo.warmCache" => {
+            // Opportunistic background refresh of the repo cache for one
+            // GitHub repo; returns `{ started: true, owner, repo }`
+            // immediately. A warm already in flight is rejected with the
+            // `warm-in-flight` busy error (PROTOCOL §5.6).
+            let github_url = require_str_param(params, "githubUrl")?;
+            let r = api
+                .repo_warm_cache(github_url)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "git.clone" => {
