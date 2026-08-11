@@ -3231,6 +3231,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `repo.warmCache`: kick off an opportunistic background refresh of the
+    /// daemon-managed repo cache for one GitHub repo, as
+    /// `{ started: true, owner, repo }` — the RPC returns immediately while
+    /// the fetch runs detached. At most one warm runs daemon-wide; a call
+    /// while one is in flight is rejected with [`Error::WarmInFlight`]
+    /// (PROTOCOL §5.6). A `githubUrl` with no owner/repo pair is `-32602`.
+    fn repo_warm_cache(&self, github_url: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = github_url;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::repo_warm_cache not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

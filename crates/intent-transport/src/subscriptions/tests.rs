@@ -124,11 +124,41 @@ fn chat_params_require_agent_id() {
     let p = parse_chat_subscribe_params(ok.as_object().unwrap()).unwrap();
     assert_eq!(p.agent_id, "agent-1");
     assert_eq!(p.replace_group.as_deref(), Some("chat:agent-1"));
+    assert_eq!(p.since_message_id, None);
 
     for bad in [r#"{}"#, r#"{"agentId":""}"#, r#"{"agentId":5}"#] {
         let v = parse(bad);
         let err = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap_err();
         assert!(err.contains("agentId is required"));
+    }
+}
+
+#[test]
+fn chat_params_since_message_id() {
+    // A non-empty string is captured for the §7.1 resume path.
+    let ok = parse(r#"{"agentId":"agent-1","sinceMessageId":"msg-42"}"#);
+    let p = parse_chat_subscribe_params(ok.as_object().unwrap()).unwrap();
+    assert_eq!(p.since_message_id.as_deref(), Some("msg-42"));
+
+    // Absent / null / empty string all mean "no resume".
+    for none in [
+        r#"{"agentId":"a"}"#,
+        r#"{"agentId":"a","sinceMessageId":null}"#,
+        r#"{"agentId":"a","sinceMessageId":""}"#,
+    ] {
+        let v = parse(none);
+        let p = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.since_message_id, None, "no resume for {none}");
+    }
+
+    // A present non-string value is a -32602 error.
+    for bad in [
+        r#"{"agentId":"a","sinceMessageId":5}"#,
+        r#"{"agentId":"a","sinceMessageId":["m"]}"#,
+    ] {
+        let v = parse(bad);
+        let err = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("sinceMessageId must be a string"), "{bad}");
     }
 }
 
@@ -1115,7 +1145,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_reads_exactly_one_bounded_page_for_large_transcript() {
         let api = BoundedPageApi::new(false);
-        let snap = chat_snapshot(&api, &agent()).await;
+        let snap = chat_snapshot(&api, &agent(), None).await;
         assert_eq!(
             api.calls.load(Ordering::SeqCst),
             1,
@@ -1127,6 +1157,11 @@ mod chat_snapshot_bounded {
         assert_eq!(snap["truncated"], true);
         assert_eq!(snap["totalMessages"], 120);
         assert_eq!(snap["nextToken"], "tok-older");
+        // No `sinceMessageId` → no `resumed` key at all (§7.1).
+        assert!(
+            snap.get("resumed").is_none(),
+            "standard snapshot carries no resumed key: {snap}"
+        );
         // Activity flags are overlaid (all-false via the trait default here).
         assert_eq!(snap["isResponding"], false);
         assert_eq!(snap["waitingForAgentIds"], json!([]));
@@ -1135,7 +1170,7 @@ mod chat_snapshot_bounded {
     #[tokio::test]
     async fn chat_snapshot_merges_live_turn_on_truncated_page() {
         let api = BoundedPageApi::new(true);
-        let snap = chat_snapshot(&api, &agent()).await;
+        let snap = chat_snapshot(&api, &agent(), None).await;
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         // The in-flight message is appended after the bounded page with the
         // next monotonic seq (CS-0 D5) — truncation does not disable the merge.
@@ -1147,6 +1182,62 @@ mod chat_snapshot_bounded {
         assert_eq!(snap["totalMessages"], 121);
         assert_eq!(snap["truncated"], true);
         assert_eq!(snap["nextToken"], "tok-older");
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_resume_serves_only_messages_after_since_id() {
+        let api = BoundedPageApi::new(false);
+        let snap = chat_snapshot(&api, &agent(), Some("m-118")).await;
+        // Resume is a post-filter, never a second fetch.
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        let messages = snap["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "only rows after m-118: {snap}");
+        assert_eq!(messages[0]["id"], "m-119");
+        assert_eq!(snap["resumed"], true);
+        // No gap toward older history: the client already holds it.
+        assert_eq!(snap["truncated"], false);
+        assert_eq!(snap["nextToken"], Value::Null);
+        // totalMessages stays the transcript-wide count.
+        assert_eq!(snap["totalMessages"], 120);
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_resume_at_newest_id_yields_empty_page() {
+        let api = BoundedPageApi::new(false);
+        let snap = chat_snapshot(&api, &agent(), Some("m-119")).await;
+        assert_eq!(snap["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(snap["resumed"], true);
+        assert_eq!(snap["truncated"], false);
+        assert_eq!(snap["nextToken"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_resume_unknown_id_falls_back_to_full_page() {
+        let api = BoundedPageApi::new(false);
+        let snap = chat_snapshot(&api, &agent(), Some("msg-nope")).await;
+        // Still exactly one bounded read — no lookup follow-up.
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        // The standard page is served intact; `resumed: false` tells the
+        // client to discard its cache and rehydrate.
+        let messages = snap["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(snap["resumed"], false);
+        assert_eq!(snap["truncated"], true);
+        assert_eq!(snap["nextToken"], "tok-older");
+        assert_eq!(snap["totalMessages"], 120);
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_resume_keeps_live_turn_merge() {
+        let api = BoundedPageApi::new(true);
+        let snap = chat_snapshot(&api, &agent(), Some("m-119")).await;
+        // The filter trims the persisted page to empty, then the in-flight
+        // message is merged AFTER the filter, so it is never trimmed away.
+        let messages = snap["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["id"], "msg-live");
+        assert_eq!(messages[0]["isStreaming"], true);
+        assert_eq!(snap["resumed"], true);
     }
 }
 
