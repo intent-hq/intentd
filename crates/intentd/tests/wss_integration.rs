@@ -7481,9 +7481,10 @@ async fn wss_file_place_attachment_round_trip() {
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
 /// the imported workspace only appears in `workspace.list` after commit,
-/// with the import transforms applied. A version-mismatched manifest is
-/// rejected by `begin` naming both versions, and `abort` retires a pending
-/// session idempotently.
+/// with the import transforms applied, and the commit's `workspace:created`
+/// event reaches an `events.subscribe` subscriber. A version-mismatched
+/// manifest is rejected by `begin` naming both versions, and `abort` retires
+/// a pending session idempotently.
 #[tokio::test]
 async fn wss_workspace_import_lifecycle() {
     use base64::Engine as _;
@@ -7595,6 +7596,31 @@ async fn wss_workspace_import_lifecycle() {
         assert_eq!(resp["result"]["seq"], seq, "{resp}");
     }
 
+    // Subscribe BEFORE commit so the `workspace:created` notification the
+    // commit publishes (§6.5) is delivered to this connection.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created"]}}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub = loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
     // commit → workspace live with transforms applied.
     let committed = wss_call(
         srv.port,
@@ -7611,6 +7637,31 @@ async fn wss_workspace_import_lifecycle() {
         "in-flight agent surfaced as interrupted: {committed}"
     );
     assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
+
+    // The commit's `workspace:created` event reaches the subscriber (§6.3).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:created"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:created after import commit");
+    assert_eq!(evt["workspaceId"], ws_id, "{evt}");
 
     let list = wss_call(
         srv.port,

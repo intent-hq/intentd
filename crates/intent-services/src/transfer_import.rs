@@ -6,9 +6,10 @@
 //! reassembles the archive, verifies its SHA-256, unpacks it, applies the row
 //! transforms (path rewrites, session-id clearing, in-flight → interrupted),
 //! inserts every row in ONE store transaction, places assets, and rehydrates
-//! hooks / event subscriptions / PR monitors / agent queues without a daemon
-//! restart; `abort` deletes the staging state. Nothing is visible in
-//! `workspace.list` until `commit` succeeds.
+//! agent queues / delegation groups / completion watches / event
+//! subscriptions / hooks / PR monitors without a daemon restart; `abort`
+//! deletes the staging state. Nothing is visible in `workspace.list` until
+//! `commit` succeeds.
 //!
 //! Archive layout (agreed with the export orchestrator):
 //! `manifest.json` (the [`TransferManifest`]), `rows/<table>.jsonl` (one JSON
@@ -45,6 +46,11 @@ pub(crate) struct ImportSession {
     /// Bytes staged so far, keyed by chunk seq (a retried seq replaces its
     /// entry, so the sum never double-counts).
     pub chunk_sizes: HashMap<u64, u64>,
+    /// Set while `commit` is verifying/unpacking/inserting: chunks and
+    /// aborts are rejected so concurrent calls cannot mutate the files
+    /// being hashed or race the commit's cleanup. Cleared on a failed
+    /// commit (the session survives for retry or abort).
+    pub committing: bool,
 }
 
 impl ImportSession {
@@ -118,38 +124,76 @@ impl Services {
 
         let import_id = format!("import-{}", uuid::Uuid::new_v4());
         let staging_dir = self.import_staging_root().join(&import_id);
-        tokio::fs::create_dir_all(&staging_dir)
-            .await
-            .map_err(|e| Error::Internal(format!("create import staging dir failed: {e}")))?;
 
-        let session = ImportSession {
-            workspace_id: manifest.workspace_id.clone(),
-            manifest,
-            staging_dir,
-            declared_size: archive_size_bytes,
-            declared_sha256: sha,
-            chunk_sizes: HashMap::new(),
+        // Register the session BEFORE any directory exists, so every early
+        // return leaves nothing on disk. `live_ids` snapshots the registry
+        // for the orphan sweep below.
+        let live_ids: Vec<String> = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if imports
+                .values()
+                .any(|s| s.workspace_id == manifest.workspace_id)
+            {
+                return Err(Error::InvalidParams(format!(
+                    "another import of workspace {} is already in progress",
+                    manifest.workspace_id.0
+                )));
+            }
+            let session = ImportSession {
+                workspace_id: manifest.workspace_id.clone(),
+                manifest,
+                staging_dir: staging_dir.clone(),
+                declared_size: archive_size_bytes,
+                declared_sha256: sha,
+                chunk_sizes: HashMap::new(),
+                committing: false,
+            };
+            imports.insert(import_id.clone(), session);
+            imports.keys().cloned().collect()
         };
-        let mut imports = self
-            .transfer_imports
-            .lock()
-            .expect("transfer import registry poisoned");
-        if imports
-            .values()
-            .any(|s| s.workspace_id == session.workspace_id)
-        {
-            return Err(Error::InvalidParams(format!(
-                "another import of workspace {} is already in progress",
-                session.workspace_id.0
+
+        // Lazy sweep: staging dirs with no live session are orphans (a
+        // daemon restart drops the in-memory registry, and pre-fix daemons
+        // could leak dirs). Best-effort — a failed sweep never fails begin.
+        self.sweep_orphaned_staging_dirs(&live_ids).await;
+
+        if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
+            self.transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .remove(&import_id);
+            return Err(Error::Internal(format!(
+                "create import staging dir failed: {e}"
             )));
         }
-        imports.insert(import_id.clone(), session);
-        drop(imports);
 
         Ok(serde_json::json!({
             "importId": import_id,
             "maxChunkBytes": IMPORT_MAX_CHUNK_BYTES,
         }))
+    }
+
+    /// Delete `.import-staging/<id>` directories whose id has no live
+    /// session (orphans from a daemon restart mid-upload). Best-effort.
+    async fn sweep_orphaned_staging_dirs(&self, live_ids: &[String]) {
+        let root = self.import_staging_root();
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(_) => return, // no staging root yet — nothing to sweep
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if live_ids.contains(&name) {
+                continue;
+            }
+            tracing::info!(staging = %name, "sweeping orphaned import staging dir");
+            if let Err(e) = tokio::fs::remove_dir_all(entry.path()).await {
+                tracing::warn!(staging = %name, error = %e, "orphan staging sweep failed");
+            }
+        }
     }
 
     /// `InvalidParams` naming the conflict when `id` already exists on this
@@ -190,34 +234,10 @@ impl Services {
                 IMPORT_MAX_CHUNK_BYTES
             )));
         }
-        let (staging_dir, declared_size, prior_total, prior_this_seq) = {
-            let imports = self
-                .transfer_imports
-                .lock()
-                .expect("transfer import registry poisoned");
-            let session = imports
-                .get(&import_id)
-                .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
-            (
-                session.staging_dir.clone(),
-                session.declared_size,
-                session.received_bytes(),
-                session.chunk_sizes.get(&seq).copied().unwrap_or(0),
-            )
-        };
-        // A retried seq replaces its previous bytes; only NEW bytes count
-        // against the declared total.
-        let new_total = prior_total - prior_this_seq + bytes.len() as u64;
-        if new_total > declared_size {
-            return Err(Error::InvalidParams(format!(
-                "received {new_total} bytes exceed the declared archive size {declared_size}"
-            )));
-        }
-        let path = staging_dir.join(chunk_file_name(seq));
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(|e| Error::Internal(format!("write import chunk failed: {e}")))?;
-        let received = {
+        // Reserve this seq's bytes under ONE lock hold: the size check and
+        // the `chunk_sizes` update are atomic, so concurrent chunks cannot
+        // both pass the check and push the total past the declared size.
+        let (staging_dir, prior_this_seq, received) = {
             let mut imports = self
                 .transfer_imports
                 .lock()
@@ -225,9 +245,40 @@ impl Services {
             let session = imports
                 .get_mut(&import_id)
                 .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
+            if session.committing {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is committing — chunks are no longer accepted"
+                )));
+            }
+            // A retried seq replaces its previous bytes; only NEW bytes
+            // count against the declared total.
+            let prior_this_seq = session.chunk_sizes.get(&seq).copied();
+            let new_total =
+                session.received_bytes() - prior_this_seq.unwrap_or(0) + bytes.len() as u64;
+            if new_total > session.declared_size {
+                return Err(Error::InvalidParams(format!(
+                    "received {new_total} bytes exceed the declared archive size {}",
+                    session.declared_size
+                )));
+            }
             session.chunk_sizes.insert(seq, bytes.len() as u64);
-            session.received_bytes()
+            (session.staging_dir.clone(), prior_this_seq, new_total)
         };
+        let path = staging_dir.join(chunk_file_name(seq));
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            // Roll the reservation back so a retry accounts correctly.
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if let Some(session) = imports.get_mut(&import_id) {
+                match prior_this_seq {
+                    Some(prior) => session.chunk_sizes.insert(seq, prior),
+                    None => session.chunk_sizes.remove(&seq),
+                };
+            }
+            return Err(Error::Internal(format!("write import chunk failed: {e}")));
+        }
         Ok(serde_json::json!({
             "importId": import_id,
             "seq": seq,
@@ -237,16 +288,24 @@ impl Services {
 
     /// `workspace.import.abort`: drop the staging session and delete its
     /// directory. Idempotent — aborting an unknown id succeeds quietly (the
-    /// FE may retry an abort after a timeout).
+    /// FE may retry an abort after a timeout). Rejected while a commit of
+    /// the same import is in flight (abort would race the commit's cleanup).
     pub(crate) async fn workspace_import_abort_op(
         &self,
         import_id: String,
     ) -> Result<serde_json::Value> {
-        let session = self
-            .transfer_imports
-            .lock()
-            .expect("transfer import registry poisoned")
-            .remove(&import_id);
+        let session = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if imports.get(&import_id).is_some_and(|s| s.committing) {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is committing — wait for the commit to settle"
+                )));
+            }
+            imports.remove(&import_id)
+        };
         let aborted = session.is_some();
         if let Some(session) = session {
             let _ = tokio::fs::remove_dir_all(&session.staging_dir).await;
@@ -262,18 +321,43 @@ impl Services {
     /// and rehydrate hooks / event subscriptions / PR monitors / agent
     /// queues. The staging session survives a failed commit (the FE can
     /// retry or abort); it is removed only after the rows are committed.
+    /// While a commit runs, its session is flagged `committing`, so a
+    /// concurrent commit/chunk/abort of the same import is rejected instead
+    /// of mutating the files being hashed.
     pub(crate) async fn workspace_import_commit_op(
         &self,
         import_id: String,
     ) -> Result<serde_json::Value> {
+        let result = self.workspace_import_commit_inner(&import_id).await;
+        if result.is_err() {
+            // The session survives a failed commit — clear the in-flight
+            // flag so a retry (or abort) is accepted.
+            if let Some(session) = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .get_mut(&import_id)
+            {
+                session.committing = false;
+            }
+        }
+        result
+    }
+
+    async fn workspace_import_commit_inner(&self, import_id: &str) -> Result<serde_json::Value> {
         let (staging_dir, declared_size, declared_sha, manifest, workspace_id, chunk_seqs) = {
-            let imports = self
+            let mut imports = self
                 .transfer_imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
-                .get(&import_id)
+                .get_mut(import_id)
                 .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
+            if session.committing {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is already committing"
+                )));
+            }
             let received = session.received_bytes();
             if received != session.declared_size {
                 return Err(Error::InvalidParams(format!(
@@ -288,6 +372,7 @@ impl Services {
                     "chunk sequence has gaps: got seqs {seqs:?}, expected contiguous from 0"
                 )));
             }
+            session.committing = true;
             (
                 session.staging_dir.clone(),
                 session.declared_size,
@@ -334,6 +419,10 @@ impl Services {
         // Load rows/<table>.jsonl (unknown files — including event.jsonl —
         // are skipped defensively; the store layer would reject them anyway).
         let rows = load_row_files(&extracted_dir.join("rows")).await?;
+        // Every row must be scoped to the manifest's workspace — collision
+        // validation only ran for that id, so smuggled rows for other
+        // workspaces (or agents outside the archive) fail the commit.
+        validate_row_scope(&rows, &workspace_id)?;
 
         // Transform: path rewrites against OUR workspaces root, session-id
         // clearing, in-flight → interrupted, drafts dropped.
@@ -367,7 +456,7 @@ impl Services {
         self.transfer_imports
             .lock()
             .expect("transfer import registry poisoned")
-            .remove(&import_id);
+            .remove(import_id);
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
         let ws = self.store.get_workspace(&workspace_id).await?;
@@ -445,15 +534,33 @@ impl Services {
     }
 
     /// Boot-style rehydration after a committed import so the workspace's
-    /// hooks, event subscriptions, PR monitors, and queued agent messages go
-    /// live without a daemon restart. Every loader is idempotent (each skips
-    /// entries already live in memory), so re-running them over the whole
-    /// store is safe. Best-effort: failures are logged per loader.
+    /// agent queues, delegation groups, completion watches, event
+    /// subscriptions, hooks, and PR monitors go live without a daemon
+    /// restart. Every loader is idempotent (each skips entries already live
+    /// in memory), so re-running them over the whole store is safe.
+    /// Best-effort: failures are logged per loader.
     async fn rehydrate_after_import(&self) -> serde_json::Value {
-        let hooks = self.rehydrate_hooks().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "post-import hook rehydration failed");
+        // Boot order (main.rs): queues → delegation groups → completion
+        // watches (grouped watches need their live groups) → event
+        // subscriptions → hooks → PR monitors.
+        let agent_queues = self.rehydrate_agent_queues().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import agent queue rehydration failed");
             0
         });
+        let delegation_groups = self
+            .heal_delegation_groups_on_startup()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import delegation group rehydration failed");
+                0
+            });
+        let completion_watches = self
+            .heal_completion_watches_on_startup()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import completion watch rehydration failed");
+                0
+            });
         let event_subscriptions = self
             .heal_event_subscriptions_on_startup()
             .await
@@ -461,12 +568,12 @@ impl Services {
                 tracing::warn!(error = %e, "post-import event subscription rehydration failed");
                 0
             });
-        let pr_monitors = self.rehydrate_pr_monitors().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "post-import PR monitor rehydration failed");
+        let hooks = self.rehydrate_hooks().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import hook rehydration failed");
             0
         });
-        let agent_queues = self.rehydrate_agent_queues().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "post-import agent queue rehydration failed");
+        let pr_monitors = self.rehydrate_pr_monitors().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import PR monitor rehydration failed");
             0
         });
         serde_json::json!({
@@ -474,6 +581,8 @@ impl Services {
             "eventSubscriptions": event_subscriptions,
             "prMonitors": pr_monitors,
             "agentQueues": agent_queues,
+            "delegationGroups": delegation_groups,
+            "completionWatches": completion_watches,
         })
     }
 }
@@ -524,7 +633,9 @@ fn assemble_and_extract(
         .map_err(|e| Error::InvalidParams(format!("archive is not a valid zip: {e}")))?;
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| Error::Internal(format!("create extraction dir failed: {e}")))?;
-    // `ZipArchive::extract` sanitizes entry names (zip-slip safe).
+    // `ZipArchive::extract` sanitizes entry names via `enclosed_name` and
+    // refuses symlinks whose target escapes the destination (zip-slip safe;
+    // pinned by the `extract_rejects_hostile_entries` regression test).
     zip.extract(extracted_dir)
         .map_err(|e| Error::InvalidParams(format!("archive extraction failed: {e}")))?;
     Ok(())
@@ -571,6 +682,53 @@ async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::
         out.push((table.to_string(), rows));
     }
     Ok(out)
+}
+
+/// Reject archives whose rows reach beyond the manifest's workspace:
+/// `workspace` rows must carry exactly the imported id, every table with a
+/// `workspace_id` column must match it, `completion_watch` must touch it
+/// from at least one end, and `agent_message`/`agent_queue` rows (scoped
+/// through their owning session) must name an `agent_session` in the
+/// archive. Collision validation ran only for the manifest's id, so
+/// anything else would land unvalidated.
+fn validate_row_scope(
+    rows: &[(String, Vec<serde_json::Value>)],
+    workspace_id: &WorkspaceId,
+) -> Result<()> {
+    let session_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|(t, _)| t == "agent_session")
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    let field = |row: &serde_json::Value, key: &str| -> String {
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    for (table, objects) in rows {
+        for row in objects {
+            let ok = match table.as_str() {
+                "workspace" => field(row, "id") == workspace_id.0,
+                "agent_message" | "agent_queue" => {
+                    session_ids.contains(field(row, "agent_id").as_str())
+                }
+                "completion_watch" => {
+                    field(row, "parent_workspace_id") == workspace_id.0
+                        || field(row, "child_workspace_id") == workspace_id.0
+                }
+                _ => field(row, "workspace_id") == workspace_id.0,
+            };
+            if !ok {
+                return Err(Error::InvalidParams(format!(
+                    "archive rows/{table}.jsonl contains a row outside workspace {} — import rejected",
+                    workspace_id.0
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What [`transform_rows`] produced: the insert-ready batch plus the agents
@@ -697,26 +855,38 @@ fn transform_rows(
         out.push((table, objects));
     }
 
-    // Merge synthesized interrupted rows with exported ones (exported rows
-    // win — they carry the original interruption context).
-    let mut have: std::collections::HashSet<String> = existing_interrupted
+    // Merge synthesized interrupted rows with exported ones. Exported
+    // PENDING rows win (they carry the original interruption context), but
+    // resolved rows are audit history and must not suppress a fresh pending
+    // row for an agent in-flight at export time — `agent_id` is the table's
+    // PRIMARY KEY, so such a row is rewritten back to pending in place.
+    let mut pending: std::collections::HashSet<String> = existing_interrupted
         .iter()
+        .filter(|r| r.get("resolution").and_then(|v| v.as_str()) == Some("pending"))
         .filter_map(|r| r.get("agent_id").and_then(|v| v.as_str()))
         .map(str::to_string)
         .collect();
-    let mut interrupted_ids: Vec<String> = have.iter().cloned().collect();
+    let mut interrupted_ids: Vec<String> = pending.iter().cloned().collect();
     for (agent_id, prev_status) in interrupted {
-        if agent_id.is_empty() || have.contains(&agent_id) {
+        if agent_id.is_empty() || pending.contains(&agent_id) {
             continue;
         }
-        have.insert(agent_id.clone());
-        existing_interrupted.push(serde_json::json!({
+        pending.insert(agent_id.clone());
+        let row = serde_json::json!({
             "agent_id": agent_id,
             "workspace_id": workspace_id.0,
             "prev_status": prev_status,
             "interrupted_at": now,
             "resolution": "pending",
-        }));
+            "resolved_at": serde_json::Value::Null,
+        });
+        match existing_interrupted
+            .iter_mut()
+            .find(|r| r.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id.as_str()))
+        {
+            Some(resolved_audit_row) => *resolved_audit_row = row,
+            None => existing_interrupted.push(row),
+        }
         interrupted_ids.push(agent_id);
     }
     interrupted_ids.sort();
@@ -896,6 +1066,100 @@ mod tests {
         assert_eq!(interrupted[0]["interrupted_at"], "2026-01-01T00:00:00Z");
     }
 
+    /// A RESOLVED audit row (the agent was interrupted before, then resumed)
+    /// must NOT suppress the fresh pending row for an agent in-flight at
+    /// export time: `agent_id` is the PK, so the audit row is rewritten back
+    /// to pending in place.
+    #[test]
+    fn transform_resolved_audit_row_does_not_suppress_new_interruption() {
+        let rows = vec![
+            (
+                "agent_session".to_string(),
+                vec![serde_json::json!({ "id": "agent-a", "status": "active" })],
+            ),
+            (
+                "interrupted_agent".to_string(),
+                vec![serde_json::json!({
+                    "agent_id": "agent-a", "workspace_id": "ws-import",
+                    "prev_status": "Waiting", "interrupted_at": "2026-01-01T00:00:00Z",
+                    "resolution": "resumed", "resolved_at": "2026-01-02T00:00:00Z"
+                })],
+            ),
+        ];
+        let outcome =
+            transform_rows(rows, &ws(), &root(), "2026-08-11T00:00:00Z").expect("transform");
+        let interrupted = find(&outcome, "interrupted_agent");
+        assert_eq!(interrupted.len(), 1, "one row per agent (PK)");
+        assert_eq!(interrupted[0]["resolution"], "pending");
+        assert_eq!(interrupted[0]["prev_status"], "active");
+        assert_eq!(interrupted[0]["interrupted_at"], "2026-08-11T00:00:00Z");
+        assert_eq!(interrupted[0]["resolved_at"], serde_json::Value::Null);
+        assert_eq!(outcome.interrupted_agent_ids, vec!["agent-a"]);
+    }
+
+    /// Rows outside the manifest's workspace are rejected: smuggled second
+    /// `workspace` rows, child rows scoped to another workspace, and
+    /// `agent_message` rows whose owning session is not in the archive.
+    #[test]
+    fn validate_row_scope_rejects_out_of_scope_rows() {
+        let ws = ws();
+        let scoped = |rows: Vec<(&str, Vec<serde_json::Value>)>| {
+            validate_row_scope(
+                &rows
+                    .into_iter()
+                    .map(|(t, r)| (t.to_string(), r))
+                    .collect::<Vec<_>>(),
+                &ws,
+            )
+        };
+
+        assert!(scoped(vec![(
+            "workspace",
+            vec![
+                serde_json::json!({ "id": "ws-import" }),
+                serde_json::json!({ "id": "ws-smuggled" }),
+            ],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "note",
+            vec![serde_json::json!({ "id": "n1", "workspace_id": "ws-other" })],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "agent_message",
+            vec![serde_json::json!({ "id": 1, "agent_id": "agent-elsewhere" })],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "completion_watch",
+            vec![serde_json::json!({
+                "id": "w1", "parent_workspace_id": "ws-a", "child_workspace_id": "ws-b"
+            })],
+        )])
+        .is_err());
+
+        assert!(scoped(vec![
+            ("workspace", vec![serde_json::json!({ "id": "ws-import" })],),
+            (
+                "agent_session",
+                vec![serde_json::json!({ "id": "agent-a", "workspace_id": "ws-import" })],
+            ),
+            (
+                "agent_message",
+                vec![serde_json::json!({ "id": 1, "agent_id": "agent-a" })],
+            ),
+            (
+                "completion_watch",
+                vec![serde_json::json!({
+                    "id": "w1", "parent_workspace_id": "ws-import",
+                    "child_workspace_id": "ws-b"
+                })],
+            ),
+        ])
+        .is_ok());
+    }
+
     /// Drafts are dropped entirely (their owning `client` never transfers).
     #[test]
     fn transform_drops_drafts() {
@@ -960,6 +1224,82 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Pin the zip-slip safety `assemble_and_extract` relies on: hostile
+    /// entry names (`../evil`, absolute paths) and symlinks targeting
+    /// outside the destination must not write outside the extraction dir,
+    /// whatever the `zip` crate's policy (sanitize or error) is.
+    #[test]
+    fn extract_rejects_hostile_entries() {
+        use std::io::Write as _;
+
+        type Writer<'a> = zip::ZipWriter<&'a mut std::io::Cursor<Vec<u8>>>;
+        let run = |build: &dyn for<'a> Fn(&mut Writer<'a>)| {
+            let staging = TempDir::new("import-zip-slip");
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            build(&mut writer);
+            writer.finish().expect("zip");
+            let archive = buf.into_inner();
+            std::fs::write(staging.0.join(chunk_file_name(0)), &archive).expect("chunk");
+            let extracted = staging.0.join("extracted");
+            let result = assemble_and_extract(
+                &staging.0,
+                &[0],
+                archive.len() as u64,
+                &sha256_hex(&archive),
+                &extracted,
+            );
+            (staging, result)
+        };
+        let options = || zip::write::FileOptions::<'_, ()>::default();
+
+        // Path traversal in an entry name.
+        let (staging, result) = run(&|writer| {
+            writer.start_file("../evil.txt", options()).expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            !staging.0.parent().unwrap().join("evil.txt").exists(),
+            "traversal entry must not escape the extraction dir (result: {result:?})"
+        );
+
+        // Absolute entry name.
+        let escape_target = TempDir::new("import-zip-slip-target");
+        let abs = escape_target.0.join("evil-abs.txt");
+        let abs_name = abs.to_string_lossy().to_string();
+        let (_staging, result) = run(&|writer| {
+            writer.start_file(&*abs_name, options()).expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            !abs.exists(),
+            "absolute entry must not escape the extraction dir (result: {result:?})"
+        );
+
+        // Symlink whose target points outside the destination, plus a file
+        // extracted THROUGH it. The extraction must FAIL (failing the whole
+        // commit — extraction is not atomic, so an intermediate entry may
+        // linger inside the staging dir, which a failed commit discards) and
+        // nothing may land outside the extraction dir.
+        let (_staging, result) = run(&|writer| {
+            writer
+                .add_symlink("link", "/", options())
+                .expect("symlink entry");
+            writer
+                .start_file("link/evil-via-link.txt", options())
+                .expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            result.is_err(),
+            "escaping symlink must fail the extraction (result: {result:?})"
+        );
+        assert!(
+            !Path::new("/evil-via-link.txt").exists(),
+            "symlink-relayed entry must not escape (result: {result:?})"
+        );
     }
 
     async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
