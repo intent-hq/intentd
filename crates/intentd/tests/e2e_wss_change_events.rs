@@ -3215,6 +3215,8 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
     }
 
     // child dependsOn parent → -32603, ancestor relationship named in data.
+    // The full JSON-RPC error envelope shape is asserted (§1): `jsonrpc`,
+    // echoed `id`, `error` with `code`/`message`/`data`, and no `result`.
     let err = wss_rpc_envelope(
         &mut rpc,
         10,
@@ -3222,6 +3224,13 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": child, "dependsOn": [parent] }),
     )
     .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(10), "envelope id echoed: {err}");
+    assert!(err.get("result").is_none(), "no result on error: {err}");
+    assert!(
+        err["error"]["message"].is_string(),
+        "error message present: {err}"
+    );
     assert_eq!(err["error"]["code"], json!(-32603), "ancestor: {err}");
     let detail = err["error"]["data"]
         .as_str()
@@ -3243,6 +3252,8 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent, "dependsOn": [child] }),
     )
     .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(11), "envelope id echoed: {err}");
     assert_eq!(err["error"]["code"], json!(-32603), "descendant: {err}");
     let detail = err["error"]["data"]
         .as_str()
@@ -3265,6 +3276,8 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
         }),
     )
     .await;
+    assert_eq!(err["jsonrpc"], json!("2.0"), "envelope jsonrpc: {err}");
+    assert_eq!(err["id"], json!(12), "envelope id echoed: {err}");
     assert_eq!(err["error"]["code"], json!(-32603), "markAsTask: {err}");
     assert!(
         err["error"]["data"]
