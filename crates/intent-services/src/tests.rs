@@ -5628,6 +5628,50 @@ mod change_event_parity {
         assert!(ev["data"]["computedAt"].is_string());
     }
 
+    /// Pins the #1981 always-emit arm: deleting a depended-on note emits a
+    /// recompute EVEN WHEN the ready set is unchanged — here `gated` is held
+    /// back by a second incomplete dep both before and after, so the set is
+    /// `[other]` throughout, yet the dangling-edge announcement still fires.
+    #[tokio::test]
+    async fn deleting_depended_on_note_emits_even_when_set_unchanged() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("dep", TaskStatus::Complete, vec![], 0),
+            mk("holdback", TaskStatus::NotStarted, vec![], 1),
+            mk("gated", TaskStatus::NotStarted, vec!["dep", "holdback"], 2),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+        // Ready set before: ["holdback"]. After deleting `dep` its dangling
+        // edge is unmet, but `gated` was already blocked by the incomplete
+        // `holdback` dep, so the set stays ["holdback"] — only the
+        // `depended_on` arm can produce this emit.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep"), None)
+            .await
+            .expect("delete dep");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["holdback"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep", "reason": "note-deleted" })
+        );
+    }
+
     /// monorepo#2006: deleting the last incomplete task child of a parent
     /// satisfies the tree rule (all task children `complete`), so the parent
     /// ENTERS the ready set — announced with the `note-deleted` trigger and
