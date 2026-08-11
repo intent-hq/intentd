@@ -116,6 +116,15 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Internal error".to_string(),
             data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
         },
+        // `git.showFile` on a non-blob tree entry (gitlink / tree): -32602
+        // with machine-readable `data = { code: "not-a-file", path, mode }`
+        // so clients can route submodule pins to a dedicated presentation
+        // instead of matching on prose (monorepo#1739).
+        ref e @ Error::NotAFile { ref path, ref mode } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "not-a-file", "path": path, "mode": mode })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
