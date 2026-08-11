@@ -279,6 +279,12 @@ async fn delegate(
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
+        tasks: args.get("tasks").and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(NoteId::from_string))
+                .collect()
+        }),
+        greedy: opt_bool(args, "greedy"),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())
