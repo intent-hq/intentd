@@ -6643,7 +6643,9 @@ impl Services {
     /// A queue whose ready-to-send entries have sat undelivered past
     /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
     /// responding raises a `stale-queue-entry` stuck-risk
-    /// (intent-hq/monorepo#1897).
+    /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
+    /// archived workspaces park every entry, and an active question hold
+    /// parks automatic (non-user-origin) entries — neither is stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -7039,6 +7041,17 @@ impl Services {
         // under edit are excluded (the drain skips them by design), as are
         // entries whose `queuedAt` fails to parse. An actively-responding,
         // non-stale agent legitimately holds its queue until the turn ends.
+        //
+        // Affirmatively-parked queues are expected, not stuck: an archived
+        // workspace parks every queue until unarchive (the drain kick then
+        // delivers), and an active question hold (PROTOCOL §5.5) parks
+        // automatic entries until the user answers or dismisses — but never
+        // user-origin entries, which drain through the hold, so a stale
+        // user-origin entry under a hold is still a genuine risk. Both checks
+        // are lazy — one workspace read per call and one bounded
+        // [`Services::question_hold_active`] session read per agent, paid
+        // only when a stale candidate actually exists.
+        let mut workspace_archived: Option<bool> = None;
         for q in &queues {
             let aid = q["agentId"].as_str().unwrap_or_default();
             let actively_responding = session_by_id.get(aid).is_some_and(|s| {
@@ -7048,7 +7061,7 @@ impl Services {
             if actively_responding {
                 continue;
             }
-            let stale: Vec<(&str, i64)> = q["entries"]
+            let mut stale: Vec<(&str, i64)> = q["entries"]
                 .as_array()
                 .map(|entries| {
                     entries
@@ -7067,6 +7080,46 @@ impl Services {
                         .collect()
                 })
                 .unwrap_or_default();
+            if stale.is_empty() {
+                continue;
+            }
+            let archived = match workspace_archived {
+                Some(v) => v,
+                None => {
+                    let v = !workspace_id.is_chief()
+                        && self
+                            .store
+                            .get_workspace(&workspace_id)
+                            .await
+                            .map(|w| w.archived)
+                            .unwrap_or(false);
+                    workspace_archived = Some(v);
+                    v
+                }
+            };
+            if archived {
+                break;
+            }
+            let agent = AgentId(aid.to_string());
+            if self.question_hold_active(&agent).await {
+                let user_origin_ids: HashSet<String> = {
+                    let guard = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    guard
+                        .get(&agent)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|m| m.user_origin)
+                                .map(|m| m.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                stale.retain(|(id, _)| user_origin_ids.contains(*id));
+            }
             let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
                 continue;
             };

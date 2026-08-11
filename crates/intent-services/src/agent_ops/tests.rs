@@ -8013,7 +8013,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         guard.get_mut(&target).expect("queue")[0].editing = true;
     }
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None)
         .await
         .expect("diagnostics editing");
     assert!(
@@ -8023,6 +8023,91 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
             .iter()
             .all(|r| r["type"] != json!("stale-queue-entry")),
         "editing entry must not be flagged: {result}"
+    );
+
+    // An active question hold parks automatic entries by design (PROTOCOL
+    // §5.5): the old non-user-origin entry is expected to wait, no risk.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        guard.get_mut(&target).expect("queue")[0].editing = false;
+    }
+    svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
+        .await;
+    // The marker write bumps the session's `updated_at` — re-mark the agent
+    // idle so the phases below exercise the hold logic, not the
+    // actively-responding skip.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Idle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark idle");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics question hold");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "question-hold-parked automatic entry must not be flagged: {result}"
+    );
+
+    // The hold never blocks user-origin entries — a stale one is a genuine
+    // risk, flagged even under the hold and counted alone.
+    svc.enqueue_message_with_origin(
+        &target,
+        "user answer".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    );
+    let user_entry_id = {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        let m = q.iter_mut().find(|m| m.user_origin).expect("user entry");
+        m.queued_at = "2020-01-01T00:00:00Z".into();
+        m.id.clone()
+    };
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics user-origin under hold");
+    let risk = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("stale-queue-entry"))
+        .unwrap_or_else(|| panic!("stale user-origin entry under hold must be flagged: {result}"))
+        .clone();
+    assert_eq!(risk["entryId"], json!(user_entry_id), "risk: {risk}");
+    assert_eq!(risk["count"], json!(1), "risk: {risk}");
+
+    // An archived workspace affirmatively parks every queue until unarchive:
+    // nothing is flagged, user-origin or not.
+    let mut w = svc.store().get_workspace(&ws).await.expect("workspace");
+    w.archived = true;
+    svc.store().update_workspace(&w).await.expect("archive");
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics archived");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "archived-workspace queue must not be flagged: {result}"
     );
 }
 
