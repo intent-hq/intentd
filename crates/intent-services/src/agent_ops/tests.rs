@@ -8025,11 +8025,32 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         "editing entry must not be flagged: {result}"
     );
 
+    // An unparseable `queuedAt` is excluded rather than treated as
+    // infinitely old: no risk.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        q[0].editing = false;
+        q[0].queued_at = "not-a-timestamp".into();
+    }
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics unparseable");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "unparseable queuedAt must not be flagged: {result}"
+    );
+
     // An active question hold parks automatic entries by design (PROTOCOL
     // §5.5): the old non-user-origin entry is expected to wait, no risk.
     {
         let mut guard = svc.agent_queues.lock().unwrap();
-        guard.get_mut(&target).expect("queue")[0].editing = false;
+        guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
     }
     svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
         .await;

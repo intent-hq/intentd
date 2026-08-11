@@ -7069,8 +7069,9 @@ impl Services {
                         .filter(|e| e["editing"].as_bool() != Some(true))
                         .filter_map(|e| {
                             let queued_at = e["queuedAt"].as_str()?;
-                            parse_iso(queued_at)?;
-                            let age = age_ms(now_ms, queued_at);
+                            let queued_ms =
+                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let age = (now_ms - queued_ms).max(0);
                             if age > STALE_QUEUE_ENTRY_AFTER_MS {
                                 Some((e["id"].as_str().unwrap_or_default(), age))
                             } else {
