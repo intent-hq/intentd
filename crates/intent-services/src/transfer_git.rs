@@ -30,12 +30,17 @@ const INDEX_TREE_TRAILER: &str = "Intent-Index-Tree:";
 /// bundle header, which is how the target addresses them.
 const TRANSFER_REF_NS: &str = "refs/intent/transfer";
 
-/// Bundle ref name recording the workspace base commit.
-pub const BASE_BUNDLE_REF: &str = "refs/intent/transfer/base";
+/// Bundle ref name recording the workspace base commit. Namespaced by
+/// workspace id: worktree-based workspaces share the repository's common
+/// refs dir, so concurrent transfers must not collide on temp-ref names.
+pub fn base_bundle_ref(workspace_id: &str) -> String {
+    format!("{TRANSFER_REF_NS}/{workspace_id}/base")
+}
 
-/// Bundle ref name recording one sandbox's `sb/<agentId>` branch tip.
-pub fn sandbox_bundle_ref(agent_id: &str) -> String {
-    format!("{TRANSFER_REF_NS}/sandbox/{agent_id}")
+/// Bundle ref name recording one sandbox's `sb/<agentId>` branch tip
+/// (workspace-namespaced like [`base_bundle_ref`]).
+pub fn sandbox_bundle_ref(workspace_id: &str, agent_id: &str) -> String {
+    format!("{TRANSFER_REF_NS}/{workspace_id}/sandbox/{agent_id}")
 }
 
 /// Ref inventory of a transfer bundle: what each bundle ref is and how it
@@ -58,7 +63,7 @@ pub struct TransferRefsManifest {
     /// The workspace `baseRef` name (e.g. `main`), when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
-    /// Bundle ref anchoring the base commit ([`BASE_BUNDLE_REF`]); omitted
+    /// Bundle ref anchoring the base commit ([`base_bundle_ref`]); omitted
     /// when no base could be resolved locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_bundle_ref: Option<String>,
@@ -123,18 +128,38 @@ pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
     index
         .write()
         .map_err(|e| Error::Internal(format!("write index failed: {e}")))?;
-    let tree_oid = index
-        .write_tree()
-        .map_err(|e| Error::Internal(format!("write tree failed: {e}")))?;
-    let tree = repo
-        .find_tree(tree_oid)
-        .map_err(|e| Error::Internal(format!("find tree failed: {e}")))?;
-    let sig = resolve_signature(&repo)?;
-    let message = format!("{TRANSFER_WIP_SENTINEL}\n\n{INDEX_TREE_TRAILER} {orig_index_tree}");
-    let oid = repo
-        .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&head_commit])
-        .map_err(|e| Error::Internal(format!("create WIP snapshot commit failed: {e}")))?;
-    Ok(Some(oid.to_string()))
+    // From here the on-disk index has everything staged; if anything below
+    // fails there is no WIP commit for `unwind_wip` to detect, so restore the
+    // pre-snapshot index ourselves to keep the no-mutation-on-failure
+    // guarantee.
+    let commit_result = (|| -> Result<git2::Oid> {
+        let tree_oid = index
+            .write_tree()
+            .map_err(|e| Error::Internal(format!("write tree failed: {e}")))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| Error::Internal(format!("find tree failed: {e}")))?;
+        let sig = resolve_signature(&repo)?;
+        let message = format!("{TRANSFER_WIP_SENTINEL}\n\n{INDEX_TREE_TRAILER} {orig_index_tree}");
+        repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&head_commit])
+            .map_err(|e| Error::Internal(format!("create WIP snapshot commit failed: {e}")))
+    })();
+    match commit_result {
+        Ok(oid) => Ok(Some(oid.to_string())),
+        Err(e) => {
+            if let Ok(tree) = repo.find_tree(orig_index_tree) {
+                let restored = index.read_tree(&tree).and_then(|_| index.write());
+                if let Err(re) = restored {
+                    tracing::warn!(
+                        path = %repo_path.display(),
+                        error = %re,
+                        "WIP snapshot failed and pre-snapshot index could not be restored"
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Inverse of [`snapshot_wip`]: when HEAD is a transfer WIP snapshot commit,
@@ -187,6 +212,10 @@ pub fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// export settles. On failure every created WIP commit is unwound, temporary
 /// refs are deleted, and any partial bundle file is removed — the source is
 /// restored exactly as found.
+///
+/// This is blocking work (git2 I/O plus `git` child processes); async callers
+/// must run it via `spawn_blocking`, like the plan op does for
+/// `estimate_bundle_bytes`.
 pub fn create_transfer_bundle(
     ws: &Workspace,
     sandboxes: &[Sandbox],
@@ -278,10 +307,11 @@ fn build_bundle(
     let base_oid = resolve_base_commit(&repo, ws);
     let (base_bundle_ref, base_sha) = match base_oid {
         Some(oid) => {
-            repo.reference(BASE_BUNDLE_REF, oid, true, "transfer base anchor")
+            let base_ref_name = base_bundle_ref(&ws.id.0);
+            repo.reference(&base_ref_name, oid, true, "transfer base anchor")
                 .map_err(|e| Error::Internal(format!("create base transfer ref failed: {e}")))?;
-            temp_refs.push(BASE_BUNDLE_REF.to_string());
-            (Some(BASE_BUNDLE_REF.to_string()), Some(oid.to_string()))
+            temp_refs.push(base_ref_name.clone());
+            (Some(base_ref_name), Some(oid.to_string()))
         }
         None => (None, None),
     };
@@ -298,12 +328,11 @@ fn build_bundle(
             );
             continue;
         }
-        let wip = snapshot_wip(&sb_path)?;
-        if wip.is_some() {
-            snapshotted.push(sb_path.clone());
-        }
+        // Validate the branch BEFORE snapshotting: a sandbox that can't be
+        // bundled (or whose dirty state can't ride the bundled branch) must
+        // never be mutated.
         let branch_ref = format!("refs/heads/{}", sb.branch);
-        {
+        let head_on_branch = {
             let sb_repo = git2::Repository::open(&sb_path)
                 .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
             let committish = sb_repo
@@ -318,8 +347,31 @@ fn build_bundle(
                 );
                 continue;
             }
-        }
-        let bundle_ref = sandbox_bundle_ref(&sb.agent_id.0);
+            sb_repo
+                .head()
+                .ok()
+                .map(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
+                .unwrap_or(false)
+        };
+        // The WIP commit lands on HEAD's branch while the bundler fetches
+        // `sb.branch` — so only snapshot when HEAD is on `sb.branch`;
+        // otherwise the dirty state would be unreachable from any bundled
+        // ref. Diverged HEADs bundle the clean branch tip instead.
+        let wip = if head_on_branch {
+            let wip = snapshot_wip(&sb_path)?;
+            if wip.is_some() {
+                snapshotted.push(sb_path.clone());
+            }
+            wip
+        } else {
+            tracing::warn!(
+                agent = %sb.agent_id.0,
+                branch = %sb.branch,
+                "transfer bundle: sandbox HEAD is not on its recorded branch; bundling the branch tip without a WIP snapshot"
+            );
+            None
+        };
+        let bundle_ref = sandbox_bundle_ref(&ws.id.0, &sb.agent_id.0);
         fetch_local_ref(worktree, &sb_path, &branch_ref, &bundle_ref)?;
         temp_refs.push(bundle_ref.clone());
         let head_sha = repo
@@ -856,14 +908,17 @@ mod tests {
             create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
 
         assert_eq!(manifest.base_ref.as_deref(), Some("main"));
-        assert_eq!(manifest.base_bundle_ref.as_deref(), Some(BASE_BUNDLE_REF));
+        assert_eq!(
+            manifest.base_bundle_ref.as_deref(),
+            Some(base_bundle_ref(&ws.id.0).as_str())
+        );
         assert_eq!(manifest.base_sha.as_deref(), Some(head_sha(&repo).as_str()));
 
         assert_eq!(manifest.sandboxes.len(), 1);
         let entry = &manifest.sandboxes[0];
         assert_eq!(entry.agent_id, agent.0);
         assert_eq!(entry.branch, branch);
-        assert_eq!(entry.bundle_ref, sandbox_bundle_ref(&agent.0));
+        assert_eq!(entry.bundle_ref, sandbox_bundle_ref(&ws.id.0, &agent.0));
         let sb_wip = entry
             .wip_commit_sha
             .clone()
@@ -873,7 +928,7 @@ mod tests {
 
         let refs = bundle_refs(&repo, &bundle_path);
         assert!(refs.contains(&"refs/heads/main".to_string()), "{refs:?}");
-        assert!(refs.contains(&BASE_BUNDLE_REF.to_string()), "{refs:?}");
+        assert!(refs.contains(&base_bundle_ref(&ws.id.0)), "{refs:?}");
         assert!(refs.contains(&entry.bundle_ref), "{refs:?}");
 
         // The sandbox WIP content is reachable from the bundle: fetch the
@@ -927,6 +982,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_unwind_roundtrip_preserves_deletions() {
+        let (_dir, repo) = temp_repo("deletions");
+        commit_file(&repo, "staged-del.txt", "to delete\n", "feat: add files");
+        commit_file(&repo, "wt-del.txt", "to delete\n", "feat: add more");
+        let base = head_sha(&repo);
+
+        // staged deletion
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let mut index = r.index().unwrap();
+            index.remove_path(Path::new("staged-del.txt")).unwrap();
+            index.write().unwrap();
+        }
+        fs::remove_file(repo.join("staged-del.txt")).unwrap();
+        // unstaged deletion of a tracked file
+        fs::remove_file(repo.join("wt-del.txt")).unwrap();
+
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo).unwrap().expect("dirty repo snapshots");
+        // Deletions are captured: neither file is in the WIP tree.
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("staged-del.txt").is_none());
+            assert!(tree.get_name("wt-del.txt").is_none());
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(
+            status_fingerprint(&repo),
+            before,
+            "staged/unstaged deletion split restored exactly"
+        );
+        assert!(!repo.join("staged-del.txt").exists());
+        assert!(!repo.join("wt-del.txt").exists());
+    }
+
+    #[test]
     fn bundle_skips_missing_sandbox_directory() {
         let (dir, repo) = temp_repo("ws-missing-sb");
         let ws = workspace_for_repo(&repo);
@@ -938,6 +1036,64 @@ mod tests {
         let (_bundle, manifest) =
             create_transfer_bundle(&ws, &[missing], &dir.path().join("staging")).unwrap();
         assert!(manifest.sandboxes.is_empty(), "missing sandbox skipped");
+    }
+
+    #[test]
+    fn bundle_never_mutates_dirty_sandbox_with_missing_branch() {
+        let (dir, repo) = temp_repo("ws-sb-nobranch");
+        let ws = workspace_for_repo(&repo);
+
+        // Dirty sandbox whose recorded branch does not exist.
+        let agent = AgentId::new();
+        let sb_path = dir.path().join("sandbox");
+        make_sandbox_clone(&repo, &sb_path, &format!("sb/{}", agent.0));
+        fs::write(sb_path.join("dirty.txt"), "dirty\n").unwrap();
+        let sb_head = head_sha(&sb_path);
+        let before = status_fingerprint(&sb_path);
+        let mut sb = sandbox_row(&ws, &agent, &sb_path, &format!("sb/{}", agent.0));
+        sb.branch = "sb/does-not-exist".to_string();
+
+        let (_bundle, manifest) =
+            create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
+        assert!(manifest.sandboxes.is_empty(), "unbundlable sandbox skipped");
+        // The skipped sandbox was not touched: no WIP commit, dirty state intact.
+        assert_eq!(
+            head_sha(&sb_path),
+            sb_head,
+            "no WIP commit on skipped sandbox"
+        );
+        assert_eq!(status_fingerprint(&sb_path), before);
+    }
+
+    #[test]
+    fn bundle_diverged_sandbox_head_bundles_branch_tip_without_wip() {
+        let (dir, repo) = temp_repo("ws-sb-diverged");
+        let ws = workspace_for_repo(&repo);
+
+        // Sandbox whose branch exists but HEAD sits on another branch.
+        let agent = AgentId::new();
+        let branch = format!("sb/{}", agent.0);
+        let sb_path = dir.path().join("sandbox");
+        make_sandbox_clone(&repo, &sb_path, &branch);
+        let branch_tip = head_sha(&sb_path);
+        {
+            let r = git2::Repository::open(&sb_path).unwrap();
+            let head = r.head().unwrap().peel_to_commit().unwrap();
+            r.branch("other", &head, false).unwrap();
+            r.set_head("refs/heads/other").unwrap();
+        }
+        fs::write(sb_path.join("dirty.txt"), "dirty\n").unwrap();
+        let before = status_fingerprint(&sb_path);
+        let sb = sandbox_row(&ws, &agent, &sb_path, &branch);
+
+        let (_bundle, manifest) =
+            create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
+        assert_eq!(manifest.sandboxes.len(), 1);
+        let entry = &manifest.sandboxes[0];
+        assert_eq!(entry.wip_commit_sha, None, "no WIP on diverged HEAD");
+        assert_eq!(entry.head_sha, branch_tip, "clean branch tip bundled");
+        // Sandbox untouched: dirty state stays on the other branch.
+        assert_eq!(status_fingerprint(&sb_path), before);
     }
 
     #[test]
