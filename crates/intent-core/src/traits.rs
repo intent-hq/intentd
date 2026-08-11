@@ -1100,8 +1100,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// `task.markAsTask`: attach/replace task metadata on a note (PROTOCOL §5.4).
     ///
     /// `depends_on` / `conflicts_with` optionally seed the task's relations
-    /// (validated + cycle-checked like `task.setRelations`); `None` leaves any
-    /// existing relations untouched.
+    /// (validated + cycle/tree-checked like `task.setRelations`); `None`
+    /// leaves any existing relations untouched.
     ///
     /// `caller_agent_id` attributes the resulting `task:created` /
     /// `task:status-changed` event to the invoking agent (the MCP front door
@@ -1139,7 +1139,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// relation lists (PROTOCOL §5.4). `None` keeps the existing list;
     /// `Some(vec![])` clears it. Ids are validated (must be task notes in the
     /// same workspace, no self-edges) and `depends_on` writes that would close
-    /// a dependency cycle are rejected with the cycle path named in the error.
+    /// a dependency cycle — or name a tree ancestor/descendant of the task
+    /// (monorepo#1982) — are rejected with the offending path/relationship
+    /// named in the error.
     fn task_set_relations(
         &self,
         workspace_id: WorkspaceId,

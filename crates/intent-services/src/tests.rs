@@ -1765,6 +1765,147 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     assert!(err.to_string().contains("not a task"));
 }
 
+/// `dependsOn` edges onto tree ancestors/descendants are rejected
+/// (monorepo#1982): a child dependsOn its parent — the permanent mutual
+/// readiness block (the parent waits on the child via the tree rule, the
+/// child on the parent via the edge) — can no longer be written, in either
+/// direction, through `task.setRelations` or `task.markAsTask`. Ancestry
+/// chains crossing non-task notes are caught too; sibling edges stay valid.
+#[tokio::test]
+async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Tree: parent (task) → child (task), parent → mid (NON-task) →
+    // grandchild (task), parent → sibling (task).
+    let mk_task = |id: &str, parent: &str| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = id.to_string();
+        tn.parent_id = Some(NoteId::from(parent));
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        tn
+    };
+    store.insert_note(&note(&ws, "root", "body")).await.unwrap();
+    store.insert_note(&mk_task("parent", "root")).await.unwrap();
+    store
+        .insert_note(&mk_task("child", "parent"))
+        .await
+        .unwrap();
+    let mut mid = note(&ws, "mid", "body");
+    mid.parent_id = Some(NoteId::from("parent"));
+    store.insert_note(&mid).await.unwrap();
+    store
+        .insert_note(&mk_task("grandchild", "mid"))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("sibling", "parent"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // child dependsOn parent → ancestor rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("parent")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("tree ancestor"), "ancestor rejection: {msg}");
+    assert!(
+        msg.contains("parent is an ancestor of child"),
+        "relationship named: {msg}"
+    );
+
+    // parent dependsOn child → descendant rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("parent"),
+            Some(vec![NoteId::from("child")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tree descendant"),
+        "descendant rejection: {msg}"
+    );
+    assert!(
+        msg.contains("child is a descendant of parent"),
+        "relationship named: {msg}"
+    );
+
+    // The ancestry chain crossing a NON-task note (parent → mid →
+    // grandchild) is caught in both directions.
+    for (src, dep) in [("grandchild", "parent"), ("parent", "grandchild")] {
+        let err = svc
+            .task_set_relations(
+                ws.clone(),
+                NoteId::from(src),
+                Some(vec![NoteId::from(dep)]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("tree"),
+            "chain via non-task note rejected ({src} dependsOn {dep}): {err}"
+        );
+    }
+
+    // markAsTask enforces the same check.
+    let err = svc
+        .mark_as_task(
+            ws.clone(),
+            NoteId::from("child"),
+            "not_started".into(),
+            vec![],
+            None,
+            Some(vec![NoteId::from("parent")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("tree ancestor"),
+        "markAsTask ancestor rejection: {err}"
+    );
+
+    // Sibling and cross-subtree edges remain valid.
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("sibling"), NoteId::from("grandchild")]),
+            None,
+        )
+        .await
+        .expect("sibling/cross-subtree edges still valid");
+    assert!(r.ok);
+
+    // The rejected writes persisted nothing.
+    let p = svc
+        .get_my_task(ws, NoteId::from("parent"))
+        .await
+        .expect("getMyTask parent");
+    assert!(p.task_metadata.depends_on.is_empty());
+}
+
 #[tokio::test]
 async fn assign_agent_validates_and_starts_task() {
     let (_tmp, svc, ws, id) = setup("# Task").await;
