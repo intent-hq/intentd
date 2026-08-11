@@ -5897,6 +5897,12 @@ async fn hook_state_run_and_error_updates() {
     assert_eq!(got.last_run_at.as_deref(), Some(ran_at.as_str()));
     assert_eq!(got.next_run_at.as_deref(), Some(next_at.as_str()));
 
+    // Atomic expiry: one call flips state AND clears next_run_at together.
+    store.expire_hook(&id).await.expect("atomic expiry");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.state, HookState::Expired);
+    assert_eq!(got.next_run_at, None);
+
     store
         .update_hook_next_run(&id, None)
         .await
@@ -5951,6 +5957,7 @@ async fn hook_state_run_and_error_updates() {
             .update_hook_next_run(&missing, None)
             .await
             .expect_err("next run"),
+        store.expire_hook(&missing).await.expect_err("expire"),
         store
             .update_hook_last_error(&missing, None)
             .await
