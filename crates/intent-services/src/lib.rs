@@ -111,6 +111,7 @@ pub mod stack_sample;
 mod terminal_ops;
 pub mod tool_block;
 mod transfer;
+pub mod transfer_git;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
