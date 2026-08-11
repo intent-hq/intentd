@@ -15250,7 +15250,15 @@ impl WorkspaceApi for Services {
             .await;
             // Deleting a task note can move the derived displayStatus rollup
             // (§6.5), e.g. removing the last open spec-child task.
-            if note.metadata.task.is_some() {
+            if let Some(task) = &note.metadata.task {
+                // Deleting a *complete* task flips its dependents' computed
+                // unmetDependsOn from met to unmet (missing = unmet), so
+                // re-announce them for subscriber refetch (monorepo#1979).
+                // Other statuses were already unmet — no projection change.
+                if task.status == TaskStatus::Complete {
+                    let all = store.list_notes(&workspace_id).await?;
+                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &all).await;
+                }
                 services
                     .maybe_emit_display_status_changed(&workspace_id)
                     .await;
@@ -15596,9 +15604,13 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
-                // Re-announce dependents whose computed `unmetDependsOn`
-                // moved with this transition (monorepo#1979).
-                publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                // Re-announce dependents only when the transition crosses the
+                // complete boundary — that is the only move that changes their
+                // computed `unmetDependsOn` (monorepo#1979).
+                if (previous_status == TaskStatus::Complete) != (new_status == TaskStatus::Complete)
+                {
+                    publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                }
                 // A task-status transition can move the derived displayStatus
                 // rollup (§6.5): recompute-and-compare, emitting only on an
                 // actual transition.
@@ -15931,15 +15943,18 @@ impl WorkspaceApi for Services {
                         ),
                     )
                     .await;
-                    // Re-announce dependents whose computed `unmetDependsOn`
-                    // moved with this transition (monorepo#1979).
-                    publish_dependent_note_updates(
-                        &services.event_bus,
-                        &note.workspace_id,
-                        &note.id,
-                        &all,
-                    )
-                    .await;
+                    // Re-announce dependents only when the re-mark crosses the
+                    // complete boundary — the only move that changes their
+                    // computed `unmetDependsOn` (monorepo#1979).
+                    if (previous == TaskStatus::Complete) != (new_status == TaskStatus::Complete) {
+                        publish_dependent_note_updates(
+                            &services.event_bus,
+                            &note.workspace_id,
+                            &note.id,
+                            &all,
+                        )
+                        .await;
+                    }
                 }
                 Some(_) => {}
             }
@@ -16219,9 +16234,9 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
-                // Re-announce dependents whose computed `unmetDependsOn`
-                // moved with this transition (monorepo#1979).
-                publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
+                // No dependent re-announce here: the not_started → in_progress
+                // move never crosses the complete boundary, so dependents'
+                // computed `unmetDependsOn` is unchanged (monorepo#1979).
                 // The not_started → in_progress transition can move the
                 // derived displayStatus rollup (§6.5).
                 services

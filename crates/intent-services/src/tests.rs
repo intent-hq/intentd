@@ -2015,12 +2015,25 @@ async fn note_reads_project_unmet_depends_on() {
     .await
     .expect("cancel b");
     let c = svc
-        .get_note(ws, NoteId::from("task-c"))
+        .get_note(ws.clone(), NoteId::from("task-c"))
         .await
         .expect("get c after b cancelled");
     assert_eq!(
         c.metadata.task.unwrap().unmet_depends_on,
         vec![NoteId::from("task-b")]
+    );
+
+    // Deleting the complete dep a makes it unmet too (missing = unmet).
+    svc.delete_note(ws.clone(), NoteId::from("task-a"), None)
+        .await
+        .expect("delete a");
+    let c = svc
+        .get_note(ws, NoteId::from("task-c"))
+        .await
+        .expect("get c after a deleted");
+    assert_eq!(
+        c.metadata.task.unwrap().unmet_depends_on,
+        vec![NoteId::from("task-a"), NoteId::from("task-b")]
     );
 }
 
@@ -5332,6 +5345,56 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
         assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-b"]));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // A transition that does NOT cross the complete boundary (cancelled →
+        // in_progress) leaves dependents' unmetDependsOn unchanged, so no
+        // dependent re-announce fires: the next boundary-crossing transition's
+        // `task:status-changed` follows the ready-set event directly.
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("restart dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("re-complete dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // Deleting a *complete* dep also moves dependents' unmetDependsOn
+        // (missing = unmet), so the dependent is re-announced after the
+        // `note:deleted` (monorepo#1979).
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep-b"), None)
+            .await
+            .expect("delete dep-b");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        assert_eq!(ev["data"]["noteId"], json!("dep-b"));
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:updated");
         assert_eq!(ev["data"]["noteId"], json!("gated"));
