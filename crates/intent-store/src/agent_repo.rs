@@ -1189,8 +1189,11 @@ impl Store {
     /// [`Store::update_agent_session`], silently reverting a concurrent
     /// `agent.setModel` that landed between the spawn's session read and the
     /// prompt persist — the lost update behind the flaky respawn e2e
-    /// (monorepo#1936). Scoped to `workspace_id` (defense-in-depth).
-    /// `NotFound` if the session is absent or the workspace does not match.
+    /// (monorepo#1936). Unlike sibling narrow writers, this deliberately does
+    /// NOT bump `updated_at`: that timestamp belongs to the concurrent
+    /// `agent.setModel` write this call must not stomp. Scoped to
+    /// `workspace_id` (defense-in-depth). `NotFound` if the session is absent
+    /// or the workspace does not match.
     pub async fn set_agent_session_system_prompt(
         &self,
         workspace_id: &WorkspaceId,
