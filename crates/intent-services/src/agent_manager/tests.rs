@@ -4326,6 +4326,45 @@ async fn hard_stop_clears_persisted_stop_redelivery() {
     );
 }
 
+/// Regression for the consume-gap race (intent-hq/monorepo#1899 review):
+/// `spawn_worker` removes the map entry synchronously but clears the durable
+/// row from the spawned (abortable) worker task. A hard stop landing in that
+/// gap sees no map entry, so it must sync the store UNCONDITIONALLY — a
+/// change-gated sync would skip the clear, leaving a stale row that a later
+/// restart rehydrates (double redelivery of an already-consumed message).
+#[tokio::test]
+async fn hard_stop_clears_stale_persisted_row_without_map_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-gap"));
+    arm_redelivery_via_fallback_stop(&mgr, &ws, &id).await;
+
+    // Simulate the consume gap: the map entry is gone (spawn_worker removed
+    // it) but the durable row still exists (the worker task's clear never
+    // ran because the hard stop aborts it).
+    mgr.stop_redelivery.lock().unwrap().remove(&id);
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert_eq!(rows.len(), 1, "stale persisted row set up: {rows:?}");
+
+    track(&mgr, &id);
+    assert!(mgr.stop(&id).await);
+
+    let rows = mgr
+        .services
+        .store
+        .load_all_stop_redeliveries()
+        .await
+        .expect("load stop redeliveries");
+    assert!(
+        rows.is_empty(),
+        "hard stop clears the stale persisted row even with no map entry: {rows:?}"
+    );
+}
+
 /// Shutdown-capture companion: a graceful daemon shutdown landing while the
 /// live-turn slot is open but EMPTY persists the empty interrupted row
 /// stamped `daemon_shutdown` (every interruption leaves a marker row).

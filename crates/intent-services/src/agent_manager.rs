@@ -2961,17 +2961,23 @@ impl AgentManager {
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
-        let redelivery_changed = {
+        {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
                 Some(payload) => {
                     armed.insert(agent_id.clone(), payload);
-                    true
                 }
-                None => armed.remove(agent_id).is_some(),
+                None => {
+                    armed.remove(agent_id);
+                }
             }
-        };
-        if sync_store && redelivery_changed {
+        }
+        // Sync unconditionally (not only when the map changed): the durable
+        // clear after a consume runs in the spawned worker task, which this
+        // detach aborts — a hard stop landing in that gap sees no map entry
+        // yet a stale row may survive in the store (the DELETE is a cheap
+        // no-op when no row exists).
+        if sync_store {
             self.sync_stop_redelivery(agent_id).await;
         }
         self.end_turn(agent_id).await;
@@ -3316,10 +3322,15 @@ impl AgentManager {
     /// (intent-hq/monorepo#1899): upsert when a payload is armed, delete when
     /// none is — so a daemon restart between the stop and the follow-up turn
     /// rehydrates exactly the payload the map held. Re-reads the map at call
-    /// time (rather than taking a payload argument), so racing arm/consume
-    /// writers converge on the newest state. Best-effort: a store failure is
-    /// logged and never blocks the stop/turn path (the in-memory payload
-    /// still serves the current daemon lifetime).
+    /// time (rather than taking a payload argument), so a sync racing an
+    /// arm/consume usually lands the newest state — but map-read order is
+    /// not commit order on the write pool, so a residual window remains
+    /// where e.g. a consume's DELETE commits after a re-arm's UPSERT,
+    /// leaving the store missing a payload the map holds. That agent then
+    /// degrades to pre-#1899 in-memory-only behavior until the next sync.
+    /// Best-effort by design: a store failure is logged and never blocks
+    /// the stop/turn path (the in-memory payload still serves the current
+    /// daemon lifetime).
     async fn sync_stop_redelivery(&self, agent_id: &AgentId) {
         let armed = self.stop_redelivery.lock().unwrap().get(agent_id).cloned();
         let result = match armed {
