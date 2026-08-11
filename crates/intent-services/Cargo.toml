@@ -40,6 +40,8 @@ toml_edit = "0.25.5"
 tempfile = "3"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sha2 = "0.10"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -411,6 +411,37 @@ async fn dispatch(
                 .map_err(workspace_err)?;
             Ok(json!({ "plan": plan }))
         }
+        "workspace.import.begin" => {
+            let manifest = params
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_params("manifest is required"))?;
+            let archive_size_bytes = require_u64(params, "archiveSizeBytes")?;
+            let archive_sha256 = require_str_param(params, "archiveSha256")?;
+            api.workspace_import_begin(manifest, archive_size_bytes, archive_sha256)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.chunk" => {
+            let import_id = require_str_param(params, "importId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.workspace_import_chunk(import_id, seq, data)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.commit" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_commit(import_id)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.abort" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_abort(import_id)
+                .await
+                .map_err(workspace_err)
+        }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
             let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;

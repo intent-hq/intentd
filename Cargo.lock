@@ -2257,6 +2257,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "similar",
  "sqlx",
  "sysinfo",
@@ -2267,6 +2268,7 @@ dependencies = [
  "tracing",
  "uuid",
  "yrs",
+ "zip",
 ]
 
 [[package]]
@@ -2394,6 +2396,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "zip",
 ]
 
 [[package]]

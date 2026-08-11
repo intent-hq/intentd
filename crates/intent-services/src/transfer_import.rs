@@ -1,0 +1,1678 @@
+//! Staged, atomic workspace import (`workspace.import.*`, PROTOCOL §5.1):
+//! the target side of the FE-mediated transfer relay. `begin` validates the
+//! manifest header (format version, exact intentd version, id collision) and
+//! opens a staging session; `chunk` stages seq-numbered archive bytes
+//! (idempotent per seq — a retry overwrites the same chunk file); `commit`
+//! reassembles the archive, verifies its SHA-256, unpacks it, applies the row
+//! transforms (path rewrites, session-id clearing, in-flight → interrupted),
+//! inserts every row in ONE store transaction, places assets, and rehydrates
+//! agent queues / delegation groups / completion watches / event
+//! subscriptions / hooks / PR monitors without a daemon restart; `abort`
+//! deletes the staging state. Nothing is visible in `workspace.list` until
+//! `commit` succeeds.
+//!
+//! Archive layout (agreed with the export orchestrator):
+//! `manifest.json` (the [`TransferManifest`]), `rows/<table>.jsonl` (one JSON
+//! object per row, [`intent_store::TRANSFER_TABLES`] vocabulary),
+//! `assets/<assetId>`, and optionally `git/repo.bundle` + `git/refs.json`
+//! (the [`crate::transfer_git::TransferRefsManifest`]).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use base64::Engine as _;
+use intent_core::transfer::{TransferManifest, TRANSFER_FORMAT_VERSION};
+use intent_core::{clock::now_iso, Error, Result, WorkspaceId};
+use sha2::Digest as _;
+
+use crate::{publish_event, workspace_created_event, Services};
+
+/// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
+/// this by 4/3 on the wire (~21.4 MiB), keeping the full JSON-RPC frame
+/// comfortably under the 40 MiB inbound cap (PROTOCOL §1.3).
+pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// One in-flight staged import: everything `chunk`/`commit`/`abort` need
+/// between calls. Lives in [`Services::transfer_imports`]; in-memory only.
+pub(crate) struct ImportSession {
+    pub manifest: TransferManifest,
+    pub workspace_id: WorkspaceId,
+    /// `<workspaces_root>/.import-staging/<importId>/`.
+    pub staging_dir: PathBuf,
+    /// Declared final archive size — chunks may not exceed it in sum.
+    pub declared_size: u64,
+    /// Declared lowercase-hex SHA-256 of the complete archive.
+    pub declared_sha256: String,
+    /// Bytes staged so far, keyed by chunk seq (a retried seq replaces its
+    /// entry, so the sum never double-counts).
+    pub chunk_sizes: HashMap<u64, u64>,
+    /// Set while `commit` is verifying/unpacking/inserting: chunks and
+    /// aborts are rejected so concurrent calls cannot mutate the files
+    /// being hashed or race the commit's cleanup. Cleared on a failed
+    /// commit (the session survives for retry or abort).
+    pub committing: bool,
+}
+
+impl ImportSession {
+    fn received_bytes(&self) -> u64 {
+        self.chunk_sizes.values().sum()
+    }
+}
+
+/// Chunk file name for `seq` inside the staging dir (zero-padded so a
+/// directory listing sorts in seq order for humans; commit reads by index).
+fn chunk_file_name(seq: u64) -> String {
+    format!("chunk-{seq:08}")
+}
+
+impl Services {
+    /// Root directory staged imports live under. Sibling of the workspace
+    /// checkouts so the final asset/worktree moves stay on one filesystem.
+    fn import_staging_root(&self) -> PathBuf {
+        self.workspaces_root
+            .clone()
+            .unwrap_or_else(crate::default_workspaces_root)
+            .join(".import-staging")
+    }
+
+    /// `workspace.import.begin`: validate the manifest header and open a
+    /// staging session. Rejects (all `InvalidParams`, each naming the
+    /// specifics): unknown archive format versions, archives whose creating
+    /// intentd version differs from this daemon's own version (exact match —
+    /// no backwards compatibility, spec decision #5), the chief workspace,
+    /// and workspace-id collisions (an existing row OR another pending
+    /// import). Returns `{ importId, maxChunkBytes }`.
+    pub(crate) async fn workspace_import_begin_op(
+        &self,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> Result<serde_json::Value> {
+        let manifest: TransferManifest = serde_json::from_value(manifest)
+            .map_err(|e| Error::InvalidParams(format!("invalid transfer manifest: {e}")))?;
+        if manifest.format_version != TRANSFER_FORMAT_VERSION {
+            return Err(Error::InvalidParams(format!(
+                "unsupported transfer format version {} (this daemon supports {})",
+                manifest.format_version, TRANSFER_FORMAT_VERSION
+            )));
+        }
+        let own_version = env!("CARGO_PKG_VERSION");
+        if manifest.creating_intentd_version != own_version {
+            return Err(Error::InvalidParams(format!(
+                "archive was created by intentd {} but this daemon is {} — versions must match exactly",
+                manifest.creating_intentd_version, own_version
+            )));
+        }
+        if manifest.workspace_id.is_chief() {
+            return Err(Error::InvalidParams(
+                "The chief workspace cannot be imported".to_string(),
+            ));
+        }
+        if archive_size_bytes == 0 {
+            return Err(Error::InvalidParams(
+                "archiveSizeBytes must be positive".to_string(),
+            ));
+        }
+        let sha = archive_sha256.trim().to_ascii_lowercase();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::InvalidParams(
+                "archiveSha256 must be 64 hex characters".to_string(),
+            ));
+        }
+        self.reject_workspace_collision(&manifest.workspace_id)
+            .await?;
+
+        let import_id = format!("import-{}", uuid::Uuid::new_v4());
+        let staging_dir = self.import_staging_root().join(&import_id);
+
+        // Register the session BEFORE any directory exists, so every early
+        // return leaves nothing on disk. `live_ids` snapshots the registry
+        // for the orphan sweep below.
+        let live_ids: Vec<String> = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if imports
+                .values()
+                .any(|s| s.workspace_id == manifest.workspace_id)
+            {
+                return Err(Error::InvalidParams(format!(
+                    "another import of workspace {} is already in progress",
+                    manifest.workspace_id.0
+                )));
+            }
+            let session = ImportSession {
+                workspace_id: manifest.workspace_id.clone(),
+                manifest,
+                staging_dir: staging_dir.clone(),
+                declared_size: archive_size_bytes,
+                declared_sha256: sha,
+                chunk_sizes: HashMap::new(),
+                committing: false,
+            };
+            imports.insert(import_id.clone(), session);
+            imports.keys().cloned().collect()
+        };
+
+        // Lazy sweep: staging dirs with no live session are orphans (a
+        // daemon restart drops the in-memory registry, and pre-fix daemons
+        // could leak dirs). Best-effort — a failed sweep never fails begin.
+        self.sweep_orphaned_staging_dirs(&live_ids).await;
+
+        if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
+            self.transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .remove(&import_id);
+            return Err(Error::Internal(format!(
+                "create import staging dir failed: {e}"
+            )));
+        }
+
+        Ok(serde_json::json!({
+            "importId": import_id,
+            "maxChunkBytes": IMPORT_MAX_CHUNK_BYTES,
+        }))
+    }
+
+    /// Delete `.import-staging/<id>` directories whose id has no live
+    /// session (orphans from a daemon restart mid-upload). Best-effort.
+    async fn sweep_orphaned_staging_dirs(&self, live_ids: &[String]) {
+        let root = self.import_staging_root();
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(_) => return, // no staging root yet — nothing to sweep
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if live_ids.contains(&name) {
+                continue;
+            }
+            tracing::info!(staging = %name, "sweeping orphaned import staging dir");
+            if let Err(e) = tokio::fs::remove_dir_all(entry.path()).await {
+                tracing::warn!(staging = %name, error = %e, "orphan staging sweep failed");
+            }
+        }
+    }
+
+    /// `InvalidParams` naming the conflict when `id` already exists on this
+    /// daemon (import never overwrites; the user renames/deletes first).
+    async fn reject_workspace_collision(&self, id: &WorkspaceId) -> Result<()> {
+        match self.store.get_workspace(id).await {
+            Ok(existing) => Err(Error::InvalidParams(format!(
+                "workspace id {} already exists on this daemon (title: {:?}) — delete it or rename before importing",
+                id.0, existing.title
+            ))),
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `workspace.import.chunk`: stage one seq-numbered slice of the archive.
+    /// `data` is base64; the decoded slice is written to its own
+    /// `chunk-<seq>` file, so retrying a seq is idempotent (same bytes land
+    /// in the same file) and chunks may arrive in any order. Rejects decoded
+    /// slices over [`IMPORT_MAX_CHUNK_BYTES`] and totals beyond the declared
+    /// archive size. Returns `{ importId, seq, receivedBytes }`.
+    pub(crate) async fn workspace_import_chunk_op(
+        &self,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> Result<serde_json::Value> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|e| Error::InvalidParams(format!("chunk data is not valid base64: {e}")))?;
+        if bytes.is_empty() {
+            return Err(Error::InvalidParams("chunk data is empty".to_string()));
+        }
+        if bytes.len() > IMPORT_MAX_CHUNK_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "chunk of {} bytes exceeds the {} byte cap",
+                bytes.len(),
+                IMPORT_MAX_CHUNK_BYTES
+            )));
+        }
+        // Reserve this seq's bytes under ONE lock hold: the size check and
+        // the `chunk_sizes` update are atomic, so concurrent chunks cannot
+        // both pass the check and push the total past the declared size.
+        let (staging_dir, prior_this_seq, received) = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            let session = imports
+                .get_mut(&import_id)
+                .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
+            if session.committing {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is committing — chunks are no longer accepted"
+                )));
+            }
+            // A retried seq replaces its previous bytes; only NEW bytes
+            // count against the declared total.
+            let prior_this_seq = session.chunk_sizes.get(&seq).copied();
+            let new_total =
+                session.received_bytes() - prior_this_seq.unwrap_or(0) + bytes.len() as u64;
+            if new_total > session.declared_size {
+                return Err(Error::InvalidParams(format!(
+                    "received {new_total} bytes exceed the declared archive size {}",
+                    session.declared_size
+                )));
+            }
+            session.chunk_sizes.insert(seq, bytes.len() as u64);
+            (session.staging_dir.clone(), prior_this_seq, new_total)
+        };
+        let path = staging_dir.join(chunk_file_name(seq));
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            // Roll the reservation back so a retry accounts correctly.
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if let Some(session) = imports.get_mut(&import_id) {
+                match prior_this_seq {
+                    Some(prior) => session.chunk_sizes.insert(seq, prior),
+                    None => session.chunk_sizes.remove(&seq),
+                };
+            }
+            return Err(Error::Internal(format!("write import chunk failed: {e}")));
+        }
+        Ok(serde_json::json!({
+            "importId": import_id,
+            "seq": seq,
+            "receivedBytes": received,
+        }))
+    }
+
+    /// `workspace.import.abort`: drop the staging session and delete its
+    /// directory. Idempotent — aborting an unknown id succeeds quietly (the
+    /// FE may retry an abort after a timeout). Rejected while a commit of
+    /// the same import is in flight (abort would race the commit's cleanup).
+    pub(crate) async fn workspace_import_abort_op(
+        &self,
+        import_id: String,
+    ) -> Result<serde_json::Value> {
+        let session = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            if imports.get(&import_id).is_some_and(|s| s.committing) {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is committing — wait for the commit to settle"
+                )));
+            }
+            imports.remove(&import_id)
+        };
+        let aborted = session.is_some();
+        if let Some(session) = session {
+            let _ = tokio::fs::remove_dir_all(&session.staging_dir).await;
+        }
+        Ok(serde_json::json!({ "importId": import_id, "aborted": aborted }))
+    }
+
+    /// `workspace.import.commit`: reassemble the staged chunks, verify the
+    /// archive SHA-256 against the declared checksum, unpack, validate the
+    /// embedded manifest matches `begin`'s, transform the rows
+    /// ([`transform_rows`]), insert them in ONE store transaction, place
+    /// assets, hand the extracted git payload to the materialization seam,
+    /// and rehydrate hooks / event subscriptions / PR monitors / agent
+    /// queues. The staging session survives a failed commit (the FE can
+    /// retry or abort); it is removed only after the rows are committed.
+    /// While a commit runs, its session is flagged `committing`, so a
+    /// concurrent commit/chunk/abort of the same import is rejected instead
+    /// of mutating the files being hashed.
+    pub(crate) async fn workspace_import_commit_op(
+        &self,
+        import_id: String,
+    ) -> Result<serde_json::Value> {
+        let result = self.workspace_import_commit_inner(&import_id).await;
+        if result.is_err() {
+            // The session survives a failed commit — clear the in-flight
+            // flag so a retry (or abort) is accepted.
+            if let Some(session) = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .get_mut(&import_id)
+            {
+                session.committing = false;
+            }
+        }
+        result
+    }
+
+    async fn workspace_import_commit_inner(&self, import_id: &str) -> Result<serde_json::Value> {
+        let (staging_dir, declared_size, declared_sha, manifest, workspace_id, chunk_seqs) = {
+            let mut imports = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned");
+            let session = imports
+                .get_mut(import_id)
+                .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
+            if session.committing {
+                return Err(Error::InvalidParams(format!(
+                    "import {import_id} is already committing"
+                )));
+            }
+            let received = session.received_bytes();
+            if received != session.declared_size {
+                return Err(Error::InvalidParams(format!(
+                    "archive incomplete: received {received} of {} declared bytes",
+                    session.declared_size
+                )));
+            }
+            let mut seqs: Vec<u64> = session.chunk_sizes.keys().copied().collect();
+            seqs.sort_unstable();
+            if seqs.first() != Some(&0) || seqs.last() != Some(&(seqs.len() as u64 - 1)) {
+                return Err(Error::InvalidParams(format!(
+                    "chunk sequence has gaps: got seqs {seqs:?}, expected contiguous from 0"
+                )));
+            }
+            session.committing = true;
+            (
+                session.staging_dir.clone(),
+                session.declared_size,
+                session.declared_sha256.clone(),
+                session.manifest.clone(),
+                session.workspace_id.clone(),
+                seqs,
+            )
+        };
+
+        // Reassemble + hash + unpack on the blocking pool (sync I/O + zip).
+        let extracted_dir = staging_dir.join("extracted");
+        {
+            let staging_dir = staging_dir.clone();
+            let extracted_dir = extracted_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                assemble_and_extract(
+                    &staging_dir,
+                    &chunk_seqs,
+                    declared_size,
+                    &declared_sha,
+                    &extracted_dir,
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("import unpack task failed: {e}")))??;
+        }
+
+        // The embedded manifest must be the one `begin` validated.
+        let embedded = tokio::fs::read(extracted_dir.join("manifest.json"))
+            .await
+            .map_err(|e| Error::InvalidParams(format!("archive has no manifest.json: {e}")))?;
+        let embedded: TransferManifest = serde_json::from_slice(&embedded)
+            .map_err(|e| Error::InvalidParams(format!("archive manifest.json is invalid: {e}")))?;
+        if embedded != manifest {
+            return Err(Error::InvalidParams(
+                "archive manifest.json does not match the manifest supplied to workspace.import.begin"
+                    .to_string(),
+            ));
+        }
+        // Re-check the collision window between begin and commit.
+        self.reject_workspace_collision(&workspace_id).await?;
+
+        // Load rows/<table>.jsonl (unknown files — including event.jsonl —
+        // are skipped defensively; the store layer would reject them anyway).
+        let rows = load_row_files(&extracted_dir.join("rows")).await?;
+        // Every row must be scoped to the manifest's workspace — collision
+        // validation only ran for that id, so smuggled rows for other
+        // workspaces (or agents outside the archive) fail the commit.
+        validate_row_scope(&rows, &workspace_id)?;
+
+        // Transform: path rewrites against OUR workspaces root, session-id
+        // clearing, in-flight → interrupted, drafts dropped.
+        let target_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(crate::default_workspaces_root);
+        let mut outcome = transform_rows(rows, &workspace_id, &target_root, &now_iso())?;
+
+        // Materialize the git payload BEFORE the rows land, so the seam can
+        // rewrite the transformed workspace/sandbox rows to the target
+        // checkout (repository_path, checkout_mode, sandbox paths, dropped
+        // sandboxes) and the apply()'d versions are what the store commits.
+        // An error fails the commit: disk materialization is all-or-nothing,
+        // no rows have landed, and the staging session survives for retry or
+        // abort.
+        self.materialize_imported_git(&workspace_id, &extracted_dir, &mut outcome.rows)
+            .await?;
+
+        let imported_rows = self.store.transfer_import_rows(&outcome.rows).await?;
+
+        // Rows are committed — the import can no longer be rolled back.
+        // Everything below is best-effort enrichment of the now-live
+        // workspace; failures are logged, never surfaced as a failed import.
+        self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
+            .await;
+
+        let rehydrated = self.rehydrate_after_import().await;
+
+        // Session retired; staging deleted.
+        self.transfer_imports
+            .lock()
+            .expect("transfer import registry poisoned")
+            .remove(import_id);
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+
+        let ws = self.store.get_workspace(&workspace_id).await?;
+        publish_event(&self.event_bus, workspace_created_event(&ws)).await;
+
+        Ok(serde_json::json!({
+            "workspace": ws,
+            "importedRows": imported_rows,
+            "interruptedAgents": outcome.interrupted_agent_ids,
+            "rehydrated": rehydrated,
+        }))
+    }
+
+    /// Copy `assets/<assetId>` files into `<assets_root>/<workspaceId>/`.
+    /// Best-effort: an unset assets root or a copy failure is logged.
+    async fn place_imported_assets(&self, workspace_id: &WorkspaceId, assets_dir: &Path) {
+        let mut entries = match tokio::fs::read_dir(assets_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return, // no assets/ in the archive
+        };
+        let Some(root) = self.assets_root.clone() else {
+            tracing::warn!(
+                workspace = %workspace_id.0,
+                "import archive carries assets but no assets root is configured — skipping"
+            );
+            return;
+        };
+        let dest_dir = root.join(&workspace_id.0);
+        if let Err(e) = tokio::fs::create_dir_all(&dest_dir).await {
+            tracing::warn!(error = %e, "create imported assets dir failed");
+            return;
+        }
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            if let Err(e) = tokio::fs::copy(entry.path(), dest_dir.join(&name)).await {
+                tracing::warn!(
+                    asset = %name.to_string_lossy(),
+                    error = %e,
+                    "copy imported asset failed"
+                );
+            }
+        }
+    }
+
+    /// Materialization seam for the imported git payload (`git/repo.bundle` +
+    /// `git/refs.json` under `extracted_dir`): clone/fetch from the bundle,
+    /// provision the checkout and sandboxes, unwind WIP snapshots. Runs
+    /// BEFORE the store insert with the transformed rows passed mutably, so
+    /// the implementation can apply `MaterializedGit`-style row rewrites
+    /// (workspace `repository_path` → the new checkout, `worktree_path`
+    /// cleared, `checkout_mode` → direct, `base_commit_sha` backfill, sandbox
+    /// path rewrites, dropping sandbox rows whose branch is absent from the
+    /// bundle) and the apply()'d versions are what land in the store.
+    /// Currently a stub — the target-git-materialization task replaces this
+    /// body with a call to `transfer_materialize::materialize_workspace_git`.
+    /// An error fails the commit: materialization is all-or-nothing on disk,
+    /// no rows have been inserted, and the staging session survives for retry
+    /// or abort.
+    async fn materialize_imported_git(
+        &self,
+        workspace_id: &WorkspaceId,
+        extracted_dir: &Path,
+        _rows: &mut [(String, Vec<serde_json::Value>)],
+    ) -> Result<()> {
+        let bundle = extracted_dir.join("git").join("repo.bundle");
+        if !bundle.exists() {
+            return Ok(()); // no repository in the archive
+        }
+        tracing::info!(
+            workspace = %workspace_id.0,
+            bundle = %bundle.display(),
+            "imported git bundle present — materialization not yet implemented (target git materialization task)"
+        );
+        Ok(())
+    }
+
+    /// Boot-style rehydration after a committed import so the workspace's
+    /// agent queues, delegation groups, completion watches, event
+    /// subscriptions, hooks, and PR monitors go live without a daemon
+    /// restart. Every loader is idempotent (each skips entries already live
+    /// in memory), so re-running them over the whole store is safe.
+    /// Best-effort: failures are logged per loader.
+    async fn rehydrate_after_import(&self) -> serde_json::Value {
+        // Boot order (main.rs): queues → delegation groups → completion
+        // watches (grouped watches need their live groups) → event
+        // subscriptions → hooks → PR monitors.
+        let agent_queues = self.rehydrate_agent_queues().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import agent queue rehydration failed");
+            0
+        });
+        let delegation_groups = self
+            .heal_delegation_groups_on_startup()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import delegation group rehydration failed");
+                0
+            });
+        let completion_watches = self
+            .heal_completion_watches_on_startup()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import completion watch rehydration failed");
+                0
+            });
+        let event_subscriptions = self
+            .heal_event_subscriptions_on_startup()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import event subscription rehydration failed");
+                0
+            });
+        let hooks = self.rehydrate_hooks().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import hook rehydration failed");
+            0
+        });
+        let pr_monitors = self.rehydrate_pr_monitors().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "post-import PR monitor rehydration failed");
+            0
+        });
+        serde_json::json!({
+            "hooks": hooks,
+            "eventSubscriptions": event_subscriptions,
+            "prMonitors": pr_monitors,
+            "agentQueues": agent_queues,
+            "delegationGroups": delegation_groups,
+            "completionWatches": completion_watches,
+        })
+    }
+}
+
+/// Concatenate the staged chunk files, verify the SHA-256 and size against
+/// the declared values, and extract the resulting zip into `extracted_dir`.
+/// Runs on the blocking pool (sync file I/O + zip inflation).
+fn assemble_and_extract(
+    staging_dir: &Path,
+    chunk_seqs: &[u64],
+    declared_size: u64,
+    declared_sha256: &str,
+    extracted_dir: &Path,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let archive_path = staging_dir.join("archive.zip");
+    let mut hasher = sha2::Sha256::new();
+    let mut out = std::fs::File::create(&archive_path)
+        .map_err(|e| Error::Internal(format!("create assembled archive failed: {e}")))?;
+    let mut total = 0u64;
+    for seq in chunk_seqs {
+        let bytes = std::fs::read(staging_dir.join(chunk_file_name(*seq)))
+            .map_err(|e| Error::Internal(format!("read staged chunk {seq} failed: {e}")))?;
+        hasher.update(&bytes);
+        total += bytes.len() as u64;
+        out.write_all(&bytes)
+            .map_err(|e| Error::Internal(format!("assemble archive failed: {e}")))?;
+    }
+    out.flush()
+        .map_err(|e| Error::Internal(format!("assemble archive flush failed: {e}")))?;
+    drop(out);
+    if total != declared_size {
+        return Err(Error::InvalidParams(format!(
+            "assembled archive is {total} bytes, expected {declared_size}"
+        )));
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != declared_sha256 {
+        return Err(Error::InvalidParams(format!(
+            "archive checksum mismatch: expected sha256 {declared_sha256}, got {actual}"
+        )));
+    }
+
+    let file = std::fs::File::open(&archive_path)
+        .map_err(|e| Error::Internal(format!("open assembled archive failed: {e}")))?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| Error::InvalidParams(format!("archive is not a valid zip: {e}")))?;
+    std::fs::create_dir_all(extracted_dir)
+        .map_err(|e| Error::Internal(format!("create extraction dir failed: {e}")))?;
+    // `ZipArchive::extract` sanitizes entry names via `enclosed_name` and
+    // refuses symlinks whose target escapes the destination (zip-slip safe;
+    // pinned by the `extract_rejects_hostile_entries` regression test).
+    zip.extract(extracted_dir)
+        .map_err(|e| Error::InvalidParams(format!("archive extraction failed: {e}")))?;
+    Ok(())
+}
+
+/// Read every `rows/<table>.jsonl` file into `(table, rows)` pairs. Only
+/// files named for [`intent_store::TRANSFER_TABLES`] members are read —
+/// anything else (`event.jsonl`, stray files) is skipped with a warning.
+async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut out = Vec::new();
+    let mut entries = match tokio::fs::read_dir(rows_dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Err(Error::InvalidParams(format!(
+                "archive has no rows/ directory: {e}"
+            )))
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(table) = name.strip_suffix(".jsonl") else {
+            tracing::warn!(file = %name, "skipping non-jsonl file in archive rows/");
+            continue;
+        };
+        if !intent_store::TRANSFER_TABLES
+            .iter()
+            .any(|(t, _)| *t == table)
+        {
+            tracing::warn!(table = %table, "skipping non-transfer table in archive rows/");
+            continue;
+        }
+        let content = tokio::fs::read_to_string(entry.path())
+            .await
+            .map_err(|e| Error::Internal(format!("read rows/{name} failed: {e}")))?;
+        let mut rows = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            rows.push(serde_json::from_str(line).map_err(|e| {
+                Error::InvalidParams(format!("rows/{name} line {} is invalid JSON: {e}", i + 1))
+            })?);
+        }
+        out.push((table.to_string(), rows));
+    }
+    Ok(out)
+}
+
+/// Reject archives whose rows reach beyond the manifest's workspace:
+/// `workspace` rows must carry exactly the imported id, every table with a
+/// `workspace_id` column must match it, `completion_watch` must touch it
+/// from at least one end, and `agent_message`/`agent_queue` rows (scoped
+/// through their owning session) must name an `agent_session` in the
+/// archive. Collision validation ran only for the manifest's id, so
+/// anything else would land unvalidated.
+fn validate_row_scope(
+    rows: &[(String, Vec<serde_json::Value>)],
+    workspace_id: &WorkspaceId,
+) -> Result<()> {
+    let session_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|(t, _)| t == "agent_session")
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+        .collect();
+    let field = |row: &serde_json::Value, key: &str| -> String {
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    for (table, objects) in rows {
+        for row in objects {
+            let ok = match table.as_str() {
+                "workspace" => field(row, "id") == workspace_id.0,
+                "agent_message" | "agent_queue" => {
+                    session_ids.contains(field(row, "agent_id").as_str())
+                }
+                "completion_watch" => {
+                    field(row, "parent_workspace_id") == workspace_id.0
+                        || field(row, "child_workspace_id") == workspace_id.0
+                }
+                _ => field(row, "workspace_id") == workspace_id.0,
+            };
+            if !ok {
+                return Err(Error::InvalidParams(format!(
+                    "archive rows/{table}.jsonl contains a row outside workspace {} — import rejected",
+                    workspace_id.0
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What [`transform_rows`] produced: the insert-ready batch plus the agents
+/// that were in-flight at export time (now carrying `interrupted_agent`
+/// rows with `resolution='pending'`).
+pub(crate) struct TransformOutcome {
+    pub rows: Vec<(String, Vec<serde_json::Value>)>,
+    pub interrupted_agent_ids: Vec<String>,
+}
+
+/// Agent statuses that count as in-flight at export time — the same set
+/// [`crate::is_stale_in_flight_status`] heals after a daemon restart, in
+/// their persisted DB spellings (serde wire forms of `Active` / `Processing`
+/// / `Waiting`).
+const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
+
+/// Apply the import-side row transforms (spec §3/§4):
+///
+/// - **workspace**: `worktree_path`, `repository_path`, and `path` are
+///   rewritten under `<target_root>/<workspaceId>/`; PR linkage columns are
+///   kept (monitors re-poll).
+/// - **agent_session**: `acp_session_id` / `backend_session_id` nulled (no
+///   stale resume, ACP sessions are process-local), `is_active` forced 0;
+///   in-flight statuses (`active`/`Processing`/`Waiting`) become `idle` with
+///   a stop reason, and each such agent gains an `interrupted_agent` row
+///   (`resolution='pending'`) so `agent.listInterrupted` offers resumption.
+/// - **sandbox**: `path` rewritten under the target root.
+/// - **script**: absolute `cwd` rewritten under the target root.
+/// - **draft**: dropped — drafts FK onto `client`, which never transfers.
+/// - **interrupted_agent**: exported pending rows are kept; synthesized rows
+///   for newly-interrupted agents are added unless the agent already has one.
+fn transform_rows(
+    rows: Vec<(String, Vec<serde_json::Value>)>,
+    workspace_id: &WorkspaceId,
+    target_root: &Path,
+    now: &str,
+) -> Result<TransformOutcome> {
+    let ws_dir = target_root.join(&workspace_id.0);
+    let mut interrupted: Vec<(String, String)> = Vec::new(); // (agent_id, prev_status)
+    let mut out: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    let mut existing_interrupted: Vec<serde_json::Value> = Vec::new();
+
+    for (table, mut objects) in rows {
+        match table.as_str() {
+            "draft" => continue,
+            "interrupted_agent" => {
+                existing_interrupted = objects;
+                continue;
+            }
+            "workspace" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    for key in ["worktree_path", "repository_path"] {
+                        rewrite_path(map, key, &ws_dir);
+                    }
+                    // `path` is the workspace dir itself — re-root it whole.
+                    if let Some(serde_json::Value::String(value)) = map.get_mut("path") {
+                        if Path::new(value.as_str()).is_absolute() {
+                            *value = ws_dir.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+            "agent_session" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    map.insert("acp_session_id".into(), serde_json::Value::Null);
+                    map.insert("backend_session_id".into(), serde_json::Value::Null);
+                    map.insert("is_active".into(), serde_json::json!(0));
+                    let status = map
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if IN_FLIGHT_STATUSES.contains(&status.as_str()) {
+                        let agent_id = map
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        interrupted.push((agent_id, status.clone()));
+                        map.insert("status".into(), serde_json::json!("idle"));
+                        map.insert(
+                            "stop_reason".into(),
+                            serde_json::json!(format!(
+                                "workspace was transferred while the agent was responding (previous status: {status})"
+                            )),
+                        );
+                        map.insert("stop_reason_timestamp".into(), serde_json::json!(now));
+                    }
+                }
+            }
+            "sandbox" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    let agent = map
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(serde_json::Value::String(path)) = map.get_mut("path") {
+                        // <ws-dir>/sandboxes/<agentId>/<last component>
+                        let slug = Path::new(path.as_str())
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "repo".to_string());
+                        *path = ws_dir
+                            .join("sandboxes")
+                            .join(&agent)
+                            .join(slug)
+                            .to_string_lossy()
+                            .to_string();
+                    }
+                }
+            }
+            "script" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    rewrite_path(map, "cwd", &ws_dir);
+                }
+            }
+            _ => {}
+        }
+        out.push((table, objects));
+    }
+
+    // Merge synthesized interrupted rows with exported ones. Exported
+    // PENDING rows win (they carry the original interruption context), but
+    // resolved rows are audit history and must not suppress a fresh pending
+    // row for an agent in-flight at export time — `agent_id` is the table's
+    // PRIMARY KEY, so such a row is rewritten back to pending in place.
+    let mut pending: std::collections::HashSet<String> = existing_interrupted
+        .iter()
+        .filter(|r| r.get("resolution").and_then(|v| v.as_str()) == Some("pending"))
+        .filter_map(|r| r.get("agent_id").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    let mut interrupted_ids: Vec<String> = pending.iter().cloned().collect();
+    for (agent_id, prev_status) in interrupted {
+        if agent_id.is_empty() || pending.contains(&agent_id) {
+            continue;
+        }
+        pending.insert(agent_id.clone());
+        let row = serde_json::json!({
+            "agent_id": agent_id,
+            "workspace_id": workspace_id.0,
+            "prev_status": prev_status,
+            "interrupted_at": now,
+            "resolution": "pending",
+            "resolved_at": serde_json::Value::Null,
+        });
+        match existing_interrupted
+            .iter_mut()
+            .find(|r| r.get("agent_id").and_then(|v| v.as_str()) == Some(agent_id.as_str()))
+        {
+            Some(resolved_audit_row) => *resolved_audit_row = row,
+            None => existing_interrupted.push(row),
+        }
+        interrupted_ids.push(agent_id);
+    }
+    interrupted_ids.sort();
+    out.push(("interrupted_agent".to_string(), existing_interrupted));
+
+    Ok(TransformOutcome {
+        rows: out,
+        interrupted_agent_ids: interrupted_ids,
+    })
+}
+
+/// Replace `map[key]`'s LAST path component context: the stored absolute
+/// source path keeps only its final component, re-rooted under `ws_dir`.
+/// Non-string / relative / empty values are left untouched.
+fn rewrite_path(map: &mut serde_json::Map<String, serde_json::Value>, key: &str, ws_dir: &Path) {
+    let Some(serde_json::Value::String(value)) = map.get_mut(key) else {
+        return;
+    };
+    let path = Path::new(value.as_str());
+    if !path.is_absolute() {
+        return;
+    }
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    *value = ws_dir.join(name).to_string_lossy().to_string();
+}
+
+fn expect_object<'v>(
+    table: &str,
+    value: &'v mut serde_json::Value,
+) -> Result<&'v mut serde_json::Map<String, serde_json::Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidParams(format!("{table} row is not a JSON object")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId("ws-import".to_string())
+    }
+
+    fn root() -> PathBuf {
+        PathBuf::from("/target/workspaces")
+    }
+
+    fn transform_one(table: &str, row: serde_json::Value) -> TransformOutcome {
+        transform_rows(
+            vec![(table.to_string(), vec![row])],
+            &ws(),
+            &root(),
+            "2026-08-11T00:00:00Z",
+        )
+        .expect("transform")
+    }
+
+    fn find<'o>(outcome: &'o TransformOutcome, table: &str) -> &'o Vec<serde_json::Value> {
+        &outcome
+            .rows
+            .iter()
+            .find(|(t, _)| t == table)
+            .unwrap_or_else(|| panic!("table {table} missing from outcome"))
+            .1
+    }
+
+    /// Workspace paths are re-rooted under `<target_root>/<workspaceId>/`,
+    /// keeping only the source path's final component.
+    #[test]
+    fn transform_rewrites_workspace_paths() {
+        let outcome = transform_one(
+            "workspace",
+            serde_json::json!({
+                "id": "ws-import",
+                "worktree_path": "/home/src/intent/workspaces/ws-import/repo",
+                "repository_path": "/home/src/code/repo",
+                "path": "/home/src/intent/workspaces/ws-import",
+            }),
+        );
+        let row = &find(&outcome, "workspace")[0];
+        assert_eq!(row["worktree_path"], "/target/workspaces/ws-import/repo");
+        assert_eq!(row["repository_path"], "/target/workspaces/ws-import/repo");
+        assert_eq!(row["path"], "/target/workspaces/ws-import");
+    }
+
+    /// Relative / null path values are left untouched by the rewrite.
+    #[test]
+    fn transform_leaves_relative_and_null_paths() {
+        let outcome = transform_one(
+            "workspace",
+            serde_json::json!({
+                "id": "ws-import",
+                "worktree_path": null,
+                "repository_path": "relative/path",
+            }),
+        );
+        let row = &find(&outcome, "workspace")[0];
+        assert_eq!(row["worktree_path"], serde_json::Value::Null);
+        assert_eq!(row["repository_path"], "relative/path");
+    }
+
+    /// In-flight agent sessions (all three spellings) are forced idle with
+    /// nulled session ids and gain a pending `interrupted_agent` row; settled
+    /// sessions only get the session-id/is_active scrub.
+    #[test]
+    fn transform_interrupts_in_flight_agents() {
+        let rows = vec![(
+            "agent_session".to_string(),
+            vec![
+                serde_json::json!({
+                    "id": "agent-a", "status": "active",
+                    "acp_session_id": "acp-1", "backend_session_id": "b-1",
+                    "is_active": 1
+                }),
+                serde_json::json!({ "id": "agent-b", "status": "Processing" }),
+                serde_json::json!({ "id": "agent-c", "status": "Waiting" }),
+                serde_json::json!({
+                    "id": "agent-d", "status": "idle", "acp_session_id": "acp-4"
+                }),
+            ],
+        )];
+        let outcome =
+            transform_rows(rows, &ws(), &root(), "2026-08-11T00:00:00Z").expect("transform");
+        let sessions = find(&outcome, "agent_session");
+        for s in sessions {
+            assert_eq!(s["acp_session_id"], serde_json::Value::Null);
+            assert_eq!(s["backend_session_id"], serde_json::Value::Null);
+            assert_eq!(s["is_active"], 0);
+        }
+        assert!(sessions[..3].iter().all(|s| s["status"] == "idle"));
+        assert!(sessions[..3]
+            .iter()
+            .all(|s| s["stop_reason"].as_str().unwrap().contains("transferred")));
+        assert_eq!(sessions[3]["status"], "idle");
+        assert!(sessions[3].get("stop_reason").is_none());
+
+        assert_eq!(
+            outcome.interrupted_agent_ids,
+            vec!["agent-a", "agent-b", "agent-c"]
+        );
+        let interrupted = find(&outcome, "interrupted_agent");
+        assert_eq!(interrupted.len(), 3);
+        let a = interrupted
+            .iter()
+            .find(|r| r["agent_id"] == "agent-a")
+            .expect("agent-a row");
+        assert_eq!(a["prev_status"], "active");
+        assert_eq!(a["resolution"], "pending");
+        assert_eq!(a["workspace_id"], "ws-import");
+    }
+
+    /// An exported pending `interrupted_agent` row wins over a synthesized
+    /// one for the same agent (original interruption context preserved).
+    #[test]
+    fn transform_keeps_exported_interrupted_rows() {
+        let rows = vec![
+            (
+                "agent_session".to_string(),
+                vec![serde_json::json!({ "id": "agent-a", "status": "active" })],
+            ),
+            (
+                "interrupted_agent".to_string(),
+                vec![serde_json::json!({
+                    "agent_id": "agent-a", "workspace_id": "ws-import",
+                    "prev_status": "Waiting", "interrupted_at": "2026-01-01T00:00:00Z",
+                    "resolution": "pending"
+                })],
+            ),
+        ];
+        let outcome =
+            transform_rows(rows, &ws(), &root(), "2026-08-11T00:00:00Z").expect("transform");
+        let interrupted = find(&outcome, "interrupted_agent");
+        assert_eq!(interrupted.len(), 1, "no duplicate for agent-a");
+        assert_eq!(interrupted[0]["prev_status"], "Waiting");
+        assert_eq!(interrupted[0]["interrupted_at"], "2026-01-01T00:00:00Z");
+    }
+
+    /// A RESOLVED audit row (the agent was interrupted before, then resumed)
+    /// must NOT suppress the fresh pending row for an agent in-flight at
+    /// export time: `agent_id` is the PK, so the audit row is rewritten back
+    /// to pending in place.
+    #[test]
+    fn transform_resolved_audit_row_does_not_suppress_new_interruption() {
+        let rows = vec![
+            (
+                "agent_session".to_string(),
+                vec![serde_json::json!({ "id": "agent-a", "status": "active" })],
+            ),
+            (
+                "interrupted_agent".to_string(),
+                vec![serde_json::json!({
+                    "agent_id": "agent-a", "workspace_id": "ws-import",
+                    "prev_status": "Waiting", "interrupted_at": "2026-01-01T00:00:00Z",
+                    "resolution": "resumed", "resolved_at": "2026-01-02T00:00:00Z"
+                })],
+            ),
+        ];
+        let outcome =
+            transform_rows(rows, &ws(), &root(), "2026-08-11T00:00:00Z").expect("transform");
+        let interrupted = find(&outcome, "interrupted_agent");
+        assert_eq!(interrupted.len(), 1, "one row per agent (PK)");
+        assert_eq!(interrupted[0]["resolution"], "pending");
+        assert_eq!(interrupted[0]["prev_status"], "active");
+        assert_eq!(interrupted[0]["interrupted_at"], "2026-08-11T00:00:00Z");
+        assert_eq!(interrupted[0]["resolved_at"], serde_json::Value::Null);
+        assert_eq!(outcome.interrupted_agent_ids, vec!["agent-a"]);
+    }
+
+    /// Rows outside the manifest's workspace are rejected: smuggled second
+    /// `workspace` rows, child rows scoped to another workspace, and
+    /// `agent_message` rows whose owning session is not in the archive.
+    #[test]
+    fn validate_row_scope_rejects_out_of_scope_rows() {
+        let ws = ws();
+        let scoped = |rows: Vec<(&str, Vec<serde_json::Value>)>| {
+            validate_row_scope(
+                &rows
+                    .into_iter()
+                    .map(|(t, r)| (t.to_string(), r))
+                    .collect::<Vec<_>>(),
+                &ws,
+            )
+        };
+
+        assert!(scoped(vec![(
+            "workspace",
+            vec![
+                serde_json::json!({ "id": "ws-import" }),
+                serde_json::json!({ "id": "ws-smuggled" }),
+            ],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "note",
+            vec![serde_json::json!({ "id": "n1", "workspace_id": "ws-other" })],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "agent_message",
+            vec![serde_json::json!({ "id": 1, "agent_id": "agent-elsewhere" })],
+        )])
+        .is_err());
+        assert!(scoped(vec![(
+            "completion_watch",
+            vec![serde_json::json!({
+                "id": "w1", "parent_workspace_id": "ws-a", "child_workspace_id": "ws-b"
+            })],
+        )])
+        .is_err());
+
+        assert!(scoped(vec![
+            ("workspace", vec![serde_json::json!({ "id": "ws-import" })],),
+            (
+                "agent_session",
+                vec![serde_json::json!({ "id": "agent-a", "workspace_id": "ws-import" })],
+            ),
+            (
+                "agent_message",
+                vec![serde_json::json!({ "id": 1, "agent_id": "agent-a" })],
+            ),
+            (
+                "completion_watch",
+                vec![serde_json::json!({
+                    "id": "w1", "parent_workspace_id": "ws-import",
+                    "child_workspace_id": "ws-b"
+                })],
+            ),
+        ])
+        .is_ok());
+    }
+
+    /// Drafts are dropped entirely (their owning `client` never transfers).
+    #[test]
+    fn transform_drops_drafts() {
+        let outcome = transform_one(
+            "draft",
+            serde_json::json!({ "workspace_id": "ws-import", "text": "d" }),
+        );
+        assert!(!outcome.rows.iter().any(|(t, _)| t == "draft"));
+    }
+
+    /// Sandbox paths are re-provisioned under
+    /// `<ws-dir>/sandboxes/<agentId>/<repo-slug>`; script cwds re-root like
+    /// workspace paths.
+    #[test]
+    fn transform_rewrites_sandbox_and_script_paths() {
+        let outcome = transform_one(
+            "sandbox",
+            serde_json::json!({
+                "id": "sb-1", "agent_id": "agent-a",
+                "path": "/src/ws/old/sandboxes/agent-a/repo-slug"
+            }),
+        );
+        assert_eq!(
+            find(&outcome, "sandbox")[0]["path"],
+            "/target/workspaces/ws-import/sandboxes/agent-a/repo-slug"
+        );
+
+        let outcome = transform_one(
+            "script",
+            serde_json::json!({ "id": "s-1", "cwd": "/src/ws/old/repo" }),
+        );
+        assert_eq!(
+            find(&outcome, "script")[0]["cwd"],
+            "/target/workspaces/ws-import/repo"
+        );
+    }
+
+    /// Untouched tables (notes, hooks, monitors…) pass through verbatim.
+    #[test]
+    fn transform_passes_other_tables_through() {
+        let row = serde_json::json!({
+            "hook_id": "h-1", "workspace_id": "ws-import",
+            "code": "return { dispatch: false }", "state": "scheduled"
+        });
+        let outcome = transform_one("hook", row.clone());
+        assert_eq!(find(&outcome, "hook")[0], row);
+    }
+
+    // ---- functional lifecycle tests -------------------------------------
+
+    use intent_store::Store;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&p).expect("mkdir");
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Pin the zip-slip safety `assemble_and_extract` relies on: hostile
+    /// entry names (`../evil`, absolute paths) and symlinks targeting
+    /// outside the destination must not write outside the extraction dir,
+    /// whatever the `zip` crate's policy (sanitize or error) is.
+    #[test]
+    fn extract_rejects_hostile_entries() {
+        use std::io::Write as _;
+
+        type Writer<'a> = zip::ZipWriter<&'a mut std::io::Cursor<Vec<u8>>>;
+        let run = |build: &dyn for<'a> Fn(&mut Writer<'a>)| {
+            let staging = TempDir::new("import-zip-slip");
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            build(&mut writer);
+            writer.finish().expect("zip");
+            let archive = buf.into_inner();
+            std::fs::write(staging.0.join(chunk_file_name(0)), &archive).expect("chunk");
+            let extracted = staging.0.join("extracted");
+            let result = assemble_and_extract(
+                &staging.0,
+                &[0],
+                archive.len() as u64,
+                &sha256_hex(&archive),
+                &extracted,
+            );
+            (staging, result)
+        };
+        let options = || zip::write::FileOptions::<'_, ()>::default();
+
+        // Path traversal in an entry name.
+        let (staging, result) = run(&|writer| {
+            writer.start_file("../evil.txt", options()).expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            !staging.0.parent().unwrap().join("evil.txt").exists(),
+            "traversal entry must not escape the extraction dir (result: {result:?})"
+        );
+
+        // Absolute entry name.
+        let escape_target = TempDir::new("import-zip-slip-target");
+        let abs = escape_target.0.join("evil-abs.txt");
+        let abs_name = abs.to_string_lossy().to_string();
+        let (_staging, result) = run(&|writer| {
+            writer.start_file(&*abs_name, options()).expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            !abs.exists(),
+            "absolute entry must not escape the extraction dir (result: {result:?})"
+        );
+
+        // Symlink whose target points outside the destination, plus a file
+        // extracted THROUGH it. The extraction must FAIL (failing the whole
+        // commit — extraction is not atomic, so an intermediate entry may
+        // linger inside the staging dir, which a failed commit discards) and
+        // nothing may land outside the extraction dir.
+        let (_staging, result) = run(&|writer| {
+            writer
+                .add_symlink("link", "/", options())
+                .expect("symlink entry");
+            writer
+                .start_file("link/evil-via-link.txt", options())
+                .expect("entry");
+            writer.write_all(b"escaped").expect("bytes");
+        });
+        assert!(
+            result.is_err(),
+            "escaping symlink must fail the extraction (result: {result:?})"
+        );
+        assert!(
+            !Path::new("/evil-via-link.txt").exists(),
+            "symlink-relayed entry must not escape (result: {result:?})"
+        );
+    }
+
+    async fn fresh_services(workspaces_root: &Path, assets_root: &Path) -> Services {
+        let db = std::env::temp_dir().join(format!("import-test-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&db).await.expect("open store");
+        Services::new(store)
+            .with_workspaces_root(workspaces_root.to_path_buf())
+            .with_assets_root(assets_root.to_path_buf())
+    }
+
+    fn manifest(ws: &WorkspaceId) -> TransferManifest {
+        TransferManifest {
+            format_version: TRANSFER_FORMAT_VERSION,
+            creating_intentd_version: env!("CARGO_PKG_VERSION").to_string(),
+            workspace_id: ws.clone(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+            tables: vec![],
+            assets: vec![],
+            git: intent_core::transfer::TransferGitSummary {
+                has_repository: false,
+                branch: None,
+                dirty_files: vec![],
+                sandbox_branches: vec![],
+            },
+        }
+    }
+
+    /// Build a fixture archive: manifest.json + rows/*.jsonl (+ one asset).
+    fn build_archive(m: &TransferManifest, rows: &[(&str, Vec<serde_json::Value>)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        zip.start_file("manifest.json", options).expect("manifest");
+        zip.write_all(serde_json::to_string(m).expect("json").as_bytes())
+            .expect("manifest bytes");
+        for (table, objects) in rows {
+            zip.start_file(format!("rows/{table}.jsonl"), options)
+                .expect("row file");
+            for o in objects {
+                let line = format!("{}\n", serde_json::to_string(o).expect("row json"));
+                zip.write_all(line.as_bytes()).expect("row bytes");
+            }
+        }
+        zip.start_file("assets/img.png", options).expect("asset");
+        zip.write_all(b"asset-bytes").expect("asset bytes");
+        zip.finish().expect("finish zip");
+        buf.into_inner()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn fixture_rows(ws: &WorkspaceId) -> Vec<(&'static str, Vec<serde_json::Value>)> {
+        let t = "2026-08-11T00:00:00Z";
+        vec![
+            (
+                "workspace",
+                vec![serde_json::json!({
+                    "id": ws.0, "title": "Imported", "branch": "main",
+                    "status": "Active", "worktree_path": "/src/ws/repo",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "note",
+                vec![serde_json::json!({
+                    "id": "n1", "workspace_id": ws.0, "title": "N", "content": "body",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "agent_session",
+                vec![serde_json::json!({
+                    "id": "agent-live", "workspace_id": ws.0, "name": "A",
+                    "status": "active", "is_active": 1,
+                    "acp_session_id": "acp-1", "backend_session_id": "b-1",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "hook",
+                vec![serde_json::json!({
+                    "hook_id": "h-1", "workspace_id": ws.0, "agent_id": "agent-live",
+                    "name": "H", "code": "return { dispatch: false }",
+                    "delay_ms": 10000, "state": "scheduled", "created_at": t,
+                    "next_run_at": "2027-01-01T00:00:00Z",
+                    "expires_at": "2027-01-01T00:30:00Z"
+                })],
+            ),
+            (
+                "draft",
+                vec![serde_json::json!({
+                    "workspace_id": ws.0, "agent_id": "agent-live",
+                    "client_id": "client-x", "text": "d", "updated_at": t
+                })],
+            ),
+        ]
+    }
+
+    /// Full lifecycle: begin → two chunks (out of order, one retried) →
+    /// commit. The workspace is invisible before commit and live after, with
+    /// transforms applied (paths re-rooted, session ids nulled, in-flight
+    /// agent interrupted, draft dropped), the asset placed, and the hook
+    /// rehydrated without a restart.
+    #[tokio::test]
+    async fn import_lifecycle_begin_chunk_commit() {
+        let ws = WorkspaceId("ws-imported".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let m = manifest(&ws);
+        let archive = build_archive(&m, &fixture_rows(&ws));
+        let sha = sha256_hex(&archive);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        assert!(begin["maxChunkBytes"].as_u64().unwrap() > 0);
+
+        // Nothing visible before commit.
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+
+        // Chunks out of order; seq 0 retried (idempotent overwrite).
+        let mid = archive.len() / 2;
+        svc.workspace_import_chunk_op(import_id.clone(), 1, b64(&archive[mid..]))
+            .await
+            .expect("chunk 1");
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive[..mid]))
+            .await
+            .expect("chunk 0");
+        let retried = svc
+            .workspace_import_chunk_op(import_id.clone(), 0, b64(&archive[..mid]))
+            .await
+            .expect("chunk 0 retry");
+        assert_eq!(
+            retried["receivedBytes"].as_u64().unwrap(),
+            archive.len() as u64,
+            "retried chunk must not double-count"
+        );
+
+        let committed = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect("commit");
+
+        let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
+        assert_eq!(imported.title, "Imported");
+        let expected_wt = ws_root.0.join(&ws.0).join("repo");
+        assert_eq!(
+            imported.worktree_path.as_deref(),
+            Some(expected_wt.to_str().unwrap()),
+            "worktree path re-rooted under the target workspaces root"
+        );
+
+        let session = svc
+            .store
+            .get_agent_session(&intent_core::AgentId("agent-live".to_string()))
+            .await
+            .expect("session");
+        assert_eq!(session.status, intent_core::AgentStatus::RuntimeIdle);
+        assert!(session.acp_session_id.is_none());
+        assert_eq!(
+            committed["interruptedAgents"],
+            serde_json::json!(["agent-live"])
+        );
+        assert!(committed["rehydrated"]["hooks"].as_u64().unwrap() >= 1);
+        assert!(committed["importedRows"].as_u64().unwrap() >= 4);
+
+        // Draft dropped; asset placed.
+        let stats = svc.store.transfer_table_stats(&ws).await.expect("stats");
+        let row_count = |n: &str| {
+            stats
+                .iter()
+                .find(|s| s.name == n)
+                .map(|s| s.row_count)
+                .unwrap_or(-1)
+        };
+        assert_eq!(row_count("draft"), 0);
+        assert_eq!(row_count("note"), 1);
+        assert_eq!(row_count("interrupted_agent"), 1);
+        assert_eq!(
+            std::fs::read(assets_root.0.join(&ws.0).join("img.png")).expect("asset"),
+            b"asset-bytes"
+        );
+
+        // Session retired: a second commit is NotFound.
+        assert!(matches!(
+            svc.workspace_import_commit_op(import_id).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// `begin` rejects: bad format version, version mismatch (naming both
+    /// versions), chief workspace, malformed sha, and id collisions.
+    #[tokio::test]
+    async fn import_begin_rejections() {
+        let ws = WorkspaceId("ws-reject".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+        let sha = "a".repeat(64);
+
+        let mut bad_format = manifest(&ws);
+        bad_format.format_version = 999;
+        let err = svc
+            .workspace_import_begin_op(serde_json::to_value(&bad_format).unwrap(), 10, sha.clone())
+            .await
+            .expect_err("format");
+        assert!(err.to_string().contains("999"));
+
+        let mut bad_version = manifest(&ws);
+        bad_version.creating_intentd_version = "0.0.1-other".to_string();
+        let err = svc
+            .workspace_import_begin_op(serde_json::to_value(&bad_version).unwrap(), 10, sha.clone())
+            .await
+            .expect_err("version");
+        let msg = err.to_string();
+        assert!(msg.contains("0.0.1-other") && msg.contains(env!("CARGO_PKG_VERSION")));
+
+        let chief = manifest(&WorkspaceId::chief());
+        assert!(svc
+            .workspace_import_begin_op(serde_json::to_value(&chief).unwrap(), 10, sha.clone())
+            .await
+            .is_err());
+
+        let err = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(manifest(&ws)).unwrap(),
+                10,
+                "nothex".to_string(),
+            )
+            .await
+            .expect_err("sha");
+        assert!(err.to_string().contains("64 hex"));
+
+        // Collision with an existing workspace row.
+        let existing = crate::tests::workspace(&ws);
+        svc.store.insert_workspace(&existing).await.expect("seed");
+        let err = svc
+            .workspace_import_begin_op(serde_json::to_value(manifest(&ws)).unwrap(), 10, sha)
+            .await
+            .expect_err("collision");
+        assert!(err.to_string().contains(ws.0.as_str()));
+    }
+
+    /// `commit` rejects an incomplete upload and a checksum mismatch — and
+    /// the session survives the failed commit for a retry or abort; `abort`
+    /// removes the staging dir and is idempotent.
+    #[tokio::test]
+    async fn import_commit_verification_and_abort() {
+        let ws = WorkspaceId("ws-verify".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let m = manifest(&ws);
+        let archive = build_archive(&m, &fixture_rows(&ws));
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                "b".repeat(64), // deliberately wrong checksum
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().unwrap().to_string();
+
+        // Incomplete: only half the bytes staged.
+        let mid = archive.len() / 2;
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive[..mid]))
+            .await
+            .expect("chunk 0");
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("incomplete");
+        assert!(err.to_string().contains("incomplete"));
+
+        // Complete but checksum mismatch.
+        svc.workspace_import_chunk_op(import_id.clone(), 1, b64(&archive[mid..]))
+            .await
+            .expect("chunk 1");
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("checksum");
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+
+        // Session survived both failures; abort cleans it up.
+        let staging = svc.import_staging_root().join(&import_id);
+        assert!(staging.exists());
+        let aborted = svc
+            .workspace_import_abort_op(import_id.clone())
+            .await
+            .expect("abort");
+        assert_eq!(aborted["aborted"], true);
+        assert!(!staging.exists());
+        let again = svc
+            .workspace_import_abort_op(import_id)
+            .await
+            .expect("abort again");
+        assert_eq!(again["aborted"], false);
+    }
+
+    /// Chunk staging enforces the per-chunk cap, the declared total, and
+    /// rejects unknown import ids; a second `begin` for the same workspace
+    /// while one import is pending is rejected.
+    #[tokio::test]
+    async fn import_chunk_guards() {
+        let ws = WorkspaceId("ws-chunk".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let m = manifest(&ws);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                8,
+                "c".repeat(64),
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().unwrap().to_string();
+
+        // Duplicate begin for the same workspace id.
+        let err = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                8,
+                "c".repeat(64),
+            )
+            .await
+            .expect_err("dup begin");
+        assert!(err.to_string().contains("already in progress"));
+
+        // Over the declared total.
+        let err = svc
+            .workspace_import_chunk_op(import_id.clone(), 0, b64(b"123456789"))
+            .await
+            .expect_err("over total");
+        assert!(err.to_string().contains("declared archive size"));
+
+        // Unknown import id.
+        assert!(matches!(
+            svc.workspace_import_chunk_op("import-nope".to_string(), 0, b64(b"x"))
+                .await,
+            Err(Error::NotFound(_))
+        ));
+
+        svc.workspace_import_abort_op(import_id)
+            .await
+            .expect("abort");
+    }
+}

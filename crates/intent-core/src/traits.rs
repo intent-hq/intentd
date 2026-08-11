@@ -109,6 +109,73 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.import.begin`: validate a transfer archive's manifest
+    /// header (format version, exact creating-intentd-version match, id
+    /// collision) and open a staged import session (PROTOCOL §5.1). Returns
+    /// `{ importId, maxChunkBytes }`.
+    fn workspace_import_begin(
+        &self,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (manifest, archive_size_bytes, archive_sha256);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_import_begin not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.import.chunk`: stage one seq-numbered base64 slice of the
+    /// archive; retrying a seq is idempotent (PROTOCOL §5.1). Returns
+    /// `{ importId, seq, receivedBytes }`.
+    fn workspace_import_chunk(
+        &self,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (import_id, seq, data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_import_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.import.commit`: verify the assembled archive's checksum,
+    /// unpack it, and atomically import the workspace — rows in one
+    /// transaction, then assets, git materialization, and boot-style
+    /// rehydration (PROTOCOL §5.1). Returns `{ workspace, importedRows,
+    /// interruptedAgents, rehydrated }`.
+    fn workspace_import_commit(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = import_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_import_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `workspace.import.abort`: delete a staged import's session and
+    /// staging directory; idempotent (PROTOCOL §5.1). Returns
+    /// `{ importId, aborted }`.
+    fn workspace_import_abort(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = import_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_import_abort not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is

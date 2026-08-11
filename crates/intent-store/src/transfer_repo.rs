@@ -1,4 +1,7 @@
-//! Row statistics for the workspace transfer manifest (`workspace.transfer.plan`).
+//! Row statistics for the workspace transfer manifest (`workspace.transfer.plan`)
+//! plus the generic row export/import used by the transfer archive: export
+//! serializes every [`TRANSFER_TABLES`] row to JSON (`rows/<table>.jsonl` in
+//! the archive), import inserts transformed rows back in one transaction.
 //!
 //! Enumerates every workspace-scoped table that rides in a transfer archive —
 //! deliberately excluding `event` (event history stays on the source, spec
@@ -7,6 +10,7 @@
 
 use intent_core::transfer::TransferTableStat;
 use intent_core::{Error, Result, WorkspaceId};
+use sqlx::{Column, Row, TypeInfo, ValueRef};
 
 use crate::Store;
 
@@ -102,6 +106,246 @@ impl Store {
         .map_err(|e| Error::Internal(format!("table_info for {table} failed: {e}")))?;
         Ok(rows.into_iter().map(|(_, name)| name).collect())
     }
+
+    /// Export every [`TRANSFER_TABLES`] row for one workspace as JSON objects
+    /// (`column name → value`), in table order. Values map SQLite storage
+    /// classes to JSON: NULL → `null`, INTEGER → number, REAL → number,
+    /// TEXT → string, BLOB → `{ "$base64": "<bytes>" }`. This is the row
+    /// payload the export archive writes to `rows/<table>.jsonl` and
+    /// [`Store::transfer_import_rows`] round-trips on the target.
+    pub async fn transfer_export_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let mut out = Vec::with_capacity(TRANSFER_TABLES.len());
+        for (table, predicate) in TRANSFER_TABLES {
+            let sql = format!("SELECT * FROM \"{table}\" WHERE {predicate}");
+            let rows = sqlx::query(&sql)
+                .bind(&workspace_id.0)
+                .fetch_all(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("transfer export {table} failed: {e}")))?;
+            let mut objects = Vec::with_capacity(rows.len());
+            for row in rows {
+                objects.push(row_to_json(table, &row)?);
+            }
+            out.push(((*table).to_string(), objects));
+        }
+        Ok(out)
+    }
+
+    /// Insert transformed transfer rows into their tables inside ONE
+    /// transaction — the atomic heart of `workspace.import.commit`. `rows`
+    /// entries must name [`TRANSFER_TABLES`] members (anything else —
+    /// including `event` — is rejected before any write) and are inserted in
+    /// canonical [`TRANSFER_TABLES`] order regardless of input order, so FK
+    /// parents (`workspace`, `agent_session`, `note`) always land before
+    /// their children. Every row's keys are validated against the live
+    /// schema. Nothing is visible unless the whole batch commits. Returns
+    /// the number of rows inserted.
+    pub async fn transfer_import_rows(
+        &self,
+        rows: &[(String, Vec<serde_json::Value>)],
+    ) -> Result<usize> {
+        for (table, _) in rows {
+            if !TRANSFER_TABLES.iter().any(|(t, _)| t == table) {
+                return Err(Error::InvalidParams(format!(
+                    "transfer import: table {table} is not part of the transfer set"
+                )));
+            }
+        }
+        // Pre-fetch schemas outside the transaction (read-only pragma).
+        let mut schemas = std::collections::HashMap::new();
+        for (table, _) in TRANSFER_TABLES {
+            schemas.insert(*table, self.table_columns(table).await?);
+        }
+
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        let mut inserted = 0usize;
+        for (table, _) in TRANSFER_TABLES {
+            let Some((_, objects)) = rows.iter().find(|(t, _)| t == table) else {
+                continue;
+            };
+            let schema = &schemas[table];
+            for object in objects {
+                let map = object.as_object().ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "transfer import: {table} row is not a JSON object"
+                    ))
+                })?;
+                let mut columns = Vec::with_capacity(map.len());
+                for key in map.keys() {
+                    if !schema.contains(key) {
+                        return Err(Error::InvalidParams(format!(
+                            "transfer import: {table} has no column {key}"
+                        )));
+                    }
+                    columns.push(format!("\"{key}\""));
+                }
+                if columns.is_empty() {
+                    continue;
+                }
+                let placeholders = vec!["?"; columns.len()].join(",");
+                let sql = format!(
+                    "INSERT INTO \"{table}\" ({}) VALUES ({placeholders})",
+                    columns.join(",")
+                );
+                let mut query = sqlx::query(&sql);
+                for (key, value) in map {
+                    query = bind_json_value(query, table, key, value)?;
+                }
+                query.execute(&mut *tx).await.map_err(|e| {
+                    Error::Internal(format!("transfer import insert into {table} failed: {e}"))
+                })?;
+                inserted += 1;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
+        Ok(inserted)
+    }
+}
+
+/// Serialize one SQLite row to a JSON object keyed by column name (see
+/// [`Store::transfer_export_rows`] for the storage-class mapping).
+fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json::Value> {
+    let mut object = serde_json::Map::with_capacity(row.columns().len());
+    for (i, column) in row.columns().iter().enumerate() {
+        let raw = row.try_get_raw(i).map_err(|e| {
+            Error::Internal(format!("transfer export {table}.{}: {e}", column.name()))
+        })?;
+        let value = if raw.is_null() {
+            serde_json::Value::Null
+        } else {
+            match raw.type_info().name() {
+                "INTEGER" | "BOOLEAN" => serde_json::json!(row
+                    .try_get::<i64, _>(i)
+                    .map_err(|e| Error::Internal(format!("transfer export {table}: {e}")))?),
+                "REAL" => serde_json::json!(row
+                    .try_get::<f64, _>(i)
+                    .map_err(|e| Error::Internal(format!("transfer export {table}: {e}")))?),
+                "BLOB" => {
+                    let bytes = row
+                        .try_get::<Vec<u8>, _>(i)
+                        .map_err(|e| Error::Internal(format!("transfer export {table}: {e}")))?;
+                    serde_json::json!({ "$base64": base64_encode(&bytes) })
+                }
+                _ => serde_json::json!(row
+                    .try_get::<String, _>(i)
+                    .map_err(|e| Error::Internal(format!("transfer export {table}: {e}")))?),
+            }
+        };
+        object.insert(column.name().to_string(), value);
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+/// Bind one exported JSON value back to its SQLite storage class (the inverse
+/// of [`row_to_json`]).
+fn bind_json_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    table: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+    Ok(match value {
+        serde_json::Value::Null => query.bind(Option::<String>::None),
+        serde_json::Value::Bool(b) => query.bind(*b as i64),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                query.bind(i)
+            } else if let Some(f) = n.as_f64() {
+                query.bind(f)
+            } else {
+                return Err(Error::InvalidParams(format!(
+                    "transfer import: {table}.{key} has an unrepresentable number"
+                )));
+            }
+        }
+        serde_json::Value::String(s) => query.bind(s.clone()),
+        serde_json::Value::Object(o) => {
+            let Some(serde_json::Value::String(encoded)) = o.get("$base64") else {
+                return Err(Error::InvalidParams(format!(
+                    "transfer import: {table}.{key} object value is not a $base64 blob"
+                )));
+            };
+            query.bind(base64_decode(encoded).ok_or_else(|| {
+                Error::InvalidParams(format!("transfer import: {table}.{key} invalid base64"))
+            })?)
+        }
+        serde_json::Value::Array(_) => {
+            return Err(Error::InvalidParams(format!(
+                "transfer import: {table}.{key} array values are not supported"
+            )));
+        }
+    })
+}
+
+/// Minimal standard-alphabet base64 encode (BLOB columns only; keeps
+/// intent-store free of a base64 dependency for a path that in practice
+/// never fires — no transfer table declares a BLOB column today).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Inverse of [`base64_encode`]; `None` on any malformed input.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -214,6 +458,88 @@ mod tests {
                 stats[i].approx_bytes > 0,
                 "table {name} must report a positive byte estimate"
             );
+        }
+    }
+
+    /// Rows exported from a seeded workspace re-import into a fresh store and
+    /// come back byte-identical on a second export (full JSON round-trip:
+    /// every table, every column, every storage class the seed exercises).
+    /// `draft` rows are emptied first — drafts FK onto `client`, which is not
+    /// part of the transfer set, so the import transform layer drops them
+    /// (transient UI state; the owning client never exists on the target).
+    #[tokio::test]
+    async fn transfer_rows_round_trip_between_stores() {
+        let src_db = TempDb::new();
+        let src = Store::open(&src_db.path).await.expect("open source");
+        seed(&src, "ws-rt").await;
+        let ws = WorkspaceId("ws-rt".to_string());
+
+        let mut exported = src.transfer_export_rows(&ws).await.expect("export");
+        assert_eq!(exported.len(), TRANSFER_TABLES.len());
+        for (table, rows) in &mut exported {
+            if table == "draft" {
+                assert_eq!(rows.len(), 1, "seed must have exercised draft export");
+                rows.clear();
+            }
+        }
+        let total: usize = exported.iter().map(|(_, rows)| rows.len()).sum();
+        assert!(total > 0);
+
+        let dst_db = TempDb::new();
+        let dst = Store::open(&dst_db.path).await.expect("open target");
+        let inserted = dst.transfer_import_rows(&exported).await.expect("import");
+        assert_eq!(inserted, total);
+
+        let re_exported = dst.transfer_export_rows(&ws).await.expect("re-export");
+        assert_eq!(exported, re_exported, "round-trip must be lossless");
+    }
+
+    /// The import transaction is atomic: a batch whose LAST table row
+    /// violates the schema leaves nothing behind — not even the earlier
+    /// valid workspace row.
+    #[tokio::test]
+    async fn transfer_import_rolls_back_whole_batch_on_failure() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        let t = "2026-01-01T00:00:00Z";
+        let rows = vec![
+            (
+                "workspace".to_string(),
+                vec![serde_json::json!({
+                    "id": "ws-x", "title": "T", "branch": "main",
+                    "created_at": t, "updated_at": t
+                })],
+            ),
+            (
+                "workspace_ui_context".to_string(),
+                // NOT NULL `payload` omitted → insert fails after workspace
+                // already inserted inside the same transaction.
+                vec![serde_json::json!({ "workspace_id": "ws-x" })],
+            ),
+        ];
+        store
+            .transfer_import_rows(&rows)
+            .await
+            .expect_err("batch must fail");
+        let stats = store
+            .transfer_table_stats(&WorkspaceId("ws-x".to_string()))
+            .await
+            .expect("stats");
+        assert!(
+            stats.iter().all(|s| s.row_count == 0),
+            "failed import must leave no rows behind"
+        );
+    }
+
+    /// Unknown tables — including `event` — are rejected before any write.
+    #[tokio::test]
+    async fn transfer_import_rejects_non_transfer_tables() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        for table in ["event", "settings", "nope"] {
+            let rows = vec![(table.to_string(), vec![serde_json::json!({})])];
+            let err = store.transfer_import_rows(&rows).await.expect_err(table);
+            assert!(matches!(err, intent_core::Error::InvalidParams(_)));
         }
     }
 }
