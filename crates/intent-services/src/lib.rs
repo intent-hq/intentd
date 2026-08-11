@@ -7146,6 +7146,48 @@ fn ready_tasks_changed_event(
     new_status: TaskStatus,
     computed_at: &str,
 ) -> NewEvent {
+    ready_tasks_changed_event_with_trigger(
+        workspace_id,
+        ready_task_ids,
+        serde_json::json!({
+            "noteId": triggered_by_note.as_str(),
+            "previousStatus": status_word(previous_status),
+            "newStatus": status_word(new_status),
+        }),
+        computed_at,
+    )
+}
+
+/// Build a `task:ready-tasks-changed` change event for a non-status trigger
+/// (monorepo#1981): a `task.setRelations` write that changed `dependsOn`
+/// (`reason: "relations-changed"`) or the deletion of a task note other tasks
+/// depend on (`reason: "note-deleted"`). The `triggeredBy` variant is additive
+/// — `{ noteId, reason }`, no status fields — so status-change emissions stay
+/// byte-identical.
+fn ready_tasks_changed_reason_event(
+    workspace_id: &WorkspaceId,
+    ready_task_ids: Vec<String>,
+    triggered_by_note: &NoteId,
+    reason: &str,
+    computed_at: &str,
+) -> NewEvent {
+    ready_tasks_changed_event_with_trigger(
+        workspace_id,
+        ready_task_ids,
+        serde_json::json!({
+            "noteId": triggered_by_note.as_str(),
+            "reason": reason,
+        }),
+        computed_at,
+    )
+}
+
+fn ready_tasks_changed_event_with_trigger(
+    workspace_id: &WorkspaceId,
+    ready_task_ids: Vec<String>,
+    triggered_by: serde_json::Value,
+    computed_at: &str,
+) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
         timestamp: now_iso(),
@@ -7157,11 +7199,7 @@ fn ready_tasks_changed_event(
         metadata: None,
         data: serde_json::json!({
             "readyTaskIds": ready_task_ids,
-            "triggeredBy": {
-                "noteId": triggered_by_note.as_str(),
-                "previousStatus": status_word(previous_status),
-                "newStatus": status_word(new_status),
-            },
+            "triggeredBy": triggered_by,
             "computedAt": computed_at,
         }),
     }
@@ -15290,17 +15328,44 @@ impl WorkspaceApi for Services {
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
             )
             .await;
-            // Deleting a task note can move the derived displayStatus rollup
-            // (§6.5), e.g. removing the last open spec-child task.
             if let Some(task) = &note.metadata.task {
+                let remaining = store.list_notes(&workspace_id).await?;
+                // Deleting a task note other tasks dependOn moves the
+                // readiness predicate — a dangling `dependsOn` edge counts as
+                // unmet, so deleting a previously-`complete` dep flips its
+                // dependents out of the ready set (monorepo#1981). Recompute +
+                // broadcast with the `reason: "note-deleted"` trigger variant,
+                // before the dependent re-announce below (same ordering as the
+                // status-transition path).
+                let depended_on = remaining.iter().any(|n| {
+                    n.metadata
+                        .task
+                        .as_ref()
+                        .is_some_and(|t| t.depends_on.iter().any(|d| d == &note_id))
+                });
+                if depended_on {
+                    let ready_task_ids = compute_ready_task_ids(&remaining);
+                    publish_event(
+                        &bus,
+                        ready_tasks_changed_reason_event(
+                            &workspace_id,
+                            ready_task_ids,
+                            &note_id,
+                            "note-deleted",
+                            &now_iso(),
+                        ),
+                    )
+                    .await;
+                }
                 // Deleting a *complete* task flips its dependents' computed
                 // unmetDependsOn from met to unmet (missing = unmet), so
                 // re-announce them for subscriber refetch (monorepo#1979).
                 // Other statuses were already unmet — no projection change.
                 if task.status == TaskStatus::Complete {
-                    let all = store.list_notes(&workspace_id).await?;
-                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &all).await;
+                    publish_dependent_note_updates(&bus, &workspace_id, &note_id, &remaining).await;
                 }
+                // Deleting a task note can move the derived displayStatus
+                // rollup (§6.5), e.g. removing the last open spec-child task.
                 services
                     .maybe_emit_display_status_changed(&workspace_id)
                     .await;
@@ -15883,6 +15948,14 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             let previous_status = note.metadata.task.as_ref().map(|t| t.status);
+            // A re-mark that replaces an existing task's `dependsOn` moves the
+            // readiness predicate exactly like `task.setRelations`; capture
+            // whether it actually changed so the same-status arm below can
+            // recompute (monorepo#1981).
+            let depends_on_changed = match (&note.metadata.task, &depends_on) {
+                (Some(existing), Some(deps)) => existing.depends_on != *deps,
+                _ => false,
+            };
             match note.metadata.task.clone() {
                 // Already a task with a changing status → preserve other fields.
                 Some(mut existing) if existing.status != new_status => {
@@ -15998,7 +16071,27 @@ impl WorkspaceApi for Services {
                         .await;
                     }
                 }
-                Some(_) => {}
+                // Same-status re-mark: no status-shaped emission ran, so a
+                // `dependsOn` replace would otherwise leave ready-set
+                // subscribers stale. Same recompute + `relations-changed`
+                // trigger as `task.setRelations` (monorepo#1981).
+                Some(_) => {
+                    if depends_on_changed {
+                        let all = store.list_notes(&note.workspace_id).await?;
+                        let ready_task_ids = compute_ready_task_ids(&all);
+                        publish_event(
+                            &services.event_bus,
+                            ready_tasks_changed_reason_event(
+                                &note.workspace_id,
+                                ready_task_ids,
+                                &note.id,
+                                "relations-changed",
+                                &now_iso(),
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
             // Marking a note as a task (or moving its status) can move the
             // derived displayStatus rollup (§6.5).
@@ -16053,8 +16146,10 @@ impl WorkspaceApi for Services {
                 validate_relation_ids(&note.id, conflicts, &all, "conflictsWith")?;
             }
             let mut changed = false;
+            let mut depends_on_changed = false;
             if let Some(deps) = depends_on {
-                changed |= task.depends_on != deps;
+                depends_on_changed = task.depends_on != deps;
+                changed |= depends_on_changed;
                 task.depends_on = deps;
             }
             if let Some(conflicts) = conflicts_with {
@@ -16088,6 +16183,26 @@ impl WorkspaceApi for Services {
                 ),
             )
             .await;
+            // A changed `dependsOn` list moves the readiness predicate (adding
+            // an edge can un-ready a task, clearing one can ready it), so
+            // recompute + broadcast the ready set (monorepo#1981). The
+            // `triggeredBy` variant carries `reason: "relations-changed"`
+            // instead of status fields.
+            if depends_on_changed {
+                let all = store.list_notes(&note.workspace_id).await?;
+                let ready_task_ids = compute_ready_task_ids(&all);
+                publish_event(
+                    &services.event_bus,
+                    ready_tasks_changed_reason_event(
+                        &note.workspace_id,
+                        ready_task_ids,
+                        &note.id,
+                        "relations-changed",
+                        &now_iso(),
+                    ),
+                )
+                .await;
+            }
             Ok(result)
         })
     }

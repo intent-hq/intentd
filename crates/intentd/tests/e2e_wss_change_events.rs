@@ -3090,6 +3090,21 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
     .await;
     assert_eq!(set["ok"], json!(true), "setRelations: {set}");
 
+    // The dependsOn write itself recomputes the ready set (monorepo#1981):
+    // consume the relations-changed event — `gated` just left the set.
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": gated, "reason": "relations-changed" }),
+    );
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(gated)),
+        "gated ready right after gaining unmet deps: {evt}"
+    );
+
     // Complete dep-x: the recomputed ready set must still exclude `gated`
     // (dep-y is unmet) while including the completed-child-free dep-y.
     wss_rpc(
@@ -3151,6 +3166,106 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
         !ready.iter().any(|v| v == &json!(gated)),
         "gated ready over a cancelled dep: {evt}"
     );
+}
+
+/// End-to-end ready-set recompute on relation writes and dep-note deletion
+/// (PROTOCOL.md §6.5, monorepo#1981) over WSS: a `task.setRelations` that
+/// changes `dependsOn` emits `task:ready-tasks-changed` with the additive
+/// `triggeredBy: { noteId, reason: "relations-changed" }` variant (no status
+/// fields), and deleting a task note that other tasks dependOn emits the same
+/// event with `reason: "note-deleted"` (the dangling edge counts as unmet).
+#[tokio::test]
+async fn ready_tasks_recompute_on_relations_write_and_deletion_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Recompute", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:ready-tasks-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Two root-level task notes: `dep` (complete) and `gated` (not_started).
+    let mut ids = Vec::new();
+    for (i, (title, status)) in [("Dep", "complete"), ("Gated", "not_started")]
+        .iter()
+        .enumerate()
+    {
+        let id = i as i64 * 2 + 2;
+        let created = wss_rpc(
+            &mut rpc,
+            id,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": title, "content": "body" }),
+        )
+        .await;
+        let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+        wss_rpc(
+            &mut rpc,
+            id + 1,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": status }),
+        )
+        .await;
+        ids.push(note_id);
+    }
+    let (dep, gated) = (ids[0].clone(), ids[1].clone());
+
+    // A relations write that changes dependsOn recomputes the ready set and
+    // emits the reason-shaped trigger. The edge onto the complete `dep` is
+    // met, so `gated` stays in the set.
+    let set = wss_rpc(
+        &mut rpc,
+        10,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": gated, "dependsOn": [dep] }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "setRelations: {set}");
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": gated, "reason": "relations-changed" }),
+        "relations trigger: {evt}"
+    );
+    assert!(evt["data"]["computedAt"].is_string(), "computedAt: {evt}");
+    assert_eq!(evt["data"]["readyTaskIds"], json!([gated]), "ready: {evt}");
+
+    // Deleting the depended-on note leaves a dangling (unmet) edge: `gated`
+    // drops out of the ready set, with the deletion-shaped trigger.
+    let del = wss_rpc(
+        &mut rpc,
+        11,
+        "note.delete",
+        json!({ "workspaceId": ws_id, "noteId": dep }),
+    )
+    .await;
+    assert_eq!(del["ok"], json!(true), "delete: {del}");
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": dep, "reason": "note-deleted" }),
+        "deletion trigger: {evt}"
+    );
+    assert_eq!(evt["data"]["readyTaskIds"], json!([]), "ready: {evt}");
 }
 
 /// End-to-end tree-relative `dependsOn` rejection (PROTOCOL.md §5.4,
