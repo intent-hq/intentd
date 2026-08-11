@@ -1066,6 +1066,13 @@ pub struct TaskMetadata {
     /// convention — no cycle check). Omitted on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts_with: Vec<NoteId>,
+    /// **Computed, never persisted** (monorepo#1979): the `depends_on` subset
+    /// whose task note is not `complete` (missing and cancelled deps count as
+    /// unmet — same rule as the `task.list` projection). Projected onto
+    /// note-shaped reads/pushes at the service layer; stripped from
+    /// `task_json` at store encode time. Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.

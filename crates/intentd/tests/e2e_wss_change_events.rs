@@ -3308,3 +3308,206 @@ async fn task_relations_reject_tree_relative_edges_over_wss() {
         "rejected write persisted: {mine}"
     );
 }
+
+/// End-to-end `unmetDependsOn` on note-shaped payloads (PROTOCOL.md §5.3;
+/// monorepo#1979) over WSS: `note.get` / `note.list` project the computed
+/// field under `metadata.task` using the same rule as the `task.list`
+/// projection (dep unmet unless its task note is `complete`; cancelled =
+/// unmet), the field is omitted when empty (additive wire shape), a
+/// dependency status change re-announces dependents via `note:updated` so
+/// note-channel subscribers refetch, and the note-subscription delta carries
+/// the refreshed projection.
+#[tokio::test]
+async fn note_payloads_project_unmet_depends_on_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "UnmetDeps", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Three task notes: a (complete), b (in_progress), c (not_started).
+    let mut task_ids = Vec::new();
+    for (i, (title, status)) in [
+        ("Alpha", "complete"),
+        ("Beta", "in_progress"),
+        ("Gamma", "not_started"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = i as i64 * 2 + 2;
+        let created = wss_rpc(
+            &mut rpc,
+            id,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": title, "content": "body" }),
+        )
+        .await;
+        let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+        wss_rpc(
+            &mut rpc,
+            id + 1,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": status }),
+        )
+        .await;
+        task_ids.push(note_id);
+    }
+    let (a, b, c) = (
+        task_ids[0].clone(),
+        task_ids[1].clone(),
+        task_ids[2].clone(),
+    );
+
+    // c dependsOn [a, b]: a is met (complete), b is unmet (in_progress).
+    wss_rpc(
+        &mut rpc,
+        10,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": c, "dependsOn": [a, b] }),
+    )
+    .await;
+
+    // note.get projects `metadata.task.unmetDependsOn`.
+    let got = wss_rpc(
+        &mut rpc,
+        11,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": c }),
+    )
+    .await;
+    assert_eq!(got["note"]["metadata"]["task"]["dependsOn"], json!([a, b]));
+    assert_eq!(
+        got["note"]["metadata"]["task"]["unmetDependsOn"],
+        json!([b]),
+        "note.get: {got}"
+    );
+
+    // note.list projects the same field; dep-less tasks omit it entirely.
+    let listed = wss_rpc(&mut rpc, 12, "note.list", json!({ "workspaceId": ws_id })).await;
+    let notes = listed["notes"].as_array().expect("notes array");
+    let row_c = notes.iter().find(|n| n["id"] == json!(c)).expect("c row");
+    assert_eq!(
+        row_c["metadata"]["task"]["unmetDependsOn"],
+        json!([b]),
+        "note.list row: {row_c}"
+    );
+    let row_b = notes.iter().find(|n| n["id"] == json!(b)).expect("b row");
+    assert!(
+        row_b["metadata"]["task"].get("unmetDependsOn").is_none(),
+        "dep-less task omits the field: {row_b}"
+    );
+
+    // Subscribe to the note channel: the seq-0 snapshot carries the
+    // projection too.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "note.subscribe",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["subscriptionId"], sub_id.as_str(), "push: {push}");
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    let snap_c = snap.iter().find(|n| n["id"] == json!(c)).expect("c row");
+    assert_eq!(
+        snap_c["metadata"]["task"]["unmetDependsOn"],
+        json!([b]),
+        "snapshot row: {snap_c}"
+    );
+
+    // Also watch the event firehose for the dependent's `note:updated`.
+    let mut events = connect_ws(port, cfg.clone()).await;
+    let evt_res = wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(evt_res["subscriptionId"].is_string(), "sub id: {evt_res}");
+
+    // Complete dep b: the daemon re-announces dependent c via `note:updated`
+    // (b's own update event fires first), and the note-channel delta for c
+    // carries the emptied projection (field omitted).
+    wss_rpc(
+        &mut rpc,
+        13,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": b, "status": "complete" }),
+    )
+    .await;
+    loop {
+        let evt = next_event(&mut events, &["note:updated"], 10).await;
+        if evt["data"]["noteId"] == json!(c) {
+            break;
+        }
+    }
+    // Drain note-channel deltas until c's arrives with the refreshed
+    // projection: both dep edges are now met, so the field is omitted.
+    let updated_c = 'outer: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        if let Some(updated) = push["delta"]["updated"].as_array() {
+            for entry in updated {
+                if entry["id"] == json!(c) {
+                    break 'outer entry.clone();
+                }
+            }
+        }
+    };
+    assert_eq!(
+        updated_c["metadata"]["task"]["dependsOn"],
+        json!([a, b]),
+        "stored relations survive: {updated_c}"
+    );
+    assert!(
+        updated_c["metadata"]["task"]
+            .get("unmetDependsOn")
+            .is_none(),
+        "all deps met → field omitted: {updated_c}"
+    );
+
+    // Cancel dep b: cancelled counts as unmet again, and the re-announced
+    // delta for c carries it.
+    wss_rpc(
+        &mut rpc,
+        14,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": b, "status": "cancelled" }),
+    )
+    .await;
+    let updated_c = 'outer: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        if let Some(updated) = push["delta"]["updated"].as_array() {
+            for entry in updated {
+                if entry["id"] == json!(c) {
+                    break 'outer entry.clone();
+                }
+            }
+        }
+    };
+    assert_eq!(
+        updated_c["metadata"]["task"]["unmetDependsOn"],
+        json!([b]),
+        "cancelled dep is unmet: {updated_c}"
+    );
+}

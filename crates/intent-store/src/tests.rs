@@ -1600,6 +1600,7 @@ async fn task_metadata_round_trip_and_list_tasks() {
         peer_order: Some(100),
         depends_on: vec![NoteId::from("dep-1")],
         conflicts_with: vec![NoteId::from("conflict-1")],
+        unmet_depends_on: Vec::new(),
     };
     store
         .insert_note(&task_note(&ws_id, "Task A", Some(meta.clone())))
@@ -1612,7 +1613,28 @@ async fn task_metadata_round_trip_and_list_tasks() {
 
     let tasks = store.list_tasks(&ws_id).await.expect("list tasks");
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].metadata.task, Some(meta));
+    assert_eq!(tasks[0].metadata.task, Some(meta.clone()));
+
+    // The computed `unmet_depends_on` projection is stripped at encode time
+    // (monorepo#1979): a note written with it populated reads back clean.
+    let mut projected = task_note(
+        &ws_id,
+        "Task B",
+        Some(TaskMetadata {
+            unmet_depends_on: vec![NoteId::from("dep-1")],
+            ..meta
+        }),
+    );
+    store.insert_note(&projected).await.expect("insert B");
+    let read = store.get_note(&ws_id, &projected.id).await.expect("get B");
+    assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
+    projected.metadata.task.as_mut().unwrap().unmet_depends_on = vec![NoteId::from("dep-2")];
+    store.update_note(&projected).await.expect("update B");
+    let read = store
+        .get_note(&ws_id, &projected.id)
+        .await
+        .expect("get B after update");
+    assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
 }
 
 fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {

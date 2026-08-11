@@ -5672,6 +5672,30 @@ fn unmet_depends_on_ids(
         .collect()
 }
 
+/// Project the computed `unmetDependsOn` onto a note's task metadata in place
+/// (monorepo#1979): for a task note with `dependsOn` edges, populate
+/// `metadata.task.unmet_depends_on` with the unmet subset (same rule as the
+/// `task.list` projection — missing and cancelled deps count as unmet). The
+/// field is never persisted (stripped at store encode time); relation-less
+/// tasks and plain notes are untouched, so the wire shape stays additive
+/// (omitted when empty).
+fn project_unmet_depends_on(note: &mut Note, status_by_id: &HashMap<String, TaskStatus>) {
+    if let Some(task) = note.metadata.task.as_mut() {
+        if !task.depends_on.is_empty() {
+            task.unmet_depends_on = unmet_depends_on_ids(&task.depends_on, status_by_id);
+        }
+    }
+}
+
+/// Project `unmetDependsOn` onto every task note in a listing, computing the
+/// status index once from the same rows.
+fn project_unmet_depends_on_all(notes: &mut [Note]) {
+    let status_by_id = task_status_by_id(notes);
+    for note in notes.iter_mut() {
+        project_unmet_depends_on(note, &status_by_id);
+    }
+}
+
 /// Dedup a relation id list, preserving first-seen order.
 fn normalize_relation_ids(ids: Vec<NoteId>) -> Vec<NoteId> {
     let mut seen = HashSet::new();
@@ -6869,6 +6893,33 @@ fn note_change_event(
             "title": title,
             "action": action,
         }),
+    }
+}
+
+/// Emit `note:updated` for every task note whose `dependsOn` list names the
+/// changed task (monorepo#1979): a dependency status transition moves the
+/// dependents' computed `unmetDependsOn`, so subscribers must refetch them.
+/// `notes` is the workspace listing the caller already holds (no extra query).
+async fn publish_dependent_note_updates(
+    bus: &Option<EventBus>,
+    workspace_id: &WorkspaceId,
+    changed_note_id: &NoteId,
+    notes: &[Note],
+) {
+    for note in notes {
+        if note.id != *changed_note_id
+            && note
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| t.depends_on.contains(changed_note_id))
+        {
+            publish_event(
+                bus,
+                note_change_event(workspace_id, &note.id, &note.title, NOTE_UPDATED, "update"),
+            )
+            .await;
+        }
     }
 }
 
@@ -14591,13 +14642,33 @@ impl WorkspaceApi for Services {
                     );
                 }
             }
-            store.list_notes(&id).await
+            let mut notes = store.list_notes(&id).await?;
+            // Project the computed `unmetDependsOn` onto task notes with
+            // `dependsOn` edges (monorepo#1979) — O(rows) over the same rows,
+            // no extra queries.
+            project_unmet_depends_on_all(&mut notes);
+            Ok(notes)
         })
     }
 
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
-        Box::pin(async move { fetch_note(&store, &workspace_id, &note_id).await })
+        Box::pin(async move {
+            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
+            // Project `unmetDependsOn` (monorepo#1979). The dep-status index
+            // is only needed — and only fetched — when the note actually has
+            // `dependsOn` edges, so plain reads stay single-query.
+            if note
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| !t.depends_on.is_empty())
+            {
+                let status_by_id = task_status_by_id(&store.list_tasks(&workspace_id).await?);
+                project_unmet_depends_on(&mut note, &status_by_id);
+            }
+            Ok(note)
+        })
     }
 
     fn create_note(
@@ -15525,6 +15596,9 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // Re-announce dependents whose computed `unmetDependsOn`
+                // moved with this transition (monorepo#1979).
+                publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
                 // A task-status transition can move the derived displayStatus
                 // rollup (§6.5): recompute-and-compare, emitting only on an
                 // actual transition.
@@ -15857,6 +15931,15 @@ impl WorkspaceApi for Services {
                         ),
                     )
                     .await;
+                    // Re-announce dependents whose computed `unmetDependsOn`
+                    // moved with this transition (monorepo#1979).
+                    publish_dependent_note_updates(
+                        &services.event_bus,
+                        &note.workspace_id,
+                        &note.id,
+                        &all,
+                    )
+                    .await;
                 }
                 Some(_) => {}
             }
@@ -16136,6 +16219,9 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // Re-announce dependents whose computed `unmetDependsOn`
+                // moved with this transition (monorepo#1979).
+                publish_dependent_note_updates(&bus, &note.workspace_id, &note.id, &all).await;
                 // The not_started → in_progress transition can move the
                 // derived displayStatus rollup (§6.5).
                 services
