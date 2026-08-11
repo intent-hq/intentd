@@ -666,6 +666,12 @@ pub struct Services {
     /// Cap on concurrently active PR monitors per agent (mirrors
     /// `[hooks] maxPerAgent`).
     pr_monitors_max_per_agent: u32,
+    /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
+    /// in production) — defense in depth above the client-level network
+    /// timeouts, so a hung connection can never wedge the sweep loop. Tests
+    /// compress it via the `#[cfg(test)]`-only `with_pr_monitor_fetch_timeout`
+    /// so hung-fetch coverage completes in milliseconds.
+    pr_monitor_fetch_timeout: std::time::Duration,
     /// In-memory pending workspace deletions for the delete grace window
     /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
@@ -782,6 +788,7 @@ impl Services {
             pr_monitor_poll_seconds: None,
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+            pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -807,6 +814,14 @@ impl Services {
     /// Override the per-agent active-monitor cap.
     pub fn with_pr_monitors_max_per_agent(mut self, cap: u32) -> Self {
         self.pr_monitors_max_per_agent = cap;
+        self
+    }
+
+    /// Test-only: compress the per-fetch timeout of the PR-monitor sweep so
+    /// hung-fetch coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pr_monitor_fetch_timeout = timeout;
         self
     }
 
