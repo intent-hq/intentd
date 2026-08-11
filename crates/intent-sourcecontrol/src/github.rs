@@ -95,6 +95,26 @@ fn rest_fetch_next_page(page: u64, fetched: usize, per_page: u64) -> bool {
     page < REST_EXHAUSTIVE_MAX_PAGES && per_page > 0 && fetched as u64 == per_page
 }
 
+/// Client-side pagination for endpoints that return the entire result set in
+/// one response (GitHub ignores `per_page`/`page` on `matching-refs`,
+/// github/docs#3863): slice the 1-based `(page, per_page)` window out of
+/// `all` and emit a next cursor only when items remain beyond it — an
+/// exactly-full final window therefore ends the listing without the extra
+/// empty fetch [`rest_next_cursor`] tolerates.
+fn page_full_set<T>(all: Vec<T>, page: u64, per_page: u64) -> Page<T> {
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let has_more = (all.len() as u64) > page.saturating_mul(per_page);
+    let items = all
+        .into_iter()
+        .skip(offset as usize)
+        .take(per_page as usize)
+        .collect();
+    Page {
+        items,
+        next_cursor: has_more.then(|| (page + 1).to_string()),
+    }
+}
+
 // --- JSON → model mapping (pure; unit-tested with fixtures) ---
 
 fn login_of(user: &Option<dto::User>) -> String {
@@ -977,28 +997,26 @@ impl SourceControl for GitHubSourceControl {
         ];
         if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
             // Server-side prefix search via the git refs API
-            // (`GET /git/matching-refs/heads/{prefix}`), paginated like the
-            // other REST reads. Paging is measured on the raw GitHub page;
-            // the defensive non-`refs/heads/` filter only narrows what this
-            // page returns (parity with the `author` filter on `list_prs`).
+            // (`GET /git/matching-refs/heads/{prefix}`). GitHub ignores
+            // `per_page`/`page` on this endpoint and returns the entire
+            // match set (github/docs#3863), so the `(page, per_page)`
+            // window is applied client-side over the deterministic
+            // (ref-ordered) full set after the defensive non-`refs/heads/`
+            // filter.
             let route = format!(
                 "/repos/{owner}/{name}/git/matching-refs/heads/{}",
                 encode_path_segments(prefix)
             );
-            let v: Value = self.client.get(&route, Some(&params)).await?;
+            let v: Value = self.client.get(&route, None::<&()>).await?;
             let items: Vec<Value> = serde_json::from_value(v)?;
-            let fetched = items.len();
-            let branches = items
+            let branches: Vec<Branch> = items
                 .into_iter()
                 .map(map_matching_ref)
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .flatten()
                 .collect();
-            return Ok(Page {
-                items: branches,
-                next_cursor: rest_next_cursor(page_no, fetched, per_page),
-            });
+            return Ok(page_full_set(branches, page_no, per_page));
         }
         let route = format!("/repos/{owner}/{name}/branches");
         let v: Value = self.client.get(&route, Some(&params)).await?;
@@ -2024,6 +2042,38 @@ mod tests {
         assert_eq!(rest_next_cursor(1, 100, 100).as_deref(), Some("2"));
         assert_eq!(rest_next_cursor(2, 40, 100), None);
         assert_eq!(rest_next_cursor(1, 0, 100), None);
+    }
+
+    #[test]
+    fn client_side_pagination_of_full_match_set() {
+        // `matching-refs` returns the whole match set, so the window is cut
+        // client-side: page 1 takes the first `per_page`, page 2 the rest.
+        let all = || vec![1, 2, 3, 4, 5];
+        let p1 = page_full_set(all(), 1, 2);
+        assert_eq!(p1.items, vec![1, 2]);
+        assert_eq!(p1.next_cursor.as_deref(), Some("2"));
+        let p2 = page_full_set(all(), 2, 2);
+        assert_eq!(p2.items, vec![3, 4]);
+        assert_eq!(p2.next_cursor.as_deref(), Some("3"));
+        let p3 = page_full_set(all(), 3, 2);
+        assert_eq!(p3.items, vec![5]);
+        assert_eq!(p3.next_cursor, None);
+        // An exactly-full final window ends the listing with no next cursor
+        // (no trailing empty fetch, and no repeat of the same results).
+        let exact = page_full_set(vec![1, 2], 1, 2);
+        assert_eq!(exact.items, vec![1, 2]);
+        assert_eq!(exact.next_cursor, None);
+        // A window larger than the set returns everything, once.
+        let small = page_full_set(vec![1], 1, 100);
+        assert_eq!(small.items, vec![1]);
+        assert_eq!(small.next_cursor, None);
+        // Pages past the end are empty with no next cursor.
+        let past = page_full_set(all(), 4, 2);
+        assert!(past.items.is_empty());
+        assert_eq!(past.next_cursor, None);
+        let empty = page_full_set(Vec::<i32>::new(), 1, 2);
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.next_cursor, None);
     }
 
     #[test]
