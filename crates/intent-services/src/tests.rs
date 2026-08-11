@@ -18086,6 +18086,28 @@ mod file_ops_service {
             .is_path_ignored(std::path::Path::new(".intent/attachments/big.har"))
             .unwrap());
 
+        // Edge case: an attachment literally named `config.json` stays
+        // ignored — the `!config.json` negation in `.intent/.gitignore`
+        // cannot re-include it because git never descends into the excluded
+        // `attachments/` directory, and the nested ignore-all
+        // `attachments/.gitignore` covers customized `.intent/.gitignore`s.
+        let cfg = svc
+            .file_place_attachment(
+                ws.clone(),
+                "config.json".to_string(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
+                None,
+            )
+            .await
+            .expect("place config.json");
+        assert_eq!(
+            cfg["path"],
+            serde_json::json!(".intent/attachments/config.json")
+        );
+        assert!(repo
+            .is_path_ignored(std::path::Path::new(".intent/attachments/config.json"))
+            .unwrap());
+
         // sourcePath placement (same-host copy) collides into `-2`.
         let src = dir.join("local-source.har");
         std::fs::write(&src, b"from disk").unwrap();

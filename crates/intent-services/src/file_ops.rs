@@ -167,46 +167,89 @@ fn sanitize_attachment_name(file_name: &str) -> Option<String> {
 /// `report.tar.gz` → (`report.tar`, `.gz`), `Makefile` → (`Makefile`, ``),
 /// `.env` → (`.env`, ``) — a leading dot is part of the stem, not an extension.
 fn split_name(name: &str) -> (&str, &str) {
-    match name[1..].rfind('.') {
-        Some(i) => name.split_at(i + 1),
+    let first = name.chars().next().map(char::len_utf8).unwrap_or(0);
+    match name[first..].rfind('.') {
+        Some(i) => name.split_at(first + i),
         None => (name, ""),
     }
 }
 
+/// Payload source for `place_attachment`.
+pub(crate) enum AttachmentSource<'a> {
+    /// Decoded payload bytes (the base64 `data` arm).
+    Bytes(&'a [u8]),
+    /// Absolute host-local file to copy (the `sourcePath` arm) — streamed via
+    /// `fs::copy`, never buffered in memory.
+    CopyFrom(&'a std::path::Path),
+}
+
 /// `file.placeAttachment` → `{ ok, path, fileName, size }` (PROTOCOL §5.9;
-/// intent-hq/monorepo#1948). Places `bytes` into `.intent/attachments/` under
-/// a collision-safe name: the sanitized basename as-is when free, else
-/// `<stem>-2<ext>`, `<stem>-3<ext>`, … (bounded, then a UUID fallback).
-/// `path` in the result is workspace-relative; `size` is the byte length
-/// written. The directory sits under `.intent/`, whose default `.gitignore`
-/// excludes it from git tracking (and therefore auto-commit and attribution).
-pub(crate) fn place_attachment(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
+/// intent-hq/monorepo#1948). Places the payload into `.intent/attachments/`
+/// under a collision-safe name: the sanitized basename as-is when free, else
+/// `<stem>-2<ext>`, `<stem>-3<ext>`, … (bounded, then a UUID fallback). The
+/// name is claimed atomically (`create_new`), so concurrent placements can
+/// never pick the same one and overwrite each other. `path` in the result is
+/// workspace-relative; `size` is the byte length written. The directory sits
+/// under `.intent/`, whose default `.gitignore` excludes it from git tracking
+/// (and therefore auto-commit and attribution).
+pub(crate) fn place_attachment(
+    root: &str,
+    file_name: &str,
+    source: AttachmentSource<'_>,
+) -> Result<Value> {
     let name = sanitize_attachment_name(file_name).ok_or_else(|| {
         Error::InvalidParams(format!("invalid attachment fileName: {file_name:?}"))
     })?;
     let dir = resolve_within(root, ATTACHMENTS_DIR)?;
     std::fs::create_dir_all(&dir).map_err(io_err)?;
+    // Belt-and-braces exclusion: an ignore-all `.gitignore` inside the
+    // attachments directory keeps placed files out of git even when the
+    // repo carries a customized `.intent/.gitignore` that does not cover
+    // `attachments/`.
+    let marker = dir.join(".gitignore");
+    if !marker.exists() {
+        std::fs::write(&marker, "*\n").map_err(io_err)?;
+    }
 
     let (stem, ext) = split_name(&name);
     let mut chosen = name.clone();
     let mut n = 2u32;
-    while dir.join(&chosen).exists() {
-        if n > 1000 {
-            chosen = format!("{stem}-{}{ext}", uuid::Uuid::new_v4().simple());
-            break;
+    let full = loop {
+        let candidate = dir.join(&chosen);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                chosen = if n > 1000 {
+                    format!("{stem}-{}{ext}", uuid::Uuid::new_v4().simple())
+                } else {
+                    format!("{stem}-{n}{ext}")
+                };
+                n += 1;
+            }
+            Err(e) => return Err(io_err(e)),
         }
-        chosen = format!("{stem}-{n}{ext}");
-        n += 1;
-    }
+    };
 
-    let full = dir.join(&chosen);
-    std::fs::write(&full, bytes).map_err(io_err)?;
+    let size = match source {
+        AttachmentSource::Bytes(bytes) => {
+            std::fs::write(&full, bytes).map_err(io_err)?;
+            bytes.len() as u64
+        }
+        AttachmentSource::CopyFrom(src) => std::fs::copy(src, &full).map_err(|e| {
+            let _ = std::fs::remove_file(&full);
+            Error::Internal(format!("Failed to read sourcePath {}: {e}", src.display()))
+        })?,
+    };
     let rel = format!("{ATTACHMENTS_DIR}/{chosen}");
     Ok(json!({
         "ok": true,
         "path": rel,
         "fileName": chosen,
-        "size": bytes.len(),
+        "size": size,
     }))
 }
 
@@ -678,11 +721,15 @@ mod tests {
         assert!(matches!(stat(&root, "nope"), Err(Error::Internal(_))));
     }
 
+    fn place_bytes(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
+        place_attachment(root, file_name, AttachmentSource::Bytes(bytes))
+    }
+
     #[test]
     fn place_attachment_writes_into_attachments_dir() {
         let t = TempRoot::new();
         let root = t.root();
-        let r = place_attachment(&root, "report.har", b"payload").unwrap();
+        let r = place_bytes(&root, "report.har", b"payload").unwrap();
         assert_eq!(
             r,
             json!({
@@ -696,25 +743,54 @@ mod tests {
             std::fs::read(std::path::Path::new(&root).join(".intent/attachments/report.har"))
                 .unwrap();
         assert_eq!(on_disk, b"payload");
+        // The belt-and-braces ignore-all marker inside attachments/ exists.
+        let marker = std::fs::read_to_string(
+            std::path::Path::new(&root).join(".intent/attachments/.gitignore"),
+        )
+        .unwrap();
+        assert_eq!(marker, "*\n");
     }
 
     #[test]
     fn place_attachment_collision_safe_naming() {
         let t = TempRoot::new();
         let root = t.root();
-        let a = place_attachment(&root, "dump.tar.gz", b"one").unwrap();
-        let b = place_attachment(&root, "dump.tar.gz", b"two").unwrap();
-        let c = place_attachment(&root, "dump.tar.gz", b"three").unwrap();
+        let a = place_bytes(&root, "dump.tar.gz", b"one").unwrap();
+        let b = place_bytes(&root, "dump.tar.gz", b"two").unwrap();
+        let c = place_bytes(&root, "dump.tar.gz", b"three").unwrap();
         assert_eq!(a["fileName"], json!("dump.tar.gz"));
         assert_eq!(b["fileName"], json!("dump.tar-2.gz"));
         assert_eq!(c["fileName"], json!("dump.tar-3.gz"));
         // Extension-less and dotfile names suffix at the end.
-        place_attachment(&root, "Makefile", b"x").unwrap();
-        let m2 = place_attachment(&root, "Makefile", b"y").unwrap();
+        place_bytes(&root, "Makefile", b"x").unwrap();
+        let m2 = place_bytes(&root, "Makefile", b"y").unwrap();
         assert_eq!(m2["fileName"], json!("Makefile-2"));
-        place_attachment(&root, ".env", b"x").unwrap();
-        let e2 = place_attachment(&root, ".env", b"y").unwrap();
+        place_bytes(&root, ".env", b"x").unwrap();
+        let e2 = place_bytes(&root, ".env", b"y").unwrap();
         assert_eq!(e2["fileName"], json!(".env-2"));
+        // Collisions never clobber: the originals still hold their bytes.
+        let dir = std::path::Path::new(&root).join(".intent/attachments");
+        assert_eq!(std::fs::read(dir.join("dump.tar.gz")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dir.join("dump.tar-2.gz")).unwrap(), b"two");
+    }
+
+    /// Regression (intentd#1090 review): names whose first character is
+    /// multi-byte UTF-8 must not panic in `split_name` — placement and
+    /// collision suffixing both work.
+    #[test]
+    fn place_attachment_multibyte_leading_names() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let a = place_bytes(&root, "截图.png", b"one").unwrap();
+        assert_eq!(a["fileName"], json!("截图.png"));
+        let b = place_bytes(&root, "截图.png", b"two").unwrap();
+        assert_eq!(b["fileName"], json!("截图-2.png"));
+        let c = place_bytes(&root, "é.txt", b"x").unwrap();
+        assert_eq!(c["fileName"], json!("é.txt"));
+        let d = place_bytes(&root, "é", b"x").unwrap();
+        assert_eq!(d["fileName"], json!("é"));
+        let e = place_bytes(&root, "é", b"y").unwrap();
+        assert_eq!(e["fileName"], json!("é-2"));
     }
 
     #[test]
@@ -722,19 +798,38 @@ mod tests {
         let t = TempRoot::new();
         let root = t.root();
         // Path components are stripped down to the basename — no escape.
-        let r = place_attachment(&root, "../../etc/passwd", b"x").unwrap();
+        let r = place_bytes(&root, "../../etc/passwd", b"x").unwrap();
         assert_eq!(r["fileName"], json!("passwd"));
-        let w = place_attachment(&root, "C:\\Users\\me\\file.txt", b"x").unwrap();
+        let w = place_bytes(&root, "C:\\Users\\me\\file.txt", b"x").unwrap();
         assert_eq!(w["fileName"], json!("file.txt"));
         for bad in ["", "   ", ".", "..", "dir/"] {
             assert!(
-                matches!(
-                    place_attachment(&root, bad, b"x"),
-                    Err(Error::InvalidParams(_))
-                ),
+                matches!(place_bytes(&root, bad, b"x"), Err(Error::InvalidParams(_))),
                 "expected InvalidParams for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn place_attachment_copy_from_source_path() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let src = std::path::Path::new(&root).join("src.bin");
+        std::fs::write(&src, b"copied bytes").unwrap();
+        let r = place_attachment(&root, "src.bin", AttachmentSource::CopyFrom(&src)).unwrap();
+        assert_eq!(r["fileName"], json!("src.bin"));
+        assert_eq!(r["size"], json!(12));
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&root).join(".intent/attachments/src.bin")).unwrap(),
+            b"copied bytes"
+        );
+        // A missing source fails without leaving the claimed placeholder behind.
+        let missing = std::path::Path::new(&root).join("nope.bin");
+        let err = place_attachment(&root, "gone.bin", AttachmentSource::CopyFrom(&missing));
+        assert!(matches!(err, Err(Error::Internal(_))));
+        assert!(!std::path::Path::new(&root)
+            .join(".intent/attachments/gone.bin")
+            .exists());
     }
 
     #[cfg(unix)]
