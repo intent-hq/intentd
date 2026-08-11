@@ -3022,3 +3022,133 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
         "complete dep is met (field omitted): {mine}"
     );
 }
+
+/// End-to-end readiness-over-dependsOn (PROTOCOL.md §5.4/§6.5; spec §2.2,
+/// monorepo#1974) over WSS: a task with `dependsOn` edges onto two
+/// sibling-subtree tasks stays out of `task:ready-tasks-changed`'s
+/// `readyTaskIds` until BOTH deps are `complete` — the event shape itself is
+/// unchanged (readyTaskIds + triggeredBy + computedAt).
+#[tokio::test]
+async fn ready_tasks_gate_on_depends_on_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Readiness", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:ready-tasks-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Two sibling task notes (dep-x, dep-y) plus a `gated` task depending on
+    // both — all root-level (the ready traversal starts at the root level),
+    // all not_started.
+    let mut ids = Vec::new();
+    for (i, title) in ["DepX", "DepY", "Gated"].iter().enumerate() {
+        let id = i as i64 * 2 + 2;
+        let created = wss_rpc(
+            &mut rpc,
+            id,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": title, "content": "body" }),
+        )
+        .await;
+        let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+        wss_rpc(
+            &mut rpc,
+            id + 1,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
+        )
+        .await;
+        ids.push(note_id);
+    }
+    let (x, y, gated) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+    let set = wss_rpc(
+        &mut rpc,
+        10,
+        "task.setRelations",
+        json!({ "workspaceId": ws_id, "noteId": gated, "dependsOn": [x, y] }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "setRelations: {set}");
+
+    // Complete dep-x: the recomputed ready set must still exclude `gated`
+    // (dep-y is unmet) while including the completed-child-free dep-y.
+    wss_rpc(
+        &mut rpc,
+        11,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": x, "status": "complete" }),
+    )
+    .await;
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(evt["data"]["triggeredBy"]["noteId"], json!(x));
+    assert_eq!(evt["data"]["triggeredBy"]["newStatus"], json!("complete"));
+    assert!(evt["data"]["computedAt"].is_string(), "computedAt: {evt}");
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(gated)),
+        "gated ready with an unmet dep: {evt}"
+    );
+    assert!(
+        ready.iter().any(|v| v == &json!(y)),
+        "dep-y missing from ready set: {evt}"
+    );
+
+    // Complete dep-y: both edges are satisfied, `gated` joins the ready set.
+    wss_rpc(
+        &mut rpc,
+        12,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": y, "status": "complete" }),
+    )
+    .await;
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(evt["data"]["triggeredBy"]["noteId"], json!(y));
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        ready.iter().any(|v| v == &json!(gated)),
+        "gated not ready with all deps complete: {evt}"
+    );
+
+    // Cancelled deps do NOT satisfy edges: cancelling dep-x drops `gated`
+    // back out of the ready set.
+    wss_rpc(
+        &mut rpc,
+        13,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": x, "status": "cancelled" }),
+    )
+    .await;
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(evt["data"]["triggeredBy"]["newStatus"], json!("cancelled"));
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(gated)),
+        "gated ready over a cancelled dep: {evt}"
+    );
+}

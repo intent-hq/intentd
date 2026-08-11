@@ -112,6 +112,7 @@ mod terminal_ops;
 pub mod tool_block;
 mod transfer;
 pub mod transfer_git;
+pub mod transfer_materialize;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -5901,7 +5902,7 @@ static REPO_REGISTRY_SYNCED: std::sync::atomic::AtomicBool =
 /// Resolve a known-repo display name from an optional explicit name plus the
 /// repo path, mirroring TS `repositoryName || path.split('/').pop() || 'Unknown'`
 /// (an empty explicit name falls through to the basename).
-fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
+pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     if let Some(n) = explicit {
         if !n.is_empty() {
             return n.to_string();
@@ -6116,7 +6117,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
 /// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
 /// `"repo"` fallback.
-fn worktree_folder_slug(repo_name: &str) -> String {
+pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
@@ -6898,9 +6899,12 @@ fn is_terminal_task_status(status: TaskStatus) -> bool {
 }
 
 /// Compute the ordered ready task note IDs for a workspace, porting
-/// `flattenTaskTree` + `findReadyTasks` (`notes/utils/task-tree-utils.ts`):
-/// non-terminal task notes in leaves-first post-order (by `peerOrder`, then
-/// `createdAt`), keeping only those whose task children are all `complete`.
+/// `flattenTaskTree` + `findReadyTasks` (`notes/utils/task-tree-utils.ts`)
+/// generalized over `dependsOn` edges: non-terminal task notes in leaves-first
+/// post-order (by `peerOrder`, then `createdAt`), keeping only those whose task
+/// children are all `complete` AND whose `dependsOn` list is fully satisfied
+/// (every dep names a `complete` task note — missing and cancelled deps count
+/// as unmet, same rule as `unmet_depends_on_ids`).
 fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     // flattenTaskTree: only non-terminal task notes participate, keyed by parent.
     let mut children: HashMap<Option<&str>, Vec<&Note>> = HashMap::new();
@@ -6952,7 +6956,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
     traverse(None, &children, &mut flattened);
 
     // findReadyTasks: ready iff every task child (over ALL notes, including
-    // terminal ones) is `complete`.
+    // terminal ones) is `complete` AND every `dependsOn` edge is satisfied.
     let mut all_children: HashMap<&str, Vec<&Note>> = HashMap::new();
     for n in notes {
         if n.metadata.task.is_some() {
@@ -6961,6 +6965,7 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
             }
         }
     }
+    let status_by_id = task_status_by_id(notes);
     flattened
         .into_iter()
         .filter(|n| {
@@ -6976,6 +6981,10 @@ fn compute_ready_task_ids(notes: &[Note]) -> Vec<String> {
                     })
                 })
                 .unwrap_or(true)
+                && n.metadata
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| unmet_depends_on_ids(&t.depends_on, &status_by_id).is_empty())
         })
         .map(|n| n.id.0.clone())
         .collect()
