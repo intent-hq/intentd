@@ -2014,6 +2014,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
+            _: Option<&str>,
             _: PageParams,
         ) -> intent_sourcecontrol::Result<Page<Branch>> {
             unsupported("list_remote_branches")

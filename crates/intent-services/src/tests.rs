@@ -7286,21 +7286,20 @@ mod pr {
             &self,
             _: &str,
             _: &str,
+            prefix: Option<&str>,
             _: PageParams,
         ) -> ScResult<Page<Branch>> {
+            let items = ["main", "dev"]
+                .iter()
+                .filter(|n| prefix.is_none_or(|p| n.starts_with(p)))
+                .map(|n| Branch {
+                    name: (*n).into(),
+                    commit_sha: None,
+                    protected: false,
+                })
+                .collect();
             Ok(Page {
-                items: vec![
-                    Branch {
-                        name: "main".into(),
-                        commit_sha: None,
-                        protected: false,
-                    },
-                    Branch {
-                        name: "dev".into(),
-                        commit_sha: None,
-                        protected: false,
-                    },
-                ],
+                items,
                 next_cursor: None,
             })
         }
@@ -7860,11 +7859,41 @@ mod pr {
     async fn github_branches_list_returns_names_and_null_next_token() {
         let (_t, svc) = github_svc().await;
         let v = svc
-            .github_branches_list("octocat".into(), "hello".into(), None, None)
+            .github_branches_list("octocat".into(), "hello".into(), None, None, None)
             .await
             .expect("branches");
         assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
         assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_branches_list_threads_prefix_and_drops_blank() {
+        let (_t, svc) = github_svc().await;
+        // A non-empty prefix reaches the engine and narrows the listing.
+        let v = svc
+            .github_branches_list(
+                "octocat".into(),
+                "hello".into(),
+                Some("de".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("branches");
+        assert_eq!(v["branches"], serde_json::json!(["dev"]));
+
+        // Blank / whitespace prefixes fold to the unfiltered listing.
+        let v = svc
+            .github_branches_list(
+                "octocat".into(),
+                "hello".into(),
+                Some("   ".into()),
+                None,
+                None,
+            )
+            .await
+            .expect("branches");
+        assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
     }
 
     #[tokio::test]

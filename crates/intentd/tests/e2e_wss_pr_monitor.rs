@@ -225,6 +225,7 @@ impl SourceControl for StubForge {
         &self,
         _: &str,
         _: &str,
+        _: Option<&str>,
         _: PageParams,
     ) -> ScResult<Page<Branch>> {
         unsupported("list_remote_branches")

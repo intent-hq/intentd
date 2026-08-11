@@ -69,11 +69,14 @@ pub trait SourceControl: Send + Sync {
     async fn get_repo(&self, owner: &str, name: &str) -> Result<Repo>;
 
     /// List a repository's remote branches, one §5.5 page at a time. Backs
-    /// `github.branches.list`.
+    /// `github.branches.list`. A non-empty `prefix` narrows the listing to
+    /// branch names starting with it, server-side; `None` (or empty) keeps
+    /// the unfiltered listing.
     async fn list_remote_branches(
         &self,
         owner: &str,
         name: &str,
+        prefix: Option<&str>,
         page: PageParams,
     ) -> Result<Page<Branch>>;
 

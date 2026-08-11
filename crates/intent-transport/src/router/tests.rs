@@ -946,11 +946,16 @@ impl WorkspaceApi for FakeApi {
         &self,
         owner: String,
         repo: String,
+        prefix: Option<String>,
         _limit: Option<i64>,
         _next_token: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
-            Ok(serde_json::json!({ "branches": [owner, repo], "nextToken": Value::Null }))
+            Ok(serde_json::json!({
+                "branches": [owner, repo],
+                "nextToken": Value::Null,
+                "echoPrefix": prefix,
+            }))
         })
     }
 
@@ -3792,6 +3797,26 @@ async fn github_branches_list_requires_owner_and_repo() {
     .unwrap();
     assert_eq!(ok["result"]["branches"], serde_json::json!(["o", "r"]));
     assert_eq!(ok["result"]["nextToken"], Value::Null);
+}
+
+#[tokio::test]
+async fn github_branches_list_threads_optional_prefix() {
+    // Absent `prefix` reaches the API as `None` (old behavior preserved).
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.list","params":{"owner":"o","repo":"r"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["result"]["echoPrefix"], Value::Null);
+
+    // A wire `prefix` string is threaded through verbatim.
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.branches.list","params":{"owner":"o","repo":"r","prefix":"feature/"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok["result"]["echoPrefix"], serde_json::json!("feature/"));
+    assert_eq!(ok["result"]["branches"], serde_json::json!(["o", "r"]));
 }
 
 #[tokio::test]

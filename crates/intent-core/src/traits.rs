@@ -3314,14 +3314,18 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.branches.list`: a repository's remote branch names
     /// (`GET /repos/{owner}/{repo}/branches`) → `{ branches: string[], nextToken }`.
+    /// A non-empty `prefix` narrows the listing server-side to branch names
+    /// starting with it (`GET /git/matching-refs/heads/{prefix}`); absent or
+    /// blank keeps the unfiltered listing.
     fn github_branches_list(
         &self,
         owner: String,
         repo: String,
+        prefix: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, limit, next_token);
+        let _ = (owner, repo, prefix, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_branches_list not implemented".to_string(),

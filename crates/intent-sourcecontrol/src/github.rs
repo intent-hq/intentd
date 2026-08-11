@@ -213,6 +213,23 @@ pub(crate) fn map_branch(value: Value) -> Result<Branch> {
     })
 }
 
+/// Map a `GET /git/matching-refs/heads/{prefix}` entry onto a [`Branch`]:
+/// `refs/heads/<name>` → `<name>` plus the ref object's SHA. Non-branch refs
+/// map to `None` (defensive; the route already scopes to `heads/`). The refs
+/// API carries no protection flag, so `protected` defaults to `false`.
+pub(crate) fn map_matching_ref(value: Value) -> Result<Option<Branch>> {
+    let r: dto::MatchingRef = serde_json::from_value(value)?;
+    let full = r.r#ref.unwrap_or_default();
+    let Some(name) = full.strip_prefix("refs/heads/") else {
+        return Ok(None);
+    };
+    Ok(Some(Branch {
+        name: name.to_string(),
+        commit_sha: r.object.and_then(|o| o.sha),
+        protected: false,
+    }))
+}
+
 pub(crate) fn map_user_identity(value: Value) -> Result<UserIdentity> {
     let u: dto::UserFull = serde_json::from_value(value)?;
     Ok(UserIdentity {
@@ -535,6 +552,20 @@ mod dto {
         #[serde(rename = "ref")]
         pub r#ref: Option<String>,
         pub sha: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct RefObject {
+        pub sha: Option<String>,
+    }
+
+    /// A `GET /git/matching-refs/{ref}` entry: the fully-qualified ref name
+    /// plus the object it points at.
+    #[derive(Deserialize)]
+    pub(super) struct MatchingRef {
+        #[serde(rename = "ref")]
+        pub r#ref: Option<String>,
+        pub object: Option<RefObject>,
     }
 
     #[derive(Deserialize)]
@@ -935,15 +966,41 @@ impl SourceControl for GitHubSourceControl {
         &self,
         owner: &str,
         name: &str,
+        prefix: Option<&str>,
         page: PageParams,
     ) -> Result<Page<Branch>> {
         let per_page = rest_per_page(page.limit);
         let page_no = rest_page(page.cursor.as_deref());
-        let route = format!("/repos/{owner}/{name}/branches");
         let params: Vec<(&str, String)> = vec![
             ("per_page", per_page.to_string()),
             ("page", page_no.to_string()),
         ];
+        if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+            // Server-side prefix search via the git refs API
+            // (`GET /git/matching-refs/heads/{prefix}`), paginated like the
+            // other REST reads. Paging is measured on the raw GitHub page;
+            // the defensive non-`refs/heads/` filter only narrows what this
+            // page returns (parity with the `author` filter on `list_prs`).
+            let route = format!(
+                "/repos/{owner}/{name}/git/matching-refs/heads/{}",
+                encode_path_segments(prefix)
+            );
+            let v: Value = self.client.get(&route, Some(&params)).await?;
+            let items: Vec<Value> = serde_json::from_value(v)?;
+            let fetched = items.len();
+            let branches = items
+                .into_iter()
+                .map(map_matching_ref)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            return Ok(Page {
+                items: branches,
+                next_cursor: rest_next_cursor(page_no, fetched, per_page),
+            });
+        }
+        let route = format!("/repos/{owner}/{name}/branches");
         let v: Value = self.client.get(&route, Some(&params)).await?;
         let items: Vec<Value> = serde_json::from_value(v)?;
         let fetched = items.len();
@@ -1921,6 +1978,35 @@ mod tests {
         let wire = serde_json::to_value(&b).unwrap();
         assert!(wire.get("commitSha").is_none());
         assert_eq!(wire["protected"], false);
+    }
+
+    #[test]
+    fn maps_matching_ref_fixture() {
+        // `refs/heads/<name>` → branch name (slashes in the name preserved),
+        // SHA from the ref object, and no protection flag on the refs API.
+        let b = map_matching_ref(json!({
+            "ref": "refs/heads/feature/login",
+            "object": { "sha": "deadbeef", "type": "commit" }
+        }))
+        .unwrap()
+        .expect("branch ref maps");
+        assert_eq!(b.name, "feature/login");
+        assert_eq!(b.commit_sha.as_deref(), Some("deadbeef"));
+        assert!(!b.protected);
+    }
+
+    #[test]
+    fn matching_ref_skips_non_branch_refs_and_defaults_sha() {
+        // Defensive: a non-`refs/heads/` ref maps to `None` instead of a
+        // mangled branch name.
+        assert!(map_matching_ref(json!({ "ref": "refs/tags/v1.0.0" }))
+            .unwrap()
+            .is_none());
+        let b = map_matching_ref(json!({ "ref": "refs/heads/dev" }))
+            .unwrap()
+            .expect("branch ref maps");
+        assert_eq!(b.name, "dev");
+        assert!(b.commit_sha.is_none());
     }
 
     #[test]
