@@ -80,9 +80,14 @@
 //! the first-class `dependsOn` / `conflictsWith` task relations (validated,
 //! cycle-checked) that `task.getMyTask` / `task.list` / `note.listTasks`
 //! project with the computed `unmetDependsOn` — 277 router methods, 316 total.
+//! Version 6.9 adds the staged import surface `workspace.import.begin` /
+//! `.chunk` / `.commit` / `.abort` (additive; §5.1): chunked, idempotent
+//! upload of a transfer zip archive with an atomic checksum-verified commit
+//! — nothing is visible in `workspace.list` until commit succeeds — 281
+//! router methods, 320 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.8";
+pub const PROTOCOL_VERSION: &str = "6.9";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

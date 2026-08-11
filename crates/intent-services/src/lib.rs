@@ -112,6 +112,7 @@ mod terminal_ops;
 pub mod tool_block;
 mod transfer;
 pub mod transfer_git;
+mod transfer_import;
 pub mod transfer_materialize;
 mod unsloth_server;
 mod voice_ops;
@@ -671,6 +672,13 @@ pub struct Services {
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
     pending_agent_deletes: delete_grace::PendingDeletes,
+    /// In-flight staged workspace imports (`workspace.import.*`, keyed by
+    /// `importId`): manifest + staging paths + chunk cursor between `begin`
+    /// and `commit`/`abort`. Shared across clones so chunks arriving over any
+    /// connection append to the same staging file. In-memory only — a daemon
+    /// restart drops pending imports (staging dirs are swept lazily by the
+    /// next `begin`), and the FE simply restarts the upload.
+    transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -767,6 +775,7 @@ impl Services {
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
+            transfer_imports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -10560,6 +10569,41 @@ impl WorkspaceApi for Services {
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
         Box::pin(async move { self.workspace_transfer_plan_op(id).await })
+    }
+
+    fn workspace_import_begin(
+        &self,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
+                .await
+        })
+    }
+
+    fn workspace_import_chunk(
+        &self,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_chunk_op(import_id, seq, data).await })
+    }
+
+    fn workspace_import_commit(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_commit_op(import_id).await })
+    }
+
+    fn workspace_import_abort(
+        &self,
+        import_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_import_abort_op(import_id).await })
     }
 
     fn create_workspace(
