@@ -7108,6 +7108,77 @@ async fn wss_workspace_transfer_plan_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
+/// monorepo#1948): a base64 payload lands in the workspace's
+/// `.intent/attachments/` directory and the response carries the
+/// workspace-relative `{ ok, path, fileName, size }`; a same-name re-place
+/// answers a collision-suffixed name; the `.intent/.gitignore` exclusion file
+/// is ensured; and the exactly-one-of `data`/`sourcePath` violation is the
+/// documented `-32602`.
+#[tokio::test]
+async fn wss_file_place_attachment_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-placeatt-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "ok": true,
+            "path": ".intent/attachments/trace.har",
+            "fileName": "trace.har",
+            "size": 26
+        }),
+        "result: {resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
+        b"oversized attachment bytes"
+    );
+    // The exclusion contract: the default `.intent/.gitignore` (ignore
+    // everything except config.json) was ensured on the way.
+    let gitignore =
+        std::fs::read_to_string(root.join(".intent/.gitignore")).expect("gitignore ensured");
+    assert!(gitignore.contains("*"), "gitignore content: {gitignore}");
+
+    // Same name again → collision-suffixed `trace-2.har`.
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    assert_eq!(resp2["result"]["fileName"], "trace-2.har", "{resp2}");
+    assert_eq!(
+        resp2["result"]["path"], ".intent/attachments/trace-2.har",
+        "{resp2}"
+    );
+
+    // Neither `data` nor `sourcePath` → -32602.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"x.bin"}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.

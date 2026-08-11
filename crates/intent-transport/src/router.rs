@@ -2958,6 +2958,17 @@ async fn dispatch(
             let path = require_str_param(params, "path")?;
             api.file_stat(ws, path).await.map_err(domain_to_rpc)
         }
+        "file.placeAttachment" => {
+            // Exactly-one-of `data` / `sourcePath` is validated in the service
+            // (→ -32602); the router only enforces the always-required params.
+            let ws = require_ws_note(params)?;
+            let file_name = require_str_param(params, "fileName")?;
+            let data = opt_str(params, "data");
+            let source_path = opt_str(params, "sourcePath");
+            api.file_place_attachment(ws, file_name, data, source_path)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
