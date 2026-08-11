@@ -11,6 +11,12 @@
 /// lengths, just with a neutral weight.
 pub(crate) const DEFAULT_EFFORT_MINUTES: u64 = 30;
 
+/// Ceiling on a single parsed estimate (a year of 8-hour workdays). The
+/// field is free-form, so an absurd number would otherwise saturate the
+/// float→u64 cast at `u64::MAX` and overflow the critical-path sums
+/// downstream; anything at or beyond the cap clamps to it.
+pub(crate) const MAX_EFFORT_MINUTES: u64 = 365 * 480;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Unit {
     Minute,
@@ -102,7 +108,7 @@ fn side_minutes(s: &str, fallback_unit: Option<Unit>) -> Option<(f64, Option<Uni
 }
 
 fn to_minutes(value: f64) -> Option<u64> {
-    (value.is_finite() && value >= 0.0).then(|| value.round() as u64)
+    (value.is_finite() && value >= 0.0).then(|| (value.round() as u64).min(MAX_EFFORT_MINUTES))
 }
 
 /// Parse an `estimatedEffort` string into minutes. `~` prefixes are
@@ -175,6 +181,22 @@ mod tests {
         assert_eq!(parse_effort_minutes("~1–2h"), Some(90));
         // Midpoints round to the nearest minute.
         assert_eq!(parse_effort_minutes("30-45 min"), Some(38));
+    }
+
+    #[test]
+    fn absurd_estimates_clamp_to_the_cap() {
+        use super::MAX_EFFORT_MINUTES;
+        assert_eq!(
+            parse_effort_minutes("99999999999999999999d"),
+            Some(MAX_EFFORT_MINUTES)
+        );
+        assert_eq!(
+            parse_effort_minutes("1e308"),
+            None,
+            "exponent shapes stay unparseable"
+        );
+        assert_eq!(parse_effort_minutes("365d"), Some(MAX_EFFORT_MINUTES));
+        assert_eq!(parse_effort_minutes("364d"), Some(364 * 480));
     }
 
     #[test]

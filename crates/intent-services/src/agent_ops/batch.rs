@@ -117,7 +117,10 @@ pub(crate) fn critical_path_priorities(
             .max()
             .copied()
             .unwrap_or(0);
-        priorities.insert((*id).to_string(), effort_of(&snaps[*id]) + downstream);
+        priorities.insert(
+            (*id).to_string(),
+            effort_of(&snaps[*id]).saturating_add(downstream),
+        );
     }
     for id in &workable {
         priorities
