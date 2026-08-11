@@ -5891,6 +5891,16 @@ async fn wss_git_show_file_round_trip() {
     std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "second"]);
+    // Commit a gitlink (submodule pin) via plumbing — the pin commit need not
+    // exist in this odb, exactly like a real submodule bump (monorepo#1739).
+    let pin_sha = "7257a190564088376227525989c4994e46082ad1";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{pin_sha},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
 
     let create_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS showFile WS","worktreePath":"{}","path":"{}"}}}}"#,
@@ -5903,7 +5913,8 @@ async fn wss_git_show_file_round_trip() {
         .expect("ws id")
         .to_string();
 
-    // Content at HEAD and at the parent revision.
+    // Content at HEAD and at an earlier revision (HEAD~2 — before the
+    // "second" edit; HEAD^ is the gitlink-less "second" commit).
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -5917,7 +5928,7 @@ async fn wss_git_show_file_round_trip() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD^"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD~2"}}}}"#
         ),
     )
     .await;
@@ -5933,6 +5944,22 @@ async fn wss_git_show_file_round_trip() {
     )
     .await;
     assert_eq!(resp["result"]["content"], "");
+
+    // Gitlink (submodule pin) path → typed -32602 with
+    // `data = { code: "not-a-file", path, mode }` (monorepo#1739).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"sub","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "not-a-file", "path": "sub", "mode": "160000" })
+    );
 
     // Unresolvable ref → -32603; missing ref param → -32602 (PROTOCOL §9).
     let resp = wss_call(

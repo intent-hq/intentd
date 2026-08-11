@@ -10650,6 +10650,47 @@ mod file_tracking {
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
     }
 
+    /// `git.diffs` (staged) on a submodule pin bump synthesizes the
+    /// `Subproject commit <sha>` pseudo-hunk instead of failing to hydrate the
+    /// pin SHAs as blobs (monorepo#1739).
+    #[tokio::test]
+    async fn git_diffs_staged_gitlink_synthesizes_subproject_hunk() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        // Stage a pin bump: point the gitlink at a different (synthetic) sha.
+        let new_sha = "7908777602d4e96f13c663c8a70a617163f38413";
+        let old_sha = {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            let mut entry = idx.get_path(std::path::Path::new("sub"), 0).unwrap();
+            let old = entry.id.to_string();
+            entry.id = git2::Oid::from_str(new_sha).unwrap();
+            idx.add(&entry).unwrap();
+            idx.write().unwrap();
+            old
+        };
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc.git_diffs(ws_id, None, true, None).await.unwrap();
+        let arr = diffs.as_array().unwrap();
+        let f = arr.iter().find(|d| d["path"] == "sub").unwrap();
+        let hunks = f["hunks"].as_array().unwrap();
+        assert_eq!(hunks.len(), 1);
+        let lines = hunks[0]["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "Deletion");
+        assert_eq!(
+            lines[0]["content"],
+            serde_json::json!(format!("Subproject commit {old_sha}\n"))
+        );
+        assert_eq!(lines[1]["type"], "Addition");
+        assert_eq!(
+            lines[1]["content"],
+            serde_json::json!(format!("Subproject commit {new_sha}\n"))
+        );
+    }
+
     /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
     async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

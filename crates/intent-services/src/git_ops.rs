@@ -404,7 +404,17 @@ pub(crate) fn build_diffs(
                     continue;
                 }
             }
-            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_binary {
+            // A gitlink delta has no blob content for libgit2 to patch, so
+            // synthesize the `Subproject commit <sha>` pseudo-hunk from the
+            // pin SHAs (monorepo#1739).
+            let gitlink_hunks;
+            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_gitlink {
+                gitlink_hunks = intent_git::diff::gitlink_hunks(
+                    entry.file.old_blob.as_deref(),
+                    entry.file.new_blob.as_deref(),
+                );
+                &gitlink_hunks
+            } else if entry.file.is_binary {
                 &[]
             } else {
                 &entry.hunks
@@ -443,7 +453,12 @@ pub(crate) fn build_diffs(
                 continue;
             }
         }
-        let hunks = if fd.is_binary {
+        let hunks = if fd.is_gitlink {
+            // Gitlink pins are commit SHAs in the submodule's odb — not blobs
+            // here — so `hunks_between` cannot hydrate them; synthesize the
+            // `Subproject commit <sha>` pseudo-hunk instead (monorepo#1739).
+            intent_git::diff::gitlink_hunks(fd.old_blob.as_deref(), fd.new_blob.as_deref())
+        } else if fd.is_binary {
             Vec::new()
         } else {
             intent_git::diff::hunks_between(
