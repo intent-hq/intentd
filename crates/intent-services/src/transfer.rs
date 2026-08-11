@@ -57,10 +57,16 @@ impl Services {
                 tokio::task::spawn_blocking(move || {
                     let status = intent_git::status::status(&root);
                     let (branch, dirty_files) = match status {
-                        Ok(s) => (
-                            Some(s.branch),
-                            s.files.into_iter().map(|f| f.path).collect(),
-                        ),
+                        Ok(s) => {
+                            // status() emits one entry per index/worktree change, so a
+                            // path that is both staged and unstaged appears twice —
+                            // dedupe to one dirty file per path.
+                            let mut paths: Vec<String> =
+                                s.files.into_iter().map(|f| f.path).collect();
+                            paths.sort();
+                            paths.dedup();
+                            (Some(s.branch), paths)
+                        }
                         Err(_) => (intent_git::status::current_branch_at(&root), Vec::new()),
                     };
                     let bundle = estimate_bundle_bytes(&root, &branches);
@@ -340,7 +346,11 @@ mod tests {
         run_git(&repo.0, &["add", "."]);
         run_git(&repo.0, &["commit", "-m", "init"]);
         run_git(&repo.0, &["branch", "sandbox/agent-1"]);
+        // Stage dirty.txt, then modify it again so the path has both staged and
+        // unstaged changes — it must still appear once in dirtyFiles.
         std::fs::write(repo.0.join("dirty.txt"), "uncommitted").expect("write");
+        run_git(&repo.0, &["add", "dirty.txt"]);
+        std::fs::write(repo.0.join("dirty.txt"), "uncommitted again").expect("write");
 
         let mut w = workspace(&ws);
         w.worktree_path = Some(repo.0.to_string_lossy().to_string());
