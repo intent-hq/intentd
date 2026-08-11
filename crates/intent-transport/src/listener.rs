@@ -37,11 +37,9 @@ use tokio::net::UnixListener;
 
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(any(unix, windows))]
-use tokio::sync::mpsc;
 
 #[cfg(any(unix, windows))]
-use crate::conn::{process_frame, ConnSubs, OUTBOUND_CAPACITY};
+use crate::conn::{outbound_channel, process_frame, ConnSubs};
 #[cfg(any(unix, windows))]
 use crate::forward::ForwardRegistry;
 #[cfg(any(unix, windows))]
@@ -202,9 +200,11 @@ where
 {
     let mut reader = BufReader::new(read_half);
 
-    // One writer task drains the outbound queue so responses and pushed
-    // notifications never interleave mid-frame on the socket.
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    // One writer task drains the two-lane outbound queue (priority lane
+    // first, so RPC responses overtake queued event/subscription pushes on a
+    // saturated link) and responses and pushed notifications never interleave
+    // mid-frame on the socket.
+    let (out_tx, mut out_rx) = outbound_channel();
     let writer = tokio::spawn(async move {
         let mut write_half = write_half;
         while let Some(frame) = out_rx.recv().await {
@@ -233,7 +233,7 @@ where
 
     let mut subs = ConnSubs::default();
     let mut forwards = ForwardRegistry::default();
-    let reverse = ReverseChannel::new(out_tx.clone());
+    let reverse = ReverseChannel::new(out_tx.priority_sender());
     // REV-1: register this connection's reverse channel with the shared
     // primary-target set so agent-initiated `browser.exec` calls can route to
     // whichever client connected first. The guard drops when this function
@@ -261,7 +261,7 @@ where
                         crate::MAX_INBOUND_MESSAGE_BYTES
                     ),
                 );
-                let _ = out_tx.send(frame).await;
+                let _ = out_tx.send_priority(frame).await;
                 break Ok(());
             }
             Err(e) => break Err(e),

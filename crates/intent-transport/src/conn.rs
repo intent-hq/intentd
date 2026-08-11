@@ -6,7 +6,8 @@
 //! dispatcher, push `events.event` notifications over the same connection, and
 //! drop all subscriptions when the connection closes — so the wire result is
 //! identical regardless of transport. The only difference is framing, which the
-//! transports handle by draining an outbound `mpsc::Sender<String>`.
+//! transports handle by draining the two-lane outbound queue
+//! ([`OutboundSender`] / [`OutboundReceiver`], priority lane first).
 
 use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
 use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
@@ -30,9 +31,131 @@ use crate::router::{check_envelope, handle_message, EnvelopeCheck};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
-/// Capacity of the per-connection outbound frame queue (responses + pushed
+/// Capacity of each per-connection outbound frame lane (responses + pushed
 /// notifications are serialized through one writer so they never interleave).
 pub(crate) const OUTBOUND_CAPACITY: usize = 256;
+
+/// Per-connection outbound frame queue, split into two lanes:
+///
+/// - **priority** — JSON-RPC responses (fast-path and dispatcher), error
+///   frames, and daemon-initiated reverse-RPC requests. Latency-critical:
+///   a client awaiting `host.status` must not sit behind megabytes of event
+///   traffic.
+/// - **bulk** — `events.event` notifications and `subscription.push`
+///   snapshot/delta frames pushed by forwarder tasks. High-volume,
+///   throughput-bound.
+///
+/// The transports drain both lanes through [`OutboundReceiver::recv`], which
+/// always empties the priority lane before taking a bulk frame, so an RPC
+/// response overtakes queued event traffic even on a saturated link. Frames
+/// within one lane keep FIFO order, which preserves the per-subscription
+/// invariants (response before first push, strictly monotonic `seq`): each
+/// subscription's frames all travel on the bulk lane in publish order, and
+/// its `{ subscriptionId }` response is enqueued on the priority lane before
+/// the forwarder is spawned.
+#[derive(Clone)]
+pub(crate) struct OutboundSender {
+    priority: mpsc::Sender<String>,
+    bulk: mpsc::Sender<String>,
+}
+
+impl OutboundSender {
+    /// Queue a latency-critical frame (RPC response / error / reverse
+    /// request). `Err` means the connection's writer is gone.
+    pub(crate) async fn send_priority(&self, frame: String) -> Result<(), ()> {
+        self.priority.send(frame).await.map_err(|_| ())
+    }
+
+    /// Queue a bulk frame (event notification / subscription push). `Err`
+    /// means the connection's writer is gone.
+    pub(crate) async fn send_bulk(&self, frame: String) -> Result<(), ()> {
+        self.bulk.send(frame).await.map_err(|_| ())
+    }
+
+    /// Whether the writer has stopped draining (both lanes closed together;
+    /// checking one suffices).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.priority.is_closed()
+    }
+
+    /// The priority-lane sender for collaborators that only ever send
+    /// latency-critical frames (the reverse-RPC channel).
+    pub(crate) fn priority_sender(&self) -> mpsc::Sender<String> {
+        self.priority.clone()
+    }
+}
+
+/// Receiving half of the two-lane outbound queue; owned by the transport
+/// writer.
+pub(crate) struct OutboundReceiver {
+    pub(crate) priority: mpsc::Receiver<String>,
+    pub(crate) bulk: mpsc::Receiver<String>,
+    priority_open: bool,
+    bulk_open: bool,
+}
+
+impl OutboundReceiver {
+    /// Next frame to write, priority lane first. Empties the priority lane
+    /// before taking a bulk frame; when both lanes are idle, waits on both
+    /// (biased toward priority). Returns `None` once every sender is dropped
+    /// and both lanes are drained. Cancel-safe: no frame is lost when the
+    /// caller races this against other select arms.
+    pub(crate) async fn recv(&mut self) -> Option<String> {
+        loop {
+            // Drain whatever is already queued on the priority lane first.
+            if self.priority_open {
+                match self.priority.try_recv() {
+                    Ok(frame) => return Some(frame),
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => self.priority_open = false,
+                }
+            }
+            match (self.priority_open, self.bulk_open) {
+                (true, true) => {
+                    tokio::select! {
+                        biased;
+                        frame = self.priority.recv() => match frame {
+                            Some(frame) => return Some(frame),
+                            None => self.priority_open = false,
+                        },
+                        frame = self.bulk.recv() => match frame {
+                            Some(frame) => return Some(frame),
+                            None => self.bulk_open = false,
+                        },
+                    }
+                }
+                (true, false) => match self.priority.recv().await {
+                    Some(frame) => return Some(frame),
+                    None => self.priority_open = false,
+                },
+                (false, true) => match self.bulk.recv().await {
+                    Some(frame) => return Some(frame),
+                    None => self.bulk_open = false,
+                },
+                (false, false) => return None,
+            }
+        }
+    }
+}
+
+/// Build one connection's two-lane outbound queue
+/// ([`OUTBOUND_CAPACITY`] frames per lane).
+pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    let (priority_tx, priority_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    (
+        OutboundSender {
+            priority: priority_tx,
+            bulk: bulk_tx,
+        },
+        OutboundReceiver {
+            priority: priority_rx,
+            bulk: bulk_rx,
+            priority_open: true,
+            bulk_open: true,
+        },
+    )
+}
 
 /// Per-connection record for one active subscription: the forwarder task (its
 /// `Drop` aborts delivery and releases the bus subscription) and the optional
@@ -104,9 +227,12 @@ impl ConnSubs {
 /// fast-paths) run inline on the read loop and stay serialized. The two
 /// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
 /// dispatcher — are spawned onto detached tokio tasks that write their response
-/// frame through a cloned `out_tx`, so a long-running request (e.g.
+/// frame through a cloned outbound sender, so a long-running request (e.g.
 /// `host.exec`) cannot delay responses to other requests on the same connection.
 /// Out-of-order responses are fine: JSON-RPC correlates by `id`.
+///
+/// Every frame sent here is a response/error frame and travels on the
+/// priority lane; only the forwarder tasks push on the bulk lane.
 ///
 /// Every detached spawn claims a slot from the daemon-wide `limiter`
 /// (`server.maxOutstandingRpcs`) first; when the cap is reached the request is
@@ -121,7 +247,7 @@ pub(crate) async fn process_frame(
     raw: &str,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &OutboundSender,
     subs: &mut ConnSubs,
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
@@ -164,7 +290,7 @@ pub(crate) async fn process_frame(
                 )
                 .await;
                 return match frame {
-                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                     None => true,
                 };
             }
@@ -181,7 +307,7 @@ pub(crate) async fn process_frame(
                 )
                 .await;
                 return match frame {
-                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                     None => true,
                 };
             }
@@ -196,7 +322,7 @@ pub(crate) async fn process_frame(
                 )
                 .await;
                 return match frame {
-                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                     None => true,
                 };
             }
@@ -232,7 +358,7 @@ pub(crate) async fn process_frame(
                     )
                     .await
                     {
-                        let _ = out.send(frame).await;
+                        let _ = out.send_priority(frame).await;
                     }
                 })
                 .await
@@ -261,7 +387,7 @@ pub(crate) async fn process_frame(
                         panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
                             .await
                     {
-                        let _ = out.send(frame).await;
+                        let _ = out.send_priority(frame).await;
                     }
                 })
                 .await
@@ -276,7 +402,7 @@ pub(crate) async fn process_frame(
             )
             .await;
             return match frame {
-                Some(frame) => out_tx.send(frame).await.is_ok(),
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,
             };
         }
@@ -288,7 +414,7 @@ pub(crate) async fn process_frame(
             )
             .await;
             return match frame {
-                Some(frame) => out_tx.send(frame).await.is_ok(),
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,
             };
         }
@@ -300,7 +426,7 @@ pub(crate) async fn process_frame(
             )
             .await;
             return match frame {
-                Some(frame) => out_tx.send(frame).await.is_ok(),
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,
             };
         }
@@ -351,7 +477,7 @@ pub(crate) async fn process_frame(
         let frame =
             panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), raw)).await;
         return match frame {
-            Some(frame) => out_tx.send(frame).await.is_ok(),
+            Some(frame) => out_tx.send_priority(frame).await.is_ok(),
             None => true,
         };
     }
@@ -369,7 +495,7 @@ pub(crate) async fn process_frame(
             if let Some(response) =
                 panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
             {
-                let _ = out_tx.send(response).await;
+                let _ = out_tx.send_priority(response).await;
             }
         })
         .await
@@ -402,7 +528,7 @@ fn is_dispatchable(parsed: Option<&Value>) -> bool {
 async fn reject_overloaded(
     method: &str,
     rpc_id: Option<Value>,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &OutboundSender,
     overloaded: Overloaded,
 ) -> bool {
     if overloaded.newly_saturated {
@@ -418,7 +544,7 @@ async fn reject_overloaded(
     }
     match rpc_id {
         Some(id) => out_tx
-            .send(events::error_frame(
+            .send_priority(events::error_frame(
                 id,
                 OVERLOAD_ERROR_CODE,
                 OVERLOAD_ERROR_MESSAGE,
@@ -435,7 +561,7 @@ async fn reject_overloaded(
 async fn handle_fast_path(
     fast_path: FastPath,
     bus: &EventBus,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
     match fast_path {
@@ -458,14 +584,15 @@ async fn handle_fast_path(
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
-                // Enqueue the response before spawning the forwarder so it can
-                // never be preceded by an `events.event` notification.
+                // Enqueue the response (priority lane) before spawning the
+                // forwarder (bulk lane); the writer drains priority first, so
+                // it can never be preceded by an `events.event` notification.
                 if id.present {
                     let frame = events::success_frame(
                         id.echo,
                         json!({ "subscriptionId": subscription_id }),
                     );
-                    if out_tx.send(frame).await.is_err() {
+                    if out_tx.send_priority(frame).await.is_err() {
                         return false;
                     }
                 }
@@ -484,7 +611,7 @@ async fn handle_fast_path(
                 let success = subs.remove(&subscription_id);
                 if id.present {
                     let frame = events::success_frame(id.echo, json!({ "success": success }));
-                    return out_tx.send(frame).await.is_ok();
+                    return out_tx.send_priority(frame).await.is_ok();
                 }
                 true
             }
@@ -495,30 +622,26 @@ async fn handle_fast_path(
 
 /// Send a `-32602` error for a fast-path request, but only when it had an `id`
 /// (notifications get no response). Returns `false` if the channel is closed.
-async fn send_fast_path_error(
-    id: events::IdInfo,
-    message: &str,
-    out_tx: &mpsc::Sender<String>,
-) -> bool {
+async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &OutboundSender) -> bool {
     if id.present {
         let frame = events::error_frame(id.echo, -32602, message);
-        return out_tx.send(frame).await.is_ok();
+        return out_tx.send_priority(frame).await.is_ok();
     }
     true
 }
 
 /// Forward filtered events from one bus subscription to the connection's
-/// outbound queue as `events.event` notifications until the bus or connection
-/// closes. Aborted by [`ConnSub`] on unsubscribe / disconnect.
+/// outbound queue (bulk lane) as `events.event` notifications until the bus
+/// or connection closes. Aborted by [`ConnSub`] on unsubscribe / disconnect.
 async fn forward_subscription(
     mut subscription: Subscription,
     subscription_id: String,
-    out_tx: mpsc::Sender<String>,
+    out_tx: OutboundSender,
 ) {
     while let Some(batch) = subscription.recv().await {
         for event in batch {
             let frame = events::build_event_notification(&subscription_id, &event);
-            if out_tx.send(frame).await.is_err() {
+            if out_tx.send_bulk(frame).await.is_err() {
                 return;
             }
         }
@@ -534,7 +657,7 @@ async fn handle_sub_fast_path(
     sub: SubFastPath,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
     match sub {
@@ -566,14 +689,15 @@ async fn handle_sub_fast_path(
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
-                // Enqueue the response before spawning the forwarder so it can
-                // never be preceded by a `subscription.push` notification (§3.4).
+                // Enqueue the response (priority lane) before spawning the
+                // forwarder (bulk lane); the writer drains priority first, so it
+                // can never be preceded by a `subscription.push` notification (§3.4).
                 if id.present {
                     let frame = events::success_frame(
                         id.echo,
                         json!({ "subscriptionId": subscription_id }),
                     );
-                    if out_tx.send(frame).await.is_err() {
+                    if out_tx.send_priority(frame).await.is_err() {
                         return false;
                     }
                 }
@@ -624,7 +748,7 @@ async fn handle_sub_fast_path(
                         id.echo,
                         json!({ "subscriptionId": subscription_id }),
                     );
-                    if out_tx.send(frame).await.is_err() {
+                    if out_tx.send_priority(frame).await.is_err() {
                         return false;
                     }
                 }
@@ -675,7 +799,7 @@ async fn handle_sub_fast_path(
                             id.echo,
                             json!({ "subscriptionId": subscription_id }),
                         );
-                        if out_tx.send(frame).await.is_err() {
+                        if out_tx.send_priority(frame).await.is_err() {
                             return false;
                         }
                     }
@@ -701,7 +825,7 @@ async fn handle_sub_fast_path(
                 let success = subs.remove(&subscription_id);
                 if id.present {
                     let frame = events::success_frame(id.echo, json!({ "success": success }));
-                    return out_tx.send(frame).await.is_ok();
+                    return out_tx.send_priority(frame).await.is_ok();
                 }
                 true
             }
@@ -720,14 +844,14 @@ async fn forward_note_subscription(
     workspace_id: WorkspaceId,
     mut subscription: Subscription,
     subscription_id: String,
-    out_tx: mpsc::Sender<String>,
+    out_tx: OutboundSender,
 ) {
     let snapshot = match api.list_notes(&workspace_id).await {
         Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
         Err(_) => Value::Array(Vec::new()),
     };
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
-    if out_tx.send(frame).await.is_err() {
+    if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
     let mut seq: u64 = 1;
@@ -737,7 +861,7 @@ async fn forward_note_subscription(
                 subscriptions::note_delta(api.as_ref(), &workspace_id, &event).await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
-                if out_tx.send(frame).await.is_err() {
+                if out_tx.send_bulk(frame).await.is_err() {
                     return;
                 }
                 seq += 1;
@@ -764,11 +888,11 @@ async fn forward_chat_subscription(
     agent_id: AgentId,
     mut subscription: Subscription,
     subscription_id: String,
-    out_tx: mpsc::Sender<String>,
+    out_tx: OutboundSender,
 ) {
     let snapshot = subscriptions::chat_snapshot(api.as_ref(), &agent_id).await;
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
-    if out_tx.send(frame).await.is_err() {
+    if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
     let mut state = subscriptions::ChatDeltaState::new(&agent_id);
@@ -787,7 +911,7 @@ async fn forward_chat_subscription(
             if let Some(delta) = state.delta(api.as_ref(), &event).await {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 seq += 1;
-                if out_tx.send(frame).await.is_err() {
+                if out_tx.send_bulk(frame).await.is_err() {
                     return;
                 }
             }
@@ -851,13 +975,13 @@ async fn forward_channel_subscription(
     note_id: Option<NoteId>,
     mut subscription: Subscription,
     subscription_id: String,
-    out_tx: mpsc::Sender<String>,
+    out_tx: OutboundSender,
 ) {
     let snapshot =
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await;
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
-    if out_tx.send(frame).await.is_err() {
+    if out_tx.send_bulk(frame).await.is_err() {
         return;
     }
     let mut seq: u64 = 1;
@@ -873,7 +997,7 @@ async fn forward_channel_subscription(
             .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
-                if out_tx.send(frame).await.is_err() {
+                if out_tx.send_bulk(frame).await.is_err() {
                     return;
                 }
                 seq += 1;
@@ -890,7 +1014,7 @@ mod tests {
     /// overloaded"` echoing its id, and the connection stays open.
     #[tokio::test]
     async fn overload_rejection_echoes_the_request_id() {
-        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let (tx, mut rx) = outbound_channel();
         let open = reject_overloaded(
             "agent.list",
             Some(json!("req-7")),
@@ -901,7 +1025,8 @@ mod tests {
         )
         .await;
         assert!(open, "the connection must stay open");
-        let frame = rx.try_recv().expect("frame queued");
+        // The overload error is a response frame → priority lane.
+        let frame = rx.priority.try_recv().expect("frame queued");
         let v: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], json!("req-7"));
@@ -913,7 +1038,7 @@ mod tests {
     /// notifications never get a response (PROTOCOL §9).
     #[tokio::test]
     async fn overload_rejection_drops_notifications_without_a_frame() {
-        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let (tx, mut rx) = outbound_channel();
         let open = reject_overloaded(
             "agent.list",
             None,
@@ -924,7 +1049,10 @@ mod tests {
         )
         .await;
         assert!(open, "the connection must stay open");
-        assert!(rx.try_recv().is_err(), "notifications get no response");
+        assert!(
+            rx.priority.try_recv().is_err() && rx.bulk.try_recv().is_err(),
+            "notifications get no response"
+        );
     }
 
     /// Only frames that survive envelope validation are gated by the limiter;
@@ -1014,7 +1142,7 @@ mod tests {
     /// A closed outbound channel is reported so the read loop can end.
     #[tokio::test]
     async fn overload_rejection_reports_a_closed_channel() {
-        let (tx, rx) = mpsc::channel::<String>(4);
+        let (tx, rx) = outbound_channel();
         drop(rx);
         assert!(
             !reject_overloaded(
@@ -1037,6 +1165,93 @@ mod tests {
                 },
             )
             .await
+        );
+    }
+
+    /// The writer-facing drain contract: `OutboundReceiver::recv` empties the
+    /// priority lane before yielding any bulk frame, even when the bulk frames
+    /// were queued first.
+    #[tokio::test]
+    async fn outbound_recv_drains_priority_before_bulk() {
+        let (tx, mut rx) = outbound_channel();
+        tx.send_bulk("bulk-1".to_string()).await.unwrap();
+        tx.send_bulk("bulk-2".to_string()).await.unwrap();
+        tx.send_priority("prio-1".to_string()).await.unwrap();
+        tx.send_priority("prio-2".to_string()).await.unwrap();
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            order.push(rx.recv().await.expect("frame"));
+        }
+        assert_eq!(order, ["prio-1", "prio-2", "bulk-1", "bulk-2"]);
+    }
+
+    /// FIFO order holds within each lane, and interleaved sends drain
+    /// priority-first at every step.
+    #[tokio::test]
+    async fn outbound_recv_keeps_fifo_within_each_lane() {
+        let (tx, mut rx) = outbound_channel();
+        tx.send_priority("p1".to_string()).await.unwrap();
+        tx.send_bulk("b1".to_string()).await.unwrap();
+        tx.send_priority("p2".to_string()).await.unwrap();
+        assert_eq!(rx.recv().await.as_deref(), Some("p1"));
+        assert_eq!(rx.recv().await.as_deref(), Some("p2"));
+        assert_eq!(rx.recv().await.as_deref(), Some("b1"));
+        // A priority frame queued while only bulk remains still wins the next
+        // recv.
+        tx.send_bulk("b2".to_string()).await.unwrap();
+        tx.send_priority("p3".to_string()).await.unwrap();
+        assert_eq!(rx.recv().await.as_deref(), Some("p3"));
+        assert_eq!(rx.recv().await.as_deref(), Some("b2"));
+    }
+
+    /// `recv` returns `None` only after every sender is dropped AND both lanes
+    /// are fully drained; frames buffered at close time are not lost.
+    #[tokio::test]
+    async fn outbound_recv_drains_buffered_frames_after_close() {
+        let (tx, mut rx) = outbound_channel();
+        tx.send_bulk("b1".to_string()).await.unwrap();
+        tx.send_priority("p1".to_string()).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await.as_deref(), Some("p1"));
+        assert_eq!(rx.recv().await.as_deref(), Some("b1"));
+        assert_eq!(rx.recv().await, None);
+        assert_eq!(rx.recv().await, None, "recv stays terminal after None");
+    }
+
+    /// `recv` wakes for a frame that arrives while it is parked (both lanes
+    /// empty) — the writer must not deadlock waiting on an idle connection.
+    #[tokio::test]
+    async fn outbound_recv_wakes_on_late_frames() {
+        let (tx, mut rx) = outbound_channel();
+        let waiter = tokio::spawn(async move {
+            let first = rx.recv().await;
+            let second = rx.recv().await;
+            (first, second)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx.send_bulk("b1".to_string()).await.unwrap();
+        tx.send_priority("p1".to_string()).await.unwrap();
+        let (first, second) = waiter.await.unwrap();
+        // Both frames are delivered; the parked recv takes whichever lane
+        // wakes it first, then the follow-up recv drains the other.
+        let mut got = vec![first.unwrap(), second.unwrap()];
+        got.sort();
+        assert_eq!(got, ["b1", "p1"]);
+    }
+
+    /// A dropped receiver is visible to senders on both lanes (the read loop's
+    /// "connection closed" signal).
+    #[tokio::test]
+    async fn outbound_sender_reports_closed_when_receiver_drops() {
+        let (tx, rx) = outbound_channel();
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
+        assert!(tx.send_priority("p".to_string()).await.is_err());
+        assert!(tx.send_bulk("b".to_string()).await.is_err());
+        assert!(
+            tx.priority_sender().send("p".to_string()).await.is_err(),
+            "the raw priority sender observes the close too"
         );
     }
 }
