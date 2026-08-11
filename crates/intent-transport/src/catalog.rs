@@ -11,13 +11,14 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 273 canonical methods routed through the main dispatch match in
+/// These are the 277 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
 /// error code (never `-32601`) when the method is recognized but fails for other reasons.
 pub const ROUTER_METHODS: &[&str] = &[
     "agent.appendMessage",
+    "agent.cancelDelete",
     "agent.cancelSubscriptions",
     "agent.completeOnce",
     "agent.create",
@@ -75,6 +76,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "file.exists",
     "file.list",
     "file.mkdir",
+    "file.placeAttachment",
     "file.read",
     "file.rename",
     "file.stat",
@@ -265,6 +267,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "voice.getWorkspaceVocabulary",
     "voice.transcribe",
     "workspace.archive",
+    "workspace.cancelDelete",
     "workspace.cleanup",
     "workspace.create",
     "workspace.delete",
@@ -286,6 +289,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "workspace.restore",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
+    "workspace.transfer.plan",
     "workspace.unarchive",
     "workspace.update",
     "workspace.updateContext",

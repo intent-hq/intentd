@@ -33,6 +33,7 @@ pub mod settings_file;
 pub mod slug;
 pub mod tilde;
 pub mod traits;
+pub mod transfer;
 pub mod turn_attachments;
 
 pub use agent_configs::{
@@ -43,7 +44,9 @@ pub use agent_logs::{
     sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
 };
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
-pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
+pub use clock::{
+    iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
+};
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};

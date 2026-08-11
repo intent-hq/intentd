@@ -584,6 +584,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -628,6 +629,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 

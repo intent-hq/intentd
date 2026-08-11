@@ -216,6 +216,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -304,6 +305,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session1)
@@ -359,6 +361,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session2)

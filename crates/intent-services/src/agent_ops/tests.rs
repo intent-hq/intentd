@@ -96,6 +96,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -7905,6 +7906,239 @@ async fn diagnostics_reports_queue_snapshots() {
     let text = drained["text"].as_str().expect("text");
     assert!(text.contains("Queued agents: 0"), "text: {text}");
     assert!(!text.contains("Pending message queues:"), "text: {text}");
+}
+
+/// intent-hq/monorepo#1897: a ready-to-send queue entry older than
+/// `STALE_QUEUE_ENTRY_AFTER_MS` on an agent that is not actively responding
+/// raises a `stale-queue-entry` stuck risk naming the agent and the oldest
+/// entry; fresh entries, actively-responding agents, and entries under edit
+/// stay silent.
+#[tokio::test]
+async fn diagnostics_flags_stale_undelivered_queue_entry() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Idle").await;
+
+    // Fresh entry on a non-running agent: below the age threshold, no risk.
+    svc.enqueue_message(&target, "old".into(), None, None, None, None, false);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics fresh");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "fresh entry must not be flagged: {result}"
+    );
+
+    // Backdate the first entry past the threshold and add a second fresh
+    // entry: the risk fires naming the agent and the stale entry only.
+    let entry_id = {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        q[0].queued_at = "2020-01-01T00:00:00Z".into();
+        q[0].id.clone()
+    };
+    svc.enqueue_message(&target, "fresh".into(), None, None, None, None, false);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics stale");
+    let risk = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk present")
+        .clone();
+    assert_eq!(risk["severity"], json!("warning"), "risk: {risk}");
+    assert_eq!(risk["agentId"], json!(target.0), "risk: {risk}");
+    assert_eq!(risk["entryId"], json!(entry_id), "risk: {risk}");
+    assert_eq!(risk["count"], json!(1), "risk: {risk}");
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "risk: {risk}"
+    );
+    let text = result["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    // An actively-responding (non-stale) agent legitimately holds its queue
+    // until the turn ends: no risk even with the old entry.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = now_iso();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark responding");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics responding");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "responding agent must not be flagged: {result}"
+    );
+
+    // A stale-responding agent is NOT actively draining — the risk returns.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Active;
+    s.updated_at = "2020-01-01T00:00:00Z".into();
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark stale responding");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics stale responding");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .any(|r| r["type"] == json!("stale-queue-entry")),
+        "stale-responding agent must be flagged: {result}"
+    );
+
+    // An old entry under edit is intentionally held by the drain — with only
+    // it and a fresh entry ready, nothing is flagged.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        guard.get_mut(&target).expect("queue")[0].editing = true;
+    }
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics editing");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "editing entry must not be flagged: {result}"
+    );
+
+    // An unparseable `queuedAt` is excluded rather than treated as
+    // infinitely old: no risk.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        q[0].editing = false;
+        q[0].queued_at = "not-a-timestamp".into();
+    }
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics unparseable");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "unparseable queuedAt must not be flagged: {result}"
+    );
+
+    // An active question hold parks automatic entries by design (PROTOCOL
+    // §5.5): the old non-user-origin entry is expected to wait, no risk.
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        guard.get_mut(&target).expect("queue")[0].queued_at = "2020-01-01T00:00:00Z".into();
+    }
+    svc.record_pending_questions_marker(&ws, &target, "q-msg-1")
+        .await;
+    // The marker write bumps the session's `updated_at` — re-mark the agent
+    // idle so the phases below exercise the hold logic, not the
+    // actively-responding skip.
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("session");
+    s.status = intent_core::AgentStatus::Idle;
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark idle");
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics question hold");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "question-hold-parked automatic entry must not be flagged: {result}"
+    );
+
+    // The hold never blocks user-origin entries — a stale one is a genuine
+    // risk, flagged even under the hold and counted alone.
+    svc.enqueue_message_with_origin(
+        &target,
+        "user answer".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+    );
+    let user_entry_id = {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let q = guard.get_mut(&target).expect("queue");
+        let m = q.iter_mut().find(|m| m.user_origin).expect("user entry");
+        m.queued_at = "2020-01-01T00:00:00Z".into();
+        m.id.clone()
+    };
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics user-origin under hold");
+    let risk = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks")
+        .iter()
+        .find(|r| r["type"] == json!("stale-queue-entry"))
+        .unwrap_or_else(|| panic!("stale user-origin entry under hold must be flagged: {result}"))
+        .clone();
+    assert_eq!(risk["entryId"], json!(user_entry_id), "risk: {risk}");
+    assert_eq!(risk["count"], json!(1), "risk: {risk}");
+
+    // An archived workspace affirmatively parks every queue until unarchive:
+    // nothing is flagged, user-origin or not.
+    let mut w = svc.store().get_workspace(&ws).await.expect("workspace");
+    w.archived = true;
+    svc.store().update_workspace(&w).await.expect("archive");
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics archived");
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("stale-queue-entry")),
+        "archived-workspace queue must not be flagged: {result}"
+    );
 }
 
 /// monorepo#947: deleting a workspace drops its event subscriptions — the
@@ -20501,6 +20735,153 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     );
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
     assert_eq!(metadata["stallSuspected"], json!(true), "meta: {metadata}");
+}
+
+/// monorepo#1898: a task note in `review_required` means the child explicitly
+/// reported completion (reportToParent's TASK-B transition) — an idle with no
+/// persisted report must NOT get the "may have stalled" annotation.
+#[tokio::test]
+async fn stall_annotation_skipped_when_task_review_required() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Reported task", "review_required").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "wrapped up" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(!text.contains(STALL_MARKER), "clean wake: {text}");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no stall flag: {metadata}"
+    );
+}
+
+/// monorepo#1898: even when the stall predicate would fire (task still
+/// `in_progress`, no PERSISTED report), an event payload carrying a
+/// `completionReport` means the child DID report — the wake must carry
+/// neither the contradictory "No completion report … may have stalled" tail
+/// nor the machine-readable `stallSuspected` metadata, in both the
+/// standalone wake and the grouped after_all per-child line.
+#[tokio::test]
+async fn stall_tail_never_contradicts_rendered_report() {
+    let (_t, svc, ws) = setup().await;
+
+    // Standalone completion wake.
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Racy task", "in_progress").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "event-only report" }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains("event-only report"),
+        "report rendered: {text}"
+    );
+    assert!(
+        !text.contains(STALL_MARKER),
+        "no contradictory tail after a Report: clause: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no contradictory machine-readable flag: {metadata}"
+    );
+
+    // Grouped after_all per-child line.
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let grouped = create_agent(&svc, &ws, "Grouped").await;
+    link_task_note(&svc, &ws, &grouped, "Racy grouped task", "in_progress").await;
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![grouped.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &grouped,
+        json!({ "agentId": grouped.0, "completionReport": "grouped event report" }),
+    ))
+    .await;
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains("grouped event report"),
+        "report rendered: {text}"
+    );
+    assert!(
+        !text.contains(STALL_MARKER),
+        "no contradictory tail on the per-child line: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no contradictory flag in aggregated metadata: {metadata}"
+    );
+    assert!(
+        metadata["events"][0]["data"]
+            .get("stallSuspected")
+            .is_none(),
+        "no contradictory flag on the grouped raw event: {metadata}"
+    );
 }
 
 // ---------------------------------------------------------------------------

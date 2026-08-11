@@ -23,6 +23,15 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Age past which an undelivered ready-to-send queue entry on an agent that is
+/// not actively running counts as a `stale-queue-entry` stuck-risk in
+/// `agent.diagnostics` (intent-hq/monorepo#1897): during the monorepo#1791
+/// incident a settlement wake sat undelivered at position 0 for ~13 minutes on
+/// an idle agent while diagnostics reported zero stuck risks. Five minutes is
+/// comfortably past any normal drain latency (drains trigger in seconds) while
+/// catching a wedged queue well before the incident's timescale.
+const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -760,10 +769,20 @@ impl QueuedMessage {
 /// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
 /// quarantine park, append-failure auto-queue) still deliver the preempted
 /// message ahead of the interrupt message when the entry drains.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializes to camelCase JSON as the durable `agent_stop_redelivery.payload`
+/// shape (intent-hq/monorepo#1899): the zero-output stop-redelivery arm mirrors
+/// the in-memory payload write-through so it survives a daemon restart. The
+/// fields take `#[serde(default)]` so older payloads missing a later field
+/// still rehydrate.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedPrepend {
+    #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
     pub image_blocks: Option<Value>,
+    #[serde(default)]
     pub file_blocks: Option<Value>,
 }
 
@@ -1877,6 +1896,9 @@ impl Services {
         } else {
             None
         };
+        // Delete grace window (§5.5): overlay the pending-deletion deadline
+        // from the in-memory registry (O(1) map lookup, never persisted).
+        let pending_delete_at = self.pending_agent_deletes.deadline(session.id.0.as_str());
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1885,6 +1907,7 @@ impl Services {
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
         lite.session_corrupted = session_corrupted;
+        lite.pending_delete_at = pending_delete_at;
         if let Some((live_response, live_digest)) = live_overlay {
             if live_response.is_some() {
                 // The in-flight turn has derivable streamed text: the newest
@@ -2533,6 +2556,7 @@ impl Services {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
@@ -2757,6 +2781,12 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // Immediate-delete-while-pending (§5.5): an immediate delete
+        // supersedes a running grace window — drop the pending entry and
+        // abort its timer, then commit now. The timer-fired commit path has
+        // already claimed (removed) its entry before calling here, so this
+        // is a no-op for it.
+        self.pending_agent_deletes.cancel(agent_id.0.as_str());
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -2805,6 +2835,130 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// `agent.delete` with `undoDelayMs > 0` (PROTOCOL §5.5): register an
+    /// in-memory pending deletion with deadline `now + undo_delay_ms`
+    /// (clamped to the 60s cap) and return the ISO `deleteAt` deadline.
+    /// Scheduling does NOT stop the agent — the deadline commit runs the
+    /// ordinary [`Services::agent_delete_op`] cascade (which does). Emits
+    /// `agent:delete-scheduled`. Re-scheduling while pending is idempotent;
+    /// nothing is persisted, so a daemon restart drops the pending deletion.
+    pub(crate) async fn agent_schedule_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> Result<String> {
+        // Validate existence up front so scheduling a delete for an unknown
+        // session is the standard `NotFound` error, not a timer that fails
+        // later. When the caller declares a workspace, reject a
+        // cross-workspace bare-id probe the same way `agent_delete_op` does.
+        let session_ws = self
+            .store
+            .get_agent_session_summary(&agent_id)
+            .await?
+            .workspace_id;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session_ws != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let delay_ms = crate::delete_grace::clamp_undo_delay_ms(undo_delay_ms);
+        let delete_at = intent_core::iso_ms_from_now(delay_ms);
+        let key = agent_id.0.clone();
+        let timer_services = self.clone();
+        let timer_id = agent_id.clone();
+        let timer_ws = session_ws.clone();
+        // Idempotent re-schedule (§5.5): the registry arms the timer only
+        // when nothing is pending for this key — the check runs under the
+        // registry lock, so concurrent schedules converge on one deadline
+        // and only the arming call emits `agent:delete-scheduled`.
+        if let Some(existing) =
+            self.pending_agent_deletes
+                .schedule(key, delete_at.clone(), move |generation| {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        // Claim-or-abstain: only the timer that still owns the
+                        // entry commits. A cancel or an immediate delete that
+                        // raced ahead removed/superseded the entry — do nothing.
+                        if !timer_services
+                            .pending_agent_deletes
+                            .claim(timer_id.0.as_str(), generation)
+                        {
+                            return;
+                        }
+                        // Commit via the existing immediate-delete cascade (same
+                        // events). Best-effort: the caller is long gone, so a
+                        // failure is logged, not surfaced.
+                        if let Err(e) = timer_services
+                            .agent_delete_op(timer_id.clone(), Some(timer_ws))
+                            .await
+                        {
+                            tracing::warn!(
+                                agent = %timer_id.0,
+                                error = %e,
+                                "scheduled agent delete failed at commit"
+                            );
+                        }
+                    })
+                })
+        {
+            return Ok(existing);
+        }
+        crate::publish_event(
+            &self.event_bus,
+            crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
+        )
+        .await;
+        Ok(delete_at)
+    }
+
+    /// `agent.cancelDelete` (PROTOCOL §5.5): cancel a pending agent-session
+    /// deletion. `true` when something was pending (emits
+    /// `agent:delete-cancelled`), `false` otherwise (already committed, or
+    /// never scheduled) — the non-error, race-safe outcome. A caller-declared
+    /// workspace mismatch is rejected as `NotFound` BEFORE touching the
+    /// registry, mirroring `agent_delete_op`/`agent_schedule_delete_op`, so
+    /// a stale or cross-workspace scoped cancel cannot remove another
+    /// workspace's pending deletion.
+    pub(crate) async fn agent_cancel_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<bool> {
+        let session_ws = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(summary) => summary.workspace_id,
+            // Row already gone: the deletion committed (or the session never
+            // existed) — nothing pending, the race-safe non-error outcome.
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if let Some(ws) = workspace_id.as_ref() {
+            if session_ws != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
+        if cancelled {
+            crate::publish_event(
+                &self.event_bus,
+                crate::agent_delete_cancelled_event(&session_ws, &agent_id),
+            )
+            .await;
+        }
+        Ok(cancelled)
+    }
+
+    /// Abort any pending agent-session deletions in `workspace_id` without
+    /// emitting per-agent cancel events: the caller is the workspace delete
+    /// cascade (immediate or committed-from-pending), which supersedes them —
+    /// every session is deleted right after, emitting `agent:deleted` per
+    /// session (§5.5 cascade interaction).
+    pub(crate) fn abort_pending_agent_deletes(&self, sessions: &[AgentSession]) {
+        for session in sessions {
+            self.pending_agent_deletes.cancel(session.id.0.as_str());
+        }
+    }
+
     /// `agent.getSession` (PROTOCOL §5.5). Full [`AgentSession`] projection —
     /// the superset that `agent.get`/[`AgentLite`] strips (`systemPrompt`,
     /// `specialist`, persisted metadata block, full `messages` log). Used by
@@ -2816,6 +2970,9 @@ impl Services {
         // monorepo#940: derived on emit (never persisted); see
         // `project_lite_with_flags`.
         session.session_corrupted = self.session_poisoned(&session);
+        // Delete grace window (§5.5): overlay the pending-deletion deadline
+        // from the in-memory registry (O(1) map lookup, never persisted).
+        session.pending_delete_at = self.pending_agent_deletes.deadline(agent_id.0.as_str());
         Ok(session)
     }
 
@@ -6631,6 +6788,12 @@ impl Services {
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
     /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// A queue whose ready-to-send entries have sat undelivered past
+    /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
+    /// responding raises a `stale-queue-entry` stuck-risk
+    /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
+    /// archived workspaces park every entry, and an active question hold
+    /// parks automatic (non-user-origin) entries — neither is stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -7018,6 +7181,113 @@ impl Services {
                 }
                 stuck_risks.push(Value::Object(risk));
             }
+        }
+        // Stale undelivered queue entries (intent-hq/monorepo#1897): a
+        // ready-to-send entry older than [`STALE_QUEUE_ENTRY_AFTER_MS`] whose
+        // target agent is not actively responding should have drained long
+        // ago — surface it instead of leaving the wake invisible. Entries
+        // under edit are excluded (the drain skips them by design), as are
+        // entries whose `queuedAt` fails to parse. An actively-responding,
+        // non-stale agent legitimately holds its queue until the turn ends.
+        //
+        // Affirmatively-parked queues are expected, not stuck: an archived
+        // workspace parks every queue until unarchive (the drain kick then
+        // delivers), and an active question hold (PROTOCOL §5.5) parks
+        // automatic entries until the user answers or dismisses — but never
+        // user-origin entries, which drain through the hold, so a stale
+        // user-origin entry under a hold is still a genuine risk. Both checks
+        // are lazy — one workspace read per call and one bounded
+        // [`Services::question_hold_active`] session read per agent, paid
+        // only when a stale candidate actually exists.
+        let mut workspace_archived: Option<bool> = None;
+        for q in &queues {
+            let aid = q["agentId"].as_str().unwrap_or_default();
+            let actively_responding = session_by_id.get(aid).is_some_and(|s| {
+                agent_status_wire(s.status) == Some("responding")
+                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+            });
+            if actively_responding {
+                continue;
+            }
+            let mut stale: Vec<(&str, i64)> = q["entries"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e["editing"].as_bool() != Some(true))
+                        .filter_map(|e| {
+                            let queued_at = e["queuedAt"].as_str()?;
+                            let queued_ms =
+                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let age = (now_ms - queued_ms).max(0);
+                            if age > STALE_QUEUE_ENTRY_AFTER_MS {
+                                Some((e["id"].as_str().unwrap_or_default(), age))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if stale.is_empty() {
+                continue;
+            }
+            let archived = match workspace_archived {
+                Some(v) => v,
+                None => {
+                    let v = !workspace_id.is_chief()
+                        && self
+                            .store
+                            .get_workspace(&workspace_id)
+                            .await
+                            .map(|w| w.archived)
+                            .unwrap_or(false);
+                    workspace_archived = Some(v);
+                    v
+                }
+            };
+            if archived {
+                break;
+            }
+            let agent = AgentId(aid.to_string());
+            if self.question_hold_active(&agent).await {
+                let user_origin_ids: HashSet<String> = {
+                    let guard = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    guard
+                        .get(&agent)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|m| m.user_origin)
+                                .map(|m| m.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                stale.retain(|(id, _)| user_origin_ids.contains(*id));
+            }
+            let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
+                continue;
+            };
+            let status = session_by_id
+                .get(aid)
+                .and_then(|s| agent_status_wire(s.status))
+                .unwrap_or("unknown");
+            stuck_risks.push(json!({
+                "type": "stale-queue-entry",
+                "severity": "warning",
+                "message": format!(
+                    "Agent {aid} ({status}) has {} undelivered queued message(s); oldest entry {oldest_id} queued {oldest_age}ms ago",
+                    stale.len(),
+                ),
+                "agentId": aid,
+                "entryId": oldest_id,
+                "ageMs": oldest_age,
+                "count": stale.len(),
+            }));
         }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {

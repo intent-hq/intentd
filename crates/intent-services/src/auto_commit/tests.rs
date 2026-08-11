@@ -102,6 +102,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn session(
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 

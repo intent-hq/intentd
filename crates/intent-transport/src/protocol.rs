@@ -57,13 +57,32 @@
 //! (additive; §5.14, monorepo#1891): uncached node/gh detection mirroring
 //! `host.checkGit` (`{ available, version?, path? }`) so a fresh install is
 //! seen immediately — 272 router methods, 311 total. Version 6.5 adds the
+//! `file.placeAttachment` router method (additive; §5.9, monorepo#1948):
+//! daemon-mediated attachment placement into the git-ignored
+//! `.intent/attachments/` workspace directory with collision-safe naming —
+//! 273 router methods, 312 total. Version 6.6 adds `workspace.transfer.plan`
+//! (additive; §5.1): read-only transfer preview — the versioned export
+//! manifest (tables, assets, git summary) plus the size estimate (DB rows +
+//! assets + estimated git bundle) and pre-flight warnings — 274 router
+//! methods, 313 total. Version 6.7 adds the delete grace window
+//! (additive; §5.1 / §5.5): the optional `undoDelayMs` param on
+//! `workspace.delete` and `agent.delete` (schedules an in-memory pending
+//! deletion, returning `{ success, scheduled, deleteAt }`), the
+//! `workspace.cancelDelete` / `agent.cancelDelete` router methods, the
+//! `workspace:delete-scheduled` / `workspace:delete-cancelled` and
+//! `agent:delete-scheduled` / `agent:delete-cancelled` events (§6.5), and
+//! the optional `pendingDeleteAt` field on `Workspace` rows and the
+//! `AgentLite` / `AgentSession` projections. Scheduling an agent delete
+//! does NOT stop the agent (the deadline commit does), and a workspace
+//! delete — immediate or committed-from-pending — supersedes pending agent
+//! deletes inside it — 276 router methods, 315 total. Version 6.8 adds the
 //! `task.setRelations` router method (additive; §5.4, monorepo#1974): writes
 //! the first-class `dependsOn` / `conflictsWith` task relations (validated,
 //! cycle-checked) that `task.getMyTask` / `task.list` / `note.listTasks`
-//! project with the computed `unmetDependsOn` — 273 router methods, 312 total.
+//! project with the computed `unmetDependsOn` — 277 router methods, 316 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.5";
+pub const PROTOCOL_VERSION: &str = "6.8";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -92,6 +92,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.transfer.plan`: read-only preview of a workspace transfer
+    /// (PROTOCOL §5.1) — the versioned [`crate::transfer::TransferManifest`]
+    /// plus a size estimate broken down as DB row bytes + asset bytes +
+    /// estimated git bundle bytes, and non-blocking pre-flight warnings.
+    /// No side effects; `NotFound` if the workspace is absent.
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<crate::transfer::TransferPlan>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_transfer_plan not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is
@@ -133,6 +150,39 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::delete_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Schedule a workspace deletion after a grace window (PROTOCOL §5.1):
+    /// registers an in-memory pending deletion with deadline
+    /// `now + undo_delay_ms` (clamped to the 60s cap) and returns the ISO
+    /// `deleteAt` deadline. Re-scheduling while pending is idempotent (returns
+    /// the existing deadline). On expiry the daemon runs the immediate-delete
+    /// cascade ([`WorkspaceApi::delete_workspace`]). Never persisted — a
+    /// daemon restart drops the pending deletion.
+    fn schedule_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (id, undo_delay_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::schedule_workspace_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Cancel a pending workspace deletion (PROTOCOL §5.1). Returns `true`
+    /// when a pending deletion was cancelled, `false` when nothing was
+    /// pending (already committed, or never scheduled) — a non-error,
+    /// race-safe outcome.
+    fn cancel_workspace_delete(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cancel_workspace_delete not implemented".to_string(),
             ))
         })
     }
@@ -1887,6 +1937,45 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Schedule an agent-session deletion after a grace window (PROTOCOL
+    /// §5.5): registers an in-memory pending deletion with deadline
+    /// `now + undo_delay_ms` (clamped to the 60s cap) and returns the ISO
+    /// `deleteAt` deadline. Scheduling does NOT stop the agent — the commit
+    /// performs the ordinary [`WorkspaceApi::agent_delete`] (which does).
+    /// Re-scheduling while pending is idempotent (returns the existing
+    /// deadline). Never persisted — a daemon restart drops the pending
+    /// deletion.
+    fn agent_schedule_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (agent_id, workspace_id, undo_delay_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_schedule_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.cancelDelete`: cancel a pending agent-session deletion
+    /// (PROTOCOL §5.5). Returns `true` when a pending deletion was cancelled,
+    /// `false` when nothing was pending (already committed, or never
+    /// scheduled) — a non-error, race-safe outcome.
+    fn agent_cancel_delete(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        let _ = (agent_id, workspace_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_cancel_delete not implemented".to_string(),
             ))
         })
     }
@@ -5168,6 +5257,32 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_stat not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.placeAttachment`: place an attachment payload into the
+    /// workspace's `.intent/attachments/` directory with a collision-safe
+    /// name and return `{ ok, path, fileName, size }` where `path` is
+    /// workspace-relative and `size` is the placed byte length
+    /// (PROTOCOL §5.9; intent-hq/monorepo#1948). Exactly one of `data`
+    /// (base64 payload, `data:` URL prefix tolerated) or `source_path`
+    /// (absolute host-local file to copy — the daemon and caller share the
+    /// host) must be provided; anything else is `Error::InvalidParams`
+    /// (→ `-32602`). The directory is covered by the default
+    /// `.intent/.gitignore`, so placed files never reach git tracking,
+    /// auto-commit, or attribution.
+    fn file_place_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        data: Option<String>,
+        source_path: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_name, data, source_path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_place_attachment not implemented".to_string(),
             ))
         })
     }
