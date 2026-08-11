@@ -2535,14 +2535,12 @@ fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
         return errno.to_string();
     }
     match read_pid(pid_path).filter(|pid| (1..=i32::MAX as u32).contains(pid)) {
-        Some(pid) => {
-            let liveness = if pid_is_alive(pid) {
-                "alive"
-            } else {
-                "not running"
-            };
-            format!("pid {pid}, {liveness}")
-        }
+        Some(pid) if pid_is_alive(pid) => format!("pid {pid}, alive"),
+        // A contended flock is by definition held by a live process, so a
+        // dead pidfile pid cannot be the holder — say what is actually known
+        // instead of the self-contradictory "running instance (pid N, not
+        // running)".
+        Some(pid) => format!("stale pidfile names pid {pid} (not running); holder unknown"),
         None => errno.to_string(),
     }
 }
@@ -4060,8 +4058,8 @@ mod tests {
             .expect_err("a held data-dir lock must refuse a second acquire")
             .to_string();
         assert!(
-            err.contains("pid 2147483640, not running"),
-            "error names the dead holder: {err}"
+            err.contains("stale pidfile names pid 2147483640 (not running); holder unknown"),
+            "error flags the stale pidfile without claiming a dead holder: {err}"
         );
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
