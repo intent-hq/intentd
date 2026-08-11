@@ -15,6 +15,19 @@ ws.agent.delegate({ taskNoteId: "abc-123", waitMode: "after_all" })
 ws.agent.delegate({ taskNoteId: "def-456", waitMode: "after_all" })
 ```
 
+### Batch delegation (preferred for multi-task plans)
+
+When tasks carry `dependsOn`/`conflictsWith` relations, delegate the whole remaining list in one call and let the app work out what can start:
+
+```
+ws.agent.delegate({ tasks: ["t1", "t2", "t3"], waitMode: "after_all" })
+```
+
+- **Supply the full remaining list every time.** The call is idempotent — already-running and finished tasks come back `skipped`, so re-supplying them never duplicates agents.
+- **Read the response instead of tracking graph state yourself.** Every supplied task comes back with a disposition (`started` / `held:blocked-on-deps` / `held:conflict` / `skipped` / `error`) and a reason, and `unlockPlan` names which held tasks become startable when the running set settles. With effort estimates on the tasks, `unlockPlan.criticalPathMinutes` estimates the serial work remaining.
+- **Re-call delegate on settlement wakes.** The app never auto-starts held tasks; when the group-settlement wake arrives, re-call `agent.delegate` with the remaining list — classification is recomputed fresh on every call. A held task whose dependency failed or was cancelled comes back flagged "decision needed": resolve it with the user rather than re-calling in a loop.
+- **`greedy: true`** starts conflicting tasks anyway and names the pairs — use it only when you accept overlapping edits and the rebase work that follows. The default (greedy off) holds conflicts and serializes them for you.
+
 Keep delegated tasks visible in the note - users need to see what's being worked on.
 
 ## GitHub & Git Operations

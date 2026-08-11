@@ -79,6 +79,23 @@ Each subtask should be:
 - "Fix typo in variable name"
 - "Add single line comment"
 
+### Contract-First Splitting
+
+When a task spans an interface boundary (API shape, wire protocol, shared types, DB schema), split the contract out as its own early task:
+
+- **Define the contract first**: a small task that pins down the interface — types, method signatures, payload shapes, error cases. Implementation tasks then `dependsOn` the contract task and can proceed in parallel against the agreed shape.
+- **Cross-component example**: a contract task, then backend-implement+merge and frontend-implement-against-contract both `dependsOn` it and run in parallel, then a small frontend rebase+merge task `dependsOn` both. Only the final merge is serialized, not all the frontend work.
+
+### Declaring Task Relations
+
+Task notes carry first-class relations that batch delegation uses to order and serialize work — declare them at breakdown time, not later:
+
+- **`dependsOn`** (hard ordering): the task is not ready until every dependency is complete. Use it for contract → implementation and implement → integrate ordering. Edges onto tree ancestors/descendants and cycles are rejected at write time.
+- **`conflictsWith`** (advisory): the tasks should not run concurrently. Declare it for any pair of tasks touching the same files — and default to declaring it for same-repo tasks sharing a checkout, since concurrent agents in one checkout step on each other even without direct file overlap.
+- Prefer **more, smaller tasks with explicit relations** over fewer large ones: everything whose dependencies are met can start in parallel while conflicting work is held, so fine-grained splits parallelize better than hand-serialized big tasks.
+
+`@@@task` blocks don't carry relations; after the blocks are materialized into Task Notes, set relations by id with `ws.task.setRelations(noteId, { dependsOn: [...], conflictsWith: [...] })` (or seed them via `ws.task.markAsTask` when marking an existing note).
+
 ## Breakdown Process
 
 ### 1. Research Phase
@@ -99,7 +116,7 @@ Each subtask should be:
 
 - Break down into logical phases (research → implement → test → integrate)
 - Ensure each subtask has a single clear objective
-- Order subtasks by dependencies (what needs to happen first)
+- Order subtasks by dependencies (what needs to happen first) and declare the ordering as `dependsOn` edges once the tasks are materialized
 - Validate that subtasks are appropriately scoped
 
 ### 4. Validation Phase
