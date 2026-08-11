@@ -164,6 +164,9 @@ impl Services {
     /// List `<assets_root>/<workspaceId>/` as manifest assets (id = file
     /// name), sorted by id. Missing root/dir or read errors degrade to an
     /// empty list — a plan must not fail because a workspace has no assets.
+    /// `<assetId>.meta.json` sidecars are intentionally listed as first-class
+    /// entries: the archive carries them, so the manifest (and its byte
+    /// total) reflects exactly what a transfer would copy.
     async fn transfer_assets(&self, id: &WorkspaceId) -> Vec<TransferAsset> {
         let Some(root) = self.assets_root.clone() else {
             return Vec::new();
@@ -207,7 +210,9 @@ fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
             .map(|o| o.status.success())
             .unwrap_or(false);
         if exists {
-            refs.push(branch.clone());
+            // Push the unambiguous form: a worktree path or `-`-prefixed name
+            // matching the short branch name would otherwise break rev-list.
+            refs.push(format!("refs/heads/{branch}"));
         }
     }
     let out = std::process::Command::new("git")
