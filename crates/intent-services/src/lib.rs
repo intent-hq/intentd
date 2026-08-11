@@ -115,6 +115,8 @@ mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
 pub mod transfer_materialize;
+#[cfg(test)]
+mod transfer_roundtrip;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
