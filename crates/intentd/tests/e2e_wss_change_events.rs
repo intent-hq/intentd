@@ -3090,6 +3090,21 @@ async fn ready_tasks_gate_on_depends_on_over_wss() {
     .await;
     assert_eq!(set["ok"], json!(true), "setRelations: {set}");
 
+    // The dependsOn write itself recomputes the ready set (monorepo#1981):
+    // consume the relations-changed event — `gated` just left the set.
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"],
+        json!({ "noteId": gated, "reason": "relations-changed" }),
+    );
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(gated)),
+        "gated ready right after gaining unmet deps: {evt}"
+    );
+
     // Complete dep-x: the recomputed ready set must still exclude `gated`
     // (dep-y is unmet) while including the completed-child-free dep-y.
     wss_rpc(
