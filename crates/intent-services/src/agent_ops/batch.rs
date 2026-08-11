@@ -6,21 +6,177 @@
 //! start / held / skipped and project the unlock plan. The functions write no
 //! scheduler state — the delegate op re-runs them on every call, which is what
 //! makes re-supplying the same list idempotent.
+//!
+//! Greedy-off admission is a HEURISTIC, deliberately not an exact solver:
+//! makespan minimization under `dependsOn` + `conflictsWith` is NP-complete,
+//! and the spec records the decision to use deterministic effort-weighted
+//! critical-path list scheduling instead of an external solver crate.
+//! Priority = the longest effort-weighted chain of dependents downstream of
+//! the task (one topological pass — cheap and exact since `dependsOn` is
+//! validated as a DAG at write time); startable tasks are admitted in
+//! descending priority, holding any whose `conflictsWith` intersects the
+//! admitted/running set. Ties break by more-dependents-unlocked, then
+//! shortest-processing-time, then task id — fully deterministic. Classic list
+//! scheduling: O(V+E), no search or backtracking, within 2x of optimal for
+//! this constraint family.
 
 use std::collections::{HashMap, HashSet};
 
 use intent_core::TaskStatus;
 
+use crate::task_effort::DEFAULT_EFFORT_MINUTES;
+
 /// Per-task snapshot the classification runs over. Built by the delegate op
 /// from the workspace's notes plus a live-agent scan; `live_agent` is
 /// `Some((id, name))` when the task's newest assigned agent is live (the same
 /// live/resumable predicate as the single-task occupancy gate).
+/// `effort_minutes` is the parsed `estimatedEffort` (None when absent or
+/// unparseable — scheduling math then uses [`DEFAULT_EFFORT_MINUTES`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BatchTaskSnap {
     pub(crate) status: TaskStatus,
     pub(crate) depends_on: Vec<String>,
     pub(crate) conflicts_with: Vec<String>,
     pub(crate) live_agent: Option<(String, String)>,
+    pub(crate) effort_minutes: Option<u64>,
+}
+
+fn is_workable(status: TaskStatus) -> bool {
+    !matches!(status, TaskStatus::Complete | TaskStatus::Cancelled)
+}
+
+fn effort_of(snap: &BatchTaskSnap) -> u64 {
+    snap.effort_minutes.unwrap_or(DEFAULT_EFFORT_MINUTES)
+}
+
+/// Reverse `dependsOn` adjacency over workable tasks: dep id → workable
+/// tasks that depend on it. Duplicate `dependsOn` entries on a note dedup to
+/// one edge so consumers (the unlocked tie-break) count dependents, not edge
+/// occurrences.
+fn dependent_edges(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<&str, Vec<&str>> {
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (id, snap) in snaps {
+        if !is_workable(snap.status) {
+            continue;
+        }
+        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        for dep in deps {
+            dependents.entry(dep).or_default().push(id);
+        }
+    }
+    dependents
+}
+
+/// Per-task critical-path detail: effort-weighted priority plus whether the
+/// chain attaining it carries at least one explicit (parsed) estimate.
+type PathDetail = (u64, bool);
+
+/// Effort-weighted critical-path detail for every workable task: own effort
+/// plus the longest chain of workable dependents downstream, computed in one
+/// topological (Kahn) pass over the reverse-`dependsOn` graph, alongside
+/// whether that chain contains any explicit estimate (vs pure
+/// [`DEFAULT_EFFORT_MINUTES`] defaults). `dependsOn` is cycle-checked at
+/// write time; leftover nodes from a defensive cycle fall back to their own
+/// effort.
+fn critical_path_details(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<String, PathDetail> {
+    let workable: HashSet<&str> = snaps
+        .iter()
+        .filter(|(_, s)| is_workable(s.status))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut indegree: HashMap<&str, usize> = workable.iter().map(|id| (*id, 0)).collect();
+    for (id, snap) in snaps {
+        if !workable.contains(id.as_str()) {
+            continue;
+        }
+        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        for dep in deps {
+            if workable.contains(dep) {
+                dependents.entry(dep).or_default().push(id);
+                *indegree.get_mut(id.as_str()).unwrap() += 1;
+            }
+        }
+    }
+    let mut queue: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    let mut order: Vec<&str> = Vec::new();
+    while let Some(id) = queue.pop() {
+        order.push(id);
+        for dependent in dependents.get(id).into_iter().flatten() {
+            let deg = indegree.get_mut(*dependent).unwrap();
+            *deg -= 1;
+            if *deg == 0 {
+                queue.push(dependent);
+            }
+        }
+    }
+    // Sinks-first: every dependent's detail exists before its dep's. The
+    // estimate flag propagates along max-attaining chains only (any of them
+    // on a tie), so it says something about the reported number itself.
+    let mut details: HashMap<String, PathDetail> = HashMap::new();
+    for id in order.iter().rev() {
+        let downstream: Vec<&PathDetail> = dependents
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|d| details.get(*d))
+            .collect();
+        let max = downstream.iter().map(|(p, _)| *p).max().unwrap_or(0);
+        let chain_estimated = downstream
+            .iter()
+            .any(|(p, estimated)| *p == max && *estimated);
+        let own = &snaps[*id];
+        details.insert(
+            (*id).to_string(),
+            (
+                effort_of(own).saturating_add(max),
+                own.effort_minutes.is_some() || chain_estimated,
+            ),
+        );
+    }
+    for id in &workable {
+        details
+            .entry((*id).to_string())
+            .or_insert_with(|| (effort_of(&snaps[*id]), snaps[*id].effort_minutes.is_some()));
+    }
+    details
+}
+
+/// Effort-weighted critical-path priority for every workable task (see
+/// [`critical_path_details`]).
+pub(crate) fn critical_path_priorities(
+    snaps: &HashMap<String, BatchTaskSnap>,
+) -> HashMap<String, u64> {
+    critical_path_details(snaps)
+        .into_iter()
+        .map(|(id, (priority, _))| (id, priority))
+        .collect()
+}
+
+/// Remaining serial work: the longest effort-weighted `dependsOn` chain
+/// through the requested tasks (their critical-path priority already spans
+/// all downstream dependents). `Some` only when the chain attaining the
+/// reported max carries at least one parsed estimate — a number that is pure
+/// 30-min defaults is suppressed even if an unrelated requested subtree has
+/// an estimate. Deliberately downstream-only: an incomplete upstream dep
+/// outside the requested set does NOT count toward the estimate, so partial
+/// batches can understate total remaining serial time.
+pub(crate) fn serial_remaining_minutes(
+    requested: &[String],
+    snaps: &HashMap<String, BatchTaskSnap>,
+) -> Option<u64> {
+    let details = critical_path_details(snaps);
+    let requested_details: Vec<&PathDetail> =
+        requested.iter().filter_map(|id| details.get(id)).collect();
+    let minutes = requested_details.iter().map(|(p, _)| *p).max()?;
+    let estimated = requested_details
+        .iter()
+        .any(|(p, estimated)| *p == minutes && *estimated);
+    (minutes > 0 && estimated).then_some(minutes)
 }
 
 /// Classified disposition for one requested task.
@@ -57,7 +213,9 @@ pub(crate) enum BatchDisposition {
 /// `conflictsWith` edges, and which tasks have live assigned agents. The
 /// conflict relation is treated as symmetric (undirected closure over the
 /// whole snapshot), and tasks started earlier in this same batch count toward
-/// the running set for later entries.
+/// the running set for later entries. Under `greedy: false`, startable tasks
+/// are admitted in critical-path-priority order (see the module docs), not
+/// request order — the output order still follows the request.
 pub(crate) fn classify_batch_tasks(
     requested: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
@@ -75,15 +233,15 @@ pub(crate) fn classify_batch_tasks(
     // Running set: tasks with a live assigned agent that are still workable.
     let mut active: HashSet<&str> = snaps
         .iter()
-        .filter(|(_, s)| {
-            s.live_agent.is_some()
-                && !matches!(s.status, TaskStatus::Complete | TaskStatus::Cancelled)
-        })
+        .filter(|(_, s)| s.live_agent.is_some() && is_workable(s.status))
         .map(|(id, _)| id.as_str())
         .collect();
 
+    // First pass: fixed dispositions (terminal / running / dep-blocked);
+    // conflict-free dep-satisfied tasks are candidates for admission.
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut out: Vec<(String, Option<BatchDisposition>)> = Vec::new();
+    let mut startable: Vec<&str> = Vec::new();
     for id in requested {
         if !seen.insert(id.as_str()) {
             continue;
@@ -92,14 +250,14 @@ pub(crate) fn classify_batch_tasks(
             continue; // caller validated existence; defensive skip
         };
         let disposition = match snap.status {
-            TaskStatus::Complete => BatchDisposition::SkippedComplete,
-            TaskStatus::Cancelled => BatchDisposition::SkippedCancelled,
+            TaskStatus::Complete => Some(BatchDisposition::SkippedComplete),
+            TaskStatus::Cancelled => Some(BatchDisposition::SkippedCancelled),
             _ => {
                 if let Some((agent_id, agent_name)) = &snap.live_agent {
-                    BatchDisposition::SkippedAlreadyRunning {
+                    Some(BatchDisposition::SkippedAlreadyRunning {
                         agent_id: agent_id.clone(),
                         agent_name: agent_name.clone(),
-                    }
+                    })
                 } else {
                     let unmet: Vec<String> = snap
                         .depends_on
@@ -122,44 +280,92 @@ pub(crate) fn classify_batch_tasks(
                             })
                             .cloned()
                             .collect();
-                        BatchDisposition::HeldOnDeps {
+                        Some(BatchDisposition::HeldOnDeps {
                             unmet,
                             decision_needed,
-                        }
+                        })
                     } else {
-                        let mut overlapping: Vec<String> = conflicts
-                            .get(id.as_str())
-                            .map(|neighbors| {
-                                neighbors
-                                    .iter()
-                                    .filter(|n| active.contains(**n))
-                                    .map(|n| n.to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        overlapping.sort();
-                        if overlapping.is_empty() {
-                            active.insert(id.as_str());
-                            BatchDisposition::Start {
-                                conflicts_with: Vec::new(),
-                            }
-                        } else if greedy {
-                            active.insert(id.as_str());
-                            BatchDisposition::Start {
-                                conflicts_with: overlapping,
-                            }
-                        } else {
-                            BatchDisposition::HeldOnConflict {
-                                conflicts_with: overlapping,
-                            }
-                        }
+                        startable.push(id.as_str());
+                        None
                     }
                 }
             }
         };
         out.push((id.clone(), disposition));
     }
-    out
+
+    // Admission. Greedy admits everything in request order (conflicts named
+    // against the active-so-far set); greedy-off is the deterministic
+    // critical-path list scheduling documented on the module: descending
+    // priority, ties by more-dependents-unlocked, then shortest effort, then
+    // task id.
+    if !greedy {
+        let priorities = critical_path_priorities(snaps);
+        let dependents = dependent_edges(snaps);
+        startable.sort_by(|a, b| {
+            let priority = |id: &str| priorities.get(id).copied().unwrap_or(0);
+            let unlocked = |id: &str| dependents.get(id).map_or(0, |d| d.len());
+            priority(b)
+                .cmp(&priority(a))
+                .then(unlocked(b).cmp(&unlocked(a)))
+                .then(effort_of(&snaps[*a]).cmp(&effort_of(&snaps[*b])))
+                .then(a.cmp(b))
+        });
+    }
+    let mut admitted_overlaps: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut held_on_conflict: HashSet<&str> = HashSet::new();
+    for id in startable {
+        let mut overlapping: Vec<String> = conflicts
+            .get(id)
+            .map(|neighbors| {
+                neighbors
+                    .iter()
+                    .filter(|n| active.contains(**n))
+                    .map(|n| n.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        overlapping.sort();
+        if overlapping.is_empty() || greedy {
+            active.insert(id);
+            admitted_overlaps.insert(id, overlapping);
+        } else {
+            held_on_conflict.insert(id);
+        }
+    }
+
+    out.into_iter()
+        .map(|(id, disposition)| {
+            let disposition = disposition.unwrap_or_else(|| {
+                if held_on_conflict.contains(id.as_str()) {
+                    // Report overlap against the FINAL admitted/running set:
+                    // an admission decided after the hold can add overlap.
+                    let mut overlapping: Vec<String> = conflicts
+                        .get(id.as_str())
+                        .map(|neighbors| {
+                            neighbors
+                                .iter()
+                                .filter(|n| active.contains(**n))
+                                .map(|n| n.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    overlapping.sort();
+                    BatchDisposition::HeldOnConflict {
+                        conflicts_with: overlapping,
+                    }
+                } else {
+                    BatchDisposition::Start {
+                        conflicts_with: admitted_overlaps
+                            .get(id.as_str())
+                            .cloned()
+                            .unwrap_or_default(),
+                    }
+                }
+            });
+            (id, disposition)
+        })
+        .collect()
 }
 
 /// Project the unlock plan: which of the held tasks become startable once the
@@ -216,7 +422,13 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             conflicts_with: conflicts.iter().map(|s| s.to_string()).collect(),
             live_agent: None,
+            effort_minutes: None,
         }
+    }
+
+    fn with_effort(mut s: BatchTaskSnap, minutes: u64) -> BatchTaskSnap {
+        s.effort_minutes = Some(minutes);
+        s
     }
 
     fn running(mut s: BatchTaskSnap) -> BatchTaskSnap {
@@ -226,6 +438,13 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn started_ids(out: &[(String, BatchDisposition)]) -> Vec<&str> {
+        out.iter()
+            .filter(|(_, d)| matches!(d, BatchDisposition::Start { .. }))
+            .map(|(id, _)| id.as_str())
+            .collect()
     }
 
     #[test]
@@ -402,5 +621,240 @@ mod tests {
         let classified = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps, false);
         let unlocked = project_unlock_plan(&classified, &snaps, &[]);
         assert_eq!(unlocked, Vec::<String>::new());
+    }
+
+    #[test]
+    fn no_two_conflicting_tasks_ever_co_admitted_greedy_off() {
+        // Conflict edges a—b, b—c, c—d (declared on one side each; the
+        // symmetric closure covers both directions). No greedy-off start set
+        // may contain both endpoints of any edge.
+        let mut snaps = HashMap::new();
+        snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &["b"]));
+        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &["c"]));
+        snaps.insert("c".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("d".into(), snap(TaskStatus::NotStarted, &[], &["c"]));
+        let out = classify_batch_tasks(&ids(&["a", "b", "c", "d"]), &snaps, false);
+        let started = started_ids(&out);
+        for (id, s) in snaps.iter() {
+            for other in &s.conflicts_with {
+                assert!(
+                    !(started.contains(&id.as_str()) && started.contains(&other.as_str())),
+                    "conflicting pair {id}—{other} co-admitted: {out:?}"
+                );
+            }
+        }
+        assert!(!started.is_empty(), "at least one task admitted: {out:?}");
+    }
+
+    #[test]
+    fn longer_dependency_chain_admitted_before_equal_conflict_shorter_one() {
+        // `short` and `long` conflict; `long` heads a 3-task dependsOn chain
+        // while `short` heads a 1-task chain. Request order puts `short`
+        // first — greedy-off must still admit `long` (higher critical-path
+        // priority) and hold `short`.
+        let mut snaps = HashMap::new();
+        snaps.insert("long".into(), snap(TaskStatus::NotStarted, &[], &["short"]));
+        snaps.insert("mid".into(), snap(TaskStatus::NotStarted, &["long"], &[]));
+        snaps.insert("leaf".into(), snap(TaskStatus::NotStarted, &["mid"], &[]));
+        snaps.insert("short".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        let out = classify_batch_tasks(&ids(&["short", "long"]), &snaps, false);
+        // Output order still follows the request.
+        assert_eq!(out[0].0, "short");
+        assert_eq!(
+            out[0].1,
+            BatchDisposition::HeldOnConflict {
+                conflicts_with: vec!["long".into()]
+            }
+        );
+        assert_eq!(
+            out[1].1,
+            BatchDisposition::Start {
+                conflicts_with: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn effort_weighted_priority_beats_hop_count() {
+        // `heavy` unlocks one 300-min dependent; `chatty` heads a 2-hop chain
+        // of 10-min tasks (30 total). Effort-weighted critical path admits
+        // `heavy` (330 > 30) despite the shorter hop count.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "heavy".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &["chatty"]), 30),
+        );
+        snaps.insert(
+            "big".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["heavy"], &[]), 300),
+        );
+        snaps.insert(
+            "chatty".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 10),
+        );
+        snaps.insert(
+            "c2".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["chatty"], &[]), 10),
+        );
+        snaps.insert(
+            "c3".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["c2"], &[]), 10),
+        );
+        let out = classify_batch_tasks(&ids(&["chatty", "heavy"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["heavy"]);
+    }
+
+    #[test]
+    fn ties_break_by_unlock_count_then_effort_then_id() {
+        // Equal critical-path priority (60 each): `u` unlocks two dependents,
+        // `v` one — `u` wins the unlock-count tie and `v` is held.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "u".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &["v"]), 30),
+        );
+        snaps.insert(
+            "ud1".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["u"], &[]), 30),
+        );
+        snaps.insert(
+            "ud2".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["u"], &[]), 30),
+        );
+        snaps.insert(
+            "v".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 30),
+        );
+        snaps.insert(
+            "vd1".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["v"], &[]), 30),
+        );
+        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["u"]);
+
+        // Equal priority (50) and unlock count (1); own effort 10 vs 20 —
+        // shortest-processing-time admits `zquick` even though its id sorts
+        // after `slow`.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "zquick".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &["slow"]), 10),
+        );
+        snaps.insert(
+            "slow".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 20),
+        );
+        snaps.insert(
+            "qd".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["zquick"], &[]), 40),
+        );
+        snaps.insert(
+            "sd".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["slow"], &[]), 30),
+        );
+        let out = classify_batch_tasks(&ids(&["slow", "zquick"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["zquick"]);
+
+        // Everything ties → lexicographically smaller id wins.
+        let mut snaps = HashMap::new();
+        snaps.insert("x".into(), snap(TaskStatus::NotStarted, &[], &["y"]));
+        snaps.insert("y".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        let out = classify_batch_tasks(&ids(&["y", "x"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["x"]);
+    }
+
+    #[test]
+    fn critical_path_priorities_span_chains_and_skip_terminal_tasks() {
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "a".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 60),
+        );
+        snaps.insert(
+            "b".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["a"], &[]), 120),
+        );
+        // Unestimated → 30-min default in the chain math.
+        snaps.insert("c".into(), snap(TaskStatus::NotStarted, &["b"], &[]));
+        // Terminal dependents contribute nothing.
+        snaps.insert(
+            "done".into(),
+            with_effort(snap(TaskStatus::Complete, &["a"], &[]), 999),
+        );
+        let priorities = critical_path_priorities(&snaps);
+        assert_eq!(priorities.get("c"), Some(&30));
+        assert_eq!(priorities.get("b"), Some(&150));
+        assert_eq!(priorities.get("a"), Some(&210));
+        assert!(!priorities.contains_key("done"));
+    }
+
+    #[test]
+    fn serial_remaining_minutes_requires_estimates_and_spans_downstream() {
+        // No estimates anywhere → suppressed.
+        let mut snaps = HashMap::new();
+        snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &["a"], &[]));
+        assert_eq!(serial_remaining_minutes(&ids(&["a"]), &snaps), None);
+
+        // A downstream (non-requested) estimate is enough to surface the
+        // number; the unestimated requested task uses the 30-min default.
+        snaps.get_mut("b").unwrap().effort_minutes = Some(90);
+        assert_eq!(serial_remaining_minutes(&ids(&["a"]), &snaps), Some(120));
+
+        // Terminal requested tasks contribute nothing.
+        snaps.get_mut("a").unwrap().status = TaskStatus::Complete;
+        assert_eq!(serial_remaining_minutes(&ids(&["a"]), &snaps), None);
+        // ...but a workable requested task still reports its own chain.
+        assert_eq!(serial_remaining_minutes(&ids(&["b"]), &snaps), Some(90));
+    }
+
+    #[test]
+    fn serial_remaining_suppressed_when_max_chain_is_pure_defaults() {
+        // `a` is isolated with a real estimate; `b` (no estimate) heads a
+        // longer chain of pure 30-min defaults that attains the max. The
+        // reported number would say nothing real → suppressed.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "a".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 10),
+        );
+        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("b1".into(), snap(TaskStatus::NotStarted, &["b"], &[]));
+        snaps.insert("b2".into(), snap(TaskStatus::NotStarted, &["b1"], &[]));
+        snaps.insert("b3".into(), snap(TaskStatus::NotStarted, &["b2"], &[]));
+        assert_eq!(serial_remaining_minutes(&ids(&["a", "b"]), &snaps), None);
+        // Estimating anywhere on the max-attaining chain surfaces it.
+        snaps.get_mut("b2").unwrap().effort_minutes = Some(30);
+        assert_eq!(
+            serial_remaining_minutes(&ids(&["a", "b"]), &snaps),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn duplicate_depends_on_entries_count_once_in_the_unlock_tie_break() {
+        // `u` and `v` conflict with equal critical-path priority (60 each)
+        // and one real dependent each — but `vd` duplicates its dep on `v`.
+        // Double-counting edges would hand `v` the unlock tie (2 > 1);
+        // deduped, the tie falls through to the id tie-break and `u` wins.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "u".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &["v"]), 30),
+        );
+        snaps.insert(
+            "ud".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["u"], &[]), 30),
+        );
+        snaps.insert(
+            "v".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 30),
+        );
+        snaps.insert(
+            "vd".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["v", "v"], &[]), 30),
+        );
+        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["u"]);
     }
 }

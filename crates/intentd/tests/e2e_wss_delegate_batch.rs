@@ -247,6 +247,7 @@ async fn seed_task<S>(
     title: &str,
     depends_on: &[&str],
     conflicts_with: &[&str],
+    effort: Option<&str>,
 ) -> String
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -269,6 +270,9 @@ where
     }
     if !conflicts_with.is_empty() {
         params["conflictsWith"] = json!(conflicts_with);
+    }
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
     }
     let marked = wss_rpc(ws, id_base + 1, "task.markAsTask", params).await;
     assert_eq!(marked["ok"], json!(true), "markAsTask ok: {marked}");
@@ -330,10 +334,11 @@ async fn batch_delegate_request_response_shape_over_wss() {
         .expect("workspace id")
         .to_string();
 
-    // t1 ready; t2 dependsOn t1; t3 conflictsWith t1.
-    let t1 = seed_task(&mut ws, 20, &ws_id, "T1", &[], &[]).await;
-    let t2 = seed_task(&mut ws, 22, &ws_id, "T2", &[&t1], &[]).await;
-    let t3 = seed_task(&mut ws, 24, &ws_id, "T3", &[], &[&t1]).await;
+    // t1 ready (~1h); t2 dependsOn t1 (~30 min); t3 conflictsWith t1 (no
+    // estimate → 30-min default in the critical-path math).
+    let t1 = seed_task(&mut ws, 20, &ws_id, "T1", &[], &[], Some("~1h")).await;
+    let t2 = seed_task(&mut ws, 22, &ws_id, "T2", &[&t1], &[], Some("30 min")).await;
+    let t3 = seed_task(&mut ws, 24, &ws_id, "T3", &[], &[&t1], None).await;
 
     let resp = wss_rpc(
         &mut ws,
@@ -378,6 +383,21 @@ async fn batch_delegate_request_response_shape_over_wss() {
             .as_str()
             .unwrap()
             .contains("re-call agent.delegate"),
+        "{resp}"
+    );
+    // Estimates exist (t1 ~1h, t2 30 min), so the plan surfaces the
+    // effort-weighted critical path: t1 → t2 = 60 + 30 = 90 min (t3's
+    // 30-min-default chain is shorter).
+    assert_eq!(
+        resp["unlockPlan"]["criticalPathMinutes"],
+        json!(90),
+        "{resp}"
+    );
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("~90 min of serial work remains on the critical path"),
         "{resp}"
     );
 
