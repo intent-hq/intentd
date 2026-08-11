@@ -21244,6 +21244,217 @@ mod clone_orchestration {
     }
 }
 
+/// `repo.warmCache` (PROTOCOL §5.6): opportunistic background refresh of the
+/// daemon repo cache with a global single-flight — accept one warm, reject a
+/// second while in flight with `WarmInFlight`, clear the flag on completion.
+mod repo_warm_cache {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{Error, WorkspaceApi};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::Services;
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a small git repo with one commit; returns the guard.
+    fn seed_repo(prefix: &str) -> TempDir {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    async fn services_with_root(root: &TempDir) -> (Services, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        (svc, tmp)
+    }
+
+    /// Await the warm's detached completion: poll until the cache slot for
+    /// `owner/repo` exists AND a follow-up warm is accepted (flag cleared).
+    async fn wait_for_warm_completion(svc: &Services, root: &std::path::Path, url: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match svc.repo_warm_cache(url.to_string()).await {
+                Ok(v) => {
+                    let cache = root
+                        .join(".repo-cache")
+                        .join(v["owner"].as_str().unwrap())
+                        .join(v["repo"].as_str().unwrap());
+                    // The accepted re-warm proves the flag cleared; the
+                    // populated cache proves the first ensure ran.
+                    assert!(cache.join(".git").exists(), "repo cache populated");
+                    return;
+                }
+                Err(Error::WarmInFlight { .. }) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "warm did not complete in time"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("unexpected warm error: {e}"),
+            }
+        }
+    }
+
+    /// Happy path: the warm is accepted, returns `{ started, owner, repo }`
+    /// immediately, populates the cache in the background, and clears the
+    /// in-flight flag so a later warm is accepted again.
+    #[tokio::test]
+    async fn warm_starts_populates_cache_and_clears_flag() {
+        let source = seed_repo("intentd-warm-src");
+        let root = unique_dir("intentd-warm-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let v = svc
+            .repo_warm_cache(url.clone())
+            .await
+            .expect("warm accepted");
+        assert_eq!(v["started"], serde_json::json!(true));
+        let owner = v["owner"].as_str().expect("owner in result").to_string();
+        let repo = v["repo"].as_str().expect("repo in result").to_string();
+        assert_eq!(
+            repo,
+            source.0.file_name().unwrap().to_str().unwrap(),
+            "repo derived from the URL"
+        );
+        assert!(!owner.is_empty(), "owner derived from the URL");
+
+        wait_for_warm_completion(&svc, &root.0, &url).await;
+    }
+
+    /// Busy: while a warm is in flight (its ensure parked behind the held
+    /// per-repo cache lock), a second call — same repo or any other — is
+    /// rejected with `WarmInFlight` naming the repo being warmed.
+    /// Multi-thread flavor: the test thread blocks on the held-signal recv
+    /// while the lock holder runs on the blocking pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_warm_rejected_while_in_flight() {
+        let source = seed_repo("intentd-warm-busy-src");
+        let root = unique_dir("intentd-warm-busy-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
+        let cache_path = root.0.join(".repo-cache").join(&owner).join(&repo);
+
+        // Park the warm's ensure behind the per-repo cache lock so the
+        // in-flight window is deterministic.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let lock_holder = tokio::spawn(async move {
+            intent_git::repo_cache::with_cache_lock_blocking(&cache_path, move || {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let v = svc
+            .repo_warm_cache(url.clone())
+            .await
+            .expect("warm accepted");
+        assert_eq!(v["started"], serde_json::json!(true));
+
+        match svc.repo_warm_cache(url.clone()).await {
+            Err(Error::WarmInFlight {
+                owner: busy_owner,
+                repo: busy_repo,
+            }) => {
+                assert_eq!(busy_owner, owner, "busy error names the warming owner");
+                assert_eq!(busy_repo, repo, "busy error names the warming repo");
+            }
+            other => panic!("expected WarmInFlight, got {other:?}"),
+        }
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap().unwrap();
+        wait_for_warm_completion(&svc, &root.0, &url).await;
+    }
+
+    /// A URL whose owner/repo segments would be rejected by the cache ensure
+    /// (path escapes like `..`) is `-32602` up front and never claims the
+    /// single-flight slot — a malformed request cannot block valid warms.
+    #[tokio::test]
+    async fn traversal_segments_rejected_before_claiming_slot() {
+        let source = seed_repo("intentd-warm-trav-src");
+        let root = unique_dir("intentd-warm-trav-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        match svc
+            .repo_warm_cache("https://github.com/../repo".to_string())
+            .await
+        {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("owner"), "names the bad segment: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // The rejected call left the slot free: a valid warm is accepted.
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.repo_warm_cache(url)
+            .await
+            .expect("valid warm accepted after the rejected one");
+    }
+
+    /// A URL with no owner/repo pair is rejected with `-32602` and never
+    /// claims the single-flight slot.
+    #[tokio::test]
+    async fn invalid_url_is_invalid_params() {
+        let source = seed_repo("intentd-warm-inv-src");
+        let root = unique_dir("intentd-warm-inv-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        match svc.repo_warm_cache("not-a-repo-url".to_string()).await {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("owner/repo"), "actionable message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // The rejected call left the slot free: a valid warm is accepted.
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.repo_warm_cache(url)
+            .await
+            .expect("valid warm accepted after the rejected one");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A6 verifier hooks: surgical mutations schedule line-attribution recompute;
 // composition-root sweeper spawns as an abortable task.
