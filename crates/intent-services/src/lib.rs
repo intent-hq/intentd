@@ -7160,8 +7160,10 @@ fn ready_tasks_changed_event(
 
 /// Build a `task:ready-tasks-changed` change event for a non-status trigger
 /// (monorepo#1981): a `task.setRelations` write that changed `dependsOn`
-/// (`reason: "relations-changed"`) or the deletion of a task note other tasks
-/// depend on (`reason: "note-deleted"`). The `triggeredBy` variant is additive
+/// (`reason: "relations-changed"`) or the deletion of a task note that moves
+/// the ready set — one other tasks depend on, one that was itself ready, or
+/// the last incomplete child of a parent (monorepo#2006) — with
+/// `reason: "note-deleted"`. The `triggeredBy` variant is additive
 /// — `{ noteId, reason }`, no status fields — so status-change emissions stay
 /// byte-identical.
 fn ready_tasks_changed_reason_event(
@@ -15319,6 +15321,15 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Scope-check first so a foreign/absent note yields the peer message.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            // Snapshot the pre-delete note list for the ready-set comparison
+            // below: the `note_parent_set_null_on_delete` trigger clears each
+            // child's `parent_id` on delete, so the pre-delete tree cannot be
+            // reconstructed from the post-delete rows.
+            let before = if note.metadata.task.is_some() {
+                Some(store.list_notes(&workspace_id).await?)
+            } else {
+                None
+            };
             store
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
@@ -15330,21 +15341,35 @@ impl WorkspaceApi for Services {
             .await;
             if let Some(task) = &note.metadata.task {
                 let remaining = store.list_notes(&workspace_id).await?;
-                // Deleting a task note other tasks dependOn moves the
-                // readiness predicate — a dangling `dependsOn` edge counts as
-                // unmet, so deleting a previously-`complete` dep flips its
-                // dependents out of the ready set (monorepo#1981). Recompute +
-                // broadcast with the `reason: "note-deleted"` trigger variant,
-                // before the dependent re-announce below (same ordering as the
-                // status-transition path).
+                // Deleting a task note can move the readiness predicate three
+                // ways: a dangling `dependsOn` edge counts as unmet, so
+                // deleting a previously-`complete` dep flips its dependents
+                // out of the ready set (monorepo#1981); deleting a task that
+                // is itself in the ready set silently removes its id; and
+                // deleting the last incomplete task child satisfies the tree
+                // rule, so the parent ENTERS the set (both monorepo#2006).
+                // Recompute + broadcast with the `reason: "note-deleted"`
+                // trigger variant, before the dependent re-announce below
+                // (same ordering as the status-transition path). Dependent
+                // deletes keep the #1981 always-emit contract; otherwise the
+                // pre-delete ready set (computed from the snapshot taken
+                // before the store delete — see above) is compared with the
+                // post-delete set, and a delete that provably cannot move the
+                // set (e.g. a terminal task nobody depends on) still emits no
+                // recompute. `compute_ready_task_ids` orders by
+                // peerOrder/createdAt, so Vec equality is set equality.
                 let depended_on = remaining.iter().any(|n| {
                     n.metadata
                         .task
                         .as_ref()
                         .is_some_and(|t| t.depends_on.iter().any(|d| d == &note_id))
                 });
-                if depended_on {
-                    let ready_task_ids = compute_ready_task_ids(&remaining);
+                let ready_task_ids = compute_ready_task_ids(&remaining);
+                let ready_set_moved = depended_on
+                    || before
+                        .as_deref()
+                        .is_none_or(|b| compute_ready_task_ids(b) != ready_task_ids);
+                if ready_set_moved {
                     publish_event(
                         &bus,
                         ready_tasks_changed_reason_event(
