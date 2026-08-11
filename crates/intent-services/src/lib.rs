@@ -3715,7 +3715,12 @@ impl Services {
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
         // failures fail open (no annotation); the wake always proceeds.
-        let stall = if watches.is_empty() {
+        // monorepo#1898: an event payload carrying a report (copied from the
+        // session at emit time) means the child DID report — suppress the
+        // suspicion entirely (text AND `stallSuspected` metadata) even if the
+        // persisted report was cleared since, so the machine-readable flag
+        // can never contradict the rendered `Report:` clause.
+        let stall = if watches.is_empty() || event_carries_report(&event.data) {
             None
         } else {
             self.stall_suspicion_for_completion(child_id, &event.event_type)
@@ -7966,6 +7971,19 @@ fn replace_uuid_tokens(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// monorepo#1898: does this completion event's payload carry a non-empty
+/// completion report (`completionReport`, canonical, or the legacy `report`
+/// key)? The report is copied from the session at emit time, so a carrying
+/// event means the child DID report — used to suppress the stall suspicion
+/// (text and `stallSuspected` metadata) even when the persisted session
+/// report was cleared after emit.
+pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| !r.is_empty())
 }
 
 /// Build a concise, human-readable wake string describing a child agent's

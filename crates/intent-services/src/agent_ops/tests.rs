@@ -20533,11 +20533,12 @@ async fn stall_annotation_skipped_when_task_review_required() {
     );
 }
 
-/// monorepo#1898: even when the stall predicate fires (task still
-/// `in_progress`, no PERSISTED report), a wake whose text rendered a
-/// `Report:` clause from the EVENT payload must not carry the contradictory
-/// "No completion report … may have stalled" tail — in both the standalone
-/// wake and the grouped after_all per-child line.
+/// monorepo#1898: even when the stall predicate would fire (task still
+/// `in_progress`, no PERSISTED report), an event payload carrying a
+/// `completionReport` means the child DID report — the wake must carry
+/// neither the contradictory "No completion report … may have stalled" tail
+/// nor the machine-readable `stallSuspected` metadata, in both the
+/// standalone wake and the grouped after_all per-child line.
 #[tokio::test]
 async fn stall_tail_never_contradicts_rendered_report() {
     let (_t, svc, ws) = setup().await;
@@ -20576,6 +20577,11 @@ async fn stall_tail_never_contradicts_rendered_report() {
     assert!(
         !text.contains(STALL_MARKER),
         "no contradictory tail after a Report: clause: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no contradictory machine-readable flag: {metadata}"
     );
 
     // Grouped after_all per-child line.
@@ -20618,6 +20624,17 @@ async fn stall_tail_never_contradicts_rendered_report() {
     assert!(
         !text.contains(STALL_MARKER),
         "no contradictory tail on the per-child line: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no contradictory flag in aggregated metadata: {metadata}"
+    );
+    assert!(
+        metadata["events"][0]["data"]
+            .get("stallSuspected")
+            .is_none(),
+        "no contradictory flag on the grouped raw event: {metadata}"
     );
 }
 
