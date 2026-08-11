@@ -438,15 +438,33 @@ impl Services {
 
         // Materialize the git payload BEFORE the rows land, so the seam can
         // rewrite the transformed workspace/sandbox rows to the target
-        // checkout (repository_path, checkout_mode, sandbox paths, dropped
-        // sandboxes) and the apply()'d versions are what the store commits.
-        // An error fails the commit: disk materialization is all-or-nothing,
-        // no rows have landed, and the staging session survives for retry or
-        // abort.
-        self.materialize_imported_git(&workspace_id, &extracted_dir, &mut outcome.rows)
+        // checkout (repository_path, checkout_mode, branch, sandbox paths,
+        // dropped sandboxes) and the apply()'d versions are what the store
+        // commits. An error fails the commit: disk materialization is
+        // all-or-nothing, no rows have landed, and the staging session
+        // survives for retry or abort.
+        let materialized = self
+            .materialize_imported_git(&workspace_id, &extracted_dir, &mut outcome.rows)
             .await?;
 
-        let imported_rows = self.store.transfer_import_rows(&outcome.rows).await?;
+        // If the row insert fails AFTER materialization succeeded, unwind
+        // the checkout/sandboxes and the known_repo registration so a
+        // retried commit does not hit "materialize target already exists"
+        // and no uncommitted import leaks into known_repo.
+        let imported_rows = match self.store.transfer_import_rows(&outcome.rows).await {
+            Ok(n) => n,
+            Err(e) => {
+                if let Some(out) = &materialized {
+                    crate::transfer_materialize::rollback_materialized(
+                        &self.store,
+                        out,
+                        &target_root.join(&workspace_id.0),
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
+        };
 
         // Rows are committed — the import can no longer be rolled back.
         // Everything below is best-effort enrichment of the now-live
@@ -513,24 +531,29 @@ impl Services {
     /// checkout in `known_repo`. Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
     /// rewrites (workspace `repository_path` → the new checkout,
-    /// `worktree_path` cleared, `checkout_mode` → direct, `base_commit_sha`
-    /// backfill, sandbox path rewrites, dropping sandbox rows whose branch
-    /// is absent from the bundle) are written back onto the JSON rows, so
-    /// the apply()'d versions are what land in the store. An error fails the
-    /// commit: materialization is all-or-nothing on disk, no rows have been
-    /// inserted, and the staging session survives for retry or abort.
+    /// `worktree_path` cleared, `checkout_mode` → direct, `branch` → the
+    /// bundled branch, `base_commit_sha` backfill, sandbox path rewrites,
+    /// dropping sandbox rows whose branch is absent from the bundle) are
+    /// written back onto the JSON rows, so the apply()'d versions are what
+    /// land in the store. An error fails the commit: materialization is
+    /// all-or-nothing on disk, no rows have been inserted, and the staging
+    /// session survives for retry or abort. Returns the materialization
+    /// result (`None` when the archive carries no repository) so the caller
+    /// can unwind it via [`rollback_materialized`] if a LATER commit step
+    /// fails.
     ///
     /// [`MaterializedGit::apply`]: crate::transfer_materialize::MaterializedGit::apply
+    /// [`rollback_materialized`]: crate::transfer_materialize::rollback_materialized
     async fn materialize_imported_git(
         &self,
         workspace_id: &WorkspaceId,
         extracted_dir: &Path,
         rows: &mut [(String, Vec<serde_json::Value>)],
-    ) -> Result<()> {
+    ) -> Result<Option<crate::transfer_materialize::MaterializedGit>> {
         let git_dir = extracted_dir.join("git");
         let bundle = git_dir.join("repo.bundle");
         if !bundle.exists() {
-            return Ok(()); // no repository in the archive
+            return Ok(None); // no repository in the archive
         }
         let refs = tokio::fs::read(git_dir.join("refs.json"))
             .await
@@ -594,6 +617,7 @@ impl Services {
                             "checkout_mode".to_string(),
                             serde_json::json!(ws.checkout_mode),
                         );
+                        map.insert("branch".to_string(), serde_json::json!(ws.branch));
                         map.insert(
                             "base_commit_sha".to_string(),
                             serde_json::json!(ws.base_commit_sha),
@@ -621,7 +645,7 @@ impl Services {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(Some(out))
     }
 
     /// Boot-style rehydration after a committed import so the workspace's
@@ -1744,12 +1768,15 @@ mod tests {
 
     /// Full `begin → chunk → commit` over an archive that carries a real git
     /// payload: a dirty workspace repo (staged + untracked) and one sandbox,
-    /// plus a sandbox row whose branch never made it into the bundle. Commit
-    /// must materialize the checkout and sandbox on disk, rewrite the stored
-    /// workspace row (repository_path → checkout, worktree_path cleared,
-    /// checkout_mode direct, base_commit_sha backfilled), rewrite the stored
-    /// sandbox path, drop the bundle-less sandbox row, and register the
-    /// checkout in known_repo.
+    /// plus a sandbox row whose branch never made it into the bundle. The
+    /// workspace ROW records a stale branch name (`feature-stale`) that
+    /// diverges from the branch HEAD actually pointed at when the bundle was
+    /// built (`feature`) — the bundle wins. Commit must materialize the
+    /// checkout and sandbox on disk, rewrite the stored workspace row
+    /// (repository_path → checkout, worktree_path cleared, checkout_mode
+    /// direct, branch → the bundled branch, base_commit_sha backfilled),
+    /// rewrite the stored sandbox path, drop the bundle-less sandbox row,
+    /// and register the checkout in known_repo.
     #[tokio::test]
     async fn import_commit_materializes_git() {
         let ws = WorkspaceId("ws-git-imported".to_string());
@@ -1799,10 +1826,12 @@ mod tests {
         }
         commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
 
-        // Source-side rows (DB-shaped, source-absolute paths).
+        // Source-side rows (DB-shaped, source-absolute paths). The row's
+        // `branch` is stale — HEAD is on `feature`, so the bundle records
+        // `feature` and the import must rewrite the row to match.
         let t = "2026-08-11T00:00:00Z";
         let ws_row = serde_json::json!({
-            "id": ws.0, "title": "Git WS", "branch": "feature",
+            "id": ws.0, "title": "Git WS", "branch": "feature-stale",
             "base_ref": "main", "status": "Active",
             "repository_path": repo.to_string_lossy(),
             "repository_name": "test-repo",
@@ -1865,7 +1894,8 @@ mod tests {
             .await
             .expect("commit");
 
-        // Stored workspace row: rewritten to the materialized checkout.
+        // Stored workspace row: rewritten to the materialized checkout, and
+        // the stale row branch replaced by the branch the bundle carried.
         let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
         let checkout = ws_root.0.join(&ws.0).join("test-repo");
         assert_eq!(
@@ -1877,6 +1907,7 @@ mod tests {
             imported.checkout_mode,
             Some(intent_core::CheckoutMode::Direct)
         );
+        assert_eq!(imported.branch, "feature", "row branch follows the bundle");
         assert_eq!(imported.base_commit_sha.as_deref(), Some(base.as_str()));
 
         // Checkout on disk: right branch/tip with the WIP snapshot unwound
@@ -1977,6 +2008,106 @@ mod tests {
         svc.workspace_import_abort_op(import_id)
             .await
             .expect("abort after failed commit");
+    }
+
+    /// If the row insert fails AFTER git materialization succeeded, the
+    /// commit unwinds the materialization: the checkout directory is
+    /// removed, the known_repo registration is dropped, and a retried
+    /// commit re-materializes cleanly instead of failing on "materialize
+    /// target already exists".
+    #[tokio::test]
+    async fn import_commit_rolls_back_materialization_on_row_failure() {
+        let ws = WorkspaceId("ws-git-rollback".to_string());
+        let ws_root = TempDir::new("import-git-rb-ws-root");
+        let assets_root = TempDir::new("import-git-rb-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let src = TempDir::new("import-git-rb-src");
+        let repo = src.0.join("source-repo");
+        init_repo(&repo);
+
+        let t = "2026-08-11T00:00:00Z";
+        let ws_row = serde_json::json!({
+            "id": ws.0, "title": "RB WS", "branch": "main", "status": "Active",
+            "repository_path": repo.to_string_lossy(),
+            "repository_name": "test-repo",
+            "created_at": t, "updated_at": t
+        });
+        // A note row with a column the schema does not have — the row
+        // insert fails after materialization has already succeeded.
+        let bad_note = serde_json::json!({
+            "id": "note-1", "workspace_id": ws.0, "title": "N",
+            "no_such_column": "boom",
+            "created_at": t, "updated_at": t
+        });
+
+        let src_ws = workspace_for_materialize(&ws, &ws_row);
+        let staging = src.0.join("staging");
+        let (bundle_path, refs) =
+            crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
+
+        let m = manifest(&ws);
+        let rows: Vec<(&str, Vec<serde_json::Value>)> =
+            vec![("workspace", vec![ws_row]), ("note", vec![bad_note])];
+        let archive = build_archive_with_git(&m, &rows, Some((&bundle_path, &refs)));
+        let sha = sha256_hex(&archive);
+
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk");
+
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("commit must fail on the bad row");
+        assert!(
+            err.to_string().contains("no column"),
+            "row insert failure surfaced: {err}"
+        );
+
+        // Materialization unwound: no checkout on disk, no known_repo
+        // registration, no rows landed.
+        let checkout = ws_root.0.join(&ws.0).join("test-repo");
+        assert!(!checkout.exists(), "checkout removed by rollback");
+        assert!(!ws_root.0.join(&ws.0).exists(), "workspace dir removed");
+        assert!(
+            svc.store
+                .list_known_repos()
+                .await
+                .expect("known repos")
+                .is_empty(),
+            "known_repo registration rolled back"
+        );
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+
+        // The session survived; a retried commit re-materializes cleanly
+        // and fails on the same row error — NOT on "materialize target
+        // already exists".
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("retry fails on the same rows");
+        assert!(
+            err.to_string().contains("no column"),
+            "retry re-materialized cleanly then hit the row error: {err}"
+        );
+        assert!(!checkout.exists(), "retry rollback also unwound");
+
+        svc.workspace_import_abort_op(import_id)
+            .await
+            .expect("abort after failed commits");
     }
 
     /// `begin` rejects: bad format version, version mismatch (naming both
