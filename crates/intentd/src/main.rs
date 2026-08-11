@@ -2493,7 +2493,8 @@ struct DataDirLock;
 
 /// Acquire the data-dir lock (§5.6): open/create `data_dir/intentd.lock` and take
 /// a non-blocking exclusive advisory `flock`. On contention another live instance
-/// already holds the lock, so refuse to start.
+/// already holds the lock, so refuse to start — naming the probable holder (from
+/// the pidfile) so logs and support bundles are actionable.
 #[cfg(unix)]
 fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
     use nix::fcntl::{Flock, FlockArg};
@@ -2508,9 +2509,31 @@ fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(DataDirLock { _lock: lock }),
         Err((_, errno)) => anyhow::bail!(
-            "intentd data dir {} is locked by another running instance ({errno}) — refusing to start a second instance",
-            config.data_dir.display()
+            "intentd data dir {} is locked by another running instance ({}) — refusing to start a second instance",
+            config.data_dir.display(),
+            lock_holder_detail(&config.pid_path, errno)
         ),
+    }
+}
+
+/// Describe the probable holder of a contended data-dir lock for the error
+/// message above: the pidfile's pid plus a signal-0 liveness verdict (e.g.
+/// `pid 12345, alive`). Falls back to the raw errno (`EAGAIN: ...`) when no
+/// pid is readable from the pidfile — the flock holder and the pidfile owner
+/// are the same live daemon in the normal contention case, but the pidfile is
+/// only a best-effort hint, never load-bearing for the locking semantics.
+#[cfg(unix)]
+fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
+    match read_pid(pid_path) {
+        Some(pid) => {
+            let liveness = if pid_is_alive(pid) {
+                "alive"
+            } else {
+                "not running"
+            };
+            format!("pid {pid}, {liveness}")
+        }
+        None => errno.to_string(),
     }
 }
 
@@ -3993,6 +4016,59 @@ mod tests {
         drop(guard);
         let _again =
             acquire_data_dir_lock(&config).expect("re-acquire succeeds after the guard is dropped");
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_names_live_pidfile_holder() {
+        let config = temp_config();
+        // Our own pid is trivially alive, standing in for the lock holder.
+        let pid = std::process::id();
+        std::fs::write(&config.pid_path, pid.to_string()).unwrap();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {pid}, alive")),
+            "error names the live holder: {err}"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_names_dead_pidfile_holder() {
+        let config = temp_config();
+        // A pid essentially guaranteed not to be running.
+        std::fs::write(&config.pid_path, "2147483640").unwrap();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains("pid 2147483640, not running"),
+            "error names the dead holder: {err}"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_falls_back_to_errno_without_pidfile() {
+        let config = temp_config();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains("EAGAIN"),
+            "error keeps the raw errno when no pidfile pid is readable: {err}"
+        );
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
