@@ -604,6 +604,7 @@ async fn handle_sub_fast_path(
             Ok(p) => {
                 let subscriptions::ChatSubscribeParams {
                     agent_id,
+                    since_message_id,
                     replace_group,
                 } = p;
                 if let Some(group) = replace_group.as_deref() {
@@ -631,6 +632,7 @@ async fn handle_sub_fast_path(
                 let handle = tokio::spawn(forward_chat_subscription(
                     api.clone(),
                     AgentId::from(agent_id),
+                    since_message_id,
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
@@ -759,14 +761,20 @@ async fn forward_note_subscription(
 /// into a `{ added, updated, removedIds }` block delta (CS-0 D2/D4/D6) pushed in
 /// strict seq order; `stream:end` reconciles against the persisted message so the
 /// snapshot + deltas equal a fresh `getConversation` snapshot (CS-3).
+///
+/// `since_message_id` (§7.1 resume) trims the seq-0 snapshot to the messages
+/// after that id (`resumed: true`) or falls back to the standard full page
+/// (`resumed: false`) — see [`subscriptions::chat_snapshot`].
 async fn forward_chat_subscription(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
+    since_message_id: Option<String>,
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: mpsc::Sender<String>,
 ) {
-    let snapshot = subscriptions::chat_snapshot(api.as_ref(), &agent_id).await;
+    let snapshot =
+        subscriptions::chat_snapshot(api.as_ref(), &agent_id, since_message_id.as_deref()).await;
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send(frame).await.is_err() {
         return;

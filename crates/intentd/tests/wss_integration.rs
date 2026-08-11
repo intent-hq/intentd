@@ -326,6 +326,47 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
+/// Send a `chat.subscribe` frame over a fresh WSS connection, wait for both
+/// the `{ subscriptionId }` response (matched on `id`) and the seq-0
+/// `subscription.push` snapshot, and return the snapshot object (§7.1).
+async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str, id: i64) -> Value {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("chat.subscribe frame timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == id {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let sub_resp = sub_resp.unwrap();
+    assert!(
+        sub_resp["result"]["subscriptionId"].as_str().is_some(),
+        "chat.subscribe returns subscriptionId: {sub_resp}"
+    );
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    snap["params"]["snapshot"].clone()
+}
+
 /// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
 /// `client_id` binding from `client.hello` persists across them (§16).
 async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> Vec<Value> {
@@ -6304,7 +6345,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
 /// `aroundMessageId` seek (centered page, `prevToken` walk newer, `-32602`
-/// on an unknown id), and the `chat.subscribe` seq-0 snapshot, all against
+/// on an unknown id), and the `chat.subscribe` seq-0 snapshot (standard,
+/// resumed via `sinceMessageId`, and the unknown-id fallback), all against
 /// one seeded 120-message session. Then the hydration regression at the wire
 /// level: with every row OLDER than the newest bounded page corrupted to
 /// non-JSON (which errors any path that decodes it — `agent.getSession`
@@ -6341,7 +6383,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
+    // Capture the id at seq 100 (inside the bounded newest page 70..=119) for
+    // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
+    let mut seq_100_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
@@ -6359,6 +6404,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .await
             .expect("append message")
             .id;
+        if i == 100 {
+            seq_100_message_id = newest_message_id.clone();
+        }
     }
 
     // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
@@ -6674,7 +6722,64 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         snapshot["nextToken"].as_str().is_some(),
         "truncated snapshot carries the older-pages cursor"
     );
+    assert!(
+        snapshot.get("resumed").is_none(),
+        "no sinceMessageId: snapshot carries no resumed key: {snapshot}"
+    );
     drop(sub);
+
+    // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
+    // bounded page yields only the messages AFTER it, `resumed: true`, and no
+    // older-pages cursor (the client already holds everything up to the id).
+    let resumed = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_100_message_id}"}}}}"#
+        ),
+        40,
+    )
+    .await;
+    let msgs = resumed["messages"].as_array().expect("resumed messages");
+    assert_eq!(
+        msgs.len(),
+        19,
+        "only rows after seq 100 (101..=119): {resumed}"
+    );
+    assert_eq!(msgs[0]["seq"], 101);
+    assert_eq!(msgs[18]["seq"], 119);
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["truncated"], false);
+    assert!(resumed["nextToken"].is_null(), "no gap cursor: {resumed}");
+    assert_eq!(
+        resumed["totalMessages"], 120,
+        "totalMessages stays the transcript-wide count"
+    );
+
+    // An unknown / pruned sinceMessageId falls back to the standard full
+    // bounded page with `resumed: false` — the client must rehydrate.
+    let fallback = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":41,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"msg-nope"}}}}"#
+        ),
+        41,
+    )
+    .await;
+    let msgs = fallback["messages"].as_array().expect("fallback messages");
+    assert_eq!(
+        msgs.len(),
+        50,
+        "full bounded page on unknown id: {fallback}"
+    );
+    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(fallback["resumed"], false);
+    assert_eq!(fallback["truncated"], true);
+    assert!(
+        fallback["nextToken"].as_str().is_some(),
+        "fallback keeps the older-pages cursor"
+    );
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
