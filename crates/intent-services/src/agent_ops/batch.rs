@@ -50,28 +50,35 @@ fn effort_of(snap: &BatchTaskSnap) -> u64 {
 }
 
 /// Reverse `dependsOn` adjacency over workable tasks: dep id → workable
-/// tasks that depend on it.
+/// tasks that depend on it. Duplicate `dependsOn` entries on a note dedup to
+/// one edge so consumers (the unlocked tie-break) count dependents, not edge
+/// occurrences.
 fn dependent_edges(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<&str, Vec<&str>> {
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
     for (id, snap) in snaps {
         if !is_workable(snap.status) {
             continue;
         }
-        for dep in &snap.depends_on {
-            dependents.entry(dep.as_str()).or_default().push(id);
+        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        for dep in deps {
+            dependents.entry(dep).or_default().push(id);
         }
     }
     dependents
 }
 
-/// Effort-weighted critical-path priority for every workable task: own
-/// effort plus the longest chain of workable dependents downstream, computed
-/// in one topological (Kahn) pass over the reverse-`dependsOn` graph.
-/// `dependsOn` is cycle-checked at write time; leftover nodes from a
-/// defensive cycle fall back to their own effort.
-pub(crate) fn critical_path_priorities(
-    snaps: &HashMap<String, BatchTaskSnap>,
-) -> HashMap<String, u64> {
+/// Per-task critical-path detail: effort-weighted priority plus whether the
+/// chain attaining it carries at least one explicit (parsed) estimate.
+type PathDetail = (u64, bool);
+
+/// Effort-weighted critical-path detail for every workable task: own effort
+/// plus the longest chain of workable dependents downstream, computed in one
+/// topological (Kahn) pass over the reverse-`dependsOn` graph, alongside
+/// whether that chain contains any explicit estimate (vs pure
+/// [`DEFAULT_EFFORT_MINUTES`] defaults). `dependsOn` is cycle-checked at
+/// write time; leftover nodes from a defensive cycle fall back to their own
+/// effort.
+fn critical_path_details(snaps: &HashMap<String, BatchTaskSnap>) -> HashMap<String, PathDetail> {
     let workable: HashSet<&str> = snaps
         .iter()
         .filter(|(_, s)| is_workable(s.status))
@@ -83,9 +90,10 @@ pub(crate) fn critical_path_priorities(
         if !workable.contains(id.as_str()) {
             continue;
         }
-        for dep in &snap.depends_on {
-            if workable.contains(dep.as_str()) {
-                dependents.entry(dep.as_str()).or_default().push(id);
+        let deps: HashSet<&str> = snap.depends_on.iter().map(|d| d.as_str()).collect();
+        for dep in deps {
+            if workable.contains(dep) {
+                dependents.entry(dep).or_default().push(id);
                 *indegree.get_mut(id.as_str()).unwrap() += 1;
             }
         }
@@ -106,66 +114,69 @@ pub(crate) fn critical_path_priorities(
             }
         }
     }
-    // Sinks-first: every dependent's priority exists before its dep's.
-    let mut priorities: HashMap<String, u64> = HashMap::new();
+    // Sinks-first: every dependent's detail exists before its dep's. The
+    // estimate flag propagates along max-attaining chains only (any of them
+    // on a tie), so it says something about the reported number itself.
+    let mut details: HashMap<String, PathDetail> = HashMap::new();
     for id in order.iter().rev() {
-        let downstream = dependents
+        let downstream: Vec<&PathDetail> = dependents
             .get(id)
             .into_iter()
             .flatten()
-            .filter_map(|d| priorities.get(*d))
-            .max()
-            .copied()
-            .unwrap_or(0);
-        priorities.insert(
+            .filter_map(|d| details.get(*d))
+            .collect();
+        let max = downstream.iter().map(|(p, _)| *p).max().unwrap_or(0);
+        let chain_estimated = downstream
+            .iter()
+            .any(|(p, estimated)| *p == max && *estimated);
+        let own = &snaps[*id];
+        details.insert(
             (*id).to_string(),
-            effort_of(&snaps[*id]).saturating_add(downstream),
+            (
+                effort_of(own).saturating_add(max),
+                own.effort_minutes.is_some() || chain_estimated,
+            ),
         );
     }
     for id in &workable {
-        priorities
+        details
             .entry((*id).to_string())
-            .or_insert_with(|| effort_of(&snaps[*id]));
+            .or_insert_with(|| (effort_of(&snaps[*id]), snaps[*id].effort_minutes.is_some()));
     }
-    priorities
+    details
+}
+
+/// Effort-weighted critical-path priority for every workable task (see
+/// [`critical_path_details`]).
+pub(crate) fn critical_path_priorities(
+    snaps: &HashMap<String, BatchTaskSnap>,
+) -> HashMap<String, u64> {
+    critical_path_details(snaps)
+        .into_iter()
+        .map(|(id, (priority, _))| (id, priority))
+        .collect()
 }
 
 /// Remaining serial work: the longest effort-weighted `dependsOn` chain
 /// through the requested tasks (their critical-path priority already spans
-/// all downstream dependents). `Some` only when at least one workable task in
-/// the requested set or its downstream closure carries a parsed estimate —
-/// otherwise the number would be pure 30-min defaults and is suppressed.
+/// all downstream dependents). `Some` only when the chain attaining the
+/// reported max carries at least one parsed estimate — a number that is pure
+/// 30-min defaults is suppressed even if an unrelated requested subtree has
+/// an estimate. Deliberately downstream-only: an incomplete upstream dep
+/// outside the requested set does NOT count toward the estimate, so partial
+/// batches can understate total remaining serial time.
 pub(crate) fn serial_remaining_minutes(
     requested: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
 ) -> Option<u64> {
-    let dependents = dependent_edges(snaps);
-    let mut stack: Vec<&str> = requested
+    let details = critical_path_details(snaps);
+    let requested_details: Vec<&PathDetail> =
+        requested.iter().filter_map(|id| details.get(id)).collect();
+    let minutes = requested_details.iter().map(|(p, _)| *p).max()?;
+    let estimated = requested_details
         .iter()
-        .map(|s| s.as_str())
-        .filter(|id| snaps.get(*id).is_some_and(|s| is_workable(s.status)))
-        .collect();
-    let mut closure: HashSet<&str> = stack.iter().copied().collect();
-    while let Some(id) = stack.pop() {
-        for dependent in dependents.get(id).into_iter().flatten() {
-            if closure.insert(dependent) {
-                stack.push(dependent);
-            }
-        }
-    }
-    if !closure
-        .iter()
-        .any(|id| snaps.get(*id).is_some_and(|s| s.effort_minutes.is_some()))
-    {
-        return None;
-    }
-    let priorities = critical_path_priorities(snaps);
-    let minutes = requested
-        .iter()
-        .filter_map(|id| priorities.get(id))
-        .max()
-        .copied()?;
-    (minutes > 0).then_some(minutes)
+        .any(|(p, estimated)| *p == minutes && *estimated);
+    (minutes > 0 && estimated).then_some(minutes)
 }
 
 /// Classified disposition for one requested task.
@@ -795,5 +806,55 @@ mod tests {
         assert_eq!(serial_remaining_minutes(&ids(&["a"]), &snaps), None);
         // ...but a workable requested task still reports its own chain.
         assert_eq!(serial_remaining_minutes(&ids(&["b"]), &snaps), Some(90));
+    }
+
+    #[test]
+    fn serial_remaining_suppressed_when_max_chain_is_pure_defaults() {
+        // `a` is isolated with a real estimate; `b` (no estimate) heads a
+        // longer chain of pure 30-min defaults that attains the max. The
+        // reported number would say nothing real → suppressed.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "a".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 10),
+        );
+        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("b1".into(), snap(TaskStatus::NotStarted, &["b"], &[]));
+        snaps.insert("b2".into(), snap(TaskStatus::NotStarted, &["b1"], &[]));
+        snaps.insert("b3".into(), snap(TaskStatus::NotStarted, &["b2"], &[]));
+        assert_eq!(serial_remaining_minutes(&ids(&["a", "b"]), &snaps), None);
+        // Estimating anywhere on the max-attaining chain surfaces it.
+        snaps.get_mut("b2").unwrap().effort_minutes = Some(30);
+        assert_eq!(
+            serial_remaining_minutes(&ids(&["a", "b"]), &snaps),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn duplicate_depends_on_entries_count_once_in_the_unlock_tie_break() {
+        // `u` and `v` conflict with equal critical-path priority (60 each)
+        // and one real dependent each — but `vd` duplicates its dep on `v`.
+        // Double-counting edges would hand `v` the unlock tie (2 > 1);
+        // deduped, the tie falls through to the id tie-break and `u` wins.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "u".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &["v"]), 30),
+        );
+        snaps.insert(
+            "ud".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["u"], &[]), 30),
+        );
+        snaps.insert(
+            "v".into(),
+            with_effort(snap(TaskStatus::NotStarted, &[], &[]), 30),
+        );
+        snaps.insert(
+            "vd".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["v", "v"], &[]), 30),
+        );
+        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps, false);
+        assert_eq!(started_ids(&out), vec!["u"]);
     }
 }

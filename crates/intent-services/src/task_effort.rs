@@ -113,8 +113,9 @@ fn to_minutes(value: f64) -> Option<u64> {
 
 /// Parse an `estimatedEffort` string into minutes. `~` prefixes are
 /// stripped, ranges (`-`, `–`, `—`, or `" to "`) resolve to their midpoint,
-/// and a bare number reads as minutes. Unparseable input → `None` (callers
-/// use [`DEFAULT_EFFORT_MINUTES`] for scheduling math).
+/// hyphen-joined units (`"90-minute"`) read as plain amounts, and a bare
+/// number reads as minutes. Unparseable input → `None` (callers use
+/// [`DEFAULT_EFFORT_MINUTES`] for scheduling math).
 pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
     let s = raw
         .trim()
@@ -124,14 +125,29 @@ pub(crate) fn parse_effort_minutes(raw: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
+    // A separator that fails to parse as a range falls through rather than
+    // failing the whole parse — "90-minute" is a joiner, not a range.
     for separator in ["–", "—", " to ", "-"] {
         if let Some((left, right)) = s.split_once(separator) {
-            let (right_minutes, right_unit) = side_minutes(right, None)?;
-            let (left_minutes, _) = side_minutes(left, right_unit)?;
-            return to_minutes((left_minutes + right_minutes) / 2.0);
+            let range = side_minutes(right, None).and_then(|(right_minutes, right_unit)| {
+                let (left_minutes, _) = side_minutes(left, right_unit)?;
+                to_minutes((left_minutes + right_minutes) / 2.0)
+            });
+            if range.is_some() {
+                return range;
+            }
         }
     }
-    let (minutes, _) = side_minutes(&s, None)?;
+    if let Some((minutes, _)) = side_minutes(&s, None) {
+        return to_minutes(minutes);
+    }
+    // Hyphen-joined unit: "90-minute", "1.5-hour" — read the hyphen as a
+    // space when the right side is a unit word.
+    let (left, right) = s.split_once('-')?;
+    if !right.chars().next().is_some_and(|c| c.is_alphabetic()) {
+        return None;
+    }
+    let (minutes, _) = side_minutes(&format!("{left} {right}"), None)?;
     to_minutes(minutes)
 }
 
@@ -181,6 +197,15 @@ mod tests {
         assert_eq!(parse_effort_minutes("~1–2h"), Some(90));
         // Midpoints round to the nearest minute.
         assert_eq!(parse_effort_minutes("30-45 min"), Some(38));
+    }
+
+    #[test]
+    fn hyphen_joined_units_read_as_plain_amounts() {
+        assert_eq!(parse_effort_minutes("90-minute"), Some(90));
+        assert_eq!(parse_effort_minutes("1.5-hour"), Some(90));
+        assert_eq!(parse_effort_minutes("2-day"), Some(960));
+        // A hyphen with a numeric right side is still a range.
+        assert_eq!(parse_effort_minutes("1-2h"), Some(90));
     }
 
     #[test]
