@@ -18,9 +18,10 @@ use intent_services::{
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds_with_reverse,
-    AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl,
-    SystemStatus, TokenStore, WsApiServer, WsOptions,
+    collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
+    local_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
+    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
+    WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -1339,6 +1340,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
+    let route_info = spawn_route_info_sampler();
 
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
@@ -1346,6 +1348,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
         proc_usage,
+        route_info,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: tokio::sync::Mutex::new(()),
@@ -1667,6 +1670,9 @@ struct DaemonControl {
     start_time: std::time::Instant,
     /// Latest own-process CPU/memory sample from the background sampler.
     proc_usage: Arc<ProcUsage>,
+    /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
+    /// background sampler, so `status()` never enumerates interfaces inline.
+    route_info: Arc<RouteInfo>,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
@@ -1703,6 +1709,44 @@ impl ProcUsage {
             self.memory_bytes.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Cached route-discovery snapshot (`localIps` + `hostname`) for
+/// `system.status` (§5.7), written by the background sampler task and read
+/// from `status()` without touching the OS. `localIps` is invalidated by
+/// external network activity, so per the derived-field ladder it is refreshed
+/// off the read path (TTL cache) rather than computed inline on read.
+struct RouteInfo {
+    inner: std::sync::RwLock<(Vec<String>, String)>,
+}
+
+impl RouteInfo {
+    fn load(&self) -> (Vec<String>, String) {
+        self.inner.read().expect("route info lock poisoned").clone()
+    }
+}
+
+/// Spawn the route-info sampler backing `system.status` (§5.7). Takes one
+/// synchronous sample first so `localIps`/`hostname` are populated before the
+/// listeners come up, then refreshes on a slow tick — the interface list only
+/// changes with external network state, so a short-TTL cache keeps the status
+/// read path free of `getifaddrs(3)`/hostname syscalls.
+fn spawn_route_info_sampler() -> Arc<RouteInfo> {
+    let info = Arc::new(RouteInfo {
+        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname())),
+    });
+    let task_info = info.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(15);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let sample = (collect_local_ips(), local_hostname());
+            *task_info.inner.write().expect("route info lock poisoned") = sample;
+        }
+    });
+    info
 }
 
 /// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
@@ -1823,6 +1867,11 @@ impl SystemControl for DaemonControl {
         };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
+        // Alternative routes for remote clients: same sources as
+        // `server.pairingInfo`, so a remote caller can refresh its stored
+        // host list from `system.status` alone. Served from the background
+        // sampler's TTL cache — never enumerated inline on the read path.
+        let (local_ips, hostname) = self.route_info.load();
         // Derived transport surface: UDS always serves; `tcp`/`listenMode`
         // reflect the live TCP listener state (runtime toggles included), so
         // `listenMode` is `both` while the listener is up and `uds` otherwise.
@@ -1845,6 +1894,8 @@ impl SystemControl for DaemonControl {
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
+            local_ips,
+            hostname,
             cpu_percent,
             memory_bytes,
         }
