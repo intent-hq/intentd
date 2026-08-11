@@ -292,6 +292,16 @@ pub const WORKSPACE_TOKEN_USAGE_CHANGED: &str = "workspace:tokenUsage-changed";
 // `{ workspaceId, items: ContextItem[] }` carries the new authoritative list
 // so subscribers refresh without a follow-up `workspace.getContext`.
 pub const WORKSPACE_CONTEXT_CHANGED: &str = "workspace:context-changed";
+// Workspace transfer/export lifecycle (PROTOCOL §5.1 / §6.5), emitted by the
+// source-side `workspace.export.*` build task. Self-sufficient payloads:
+// `progress` carries `{ workspaceId, exportId, stage, bytesWritten? }`,
+// `ready` carries `{ workspaceId, exportId, manifest, archiveSizeBytes,
+// archiveSha256, maxChunkBytes, totalChunks }` (everything the FE hands to
+// `workspace.import.begin` on the target), and `failed` carries
+// `{ workspaceId, exportId, reason }`.
+pub const WORKSPACE_TRANSFER_PROGRESS: &str = "workspace:transfer:progress";
+pub const WORKSPACE_TRANSFER_READY: &str = "workspace:transfer:ready";
+pub const WORKSPACE_TRANSFER_FAILED: &str = "workspace:transfer:failed";
 
 // Spec / goal events.
 pub const SPEC_UPDATED: &str = "spec:updated";
@@ -501,6 +511,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_TRANSFER_PROGRESS,
+    WORKSPACE_TRANSFER_READY,
+    WORKSPACE_TRANSFER_FAILED,
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,

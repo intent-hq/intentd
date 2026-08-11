@@ -90,10 +90,17 @@
 //! repo }` returned immediately, the fetch running detached with no events;
 //! at most one warm daemon-wide, a second call while one is in flight is
 //! rejected with `-32603` carrying `error.data = { code: "warm-in-flight",
-//! owner, repo }` — 282 router methods, 321 total.
+//! owner, repo }` — 282 router methods, 321 total. Version 6.11 adds the
+//! source-side export surface `workspace.export.start` / `.read` /
+//! `.finalize` / `.abort` (additive; §5.1): agents stopped and the transfer
+//! zip archive built on a background task (progress/outcome on the new
+//! `workspace:transfer:progress` / `:ready` / `:failed` events, §6.5),
+//! chunked idempotent download, and a finalize that applies the
+//! post-transfer source state (status message + optional archive) — 286
+//! router methods, 325 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.10";
+pub const PROTOCOL_VERSION: &str = "6.11";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

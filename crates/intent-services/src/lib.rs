@@ -112,9 +112,12 @@ mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
 mod transfer;
+mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
 pub mod transfer_materialize;
+#[cfg(test)]
+mod transfer_roundtrip;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -694,6 +697,12 @@ pub struct Services {
     /// restart drops pending imports (staging dirs are swept lazily by the
     /// next `begin`), and the FE simply restarts the upload.
     transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
+    /// In-flight source-side exports (`workspace.export.*`, keyed by
+    /// `exportId`): build state + sealed archive + WIP bookkeeping between
+    /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
+    /// drops sessions (staging dirs are swept at boot and lazily by the next
+    /// `start`), and the FE simply restarts the export.
+    transfer_exports: Arc<Mutex<HashMap<String, transfer_export::ExportSession>>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -793,6 +802,7 @@ impl Services {
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
+            transfer_exports: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -10768,6 +10778,37 @@ impl WorkspaceApi for Services {
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_import_abort_op(import_id).await })
+    }
+
+    fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_export_start_op(id).await })
+    }
+
+    fn workspace_export_read(
+        &self,
+        export_id: String,
+        seq: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_export_read_op(export_id, seq).await })
+    }
+
+    fn workspace_export_finalize(
+        &self,
+        export_id: String,
+        archive_source: bool,
+        final_status_message: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_export_finalize_op(export_id, archive_source, final_status_message)
+                .await
+        })
+    }
+
+    fn workspace_export_abort(
+        &self,
+        export_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.workspace_export_abort_op(export_id).await })
     }
 
     fn create_workspace(

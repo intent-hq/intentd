@@ -1180,6 +1180,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             );
         }
     });
+    // Sweep stale export staging dirs (workspace.export.*): export sessions
+    // are in-memory only, so after a restart every leftover staging dir is an
+    // orphan. Spawned + best-effort like the worktree trash sweep above.
+    let services_export_sweep = services.clone();
+    tokio::spawn(async move {
+        services_export_sweep.sweep_stale_export_staging().await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
