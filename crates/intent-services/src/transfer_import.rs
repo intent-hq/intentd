@@ -5,11 +5,13 @@
 //! (idempotent per seq — a retry overwrites the same chunk file); `commit`
 //! reassembles the archive, verifies its SHA-256, unpacks it, applies the row
 //! transforms (path rewrites, session-id clearing, in-flight → interrupted),
-//! inserts every row in ONE store transaction, places assets, and rehydrates
-//! agent queues / delegation groups / completion watches / event
-//! subscriptions / hooks / PR monitors without a daemon restart; `abort`
-//! deletes the staging state. Nothing is visible in `workspace.list` until
-//! `commit` succeeds.
+//! materializes the git payload when the archive carries one
+//! ([`crate::transfer_materialize`]: checkout + sandboxes recreated from the
+//! bundle, rows rewritten to the target paths), inserts every row in ONE
+//! store transaction, places assets, and rehydrates agent queues /
+//! delegation groups / completion watches / event subscriptions / hooks /
+//! PR monitors without a daemon restart; `abort` deletes the staging state.
+//! Nothing is visible in `workspace.list` until `commit` succeeds.
 //!
 //! Archive layout (agreed with the export orchestrator):
 //! `manifest.json` (the [`TransferManifest`]), `rows/<table>.jsonl` (one JSON
@@ -22,9 +24,11 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use intent_core::transfer::{TransferManifest, TRANSFER_FORMAT_VERSION};
-use intent_core::{clock::now_iso, Error, Result, WorkspaceId};
+use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId};
+use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
+use crate::transfer_git::TransferRefsManifest;
 use crate::{publish_event, workspace_created_event, Services};
 
 /// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
@@ -501,35 +505,122 @@ impl Services {
         }
     }
 
-    /// Materialization seam for the imported git payload (`git/repo.bundle` +
-    /// `git/refs.json` under `extracted_dir`): clone/fetch from the bundle,
-    /// provision the checkout and sandboxes, unwind WIP snapshots. Runs
-    /// BEFORE the store insert with the transformed rows passed mutably, so
-    /// the implementation can apply `MaterializedGit`-style row rewrites
-    /// (workspace `repository_path` → the new checkout, `worktree_path`
-    /// cleared, `checkout_mode` → direct, `base_commit_sha` backfill, sandbox
-    /// path rewrites, dropping sandbox rows whose branch is absent from the
-    /// bundle) and the apply()'d versions are what land in the store.
-    /// Currently a stub — the target-git-materialization task replaces this
-    /// body with a call to `transfer_materialize::materialize_workspace_git`.
-    /// An error fails the commit: materialization is all-or-nothing on disk,
-    /// no rows have been inserted, and the staging session survives for retry
-    /// or abort.
+    /// Materialize the imported git payload (`git/repo.bundle` +
+    /// `git/refs.json` under `extracted_dir`) via
+    /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
+    /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, fetch the base
+    /// ref, re-provision sandboxes, unwind WIP snapshots, and register the
+    /// checkout in `known_repo`. Runs BEFORE the store insert with the
+    /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
+    /// rewrites (workspace `repository_path` → the new checkout,
+    /// `worktree_path` cleared, `checkout_mode` → direct, `base_commit_sha`
+    /// backfill, sandbox path rewrites, dropping sandbox rows whose branch
+    /// is absent from the bundle) are written back onto the JSON rows, so
+    /// the apply()'d versions are what land in the store. An error fails the
+    /// commit: materialization is all-or-nothing on disk, no rows have been
+    /// inserted, and the staging session survives for retry or abort.
+    ///
+    /// [`MaterializedGit::apply`]: crate::transfer_materialize::MaterializedGit::apply
     async fn materialize_imported_git(
         &self,
         workspace_id: &WorkspaceId,
         extracted_dir: &Path,
-        _rows: &mut [(String, Vec<serde_json::Value>)],
+        rows: &mut [(String, Vec<serde_json::Value>)],
     ) -> Result<()> {
-        let bundle = extracted_dir.join("git").join("repo.bundle");
+        let git_dir = extracted_dir.join("git");
+        let bundle = git_dir.join("repo.bundle");
         if !bundle.exists() {
             return Ok(()); // no repository in the archive
         }
-        tracing::info!(
-            workspace = %workspace_id.0,
-            bundle = %bundle.display(),
-            "imported git bundle present — materialization not yet implemented (target git materialization task)"
-        );
+        let refs = tokio::fs::read(git_dir.join("refs.json"))
+            .await
+            .map_err(|e| {
+                Error::InvalidParams(format!(
+                    "archive carries git/repo.bundle but git/refs.json is unreadable: {e}"
+                ))
+            })?;
+        let refs: TransferRefsManifest = serde_json::from_slice(&refs)
+            .map_err(|e| Error::InvalidParams(format!("archive git/refs.json is invalid: {e}")))?;
+
+        // Rebuild just enough of the workspace/sandbox models from the
+        // transformed DB-shaped rows for the materializer (repo naming
+        // inputs and the `apply()` targets); everything else takes inert
+        // defaults and is never written back.
+        let ws_row = rows
+            .iter()
+            .find(|(t, _)| t == "workspace")
+            .and_then(|(_, objects)| objects.first())
+            .ok_or_else(|| {
+                Error::InvalidParams(
+                    "archive carries a git bundle but no workspace row".to_string(),
+                )
+            })?;
+        let mut ws = workspace_for_materialize(workspace_id, ws_row);
+        let mut sandboxes: Vec<Sandbox> = rows
+            .iter()
+            .find(|(t, _)| t == "sandbox")
+            .map(|(_, objects)| objects.iter().map(sandbox_for_materialize).collect())
+            .unwrap_or_default();
+
+        let target_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(crate::default_workspaces_root);
+        let out = crate::transfer_materialize::materialize_workspace_git(
+            &self.store,
+            bundle,
+            refs,
+            ws.clone(),
+            sandboxes.clone(),
+            target_root,
+        )
+        .await?;
+        out.apply(&mut ws, &mut sandboxes);
+
+        // Write the applied values back onto the JSON rows.
+        for (table, objects) in rows.iter_mut() {
+            match table.as_str() {
+                "workspace" => {
+                    for row in objects.iter_mut() {
+                        let Some(map) = row.as_object_mut() else {
+                            continue;
+                        };
+                        map.insert(
+                            "repository_path".to_string(),
+                            serde_json::json!(ws.repository_path),
+                        );
+                        map.insert("worktree_path".to_string(), serde_json::Value::Null);
+                        map.insert(
+                            "checkout_mode".to_string(),
+                            serde_json::json!(ws.checkout_mode),
+                        );
+                        map.insert(
+                            "base_commit_sha".to_string(),
+                            serde_json::json!(ws.base_commit_sha),
+                        );
+                    }
+                }
+                "sandbox" => {
+                    objects.retain_mut(|row| {
+                        let agent = row
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        match sandboxes.iter().find(|sb| sb.agent_id.0 == agent) {
+                            Some(sb) => {
+                                if let Some(map) = row.as_object_mut() {
+                                    map.insert("path".to_string(), serde_json::json!(sb.path));
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -682,6 +773,87 @@ async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::
         out.push((table.to_string(), rows));
     }
     Ok(out)
+}
+
+/// Rebuild the [`Workspace`] fields the materializer consumes from the
+/// transformed DB-shaped workspace row: `repository_name`/`repository_path`
+/// name the checkout slug, `base_commit_sha` gates the backfill, and
+/// `branch` labels errors. Everything else takes inert defaults — the model
+/// is only an input to `materialize_workspace_git` and its `apply()`; the
+/// JSON row (not this struct) is what lands in the store.
+fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value) -> Workspace {
+    let s = |key: &str| -> Option<String> {
+        row.get(key).and_then(|v| v.as_str()).map(|v| v.to_string())
+    };
+    let now = now_iso();
+    Workspace {
+        id: workspace_id.clone(),
+        title: s("title").unwrap_or_default(),
+        branch: s("branch").unwrap_or_default(),
+        base_ref: s("base_ref"),
+        base_commit_sha: s("base_commit_sha"),
+        status: intent_core::WorkspaceStatus::Active,
+        status_message: None,
+        status_image_asset_id: None,
+        activity: intent_core::WorkspaceActivity::Idle,
+        attention: intent_core::WorkspaceAttention::None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_activity: None,
+        tags: vec![],
+        path: s("path"),
+        repository_path: s("repository_path"),
+        repository_owner: s("repository_owner"),
+        repository_name: s("repository_name"),
+        worktree_path: s("worktree_path"),
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        pending_delete_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+        cow_supported: None,
+        display_status: None,
+        checkout_mode: None,
+        disk_usage: None,
+    }
+}
+
+/// Rebuild the [`Sandbox`] fields the materializer consumes from a
+/// transformed DB-shaped sandbox row (`agent_id` matches bundle entries and
+/// names the target directory; `branch` labels warnings). Same contract as
+/// [`workspace_for_materialize`]: input-only, never stored.
+fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
+    let s = |key: &str| -> String {
+        row.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Sandbox {
+        id: s("id"),
+        workspace_id: WorkspaceId(s("workspace_id")),
+        agent_id: AgentId(s("agent_id")),
+        path: s("path"),
+        branch: s("branch"),
+        base_commit_sha: s("base_commit_sha"),
+        snapshot_commit_sha: None,
+        status: SandboxStatus::Created,
+        retry_count: 0,
+        created_at: s("created_at"),
+        updated_at: s("updated_at"),
+    }
 }
 
 /// Reject archives whose rows reach beyond the manifest's workspace:
@@ -1329,6 +1501,16 @@ mod tests {
 
     /// Build a fixture archive: manifest.json + rows/*.jsonl (+ one asset).
     fn build_archive(m: &TransferManifest, rows: &[(&str, Vec<serde_json::Value>)]) -> Vec<u8> {
+        build_archive_with_git(m, rows, None)
+    }
+
+    /// [`build_archive`] plus an optional `git/repo.bundle` + `git/refs.json`
+    /// payload, matching the export orchestrator's archive layout.
+    fn build_archive_with_git(
+        m: &TransferManifest,
+        rows: &[(&str, Vec<serde_json::Value>)],
+        git: Option<(&Path, &TransferRefsManifest)>,
+    ) -> Vec<u8> {
         use std::io::Write as _;
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut buf);
@@ -1346,6 +1528,14 @@ mod tests {
         }
         zip.start_file("assets/img.png", options).expect("asset");
         zip.write_all(b"asset-bytes").expect("asset bytes");
+        if let Some((bundle_path, refs)) = git {
+            zip.start_file("git/repo.bundle", options).expect("bundle");
+            zip.write_all(&std::fs::read(bundle_path).expect("bundle bytes"))
+                .expect("bundle write");
+            zip.start_file("git/refs.json", options).expect("refs");
+            zip.write_all(serde_json::to_string(refs).expect("refs json").as_bytes())
+                .expect("refs write");
+        }
         zip.finish().expect("finish zip");
         buf.into_inner()
     }
@@ -1507,6 +1697,286 @@ mod tests {
             svc.workspace_import_commit_op(import_id).await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    // ---- git materialization e2e ----------------------------------------
+
+    fn init_repo(repo_path: &Path) {
+        std::fs::create_dir_all(repo_path).unwrap();
+        let repo = git2::Repository::init_opts(
+            repo_path,
+            git2::RepositoryInitOptions::new().initial_head("main"),
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("README.md"), "hello\n").unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+    }
+
+    fn commit_file(repo_path: &Path, file: &str, content: &str, message: &str) -> String {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        std::fs::write(repo_path.join(file), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(file)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .unwrap()
+            .to_string()
+    }
+
+    fn repo_head(repo_path: &Path) -> String {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        let sha = repo.head().unwrap().target().unwrap().to_string();
+        sha
+    }
+
+    /// Full `begin → chunk → commit` over an archive that carries a real git
+    /// payload: a dirty workspace repo (staged + untracked) and one sandbox,
+    /// plus a sandbox row whose branch never made it into the bundle. Commit
+    /// must materialize the checkout and sandbox on disk, rewrite the stored
+    /// workspace row (repository_path → checkout, worktree_path cleared,
+    /// checkout_mode direct, base_commit_sha backfilled), rewrite the stored
+    /// sandbox path, drop the bundle-less sandbox row, and register the
+    /// checkout in known_repo.
+    #[tokio::test]
+    async fn import_commit_materializes_git() {
+        let ws = WorkspaceId("ws-git-imported".to_string());
+        let ws_root = TempDir::new("import-git-ws-root");
+        let assets_root = TempDir::new("import-git-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        // Source workspace repo on branch `feature` with committed work and
+        // dirty state (staged + untracked).
+        let src = TempDir::new("import-git-src");
+        let repo = src.0.join("source-repo");
+        init_repo(&repo);
+        let base = repo_head(&repo);
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let head = r.head().unwrap().peel_to_commit().unwrap();
+            r.branch("feature", &head, false).unwrap();
+            r.set_head("refs/heads/feature").unwrap();
+        }
+        let feature_tip = commit_file(&repo, "feature.txt", "feature\n", "feat: branch work");
+        std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let mut index = r.index().unwrap();
+            index.add_path(Path::new("staged.txt")).unwrap();
+            index.write().unwrap();
+        }
+        std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+
+        // Source sandbox: clone on `sb/<agent>` with one commit.
+        let agent = "agent-sb";
+        let sb_branch = format!("sb/{agent}");
+        let sb_src = src.0.join("sandbox");
+        let out = std::process::Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg(&repo)
+            .arg(&sb_src)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        {
+            let r = git2::Repository::open(&sb_src).unwrap();
+            let head = r.head().unwrap().peel_to_commit().unwrap();
+            r.branch(&sb_branch, &head, false).unwrap();
+            r.set_head(&format!("refs/heads/{sb_branch}")).unwrap();
+        }
+        commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+
+        // Source-side rows (DB-shaped, source-absolute paths).
+        let t = "2026-08-11T00:00:00Z";
+        let ws_row = serde_json::json!({
+            "id": ws.0, "title": "Git WS", "branch": "feature",
+            "base_ref": "main", "status": "Active",
+            "repository_path": repo.to_string_lossy(),
+            "repository_name": "test-repo",
+            "created_at": t, "updated_at": t
+        });
+        let sb_row = serde_json::json!({
+            "id": "sb-1", "workspace_id": ws.0, "agent_id": agent,
+            "path": sb_src.to_string_lossy(), "branch": sb_branch,
+            "base_commit_sha": base, "status": "created",
+            "created_at": t, "updated_at": t
+        });
+        // A second sandbox row with no branch in the bundle — dropped.
+        let ghost_row = serde_json::json!({
+            "id": "sb-ghost", "workspace_id": ws.0, "agent_id": "agent-ghost",
+            "path": "/gone/sandbox", "branch": "sb/agent-ghost",
+            "base_commit_sha": base, "status": "created",
+            "created_at": t, "updated_at": t
+        });
+        let sessions = serde_json::json!([
+            { "id": agent, "workspace_id": ws.0, "name": "SB",
+              "status": "idle", "created_at": t, "updated_at": t },
+            { "id": "agent-ghost", "workspace_id": ws.0, "name": "G",
+              "status": "idle", "created_at": t, "updated_at": t }
+        ]);
+
+        // Bundle the source exactly as the export orchestrator would.
+        let src_ws = workspace_for_materialize(&ws, &ws_row);
+        let src_sb = sandbox_for_materialize(&sb_row);
+        let staging = src.0.join("staging");
+        let (bundle_path, refs) = crate::transfer_git::create_transfer_bundle(
+            &src_ws,
+            std::slice::from_ref(&src_sb),
+            &staging,
+        )
+        .expect("bundle");
+        assert!(refs.workspace_wip_commit_sha.is_some(), "source was dirty");
+
+        let m = manifest(&ws);
+        let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            ("workspace", vec![ws_row]),
+            ("agent_session", sessions.as_array().unwrap().clone()),
+            ("sandbox", vec![sb_row, ghost_row]),
+        ];
+        let archive = build_archive_with_git(&m, &rows, Some((&bundle_path, &refs)));
+        let sha = sha256_hex(&archive);
+
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk");
+        svc.workspace_import_commit_op(import_id)
+            .await
+            .expect("commit");
+
+        // Stored workspace row: rewritten to the materialized checkout.
+        let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
+        let checkout = ws_root.0.join(&ws.0).join("test-repo");
+        assert_eq!(
+            imported.repository_path.as_deref(),
+            Some(checkout.to_str().unwrap())
+        );
+        assert_eq!(imported.worktree_path, None);
+        assert_eq!(
+            imported.checkout_mode,
+            Some(intent_core::CheckoutMode::Direct)
+        );
+        assert_eq!(imported.base_commit_sha.as_deref(), Some(base.as_str()));
+
+        // Checkout on disk: right branch/tip with the WIP snapshot unwound
+        // (dirty files restored, not committed).
+        assert_eq!(repo_head(&checkout), feature_tip);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("staged.txt")).unwrap(),
+            "staged\n"
+        );
+
+        // Sandbox rows: the bundled one rewritten on disk + in the store,
+        // the ghost dropped.
+        let sandboxes = svc.store.list_sandboxes(&ws).await.expect("sandboxes");
+        assert_eq!(sandboxes.len(), 1);
+        let expected_sb = ws_root
+            .0
+            .join(&ws.0)
+            .join("sandboxes")
+            .join(agent)
+            .join("test-repo");
+        assert_eq!(sandboxes[0].path, expected_sb.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(expected_sb.join("sb.txt")).unwrap(),
+            "sandbox work\n"
+        );
+
+        // Checkout registered as a known repo.
+        let known = svc.store.list_known_repos().await.expect("known repos");
+        assert!(
+            known
+                .iter()
+                .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
+            "checkout registered in known_repo: {known:?}"
+        );
+    }
+
+    /// A git-carrying archive whose `git/refs.json` is missing or invalid
+    /// fails the commit, and the staging session survives for retry/abort.
+    #[tokio::test]
+    async fn import_commit_rejects_bundle_without_refs() {
+        let ws = WorkspaceId("ws-git-norefs".to_string());
+        let ws_root = TempDir::new("import-git-ws-root");
+        let assets_root = TempDir::new("import-git-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        // Archive with a git/repo.bundle but no git/refs.json.
+        let m = manifest(&ws);
+        let t = "2026-08-11T00:00:00Z";
+        let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![(
+            "workspace",
+            vec![serde_json::json!({
+                "id": ws.0, "title": "W", "branch": "main", "status": "Active",
+                "created_at": t, "updated_at": t
+            })],
+        )];
+        let archive = {
+            use std::io::Write as _;
+            let mut buf = std::io::Cursor::new(build_archive(&m, &rows));
+            buf.set_position(buf.get_ref().len() as u64);
+            let mut zip = zip::ZipWriter::new_append(buf).expect("append zip");
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("git/repo.bundle", options).expect("bundle");
+            zip.write_all(b"not a real bundle").expect("bundle bytes");
+            zip.finish().expect("finish").into_inner()
+        };
+        let sha = sha256_hex(&archive);
+
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk");
+
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("commit must fail");
+        assert!(
+            err.to_string().contains("refs.json"),
+            "error names refs.json: {err}"
+        );
+        // Nothing landed; the session survives for abort.
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+        svc.workspace_import_abort_op(import_id)
+            .await
+            .expect("abort after failed commit");
     }
 
     /// `begin` rejects: bad format version, version mismatch (naming both
