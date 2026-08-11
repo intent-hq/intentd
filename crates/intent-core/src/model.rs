@@ -1585,15 +1585,17 @@ pub struct TaskMarkAsTaskResult {
 }
 
 /// Result of `task.setRelations` (PROTOCOL §5.4). Echoes the stored relations
-/// after the write so callers see the normalized (deduped) lists.
+/// after the write so callers see the normalized (deduped) lists — always
+/// present (a cleared list echoes `[]`), unlike the omitted-when-empty
+/// projections on the read paths.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSetRelationsResult {
     pub ok: bool,
     pub note_id: NoteId,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub depends_on: Vec<NoteId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub conflicts_with: Vec<NoteId>,
 }
 

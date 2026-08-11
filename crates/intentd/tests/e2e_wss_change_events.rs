@@ -2876,6 +2876,16 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
         task_ids[2].clone(),
     );
 
+    // Drain the setup emissions (each markAsTask queued a `note:updated`,
+    // ending with c's) so the next `note:updated` for c observed below is
+    // unambiguously the `task.setRelations` write's.
+    loop {
+        let evt = next_event(&mut sub, &["note:updated"], 10).await;
+        if evt["data"]["noteId"] == json!(c) {
+            break;
+        }
+    }
+
     // Write relations on c: dependsOn [a, b, a] (dedup) + conflictsWith [b].
     let set = wss_rpc(
         &mut rpc,
@@ -2894,14 +2904,14 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
     assert_eq!(set["dependsOn"], json!([a, b]), "deduped: {set}");
     assert_eq!(set["conflictsWith"], json!([b]));
 
-    // Relation write emits `note:updated` for the task note (§6.5); skip
-    // forward past the markAsTask emissions to this write's.
-    loop {
-        let evt = next_event(&mut sub, &["note:updated"], 10).await;
-        if evt["data"]["noteId"] == json!(c) {
-            break;
-        }
-    }
+    // Relation write emits `note:updated` for the task note (§6.5). The
+    // setup emissions were drained above, so this is the write's own event.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(
+        evt["data"]["noteId"],
+        json!(c),
+        "setRelations note:updated: {evt}"
+    );
 
     // getMyTask carries the stored relations + computed unmetDependsOn (the
     // complete dep `a` is met, `b` is not).
