@@ -17767,18 +17767,51 @@ impl WorkspaceApi for Services {
                     "githubUrl carries no owner/repo pair: {url}"
                 )));
             };
+            // Reject segments the cache ensure would refuse anyway (same
+            // rules as repo_cache's validate_segment: path escapes, git
+            // option lookalikes) BEFORE claiming the single-flight slot, so
+            // a malformed URL can never block valid warms.
+            for (what, value) in [("owner", owner.as_str()), ("repo", repo.as_str())] {
+                let bad = value.is_empty()
+                    || value == "."
+                    || value == ".."
+                    || value.starts_with('-')
+                    || value.contains('/')
+                    || value.contains('\\')
+                    || value.contains('\0');
+                if bad {
+                    return Err(Error::InvalidParams(format!(
+                        "githubUrl carries an invalid {what} segment: {value:?}"
+                    )));
+                }
+            }
             let cache_root = resolve_workspaces_parent(
                 workspaces_root,
                 workspaces_root_pinned,
                 &worktrees_location,
             )?
             .join(".repo-cache");
+            // RAII clear for the single-flight slot: `Drop` runs even when
+            // the detached task panics mid-ensure, so the flag can never
+            // leak into a permanently-busy state. Poisoned locks recover via
+            // `into_inner` — the guarded Option is trivially valid — so a
+            // panic while the tiny critical section is held cannot brick the
+            // method either.
+            struct WarmSlotClear(Arc<Mutex<Option<(String, String)>>>);
+            impl Drop for WarmSlotClear {
+                fn drop(&mut self) {
+                    *self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+            }
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
                 let mut slot = warm_in_flight
                     .lock()
-                    .map_err(|_| Error::Internal("warm-in-flight lock poisoned".to_string()))?;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some((o, r)) = slot.as_ref() {
                     return Err(Error::WarmInFlight {
                         owner: o.clone(),
@@ -17787,6 +17820,7 @@ impl WorkspaceApi for Services {
                 }
                 *slot = Some((owner.clone(), repo.clone()));
             }
+            let clear_on_drop = WarmSlotClear(warm_in_flight);
             // Detached background warm: token resolution (bounded secrets /
             // `gh` lookups) and the cache ensure both run off the RPC path.
             // Deliberately silent — no `git:clone:*` frames, no events; a
@@ -17795,6 +17829,7 @@ impl WorkspaceApi for Services {
             let task_owner = owner.clone();
             let task_repo = repo.clone();
             tokio::spawn(async move {
+                let _clear_on_drop = clear_on_drop;
                 let token = github_git_token_for_url(registry.as_deref(), &url).await;
                 let result = intent_git::repo_cache::ensure_cached_repo(
                     &cache_root,
@@ -17817,9 +17852,6 @@ impl WorkspaceApi for Services {
                         error = %e,
                         "opportunistic repo cache warm failed"
                     ),
-                }
-                if let Ok(mut slot) = warm_in_flight.lock() {
-                    *slot = None;
                 }
             });
             Ok(serde_json::json!({ "started": true, "owner": owner, "repo": repo }))

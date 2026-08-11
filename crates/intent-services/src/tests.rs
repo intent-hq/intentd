@@ -21406,6 +21406,32 @@ mod repo_warm_cache {
         wait_for_warm_completion(&svc, &root.0, &url).await;
     }
 
+    /// A URL whose owner/repo segments would be rejected by the cache ensure
+    /// (path escapes like `..`) is `-32602` up front and never claims the
+    /// single-flight slot — a malformed request cannot block valid warms.
+    #[tokio::test]
+    async fn traversal_segments_rejected_before_claiming_slot() {
+        let source = seed_repo("intentd-warm-trav-src");
+        let root = unique_dir("intentd-warm-trav-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        match svc
+            .repo_warm_cache("https://github.com/../repo".to_string())
+            .await
+        {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("owner"), "names the bad segment: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // The rejected call left the slot free: a valid warm is accepted.
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.repo_warm_cache(url)
+            .await
+            .expect("valid warm accepted after the rejected one");
+    }
+
     /// A URL with no owner/repo pair is rejected with `-32602` and never
     /// claims the single-flight slot.
     #[tokio::test]

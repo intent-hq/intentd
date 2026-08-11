@@ -1,7 +1,8 @@
 //! WSS end-to-end test for `repo.warmCache` (PROTOCOL §5.6): drives the real
-//! WS transport against a `file://` fixture repo and asserts the
-//! `{ started, owner, repo }` result shape, the busy rejection envelope
-//! (`error.data.code === "warm-in-flight"`), and the `-32602` invalid-URL arm.
+//! WSS transport (TLS + fingerprint pinning + bearer auth) against a
+//! `file://` fixture repo and asserts the `{ started, owner, repo }` result
+//! shape, the busy rejection envelope (`error.data.code === "warm-in-flight"`),
+//! and the `-32602` invalid-URL arm.
 
 #![cfg(unix)]
 
@@ -9,21 +10,119 @@ mod common;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::WorkspaceApi;
+use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
-use intent_transport::{WsApiServer, WsOptions};
+use intent_transport::{
+    ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
-type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+/// A fixed 64-char hex token (valid shape) shared by server + client.
+const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+/// In-memory [`TokenStore`] so tests never touch the real OS keychain.
+#[derive(Default)]
+struct MemTokenStore(Mutex<Option<String>>);
+
+impl TokenStore for MemTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn store_token(&self, token: &str) -> CoreResult<()> {
+        *self.0.lock().unwrap() = Some(token.to_string());
+        Ok(())
+    }
+}
+
+/// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
+}
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -35,6 +134,7 @@ impl Drop for TempDir {
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
+    cfg: Arc<ClientConfig>,
     root: PathBuf,
     _dir: TempDir,
 }
@@ -51,30 +151,35 @@ async fn boot() -> Fixture {
         .with_workspaces_root(workspaces_root.clone())
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure(api, bus, opts, None);
+    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Fixture {
         _ws: ws,
         port,
+        cfg,
         root: workspaces_root,
         _dir: TempDir(dir),
     }
 }
 
-async fn connect(port: u16) -> PlainWs {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (sock, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("plain ws handshake");
-    sock
+/// Open an authenticated WSS connection (pinned TLS, token in the query
+/// string).
+async fn connect(fx: &Fixture) -> TlsWs {
+    let url = format!("wss://localhost:{}/ws?token={TOKEN}", fx.port);
+    common::wss_connect_with_retry(fx.port, fx.cfg.clone(), &url).await
 }
 
-async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
         .await
@@ -88,7 +193,10 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
                         return v;
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Message::Pong(_) => {}
                 _ => panic!("unexpected message"),
             }
         }
@@ -133,7 +241,7 @@ fn owner_repo_of(dir: &std::path::Path) -> (String, String) {
 /// Poll `repo.warmCache` until the detached warm completes: an accepted
 /// re-warm proves the in-flight flag cleared; the populated cache slot
 /// proves the ensure ran.
-async fn wait_for_warm_completion(ws: &mut PlainWs, root: &std::path::Path, url: &str, base: i64) {
+async fn wait_for_warm_completion(ws: &mut TlsWs, root: &std::path::Path, url: &str, base: i64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut id = base;
     loop {
@@ -167,7 +275,7 @@ async fn wait_for_warm_completion(ws: &mut PlainWs, root: &std::path::Path, url:
 #[tokio::test]
 async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
     let fx = boot().await;
-    let mut rpc = connect(fx.port).await;
+    let mut rpc = connect(&fx).await;
 
     let repo_dir = fx.root.parent().unwrap().join("warm-fixture-src");
     seed_repo(&repo_dir);
@@ -192,7 +300,7 @@ async fn repo_warm_cache_starts_and_populates_cache_over_wss() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
     let fx = boot().await;
-    let mut rpc = connect(fx.port).await;
+    let mut rpc = connect(&fx).await;
 
     let repo_dir = fx.root.parent().unwrap().join("warm-busy-src");
     seed_repo(&repo_dir);
@@ -238,7 +346,7 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
 #[tokio::test]
 async fn repo_warm_cache_invalid_params_over_wss() {
     let fx = boot().await;
-    let mut rpc = connect(fx.port).await;
+    let mut rpc = connect(&fx).await;
 
     let v = wss_rpc(
         &mut rpc,
@@ -250,5 +358,16 @@ async fn repo_warm_cache_invalid_params_over_wss() {
     assert_eq!(v["error"]["code"], json!(-32602));
 
     let v = wss_rpc(&mut rpc, 2, "repo.warmCache", json!({})).await;
+    assert_eq!(v["error"]["code"], json!(-32602));
+
+    // A traversal owner segment is rejected up front (-32602) without
+    // claiming the single-flight slot.
+    let v = wss_rpc(
+        &mut rpc,
+        3,
+        "repo.warmCache",
+        json!({ "githubUrl": "https://github.com/../repo" }),
+    )
+    .await;
     assert_eq!(v["error"]["code"], json!(-32602));
 }
