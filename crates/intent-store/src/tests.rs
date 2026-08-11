@@ -1597,6 +1597,8 @@ async fn task_metadata_round_trip_and_list_tasks() {
         started_at: Some(now_iso()),
         completed_at: None,
         peer_order: Some(100),
+        depends_on: vec![NoteId::from("dep-1")],
+        conflicts_with: vec![NoteId::from("conflict-1")],
     };
     store
         .insert_note(&task_note(&ws_id, "Task A", Some(meta.clone())))

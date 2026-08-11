@@ -56,10 +56,14 @@
 //! Version 6.4 adds the `host.checkNode` and `host.checkGh` fast-path methods
 //! (additive; §5.14, monorepo#1891): uncached node/gh detection mirroring
 //! `host.checkGit` (`{ available, version?, path? }`) so a fresh install is
-//! seen immediately — 272 router methods, 311 total.
+//! seen immediately — 272 router methods, 311 total. Version 6.5 adds the
+//! `task.setRelations` router method (additive; §5.4, monorepo#1974): writes
+//! the first-class `dependsOn` / `conflictsWith` task relations (validated,
+//! cycle-checked) that `task.getMyTask` / `task.list` / `note.listTasks`
+//! project with the computed `unmetDependsOn` — 273 router methods, 312 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.4";
+pub const PROTOCOL_VERSION: &str = "6.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

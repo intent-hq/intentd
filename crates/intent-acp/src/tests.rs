@@ -1828,6 +1828,7 @@ mod mcp_tests {
                     assigned_agents: task.assigned_agent_ids.clone(),
                     task_metadata: task,
                     rev: 3,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -6035,6 +6036,9 @@ mod wsapi3_bindings_tests {
                     status: "todo".to_string(),
                     task_note_id: None,
                     linked_task_note_id: None,
+                    depends_on: Vec::new(),
+                    conflicts_with: Vec::new(),
+                    unmet_depends_on: Vec::new(),
                 }])
             })
         }
@@ -6314,6 +6318,7 @@ mod wsapi3_bindings_tests {
                     subtasks: Vec::new(),
                     assigned_agents: Vec::new(),
                     rev: 1,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -6325,6 +6330,8 @@ mod wsapi3_bindings_tests {
             status: String,
             acceptance_criteria: Vec<String>,
             effort: Option<String>,
+            _depends_on: Option<Vec<NoteId>>,
+            _conflicts_with: Option<Vec<NoteId>>,
             _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
             self.mark_as_task_calls.lock().unwrap().push((

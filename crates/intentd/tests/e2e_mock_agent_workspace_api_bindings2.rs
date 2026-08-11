@@ -915,6 +915,8 @@ async fn agent_bindings_send_single_pending_message_guard() {
             vec![],
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("mark as task");

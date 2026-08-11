@@ -1048,6 +1048,15 @@ pub struct TaskMetadata {
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_order: Option<i64>,
+    /// Task-note ids this task depends on (hard ordering edges). Written via
+    /// `task.setRelations` / `task.markAsTask`; cycle-checked at write time.
+    /// Omitted on the wire when empty so pre-existing notes are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    /// Task-note ids this task conflicts with (advisory, symmetric by
+    /// convention — no cycle check). Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
 }
 
 /// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.
@@ -1316,6 +1325,15 @@ pub struct NoteTaskRow {
     pub status: String,
     pub task_note_id: Option<String>,
     pub linked_task_note_id: Option<String>,
+    /// Relations mirrored from the linked task note's metadata (empty and
+    /// omitted for rows without a linked task note).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Result of `note.readAsset` (PROTOCOL §5.2). `data` is base64; `sizeKb` is
@@ -1509,6 +1527,10 @@ pub struct TaskGetMyTaskResult {
     pub assigned_agents: Vec<AgentId>,
     /// Monotonic version counter echoed from the backing note (§8.3/§8.4).
     pub rev: i64,
+    /// Computed: `dependsOn` ids whose task is not yet `complete` (missing
+    /// and cancelled deps count as unmet). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Canonical task facts for a workspace (TS `WorkspaceTask`, `shared/types.ts`).
@@ -1522,6 +1544,14 @@ pub struct WorkspaceTask {
     pub title: String,
     pub status: TaskStatus,
     pub updated_at: String,
+    /// Task relations (empty and omitted for tasks without them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
@@ -1543,6 +1573,19 @@ pub struct TaskMarkAsTaskResult {
     pub ok: bool,
     pub note_id: NoteId,
     pub status: TaskStatus,
+}
+
+/// Result of `task.setRelations` (PROTOCOL §5.4). Echoes the stored relations
+/// after the write so callers see the normalized (deduped) lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSetRelationsResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
 }
 
 /// Result of `task.convertBlocks`.
