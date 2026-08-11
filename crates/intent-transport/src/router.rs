@@ -454,6 +454,31 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)
         }
+        "workspace.export.start" => {
+            let id = require_workspace_id(params)?;
+            api.workspace_export_start(id).await.map_err(workspace_err)
+        }
+        "workspace.export.read" => {
+            let export_id = require_str_param(params, "exportId")?;
+            let seq = require_u64(params, "seq")?;
+            api.workspace_export_read(export_id, seq)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.export.finalize" => {
+            let export_id = require_str_param(params, "exportId")?;
+            let archive_source = opt_bool(params, "archiveSource").unwrap_or(false);
+            let final_status_message = opt_str(params, "finalStatusMessage");
+            api.workspace_export_finalize(export_id, archive_source, final_status_message)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.export.abort" => {
+            let export_id = require_str_param(params, "exportId")?;
+            api.workspace_export_abort(export_id)
+                .await
+                .map_err(workspace_err)
+        }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
             let ws = api.dismiss_attention(id).await.map_err(workspace_err)?;
