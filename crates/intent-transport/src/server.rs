@@ -155,7 +155,7 @@ pub fn collect_local_ips() -> Vec<String> {
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
             // Skip virtual/container interfaces (same prefixes as tls::collect_san).
-            if ["docker", "veth", "br-", "vboxnet", "vmnet"]
+            if ["docker", "veth", "br-", "bridge", "vboxnet", "vmnet"]
                 .iter()
                 .any(|p| iface.name.starts_with(p))
             {
