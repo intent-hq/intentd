@@ -373,7 +373,7 @@ pub async fn validate_token(store: &AsyncTokenStore, candidate: &str) -> bool {
 /// 32 cryptographically-random bytes, lowercase hex-encoded (64 chars).
 fn random_hex_token() -> Result<String> {
     let mut bytes = [0u8; TOKEN_BYTES];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| Error::Internal(format!("failed to generate random token: {e}")))?;
     Ok(hex::encode(bytes))
 }
@@ -472,7 +472,7 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
 
 /// Lowercased OS hostname (`os.hostname()` equivalent), or empty on failure.
 fn local_hostname() -> String {
-    whoami::fallible::hostname()
+    whoami::hostname()
         .map(|h| h.to_lowercase())
         .unwrap_or_default()
 }

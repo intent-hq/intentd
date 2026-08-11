@@ -359,9 +359,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -564,9 +564,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -574,9 +574,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1454,7 +1454,7 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "wasm-bindgen",
 ]
 
@@ -1509,9 +1509,9 @@ dependencies = [
 
 [[package]]
 name = "globset"
-version = "0.4.19"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -1981,9 +1981,9 @@ dependencies = [
 
 [[package]]
 name = "ignore"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f8a7b8211e695a1d0cd91cace480d4d0bd57667ab10277cc412c5f7f4884f83"
+checksum = "0b17771570a2b94107741a7b033f19132c2eee21d59d21b24d2ced26500bd66e"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-client-protocol",
  "ctor",
@@ -2068,7 +2068,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "toon-format",
  "tracing",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "ctor",
@@ -2101,7 +2101,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "time",
  "toml",
  "tracing",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "git2",
  "intent-core",
@@ -2122,31 +2122,31 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "rquickjs",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
 [[package]]
 name = "intent-linear"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "intent-core",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "intent-providers"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "ctor",
  "intent-core",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "globset",
  "grep",
@@ -2182,25 +2182,25 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
  "intent-core",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "intent-services"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-recursion",
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "ctor",
  "git2",
  "ignore",
@@ -2240,10 +2240,10 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "http",
  "intent-core",
  "octocrab",
@@ -2251,14 +2251,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "intent-store"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "intent-core",
  "rand 0.10.2",
@@ -2272,13 +2272,13 @@ dependencies = [
 
 [[package]]
 name = "intent-transport"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "ctor",
  "futures",
  "futures-util",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "hex",
  "httparse",
  "if-addrs",
@@ -2298,7 +2298,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
- "whoami",
+ "whoami 2.1.2",
  "x509-parser",
 ]
 
@@ -2311,18 +2311,18 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "intentd"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "ctor",
@@ -2380,7 +2380,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "toml",
@@ -2700,7 +2700,7 @@ checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
  "log",
- "wasi",
+ "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
 
@@ -2895,6 +2895,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-system-configuration"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
+dependencies = [
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2905,9 +2914,9 @@ dependencies = [
 
 [[package]]
 name = "octocrab"
-version = "0.53.1"
+version = "0.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe45bd53ce50c9e85e8a27259675f65d772165fe5eef3e278c1b6168c3f97623"
+checksum = "432fad6f447c52acda76a7a0660f022b21f4c42f373bbdc29f04332ba19a89bf"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2930,6 +2939,7 @@ dependencies = [
  "jsonwebtoken",
  "percent-encoding",
  "pin-project",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -3515,9 +3525,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.16"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcfdb36bda0c880c5931cdc7a2bcdc8ba4556847b9d912bca70bc94708711ad"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4136,9 +4146,9 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "similar"
-version = "3.1.1"
+version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6505efef05804732ed8a3f2d4f279429eb485bd69d5b0cc6b19cc02005cda16"
+checksum = "85ee016af5d736b69fc89e19254540fa4b5f5492853fb5503920f084011c78b6"
 
 [[package]]
 name = "simple_asn1"
@@ -4363,7 +4373,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
- "whoami",
+ "whoami 1.6.1",
 ]
 
 [[package]]
@@ -4401,7 +4411,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
- "whoami",
+ "whoami 1.6.1",
 ]
 
 [[package]]
@@ -5149,6 +5159,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
+name = "wasi"
+version = "0.14.7+wasi-0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "883478de20367e224c0090af9cf5f9fa85bed63a95c1abf3afc5c083ebc06e8c"
+dependencies = [
+ "wasip2",
+]
+
+[[package]]
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5171,6 +5190,15 @@ name = "wasite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8dad83b4f25e74f184f64c43b150b91efe7647395b42289f38e50566d82855b"
+
+[[package]]
+name = "wasite"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66fe902b4a6b8028a753d5424909b764ccf79b7a209eac9bf97e59cda9f71a42"
+dependencies = [
+ "wasi 0.14.7+wasi-0.2.4",
+]
 
 [[package]]
 name = "wasm-bindgen"
@@ -5307,7 +5335,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d4a4db5077702ca3015d3d02d74974948aba2ad9e12ab7df718ee64ccd7e97d"
 dependencies = [
  "libredox",
- "wasite",
+ "wasite 0.1.0",
+]
+
+[[package]]
+name = "whoami"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "998767ef88740d1f5b0682a9c53c24431453923962269c2db68ee43788c5a40d"
+dependencies = [
+ "libc",
+ "libredox",
+ "objc2-system-configuration",
+ "wasite 1.0.2",
  "web-sys",
 ]
 

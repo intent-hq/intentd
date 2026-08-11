@@ -236,6 +236,12 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override for the remote URL base the
+    /// `github.branches.listCached` ls-remote fallback targets. Production
+    /// composition leaves this `None` (`https://github.com`); tests point it
+    /// at a `file://` directory of `<owner>/<repo>.git` fixtures so the
+    /// fallback path never touches the network.
+    branches_ls_remote_base: Option<String>,
     /// Test-only override for npx discovery on the one-shot ACP route
     /// (`agent.completeOnce` §5.32). Outer `None` (production) resolves via
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
@@ -669,6 +675,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            branches_ls_remote_base: None,
             one_shot_npx: None,
             auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
@@ -2311,6 +2318,15 @@ impl Services {
         self
     }
 
+    /// Override the remote URL base the `github.branches.listCached`
+    /// ls-remote fallback targets (production: `https://github.com`). Tests
+    /// point it at a `file://` directory of `<owner>/<repo>.git` fixtures so
+    /// the fallback path never touches the network.
+    pub fn with_branches_ls_remote_base(mut self, base: String) -> Self {
+        self.branches_ls_remote_base = Some(base);
+        self
+    }
+
     /// Pin npx discovery for the one-shot ACP route (`agent.completeOnce`
     /// §5.32). `None` simulates a host without npx — unreachable through the
     /// real `find_npx` on any machine with node installed — so the
@@ -3431,6 +3447,11 @@ impl Services {
         // shape-parity stamp — empty (omitted) here unless the report bypass
         // passed the active-pr-monitors guard above.
         self.annotate_waiting_on_pr_monitors(child_id, &mut data)
+            .await;
+        // Archived-workspace suppression hint: same `workspaceArchived`
+        // stamp as the live idle emit sites (omitted when the workspace is
+        // not archived).
+        self.annotate_workspace_archived(&session.workspace_id, &mut data)
             .await;
         let event = Event {
             id: uuid::Uuid::new_v4().to_string(),
@@ -10407,15 +10428,45 @@ impl WorkspaceApi for Services {
                                 )
                                 .await;
                                 let cache_root = workspaces_root.join(".repo-cache");
-                                let cache_path = match intent_git::repo_cache::ensure_cached_repo(
-                                    &cache_root,
-                                    url,
-                                    &owner,
-                                    &name,
-                                    token.as_deref(),
-                                )
-                                .await
-                                {
+                                // Real streaming progress for the ensure: the
+                                // callback forwards raw git output to a pump
+                                // task that parses it (submodule-aware) and
+                                // reports on the unified scale. Await the pump
+                                // after the ensure so buffered frames flush
+                                // before the "cache ready" milestone.
+                                let (ensure_progress, ensure_pump) = match progress.clone() {
+                                    Some(reporter) => {
+                                        let (cb, pump) =
+                                            create_progress::cache_ensure_reporter(reporter);
+                                        (Some(cb), Some(pump))
+                                    }
+                                    None => (None, None),
+                                };
+                                let ensure_result =
+                                    intent_git::repo_cache::ensure_cached_repo_with_progress(
+                                        &cache_root,
+                                        url,
+                                        &owner,
+                                        &name,
+                                        token.as_deref(),
+                                        ensure_progress,
+                                    )
+                                    .await;
+                                if let Some(pump) = ensure_pump {
+                                    // Bounded: on the ensure's timeout path a
+                                    // lingering grandchild (e.g.
+                                    // git-remote-https) can hold the pipe —
+                                    // and thus a callback clone — open
+                                    // indefinitely; don't let it delay error
+                                    // surfacing (buffered frames only matter
+                                    // cosmetically there).
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        pump,
+                                    )
+                                    .await;
+                                }
+                                let cache_path = match ensure_result {
                                     Ok(path) => path,
                                     Err(e) => {
                                         // Legacy-clone parity: redact any
@@ -10573,6 +10624,10 @@ impl WorkspaceApi for Services {
                                 token,
                                 bus: bus_ref,
                                 progress: progress.clone(),
+                                // Workspace checkouts should land with
+                                // populated submodules, like the cache
+                                // hydration path (decision 2026-08-10).
+                                recurse_submodules: true,
                             })
                             .await
                             .map_err(|failure| Error::CloneFailed {
@@ -10940,15 +10995,39 @@ impl WorkspaceApi for Services {
                             }
                             let branch = ws.branch.clone();
                             let base_ref = ws.base_ref.clone();
+                            let provision_progress = progress.clone();
                             let provision = |mode: intent_core::CheckoutMode| {
                                 let cache = cache_path.clone();
                                 let checkout = checkout_path.clone();
                                 let branch = branch.clone();
                                 let base_ref = base_ref.clone();
                                 let url = hydration_url.clone();
+                                let progress = provision_progress.clone();
                                 async move {
                                     let lock_cache = cache.clone();
-                                    intent_git::repo_cache::with_cache_lock_blocking(
+                                    // Direct hydration streams its submodule
+                                    // population through the reporter (the
+                                    // update's `--progress` output, mapped
+                                    // into the provisioning tail); the pump
+                                    // is awaited after the blocking work so
+                                    // buffered frames flush in order.
+                                    let (sub_chunk, sub_pump) = match (
+                                        mode,
+                                        progress,
+                                    ) {
+                                        (
+                                            intent_core::CheckoutMode::Direct,
+                                            Some(reporter),
+                                        ) => {
+                                            let (cb, pump) =
+                                                create_progress::submodule_hydration_reporter(
+                                                    reporter,
+                                                );
+                                            (Some(cb), Some(pump))
+                                        }
+                                        _ => (None, None),
+                                    };
+                                    let result = intent_git::repo_cache::with_cache_lock_blocking(
                                         &lock_cache,
                                         move || match mode {
                                             intent_core::CheckoutMode::Cow => {
@@ -10980,12 +11059,13 @@ impl WorkspaceApi for Services {
                                                 Ok(sha)
                                             }
                                             intent_core::CheckoutMode::Direct => {
-                                                intent_git::repo_cache::provision_direct_checkout(
+                                                intent_git::repo_cache::provision_direct_checkout_with_progress(
                                                     &cache,
                                                     &checkout,
                                                     &url,
                                                     &branch,
                                                     base_ref.as_deref(),
+                                                    sub_chunk,
                                                 )
                                             }
                                             intent_core::CheckoutMode::Worktree => {
@@ -10996,7 +11076,18 @@ impl WorkspaceApi for Services {
                                             }
                                         },
                                     )
-                                    .await
+                                    .await;
+                                    if let Some(pump) = sub_pump {
+                                        // Bounded for the same reason as the
+                                        // ensure pump: a lingering grandchild
+                                        // can hold the callback open.
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            pump,
+                                        )
+                                        .await;
+                                    }
+                                    result
                                 }
                             };
                             let sha = match provision(mode).await {
@@ -16944,6 +17035,9 @@ impl WorkspaceApi for Services {
                     token,
                     bus,
                     progress: None,
+                    // Standalone `git.clone` keeps its historical plain
+                    // (non-recursive) clone.
+                    recurse_submodules: false,
                 });
             });
             Ok(serde_json::json!({
@@ -19540,12 +19634,15 @@ impl WorkspaceApi for Services {
             .configured_worktrees_location()
             .or_else(|| self.workspaces_root.clone())
             .unwrap_or_else(default_workspaces_root);
+        let registry = self.settings_registry.clone();
+        let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
             let cache_root = cache_parent.join(".repo-cache");
             match intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await? {
                 Some(cached) => {
                     let mut result = serde_json::json!({
                         "cached": true,
+                        "source": "cache",
                         "branches": cached.branches,
                     });
                     // `defaultBranch` is optional on the wire: omitted (not
@@ -19555,10 +19652,41 @@ impl WorkspaceApi for Services {
                     }
                     Ok(result)
                 }
-                None => Ok(serde_json::json!({
-                    "cached": false,
-                    "branches": [],
-                })),
+                // Cold cache: fall back to one `git ls-remote` against the
+                // GitHub remote (monorepo#1955) — one child process, one
+                // round-trip, token offered via env exactly like the clone
+                // pipeline. Any failure (offline, missing repo, no access)
+                // folds to the pre-fallback `{ cached: false, branches: [] }`
+                // — this method never errors for the FE seam.
+                None => {
+                    let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
+                    let url = format!("{base}/{owner}/{repo}.git");
+                    let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                    match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+                        Ok(remote) => {
+                            let mut result = serde_json::json!({
+                                "cached": false,
+                                "source": "ls-remote",
+                                "branches": remote.branches,
+                            });
+                            if let Some(default) = remote.default_branch {
+                                result["defaultBranch"] = serde_json::Value::String(default);
+                            }
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                owner = %owner,
+                                repo = %repo,
+                                "branches.listCached ls-remote fallback failed: {e}"
+                            );
+                            Ok(serde_json::json!({
+                                "cached": false,
+                                "branches": [],
+                            }))
+                        }
+                    }
+                }
             }
         })
     }
