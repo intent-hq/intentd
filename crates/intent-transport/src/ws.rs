@@ -38,7 +38,7 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
-use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
+use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
@@ -573,10 +573,13 @@ impl WsInner {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut sink, mut stream) = ws.split();
-        let (app_tx, mut app_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+        // Two-lane outbound queue: RPC responses on the priority lane, event/
+        // subscription pushes on the bulk lane; `recv()` drains priority first
+        // so responses overtake queued bulk traffic on a saturated link.
+        let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
-        let reverse = ReverseChannel::new(app_tx.clone());
+        let reverse = ReverseChannel::new(app_tx.priority_sender());
         // REV-1: register this connection's reverse channel with the shared
         // primary-target set so agent-initiated `browser.exec` calls can route
         // to whichever client connected first. Guard drops when this loop

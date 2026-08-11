@@ -12,7 +12,8 @@ use std::panic::AssertUnwindSafe;
 
 use futures::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+
+use crate::conn::OutboundSender;
 
 /// Extract the request `id` (`None` when absent → notification) and the
 /// `method` name (empty string when absent) from a parsed frame. Invalid id
@@ -108,7 +109,7 @@ where
 pub(crate) async fn guard_send<F>(
     method: &str,
     rpc_id: Option<Value>,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &OutboundSender,
     fut: F,
 ) -> bool
 where
@@ -129,7 +130,7 @@ where
                 "JSON-RPC handler panicked; connection kept alive"
             );
             match rpc_id {
-                Some(id) => out_tx.send(internal_error_frame(id)).await.is_ok(),
+                Some(id) => out_tx.send_priority(internal_error_frame(id)).await.is_ok(),
                 None => !out_tx.is_closed(),
             }
         }
@@ -208,14 +209,15 @@ mod tests {
 
     #[tokio::test]
     async fn guard_send_panic_on_request_sends_internal_error() {
-        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let (tx, mut rx) = crate::conn::outbound_channel();
         let open = with_quiet_panics(|| {
             futures::executor::block_on(guard_send("x.y", Some(json!(3)), &tx, async {
                 panic!("boom");
             }))
         });
         assert!(open);
-        let frame = rx.try_recv().expect("frame queued");
+        // The internal-error frame travels on the priority lane.
+        let frame = rx.priority.try_recv().expect("frame queued");
         let v: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["id"], json!(3));
         assert_eq!(v["error"]["code"], json!(-32603));
@@ -223,19 +225,20 @@ mod tests {
 
     #[tokio::test]
     async fn guard_send_panic_on_notification_sends_nothing() {
-        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let (tx, mut rx) = crate::conn::outbound_channel();
         let open = with_quiet_panics(|| {
             futures::executor::block_on(guard_send("x.y", None, &tx, async {
                 panic!("boom");
             }))
         });
         assert!(open);
-        assert!(rx.try_recv().is_err());
+        assert!(rx.priority.try_recv().is_err());
+        assert!(rx.bulk.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn guard_send_panic_on_notification_reports_closed_channel() {
-        let (tx, rx) = mpsc::channel::<String>(4);
+        let (tx, rx) = crate::conn::outbound_channel();
         drop(rx);
         let open = with_quiet_panics(|| {
             futures::executor::block_on(guard_send("x.y", None, &tx, async {
