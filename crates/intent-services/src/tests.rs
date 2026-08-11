@@ -18031,6 +18031,95 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
+    /// lands in `.intent/attachments/` with a workspace-relative result path,
+    /// the `.intent/.gitignore` exclusion is ensured on the way, param
+    /// validation surfaces as `Error::InvalidParams` (→ `-32602`), and the
+    /// placed file is invisible to `git status` (monorepo#1948).
+    #[tokio::test]
+    async fn file_place_attachment_places_excluded_from_git() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let dir = std::env::temp_dir().join(format!("intentd-placeatt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        git2::Repository::init(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        // Base64 placement (data: URL prefix tolerated).
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"attached bytes");
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "big.har".to_string(),
+                Some(format!("data:application/json;base64,{b64}")),
+                None,
+            )
+            .await
+            .expect("place");
+        assert_eq!(
+            placed,
+            serde_json::json!({
+                "ok": true,
+                "path": ".intent/attachments/big.har",
+                "fileName": "big.har",
+                "size": 14
+            })
+        );
+        assert_eq!(
+            std::fs::read(dir.join(".intent/attachments/big.har")).unwrap(),
+            b"attached bytes"
+        );
+
+        // The default `.intent/.gitignore` was ensured, and git reports the
+        // placed file as ignored (the exclusion contract).
+        assert!(dir.join(".intent/.gitignore").exists());
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert!(repo
+            .is_path_ignored(std::path::Path::new(".intent/attachments/big.har"))
+            .unwrap());
+
+        // sourcePath placement (same-host copy) collides into `-2`.
+        let src = dir.join("local-source.har");
+        std::fs::write(&src, b"from disk").unwrap();
+        let placed2 = svc
+            .file_place_attachment(
+                ws.clone(),
+                "big.har".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+            )
+            .await
+            .expect("place from sourcePath");
+        assert_eq!(placed2["fileName"], serde_json::json!("big-2.har"));
+        assert_eq!(
+            std::fs::read(dir.join(".intent/attachments/big-2.har")).unwrap(),
+            b"from disk"
+        );
+
+        // Param validation: none / both / bad base64 / relative sourcePath.
+        for (data, source_path) in [
+            (None, None),
+            (Some("aGk=".to_string()), Some("/tmp/x".to_string())),
+            (Some("!!!not-base64!!!".to_string()), None),
+            (None, Some("relative/path.txt".to_string())),
+        ] {
+            let res = svc
+                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path)
+                .await;
+            assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
     /// and assert the write landed in the sandbox and the user's directory is untouched.

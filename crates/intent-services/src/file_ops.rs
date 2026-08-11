@@ -19,6 +19,13 @@ use crate::git_ops;
 /// TS `LocalFileSystemAdapter` access-denied message.
 const ACCESS_DENIED: &str = "Access denied: path outside workspace";
 
+/// Workspace-relative directory attachments are placed into by
+/// `file.placeAttachment` (intent-hq/monorepo#1948). Lives under `.intent/`
+/// so the default `.intent/.gitignore` (`*` with only `.gitignore` and
+/// `config.json` re-included) keeps placed files out of git tracking,
+/// auto-commit, and attribution.
+pub(crate) const ATTACHMENTS_DIR: &str = ".intent/attachments";
+
 /// Resolve the workspace filesystem root the way the TS protocol adapter does:
 /// `worktreePath || repositoryPath`, else empty (→ CWD-relative resolution).
 pub(crate) fn workspace_root(ws: &Workspace) -> String {
@@ -139,6 +146,68 @@ pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
     std::fs::write(&full, content).map_err(io_err)?;
     let size = content.encode_utf16().count();
     Ok(json!({ "ok": true, "path": path, "size": size }))
+}
+
+/// Reduce a client-supplied attachment file name to a safe basename: keep
+/// only the final path component (either separator style), then drop any
+/// remaining `..`/`.`/empty outcome. `None` when nothing usable is left.
+fn sanitize_attachment_name(file_name: &str) -> Option<String> {
+    let base = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if base.is_empty() || base == "." || base == ".." {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+/// Split a file name into (stem, extension-with-dot) for collision suffixing:
+/// `report.tar.gz` → (`report.tar`, `.gz`), `Makefile` → (`Makefile`, ``),
+/// `.env` → (`.env`, ``) — a leading dot is part of the stem, not an extension.
+fn split_name(name: &str) -> (&str, &str) {
+    match name[1..].rfind('.') {
+        Some(i) => name.split_at(i + 1),
+        None => (name, ""),
+    }
+}
+
+/// `file.placeAttachment` → `{ ok, path, fileName, size }` (PROTOCOL §5.9;
+/// intent-hq/monorepo#1948). Places `bytes` into `.intent/attachments/` under
+/// a collision-safe name: the sanitized basename as-is when free, else
+/// `<stem>-2<ext>`, `<stem>-3<ext>`, … (bounded, then a UUID fallback).
+/// `path` in the result is workspace-relative; `size` is the byte length
+/// written. The directory sits under `.intent/`, whose default `.gitignore`
+/// excludes it from git tracking (and therefore auto-commit and attribution).
+pub(crate) fn place_attachment(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
+    let name = sanitize_attachment_name(file_name).ok_or_else(|| {
+        Error::InvalidParams(format!("invalid attachment fileName: {file_name:?}"))
+    })?;
+    let dir = resolve_within(root, ATTACHMENTS_DIR)?;
+    std::fs::create_dir_all(&dir).map_err(io_err)?;
+
+    let (stem, ext) = split_name(&name);
+    let mut chosen = name.clone();
+    let mut n = 2u32;
+    while dir.join(&chosen).exists() {
+        if n > 1000 {
+            chosen = format!("{stem}-{}{ext}", uuid::Uuid::new_v4().simple());
+            break;
+        }
+        chosen = format!("{stem}-{n}{ext}");
+        n += 1;
+    }
+
+    let full = dir.join(&chosen);
+    std::fs::write(&full, bytes).map_err(io_err)?;
+    let rel = format!("{ATTACHMENTS_DIR}/{chosen}");
+    Ok(json!({
+        "ok": true,
+        "path": rel,
+        "fileName": chosen,
+        "size": bytes.len(),
+    }))
 }
 
 /// `file.list` → bare array of `{ name, type }`.
@@ -607,6 +676,65 @@ mod tests {
         assert_eq!(ds["isDirectory"], json!(true));
 
         assert!(matches!(stat(&root, "nope"), Err(Error::Internal(_))));
+    }
+
+    #[test]
+    fn place_attachment_writes_into_attachments_dir() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let r = place_attachment(&root, "report.har", b"payload").unwrap();
+        assert_eq!(
+            r,
+            json!({
+                "ok": true,
+                "path": ".intent/attachments/report.har",
+                "fileName": "report.har",
+                "size": 7
+            })
+        );
+        let on_disk =
+            std::fs::read(std::path::Path::new(&root).join(".intent/attachments/report.har"))
+                .unwrap();
+        assert_eq!(on_disk, b"payload");
+    }
+
+    #[test]
+    fn place_attachment_collision_safe_naming() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let a = place_attachment(&root, "dump.tar.gz", b"one").unwrap();
+        let b = place_attachment(&root, "dump.tar.gz", b"two").unwrap();
+        let c = place_attachment(&root, "dump.tar.gz", b"three").unwrap();
+        assert_eq!(a["fileName"], json!("dump.tar.gz"));
+        assert_eq!(b["fileName"], json!("dump.tar-2.gz"));
+        assert_eq!(c["fileName"], json!("dump.tar-3.gz"));
+        // Extension-less and dotfile names suffix at the end.
+        place_attachment(&root, "Makefile", b"x").unwrap();
+        let m2 = place_attachment(&root, "Makefile", b"y").unwrap();
+        assert_eq!(m2["fileName"], json!("Makefile-2"));
+        place_attachment(&root, ".env", b"x").unwrap();
+        let e2 = place_attachment(&root, ".env", b"y").unwrap();
+        assert_eq!(e2["fileName"], json!(".env-2"));
+    }
+
+    #[test]
+    fn place_attachment_sanitizes_names_and_rejects_unusable() {
+        let t = TempRoot::new();
+        let root = t.root();
+        // Path components are stripped down to the basename — no escape.
+        let r = place_attachment(&root, "../../etc/passwd", b"x").unwrap();
+        assert_eq!(r["fileName"], json!("passwd"));
+        let w = place_attachment(&root, "C:\\Users\\me\\file.txt", b"x").unwrap();
+        assert_eq!(w["fileName"], json!("file.txt"));
+        for bad in ["", "   ", ".", "..", "dir/"] {
+            assert!(
+                matches!(
+                    place_attachment(&root, bad, b"x"),
+                    Err(Error::InvalidParams(_))
+                ),
+                "expected InvalidParams for {bad:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
