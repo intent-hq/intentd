@@ -108,6 +108,7 @@ mod shell;
 pub mod stack_sample;
 mod terminal_ops;
 pub mod tool_block;
+mod transfer;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -10193,6 +10194,13 @@ impl WorkspaceApi for Services {
 
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.workspace_disk_usage_op(id).await })
+    }
+
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+        Box::pin(async move { self.workspace_transfer_plan_op(id).await })
     }
 
     fn create_workspace(

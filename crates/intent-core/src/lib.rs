@@ -33,6 +33,7 @@ pub mod settings_file;
 pub mod slug;
 pub mod tilde;
 pub mod traits;
+pub mod transfer;
 pub mod turn_attachments;
 
 pub use agent_configs::{

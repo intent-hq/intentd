@@ -92,6 +92,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `workspace.transfer.plan`: read-only preview of a workspace transfer
+    /// (PROTOCOL §5.1) — the versioned [`crate::transfer::TransferManifest`]
+    /// plus a size estimate broken down as DB row bytes + asset bytes +
+    /// estimated git bundle bytes, and non-blocking pre-flight warnings.
+    /// No side effects; `NotFound` if the workspace is absent.
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<crate::transfer::TransferPlan>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::workspace_transfer_plan not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Create a workspace from wire input, filling ids/defaults, and
     /// orchestrate the optional initial agent — created and its prompt
     /// delivered inside the same idempotency scope, so `initialAgent` is

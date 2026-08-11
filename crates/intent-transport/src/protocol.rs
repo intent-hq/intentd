@@ -56,10 +56,14 @@
 //! Version 6.4 adds the `host.checkNode` and `host.checkGh` fast-path methods
 //! (additive; §5.14, monorepo#1891): uncached node/gh detection mirroring
 //! `host.checkGit` (`{ available, version?, path? }`) so a fresh install is
-//! seen immediately — 272 router methods, 311 total.
+//! seen immediately — 272 router methods, 311 total. Version 6.5 adds
+//! `workspace.transfer.plan` (additive; §5.1): read-only transfer preview —
+//! the versioned export manifest (tables, assets, git summary) plus the size
+//! estimate (DB rows + assets + estimated git bundle) and pre-flight
+//! warnings — 273 router methods, 312 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.4";
+pub const PROTOCOL_VERSION: &str = "6.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -7042,6 +7042,72 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
     srv.ws.stop().await;
 }
 
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1):
+/// the result carries `{ plan }` with the versioned manifest (formatVersion,
+/// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
+/// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
+/// never listed; unknown workspace ids map to `-32602 Workspace not found`.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Transfer"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let manifest = &plan["manifest"];
+    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert!(
+        manifest["creatingIntentdVersion"].is_string(),
+        "manifest records the creating daemon version: {resp}"
+    );
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
+    let tables = manifest["tables"].as_array().expect("tables array");
+    assert!(
+        tables.iter().any(|t| t["name"] == "workspace"
+            && t["rowCount"] == 1
+            && t["approxBytes"].as_i64().unwrap_or(0) > 0),
+        "workspace row is counted with a byte estimate: {resp}"
+    );
+    assert!(
+        tables.iter().all(|t| t["name"] != "event"),
+        "event log is excluded from the manifest: {resp}"
+    );
+    assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(total, db + assets + bundle, "size breakdown sums: {resp}");
+    assert!(plan["warnings"].is_array(), "{resp}");
+
+    // Unknown workspace → the standard workspace-not-found mapping.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Workspace not found", "{resp}");
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
