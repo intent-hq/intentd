@@ -112,6 +112,7 @@ mod terminal_ops;
 pub mod tool_block;
 mod transfer;
 pub mod transfer_git;
+pub mod transfer_materialize;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -5901,7 +5902,7 @@ static REPO_REGISTRY_SYNCED: std::sync::atomic::AtomicBool =
 /// Resolve a known-repo display name from an optional explicit name plus the
 /// repo path, mirroring TS `repositoryName || path.split('/').pop() || 'Unknown'`
 /// (an empty explicit name falls through to the basename).
-fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
+pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     if let Some(n) = explicit {
         if !n.is_empty() {
             return n.to_string();
@@ -6116,7 +6117,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
 /// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
 /// `"repo"` fallback.
-fn worktree_folder_slug(repo_name: &str) -> String {
+pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
