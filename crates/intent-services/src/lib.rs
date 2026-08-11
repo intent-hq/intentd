@@ -3716,7 +3716,12 @@ impl Services {
         // completion report while the child's assigned task note is still
         // incomplete gets its wake annotated (text + metadata). Store lookup
         // failures fail open (no annotation); the wake always proceeds.
-        let stall = if watches.is_empty() {
+        // monorepo#1898: an event payload carrying a report (copied from the
+        // session at emit time) means the child DID report — suppress the
+        // suspicion entirely (text AND `stallSuspected` metadata) even if the
+        // persisted report was cleared since, so the machine-readable flag
+        // can never contradict the rendered `Report:` clause.
+        let stall = if watches.is_empty() || event_carries_report(&event.data) {
             None
         } else {
             self.stall_suspicion_for_completion(child_id, &event.event_type)
@@ -7969,6 +7974,19 @@ fn replace_uuid_tokens(text: &str) -> String {
     out
 }
 
+/// monorepo#1898: does this completion event's payload carry a non-empty
+/// completion report (`completionReport`, canonical, or the legacy `report`
+/// key)? The report is copied from the session at emit time, so a carrying
+/// event means the child DID report — used to suppress the stall suspicion
+/// (text and `stallSuspected` metadata) even when the persisted session
+/// report was cleared after emit.
+pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
+    data.get("completionReport")
+        .or_else(|| data.get("report"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|r| !r.is_empty())
+}
+
 /// Build a concise, human-readable wake string describing a child agent's
 /// completion for its parent. A minimal port of the TS formatEventNotification
 /// intent: it names the child, the completion kind, and any completion
@@ -7997,6 +8015,7 @@ fn format_completion_wake(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = event
         .data
         .get("completionReport")
@@ -8005,6 +8024,7 @@ fn format_completion_wake(
         .filter(|s| !s.is_empty())
     {
         msg.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -8019,8 +8039,14 @@ fn format_completion_wake(
             msg.push_str(&format!(" Error: {err}"));
         }
     }
+    // monorepo#1898: the stall suspicion and the report can come from
+    // different session reads, so the tail is derived from what was actually
+    // rendered — a wake carrying a `Report:` clause never gets the
+    // contradictory "No completion report … may have stalled" suffix.
     if let Some(stall) = stall {
-        msg.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            msg.push_str(&stall.annotation_suffix());
+        }
     }
     msg
 }
@@ -8052,6 +8078,7 @@ pub(crate) fn format_group_child_line(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut line = format!("- {label} {kind}.");
+    let mut report_rendered = false;
     if let Some(report) = completion_report
         .or_else(|| {
             event
@@ -8063,6 +8090,7 @@ pub(crate) fn format_group_child_line(
         .filter(|r| !r.is_empty())
     {
         line.push_str(&format!(" Report: {report}"));
+        report_rendered = true;
     } else if let Some(summary) = event
         .data
         .get("lastResponseSummary")
@@ -8100,8 +8128,13 @@ pub(crate) fn format_group_child_line(
             .unwrap_or("");
         line.push_str(&format!(" {verb}: {reason}"));
     }
+    // monorepo#1898: same consistency guard as `format_completion_wake` —
+    // never append the "No completion report" tail to a line that already
+    // rendered a `Report:` clause.
     if let Some(stall) = stall {
-        line.push_str(&stall.annotation_suffix());
+        if !report_rendered {
+            line.push_str(&stall.annotation_suffix());
+        }
     }
     line
 }
@@ -8145,9 +8178,10 @@ impl StallSuspicion {
 impl Services {
     /// Evaluate the monorepo#1016 stall predicate for a child completion:
     /// `agent:idle` AND no persisted completion report AND the session has an
-    /// assigned task note whose status is not complete/cancelled. Every store
-    /// failure fails OPEN (returns `None`) — annotation is best-effort and
-    /// must never block, delay, or drop a wake.
+    /// assigned task note whose status is not complete/cancelled/
+    /// review_required (monorepo#1898). Every store failure fails OPEN
+    /// (returns `None`) — annotation is best-effort and must never block,
+    /// delay, or drop a wake.
     pub(crate) async fn stall_suspicion_for_completion(
         &self,
         child_id: &AgentId,
@@ -8180,7 +8214,18 @@ impl Services {
             .await
             .ok()?;
         let task = note.metadata.task.as_ref()?;
-        if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+        // `review_required` is excluded alongside the terminal statuses
+        // (monorepo#1898): it is set by the child's explicit completion
+        // signal (`agent.reportToParent`'s TASK-B transition), so the child
+        // finished and awaits review — "may have stalled rather than
+        // finished" would contradict it. Incident shape (monorepo#1791): a
+        // child reports (task → review_required), a later turn clears the
+        // persisted report (`clear_completion_report_if_present`), and the
+        // final idle would otherwise get the self-contradictory stall tail.
+        if matches!(
+            task.status,
+            TaskStatus::Complete | TaskStatus::Cancelled | TaskStatus::ReviewRequired
+        ) {
             return None;
         }
         let task_status = serde_json::to_value(task.status)
