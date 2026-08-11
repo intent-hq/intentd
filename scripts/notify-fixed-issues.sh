@@ -31,6 +31,13 @@
 #                    back to ambient gh auth when unset)
 set -euo pipefail
 
+# Callers run this script fail-soft (continue-on-error), so an unexpected
+# set -e exit would otherwise be invisible (intent-hq/monorepo#1921). Log
+# where it died before the shell unwinds. -o errtrace propagates the trap
+# into functions and subshells.
+set -o errtrace
+trap 'echo "error: notify-fixed-issues.sh: command failed (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
+
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=true
