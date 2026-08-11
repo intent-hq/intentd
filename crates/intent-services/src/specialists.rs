@@ -39,10 +39,6 @@ const EMBEDDED_BUNDLED: &[(&str, &str)] = &[
         "pr-reviewer",
         include_str!("../resources/specialists/pr-reviewer.md"),
     ),
-    (
-        "pr-shepherd",
-        include_str!("../resources/specialists/pr-shepherd.md"),
-    ),
     ("ralph", include_str!("../resources/specialists/ralph.md")),
     (
         "spec-writer",
@@ -1286,8 +1282,8 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    /// The nine reference specialist ids embedded via `include_str!` (PP-2).
-    const EMBEDDED_IDS: [&str; 9] = [
+    /// The eight reference specialist ids embedded via `include_str!` (PP-2).
+    const EMBEDDED_IDS: [&str; 8] = [
         "spec-writer",
         "implementor",
         "verifier",
@@ -1296,11 +1292,10 @@ mod tests {
         "ralph",
         "ui-designer",
         "pr-reviewer",
-        "pr-shepherd",
     ];
 
     #[test]
-    fn embedded_bundled_resolves_all_nine_with_zero_local_files() {
+    fn embedded_bundled_resolves_all_eight_with_zero_local_files() {
         // Empty user + bundled dirs: every embedded id still resolves through
         // get()/list()/resolve_agent_type()/resolve_role_reminder().
         let dir = TempSpecialistsDir::new();
