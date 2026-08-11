@@ -1708,6 +1708,55 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     assert_eq!(b.task_metadata.conflicts_with[0].as_str(), "task-c");
     assert!(b.unmet_depends_on.is_empty(), "complete dep is met");
 
+    // Re-marking at the SAME status with omitted relation params keeps the
+    // existing relations (regression: the same-status arm rebuilds metadata
+    // from scratch and must carry them over).
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("same-status re-mark");
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after re-mark");
+    assert_eq!(
+        b.task_metadata.depends_on[0].as_str(),
+        "task-a",
+        "same-status re-mark must keep dependsOn"
+    );
+    assert_eq!(
+        b.task_metadata.conflicts_with[0].as_str(),
+        "task-c",
+        "same-status re-mark must keep conflictsWith"
+    );
+
+    // No-op setRelations (identical lists) skips the store write: rev is
+    // unchanged.
+    let rev_before = b.rev;
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-b"),
+            Some(vec![NoteId::from("task-a")]),
+            None,
+        )
+        .await
+        .expect("no-op setRelations");
+    assert!(r.ok);
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after no-op");
+    assert_eq!(b.rev, rev_before, "no-op setRelations must not bump rev");
+
     // setRelations on a non-task note is rejected.
     let err = svc
         .task_set_relations(ws, NoteId::from("plain"), Some(vec![]), None)
