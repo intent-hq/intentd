@@ -2518,13 +2518,23 @@ fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
 
 /// Describe the probable holder of a contended data-dir lock for the error
 /// message above: the pidfile's pid plus a signal-0 liveness verdict (e.g.
-/// `pid 12345, alive`). Falls back to the raw errno (`EAGAIN: ...`) when no
-/// pid is readable from the pidfile — the flock holder and the pidfile owner
-/// are the same live daemon in the normal contention case, but the pidfile is
-/// only a best-effort hint, never load-bearing for the locking semantics.
+/// `pid 12345, alive`). Falls back to the raw errno when the pidfile does not
+/// implicate a holder — the flock holder and the pidfile owner are the same
+/// live daemon in the normal contention case, but the pidfile is only a
+/// best-effort hint, never load-bearing for the locking semantics.
+///
+/// Only contention (`EAGAIN`/`EWOULDBLOCK`) is attributed to the pidfile
+/// owner; any other errno is a real flock failure (e.g. `ENOLCK`) and stays
+/// visible as-is. Pids outside `1..=i32::MAX` are ignored: `kill(0, 0)`
+/// probes our own process group and larger values go negative in the
+/// `i32` cast, so a malformed pidfile would falsely read as `alive`.
 #[cfg(unix)]
 fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
-    match read_pid(pid_path) {
+    use nix::errno::Errno;
+    if errno != Errno::EAGAIN && errno != Errno::EWOULDBLOCK {
+        return errno.to_string();
+    }
+    match read_pid(pid_path).filter(|pid| (1..=i32::MAX as u32).contains(pid)) {
         Some(pid) => {
             let liveness = if pid_is_alive(pid) {
                 "alive"
@@ -4053,6 +4063,36 @@ mod tests {
             err.contains("pid 2147483640, not running"),
             "error names the dead holder: {err}"
         );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_holder_detail_keeps_non_contention_errno_despite_pidfile() {
+        let config = temp_config();
+        // A real flock failure (e.g. ENOLCK) must stay visible as-is even
+        // when a parseable pidfile exists — only contention implicates it.
+        std::fs::write(&config.pid_path, std::process::id().to_string()).unwrap();
+        let detail = lock_holder_detail(&config.pid_path, nix::errno::Errno::ENOLCK);
+        assert_eq!(detail, nix::errno::Errno::ENOLCK.to_string());
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_holder_detail_ignores_implausible_pids() {
+        let config = temp_config();
+        // pid 0 would signal-0 our own process group; pids above i32::MAX go
+        // negative in the kill() cast. Both must fall back to the errno.
+        for bogus in ["0", "4294967295"] {
+            std::fs::write(&config.pid_path, bogus).unwrap();
+            let detail = lock_holder_detail(&config.pid_path, nix::errno::Errno::EAGAIN);
+            assert_eq!(
+                detail,
+                nix::errno::Errno::EAGAIN.to_string(),
+                "pidfile {bogus} must not be probed"
+            );
+        }
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
