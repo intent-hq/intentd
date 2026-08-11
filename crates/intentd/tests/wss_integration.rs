@@ -1055,6 +1055,140 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
     srv.ws.stop().await;
 }
 
+/// intent-hq/monorepo#1897 over the real WSS wire: a ready-to-send queue
+/// entry older than the stale-queue threshold on an idle agent surfaces as a
+/// `stale-queue-entry` stuck-risk in the `agent.diagnostics` response —
+/// `stuckRisks` names the agent and oldest entry, `summary.stuckRisks` counts
+/// it, and the `text` rendering mentions it. The stale entry is seeded via
+/// the durable queue snapshot + rehydration path (the same path a daemon
+/// restart uses), so the wire read reflects the live in-memory queue.
+#[tokio::test]
+async fn wss_agent_diagnostics_flags_stale_queue_entry() {
+    let dir = test_tempdir("intentd-wss-stalequeue-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    // Keep a concrete handle (Services is Clone over shared internals) so the
+    // test can rehydrate the seeded queue into the same live registry the
+    // WSS listener serves from.
+    let services_handle = services.clone();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let mut opts = WsOptions {
+        base_port: 0,
+        ..WsOptions::default()
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = server.start().await.expect("start");
+
+    let created_ws = wss_call(
+        port,
+        cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Stale Queue"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Stale Queue Target"}}}}"#
+    );
+    let created = wss_call(port, cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+
+    // Seed one backdated and one fresh ready-to-send entry through the
+    // durable snapshot, then rehydrate into the live in-memory registry.
+    let stale_at = "2020-01-01T00:00:00Z";
+    let fresh_at = now_iso();
+    let row = |id: &str, position: i64, queued_at: &str| intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position,
+        payload: serde_json::json!({
+            "id": id,
+            "content": "undelivered wake",
+            "queuedAt": queued_at,
+        }),
+        created_at: queued_at.into(),
+        turn_id: id.into(),
+    };
+    store
+        .replace_agent_queue(
+            &agent,
+            &[
+                row("qmsg-stale", 0, stale_at),
+                row("qmsg-fresh", 1, &fresh_at),
+            ],
+        )
+        .await
+        .expect("seed queue");
+    let rehydrated = services_handle
+        .rehydrate_agent_queues()
+        .await
+        .expect("rehydrate queues");
+    assert_eq!(rehydrated, 2, "both seeded entries rehydrated");
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(port, cfg.clone(), &diag_frame).await;
+    assert_eq!(diag["jsonrpc"], Value::String("2.0".into()), "{diag}");
+    assert_eq!(diag["id"], Value::from(3), "{diag}");
+    let d = &diag["result"]["diagnostics"];
+    let risks = d["stuckRisks"].as_array().expect("stuckRisks array");
+    let risk = risks
+        .iter()
+        .find(|r| r["type"] == serde_json::json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk on the wire");
+    assert_eq!(risk["severity"], Value::String("warning".into()), "{risk}");
+    assert_eq!(risk["agentId"], Value::String(agent_id.clone()), "{risk}");
+    assert_eq!(
+        risk["entryId"],
+        Value::String("qmsg-stale".into()),
+        "{risk}"
+    );
+    assert_eq!(
+        risk["count"],
+        Value::from(1),
+        "fresh entry excluded: {risk}"
+    );
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "{risk}"
+    );
+    assert_eq!(
+        d["summary"]["stuckRisks"],
+        Value::from(risks.len()),
+        "summary counts the risks: {d}"
+    );
+    let text = diag["result"]["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    server.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
