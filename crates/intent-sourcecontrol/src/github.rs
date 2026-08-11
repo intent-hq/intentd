@@ -8,12 +8,24 @@
 //! `errors` mapped onto [`Error::Api`]), so [`graphql_data`] only guards
 //! against a `null` payload.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::model::*;
 use crate::SourceControl;
+
+/// Bounded TCP connect wait for every octocrab request. Without these
+/// timeouts a connection that goes dark makes an in-flight request pend
+/// forever, which wedged the serialized PR-monitor sweep — `lastPolledAt`
+/// froze for *all* monitors and no wakes were delivered
+/// (intent-hq/monorepo#1988).
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounded per-read/-write socket wait for every octocrab request; same
+/// rationale as [`CONNECT_TIMEOUT`] (intent-hq/monorepo#1988).
+pub(crate) const READ_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GitHub implementation of [`SourceControl`].
 pub struct GitHubSourceControl {
@@ -24,7 +36,11 @@ impl GitHubSourceControl {
     /// Build a client from a personal token, optionally targeting a GitHub
     /// Enterprise instance via `api_base_url` (`octocrab` `.base_uri(...)`).
     pub fn new(token: &str, api_base_url: Option<&str>) -> Result<Self> {
-        let mut builder = octocrab::Octocrab::builder().personal_token(token.to_string());
+        let mut builder = octocrab::Octocrab::builder()
+            .personal_token(token.to_string())
+            .set_connect_timeout(Some(CONNECT_TIMEOUT))
+            .set_read_timeout(Some(READ_WRITE_TIMEOUT))
+            .set_write_timeout(Some(READ_WRITE_TIMEOUT));
         if let Some(base) = api_base_url {
             builder = builder
                 .base_uri(base)

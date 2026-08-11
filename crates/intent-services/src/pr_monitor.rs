@@ -47,6 +47,13 @@ use intent_core::config::{MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_POLL_S
 /// `maxPerAgent` convention).
 pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 
+/// Upper bound on one shared `(repo, pr)` forge fetch within a sweep —
+/// defense in depth above the client-level network timeouts, so a fetch
+/// that pends indefinitely (e.g. a TCP connection that went dark) surfaces
+/// as a recorded `lastError` on the affected monitors instead of wedging
+/// the single serialized sweep loop for every monitor.
+pub(crate) const PR_MONITOR_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Max-latency bound on the debounce hold, in debounce windows: a PR that
 /// never goes quiet (a long CI matrix flipping one check at a time, an active
 /// review conversation) still gets its consolidated wake once the OLDEST
@@ -1118,10 +1125,22 @@ impl Services {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
-                    let fetched =
-                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64)
-                            .await
-                            .map_err(|e| e.to_string());
+                    // The timeout is defense in depth above the client-level
+                    // network timeouts: a fetch that pends indefinitely maps
+                    // to an error (recorded as `lastError` below) instead of
+                    // wedging the sweep for every other monitor.
+                    let fetched = match tokio::time::timeout(
+                        self.pr_monitor_fetch_timeout,
+                        fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(|e| e.to_string()),
+                        Err(_) => Err(format!(
+                            "PR fetch timed out after {:?}",
+                            self.pr_monitor_fetch_timeout
+                        )),
+                    };
                     entry.insert(fetched).clone()
                 }
             };
@@ -1918,6 +1937,8 @@ mod tests {
         checks: Vec<RollupCheck>,
         fail_get_pr: bool,
         fail_list_comments: bool,
+        /// PR number whose `get_pr` pends forever (hung-connection regression).
+        hang_get_pr: Option<u64>,
     }
 
     impl Default for ForgeState {
@@ -1939,6 +1960,7 @@ mod tests {
                 }],
                 fail_get_pr: false,
                 fail_list_comments: false,
+                hang_get_pr: None,
             }
         }
     }
@@ -2042,6 +2064,10 @@ mod tests {
             self.get_pr_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let s = self.state.lock().unwrap().clone();
+            if s.hang_get_pr == Some(number) {
+                // A TCP connection that went dark: the future never resolves.
+                std::future::pending::<()>().await;
+            }
             if s.fail_get_pr {
                 return Err(intent_sourcecontrol::Error::Unsupported(
                     "forge down".into(),
@@ -3294,6 +3320,61 @@ mod tests {
             assert_eq!(row.state, PrMonitorState::Active);
             assert!(row.last_error.is_some(), "error recorded on {}", id.0);
         }
+    }
+
+    /// Regression for intent-hq/monorepo#1988: a forge fetch that pends
+    /// forever (a TCP connection gone dark) must not wedge the sweep. The
+    /// per-fetch timeout maps the hang to an error — `lastError` set,
+    /// `lastPolledAt` stamped, baseline untouched, monitor still active —
+    /// and the sweep proceeds to poll the remaining monitors.
+    #[tokio::test]
+    async fn a_hung_fetch_times_out_and_the_sweep_still_polls_other_monitors() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_fetch_timeout(Duration::from_millis(50));
+        // The hung monitor registers FIRST so the sweep (created_at order)
+        // hits the hang before the healthy monitor — forward progress past
+        // the hang is exactly what the test proves.
+        let hung = register(&svc, &ws, &owner).await;
+        let baseline = hung.last_snapshot.clone();
+        let healthy = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 43)
+            .await
+            .expect("register healthy")
+            .0;
+
+        forge.edit(|s| s.hang_get_pr = Some(42));
+        let before = forge.fetches();
+        svc.poll_pr_monitors().await;
+        assert_eq!(
+            forge.fetches() - before,
+            2,
+            "the sweep completes: one hung attempt on PR 42, one healthy fetch on PR 43"
+        );
+
+        let hung_row = svc.store().get_pr_monitor(&hung.monitor_id).await.unwrap();
+        assert_eq!(hung_row.state, PrMonitorState::Active, "the loop survives");
+        assert!(
+            hung_row
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("timed out")),
+            "timeout recorded as lastError: {:?}",
+            hung_row.last_error
+        );
+        assert!(hung_row.last_polled_at.is_some(), "lastPolledAt stamped");
+        assert_eq!(hung_row.last_snapshot, baseline, "baseline untouched");
+
+        let healthy_row = svc
+            .store()
+            .get_pr_monitor(&healthy.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(healthy_row.state, PrMonitorState::Active);
+        assert!(
+            healthy_row.last_error.is_none(),
+            "the healthy monitor polled cleanly: {:?}",
+            healthy_row.last_error
+        );
     }
 
     /// The property `SharedPrSnapshot` exists for: when the comment read
