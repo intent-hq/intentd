@@ -21792,12 +21792,17 @@ impl WorkspaceApi for Services {
     }
 
     /// `prMonitor.flush`: emit the pending debounced changes immediately.
+    /// `check: true` re-polls the monitor on demand first.
     fn pr_monitor_flush_pending(
         &self,
         workspace_id: WorkspaceId,
         monitor_id: intent_core::PrMonitorId,
+        check: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.pr_monitor_flush_op(&workspace_id, &monitor_id).await })
+        Box::pin(async move {
+            self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
+                .await
+        })
     }
 }
 

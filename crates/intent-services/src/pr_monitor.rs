@@ -1057,6 +1057,53 @@ impl Services {
         self.emit_pending_changes(&monitor).await
     }
 
+    /// `check: true` variant of [`Services::pr_monitor_flush`]: first re-poll
+    /// the one monitor on demand — fresh shared snapshot, recomputed
+    /// coalesced pending set against the emit baseline, persisted through
+    /// the same guarded CAS write as the sweep, terminalizing if the PR
+    /// merged/closed — then deliver whatever is pending immediately,
+    /// bypassing the debounce window. `Ok(false)` with no wake when the
+    /// re-poll finds nothing changed vs. the emit baseline. A forge fetch
+    /// failure records `lastError` (like a sweep poll) and propagates the
+    /// error.
+    pub async fn pr_monitor_check_and_flush(
+        &self,
+        workspace_id: &WorkspaceId,
+        monitor_id: &PrMonitorId,
+    ) -> Result<bool> {
+        let monitor = self.store.get_pr_monitor(monitor_id).await?;
+        if &monitor.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!(
+                "pr monitor {} not found",
+                monitor_id.0
+            )));
+        }
+        if monitor.state != PrMonitorState::Active {
+            return Ok(false);
+        }
+        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        let repo_ref = RepoRef::new(&monitor.repo_owner, &monitor.repo_name);
+        let shared =
+            match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number as u64).await {
+                Ok(shared) => shared,
+                Err(e) => {
+                    self.record_pr_monitor_error(&monitor, &e.to_string()).await;
+                    return Err(e);
+                }
+            };
+        // The poll itself can deliver the wake (the terminal final wake, or
+        // a debounce window that had already elapsed).
+        if self.poll_one_pr_monitor(&monitor, &shared).await? {
+            return Ok(true);
+        }
+        // Otherwise flush the recomputed pending set (if any) immediately.
+        let monitor = self.store.get_pr_monitor(monitor_id).await?;
+        if monitor.state != PrMonitorState::Active || monitor.pending_changes.is_empty() {
+            return Ok(false);
+        }
+        self.emit_pending_changes(&monitor).await
+    }
+
     /// Spawn the ONE centralized poll loop: every `[prMonitor] pollSeconds`
     /// (re-read each tick), poll every DUE active monitor. Returns the task
     /// handle so the composition root can hold/abort it.
@@ -1203,12 +1250,13 @@ impl Services {
     /// Poll one monitor against the sweep's shared snapshot: RECOMPUTE the
     /// coalesced pending set against the persisted emit baseline, and either
     /// terminalize (PR merged/closed → immediate final wake) or evaluate the
-    /// debounce window.
+    /// debounce window. Returns whether a wake was delivered (the terminal
+    /// final wake, or the consolidated change wake on an elapsed window).
     async fn poll_one_pr_monitor(
         &self,
         monitor: &PrMonitor,
         shared: &SharedPrSnapshot,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let previous: Option<PrMonitorSnapshot> = monitor
             .last_snapshot
             .as_deref()
@@ -1293,7 +1341,7 @@ impl Services {
             // The row moved under this sweep's stale image (a concurrent
             // flush, cancel, or re-register): discard the write and its
             // side effects; the next tick re-reads and retries.
-            return Ok(());
+            return Ok(false);
         }
         let mut updated = monitor.clone();
         updated.last_snapshot = fresh_json;
@@ -1317,15 +1365,18 @@ impl Services {
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an
-        // immediate, undebounced final wake.
+        // immediate, undebounced final wake. A lost guarded write inside
+        // (a concurrent flush/cancel won the row) skips the wake, and that
+        // outcome propagates so callers never report a delivery that did
+        // not happen.
         if fresh.is_terminal() {
-            self.complete_pr_monitor(&updated, &fresh).await?;
+            let delivered = self.complete_pr_monitor(&updated, &fresh).await?;
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
-            return Ok(());
+            return Ok(delivered);
         }
         if updated.pending_changes.is_empty() {
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
-            return Ok(());
+            return Ok(false);
         }
         // Restart catch-up: anything accumulated across the downtime fires
         // now. Otherwise hold until the PR has been quiet for the window
@@ -1334,8 +1385,9 @@ impl Services {
             && self.emit_pending_changes(&updated).await?
         {
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Consume a monitor's restart catch-up marker once its post-restart
@@ -1439,12 +1491,14 @@ impl Services {
     /// state, and deliver the immediate final wake. Its "Changes since the
     /// last report" section coalesces the same way as a change wake —
     /// `diff(baseline, final)` — so the journey to terminal never replays
-    /// intermediate transitions.
+    /// intermediate transitions. Returns whether the final wake was
+    /// delivered — `false` when a lost guarded write (a concurrent
+    /// flush/cancel/re-register moved the row) skipped it.
     async fn complete_pr_monitor(
         &self,
         monitor: &PrMonitor,
         snapshot: &PrMonitorSnapshot,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let changes = monitor
             .baseline_snapshot
             .as_deref()
@@ -1471,7 +1525,7 @@ impl Services {
         {
             // The row moved under us (concurrent flush/cancel/re-register);
             // skip the wake — the next tick re-detects the terminal state.
-            return Ok(());
+            return Ok(false);
         }
         if !self
             .store
@@ -1479,7 +1533,7 @@ impl Services {
             .await?
         {
             // A concurrent cancel won; it already delivered its own notice.
-            return Ok(());
+            return Ok(false);
         }
         let mut completed = monitor.clone();
         completed.state = PrMonitorState::Completed;
@@ -1499,7 +1553,7 @@ impl Services {
         // displayStatus (§6.5) — best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&completed.workspace_id)
             .await;
-        Ok(())
+        Ok(true)
     }
 
     /// Persist a failed poll's error without disturbing the baseline or the
@@ -1735,12 +1789,20 @@ impl Services {
 
     /// Wire `prMonitor.flush`: emit the pending debounced changes now.
     /// `flushed: false` when nothing was pending (a no-op, not an error).
+    /// With `check: true`, an immediate on-demand re-poll of the monitor
+    /// runs first, so the flush covers changes the loop has not seen yet.
     pub(crate) async fn pr_monitor_flush_op(
         &self,
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
+        check: bool,
     ) -> Result<Value> {
-        let flushed = self.pr_monitor_flush(workspace_id, monitor_id).await?;
+        let flushed = if check {
+            self.pr_monitor_check_and_flush(workspace_id, monitor_id)
+                .await?
+        } else {
+            self.pr_monitor_flush(workspace_id, monitor_id).await?
+        };
         Ok(json!({ "ok": true, "flushed": flushed }))
     }
 
@@ -3224,6 +3286,154 @@ mod tests {
         );
     }
 
+    /// `check: true` re-polls on demand: a change the loop has NOT seen yet
+    /// is fetched fresh and the wake delivered immediately, bypassing the
+    /// debounce window entirely.
+    #[tokio::test]
+    async fn check_and_flush_repolls_and_delivers_unseen_changes_immediately() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        // The change lands AFTER the last sweep — a plain flush sees nothing.
+        forge.edit(|s| s.conversation_comments = 1);
+        assert!(
+            !svc.pr_monitor_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "plain flush has no pending set to deliver"
+        );
+
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap());
+        let text = owner_messages(&svc, &owner).await;
+        assert!(text.contains("[PR monitor o/r#42]"), "{text}");
+        assert!(text.contains("conversation comment"), "{text}");
+
+        // The emit baseline advanced: pending drained, nothing left to flush.
+        let drained = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(drained.pending_changes.is_empty());
+        assert!(drained.last_polled_at.is_some());
+    }
+
+    /// `check: true` with nothing changed vs. the emit baseline: no wake,
+    /// `Ok(false)` — but the poll still stamps `lastPolledAt`.
+    #[tokio::test]
+    async fn check_and_flush_with_no_changes_is_a_noop() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        assert!(
+            !svc.pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "nothing changed vs. the baseline"
+        );
+        assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty());
+        assert!(row.last_polled_at.is_some(), "the on-demand poll stamped");
+    }
+
+    /// `check: true` on a PR that merged since the last sweep terminalizes
+    /// through the normal path: `completed` state, immediate final wake.
+    #[tokio::test]
+    async fn check_and_flush_terminalizes_a_merged_pr() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        assert!(
+            svc.pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+                .await
+                .unwrap(),
+            "the terminal final wake counts as flushed"
+        );
+        let completed = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.state, PrMonitorState::Completed);
+        let text = owner_messages(&svc, &owner).await;
+        assert!(text.contains("was MERGED"), "{text}");
+
+        // A later check on the completed row is a plain no-op.
+        assert!(!svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap());
+    }
+
+    /// A forge fetch failure during the check records `lastError` and
+    /// propagates the error — matching the wire layer's error-shape
+    /// conventions — without touching the baseline.
+    #[tokio::test]
+    async fn check_and_flush_records_last_error_on_forge_failure() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let monitor = register(&svc, &ws, &owner).await;
+        let baseline = monitor.last_snapshot.clone();
+
+        forge.edit(|s| s.fail_get_pr = true);
+        let err = svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect_err("forge down surfaces as an error");
+        assert!(err.to_string().contains("forge down"), "{err}");
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Active, "still active");
+        assert!(row.last_error.is_some(), "lastError recorded");
+        assert_eq!(row.last_snapshot, baseline, "baseline untouched");
+        assert!(!owner_messages(&svc, &owner).await.contains("PR monitor"));
+    }
+
+    /// The wire op: `check: false` preserves the exact existing semantics,
+    /// `check: true` folds the on-demand poll in.
+    #[tokio::test]
+    async fn flush_op_with_check_repolls_and_without_check_is_unchanged() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.conversation_comments = 1);
+        // No check: the unseen change stays invisible.
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+                .await
+                .unwrap(),
+            json!({ "ok": true, "flushed": false })
+        );
+        // Check: the re-poll picks it up and the wake goes out now.
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, true)
+                .await
+                .unwrap(),
+            json!({ "ok": true, "flushed": true })
+        );
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, true)
+                .await
+                .unwrap(),
+            json!({ "ok": true, "flushed": false })
+        );
+    }
+
     #[tokio::test]
     async fn cancel_is_agent_owned_and_only_the_app_path_notifies() {
         let (_db, _root, svc, _forge, ws, owner) = setup().await;
@@ -3742,11 +3952,15 @@ mod tests {
         // Flush delivers the held wake now; a second flush is a no-op.
         let monitor_id = PrMonitorId::from(row["monitorId"].as_str().unwrap());
         assert_eq!(
-            svc.pr_monitor_flush_op(&ws, &monitor_id).await.unwrap(),
+            svc.pr_monitor_flush_op(&ws, &monitor_id, false)
+                .await
+                .unwrap(),
             json!({ "ok": true, "flushed": true })
         );
         assert_eq!(
-            svc.pr_monitor_flush_op(&ws, &monitor_id).await.unwrap(),
+            svc.pr_monitor_flush_op(&ws, &monitor_id, false)
+                .await
+                .unwrap(),
             json!({ "ok": true, "flushed": false })
         );
 
