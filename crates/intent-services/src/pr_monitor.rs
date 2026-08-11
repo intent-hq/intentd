@@ -52,6 +52,19 @@ pub(crate) const DEFAULT_PR_MONITORS_MAX_PER_AGENT: u32 = 5;
 /// that pends indefinitely (e.g. a TCP connection that went dark) surfaces
 /// as a recorded `lastError` on the affected monitors instead of wedging
 /// the single serialized sweep loop for every monitor.
+///
+/// This is an *aggregate* budget over the whole multi-request snapshot fetch
+/// (PR read, merge requirements, reviews, check runs, paged review threads /
+/// comments), not a per-request bound — a legitimately slow forge or a very
+/// large PR could exceed it without any dead connection, in which case the
+/// monitor stays `active` with a visible "timed out" `lastError` each tick.
+/// Accepted tradeoff: widen it (or make it per-request) only if dogfooding
+/// shows repeated timeouts on healthy PRs.
+///
+/// Sweep-only by design: the registration path (`fetch_snapshot`) is caller-
+/// scoped — a hang there blocks only the registering RPC, which the client-
+/// level network timeouts already bound — so it is deliberately not wrapped
+/// in this timeout.
 pub(crate) const PR_MONITOR_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Max-latency bound on the debounce hold, in debounce windows: a PR that
