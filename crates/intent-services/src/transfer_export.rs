@@ -8,9 +8,16 @@
 //! manifest + checksum + chunk count the FE hands to `workspace.import.begin`)
 //! or `:failed` (staging cleaned, WIP snapshots unwound, workspace intact).
 //! `read` serves the sealed archive in seq-numbered chunks, idempotently.
-//! `finalize` settles the source after a successful relay: WIP snapshots
-//! unwound, optional final status message + archive applied, staging deleted.
-//! `abort` cleans up and leaves the workspace usable (agents stay stopped).
+//! `finalize` settles the source after a successful relay: optional final
+//! status message + archive applied, then WIP snapshots unwound and staging
+//! deleted. `abort` cleans up and leaves the workspace usable (agents stay
+//! stopped).
+//!
+//! The workspace is expected to stay quiet between `start` and
+//! `finalize`/`abort`: nothing enforces it, and an agent respawned after
+//! `:ready` works on top of the WIP snapshot sentinel commit — the settle
+//! unwind (correctly) refuses to pop a sentinel that is no longer HEAD, so
+//! any such commits leave the sentinel permanently in branch history.
 //!
 //! Archive layout (agreed with [`crate::transfer_import`]): `manifest.json`
 //! (the [`TransferManifest`]), `rows/<table>.jsonl`
@@ -114,7 +121,7 @@ impl Services {
         let ws = self.store.get_workspace(&id).await?;
         let export_id = format!("export-{}", uuid::Uuid::new_v4());
         let staging_dir = self.export_staging_root().join(&export_id);
-        let live_ids: Vec<String> = {
+        {
             let mut exports = self
                 .transfer_exports
                 .lock()
@@ -135,11 +142,10 @@ impl Services {
                     max_chunk_bytes: EXPORT_MAX_CHUNK_BYTES,
                 },
             );
-            exports.keys().cloned().collect()
-        };
+        }
         // Lazy sweep: export staging dirs with no live session are orphans
         // from a prior daemon run. Best-effort; never fails start.
-        self.sweep_stale_export_staging_dirs(&live_ids).await;
+        self.sweep_stale_export_staging_dirs().await;
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
             self.transfer_exports
                 .lock()
@@ -168,41 +174,41 @@ impl Services {
         let workspace_id = ws.id.clone();
         match self.build_export_archive(&export_id, ws).await {
             Ok(Some(ready)) => {
-                let event_data = serde_json::json!({
-                    "workspaceId": workspace_id.as_str(),
-                    "exportId": export_id,
-                    "manifest": ready.manifest,
-                    "archiveSizeBytes": ready.size_bytes,
-                    "archiveSha256": ready.sha256,
-                    "maxChunkBytes": EXPORT_MAX_CHUNK_BYTES,
-                    "totalChunks": ready
-                        .size_bytes
-                        .div_ceil(EXPORT_MAX_CHUNK_BYTES as u64)
-                        .max(1),
-                });
                 // Seal under the lock; the session may have been aborted
                 // while the last stage ran, in which case clean up instead.
-                let aborted = {
+                // The event payload reads the session's chunk values so
+                // `:ready` and `read` share one source of truth.
+                let event_data = {
                     let mut exports = self
                         .transfer_exports
                         .lock()
                         .expect("transfer export registry poisoned");
                     match exports.get_mut(&export_id) {
-                        Some(session) => {
-                            if matches!(session.state, ExportState::Building { aborted: true }) {
-                                true
-                            } else {
-                                session.state = ExportState::Ready(Box::new(ready));
-                                false
-                            }
+                        Some(session)
+                            if !matches!(
+                                session.state,
+                                ExportState::Building { aborted: true }
+                            ) =>
+                        {
+                            let data = serde_json::json!({
+                                "workspaceId": workspace_id.as_str(),
+                                "exportId": export_id,
+                                "manifest": ready.manifest,
+                                "archiveSizeBytes": ready.size_bytes,
+                                "archiveSha256": ready.sha256,
+                                "maxChunkBytes": session.max_chunk_bytes,
+                                "totalChunks": session.total_chunks(ready.size_bytes),
+                            });
+                            session.state = ExportState::Ready(Box::new(ready));
+                            Some(data)
                         }
-                        None => true,
+                        _ => None,
                     }
                 };
-                if aborted {
+                let Some(event_data) = event_data else {
                     self.cleanup_export(&export_id).await;
                     return;
-                }
+                };
                 publish_event(
                     &self.event_bus,
                     transfer_event(&workspace_id, WORKSPACE_TRANSFER_READY, event_data),
@@ -306,7 +312,10 @@ impl Services {
         }
         // Hold the teardown fence across the row export below: it blocks the
         // lazy-spawn paths for the swept agents, so a queued message cannot
-        // respawn one mid-export and mutate rows while they are being read.
+        // respawn one mid-export and mutate rows or the worktree/sandboxes
+        // while they are being captured. Held through the git bundle (stage
+        // 3) so the bundle is built against the same quiesced state as the
+        // rows.
         let _teardown_fence = match manager.as_ref() {
             Some(manager) => {
                 let ids: Vec<AgentId> = sessions.iter().map(|s| s.id.clone()).collect();
@@ -325,7 +334,6 @@ impl Services {
             .await;
         let manifest = self.workspace_transfer_plan_op(id.clone()).await?.manifest;
         let rows = self.store.transfer_export_rows(&id).await?;
-        drop(_teardown_fence);
         if self.export_aborted(export_id) {
             return Ok(None);
         }
@@ -385,6 +393,7 @@ impl Services {
         } else {
             None
         };
+        drop(_teardown_fence);
         if self.export_aborted(export_id) {
             return Ok(None);
         }
@@ -476,9 +485,11 @@ impl Services {
     }
 
     /// `workspace.export.finalize`: settle the source after a successful
-    /// relay — unwind the WIP snapshots, delete staging, then apply the
-    /// optional final status message and archive the workspace when
-    /// requested. Only valid on a Ready session. Returns
+    /// relay — apply the optional final status message and archive the
+    /// workspace when requested, then unwind the WIP snapshots and delete
+    /// staging. The workspace mutations run before the session is retired so
+    /// a failed mutation leaves the export intact and finalize can be
+    /// retried. Only valid on a Ready session. Returns
     /// `{ exportId, finalized: true, workspace }`.
     pub(crate) async fn workspace_export_finalize_op(
         &self,
@@ -501,7 +512,6 @@ impl Services {
             }
             session.workspace_id.clone()
         };
-        self.cleanup_export(&export_id).await;
         if let Some(message) = final_status_message {
             self.update_workspace(
                 workspace_id.clone(),
@@ -517,6 +527,7 @@ impl Services {
         } else {
             self.store.get_workspace(&workspace_id).await?
         };
+        self.cleanup_export(&export_id).await;
         Ok(serde_json::json!({
             "exportId": export_id,
             "finalized": true,
@@ -604,8 +615,11 @@ impl Services {
     /// Delete `.export-staging/<id>` dirs whose id has no live session.
     /// Called lazily from `start` and from the boot sweep (where the
     /// registry is empty, so every leftover dir is an orphan — sessions are
-    /// in-memory and cannot survive a restart). Best-effort.
-    pub(crate) async fn sweep_stale_export_staging_dirs(&self, live_ids: &[String]) {
+    /// in-memory and cannot survive a restart). The registry is re-checked
+    /// per directory entry at deletion time, so a session registered while
+    /// the sweep walks the root (a concurrent `start`) keeps its staging
+    /// dir. Best-effort.
+    pub(crate) async fn sweep_stale_export_staging_dirs(&self) {
         let root = self.export_staging_root();
         let mut entries = match tokio::fs::read_dir(&root).await {
             Ok(entries) => entries,
@@ -613,7 +627,12 @@ impl Services {
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if live_ids.contains(&name) {
+            let live = self
+                .transfer_exports
+                .lock()
+                .expect("transfer export registry poisoned")
+                .contains_key(&name);
+            if live {
                 continue;
             }
             tracing::info!(staging = %name, "sweeping orphaned export staging dir");
@@ -626,7 +645,7 @@ impl Services {
     /// Boot entry point for the orphan sweep: no sessions are live after a
     /// restart, so every leftover export staging dir is removed.
     pub async fn sweep_stale_export_staging(&self) {
-        self.sweep_stale_export_staging_dirs(&[]).await;
+        self.sweep_stale_export_staging_dirs().await;
     }
 
     async fn emit_export_progress(
@@ -1273,7 +1292,8 @@ mod tests {
         );
     }
 
-    /// The orphan sweep clears stale staging dirs but leaves live ones.
+    /// The orphan sweep clears stale staging dirs but leaves dirs whose id
+    /// has a live session in the registry.
     #[tokio::test]
     async fn export_staging_sweep() {
         let ws_root = TempDir::new("export-ws-root");
@@ -1282,11 +1302,28 @@ mod tests {
         let root = svc.export_staging_root();
         std::fs::create_dir_all(root.join("export-stale")).expect("stale dir");
         std::fs::create_dir_all(root.join("export-live")).expect("live dir");
-        svc.sweep_stale_export_staging_dirs(&["export-live".to_string()])
-            .await;
+        svc.transfer_exports
+            .lock()
+            .expect("transfer export registry poisoned")
+            .insert(
+                "export-live".to_string(),
+                ExportSession {
+                    workspace_id: WorkspaceId("ws-live".to_string()),
+                    staging_dir: root.join("export-live"),
+                    state: ExportState::Building { aborted: false },
+                    wip_paths: Vec::new(),
+                    max_chunk_bytes: EXPORT_MAX_CHUNK_BYTES,
+                },
+            );
+        svc.sweep_stale_export_staging_dirs().await;
         assert!(!root.join("export-stale").exists());
         assert!(root.join("export-live").exists());
-        // Boot sweep (no live sessions) removes everything.
+        // Boot sweep (registry empty again, as after a restart) removes
+        // everything.
+        svc.transfer_exports
+            .lock()
+            .expect("transfer export registry poisoned")
+            .clear();
         svc.sweep_stale_export_staging().await;
         assert!(!root.join("export-live").exists());
     }

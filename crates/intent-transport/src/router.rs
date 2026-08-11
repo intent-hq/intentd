@@ -467,7 +467,7 @@ async fn dispatch(
         }
         "workspace.export.finalize" => {
             let export_id = require_str_param(params, "exportId")?;
-            let archive_source = opt_bool(params, "archiveSource").unwrap_or(false);
+            let archive_source = opt_bool_strict(params, "archiveSource")?.unwrap_or(false);
             let final_status_message = opt_str(params, "finalStatusMessage");
             api.workspace_export_finalize(export_id, archive_source, final_status_message)
                 .await

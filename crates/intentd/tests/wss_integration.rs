@@ -8035,7 +8035,11 @@ async fn wss_workspace_export_lifecycle() {
         ),
     )
     .await;
-    assert!(gone["error"].is_object(), "read after finalize: {gone}");
+    assert_eq!(gone["error"]["code"], -32602, "read after finalize: {gone}");
+    assert_eq!(
+        gone["error"]["data"]["code"], "not-found",
+        "read after finalize: {gone}"
+    );
 
     // abort: ready session → true; retired/unknown → false (idempotent).
     // (A Building session stays registered until the build task observes
