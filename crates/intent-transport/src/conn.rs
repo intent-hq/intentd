@@ -697,6 +697,20 @@ async fn forward_subscription(
                             }) {
                                 Enqueue::Closed => return,
                                 Enqueue::Sent | Enqueue::Buffered => {}
+                                // Buffer at capacity (too many distinct keys /
+                                // bytes pending): fall back to the original
+                                // blocking backpressure — flush, then send.
+                                Enqueue::Overflow(item) => {
+                                    if !buffer
+                                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                        .await
+                                    {
+                                        return;
+                                    }
+                                    if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -1037,6 +1051,27 @@ async fn forward_chat_subscription(
                             }) {
                                 Enqueue::Closed => return,
                                 Enqueue::Sent | Enqueue::Buffered => continue,
+                                // Buffer at capacity: fall back to the
+                                // original blocking backpressure — flush,
+                                // then send this delta at the next seq.
+                                Enqueue::Overflow(item) => {
+                                    let drained = buffer
+                                        .drain_all(&out_tx, |item| {
+                                            let frame = item.into_frame(&subscription_id, seq);
+                                            seq += 1;
+                                            frame
+                                        })
+                                        .await;
+                                    if !drained {
+                                        return;
+                                    }
+                                    let frame = item.into_frame(&subscription_id, seq);
+                                    seq += 1;
+                                    if out_tx.send(frame).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
                             }
                         }
                     }

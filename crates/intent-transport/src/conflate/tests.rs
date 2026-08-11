@@ -85,7 +85,7 @@ fn activity_conflates_latest_wins_per_agent() {
     for (agent, n) in [("ag-1", 1), ("ag-2", 1), ("ag-1", 2), ("ag-1", 3)] {
         let ev = event(AGENT_STREAM_ACTIVITY, Some(agent), json!({ "n": n }));
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let first = buf.pop().unwrap().into_frame("sub-1");
     let second = buf.pop().unwrap().into_frame("sub-1");
@@ -115,7 +115,7 @@ fn file_conflates_per_workspace_path_latest_wins() {
     );
     for ev in [older, other, newer] {
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let first = buf.pop().unwrap().into_frame("sub-1");
     let second = buf.pop().unwrap().into_frame("sub-1");
@@ -142,7 +142,7 @@ fn burst_summaries_conflate_per_directory() {
     );
     for ev in [b1, b2] {
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let only = buf.pop().unwrap().into_frame("sub-1");
     assert!(buf.pop().is_none());
@@ -161,7 +161,7 @@ fn terminal_chunks_concatenate_in_arrival_order() {
             json!({ "terminalId": "t-1", "chunk": chunk(text) }),
         );
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let only = buf.pop().unwrap().into_frame("sub-1");
     assert!(buf.pop().is_none());
@@ -179,7 +179,7 @@ fn terminal_chunks_do_not_merge_across_terminals() {
             json!({ "terminalId": tid, "chunk": chunk(text) }),
         );
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let first = buf.pop().unwrap().into_frame("sub-1");
     let second = buf.pop().unwrap().into_frame("sub-1");
@@ -205,7 +205,7 @@ fn oversized_terminal_merge_seals_the_entry_and_starts_a_new_one() {
             json!({ "terminalId": "t-1", "chunk": chunk(text) }),
         );
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     // The big chunk refused the "yy" merge (sealed); "zz" merged onto "yy".
     let first = buf.pop().unwrap().into_frame("sub-1");
@@ -238,7 +238,7 @@ fn undecodable_terminal_chunk_passes_through_verbatim() {
     );
     for ev in [bad, good] {
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let first = buf.pop().unwrap().into_frame("sub-1");
     let second = buf.pop().unwrap().into_frame("sub-1");
@@ -271,7 +271,7 @@ fn cross_key_order_is_first_arrival_order() {
     ];
     for ev in evs {
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let order: Vec<String> = std::iter::from_fn(|| buf.pop())
         .map(|i| frame_type(&i.into_frame("s")))
@@ -304,7 +304,7 @@ fn chat_blocks_conflate_latest_text_first_bucket() {
         chunk_delta(false, "m-1:0", "Hello world"),
     ] {
         let (key, item) = ChatItem::from_delta(&delta).unwrap();
-        buf.push(key, item);
+        assert!(buf.push(key, item).is_none());
     }
     let only = buf.pop().unwrap().into_delta();
     assert!(buf.pop().is_none());
@@ -322,7 +322,7 @@ fn chat_blocks_do_not_merge_across_blocks() {
         chunk_delta(false, "m-1:0", "one more"),
     ] {
         let (key, item) = ChatItem::from_delta(&delta).unwrap();
-        buf.push(key, item);
+        assert!(buf.push(key, item).is_none());
     }
     let first = buf.pop().unwrap().into_delta();
     let second = buf.pop().unwrap().into_delta();
@@ -371,7 +371,7 @@ async fn offer_passes_through_when_uncongested() {
     let key = event_key(&ev).unwrap();
     let item = EventItem::new(&key, ev);
     let outcome = offer(&mut buf, key, item, &tx, |i| i.into_frame("sub-1"));
-    assert_eq!(outcome, Enqueue::Sent);
+    assert!(matches!(outcome, Enqueue::Sent));
     assert!(buf.is_empty());
     assert_eq!(frame_data(&rx.try_recv().unwrap())["n"], json!(1));
 }
@@ -386,7 +386,7 @@ async fn offer_buffers_and_conflates_when_the_lane_is_full() {
         let key = event_key(&ev).unwrap();
         let item = EventItem::new(&key, ev);
         let outcome = offer(&mut buf, key, item, &tx, |i| i.into_frame("sub-1"));
-        assert_eq!(outcome, Enqueue::Buffered);
+        assert!(matches!(outcome, Enqueue::Buffered));
     }
     assert!(!buf.is_empty());
     // Lane clears; drain flushes ONE conflated frame carrying the newest.
@@ -411,7 +411,7 @@ async fn barrier_flushes_conflated_frames_before_the_terminal_event() {
             json!({ "terminalId": "t-1", "chunk": chunk(text) }),
         );
         let key = event_key(&ev).unwrap();
-        buf.push(key.clone(), EventItem::new(&key, ev));
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
     }
     let exit = event(TERMINAL_EXIT, None, json!({ "terminalId": "t-1" }));
     assert_eq!(event_key(&exit), None, "terminal:exit is a barrier");
@@ -431,6 +431,81 @@ async fn barrier_flushes_conflated_frames_before_the_terminal_event() {
     assert_eq!(frame_type(&second), TERMINAL_EXIT);
 }
 
+// --- buffer bounds: unbounded distinct keys must not grow memory ---
+
+#[test]
+fn push_rejects_beyond_the_entry_bound() {
+    let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::bounded(2, usize::MAX);
+    for agent in ["ag-1", "ag-2"] {
+        let ev = event(AGENT_STREAM_ACTIVITY, Some(agent), json!({}));
+        let key = event_key(&ev).unwrap();
+        assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+    }
+    // A third distinct key is handed back untouched…
+    let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-3"), json!({}));
+    let key = event_key(&ev).unwrap();
+    assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_some());
+    // …but a same-key merge still lands (no new entry).
+    let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({ "n": 2 }));
+    let key = event_key(&ev).unwrap();
+    assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+    let first = buf.pop().unwrap().into_frame("sub-1");
+    assert_eq!(frame_data(&first)["n"], json!(2));
+}
+
+#[test]
+fn push_rejects_beyond_the_byte_bound() {
+    let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::bounded(usize::MAX, 64);
+    let ev = event(
+        TERMINAL_DATA,
+        None,
+        json!({ "terminalId": "t-1", "chunk": chunk("0123456789") }),
+    );
+    let key = event_key(&ev).unwrap();
+    assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+    // A push whose cost would exceed the byte bound is handed back.
+    let big = "x".repeat(60);
+    let ev = event(
+        TERMINAL_DATA,
+        None,
+        json!({ "terminalId": "t-2", "chunk": chunk(&big) }),
+    );
+    let key = event_key(&ev).unwrap();
+    assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_some());
+    // Popping frees budget; the same push then lands.
+    assert!(buf.pop().is_some());
+    let ev = event(
+        TERMINAL_DATA,
+        None,
+        json!({ "terminalId": "t-2", "chunk": chunk(&big) }),
+    );
+    let key = event_key(&ev).unwrap();
+    assert!(buf.push(key.clone(), EventItem::new(&key, ev)).is_none());
+}
+
+#[tokio::test]
+async fn offer_hands_back_overflow_at_capacity() {
+    let (tx, _rx) = mpsc::channel::<String>(1);
+    tx.try_send("occupying".to_string()).unwrap();
+    let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::bounded(1, usize::MAX);
+    let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({}));
+    let key = event_key(&ev).unwrap();
+    let item = EventItem::new(&key, ev);
+    assert!(matches!(
+        offer(&mut buf, key, item, &tx, |i| i.into_frame("sub-1")),
+        Enqueue::Buffered
+    ));
+    let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-2"), json!({ "n": 9 }));
+    let key = event_key(&ev).unwrap();
+    let item = EventItem::new(&key, ev);
+    let outcome = offer(&mut buf, key, item, &tx, |i| i.into_frame("sub-1"));
+    // The rejected item comes back intact for the caller's blocking path.
+    let Enqueue::Overflow(item) = outcome else {
+        panic!("expected Overflow");
+    };
+    assert_eq!(frame_data(&item.into_frame("sub-1"))["n"], json!(9));
+}
+
 #[tokio::test]
 async fn offer_reports_a_closed_lane() {
     let (tx, rx) = mpsc::channel::<String>(1);
@@ -440,5 +515,5 @@ async fn offer_reports_a_closed_lane() {
     let key = event_key(&ev).unwrap();
     let item = EventItem::new(&key, ev);
     let outcome = offer(&mut buf, key, item, &tx, |i| i.into_frame("sub-1"));
-    assert_eq!(outcome, Enqueue::Closed);
+    assert!(matches!(outcome, Enqueue::Closed));
 }

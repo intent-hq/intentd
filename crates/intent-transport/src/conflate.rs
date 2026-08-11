@@ -42,6 +42,20 @@ use crate::subscriptions;
 /// [`crate::MAX_OUTBOUND_MESSAGE_BYTES`].
 pub(crate) const TERMINAL_CONCAT_CAP_BYTES: usize = 256 * 1024;
 
+/// Cap on the number of pending entries in one [`ConflationBuffer`]. Conflation
+/// bounds repeated keys, but a slow consumer observing unbounded *distinct*
+/// keys (file paths, terminal ids) would otherwise grow the buffer without
+/// limit. A push that would exceed this is rejected ([`Enqueue::Rejected`]) and
+/// the forwarder falls back to the pre-conflation blocking (backpressured)
+/// path, so the bound never loses data.
+pub(crate) const MAX_PENDING_ENTRIES: usize = 256;
+
+/// Cap on the total approximate payload bytes buffered in one
+/// [`ConflationBuffer`], complementing [`MAX_PENDING_ENTRIES`] (terminal
+/// entries alone can reach [`TERMINAL_CONCAT_CAP_BYTES`] each). Same rejection
+/// semantics: over the cap, pushes are refused and the forwarder blocks.
+pub(crate) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 /// Conflation key: frames with equal keys supersede/merge; distinct keys never
 /// interact (no cross-stream reordering).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,28 +99,46 @@ fn str_field(data: &Value, name: &str) -> Option<String> {
 /// How two same-key items combine. `merge` consumes the newer item and returns
 /// `None` on success, or gives it back to refuse (the buffer then seals the
 /// existing entry in place and appends the newer item as a fresh tail entry).
+/// `cost` is the item's approximate payload byte size, feeding the buffer's
+/// [`MAX_PENDING_BYTES`] bound.
 pub(crate) trait Conflate: Sized {
     fn merge(&mut self, newer: Self) -> Option<Self>;
+    fn cost(&self) -> usize;
 }
 
 /// Ordered pending-frame buffer: FIFO of entries plus a key index. Same-key
 /// pushes merge into the pending entry IN PLACE (the first pending frame's
 /// position is kept, so relative order across keys is preserved); `pop` drains
-/// in arrival order.
+/// in arrival order. Hard-bounded by [`MAX_PENDING_ENTRIES`] entries and
+/// [`MAX_PENDING_BYTES`] approximate payload bytes — a push that would exceed
+/// either bound is handed back to the caller, never silently dropped.
 pub(crate) struct ConflationBuffer<T> {
-    /// `(id, key, item)` — ids are strictly ascending along the deque.
-    entries: VecDeque<(u64, Key, T)>,
+    /// `(id, key, cost, item)` — ids are strictly ascending along the deque;
+    /// `cost` is the item's byte cost at insert/merge time.
+    entries: VecDeque<(u64, Key, usize, T)>,
     /// key → id of its live (merge-target) entry.
     index: HashMap<Key, u64>,
     next_id: u64,
+    /// Sum of every entry's `cost`.
+    cost: usize,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
 impl<T: Conflate> ConflationBuffer<T> {
     pub(crate) fn new() -> Self {
+        Self::bounded(MAX_PENDING_ENTRIES, MAX_PENDING_BYTES)
+    }
+
+    /// A buffer with explicit bounds (tests exercise small ones).
+    pub(crate) fn bounded(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             index: HashMap::new(),
             next_id: 0,
+            cost: 0,
+            max_entries,
+            max_bytes,
         }
     }
 
@@ -117,29 +149,56 @@ impl<T: Conflate> ConflationBuffer<T> {
     /// Buffer one item: merge into the key's pending entry when present,
     /// otherwise append. A refused merge seals the old entry (it keeps its
     /// place but stops being a merge target) and appends the newer item.
-    pub(crate) fn push(&mut self, key: Key, item: T) {
+    ///
+    /// Returns `Some(item)` — the item handed back untouched — when accepting
+    /// it would exceed the buffer's bounds: the byte bound for any push
+    /// (conservatively pre-checked, since even a latest-wins merge may grow
+    /// the entry), the entry bound for pushes that add an entry. The caller
+    /// must then fall back to a blocking send.
+    pub(crate) fn push(&mut self, key: Key, item: T) -> Option<T> {
+        if self.cost + item.cost() > self.max_bytes {
+            return Some(item);
+        }
         if let Some(&id) = self.index.get(&key) {
             // Ids ascend along the deque, so the entry is found by binary search.
-            let pos = self.entries.partition_point(|(eid, _, _)| *eid < id);
+            let pos = self.entries.partition_point(|(eid, ..)| *eid < id);
             debug_assert!(pos < self.entries.len() && self.entries[pos].0 == id);
-            match self.entries[pos].2.merge(item) {
-                None => return,
+            let entry = &mut self.entries[pos];
+            match entry.3.merge(item) {
+                None => {
+                    let new_cost = entry.3.cost();
+                    self.cost = self.cost - entry.2 + new_cost;
+                    entry.2 = new_cost;
+                    return None;
+                }
                 Some(refused) => {
+                    if self.entries.len() >= self.max_entries {
+                        return Some(refused);
+                    }
                     let id = self.alloc();
-                    self.entries.push_back((id, key.clone(), refused));
+                    self.cost += refused.cost();
+                    let cost = refused.cost();
+                    self.entries.push_back((id, key.clone(), cost, refused));
                     self.index.insert(key, id);
-                    return;
+                    return None;
                 }
             }
         }
+        if self.entries.len() >= self.max_entries {
+            return Some(item);
+        }
         let id = self.alloc();
-        self.entries.push_back((id, key.clone(), item));
+        let cost = item.cost();
+        self.cost += cost;
+        self.entries.push_back((id, key.clone(), cost, item));
         self.index.insert(key, id);
+        None
     }
 
     /// Remove and return the oldest pending item.
     pub(crate) fn pop(&mut self) -> Option<T> {
-        let (id, key, item) = self.entries.pop_front()?;
+        let (id, key, cost, item) = self.entries.pop_front()?;
+        self.cost -= cost;
         if self.index.get(&key) == Some(&id) {
             self.index.remove(&key);
         }
@@ -213,6 +272,16 @@ impl EventItem {
 }
 
 impl Conflate for EventItem {
+    fn cost(&self) -> usize {
+        match self {
+            EventItem::Latest(event) => approx_size(&event.data),
+            EventItem::Terminal { event, bytes } => match bytes {
+                Some(bytes) => bytes.len(),
+                None => approx_size(&event.data),
+            },
+        }
+    }
+
     fn merge(&mut self, newer: Self) -> Option<Self> {
         match (self, newer) {
             (EventItem::Latest(pending), EventItem::Latest(newer)) => {
@@ -304,11 +373,32 @@ impl ChatItem {
 }
 
 impl Conflate for ChatItem {
+    fn cost(&self) -> usize {
+        approx_size(&self.entity)
+    }
+
     fn merge(&mut self, newer: Self) -> Option<Self> {
         // Latest entity wins (full accumulated text, CS-0 D2); the bucket of
         // the first pending delta is preserved.
         self.entity = newer.entity;
         None
+    }
+}
+
+/// Approximate in-memory payload size of a JSON value: string/byte content
+/// plus a small per-node constant. Feeds the buffer's byte bound — an
+/// estimate is enough, the bound is a memory backstop, not an exact quota.
+fn approx_size(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+        Value::String(s) => s.len() + 8,
+        Value::Array(items) => items.iter().map(approx_size).sum::<usize>() + 8,
+        Value::Object(map) => {
+            map.iter()
+                .map(|(k, v)| k.len() + approx_size(v))
+                .sum::<usize>()
+                + 8
+        }
     }
 }
 
@@ -319,26 +409,31 @@ pub(crate) fn chat_event_conflatable(event: &Event) -> bool {
     event.event_type == CHAT_STREAM_DELTA
 }
 
-/// Outcome of [`offer`]: sent straight through, buffered for conflation, or
-/// the outbound channel is closed (the forwarder must stop).
+/// Outcome of [`offer`]: sent straight through, buffered for conflation,
+/// rejected because the buffer is at capacity (the caller must fall back to a
+/// blocking send of the returned item), or the outbound channel is closed
+/// (the forwarder must stop).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Enqueue {
+pub(crate) enum Enqueue<T> {
     Sent,
     Buffered,
+    Overflow(T),
     Closed,
 }
 
 /// The uncongested fast path with congestion fallback: when nothing is
 /// pending and the outbound lane has room, the frame is sent immediately
 /// (no added latency); otherwise the item enters the buffer, merging with any
-/// pending same-key item.
+/// pending same-key item. A buffer at its entry/byte bound hands the item
+/// back as [`Enqueue::Overflow`] — the caller then blocks (original
+/// backpressure semantics), so the bound never loses data.
 pub(crate) fn offer<T: Conflate>(
     buffer: &mut ConflationBuffer<T>,
     key: Key,
     item: T,
     out_tx: &mpsc::Sender<String>,
     build: impl FnOnce(T) -> String,
-) -> Enqueue {
+) -> Enqueue<T> {
     if buffer.is_empty() {
         match out_tx.try_reserve() {
             Ok(permit) => {
@@ -349,8 +444,10 @@ pub(crate) fn offer<T: Conflate>(
             Err(mpsc::error::TrySendError::Full(())) => {}
         }
     }
-    buffer.push(key, item);
-    Enqueue::Buffered
+    match buffer.push(key, item) {
+        None => Enqueue::Buffered,
+        Some(rejected) => Enqueue::Overflow(rejected),
+    }
 }
 
 #[cfg(test)]
