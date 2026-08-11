@@ -4971,6 +4971,102 @@ mod change_event_parity {
         assert!(ev["data"]["computedAt"].is_string());
     }
 
+    /// Readiness generalization over `dependsOn` edges (spec §2.2,
+    /// monorepo#1974): ready = children complete AND all dependsOn complete.
+    /// Cross-subtree regression: a task depending on two sibling-subtree
+    /// tasks is not ready until BOTH complete; a cancelled dep never
+    /// satisfies its edge.
+    #[tokio::test]
+    async fn ready_tasks_respect_depends_on_edges() {
+        let h = harness().await;
+        // Two sibling subtrees: parent-a → dep-a, parent-b → dep-b, plus a
+        // root-level task `gated` with dependsOn [dep-a, dep-b]. Distinct
+        // createdAt stamps keep the sibling sort (peerOrder, then createdAt)
+        // deterministic.
+        let mk = |id: &str, parent: Option<&str>, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent-a", None, vec![], 0),
+            mk("dep-a", Some("parent-a"), vec![], 1),
+            mk("parent-b", None, vec![], 2),
+            mk("dep-b", Some("parent-b"), vec![], 3),
+            mk("gated", None, vec!["dep-a", "dep-b"], 4),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Complete dep-a: dep-b is still not_started, so `gated` stays out of
+        // the ready set (its dependsOn is only partially satisfied).
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("complete dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        // Leaves-first post-order: parent-a (child complete → ready), then
+        // dep-b (leaf → ready). `gated` is NOT ready — dep-b is incomplete —
+        // and parent-b is blocked by its incomplete child dep-b.
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-a", "dep-b"]));
+
+        // Complete dep-b: both dependsOn edges are now satisfied, so `gated`
+        // joins the ready set.
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-b"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("complete dep-b");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(
+            ev["data"]["readyTaskIds"],
+            json!(["parent-a", "parent-b", "gated"])
+        );
+
+        // Cancelled deps do NOT satisfy edges: cancelling dep-a (complete →
+        // cancelled) makes `gated` un-ready again (and parent-a too — a
+        // cancelled child is not `complete`).
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "cancelled".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("cancel dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-b"]));
+    }
+
     #[tokio::test]
     async fn comment_added_payload() {
         let h = harness().await;
