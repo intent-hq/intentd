@@ -53,6 +53,7 @@ pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;
 mod client;
+mod conflate;
 mod conn;
 pub mod context;
 pub mod control;
