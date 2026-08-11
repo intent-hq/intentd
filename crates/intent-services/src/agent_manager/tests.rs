@@ -349,6 +349,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -1321,6 +1322,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -1841,6 +1843,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     let session = AgentSession {
         id: id.clone(),
@@ -5848,6 +5851,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store
         .insert_workspace(&workspace)
@@ -8732,6 +8736,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -8954,6 +8959,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
 
     assert_eq!(

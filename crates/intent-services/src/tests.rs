@@ -168,6 +168,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -14662,6 +14663,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -14799,6 +14801,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -14927,6 +14930,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -15050,6 +15054,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -15172,6 +15177,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -15299,6 +15305,7 @@ mod rules {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -15875,6 +15882,7 @@ mod known_repo {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -24153,6 +24161,296 @@ mod worktrees_location {
         assert!(
             !ws_dir.exists(),
             "delete removes <location>/<id>/ under the custom worktrees location"
+        );
+    }
+}
+
+/// Delete grace window (§5.1): `schedule_workspace_delete` /
+/// `cancel_workspace_delete` semantics — schedule→commit, schedule→cancel,
+/// cancel-after-commit race, idempotent re-schedule, immediate-delete-while-
+/// pending, restart drop, and the `pendingDeleteAt` row projection.
+mod delete_grace_window {
+    use std::time::Duration;
+
+    use intent_core::{Error, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    /// Bounded poll until the workspace row is gone (the timer commit is
+    /// asynchronous).
+    async fn wait_deleted(h: &Harness) {
+        for _ in 0..100 {
+            if matches!(
+                h.services.get_workspace(h.ws.clone()).await,
+                Err(Error::NotFound(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("scheduled delete did not commit within the poll budget");
+    }
+
+    /// Schedule → deadline expiry commits the delete through the existing
+    /// cascade, and `pendingDeleteAt` projects on list/get while pending.
+    #[tokio::test]
+    async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
+        let h = harness().await;
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 200)
+            .await
+            .expect("schedule");
+        assert!(!delete_at.is_empty(), "ISO deadline returned");
+
+        // Row still served while pending, carrying the deadline.
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+        let listed = h.services.list_workspaces(false).await.expect("list");
+        let row = listed.iter().find(|w| w.id == h.ws).expect("row listed");
+        assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+
+        wait_deleted(&h).await;
+    }
+
+    /// Schedule → cancel restores the entity: the timer never commits and
+    /// `pendingDeleteAt` disappears from the projection.
+    #[tokio::test]
+    async fn cancel_within_window_keeps_workspace() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        assert!(cancelled, "a pending deletion was cancelled");
+
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.pending_delete_at, None, "projection cleared");
+
+        // A second cancel observes nothing pending — race-safe non-error.
+        let again = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel again");
+        assert!(!again, "nothing pending on the second cancel");
+    }
+
+    /// Cancel-after-commit race: once the timer fired and the delete
+    /// committed, cancel reports `false` (non-error) — never an error.
+    #[tokio::test]
+    async fn cancel_after_commit_is_false_not_error() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 50)
+            .await
+            .expect("schedule");
+        wait_deleted(&h).await;
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel after commit is not an error");
+        assert!(!cancelled, "already committed → cancelled: false");
+    }
+
+    /// Re-scheduling while pending is idempotent: the original deadline is
+    /// returned, not a new one.
+    #[tokio::test]
+    async fn reschedule_while_pending_returns_existing_deadline() {
+        let h = harness().await;
+        let first = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let second = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 1)
+            .await
+            .expect("re-schedule");
+        assert_eq!(first, second, "idempotent re-schedule keeps the deadline");
+
+        // The 1ms re-schedule must NOT have armed a second timer: the row
+        // survives well past 1ms because the original 60s window still owns
+        // the deletion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            h.services.get_workspace(h.ws.clone()).await.is_ok(),
+            "original window still pending; no second timer fired"
+        );
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "single pending entry cancelled"
+        );
+    }
+
+    /// An immediate delete while pending cancels the timer and commits now.
+    #[tokio::test]
+    async fn immediate_delete_while_pending_commits_now() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("immediate delete");
+        assert!(
+            matches!(
+                h.services.get_workspace(h.ws.clone()).await,
+                Err(Error::NotFound(_))
+            ),
+            "row deleted immediately"
+        );
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        assert!(
+            !cancelled,
+            "pending entry superseded by the immediate delete"
+        );
+    }
+
+    /// Restart semantics: pending deletions are in-memory only — a fresh
+    /// `Services` over the same store sees no pending deletion and the
+    /// workspace survives.
+    #[tokio::test]
+    async fn restart_drops_pending_deletion() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        svc.schedule_workspace_delete(ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        drop(svc);
+
+        // "Restarted" daemon: fresh Services over the same store.
+        let svc2 = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let got = svc2.get_workspace(ws.clone()).await.expect("survives");
+        assert_eq!(got.pending_delete_at, None, "pending state dropped");
+        assert!(
+            !svc2
+                .cancel_workspace_delete(ws)
+                .await
+                .expect("cancel on fresh daemon"),
+            "nothing pending after restart"
+        );
+    }
+
+    /// Scheduling for an unknown workspace is the standard `NotFound`.
+    #[tokio::test]
+    async fn schedule_unknown_workspace_is_not_found() {
+        let h = harness().await;
+        let missing = WorkspaceId::new();
+        assert!(matches!(
+            h.services.schedule_workspace_delete(missing, 15_000).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// The grace-window events: `workspace:delete-scheduled` carries
+    /// `{ workspaceId, deleteAt }`, `workspace:delete-cancelled` carries
+    /// `{ workspaceId }` (§6.5 self-sufficient payloads).
+    #[tokio::test]
+    async fn schedule_and_cancel_emit_events() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("scheduled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "workspace:delete-scheduled");
+        assert_eq!(
+            ev["data"],
+            serde_json::json!({ "workspaceId": h.ws.0, "deleteAt": delete_at })
+        );
+
+        h.services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("cancelled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "workspace:delete-cancelled");
+        assert_eq!(ev["data"], serde_json::json!({ "workspaceId": h.ws.0 }));
+    }
+
+    /// The caller-supplied delay is clamped to the 60s cap: the returned
+    /// deadline is at most ~60s out, never hours.
+    #[tokio::test]
+    async fn undo_delay_is_clamped_to_cap() {
+        let h = harness().await;
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 3_600_000)
+            .await
+            .expect("schedule");
+        let deadline = intent_core::parse_iso(&delete_at).expect("valid ISO deadline");
+        let max = time::OffsetDateTime::now_utc() + time::Duration::seconds(61);
+        assert!(deadline <= max, "deadline clamped to the 60s cap");
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "cleanup"
         );
     }
 }

@@ -8735,6 +8735,7 @@ mod role_reminder_tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -10621,6 +10622,7 @@ mod agent_retry_tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
             task_stats: None,
         }
     }

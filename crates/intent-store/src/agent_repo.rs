@@ -2812,6 +2812,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store
             .insert_workspace(&workspace)
@@ -2925,6 +2926,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store
             .insert_workspace(&workspace)
@@ -3076,6 +3078,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -4334,6 +4337,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store
             .insert_workspace(&workspace)
@@ -4462,6 +4466,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store
             .insert_workspace(&workspace)
@@ -4542,6 +4547,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store
             .insert_workspace(&workspace)
@@ -4702,6 +4708,7 @@ mod tests {
                 display_status: None,
                 checkout_mode: None,
                 disk_usage: None,
+                pending_delete_at: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -4984,6 +4991,7 @@ mod tests {
             display_status: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store.insert_workspace(&workspace).await.expect("insert");
 

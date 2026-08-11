@@ -251,6 +251,14 @@ pub const BUILD_COMPLETED: &str = "build:completed";
 pub const WORKSPACE_CREATED: &str = "workspace:created";
 pub const WORKSPACE_UPDATED: &str = "workspace:updated";
 pub const WORKSPACE_DELETED: &str = "workspace:deleted";
+// Delete grace window (PROTOCOL §5.1): a `workspace.delete` with
+// `undoDelayMs > 0` schedules an in-memory pending deletion instead of
+// committing immediately. Self-sufficient payloads: `delete-scheduled`
+// carries `{ workspaceId, deleteAt }` (the ISO commit deadline) and
+// `delete-cancelled` carries `{ workspaceId }` so clients flip the pending
+// state without a follow-up read.
+pub const WORKSPACE_DELETE_SCHEDULED: &str = "workspace:delete-scheduled";
+pub const WORKSPACE_DELETE_CANCELLED: &str = "workspace:delete-cancelled";
 pub const WORKSPACE_OPENED: &str = "workspace:opened";
 pub const WORKSPACE_CLOSED: &str = "workspace:closed";
 pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
@@ -473,6 +481,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_CREATED,
     WORKSPACE_UPDATED,
     WORKSPACE_DELETED,
+    WORKSPACE_DELETE_SCHEDULED,
+    WORKSPACE_DELETE_CANCELLED,
     WORKSPACE_OPENED,
     WORKSPACE_CLOSED,
     WORKSPACE_ACTIVITY,

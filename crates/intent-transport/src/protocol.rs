@@ -64,10 +64,16 @@
 //! (additive; §5.1): read-only transfer preview — the versioned export
 //! manifest (tables, assets, git summary) plus the size estimate (DB rows +
 //! assets + estimated git bundle) and pre-flight warnings — 274 router
-//! methods, 313 total.
+//! methods, 313 total. Version 6.7 adds the workspace delete
+//! grace window (additive; §5.1): the optional `undoDelayMs` param on
+//! `workspace.delete` (schedules an in-memory pending deletion, returning
+//! `{ success, scheduled, deleteAt }`), the `workspace.cancelDelete` router
+//! method, the `workspace:delete-scheduled` / `workspace:delete-cancelled`
+//! events (§6.5), and the optional `pendingDeleteAt` field on `Workspace`
+//! rows — 275 router methods, 314 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.6";
+pub const PROTOCOL_VERSION: &str = "6.7";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

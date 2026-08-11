@@ -18,7 +18,8 @@ use intent_core::events::{
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
     WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
+    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -60,6 +61,7 @@ mod completion_interception_tests;
 mod config_watcher;
 mod crdt_notes;
 mod create_progress;
+mod delete_grace;
 mod discovery_cache;
 mod disk_usage;
 mod drafts;
@@ -653,6 +655,12 @@ pub struct Services {
     /// Cap on concurrently active PR monitors per agent (mirrors
     /// `[hooks] maxPerAgent`).
     pr_monitors_max_per_agent: u32,
+    /// In-memory pending workspace deletions for the delete grace window
+    /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
+    /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
+    /// restart drops every pending deletion. Shared across clones so every
+    /// front door observes one set.
+    pending_workspace_deletes: delete_grace::PendingDeletes,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -747,6 +755,7 @@ impl Services {
             pr_monitor_poll_seconds: None,
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
+            pending_workspace_deletes: delete_grace::PendingDeletes::default(),
         }
     }
 
@@ -7065,6 +7074,46 @@ fn workspace_deleted_event(workspace_id: &WorkspaceId) -> NewEvent {
     }
 }
 
+/// Build a `workspace:delete-scheduled` event for a workspace whose delete
+/// grace window just started (§5.1 / §6.5). Self-sufficient payload
+/// `{ workspaceId, deleteAt }` carries the ISO commit deadline so clients
+/// render the pending state without a follow-up read.
+fn workspace_delete_scheduled_event(workspace_id: &WorkspaceId, delete_at: &str) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_DELETE_SCHEDULED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "deleteAt": delete_at,
+        }),
+    }
+}
+
+/// Build a `workspace:delete-cancelled` event for a pending deletion that was
+/// cancelled before its deadline (§5.1 / §6.5). Minimal payload
+/// `{ workspaceId }` — subscribers clear the pending state keyed on the id.
+fn workspace_delete_cancelled_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_DELETE_CANCELLED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+        }),
+    }
+}
+
 /// Build a `workspace:context-changed` event carrying the new authoritative
 /// context-item list (PROTOCOL §5.1 / §6.5). Self-sufficient payload
 /// `{ workspaceId, items }` (§6.7) so subscribers refresh without a
@@ -10204,6 +10253,9 @@ impl WorkspaceApi for Services {
                         .await
                         .expect("enrichment semaphore closed");
                     ws.activity = this.workspace_activity(&ws.id);
+                    // Delete grace window (§5.1): surface the in-memory
+                    // pending-deletion deadline; O(1) map read, never persisted.
+                    ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                     this.enrich_workspace_aggregates(&mut ws).await;
                     (idx, ws)
                 });
@@ -10254,6 +10306,9 @@ impl WorkspaceApi for Services {
             let cow_supported = this.compute_cow_supported().await;
             for ws in &mut list {
                 ws.activity = this.workspace_activity(&ws.id);
+                // Delete grace window (§5.1): surface the in-memory
+                // pending-deletion deadline; O(1) map read, never persisted.
+                ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
                 ws.agent_summary = None;
                 ws.diff_summary = None;
                 ws.cow_supported = cow_supported;
@@ -10289,6 +10344,9 @@ impl WorkspaceApi for Services {
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
             ws.activity = this.workspace_activity(&id);
+            // Delete grace window (§5.1): surface the in-memory
+            // pending-deletion deadline; O(1) map read, never persisted.
+            ws.pending_delete_at = this.pending_workspace_deletes.deadline(id.as_str());
             this.enrich_workspace_aggregates(&mut ws).await;
             Ok(ws)
         })
@@ -10992,6 +11050,7 @@ impl WorkspaceApi for Services {
                         display_status: None,
                         checkout_mode: None,
                         disk_usage: None,
+                        pending_delete_at: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -12298,6 +12357,12 @@ impl WorkspaceApi for Services {
             if id.is_chief() {
                 return Ok(());
             }
+            // Immediate-delete-while-pending (§5.1): an immediate delete
+            // supersedes a running grace window — drop the pending entry and
+            // abort its timer, then commit now. The timer-fired commit path
+            // has already claimed (removed) its entry before calling here,
+            // so this is a no-op for it.
+            services.pending_workspace_deletes.cancel(id.as_str());
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -12710,6 +12775,83 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn schedule_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let services = self.clone();
+        Box::pin(async move {
+            // Chief is virtual: mirror the immediate-delete no-op guard —
+            // report a deadline but never arm a timer (the commit would be a
+            // no-op anyway, and a pending marker on Chief makes no sense).
+            if id.is_chief() {
+                return Ok(intent_core::iso_ms_from_now(
+                    delete_grace::clamp_undo_delay_ms(undo_delay_ms),
+                ));
+            }
+            // Validate existence up front so scheduling a delete for an
+            // unknown workspace is the standard `NotFound` error, not a
+            // timer that fails later.
+            store.get_workspace(&id).await?;
+            // Idempotent re-schedule (§5.1): a window already running keeps
+            // its original deadline.
+            if let Some(existing) = services.pending_workspace_deletes.deadline(id.as_str()) {
+                return Ok(existing);
+            }
+            let delay_ms = delete_grace::clamp_undo_delay_ms(undo_delay_ms);
+            let delete_at = intent_core::iso_ms_from_now(delay_ms);
+            let key = id.as_str().to_string();
+            let timer_services = services.clone();
+            let timer_id = id.clone();
+            services.pending_workspace_deletes.schedule(
+                key,
+                delete_at.clone(),
+                move |generation| {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        // Claim-or-abstain: only the timer that still owns the
+                        // entry commits. A cancel or an immediate delete that
+                        // raced ahead removed/superseded the entry — do nothing.
+                        if !timer_services
+                            .pending_workspace_deletes
+                            .claim(timer_id.as_str(), generation)
+                        {
+                            return;
+                        }
+                        // Commit via the existing immediate-delete cascade
+                        // (same events, fast-ack cleanup). Best-effort: the
+                        // caller is long gone, so a failure is logged, not
+                        // surfaced.
+                        if let Err(e) = timer_services.delete_workspace(timer_id.clone()).await {
+                            tracing::warn!(
+                                workspace = %timer_id.as_str(),
+                                error = %e,
+                                "scheduled workspace delete failed at commit"
+                            );
+                        }
+                    })
+                },
+            );
+            publish_event(&bus, workspace_delete_scheduled_event(&id, &delete_at)).await;
+            Ok(delete_at)
+        })
+    }
+
+    fn cancel_workspace_delete(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let bus = self.event_bus.clone();
+        let services = self.clone();
+        Box::pin(async move {
+            let cancelled = services.pending_workspace_deletes.cancel(id.as_str());
+            if cancelled {
+                publish_event(&bus, workspace_delete_cancelled_event(&id)).await;
+            }
+            Ok(cancelled)
+        })
+    }
+
     fn archive_workspace(
         &self,
         id: WorkspaceId,
@@ -13054,6 +13196,7 @@ impl WorkspaceApi for Services {
                 display_status: None,
                 checkout_mode: None,
                 disk_usage: None,
+                pending_delete_at: None,
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`

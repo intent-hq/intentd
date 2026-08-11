@@ -5243,6 +5243,7 @@ mod workspace_api_tool_tests {
                 display_status: None,
                 checkout_mode: None,
                 disk_usage: None,
+                pending_delete_at: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
         }
@@ -8853,6 +8854,7 @@ mod workspace_api_output_limit_tests {
                     display_status: None,
                     checkout_mode: None,
                     disk_usage: None,
+                    pending_delete_at: None,
                 })
             })
         }

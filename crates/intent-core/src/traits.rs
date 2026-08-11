@@ -154,6 +154,39 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Schedule a workspace deletion after a grace window (PROTOCOL §5.1):
+    /// registers an in-memory pending deletion with deadline
+    /// `now + undo_delay_ms` (clamped to the 60s cap) and returns the ISO
+    /// `deleteAt` deadline. Re-scheduling while pending is idempotent (returns
+    /// the existing deadline). On expiry the daemon runs the immediate-delete
+    /// cascade ([`WorkspaceApi::delete_workspace`]). Never persisted — a
+    /// daemon restart drops the pending deletion.
+    fn schedule_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (id, undo_delay_ms);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::schedule_workspace_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Cancel a pending workspace deletion (PROTOCOL §5.1). Returns `true`
+    /// when a pending deletion was cancelled, `false` when nothing was
+    /// pending (already committed, or never scheduled) — a non-error,
+    /// race-safe outcome.
+    fn cancel_workspace_delete(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        let _ = id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cancel_workspace_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Archive a workspace (status→archived) (PROTOCOL §5.1).
     ///
     /// `caller_agent_id` names the agent that initiated the archive (the

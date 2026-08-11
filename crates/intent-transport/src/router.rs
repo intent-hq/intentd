@@ -348,8 +348,33 @@ async fn dispatch(
         }
         "workspace.delete" => {
             let id = require_workspace_id(params)?;
-            api.delete_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            // Delete grace window (§5.1): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .schedule_workspace_delete(id, undo_delay_ms)
+                    .await
+                    .map_err(workspace_err)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                api.delete_workspace(id).await.map_err(workspace_err)?;
+                Ok(json!({ "success": true }))
+            }
+        }
+        "workspace.cancelDelete" => {
+            let id = require_workspace_id(params)?;
+            let cancelled = api
+                .cancel_workspace_delete(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "cancelled": cancelled }))
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;

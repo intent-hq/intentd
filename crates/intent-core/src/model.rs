@@ -254,6 +254,14 @@ pub struct Workspace {
     /// directory (remote / skip-isolation / chief).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<WorkspaceDiskUsage>,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.1): set on
+    /// `workspace.list` / `workspace.get` rows while a `workspace.delete`
+    /// grace window (`undoDelayMs > 0`) is running, so clients can render or
+    /// hide the row as they choose. Never persisted — a daemon restart drops
+    /// the pending deletion and the field disappears. Omitted (not `null`)
+    /// when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -352,6 +360,7 @@ pub fn chief_workspace() -> Workspace {
         cow_supported: None,
         checkout_mode: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -3571,6 +3580,7 @@ mod tests {
             cow_supported: None,
             checkout_mode: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
