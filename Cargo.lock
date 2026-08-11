@@ -4796,7 +4796,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite"
 version = "0.30.0"
-source = "git+https://github.com/intent-hq/tokio-tungstenite?branch=deflate#1b92c7cb27514b4f01448bdbeb64e492eeacf94e"
+source = "git+https://github.com/intent-hq/tokio-tungstenite?branch=deflate#54f66a030d45e25140d5f2c328081153d3aba634"
 dependencies = [
  "futures-util",
  "log",
@@ -5026,7 +5026,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "tungstenite"
 version = "0.30.0"
-source = "git+https://github.com/intent-hq/tungstenite-rs?branch=deflate#e3eecd17d5ccab7bd40a4e4ed6db2fdefb3742f7"
+source = "git+https://github.com/intent-hq/tungstenite-rs?branch=deflate#f6ffd12cd7606d0fceaecc64322bb1317e331a6a"
 dependencies = [
  "bytes",
  "data-encoding",
