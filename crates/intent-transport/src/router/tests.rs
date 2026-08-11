@@ -990,6 +990,25 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(serde_json::json!({ "removed": path == "/src/intent" })) })
     }
 
+    fn repo_warm_cache(&self, github_url: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            match github_url.as_str() {
+                "https://github.com/intent-hq/busy" => Err(Error::WarmInFlight {
+                    owner: "intent-hq".to_string(),
+                    repo: "other".to_string(),
+                }),
+                "bad-url" => Err(Error::InvalidParams(format!(
+                    "githubUrl carries no owner/repo pair: {github_url}"
+                ))),
+                _ => Ok(serde_json::json!({
+                    "started": true,
+                    "owner": "intent-hq",
+                    "repo": "intentd"
+                })),
+            }
+        })
+    }
+
     fn github_repos_list(
         &self,
         limit: Option<i64>,
@@ -3997,6 +4016,43 @@ async fn repo_remove_routes_path_and_returns_removed_flag() {
 #[tokio::test]
 async fn repo_remove_requires_path_param() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+// ---- repo.warmCache (PROTOCOL §5.6) ------------------------------------
+
+#[tokio::test]
+async fn repo_warm_cache_routes_url_and_returns_started_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{"githubUrl":"https://github.com/intent-hq/intentd"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "started": true, "owner": "intent-hq", "repo": "intentd" })
+    );
+}
+
+#[tokio::test]
+async fn repo_warm_cache_busy_maps_to_warm_in_flight_data() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{"githubUrl":"https://github.com/intent-hq/busy"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "warm-in-flight", "owner": "intent-hq", "repo": "other" })
+    );
+}
+
+#[tokio::test]
+async fn repo_warm_cache_requires_github_url_param() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
