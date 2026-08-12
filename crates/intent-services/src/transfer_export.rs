@@ -1336,21 +1336,37 @@ mod tests {
         let db = std::env::temp_dir().join(format!("export-test-{}.db", uuid::Uuid::new_v4()));
         let store = Store::open(&db).await.expect("open store");
         let bus = crate::EventBus::new(store.clone());
+        let id = WorkspaceId("ws-fail".to_string());
+        let repo_path = ws_root.0.join(&id.0).join("repo");
         let armed = Arc::new(AtomicBool::new(true));
         let failpoint_armed = armed.clone();
+        // Captured by the failpoint: HEAD's commit message at the moment of
+        // the injected failure. Proves the failure really lands AFTER
+        // bundling (HEAD must be the WIP sentinel commit), so the unwind
+        // assertions below exercise a snapshot that actually exists.
+        let head_at_failure = Arc::new(std::sync::Mutex::new(None::<String>));
+        let head_probe = head_at_failure.clone();
+        let probe_repo = repo_path.clone();
         let svc = Services::new(store)
             .with_workspaces_root(ws_root.0.clone())
             .with_assets_root(assets_root.0.clone())
             .with_event_bus(bus.clone())
             .with_export_build_failpoint(Arc::new(move |stage: &str| {
-                (stage == "writing-archive" && failpoint_armed.load(Ordering::SeqCst))
-                    .then(|| Error::Internal("injected archive-write failure".to_string()))
+                if stage != "writing-archive" || !failpoint_armed.load(Ordering::SeqCst) {
+                    return None;
+                }
+                *head_probe.lock().unwrap() =
+                    git2::Repository::open(&probe_repo).ok().and_then(|repo| {
+                        let commit = repo.head().ok()?.peel_to_commit().ok()?;
+                        Some(commit.message().unwrap_or("").to_string())
+                    });
+                Some(Error::Internal(
+                    "injected archive-write failure".to_string(),
+                ))
             }));
-        let id = WorkspaceId("ws-fail".to_string());
 
         // A repo with every dirty flavor: a staged new file, an unstaged
         // modification, and an untracked file.
-        let repo_path = ws_root.0.join(&id.0).join("repo");
         std::fs::create_dir_all(&repo_path).expect("repo dir");
         {
             let repo = git2::Repository::init_opts(
@@ -1411,6 +1427,18 @@ mod tests {
         assert!(
             reason.contains("injected archive-write failure"),
             "reason carries the build error: {reason}"
+        );
+
+        // The failure landed post-bundle: at the failpoint HEAD was the WIP
+        // sentinel commit, i.e. bundling had snapshotted the dirty worktree.
+        let head_msg_at_failure = head_at_failure
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("failpoint observed HEAD");
+        assert!(
+            head_msg_at_failure.starts_with(crate::transfer_git::TRANSFER_WIP_SENTINEL),
+            "HEAD at failure must be the WIP snapshot: {head_msg_at_failure}"
         );
 
         // No session left registered; staging is gone.
