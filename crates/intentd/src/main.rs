@@ -1865,35 +1865,39 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
 /// exists to serve: by the time anyone captures a debug bundle the overshoot
 /// is minutes in the past and the tree has drained back to baseline. The peak
 /// survives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChildTreeSample {
+    count: usize,
+    memory_bytes: u64,
+    peak_memory_bytes: u64,
+}
+
+/// The three fields are published together under one lock rather than as
+/// separate atomics: they are only meaningful as a set, and a reader that
+/// paired a count from one sweep with a byte total from the next would report
+/// a tree that never existed. Same shape as [`RouteInfo`] above, and the
+/// contention is nil — one writer every
+/// [`CHILD_TREE_SAMPLE_SECS`], readers only on a `system.status` call.
 #[derive(Default)]
 struct ChildTreeUsage {
-    has_sample: std::sync::atomic::AtomicBool,
-    count: std::sync::atomic::AtomicUsize,
-    memory_bytes: std::sync::atomic::AtomicU64,
-    peak_memory_bytes: std::sync::atomic::AtomicU64,
+    inner: std::sync::RwLock<Option<ChildTreeSample>>,
 }
 
 impl ChildTreeUsage {
     fn store(&self, count: usize, memory_bytes: u64) {
-        use std::sync::atomic::Ordering;
-        self.count.store(count, Ordering::Relaxed);
-        self.memory_bytes.store(memory_bytes, Ordering::Relaxed);
-        self.peak_memory_bytes
-            .fetch_max(memory_bytes, Ordering::Relaxed);
-        // Released last: a reader that sees `has_sample` also sees the values.
-        self.has_sample.store(true, Ordering::Release);
+        let mut guard = self.inner.write().expect("child tree usage lock poisoned");
+        let peak_memory_bytes = guard.map_or(memory_bytes, |prev| {
+            prev.peak_memory_bytes.max(memory_bytes)
+        });
+        *guard = Some(ChildTreeSample {
+            count,
+            memory_bytes,
+            peak_memory_bytes,
+        });
     }
 
-    fn load(&self) -> Option<(usize, u64, u64)> {
-        use std::sync::atomic::Ordering;
-        if !self.has_sample.load(Ordering::Acquire) {
-            return None;
-        }
-        Some((
-            self.count.load(Ordering::Relaxed),
-            self.memory_bytes.load(Ordering::Relaxed),
-            self.peak_memory_bytes.load(Ordering::Relaxed),
-        ))
+    fn load(&self) -> Option<ChildTreeSample> {
+        *self.inner.read().expect("child tree usage lock poisoned")
     }
 }
 
@@ -2137,9 +2141,9 @@ impl SystemControl for DaemonControl {
             hostname,
             cpu_percent,
             memory_bytes,
-            child_processes: child_tree.map(|(count, _, _)| count),
-            child_memory_bytes: child_tree.map(|(_, bytes, _)| bytes),
-            child_memory_peak_bytes: child_tree.map(|(_, _, peak)| peak),
+            child_processes: child_tree.map(|s| s.count),
+            child_memory_bytes: child_tree.map(|s| s.memory_bytes),
+            child_memory_peak_bytes: child_tree.map(|s| s.peak_memory_bytes),
         }
     }
 
@@ -4493,15 +4497,19 @@ mod tests {
         );
     }
 
-    /// A status read that beats the (30s-tick) sampler must report `null`, not
-    /// zero — a bundle reading `childMemoryBytes: 0` would conclude the daemon
-    /// has no children, which is the opposite of what an unsampled tree means.
+    /// A status read that beats the sampler's first tick must report `null`,
+    /// not zero — a bundle reading `childMemoryBytes: 0` would conclude the
+    /// daemon has no children, which is the opposite of what an unsampled
+    /// tree means.
     #[test]
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
         usage.store(6, 4_294_967_296);
-        assert_eq!(usage.load(), Some((6, 4_294_967_296, 4_294_967_296)));
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.count, 6);
+        assert_eq!(sample.memory_bytes, 4_294_967_296);
+        assert_eq!(sample.peak_memory_bytes, 4_294_967_296);
     }
 
     /// The peak must survive the tree draining back to baseline — that is the
@@ -4514,11 +4522,60 @@ mod tests {
         usage.store(4, 1_000_000_000);
         usage.store(24, 5_000_000_000);
         usage.store(0, 0);
+        let sample = usage.load().expect("sampled");
         assert_eq!(
-            usage.load(),
-            Some((0, 0, 5_000_000_000)),
+            (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
+            (0, 0, 5_000_000_000),
             "instantaneous drains to zero; the peak does not"
         );
+    }
+
+    /// The published triple must always come from ONE sweep. Reading a count
+    /// from sweep N beside a byte total from sweep N+1 would describe a tree
+    /// that never existed, and this telemetry's whole job is to be believed
+    /// later from a debug bundle. Hammers a writer alternating between two
+    /// self-consistent samples while readers assert they only ever see one or
+    /// the other — never a mix.
+    #[test]
+    fn child_tree_usage_never_publishes_a_torn_sample() {
+        const A: (usize, u64) = (4, 1_000_000_000);
+        const B: (usize, u64) = (24, 5_000_000_000);
+        let usage = Arc::new(ChildTreeUsage::default());
+        usage.store(A.0, A.1);
+
+        let writer = {
+            let usage = usage.clone();
+            std::thread::spawn(move || {
+                for i in 0..20_000 {
+                    let (count, bytes) = if i % 2 == 0 { A } else { B };
+                    usage.store(count, bytes);
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let usage = usage.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        let s = usage.load().expect("sampled before the threads started");
+                        assert!(
+                            (s.count, s.memory_bytes) == A || (s.count, s.memory_bytes) == B,
+                            "torn read: count {} paired with {} bytes",
+                            s.count,
+                            s.memory_bytes
+                        );
+                        // The peak is monotonic and never regresses below the
+                        // larger of the two samples once B has been written.
+                        assert!(s.peak_memory_bytes >= s.memory_bytes);
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().expect("writer thread");
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
     }
 
     /// Build a `pid -> children` adjacency from `(parent, child)` edges.
