@@ -8901,6 +8901,7 @@ impl Services {
         // Start from the placeholder-substituted content; each valid block
         // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
         let mut working = parsed.content_without_blocks.clone();
+        let mut warnings: Vec<String> = Vec::new();
         let mut created_note_ids: Vec<String> = Vec::new();
         let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
         let mut peer_order = 100i64;
@@ -8912,7 +8913,20 @@ impl Services {
             };
             let normalized = task.title.trim().to_lowercase();
             let task_note_id = match existing_by_title.get(&normalized) {
-                Some(existing_id) => existing_id.clone(),
+                Some(existing_id) => {
+                    // Reused child: `effort=` only applies at creation — it
+                    // never overwrites a possibly user-edited estimate on the
+                    // existing note — so an explicit attribute is surfaced as
+                    // dropped rather than silently ignored.
+                    if task.effort.is_some() {
+                        warnings.push(format!(
+                            "task block {}: effort= ignored — a task note with this \
+                             title already exists and its estimate is preserved",
+                            task_block_label(task)
+                        ));
+                    }
+                    existing_id.clone()
+                }
                 None => {
                     let child = self
                         .create_child_task_note(
@@ -8944,7 +8958,6 @@ impl Services {
         // Convert-with-warnings: bad header attributes or relation references
         // never fail the conversion — the blocks above already converted;
         // every dropped attribute or skipped edge adds one warning entry.
-        let mut warnings: Vec<String> = Vec::new();
         for task in &parsed.tasks {
             for issue in &task.issues {
                 warnings.push(format!("task block {}: {issue}", task_block_label(task)));
@@ -8953,7 +8966,9 @@ impl Services {
         // Sibling resolution maps for `dependsOn`/`conflictsWith` values:
         // `key=` declarations first, exact (trimmed) titles second. A slot
         // holding `None` marks a key/title declared by more than one sibling
-        // block resolving to different notes — references to it are ambiguous.
+        // block — references to it are ambiguous even when the duplicate
+        // declarations collapsed to one reused child via the title-reuse map,
+        // because the duplication itself makes the author's intent unclear.
         let mut id_by_key: HashMap<String, Option<NoteId>> = HashMap::new();
         let mut id_by_title: HashMap<String, Option<NoteId>> = HashMap::new();
         for (i, task) in parsed.tasks.iter().enumerate() {
@@ -8961,20 +8976,12 @@ impl Services {
             if let Some(key) = &task.key {
                 id_by_key
                     .entry(key.clone())
-                    .and_modify(|slot| {
-                        if slot.as_ref() != Some(id) {
-                            *slot = None;
-                        }
-                    })
+                    .and_modify(|slot| *slot = None)
                     .or_insert_with(|| Some(id.clone()));
             }
             id_by_title
                 .entry(task.title.trim().to_string())
-                .and_modify(|slot| {
-                    if slot.as_ref() != Some(id) {
-                        *slot = None;
-                    }
-                })
+                .and_modify(|slot| *slot = None)
                 .or_insert_with(|| Some(id.clone()));
         }
         // Seed resolved relations through the same validated writer as
@@ -9057,7 +9064,7 @@ impl Services {
                 continue;
             }
             // Same code path as `task.setRelations`, so the `note:updated` +
-            // `notes:ready-tasks-changed` (`relations-changed`) emissions
+            // `task:ready-tasks-changed` (`relations-changed`) emissions
             // match §6.5. Empty accepted lists pass `None` (skip) rather than
             // `Some([])` (clear), so a block whose references were all
             // skipped never clobbers relations an existing child already has.

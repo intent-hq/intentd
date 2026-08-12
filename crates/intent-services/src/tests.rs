@@ -2400,6 +2400,100 @@ async fn convert_blocks_warns_on_ambiguous_duplicate_key() {
 }
 
 #[tokio::test]
+async fn convert_blocks_warns_on_ambiguous_duplicate_title() {
+    // Two sibling blocks share a title. The reuse map collapses them onto one
+    // child note, but the duplicated declaration still makes a title
+    // reference ambiguous: warn and skip rather than guess.
+    let content = "@@@task\n# Dup\nbody\n@@@\n\
+                   @@@task\n# Dup\nmore\n@@@\n\
+                   @@@task dependsOn=Dup\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 2, "duplicate titles reuse one child");
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    assert!(consumer.depends_on.is_empty(), "ambiguous edge skipped");
+    assert!(
+        r.warnings.iter().any(|w| w.contains("\"Consumer\"")
+            && w.contains("ambiguous")
+            && w.contains("share that title")),
+        "title ambiguity warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
+    // The converting note is itself a task note; a block's dependsOn names it
+    // by id. The reference resolves via the existing-task-note-id step, then
+    // the tree-ancestry validator rejects the edge (the converting note is
+    // the created child's parent) with a warning naming the block.
+    use intent_core::{TaskMetadata, TaskStatus};
+    let content = "@@@task dependsOn=n1\n# Child\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut parent = svc.get_note(ws.clone(), id.clone()).await.expect("parent");
+    parent.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store.update_note(&parent).await.expect("mark as task");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    let child = child_task_meta(&svc, &ws, &r.created_note_ids, "Child").await;
+    assert!(child.depends_on.is_empty(), "ancestor edge skipped");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Child\"")
+            && r.warnings[0].contains("\"n1\"")
+            && r.warnings[0].contains("ancestor"),
+        "ancestor warning names block and reference: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_effort_dropped_for_reused_child() {
+    // Idempotent-reuse path: a same-titled child already exists, so the
+    // block's `effort=` never overwrites the existing note's estimate — but
+    // the explicitly written attribute surfaces as a warning, not silently.
+    let content = "@@@task effort=3h\n# Build API\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut existing = note(&ws, "pre-child", "body");
+    existing.title = "Build API".to_string();
+    existing.parent_id = Some(id.clone());
+    svc.store.insert_note(&existing).await.expect("pre-child");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 0, "existing child reused, none created");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Build API\"") && r.warnings[0].contains("effort= ignored"),
+        "effort-drop warning names the block: {}",
+        r.warnings[0]
+    );
+    let reused = svc
+        .get_note(ws.clone(), NoteId::from("pre-child"))
+        .await
+        .expect("reused child");
+    assert!(
+        reused
+            .metadata
+            .task
+            .is_none_or(|t| t.estimated_effort.is_none()),
+        "existing estimate untouched"
+    );
+}
+
+#[tokio::test]
 async fn convert_blocks_warns_on_validator_rejected_edges() {
     // Self-edge (block depends on its own key) and a cycle (A→B after B→A)
     // are rejected by the validators with distinct warnings; the blocks
