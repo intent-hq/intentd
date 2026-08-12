@@ -695,6 +695,37 @@ fn number(
     }
 }
 
+/// Catalog max for `agents.memoryBudgetMb` when total RAM cannot be detected
+/// (RAM detection supports Linux and macOS only). Matches the static bound
+/// [`intent_core::settings_file::SettingsFile`] enforces when parsing
+/// `config.toml`, which stays machine-independent on purpose: a config file
+/// written on one seat must not fail to parse on another.
+const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
+
+/// Catalog max for `agents.memoryBudgetMb`: total physical RAM in MB, so the
+/// FE renders a slider over the range the setting can meaningfully take,
+/// falling back to [`MEMORY_BUDGET_MAX_MB_FALLBACK`] where detection is
+/// unavailable.
+///
+/// Budgeting more than the machine has is not a configuration this daemon can
+/// honour — the admission gate would simply never fire — so the bound also
+/// makes `settings.update` reject such a value (`-32602`) rather than storing
+/// a knob that silently does nothing.
+fn memory_budget_max_mb() -> f64 {
+    memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes())
+}
+
+/// [`memory_budget_max_mb`] against an explicit detection result, so both
+/// branches are testable on a host where detection itself always succeeds.
+/// A zero reading counts as "undetected": a max of 0 would collapse the
+/// slider onto its own minimum and lock the setting off.
+fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
+    match total_memory_bytes.filter(|&bytes| bytes > 0) {
+        Some(bytes) => (bytes / (1024 * 1024)) as f64,
+        None => MEMORY_BUDGET_MAX_MB_FALLBACK,
+    }
+}
+
 fn enumerated(
     path: &'static str,
     label: &'static str,
@@ -1242,7 +1273,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Aggregate resident memory the daemon's whole child-process tree may use before new agent spawns queue behind idle-process eviction (0 = off; nothing running is ever killed; changes apply on daemon restart)",
             "agents",
             Some(0.0),
-            Some(1_024_000.0),
+            Some(memory_budget_max_mb()),
             0.0,
         ),
         number(
@@ -1257,11 +1288,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
-            "Minutes before an idle agent is reaped",
+            "Minutes before an idle agent is reaped (0 disables idle reaping)",
             "agents",
             Some(0.0),
             None,
-            30.0,
+            intent_core::config::DEFAULT_IDLE_REAP_MINUTES as f64,
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -2304,13 +2335,15 @@ mod tests {
             .expect("agents.memoryBudgetMb missing from catalog");
         assert!(!def.sensitive);
         assert_eq!(def.category, "agents");
-        assert!(matches!(
-            def.ty,
-            SettingType::Number {
-                min: Some(0.0),
-                max: Some(1_024_000.0)
-            }
-        ));
+        let SettingType::Number { min, max } = def.ty else {
+            panic!("agents.memoryBudgetMb is not a number");
+        };
+        assert_eq!(min, Some(0.0));
+        // The max is the detected RAM bound, not a static figure — assert the
+        // catalog carries whatever this host resolves to, and that it is a
+        // usable range rather than a degenerate 0..0.
+        assert_eq!(max, Some(memory_budget_max_mb()));
+        assert!(max.expect("bounded") > 0.0);
         assert_eq!(def.default_value, Some(json!(0.0)));
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
@@ -2323,6 +2356,57 @@ mod tests {
             agent_memory_budget_bytes(&settings),
             Some(20 * 1024 * 1024 * 1024),
         );
+    }
+
+    /// The `agents.memoryBudgetMb` catalog max is the machine's own RAM in MB
+    /// where detection works, and the static fallback where it does not —
+    /// a slider running to 1 TB on a 48 GB seat is unusable. Both branches are
+    /// exercised through the injectable form, since detection on this host
+    /// always succeeds; a zero reading is treated as undetected so the max
+    /// never collapses onto the minimum.
+    #[test]
+    fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
+        assert_eq!(
+            memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
+            49_152.0
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(Some(16 * 1024 * 1024 * 1024)),
+            16_384.0
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(None),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(Some(0)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+
+        // The wired-up form agrees with the injectable one on this host.
+        assert_eq!(
+            memory_budget_max_mb(),
+            memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
+        );
+    }
+
+    /// The shipped idle-reap default is 10 minutes (lowered from 30,
+    /// monorepo#2109) and the catalog advertises the same constant the
+    /// config-file layer defaults to — the two drifting apart is exactly how
+    /// the FE ends up showing a default the daemon does not use. `0` stays
+    /// valid as the disable value.
+    #[test]
+    fn idle_reap_catalog_default_matches_the_shipped_constant() {
+        let def = find_definition("agents.idleReapMinutes")
+            .expect("agents.idleReapMinutes missing from catalog");
+        assert_eq!(intent_core::config::DEFAULT_IDLE_REAP_MINUTES, 10);
+        assert_eq!(def.default_value, Some(json!(10.0)));
+        assert_eq!(
+            SettingsFile::default().agents.idle_reap_minutes,
+            intent_core::config::DEFAULT_IDLE_REAP_MINUTES,
+        );
+        assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
+        def.validate(&json!(0)).expect("0 disables idle reaping");
     }
 
     /// `agents.maxConcurrentAdapters` is a bounded catalog entry with no

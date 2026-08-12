@@ -5,6 +5,7 @@
 
 mod common;
 
+use intent_core::config::DEFAULT_IDLE_REAP_MINUTES;
 use intent_core::{Config, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};
 use intent_services::Services;
 use intent_store::Store;
@@ -111,7 +112,7 @@ async fn config_resolve_fills_defaults() {
         .socket_path
         .to_string_lossy()
         .contains("intentd.sock"));
-    assert_eq!(config.idle_reap_minutes, 30);
+    assert_eq!(config.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");

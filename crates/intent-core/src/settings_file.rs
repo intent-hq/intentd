@@ -1237,15 +1237,17 @@ maxConcurrentAdapters = 6
 # window keeps its whole subtree alive (~0.66 GB each when idle), so a seat
 # that touches 20 agents within the window holds all 20 subtrees at once --
 # projecting to ~12 GB doing nothing, more if any of them ran a test suite.
-# Measured at the default: 40 procs / 5.85 GB flat across 10 minutes of full
-# idle, zero exits; the same tree at a 2-minute TTL drained to 0 in 122 s.
-# Lowering it trades a warm process on the next use for memory reclaimed
-# sooner. Only agents idle past the TTL are candidates, and the sweep skips
-# any agent reported busy when it checks. An agent is selected within the TTL
-# plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the memory
-# comes back as each kill completes, so a large idle set drains over a tail
-# rather than all at once.
-idleReapMinutes = 30
+# Measured at a 30-minute TTL (the default before monorepo#2109): 40 procs /
+# 5.85 GB flat across 10 minutes of full idle, zero exits; the same tree at a
+# 2-minute TTL drained to 0 in 122 s. The default is now 10 minutes, so that
+# tree starts draining once the window passes instead of holding 5.85 GB for
+# another 20. Raising it trades memory reclaimed sooner for a warm process on
+# the next use. Only agents idle past the TTL are candidates, and the sweep
+# skips any agent reported busy when it checks. An agent is selected within
+# the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
+# memory comes back as each kill completes, so a large idle set drains over a
+# tail rather than all at once.
+idleReapMinutes = 10
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
