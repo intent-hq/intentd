@@ -3733,3 +3733,178 @@ async fn note_payloads_project_unmet_depends_on_over_wss() {
         "cancelled dep is unmet: {updated_c}"
     );
 }
+
+/// End-to-end `task.convertBlocks` relation seeding (monorepo#2018) over WSS:
+/// `@@@task` header attributes resolve at conversion time (sibling `key=` →
+/// sibling title → existing task-note id) and seed `dependsOn` through the
+/// same validated writer as `task.setRelations`, so `task:ready-tasks-changed`
+/// fires with the `relations-changed` trigger; the explicit RPC result carries
+/// the additive `warnings` array naming skipped references. Auto-conversion on
+/// `note.create` is asserted first, then `note.restoreVersion` (which does not
+/// auto-convert) restores the fence content so the explicit `task.convertBlocks`
+/// arm serializes `{ ok, convertedCount, createdNoteIds, warnings }` on the wire.
+#[tokio::test]
+async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ConvertRelations", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:ready-tasks-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Author: `note.create` auto-converts; Beta's `dependsOn=a` resolves via
+    // Alpha's `key=` and seeds, `ghost` is unknown and skipped with a warning
+    // (logged on this path; surfaced on the wire by the explicit RPC below).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Plan",
+            "content": "@@@task key=a\n# Alpha\nbody\n@@@\n@@@task dependsOn=a,ghost\n# Beta\nbody\n@@@",
+        }),
+    )
+    .await;
+    let parent_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let content = created["note"]["content"].as_str().expect("content");
+    assert!(
+        !content.contains("@@@task"),
+        "fences not removed: {content}"
+    );
+
+    // The seeded edge recomputed the ready set with the relations-changed
+    // trigger; Beta (unmet dep on Alpha) is not in `readyTaskIds`.
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"]["reason"],
+        json!("relations-changed"),
+        "auto-convert seeding trigger: {evt}"
+    );
+    let beta_id = evt["data"]["triggeredBy"]["noteId"]
+        .as_str()
+        .expect("triggering note id")
+        .to_string();
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(beta_id)),
+        "dep-blocked task still ready: {evt}"
+    );
+
+    // The seeded relation is visible on the child task note.
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": beta_id }),
+    )
+    .await;
+    assert_eq!(got["note"]["title"], json!("Beta"), "child: {got}");
+    let deps = got["note"]["metadata"]["task"]["dependsOn"]
+        .as_array()
+        .expect("dependsOn array");
+    assert_eq!(deps.len(), 1, "seeded dep: {got}");
+
+    // Explicit-RPC arm: delete the converted children, then restore v1 (the
+    // pre-conversion snapshot — `note.restoreVersion` does not auto-convert),
+    // leaving fence content in place for `task.convertBlocks` to consume.
+    let tasks = wss_rpc(
+        &mut rpc,
+        4,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    let rows = tasks.as_array().expect("bare array");
+    assert_eq!(rows.len(), 2, "rows: {tasks}");
+    for (i, row) in rows.iter().enumerate() {
+        let child_id = row["taskNoteId"].as_str().expect("child id");
+        let del = wss_rpc(
+            &mut rpc,
+            5 + i as i64,
+            "note.delete",
+            json!({ "workspaceId": ws_id, "noteId": child_id }),
+        )
+        .await;
+        assert_eq!(del["ok"], json!(true), "delete: {del}");
+    }
+    let restored = wss_rpc(
+        &mut rpc,
+        7,
+        "note.restoreVersion",
+        json!({ "workspaceId": ws_id, "noteId": parent_id, "v": 1 }),
+    )
+    .await;
+    let content = restored["note"]["content"].as_str().expect("content");
+    assert!(content.contains("@@@task"), "fences restored: {content}");
+
+    let conv = wss_rpc(
+        &mut rpc,
+        8,
+        "task.convertBlocks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(conv["ok"], json!(true), "convert: {conv}");
+    assert_eq!(conv["convertedCount"], json!(2), "convert: {conv}");
+    assert_eq!(
+        conv["createdNoteIds"].as_array().map(|a| a.len()),
+        Some(2),
+        "convert: {conv}"
+    );
+    let warnings = conv["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "convert: {conv}");
+    let w = warnings[0].as_str().expect("warning string");
+    assert!(
+        w.contains("\"Beta\"") && w.contains("ghost"),
+        "warning names block and reference: {w}"
+    );
+
+    // The re-seeded edge recomputes readiness again, triggered by the new
+    // Beta child. Child deletions above may also have emitted recomputes;
+    // scan past them to the relations-changed trigger.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for relations-changed recompute"
+        );
+        let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+        if evt["data"]["triggeredBy"]["reason"] == json!("relations-changed") {
+            let new_beta = evt["data"]["triggeredBy"]["noteId"]
+                .as_str()
+                .expect("triggering note id");
+            assert_ne!(new_beta, beta_id, "fresh child triggered: {evt}");
+            assert!(
+                conv["createdNoteIds"]
+                    .as_array()
+                    .expect("createdNoteIds")
+                    .iter()
+                    .any(|v| v == &json!(new_beta)),
+                "trigger is a created child: {evt}"
+            );
+            break;
+        }
+    }
+}
