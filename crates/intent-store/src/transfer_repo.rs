@@ -74,6 +74,11 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("agent_metrics", "workspace_id = ?1"),
     ("workspace_context_item", "workspace_id = ?1"),
     ("workspace_ui_context", "workspace_id = ?1"),
+    // Registry rows transfer; the files under `.intent/attachments/` are
+    // git-ignored so they do NOT ride the git bundle — rows are designed to
+    // survive a missing file (reads report `exists: false`), and
+    // `stored_path` is workspace-relative, so no import rewriting is needed.
+    ("attachments", "workspace_id = ?1"),
 ];
 
 /// Tables deliberately **excluded** from a transfer, each with the rationale.
@@ -520,6 +525,7 @@ mod tests {
             format!("INSERT INTO agent_metrics (agent_id, workspace_id, updated_at) VALUES ('{agent}', '{ws}', '{t}')"),
             format!("INSERT INTO workspace_context_item (workspace_id, id, ordinal, payload) VALUES ('{ws}', 'ci', 0, '{{}}')"),
             format!("INSERT INTO workspace_ui_context (workspace_id, payload) VALUES ('{ws}', '{{}}')"),
+            format!("INSERT INTO attachments (id, workspace_id, file_name, size, uploaded_at, stored_path) VALUES ('at-{ws}', '{ws}', 'f.txt', 3, '{t}', '.intent/attachments/at-{ws}')"),
         ] {
             run(store, sql).await;
         }
@@ -719,7 +725,7 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks
 agent_message: id, agent_id, seq, role, content, created_at, metadata
 agent_queue: id, agent_id, position, payload, created_at, turn_id
 interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
@@ -736,7 +742,8 @@ diffs: id, workspace_id, file_path, staged, old_content, new_content, hunks_json
 workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at
 agent_metrics: agent_id, workspace_id, additions, deletions, files_changed, updated_at
 workspace_context_item: workspace_id, id, ordinal, payload
-workspace_ui_context: workspace_id, payload";
+workspace_ui_context: workspace_id, payload
+attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path";
 
     /// Column-drift tripwire: the live columns of every transferred table
     /// must match [`TRANSFERRED_COLUMNS`]. Adding/removing a column on a
