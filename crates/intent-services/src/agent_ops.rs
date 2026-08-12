@@ -5340,8 +5340,20 @@ impl Services {
             .into_iter()
             .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
         {
+            // Attention is not a completion, so the watch is left in place —
+            // say so explicitly (issue monorepo#2051) to avoid reading as
+            // terminal next to the retiring completion wake. A watch adopted
+            // into an `after_all` delegation group wakes at group settlement,
+            // not this agent's individual completion, so state the promise
+            // that actually holds.
+            let completion_promise = if watch.group_id.is_some() {
+                "you will be woken when its delegation group settles"
+            } else {
+                "you will still be woken at its completion"
+            };
             let wake_text = format!(
-                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {}",
+                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {} (Your watch on this agent \
+                 remains armed; {completion_promise}.)",
                 session.name, caller.0, wake_verb, reason
             );
             let metadata = json!({

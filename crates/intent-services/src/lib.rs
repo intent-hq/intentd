@@ -3901,7 +3901,10 @@ impl Services {
                 // `newly_recorded` guard ensures a reprocessed duplicate
                 // `agent:failed` cannot deliver a second immediate wake.
                 if newly_recorded && event.event_type == AGENT_FAILED {
-                    let wake = format_completion_wake(child_id, event, None);
+                    // The grouped watch stays armed (group settlement owns
+                    // it), so this immediate wake must NOT carry the
+                    // retirement suffix.
+                    let wake = format_completion_wake(child_id, event, None, false);
                     let metadata = build_event_notification_metadata(&[event]);
                     if let Err(e) = self
                         .deliver_parent_wake(
@@ -4003,7 +4006,9 @@ impl Services {
                 );
                 continue;
             }
-            let wake = format_completion_wake(child_id, event, stall.as_ref());
+            // `remove_watch` just retired the one-shot watch, so the wake
+            // carries the retirement + re-arm suffix (issue monorepo#2051).
+            let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
                 .deliver_parent_wake(
@@ -8452,10 +8457,20 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// completion report wins over `lastResponseSummary` (SUB-2, mirroring
 /// `format_group_child_line`) so the single agent:idle-driven wake carries
 /// the child's `reportToParent` text end-to-end.
+///
+/// `watch_retired` — issue monorepo#2051, mirroring the #1520 hook-wake
+/// terminal/non-terminal clarity: `true` on the ungrouped delivery path
+/// (where `remove_watch` retired the one-shot watch just before delivery)
+/// appends an explicit "watch consumed / retired" note with a
+/// `ws.agent.watch` re-arm pointer (or, for `agent:deleted`, a "cannot be
+/// re-watched" note — a deleted agent is rejected by `agent.watch` and has
+/// no next completion); `false` on the immediate grouped-failure path,
+/// whose watch stays armed for group settlement.
 fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
     stall: Option<&StallSuspicion>,
+    watch_retired: bool,
 ) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
@@ -8502,6 +8517,23 @@ fn format_completion_wake(
     if let Some(stall) = stall {
         if !report_rendered {
             msg.push_str(&stall.annotation_suffix());
+        }
+    }
+    if watch_retired {
+        // A deleted agent fails closed in `agent.watch` (rejected as unknown)
+        // and has no next completion, so the deleted-kind wake must not carry
+        // the re-arm pointer — say the agent cannot be re-watched instead.
+        if event.event_type == AGENT_DELETED {
+            msg.push_str(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
+                 now retired. The agent was deleted, so it cannot be re-watched.",
+            );
+        } else {
+            msg.push_str(&format!(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+                 retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
+                child_id.0
+            ));
         }
     }
     msg
