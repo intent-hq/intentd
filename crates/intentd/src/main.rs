@@ -1852,18 +1852,25 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     usage
 }
 
-/// Latest descendant-process-tree sample for `system.status`,
-/// written by the background sampler task and read lock-free from `status()`.
-/// `memory_bytes` is the aggregate resident memory of every process descended
-/// from the daemon — agent provider CLIs dominate it, so the daemon's own
+/// Latest descendant-process-tree sample for `system.status`, written by the
+/// background sampler task and read lock-free from `status()`. `memory_bytes`
+/// is the aggregate resident memory of every process descended from the
+/// daemon — agent provider CLIs dominate it, so the daemon's own
 /// `memoryBytes` badly understates what the daemon costs the machine.
 /// `has_sample` stays false until the first walk lands, so a status read that
 /// beats the sampler reports `null` rather than a misleading zero.
+///
+/// `peak_memory_bytes` is a high-water mark since daemon start. The
+/// instantaneous pair alone is close to useless for the case this telemetry
+/// exists to serve: by the time anyone captures a debug bundle the overshoot
+/// is minutes in the past and the tree has drained back to baseline. The peak
+/// survives it.
 #[derive(Default)]
 struct ChildTreeUsage {
     has_sample: std::sync::atomic::AtomicBool,
     count: std::sync::atomic::AtomicUsize,
     memory_bytes: std::sync::atomic::AtomicU64,
+    peak_memory_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl ChildTreeUsage {
@@ -1871,11 +1878,13 @@ impl ChildTreeUsage {
         use std::sync::atomic::Ordering;
         self.count.store(count, Ordering::Relaxed);
         self.memory_bytes.store(memory_bytes, Ordering::Relaxed);
+        self.peak_memory_bytes
+            .fetch_max(memory_bytes, Ordering::Relaxed);
         // Released last: a reader that sees `has_sample` also sees the values.
         self.has_sample.store(true, Ordering::Release);
     }
 
-    fn load(&self) -> Option<(usize, u64)> {
+    fn load(&self) -> Option<(usize, u64, u64)> {
         use std::sync::atomic::Ordering;
         if !self.has_sample.load(Ordering::Acquire) {
             return None;
@@ -1883,16 +1892,21 @@ impl ChildTreeUsage {
         Some((
             self.count.load(Ordering::Relaxed),
             self.memory_bytes.load(Ordering::Relaxed),
+            self.peak_memory_bytes.load(Ordering::Relaxed),
         ))
     }
 }
 
-/// Sweep interval for the descendant-tree sampler. Unlike the own-process
-/// sampler this needs a full-system process refresh to reconstruct the
-/// parent/child tree, so it runs two orders of magnitude slower than the ~1s
-/// own-process tick — memory footprint moves on a scale of minutes, not
-/// seconds, and the point of the sample is a bundle-readable trend line.
-const CHILD_TREE_SAMPLE_SECS: u64 = 30;
+/// Sweep interval for the descendant-tree sampler. Slower than the ~1s
+/// own-process tick because this one needs a full-system process refresh to
+/// reconstruct the parent/child links, but deliberately not much slower: the
+/// tree is not only long-lived agent sessions. Every `agent.completeOnce` /
+/// `agent.enhancePrompt` quick action and every model probe spawns an
+/// ephemeral adapter chain that lives for **seconds** — measured at ~7 s for a
+/// trivial completion — so a coarse tick aliases those away entirely. Measured
+/// on a 1008-process macOS host, one refresh + walk costs ~10 ms, i.e. 0.2% of
+/// one core at this cadence.
+const CHILD_TREE_SAMPLE_SECS: u64 = 5;
 
 /// Fraction of total system RAM the descendant tree may occupy before each
 /// sample logs a WARN. Agents are budgeted ~1 GB each by
@@ -2123,8 +2137,9 @@ impl SystemControl for DaemonControl {
             hostname,
             cpu_percent,
             memory_bytes,
-            child_processes: child_tree.map(|(count, _)| count),
-            child_memory_bytes: child_tree.map(|(_, bytes)| bytes),
+            child_processes: child_tree.map(|(count, _, _)| count),
+            child_memory_bytes: child_tree.map(|(_, bytes, _)| bytes),
+            child_memory_peak_bytes: child_tree.map(|(_, _, peak)| peak),
         }
     }
 
@@ -4486,7 +4501,24 @@ mod tests {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
         usage.store(6, 4_294_967_296);
-        assert_eq!(usage.load(), Some((6, 4_294_967_296)));
+        assert_eq!(usage.load(), Some((6, 4_294_967_296, 4_294_967_296)));
+    }
+
+    /// The peak must survive the tree draining back to baseline — that is the
+    /// whole point of it. A quick-action burst spawns ~600 MB of adapter chain
+    /// per concurrent call and is gone in seconds, so a bundle captured after
+    /// the fact sees only the peak.
+    #[test]
+    fn child_tree_usage_peak_is_a_high_water_mark() {
+        let usage = ChildTreeUsage::default();
+        usage.store(4, 1_000_000_000);
+        usage.store(24, 5_000_000_000);
+        usage.store(0, 0);
+        assert_eq!(
+            usage.load(),
+            Some((0, 0, 5_000_000_000)),
+            "instantaneous drains to zero; the peak does not"
+        );
     }
 
     /// Build a `pid -> children` adjacency from `(parent, child)` edges.

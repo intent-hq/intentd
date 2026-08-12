@@ -76,6 +76,12 @@ pub struct SystemStatus {
     /// small fraction of it once agents are live. `None` alongside
     /// `child_processes`.
     pub child_memory_bytes: Option<u64>,
+    /// High-water mark of [`Self::child_memory_bytes`] since daemon start.
+    /// The instantaneous value is not enough on its own: quick-action and
+    /// model-probe adapters live for seconds, and by the time a debug bundle
+    /// is captured any overshoot has drained back to baseline. `None`
+    /// alongside `child_processes`.
+    pub child_memory_peak_bytes: Option<u64>,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -210,6 +216,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "memoryBytes": status.memory_bytes,
         "childProcesses": status.child_processes,
         "childMemoryBytes": status.child_memory_bytes,
+        "childMemoryPeakBytes": status.child_memory_peak_bytes,
         "fingerprint": status.fingerprint,
         "localIps": status.local_ips,
         "hostname": status.hostname,
