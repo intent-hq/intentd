@@ -2201,6 +2201,384 @@ async fn convert_blocks_creates_children_idempotently() {
 }
 
 // ---------------------------------------------------------------------------
+// Relation seeding at conversion time (monorepo#2018 T2): `@@@task` header
+// attributes `key=`/`dependsOn=`/`conflictsWith=`/`effort=` resolve and seed
+// relations during `convert_task_blocks`. Resolution order: sibling block
+// `key=` → sibling block exact (trimmed) title → existing task-note id.
+// Conversion never fails on bad relations — each skipped edge/attribute adds
+// one warning; blocks always convert and unaffected relations still apply.
+// ---------------------------------------------------------------------------
+
+/// Fetch the task metadata of a created child by title.
+async fn child_task_meta(
+    svc: &Services,
+    ws: &WorkspaceId,
+    created: &[String],
+    title: &str,
+) -> intent_core::TaskMetadata {
+    for id in created {
+        let n = svc
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("child note");
+        if n.title == title {
+            return n.metadata.task.expect("child is a task");
+        }
+    }
+    panic!("no created child titled {title:?}");
+}
+
+/// Map a created child's title → its note id string.
+async fn child_id_by_title(
+    svc: &Services,
+    ws: &WorkspaceId,
+    created: &[String],
+    title: &str,
+) -> String {
+    for id in created {
+        let n = svc
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("child note");
+        if n.title == title {
+            return id.clone();
+        }
+    }
+    panic!("no created child titled {title:?}");
+}
+
+#[tokio::test]
+async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
+    // `key=` reference, exact-title reference, `conflictsWith`, and `effort=`
+    // all seed in one conversion pass with zero warnings. Header values are
+    // whitespace-separated bare tokens, so title references are single words.
+    let content = "@@@task key=api effort=2h\n# Backend\nbody\n@@@\n\
+                   @@@task\n# Frontend\nbody\n@@@\n\
+                   @@@task dependsOn=api conflictsWith=Frontend\n# Wiring\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+
+    let api_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Backend").await;
+    let api_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Backend").await;
+    assert_eq!(api_meta.estimated_effort.as_deref(), Some("2h"));
+    let fe_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Frontend").await;
+
+    let ui_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Wiring").await;
+    let deps: Vec<&str> = ui_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![api_id.as_str()], "dependsOn resolved via key=");
+    let conflicts: Vec<&str> = ui_meta.conflicts_with.iter().map(|d| d.as_str()).collect();
+    assert_eq!(
+        conflicts,
+        vec![fe_id.as_str()],
+        "conflictsWith resolved via exact title"
+    );
+
+    // The seeded edge projects into readiness: "Wiring" has an unmet dep.
+    let ui_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Wiring").await;
+    let mine = svc
+        .get_my_task(ws.clone(), NoteId::from(ui_id.as_str()))
+        .await
+        .expect("getMyTask");
+    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec![api_id.as_str()]);
+}
+
+#[tokio::test]
+async fn convert_blocks_key_takes_precedence_over_title() {
+    // A sibling declares key=Target while another sibling is TITLED "Target".
+    // The reference "Target" must resolve to the key owner, not the title.
+    let content = "@@@task key=Target\n# Key Owner\nbody\n@@@\n\
+                   @@@task\n# Target\nbody\n@@@\n\
+                   @@@task dependsOn=Target\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+    let key_owner = child_id_by_title(&svc, &ws, &r.created_note_ids, "Key Owner").await;
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![key_owner.as_str()]);
+}
+
+#[tokio::test]
+async fn convert_blocks_resolves_existing_task_note_ids() {
+    // A value matching no sibling key/title resolves against an existing
+    // task-note id in the workspace; a same-shaped id on a NON-task note
+    // does not resolve and warns.
+    use intent_core::{TaskMetadata, TaskStatus};
+    let content = "@@@task dependsOn=pre-task,plain-note\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut pre = note(&ws, "pre-task", "body");
+    pre.title = "Pre-existing".to_string();
+    pre.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store.insert_note(&pre).await.expect("pre-task");
+    svc.store
+        .insert_note(&note(&ws, "plain-note", "body"))
+        .await
+        .expect("plain-note");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec!["pre-task"], "existing task-note id resolves");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Consumer\"")
+            && r.warnings[0].contains("dependsOn")
+            && r.warnings[0].contains("plain-note"),
+        "warning names block and reference: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
+    let content = "@@@task key=a dependsOn=nope\n# Alpha\nbody\n@@@\n\
+                   @@@task dependsOn=a\n# Beta\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    // Both blocks convert; the bad edge is skipped, the good one applies.
+    assert_eq!(r.converted_count, 2);
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Alpha\" (key=a)") && r.warnings[0].contains("\"nope\""),
+        "warning names block (title+key) and reference: {}",
+        r.warnings[0]
+    );
+    let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    assert!(alpha.depends_on.is_empty());
+    let alpha_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
+    let deps: Vec<&str> = beta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(
+        deps,
+        vec![alpha_id.as_str()],
+        "valid sibling edge still applies"
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_ambiguous_duplicate_key() {
+    // Two distinct blocks declare the same key → a reference to it is
+    // ambiguous: warn and skip.
+    let content = "@@@task key=dup\n# First\nbody\n@@@\n\
+                   @@@task key=dup\n# Second\nbody\n@@@\n\
+                   @@@task dependsOn=dup\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    assert!(consumer.depends_on.is_empty(), "ambiguous edge skipped");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("\"Consumer\"") && w.contains("ambiguous") && w.contains("dup")),
+        "ambiguity warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_ambiguous_duplicate_title() {
+    // Two sibling blocks share a title. The reuse map collapses them onto one
+    // child note, but the duplicated declaration still makes a title
+    // reference ambiguous: warn and skip rather than guess.
+    let content = "@@@task\n# Dup\nbody\n@@@\n\
+                   @@@task\n# Dup\nmore\n@@@\n\
+                   @@@task dependsOn=Dup\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 2, "duplicate titles reuse one child");
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    assert!(consumer.depends_on.is_empty(), "ambiguous edge skipped");
+    assert!(
+        r.warnings.iter().any(|w| w.contains("\"Consumer\"")
+            && w.contains("ambiguous")
+            && w.contains("share that title")),
+        "title ambiguity warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
+    // The converting note is itself a task note; a block's dependsOn names it
+    // by id. The reference resolves via the existing-task-note-id step, then
+    // the tree-ancestry validator rejects the edge (the converting note is
+    // the created child's parent) with a warning naming the block.
+    use intent_core::{TaskMetadata, TaskStatus};
+    let content = "@@@task dependsOn=n1\n# Child\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut parent = svc.get_note(ws.clone(), id.clone()).await.expect("parent");
+    parent.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store.update_note(&parent).await.expect("mark as task");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    let child = child_task_meta(&svc, &ws, &r.created_note_ids, "Child").await;
+    assert!(child.depends_on.is_empty(), "ancestor edge skipped");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Child\"")
+            && r.warnings[0].contains("\"n1\"")
+            && r.warnings[0].contains("ancestor"),
+        "ancestor warning names block and reference: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_effort_dropped_for_reused_child() {
+    // Idempotent-reuse path: a same-titled child already exists, so the
+    // block's `effort=` never overwrites the existing note's estimate — but
+    // the explicitly written attribute surfaces as a warning, not silently.
+    let content = "@@@task effort=3h\n# Build API\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut existing = note(&ws, "pre-child", "body");
+    existing.title = "Build API".to_string();
+    existing.parent_id = Some(id.clone());
+    svc.store.insert_note(&existing).await.expect("pre-child");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 0, "existing child reused, none created");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Build API\"") && r.warnings[0].contains("effort= ignored"),
+        "effort-drop warning names the block: {}",
+        r.warnings[0]
+    );
+    let reused = svc
+        .get_note(ws.clone(), NoteId::from("pre-child"))
+        .await
+        .expect("reused child");
+    assert!(
+        reused
+            .metadata
+            .task
+            .is_none_or(|t| t.estimated_effort.is_none()),
+        "existing estimate untouched"
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_validator_rejected_edges() {
+    // Self-edge (block depends on its own key) and a cycle (A→B after B→A)
+    // are rejected by the validators with distinct warnings; the blocks
+    // still convert and the first (acyclic) edge still applies.
+    let content = "@@@task key=a dependsOn=b\n# Alpha\nbody\n@@@\n\
+                   @@@task key=b dependsOn=a,b\n# Beta\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 2);
+    // Alpha→Beta seeded first (declaration order); Beta→Alpha then closes a
+    // cycle and Beta→Beta is a self-edge — both rejected.
+    let beta_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Beta").await;
+    let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    let deps: Vec<&str> = alpha.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![beta_id.as_str()], "acyclic edge applies");
+    let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
+    assert!(beta.depends_on.is_empty(), "rejected edges skipped");
+    assert_eq!(r.warnings.len(), 2, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("\"Beta\" (key=b)") && w.contains("cycle") && w.contains("\"a\"")),
+        "cycle warning names block and reference: {:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("\"Beta\" (key=b)")
+            && w.contains("\"b\"")
+            && w.contains("cannot reference the task itself")),
+        "self-edge warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_surfaces_header_parse_issues_as_warnings() {
+    // T1 header parse issues (unknown attribute) ride the conversion result
+    // as warnings; the block still converts.
+    let content = "@@@task key=a priority=high\n# Alpha\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Alpha\" (key=a)")
+            && r.warnings[0].contains("unknown attribute `priority`"),
+        "parse issue names the block: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
+    // The post-write auto-conversion path (note.setContent) shares the op:
+    // relations seed there too, and the write itself still succeeds.
+    let (_tmp, svc, ws, id) = setup("plain").await;
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "@@@task key=x effort=1d\n# X\nbody\n@@@\n\
+         @@@task dependsOn=x\n# Y\nbody\n@@@"
+            .into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("setContent");
+    let all = svc.store.list_notes(&ws).await.expect("list");
+    let x = all.iter().find(|n| n.title == "X").expect("child X");
+    let y = all.iter().find(|n| n.title == "Y").expect("child Y");
+    let x_meta = x.metadata.task.as_ref().expect("X task");
+    assert_eq!(x_meta.estimated_effort.as_deref(), Some("1d"));
+    let y_meta = y.metadata.task.as_ref().expect("Y task");
+    let deps: Vec<&str> = y_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![x.id.as_str()]);
+}
+
+// ---------------------------------------------------------------------------
 // Version-author attribution: `capture_note_version` stamps a `NoteVersionAuthor`
 // resolved from the caller. Reference parity with `notes.service.ts` L518-555:
 // `Some(agent_id)` → `{id, name: session.name, type: "agent"}` (name falls
@@ -5047,6 +5425,57 @@ mod change_event_parity {
             created[0]["actor"],
             json!({ "type": "agent", "id": "agent-conv", "name": "Conv" })
         );
+    }
+
+    /// Relation seeding at conversion time (monorepo#2018 T2) goes through
+    /// the same validated writer as `task.setRelations`, so a seeded
+    /// `dependsOn` edge emits the §6.5 pair: `note:updated` for the child
+    /// whose metadata changed, then `task:ready-tasks-changed` with the
+    /// `relations-changed` trigger naming that child.
+    #[tokio::test]
+    async fn convert_blocks_relation_seeding_emits_ready_tasks_changed() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-rel",
+            "@@@task key=a\n# Alpha\nbody\n@@@\n@@@task dependsOn=a\n# Beta\nbody\n@@@",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .convert_task_blocks(h.ws.clone(), n.id.clone(), None)
+            .await
+            .expect("convertBlocks");
+        assert!(r.warnings.is_empty(), "warnings: {:?}", r.warnings);
+        let beta_id = {
+            let mut found = None;
+            for id in &r.created_note_ids {
+                let child = h
+                    .services
+                    .get_note(h.ws.clone(), intent_core::NoteId::from(id.as_str()))
+                    .await
+                    .expect("child");
+                if child.title == "Beta" {
+                    found = Some(id.clone());
+                }
+            }
+            found.expect("Beta created")
+        };
+        let events = drain_events(&mut sub).await;
+        let ready = of_type(&events, "task:ready-tasks-changed");
+        assert_eq!(ready.len(), 1, "one relations-changed recompute");
+        assert_envelope(ready[0], &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], beta_id);
+        assert_eq!(
+            ready[0]["data"]["triggeredBy"]["reason"],
+            "relations-changed"
+        );
+        // Beta gained an unmet dep on Alpha, so it is not in the ready set.
+        let ready_ids = ready[0]["data"]["readyTaskIds"]
+            .as_array()
+            .expect("readyTaskIds array");
+        assert!(!ready_ids.iter().any(|v| v == beta_id.as_str()));
     }
 
     #[tokio::test]

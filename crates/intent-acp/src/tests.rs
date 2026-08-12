@@ -6367,6 +6367,7 @@ mod wsapi3_bindings_tests {
                     ok: true,
                     converted_count: 0,
                     created_note_ids: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
