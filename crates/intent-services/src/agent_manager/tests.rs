@@ -22,9 +22,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_npx_only,
-    resolve_spawn, text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
-    ResolvedSpawn, DEFAULT_AGENT_TYPE,
+    budget_admits, charged_bytes, compute_process_cap, derive_agent_type,
+    is_cancel_transport_closed, recommended_memory_budget_bytes, resolve_npx_only, resolve_spawn,
+    text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, ResolvedSpawn,
+    TreeMemoryProbe, DEFAULT_AGENT_TYPE, PROVISIONAL_AGENT_BYTES,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -260,6 +261,226 @@ async fn acquire_queues_until_a_process_goes_idle() {
         .expect("task ok");
     assert_eq!(*log.lock().unwrap(), vec![a]);
     assert_eq!(reg.size(), 0);
+}
+
+/// Tree-memory probe whose reading tests set by hand. Every `set` bumps the
+/// sample id, which is exactly what the real 5 s sampler does.
+struct FakeProbe(Mutex<(u64, u64)>);
+
+impl FakeProbe {
+    fn new(bytes: u64) -> Arc<Self> {
+        Arc::new(Self(Mutex::new((bytes, 1))))
+    }
+
+    /// Publish a freshly measured reading (new sample id → the registry drops
+    /// the provisional correction it accumulated against the previous one).
+    fn set(&self, bytes: u64) {
+        let mut guard = self.0.lock().unwrap();
+        guard.0 = bytes;
+        guard.1 += 1;
+    }
+}
+
+impl TreeMemoryProbe for FakeProbe {
+    fn sample(&self) -> Option<(u64, u64)> {
+        Some(*self.0.lock().unwrap())
+    }
+}
+
+/// A probe that has never produced a sample must leave admission untouched —
+/// a daemon in its first seconds behaves exactly as if no budget existed.
+struct NeverSampled;
+
+impl TreeMemoryProbe for NeverSampled {
+    fn sample(&self) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+#[test]
+fn recommended_budget_halves_ram_left_after_the_8gb_reserve() {
+    let gb = super::GB;
+    // The reporter's 48 GB seat: 20 GB, which the measured 21.5 GB tree crosses.
+    assert_eq!(recommended_memory_budget_bytes(48 * gb), 20 * gb);
+    assert_eq!(recommended_memory_budget_bytes(32 * gb), 12 * gb);
+    // Floor: never below 4 GB, however small (or undetectable) the host.
+    assert_eq!(recommended_memory_budget_bytes(16 * gb), 4 * gb);
+    assert_eq!(recommended_memory_budget_bytes(8 * gb), 4 * gb);
+    assert_eq!(recommended_memory_budget_bytes(0), 4 * gb);
+    // Always strictly under the slot cap's implied budget, which spends all of
+    // the same post-reserve RAM at 1 GB per agent.
+    for gb_total in 1..=160u64 {
+        let implied = compute_process_cap(gb_total * gb) as u64 * gb;
+        let budget = recommended_memory_budget_bytes(gb_total * gb);
+        assert!(
+            budget <= implied,
+            "budget {budget} must not exceed the slot cap's implied {implied} at {gb_total} GB"
+        );
+    }
+}
+
+#[test]
+fn charged_bytes_applies_a_signed_correction_and_saturates_at_zero() {
+    assert_eq!(charged_bytes(1_000, 250), 1_250);
+    assert_eq!(charged_bytes(1_000, -250), 750);
+    assert_eq!(charged_bytes(1_000, -5_000), 0, "credits cannot underflow");
+    assert_eq!(charged_bytes(u64::MAX, 1), u64::MAX, "charges cannot wrap");
+}
+
+#[test]
+fn budget_admits_an_empty_registry_however_fat_the_tree() {
+    // Over budget with nothing registered: the tree is one-shot adapters or
+    // simply another process the daemon does not own, and refusing forever
+    // would wedge the daemon.
+    assert!(budget_admits(u64::MAX, 1_000, 0));
+    assert!(!budget_admits(1_000, 1_000, 1), "at budget denies");
+    assert!(budget_admits(999, 1_000, 1));
+}
+
+#[tokio::test]
+async fn budget_is_off_by_default_and_inert_before_the_first_sample() {
+    // A 1-byte budget is unmeetable, so anything but "inert" would queue here.
+    let probes: [Option<Arc<dyn TreeMemoryProbe>>; 2] = [None, Some(Arc::new(NeverSampled))];
+    for probe in probes {
+        let reg = ProcessRegistry::new(8);
+        if let Some(probe) = probe {
+            assert!(reg.set_memory_budget(1, probe), "budget installs once");
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+        reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
+
+        timeout(Duration::from_millis(200), reg.acquire(&b))
+            .await
+            .expect("acquire must not queue without a usable budget");
+        assert!(reg.is_registered(&a), "nothing evicted");
+    }
+}
+
+#[tokio::test]
+async fn budget_reclaims_idle_processes_before_queueing_a_spawn() {
+    let gb = super::GB;
+    let reg = Arc::new(ProcessRegistry::new(8)); // Slots free; only memory binds.
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (idle, active, spawning) = (
+        AgentId::from("idle"),
+        AgentId::from("active"),
+        AgentId::from("spawning"),
+    );
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+
+    // 10 GB charged against a 4 GB budget with a slot free: the idle process is
+    // reclaimed rather than the spawn being admitted.
+    let reg2 = reg.clone();
+    let handle = tokio::spawn(async move { reg2.acquire(&spawning).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![idle.clone()],
+        "reclaims the idle process, never the active one"
+    );
+    assert!(
+        !handle.is_finished(),
+        "still over budget after the one eviction available → the spawn waits"
+    );
+
+    // Once the tree actually drains, the queued spawn proceeds without any
+    // registry event to wake it — nothing was deregistered or marked idle.
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the memory waiter must re-check on its own timer")
+        .expect("task ok");
+    assert!(
+        reg.is_registered(&active),
+        "an active process is never evicted by the budget"
+    );
+}
+
+#[tokio::test]
+async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
+    let gb = super::GB;
+    // Budget leaves room for exactly two provisional charges beyond the sample.
+    let budget = gb + 2 * PROVISIONAL_AGENT_BYTES;
+    let reg = Arc::new(ProcessRegistry::new(64));
+    let probe = FakeProbe::new(gb);
+    assert!(reg.set_memory_budget(budget, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    // The registry must be non-empty or the always-admit rule applies.
+    let seed = AgentId::from("seed");
+    reg.register(seed.clone(), recording_kill(seed.clone(), log.clone()));
+    reg.mark_active(&seed);
+
+    let mut admitted = 0usize;
+    for n in 0..6 {
+        let id = AgentId::from(format!("burst-{n}").as_str());
+        if timeout(Duration::from_millis(50), reg.acquire(&id))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+        // Active, so the next acquire cannot simply reclaim this one instead of
+        // being held by the budget — the burst is what is under test here.
+        reg.mark_active(&id);
+        admitted += 1;
+    }
+    assert_eq!(
+        admitted, 2,
+        "without the provisional charge every spawn would clear the same stale sample"
+    );
+
+    // A fresh sample supersedes the correction: the reading now reflects the
+    // admitted spawns, and headroom is judged on measurement alone.
+    probe.set(gb);
+    let next = AgentId::from("after-fresh-sample");
+    timeout(Duration::from_millis(50), reg.acquire(&next))
+        .await
+        .expect("a fresh under-budget sample admits again");
+}
+
+#[tokio::test]
+async fn deregister_credits_back_the_provisional_charge() {
+    let gb = super::GB;
+    let reg = Arc::new(ProcessRegistry::new(64));
+    let probe = FakeProbe::new(gb);
+    assert!(reg.set_memory_budget(gb + PROVISIONAL_AGENT_BYTES, probe));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seed = AgentId::from("seed");
+    reg.register(seed.clone(), recording_kill(seed.clone(), log.clone()));
+    reg.mark_active(&seed);
+
+    let first = AgentId::from("first");
+    timeout(Duration::from_millis(50), reg.acquire(&first))
+        .await
+        .expect("the single unit of headroom admits one spawn");
+    reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
+    // Active, so the budget cannot reclaim it — the credit path is under test.
+    reg.mark_active(&first);
+
+    // Headroom is now spent against the same sample.
+    let second = AgentId::from("second");
+    assert!(
+        timeout(Duration::from_millis(50), reg.acquire(&second))
+            .await
+            .is_err(),
+        "no headroom left against this sample"
+    );
+
+    // The dead process is still inside that sample, so its cost is credited
+    // back rather than waiting a full sampling period for the truth.
+    reg.deregister(&first);
+    timeout(Duration::from_millis(50), reg.acquire(&second))
+        .await
+        .expect("the credited charge frees the headroom immediately");
 }
 
 #[tokio::test]

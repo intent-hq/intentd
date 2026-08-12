@@ -426,6 +426,23 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     budget_gb.clamp(4, 100) as usize
 }
 
+/// Aggregate memory budget recommended for `total_memory_bytes` (monorepo#2063).
+///
+/// Reuses [`compute_process_cap`]'s 8 GB OS/other-apps reserve, then halves what
+/// is left. The halving is the whole point of the number: the slot cap spends
+/// *all* budgetable RAM assuming a 1 GB steady state per agent, but the measured
+/// per-agent subtree spans 22x (436 MB idle to 9.6 GB running the repo's own
+/// vitest suite), so the aggregate has to leave room for a tail agent on top of
+/// the steady state. On a 48 GB seat that is a 20 GB budget with a 9.6 GB tail
+/// agent's worth of slack still inside the 40 GB the slot cap already considers
+/// spendable — and the 21.5 GB tree measured in #2063 would have crossed it.
+///
+/// Only a recommendation today: `agents.memoryBudgetMb` defaults to 0 (off), so
+/// nothing calls this at runtime until the default is flipped.
+pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
+    (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
+}
+
 /// Best-effort process cap from detected system RAM, falling back to
 /// [`DEFAULT_PROCESS_CAP`] when total memory is unknown (RAM detection
 /// supports Linux and macOS; other platforms fall back to the default).
@@ -513,14 +530,26 @@ struct RegistryInner {
     entries: HashMap<AgentId, ProcessEntry>,
     /// Queue of waiting spawns, each carrying the agent id + oneshot channel.
     wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>)>,
+    /// Sample id [`ProcessRegistry::budget_denies`] last corrected against.
+    /// `None` until the first sample is consulted.
+    budget_sample_seq: Option<u64>,
+    /// Signed correction to that sample for spawns admitted and processes
+    /// released since it was taken. Reset whenever a newer sample lands.
+    budget_pending_bytes: i64,
 }
 
 fn pop_waiter(inner: &mut RegistryInner) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>)> {
-    if inner.wait_queue.is_empty() {
-        None
-    } else {
-        Some(inner.wait_queue.remove(0))
+    // Skip senders whose receiver is gone. A memory-budget waiter re-queues
+    // after each [`BUDGET_RECHECK`] and an abandoned `acquire` future drops its
+    // receiver outright, so handing the wakeup to a dead entry would consume it
+    // and starve a waiter that is still listening.
+    while !inner.wait_queue.is_empty() {
+        let waiter = inner.wait_queue.remove(0);
+        if !waiter.1.is_closed() {
+            return Some(waiter);
+        }
     }
+    None
 }
 
 fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
@@ -703,6 +732,39 @@ impl BusEventSink {
     }
 }
 
+/// Source of the daemon's aggregate descendant-tree memory, implemented by the
+/// composition root's `system.status` sampler (intentd#1139) and by fakes in
+/// tests.
+pub trait TreeMemoryProbe: Send + Sync {
+    /// `(resident bytes across the whole descendant tree, monotonic sample id)`,
+    /// or `None` before the first sample lands.
+    ///
+    /// The sample id lets the registry tell a fresh reading from a repeat of the
+    /// one it already corrected for; it only has to change when the bytes are
+    /// re-measured, and never has to mean anything else.
+    fn sample(&self) -> Option<(u64, u64)>;
+}
+
+/// An installed aggregate memory budget (monorepo#2063).
+struct MemoryBudget {
+    budget_bytes: u64,
+    probe: Arc<dyn TreeMemoryProbe>,
+}
+
+/// Provisional cost charged against the budget for a spawn that has been
+/// admitted but is not yet visible in a tree sample (and credited back when a
+/// process is deregistered). The measured median idle agent subtree is ~660 MB
+/// across 7 agents (436-756 MB, monorepo#2063). Without it, a burst of spawns
+/// all clear the gate against one up-to-5s-stale reading.
+const PROVISIONAL_AGENT_BYTES: u64 = 660 * 1024 * 1024;
+
+/// How long a spawn queued behind the memory budget sleeps before re-evaluating.
+/// The slot cap's waiter is woken by `deregister`/`mark_idle`, but memory can
+/// fall with no registry event at all (an agent's own child processes exit), so
+/// the memory path must also re-check on a timer or it would sleep on a wakeup
+/// that never comes.
+const BUDGET_RECHECK: Duration = Duration::from_secs(5);
+
 /// Global concurrency registry for spawned agent processes (port of
 /// `agent-process-registry`). Enforces a hard cap across all workspaces and, on
 /// [`ProcessRegistry::acquire`], evicts the least-recently-used idle process (or
@@ -713,6 +775,30 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    /// Optional aggregate memory budget, installed once by the composition root
+    /// when `agents.memoryBudgetMb` is non-zero. Absent (the default) leaves
+    /// every path below byte-for-byte identical to the slot-cap-only behaviour.
+    memory: std::sync::OnceLock<MemoryBudget>,
+}
+
+/// Last sample plus the signed correction for admissions/releases since it was
+/// taken, saturating at 0.
+fn charged_bytes(sampled: u64, pending: i64) -> u64 {
+    if pending >= 0 {
+        sampled.saturating_add(pending as u64)
+    } else {
+        sampled.saturating_sub(pending.unsigned_abs())
+    }
+}
+
+/// Whether the aggregate budget admits one more spawn.
+///
+/// `live == 0` always admits. The tree the probe measures includes processes the
+/// registry does not own (one-shot adapter chains, model probes) and, on a busy
+/// host, is simply not something the daemon controls; without this the daemon
+/// could refuse every spawn forever and never make progress.
+fn budget_admits(charged: u64, budget_bytes: u64, live: usize) -> bool {
+    live == 0 || charged < budget_bytes
 }
 
 impl ProcessRegistry {
@@ -722,6 +808,47 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            memory: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the aggregate memory budget (monorepo#2063). Called once by the
+    /// composition root after the sampler exists; returns false if a budget was
+    /// already installed. Not a builder because the probe and the registry are
+    /// constructed in either order depending on the caller.
+    pub fn set_memory_budget(&self, budget_bytes: u64, probe: Arc<dyn TreeMemoryProbe>) -> bool {
+        self.memory
+            .set(MemoryBudget {
+                budget_bytes,
+                probe,
+            })
+            .is_ok()
+    }
+
+    /// Consult the budget under the already-held lock, refreshing the pending
+    /// correction when a newer sample has landed. Returns `Some(charged_bytes)`
+    /// when the budget denies this spawn; `None` when it admits — including when
+    /// no budget is installed and when no sample exists yet, so an unconfigured
+    /// or not-yet-sampled daemon behaves exactly as before.
+    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<u64> {
+        let budget = self.memory.get()?;
+        let (sampled, seq) = budget.probe.sample()?;
+        if inner.budget_sample_seq != Some(seq) {
+            inner.budget_sample_seq = Some(seq);
+            inner.budget_pending_bytes = 0;
+        }
+        let charged = charged_bytes(sampled, inner.budget_pending_bytes);
+        (!budget_admits(charged, budget.budget_bytes, inner.entries.len())).then_some(charged)
+    }
+
+    /// Adjust the pending correction by one agent's provisional cost: `+1` on
+    /// admission (the spawn is not in the last sample yet), `-1` on deregister
+    /// (the dead process still is). No-op when no budget is installed.
+    fn budget_adjust(&self, inner: &mut RegistryInner, agents: i64) {
+        if self.memory.get().is_some() {
+            inner.budget_pending_bytes = inner
+                .budget_pending_bytes
+                .saturating_add(agents.saturating_mul(PROVISIONAL_AGENT_BYTES as i64));
         }
     }
 
@@ -770,6 +897,10 @@ impl ProcessRegistry {
             if !had {
                 return false;
             }
+            // The dead process is still inside the last tree sample; credit its
+            // provisional cost back so a spawn queued behind the budget is not
+            // held off for up to a full sample period by memory already freed.
+            self.budget_adjust(&mut inner, -1);
             pop_waiter(&mut inner)
         };
         if let Some((resumed_id, tx)) = resumed_agent {
@@ -836,34 +967,65 @@ impl ProcessRegistry {
     /// Ensure a slot is free before spawning: returns immediately under the cap,
     /// otherwise evicts the LRU idle process, or queues until one frees. Logs +
     /// emits `agent:process:queued` / `agent:process:evicted` via the event callback.
+    ///
+    /// When an aggregate memory budget is installed (monorepo#2063), being over
+    /// budget denies admission on exactly the same terms as being at the slot
+    /// cap: reclaim by evicting the LRU *idle* process, else queue. The budget
+    /// therefore never touches anything that is running — it delays a spawn and
+    /// takes back idle processes, and the agent that caused the overshoot is
+    /// never the one it acts on. That is deliberate: the measured per-agent cost
+    /// spans 22x, so a ceiling that permits a legitimate 9.6 GB test run cannot
+    /// also prevent several of them, and one that prevents them kills the work
+    /// agents exist to do. Admission is the only lever that is cheap, reversible,
+    /// and never wrong about which agent to punish.
     pub async fn acquire(&self, agent_id: &AgentId) {
         loop {
             enum Action {
                 Slot,
                 Evict(AgentId, KillFn),
-                Wait(tokio::sync::oneshot::Receiver<()>),
+                /// The `bool` is true when the wait is on memory rather than a
+                /// slot, which needs a timed re-check rather than only a wakeup.
+                Wait(tokio::sync::oneshot::Receiver<()>, bool),
             }
             let action = {
                 let mut inner = self.inner.lock().unwrap();
-                if inner.entries.len() < self.cap {
+                let over_budget = self.budget_denies(&mut inner);
+                if inner.entries.len() < self.cap && over_budget.is_none() {
+                    // Charge the spawn now: it will not appear in a tree sample
+                    // for up to a sampling period, and a burst of spawns must not
+                    // all clear the gate against the same stale reading.
+                    self.budget_adjust(&mut inner, 1);
                     Action::Slot
                 } else if let Some((id, kill)) = lru_idle(&inner) {
                     Action::Evict(id, kill)
                 } else {
                     let (tx, rx) = tokio::sync::oneshot::channel();
+                    // Drop waiters whose receiver is gone before adding ours, so
+                    // re-queueing on the budget re-check cannot grow the queue.
+                    inner.wait_queue.retain(|(_, tx)| !tx.is_closed());
                     inner.wait_queue.push((agent_id.clone(), tx));
                     let used = inner.entries.len();
-                    tracing::info!(
-                        agent = %agent_id,
-                        used = used,
-                        cap = self.cap,
-                        "process registry: spawn queued (all slots active)"
-                    );
+                    match over_budget {
+                        Some(charged) => tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            charged_memory_bytes = charged,
+                            budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            "process registry: spawn queued (aggregate memory budget)"
+                        ),
+                        None => tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            "process registry: spawn queued (all slots active)"
+                        ),
+                    }
                     if let Some(ref f) = self.event_fn {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap);
                         tokio::spawn(fut);
                     }
-                    Action::Wait(rx)
+                    Action::Wait(rx, over_budget.is_some())
                 }
             };
             match action {
@@ -883,7 +1045,13 @@ impl ProcessRegistry {
                     kill().await;
                     self.deregister(&id);
                 }
-                Action::Wait(rx) => {
+                Action::Wait(rx, true) => {
+                    // Memory can fall with no registry event to wake us — an
+                    // agent's own children exiting frees the tree without any
+                    // process being deregistered — so re-evaluate on a timer.
+                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                }
+                Action::Wait(rx, false) => {
                     let _ = rx.await;
                 }
             }
