@@ -579,6 +579,21 @@ pub(crate) struct LiveTurn {
     /// not yet durable — can still reconstruct the partial turn. Cleared with
     /// the slot itself by the flush.
     pub(crate) flush_pending: bool,
+    /// Set when the owning flush RAN and could not persist (a genuine store
+    /// error), so it deliberately kept the slot as the only copy of the content
+    /// (monorepo#2104). The pin stays set — [`LiveTurnGuard::drop`] and
+    /// [`clear_unpinned_live_turn`](Services::clear_unpinned_live_turn) must
+    /// still leave that content alone, and a later teardown re-pins and gets a
+    /// second chance at persisting it. What this flag adds is the distinction
+    /// those two consumers do not need but
+    /// [`AgentManager::try_begin`](crate::agent_manager::AgentManager) does:
+    /// "a flush is IN FLIGHT and will settle this slot" (pinned, not abandoned)
+    /// versus "no one is coming for it" (abandoned). A new turn's claim clears
+    /// the latter, because an abandoned slot outliving its turn into the next
+    /// one is exactly the stale content monorepo#2138 gets gilded as streaming.
+    /// Reset by [`pin_live_turn`](Services::pin_live_turn): a fresh pin means a
+    /// fresh flush attempt is in flight.
+    pub(crate) flush_failed: bool,
 }
 
 /// What [`flush_pinned_turn_on_interruption`](Services::flush_pinned_turn_on_interruption)
@@ -1118,6 +1133,7 @@ impl Services {
                     last_activity_at: now_iso(),
                     last_activity_emit: None,
                     flush_pending: false,
+                    flush_failed: false,
                 },
             );
         }
@@ -1166,6 +1182,51 @@ impl Services {
                 return;
             }
             slots.remove(agent_id);
+        }
+    }
+
+    /// Clear an agent's live-turn slot at a new turn's CLAIM (monorepo#2138),
+    /// leaving alone only a slot whose owning flush is still in flight.
+    ///
+    /// A slot can outlive its turn — a flush that hit a genuine store error
+    /// keeps it as the only copy of the content — and if it survives into the
+    /// next turn, the window between the claim and that turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) serves the PREVIOUS turn's
+    /// content as `isStreaming: true`. Clearing it with the claim closes that.
+    ///
+    /// The exception is narrower than [`clear_unpinned_live_turn`]'s: an
+    /// in-flight teardown flush owns its pinned slot and re-reads it at flush
+    /// time (monorepo#2110), so clearing it under that flush would silently drop
+    /// the content AND make the flush read the slot as vanished — which it
+    /// interprets as "the worker already persisted the full row". `interrupt_inner`
+    /// pins without a busy claim (a stop against an IDLE agent), so that
+    /// interleaving is reachable. But a flush that already gave up is NOT
+    /// coming back for the slot, so an abandoned slot is cleared like any other
+    /// orphan — otherwise the deliberate flush-failure keep, the very case
+    /// monorepo#2104 exists to make visible, would sail into the next turn and
+    /// be gilded as streaming again.
+    pub(crate) fn clear_live_turn_unless_flush_in_flight(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if slots
+                .get(agent_id)
+                .is_some_and(|s| s.flush_pending && !s.flush_failed)
+            {
+                return;
+            }
+            slots.remove(agent_id);
+        }
+    }
+
+    /// Record that the owning flush ran and could not persist, so the slot it
+    /// deliberately kept is no longer waiting on anything — see
+    /// [`LiveTurn::flush_failed`] and
+    /// [`clear_live_turn_unless_flush_in_flight`](Self::clear_live_turn_unless_flush_in_flight).
+    /// Leaves the pin and the content untouched.
+    fn mark_live_turn_flush_failed(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.flush_failed = true;
+            }
         }
     }
 
@@ -1222,6 +1283,13 @@ impl Services {
         if let Ok(mut slots) = self.live_turns.lock() {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.flush_pending = true;
+                // A fresh pin means a fresh flush attempt is in flight, so an
+                // earlier give-up no longer describes this slot: re-pinning a
+                // slot a previous flush abandoned (a later teardown, e.g.
+                // shutdown, reaching the same stranded content) gives it a real
+                // second chance at persisting, and must not leave it looking
+                // abandoned to `try_begin` in the meantime.
+                slot.flush_failed = false;
             }
         }
     }
@@ -1416,6 +1484,21 @@ impl Services {
                     error = %e,
                     "failed to flush partial in-flight assistant content at interruption capture"
                 );
+                // The slot is KEPT (pin and all) as the only copy of the
+                // content, but this flush is over — nothing is coming to settle
+                // it. Record that, so the one consumer that needs to tell
+                // "a flush will settle this" from "no one is coming" — a new
+                // turn's `try_begin` claim — can clear it rather than let it
+                // outlive its turn and be gilded as streaming (monorepo#2138).
+                // The pin itself stays set: `LiveTurnGuard::drop` and the normal
+                // turn-end clear must still leave this content alone, and a
+                // later teardown re-pins it for a second attempt. Only the
+                // owning flush may say this; the suspend path (`owns_slot =
+                // false`) is flushing caller-held content and must not
+                // characterize a pin a concurrent teardown holds.
+                if owns_slot {
+                    self.mark_live_turn_flush_failed(agent_id);
+                }
                 None
             }
         }
@@ -2297,6 +2380,7 @@ impl Services {
             last_activity_at: now_iso(),
             last_activity_emit: None,
             flush_pending: false,
+            flush_failed: false,
         };
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
