@@ -98,6 +98,15 @@ impl AdapterSlots {
         self.permits.available_permits()
     }
 
+    /// Chains currently live: permits handed out and not yet returned. A permit
+    /// is taken before the child is spawned and returned when
+    /// [`SpawnedAdapter`] drops — after the reap — so this spans the whole
+    /// lifetime of every ephemeral chain, which is exactly the window the
+    /// descendant-tree sampler needs to be watching (monorepo#2107).
+    pub(crate) fn live(&self) -> usize {
+        (self.limit as usize).saturating_sub(self.permits.available_permits())
+    }
+
     /// Claim a slot, waiting at most `wait` for one to free up. `None` means
     /// the caller's budget expired while queued — the caller turns that into
     /// its own distinguishable queue-timeout error rather than spawning.
@@ -147,6 +156,23 @@ pub(crate) fn adapter_slots() -> &'static AdapterSlots {
 /// when a bound was already installed.
 pub fn adapter_slot_limit() -> u32 {
     adapter_slots().limit()
+}
+
+/// Ephemeral adapter chains alive daemon-wide right now (monorepo#2107).
+///
+/// The `system.status` descendant-tree sampler polls this to decide whether a
+/// process-table sweep is worth its cost: a non-zero answer means a burst is in
+/// flight *now*, which is the only window in which a chain's memory can be
+/// observed at all — measured, 16 concurrent one-shots take 6.97 GB and are
+/// spawned and fully reaped inside 3.3 s.
+///
+/// Deliberately reads the bound without installing it, unlike
+/// [`adapter_slot_limit`]: a lazy default here would let a caller that runs
+/// before [`init_adapter_slots`] silently pin the shipped cap in place of the
+/// configured one. No bound installed means no adapter has ever spawned, so
+/// nothing is live.
+pub fn live_adapters() -> usize {
+    ADAPTER_SLOTS.get().map_or(0, AdapterSlots::live)
 }
 
 /// How to launch an ephemeral ACP adapter.
@@ -550,6 +576,23 @@ mod slot_tests {
             started.elapsed()
         );
         drop(held);
+    }
+
+    /// `live()` is what tells the `system.status` sampler a burst is in flight
+    /// (monorepo#2107), so it has to track held permits exactly: zero when the
+    /// bound is untouched, one per chain that has spawned and not been reaped,
+    /// and back to zero once they are.
+    #[tokio::test]
+    async fn live_counts_chains_that_hold_a_slot() {
+        let slots = AdapterSlots::new(4);
+        assert_eq!(slots.live(), 0, "no chain has spawned yet");
+        let first = slots.acquire(Duration::from_secs(5)).await.expect("1st");
+        let second = slots.acquire(Duration::from_secs(5)).await.expect("2nd");
+        assert_eq!(slots.live(), 2);
+        drop(first);
+        assert_eq!(slots.live(), 1, "a reaped chain stops counting");
+        drop(second);
+        assert_eq!(slots.live(), 0);
     }
 
     /// A zero limit would wedge every adapter run forever; the schema rejects

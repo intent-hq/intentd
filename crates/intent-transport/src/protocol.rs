@@ -110,7 +110,10 @@
 //! additive `childProcesses` / `childMemoryBytes` / `childMemoryPeakBytes`
 //! result fields to `system.status` (§5.7): the process count, aggregate
 //! resident memory, and since-start high-water mark of the daemon's whole
-//! descendant tree, sampled every 5s. The existing `memoryBytes` covers only
+//! descendant tree. The count and the instantaneous total are sampled every
+//! 5s; the peak additionally takes a 500ms-cadence reading while an ephemeral
+//! adapter chain is live, so it can exceed any instantaneous value ever
+//! published (monorepo#2107). The existing `memoryBytes` covers only
 //! the daemon binary and understates its real cost by more than an order of
 //! magnitude once agents are live — measured on a dev seat, a 183 MB daemon
 //! owned a 21.5 GB process tree — so a client cannot attribute system memory
