@@ -112,7 +112,7 @@ Declare relations inline on the `@@@task` fence line — the block header takes 
 
 - `key=<token>` names a block so sibling blocks can reference it; `dependsOn=<a,b>` and `conflictsWith=<c>` take comma-separated lists; `effort=<token>` seeds the estimated effort.
 - References resolve against sibling block `key=`s first, then exact sibling titles, then existing task-note ids — so a block can depend on an already-materialized task by id.
-- Conversion never fails on bad attributes: every block still becomes a Task Note, and unresolvable/ambiguous references or rejected edges (cycles, tree ancestor/descendant) are skipped with a warning. Check the `warnings` in the note-write / `convert_task_blocks` result and fix anything skipped.
+- Conversion never fails on bad attributes: every block still becomes a Task Note, and unresolvable/ambiguous references or rejected edges (cycles, tree ancestor/descendant) are skipped with a warning. Check the `warnings` in the note-write / `ws.task.convertBlocks` result and fix anything skipped.
 - To adjust relations after materialization, use `ws.task.setRelations(noteId, { dependsOn: [...], conflictsWith: [...] })` (or seed them via `ws.task.markAsTask` when marking an existing note).
 
 ## Breakdown Process
@@ -171,7 +171,7 @@ Declare relations inline on the `@@@task` fence line — the block header takes 
 
 	- Create subtasks using separate task blocks (one subtask per block).
 	- Do not use markdown checkbox lists (- [ ] ...) to create tasks; checkboxes are progress markers only.
-	- When you are editing the spec note (noteId="spec") and the spec is stable, call the `convert_task_blocks` MCP tool with noteId `"spec"` to materialize the task blocks into real Task Notes (assignable + trackable).
+	- When you are editing the spec note (noteId="spec") and the spec is stable, call `ws.task.convertBlocks("spec")` to materialize the task blocks into real Task Notes (assignable + trackable).
 
 ### Before Finalizing Breakdown
 
