@@ -5409,26 +5409,79 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `file.placeAttachment`: place an attachment payload into the
     /// workspace's `.intent/attachments/` directory with a collision-safe
-    /// name and return `{ ok, path, fileName, size }` where `path` is
-    /// workspace-relative and `size` is the placed byte length
-    /// (PROTOCOL §5.9; intent-hq/monorepo#1948). Exactly one of `data`
-    /// (base64 payload, `data:` URL prefix tolerated) or `source_path`
-    /// (absolute host-local file to copy — the daemon and caller share the
-    /// host) must be provided; anything else is `Error::InvalidParams`
-    /// (→ `-32602`). The directory is covered by the default
-    /// `.intent/.gitignore`, so placed files never reach git tracking,
-    /// auto-commit, or attribution.
+    /// name and return `{ ok, path, fileName, size, attachmentId, mimeType?,
+    /// uploadedAt }` where `path` is workspace-relative and `size` is the
+    /// placed byte length (PROTOCOL §5.9; intent-hq/monorepo#1948). Exactly
+    /// one of `data` (base64 payload, `data:` URL prefix tolerated) or
+    /// `source_path` (absolute host-local file to copy — the daemon and
+    /// caller share the host) must be provided; anything else is
+    /// `Error::InvalidParams` (→ `-32602`). The directory is covered by the
+    /// default `.intent/.gitignore`, so placed files never reach git
+    /// tracking, auto-commit, or attribution. Placement also registers the
+    /// file in the attachment registry (`attachments` table) under a
+    /// daemon-minted UUID — the additive `attachmentId` / `mimeType?` /
+    /// `uploadedAt` result fields (presence-detected; old clients unaffected)
+    /// — so agents can retrieve it later via `ws.file.getAttachment`.
+    /// `mime_type` is the optional client-supplied MIME type, recorded
+    /// verbatim.
     fn file_place_attachment(
         &self,
         workspace_id: WorkspaceId,
         file_name: String,
         data: Option<String>,
         source_path: Option<String>,
+        mime_type: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_name, data, source_path);
+        let _ = (workspace_id, file_name, data, source_path, mime_type);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_place_attachment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.getAttachmentInfo`: attachment-registry metadata lookup
+    /// (PROTOCOL §5.9) → `{ attachmentId, fileName, mimeType?, size,
+    /// uploadedAt, path, exists }`. `path` is the stored workspace-relative
+    /// path (under `.intent/attachments/`) and `exists` reflects whether the
+    /// file is still on disk (a user may delete it out-of-band; the registry
+    /// row survives). Unknown id → `Error::NotFound`.
+    fn file_get_attachment_info(
+        &self,
+        attachment_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = attachment_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_get_attachment_info not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// MCP `ws.file.getAttachment` backing op: copy a registered attachment
+    /// from the CANONICAL workspace store into the calling agent's own
+    /// working directory (the canonical checkout for shared-mode agents, the
+    /// sandbox clone for CoW-sandboxed agents — resolved from the caller's
+    /// session like other sandbox-aware bindings) under the git-ignored
+    /// `.intent/attachments/` directory, and return `{ path, fileName,
+    /// mimeType?, size, uploadedAt }` with `path` relative to that working
+    /// directory. The copy is skipped when an identical file is already
+    /// present. Two DISTINCT failure modes (never conflated): an unknown
+    /// `attachment_id` is `Error::NotFound` ("unknown attachment id"), while
+    /// a registry row whose stored file is gone from disk is
+    /// `Error::Internal` naming the original `fileName` and `uploadedAt` and
+    /// telling the model to continue without the file rather than retry.
+    fn file_get_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        attachment_id: String,
+        caller_agent_id: Option<AgentId>,
+        dest_dir: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, attachment_id, caller_agent_id, dest_dir);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_get_attachment not implemented".to_string(),
             ))
         })
     }
