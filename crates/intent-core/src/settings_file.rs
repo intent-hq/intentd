@@ -1200,21 +1200,43 @@ allowIndexing = true
 level = "info"
 
 [agents]
+# What an agent subtree actually costs, and what each knob below does and does
+# not bound, is written up under "Agent process-tree memory" in
+# docs/ARCHITECTURE.md of the intent-hq/monorepo repo. Every figure quoted in
+# this table is measured (monorepo#2062, #2063, #2109).
 # Max concurrent agents -- concurrent agent session cap (0 = auto based on
-# system RAM; changes apply on daemon restart; max 200).
+# system RAM; changes apply on daemon restart; max 200). This is a concurrency
+# cap, not a memory cap: a measured agent subtree spans a 22x range (~0.66 GB
+# idle, up to 9.6 GB running a test suite), so slot count does not predict
+# memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
 # Agent memory budget (MB) -- aggregate resident memory the daemon's whole
 # child-process tree may use before new agent spawns queue behind idle-process
 # eviction (0 = off; nothing running is ever killed; changes apply on daemon
-# restart).
+# restart). A soft admission gate rather than a ceiling: measured transient
+# overshoot of 65-105% and steady state ~16% over, so budget for roughly 2x
+# the configured value as the transient. The overshoot is a fixed offset, not
+# proportional to demand -- at 1500 MB a 20-agent burst peaked the same as an
+# 8-agent one (3.06 vs 3.09 GB) where the same 20-agent burst unbounded
+# reached 12.37 GB.
 memoryBudgetMb = 0
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
 # holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
 # their own timeout expires first (1-64; changes apply on daemon restart).
+# Peak live chains equal the cap exactly and are invariant to burst size; the
+# over-limit caller has spawned nothing, so its retry is always safe.
 maxConcurrentAdapters = 6
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
-# reaping).
+# reaping). The main lever on resident memory: every agent touched inside the
+# window keeps its whole subtree alive (~0.66 GB each when idle), so a seat
+# that touches 20 agents within the window holds ~12 GB doing nothing.
+# Measured at the default: 40 procs / 5.85 GB flat across 10 minutes of full
+# idle, zero exits; the same tree at a 2-minute TTL drained to 0 in 122 s.
+# Lowering it trades a warm process on the next use for memory reclaimed
+# sooner. Reaping never interrupts a running turn, and a reaped tree is
+# released within the TTL plus one sweep (sweep interval is ttl/4, clamped to
+# 30-300 s).
 idleReapMinutes = 30
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
