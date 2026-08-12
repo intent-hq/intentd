@@ -139,9 +139,8 @@ pub(crate) struct AssignedAgentScan {
 mod batch;
 
 // Delivery-time ready-set delta for completion wakes
-// (intent-hq/monorepo#2044). Pure helper only — the wake path consumes it in
-// a follow-up, so it is unreferenced outside its tests until then.
-#[allow(dead_code)]
+// (intent-hq/monorepo#2044): enqueue-time trigger stamping + the pure delta
+// helper the delivery paths render fresh at flush time.
 pub(crate) mod ready_delta;
 
 #[cfg(test)]
@@ -4085,6 +4084,24 @@ impl Services {
         if entry.persisted {
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
+        // Delivery-time unblocked hints (monorepo#2044): on the no-manager
+        // path this persist IS the delivery, so the section is resolved here
+        // — parity with the manager's `send_queued_message_now` and the
+        // store-only `deliver_parent_wake` branch. Same idempotency guard:
+        // a content that already carries the section is never re-annotated.
+        let mut entry = entry;
+        if !entry
+            .content
+            .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
+            && ready_delta::metadata_has_triggers(entry.message_metadata.as_ref())
+        {
+            if let Some(section) = self
+                .unblocked_section_for_delivery(std::iter::once(entry.message_metadata.as_ref()))
+                .await
+            {
+                entry.content = format!("{}\n\n{}", entry.content, section);
+            }
+        }
         // STAB-133: persist the entry's attachments alongside the text block.
         let blocks = user_message_blocks(
             &entry.content,
@@ -4923,7 +4940,7 @@ impl Services {
         // a no-op. Errors from the store lookup or the status writer are
         // logged and swallowed — the report itself is already persisted, and
         // the caller's response must not depend on FE-facing task metadata.
-        if let Some(note_id) = task_note_id {
+        if let Some(note_id) = task_note_id.clone() {
             self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
                 .await;
         }
@@ -4953,7 +4970,7 @@ impl Services {
                 session.name, caller.0, report_text
             );
             // Build event notification metadata (mirroring deliver_completion_to_watches).
-            let metadata = json!({
+            let mut metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
                 "eventTypes": ["agent:reportToParent"],
@@ -4976,6 +4993,16 @@ impl Services {
                     }
                 }]
             });
+            // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
+            // the reporting child's linked task-note id so the delivery path
+            // can compute the "tasks now unblocked" section fresh at render
+            // time. Only the triggering fact is stored here.
+            if let Some(note_id) = &task_note_id {
+                ready_delta::stamp_trigger_tasks(
+                    &mut metadata,
+                    &[(workspace_id.0.clone(), note_id.0.clone())],
+                );
+            }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
             if let Err(e) = self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
@@ -5921,6 +5948,108 @@ impl Services {
         Ok(result)
     }
 
+    /// Snapshot every task note in `workspace_id` into the
+    /// [`batch::BatchTaskSnap`] shape (+ a note-id → title map). Shared by
+    /// batch `agent.delegate` classification and the delivery-time unblocked
+    /// computation (intent-hq/monorepo#2044), so both consume identical
+    /// readiness inputs: status, `dependsOn`/`conflictsWith` edges, live
+    /// assigned agents, and effort estimates.
+    pub(crate) async fn snapshot_batch_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<(
+        HashMap<String, batch::BatchTaskSnap>,
+        HashMap<String, String>,
+    )> {
+        let notes = self.store.list_notes(workspace_id).await?;
+        let mut titles: HashMap<String, String> = HashMap::new();
+        let mut snaps: HashMap<String, batch::BatchTaskSnap> = HashMap::new();
+        for note in &notes {
+            let Some(task) = &note.metadata.task else {
+                continue;
+            };
+            let live_agent = if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+                || task.assigned_agent_ids.is_empty()
+            {
+                None
+            } else {
+                self.scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                    .map(|s| (s.id.0, s.name))
+            };
+            titles.insert(note.id.0.clone(), note.title.clone());
+            snaps.insert(
+                note.id.0.clone(),
+                batch::BatchTaskSnap {
+                    status: task.status,
+                    depends_on: task.depends_on.iter().map(|d| d.0.clone()).collect(),
+                    conflicts_with: task.conflicts_with.iter().map(|c| c.0.clone()).collect(),
+                    live_agent,
+                    effort_minutes: task
+                        .estimated_effort
+                        .as_deref()
+                        .and_then(crate::task_effort::parse_effort_minutes),
+                },
+            );
+        }
+        Ok((snaps, titles))
+    }
+
+    /// Delivery-time "tasks now unblocked" section for a draining batch of
+    /// completion wakes (intent-hq/monorepo#2044). `metadatas` are the
+    /// `messageMetadata` values of EVERY entry delivering in the same model
+    /// turn: their stamped trigger tasks (enqueue-time facts — the settled
+    /// children's linked task-note ids) are collected and deduplicated, the
+    /// named workspaces' task state is fetched FRESH, and ONE coalesced
+    /// [`ready_delta::ready_set_delta`] is rendered — so the section always
+    /// reflects readiness at delivery time, never a stale enqueue-time
+    /// snapshot. Returns `None` when no entry carries triggers or the delta
+    /// is empty. Strictly advisory and best-effort: store errors fail open
+    /// (`None`) and the wake delivers unannotated.
+    pub(crate) async fn unblocked_section_for_delivery<'a>(
+        &self,
+        metadatas: impl Iterator<Item = Option<&'a Value>>,
+    ) -> Option<String> {
+        let triggers = ready_delta::collect_trigger_tasks(metadatas);
+        if triggers.is_empty() {
+            return None;
+        }
+        // Group trigger task ids per workspace (cross-workspace parents can
+        // in principle coalesce wakes from several workspaces) and compute
+        // one delta per workspace against its CURRENT snapshot.
+        let mut by_ws: Vec<(String, Vec<String>)> = Vec::new();
+        for (ws, id) in &triggers {
+            match by_ws.iter_mut().find(|(w, _)| w == ws) {
+                Some((_, ids)) => ids.push(id.clone()),
+                None => by_ws.push((ws.clone(), vec![id.clone()])),
+            }
+        }
+        let mut delta = Vec::new();
+        for (ws, ids) in &by_ws {
+            let workspace_id = WorkspaceId::from(ws.as_str());
+            let (snaps, titles) = match self.snapshot_batch_tasks(&workspace_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %ws,
+                        error = %e,
+                        "unblocked-section snapshot failed; delivering wake without the section"
+                    );
+                    continue;
+                }
+            };
+            delta.extend(ready_delta::ready_set_delta(ids, &snaps, &titles));
+        }
+        if delta.is_empty() {
+            return None;
+        }
+        Some(ready_delta::render_unblocked_section(
+            &delta,
+            triggers.len() > 1,
+        ))
+    }
+
     /// Batch `agent.delegate` (PROTOCOL §5.5): classify every task in
     /// `input.tasks` as start / held / skipped — a PURE function of current
     /// state (task statuses, `dependsOn`/`conflictsWith` edges, live assigned
@@ -5939,7 +6068,7 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
-        use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition, BatchTaskSnap};
+        use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition};
 
         let requested: Vec<String> = input
             .tasks
@@ -6005,38 +6134,7 @@ impl Services {
         // ones): conflicts are symmetric and a running non-requested task
         // must still hold a requested one, and dependency statuses can name
         // any task note.
-        let notes = self.store.list_notes(&workspace_id).await?;
-        let mut titles: HashMap<String, String> = HashMap::new();
-        let mut snaps: HashMap<String, BatchTaskSnap> = HashMap::new();
-        for note in &notes {
-            let Some(task) = &note.metadata.task else {
-                continue;
-            };
-            let live_agent = if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
-                || task.assigned_agent_ids.is_empty()
-            {
-                None
-            } else {
-                self.scan_assigned_agents(&task.assigned_agent_ids)
-                    .await?
-                    .live_session
-                    .map(|s| (s.id.0, s.name))
-            };
-            titles.insert(note.id.0.clone(), note.title.clone());
-            snaps.insert(
-                note.id.0.clone(),
-                BatchTaskSnap {
-                    status: task.status,
-                    depends_on: task.depends_on.iter().map(|d| d.0.clone()).collect(),
-                    conflicts_with: task.conflicts_with.iter().map(|c| c.0.clone()).collect(),
-                    live_agent,
-                    effort_minutes: task
-                        .estimated_effort
-                        .as_deref()
-                        .and_then(crate::task_effort::parse_effort_minutes),
-                },
-            );
-        }
+        let (snaps, titles) = self.snapshot_batch_tasks(&workspace_id).await?;
         let unknown: Vec<&String> = requested
             .iter()
             .filter(|id| !snaps.contains_key(*id))

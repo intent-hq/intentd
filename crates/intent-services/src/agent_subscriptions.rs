@@ -1636,6 +1636,19 @@ impl Services {
                             session.attention_request_kind.as_deref(),
                             session.attention_request_reason.as_deref(),
                         );
+                        // Record-time trigger capture (intent-hq/monorepo#2044):
+                        // same stamp as the live record paths, so the
+                        // aggregated wake keeps the trigger even if this
+                        // reconciled child is deleted before the group fires.
+                        if event_type == intent_core::events::AGENT_IDLE {
+                            if let Some(n) = &session.task_note_id {
+                                crate::agent_ops::ready_delta::stamp_event_trigger_task(
+                                    &mut data,
+                                    &session.workspace_id.0,
+                                    &n.0,
+                                );
+                            }
+                        }
                         // monorepo#1945: a non-empty persisted
                         // completion_report (set by `agent.reportToParent`)
                         // is the child's explicit completion signal — it
@@ -1888,6 +1901,15 @@ impl Services {
                     s.attention_request_reason.clone(),
                 )
             });
+            // Record-time trigger capture (intent-hq/monorepo#2044): stamp
+            // the settled child's linked task onto the recorded event so the
+            // aggregated wake keeps the trigger even if the child session is
+            // deleted before the group settles.
+            let trigger = session.as_ref().and_then(|s| {
+                s.task_note_id
+                    .clone()
+                    .map(|n| (s.workspace_id.0.clone(), n.0))
+            });
             let report = session.and_then(|s| s.completion_report);
             let mut data = event_data.clone();
             if let Some(s) = &stall {
@@ -1895,6 +1917,9 @@ impl Services {
             }
             if let Some((kind, reason)) = &attention {
                 annotate_attention_request(&mut data, kind.as_deref(), reason.as_deref());
+            }
+            if let Some((ws, task)) = &trigger {
+                crate::agent_ops::ready_delta::stamp_event_trigger_task(&mut data, ws, task);
             }
             let event = Event {
                 id: String::new(),
