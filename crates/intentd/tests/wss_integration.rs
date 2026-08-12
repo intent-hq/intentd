@@ -7834,6 +7834,48 @@ async fn wss_file_place_attachment_round_trip() {
     let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
     assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
 
+    // `sourcePath` classification over the wire (monorepo#2144): a directory
+    // source is the documented -32602 with the reason in the message, not a
+    // -32603 Internal.
+    let dir_source = root.join("some-dir");
+    std::fs::create_dir_all(&dir_source).expect("mkdir dir source");
+    let frame_dir = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"some-dir","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(dir_source.to_string_lossy())
+    );
+    let resp_dir = wss_call(srv.port, srv.cfg.clone(), &frame_dir).await;
+    assert_eq!(
+        resp_dir["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_dir}"
+    );
+    assert!(
+        resp_dir["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath is a directory")),
+        "{resp_dir}"
+    );
+
+    // A missing source is equally -32602 ("does not exist").
+    let frame_missing = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"gone.txt","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(root.join("gone.txt").to_string_lossy())
+    );
+    let resp_missing = wss_call(srv.port, srv.cfg.clone(), &frame_missing).await;
+    assert_eq!(
+        resp_missing["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_missing}"
+    );
+    assert!(
+        resp_missing["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath does not exist")),
+        "{resp_missing}"
+    );
+
     // `file.getAttachmentInfo` (v6.12) serves the registry row with `exists`.
     let frame4 = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"file.getAttachmentInfo","params":{{"attachmentId":"{attachment_id}"}}}}"#
