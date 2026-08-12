@@ -4793,9 +4793,11 @@ async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persi
 /// PARALLEL tools (Claude Code fires several before any completes) push a
 /// completion's `tool_result` to the CURRENT end of the block list — NOT to its
 /// `tool_use` index + 1 — because a later call's `tool_use` already took that
-/// slot. Pins the transcript-side indices the `chat.subscribe` forwarder's
-/// `tool_result` id prediction (`next_block_id`, tool_use index + 1) is checked
-/// against; the group-opening text block at index 0 is unaffected either way.
+/// slot. Pins the transcript-side indices the `chat.subscribe` forwarder must
+/// reproduce live; it no longer predicts them (monorepo#2029), it reads the
+/// real ids off the event — see
+/// [`tool_call_events_carry_real_result_block_ids_for_parallel_completions`].
+/// The group-opening text block at index 0 is unaffected either way.
 #[tokio::test]
 async fn interleaved_tool_completions_append_results_at_the_current_end() {
     let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
@@ -4855,4 +4857,194 @@ async fn interleaved_tool_completions_append_results_at_the_current_end() {
     );
     assert_eq!(blocks[3]["tool_use_id"], json!("t1"));
     assert_eq!(blocks[4]["tool_use_id"], json!("t2"));
+}
+
+/// monorepo#2029: the `agent:tool:call` event names the REAL `tool_result`
+/// block id (`resultBlockId`), so the live `chat.subscribe` delta path never
+/// has to predict it. Shape (a): assistant text INTERLEAVES between a call and
+/// its completion, so the durable transcript flushes that text into the index
+/// the old `tool_use + 1` prediction would have claimed — the prediction landed
+/// on a legitimate `text` block (the one that can carry a `<group:Name>`
+/// opener) and clobbered it on every id-keyed client until `stream:end`.
+#[tokio::test]
+async fn tool_call_event_carries_the_real_result_block_id_when_text_interleaves() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        message_note("I'll run the tests. "),
+        tool_call_note("t1"),
+        message_note("<group:Setup>\nChecking output. "),
+        tool_done_note("t1"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| (b["type"].as_str().unwrap(), b["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("text", "m1:2"),
+            ("tool_result", "m1:3"),
+        ],
+        "the interleaved text owns m1:2; the real result is m1:3"
+    );
+
+    let events = drain_tool_call_events(&mut sub).await;
+    assert_result_ids_match_transcript(&events, &blocks);
+    let completed = events
+        .iter()
+        .find(|e| e.data["status"] == json!("completed"))
+        .expect("a completed agent:tool:call event");
+    assert_eq!(completed.data["blockId"], json!("m1:1"));
+    assert_eq!(
+        completed.data["resultBlockId"],
+        json!("m1:3"),
+        "the event names the real result id, NOT the tool_use index + 1 (m1:2)"
+    );
+    assert_eq!(completed.data["resultBlockIndex"], json!(3));
+    let started = events
+        .iter()
+        .find(|e| e.data["status"] != json!("completed"))
+        .expect("a started agent:tool:call event");
+    assert!(
+        started.data.get("resultBlockId").is_none(),
+        "a call with no result block yet carries no resultBlockId: {:?}",
+        started.data
+    );
+}
+
+/// monorepo#2029, shape (b): PARALLEL calls (Claude Code's normal mode). Both
+/// `tool_use` blocks land before either result, so `tool_use + 1` named the
+/// SECOND call's `tool_use` — live, t2's tool row was overwritten by t1's
+/// result. Each completion event now names the result id its own block took.
+#[tokio::test]
+async fn tool_call_events_carry_real_result_block_ids_for_parallel_completions() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        message_note("Running both. "),
+        tool_call_note("t1"),
+        tool_call_note("t2"),
+        tool_done_note("t1"),
+        tool_done_note("t2"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| (b["type"].as_str().unwrap(), b["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("tool_use", "m1:2"),
+            ("tool_result", "m1:3"),
+            ("tool_result", "m1:4"),
+        ]
+    );
+
+    let events = drain_tool_call_events(&mut sub).await;
+    assert_result_ids_match_transcript(&events, &blocks);
+    let result_id_for = |tool_call_id: &str| -> Value {
+        events
+            .iter()
+            .find(|e| {
+                e.data["toolCallId"] == json!(tool_call_id)
+                    && e.data["status"] == json!("completed")
+            })
+            .expect("completion event")
+            .data["resultBlockId"]
+            .clone()
+    };
+    assert_eq!(
+        result_id_for("t1"),
+        json!("m1:3"),
+        "t1's result is m1:3 — m1:2 belongs to t2's tool_use"
+    );
+    assert_eq!(result_id_for("t2"), json!("m1:4"));
+}
+
+fn tool_call_note(id: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": "bash: x", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    }
+}
+
+fn tool_done_note(id: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    }
+}
+
+async fn drain_tool_call_events(sub: &mut crate::Subscription) -> Vec<Event> {
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    events.retain(|e| e.event_type == "agent:tool:call");
+    assert!(!events.is_empty(), "the turn published tool call events");
+    events
+}
+
+/// Every id an `agent:tool:call` event carries resolves to the block of the
+/// matching type in the DURABLE transcript — the live/persisted parity the
+/// `chat.subscribe` mapper relies on now that it stamps these ids verbatim.
+fn assert_result_ids_match_transcript(events: &[Event], blocks: &[Value]) {
+    for e in events {
+        let block_id = e.data["blockId"].as_str().expect("blockId");
+        let use_block = blocks
+            .iter()
+            .find(|b| b["id"] == json!(block_id))
+            .unwrap_or_else(|| panic!("blockId {block_id} exists in the transcript"));
+        assert_eq!(use_block["type"], json!("tool_use"));
+        assert_eq!(use_block["toolCallId"], e.data["toolCallId"]);
+        let Some(result_id) = e.data.get("resultBlockId").and_then(Value::as_str) else {
+            continue;
+        };
+        let result_block = blocks
+            .iter()
+            .find(|b| b["id"] == json!(result_id))
+            .unwrap_or_else(|| panic!("resultBlockId {result_id} exists in the transcript"));
+        assert_eq!(
+            result_block["type"],
+            json!("tool_result"),
+            "resultBlockId {result_id} names a tool_result, not {:?}",
+            result_block["type"]
+        );
+        assert_eq!(
+            result_block["tool_use_id"], e.data["toolCallId"],
+            "resultBlockId {result_id} names THIS call's result"
+        );
+    }
 }

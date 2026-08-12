@@ -221,6 +221,22 @@ struct Transcript {
     usage_cost: Option<UsageCost>,
 }
 
+/// The block indices one [`Transcript::record_tool`] call materialized. The
+/// `agent:tool:call` event carries the ids derived from them (§7.1
+/// `resultBlockId` / `proposalBlockIds`) so the live `chat.subscribe` delta
+/// path stamps the REAL persisted ids on its synthesized `tool_result` /
+/// proposal-resource blocks instead of predicting `tool_use index + 1` —
+/// a prediction that collides with an interleaved text block or a parallel
+/// call's `tool_use` (monorepo#2029).
+struct RecordedToolBlocks {
+    /// Index of the `tool_use` block (the block the event is enriched against).
+    use_index: usize,
+    /// Index of the `tool_result` block, once the call completed WITH output.
+    result_index: Option<usize>,
+    /// Indices of the standalone proposal-resource blocks, in attach order.
+    proposal_indices: Vec<usize>,
+}
+
 impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
@@ -300,9 +316,12 @@ impl Transcript {
     /// (§7.1), a standalone proposal-resource block is additionally appended
     /// right after the `tool_result` (the resource stays in
     /// `tool_result.output` too). Returns
-    /// `Some(index)` of the `tool_use` block (the block the `agent:tool:call`
-    /// event is enriched against), or `None` when the update was dropped —
-    /// callers must skip event publishing for dropped updates.
+    /// `Some(`[`RecordedToolBlocks`]`)` naming every block index this update
+    /// materialized — the `tool_use` block the `agent:tool:call` event is
+    /// enriched against plus the real `tool_result` / proposal-resource
+    /// indices the event carries so the live delta path never has to guess
+    /// them — or `None` when the update was dropped; callers must skip event
+    /// publishing for dropped updates.
     ///
     /// STAB-124: a first-sight update whose derived name is empty is DROPPED
     /// (returns `None`, nothing recorded). This is the stale shape a cancelled
@@ -316,7 +335,11 @@ impl Transcript {
     /// completed call, if any. On a registry hit the batch is attached
     /// directly and echo parsing is skipped; otherwise the legacy
     /// lift/wrap-repair fallback inspects the echoed output.
-    fn record_tool(&mut self, tc: &MappedToolCall, registered: Vec<Value>) -> Option<usize> {
+    fn record_tool(
+        &mut self,
+        tc: &MappedToolCall,
+        registered: Vec<Value>,
+    ) -> Option<RecordedToolBlocks> {
         let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
             Some(&i) => {
                 let block = &mut self.blocks[i];
@@ -374,12 +397,15 @@ impl Transcript {
                 index
             }
         };
+        let mut result_index = None;
+        let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
                 match self.tool_result_index.get(&tc.tool_call_id) {
                     Some(&ri) => {
+                        result_index = Some(ri);
                         if let Some(obj) = self.blocks[ri].as_object_mut() {
                             obj.insert("output".to_string(), output.clone());
                             obj.insert("is_error".to_string(), Value::Bool(is_error));
@@ -398,6 +424,7 @@ impl Transcript {
                         }));
                         self.tool_result_index
                             .insert(tc.tool_call_id.clone(), rindex);
+                        result_index = Some(rindex);
                     }
                 }
                 // §7.1: attach the standalone resource block(s) so the FE can
@@ -432,6 +459,7 @@ impl Transcript {
                                 let id = self.block_id(pi);
                                 self.blocks[pi] =
                                     crate::tool_block::build_proposal_resource_block(&id, &item);
+                                proposal_indices.push(pi);
                             }
                             None => {
                                 self.flush_text();
@@ -444,13 +472,18 @@ impl Transcript {
                                 if i == 0 {
                                     self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                                 }
+                                proposal_indices.push(pindex);
                             }
                         }
                     }
                 }
             }
         }
-        Some(use_index)
+        Some(RecordedToolBlocks {
+            use_index,
+            result_index,
+            proposal_indices,
+        })
     }
 
     /// The recorded tool name for a known `toolCallId` (from its `tool_use`
@@ -2744,9 +2777,10 @@ impl Services {
                 // D6: accumulate tool_use/tool_result blocks into the transcript
                 // so they persist (and reach `agent.getConversation`). A dropped
                 // update (STAB-124: anonymous first sight) publishes no event.
-                let Some(block_index) = transcript.record_tool(&tc, registered.clone()) else {
+                let Some(recorded) = transcript.record_tool(&tc, registered.clone()) else {
                     return true;
                 };
+                let block_index = recorded.use_index;
                 // On a known toolCallId the transcript block is the
                 // authoritative MERGED state — publish its name/title/kind/
                 // input so a sparse (e.g. status-only) update doesn't wipe
@@ -2792,6 +2826,27 @@ impl Services {
                 });
                 if let Some(output) = tc.output {
                     data["output"] = output;
+                }
+                // §7.1 (monorepo#2029): carry the REAL ids of the blocks this
+                // update just materialized. The live `chat.subscribe` mapper
+                // used to predict them as `tool_use index + 1`, which collides
+                // with an interleaved text block or a parallel call's
+                // `tool_use` and clobbers it on every id-keyed client until
+                // the terminal reconcile heals it. Present only when the
+                // block exists (a `started`/output-less update materializes
+                // no result block, so both fields stay absent).
+                if let Some(rindex) = recorded.result_index {
+                    data["resultBlockIndex"] = json!(rindex);
+                    data["resultBlockId"] = json!(transcript.block_id(rindex));
+                }
+                if !recorded.proposal_indices.is_empty() {
+                    data["proposalBlockIds"] = Value::Array(
+                        recorded
+                            .proposal_indices
+                            .iter()
+                            .map(|&i| Value::String(transcript.block_id(i)))
+                            .collect(),
+                    );
                 }
                 // Carry the claimed canonical batch on the event so the live
                 // `chat.subscribe` delta path attaches the SAME blocks the

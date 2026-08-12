@@ -809,10 +809,17 @@ impl ChatDeltaState {
     /// persisted `record_tool` shape (D6). Once the call completes WITH
     /// output, also synthesize a `tool_result` block, and — when a `completed`
     /// (not `error`) output carries a proposal-MIME resource item (§7.1) — a
-    /// standalone proposal-resource block. The `tool_result` block id is the
-    /// `tool_use` index + 1 (it is appended right after) and the proposal
-    /// block follows at + 2; a mispredicted id self-heals at the terminal
-    /// reconcile via `removedIds`.
+    /// standalone proposal-resource block. Their ids are NOT derived from the
+    /// `tool_use` id — they are read verbatim off the event (`resultBlockId` /
+    /// `proposalBlockIds`), which `record_tool` stamps from the indices the
+    /// blocks actually took in the durable transcript. Predicting them as
+    /// `tool_use` index + 1 was wrong whenever text interleaved between a call
+    /// and its completion, or a parallel call's `tool_use` already owned that
+    /// index — the live block then clobbered a legitimate block on every
+    /// id-keyed client until the terminal reconcile healed it
+    /// (monorepo#2029). An event without the field (no such block was
+    /// materialized) synthesizes nothing; a genuinely orphaned live block
+    /// still self-heals at the terminal reconcile via `removedIds`.
     fn tool_delta(&mut self, event: &Event) -> Option<Value> {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
@@ -844,7 +851,11 @@ impl ChatDeltaState {
         );
         let completed = status == "completed" || status == "error";
         if completed {
-            if let (Some(output), Some(result_id)) = (d.get("output"), next_block_id(&block_id)) {
+            let result_id = d
+                .get("resultBlockId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let (Some(output), Some(result_id)) = (d.get("output"), result_id) {
                 let result_block = json!({
                     "type": "tool_result",
                     "id": result_id,
@@ -866,7 +877,10 @@ impl ChatDeltaState {
                 // otherwise fall back to lifting a proposal-MIME resource
                 // item out of the echoed output. Gated on `completed` only
                 // (matching `record_tool`) — an errored tool must not surface
-                // an actionable ProposalCard.
+                // an actionable ProposalCard. Each item is paired positionally
+                // with the id `record_tool` gave the block it wrote for that
+                // same item; an item without an id (the event carried none —
+                // nothing was materialized for it) is skipped.
                 if status == "completed" {
                     let items: Vec<Value> = d
                         .get("registeredAttachments")
@@ -877,23 +891,23 @@ impl ChatDeltaState {
                                 .into_iter()
                                 .collect()
                         });
-                    let mut anchor_id = result_id.clone();
-                    for item in items {
-                        let Some(attach_id) = next_block_id(&anchor_id) else {
-                            break;
-                        };
+                    let attach_ids: Vec<&str> = d
+                        .get("proposalBlockIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    for (item, attach_id) in items.iter().zip(attach_ids) {
                         let attach_block =
                             intent_services::tool_block::build_proposal_resource_block(
-                                &attach_id, &item,
+                                attach_id, item,
                             );
-                        let attach_added = self.note_block(&attach_id);
+                        let attach_added = self.note_block(attach_id);
                         push_entity(
                             &mut added,
                             &mut updated,
                             attach_added,
                             self.entity(&message_id, attach_block, None, None, false),
                         );
-                        anchor_id = attach_id;
                     }
                 }
             }
@@ -1041,14 +1055,6 @@ fn push_entity(added: &mut Vec<Value>, updated: &mut Vec<Value>, is_added: bool,
     } else {
         updated.push(entity);
     }
-}
-
-/// `{prefix}:{n}` → `{prefix}:{n+1}` — the `tool_result` block id follows its
-/// `tool_use` block by one index in the persisted transcript (`record_tool`).
-fn next_block_id(block_id: &str) -> Option<String> {
-    let (prefix, idx) = block_id.rsplit_once(':')?;
-    let n: usize = idx.parse().ok()?;
-    Some(format!("{prefix}:{}", n + 1))
 }
 
 /// Map one bus change event to a channel delta via the re-read strategy (TB-0
