@@ -123,8 +123,32 @@ pub fn snapshot_wip(repo_path: &Path) -> Result<Option<String>> {
     let orig_index_tree = index
         .write_tree()
         .map_err(|e| Error::Internal(format!("write pre-snapshot index tree failed: {e}")))?;
+    // Untracked nested repos/worktrees cannot be staged: libgit2's add_all
+    // rejects their paths outright (`invalid path`), and `git add` skips
+    // embedded repos too. Filter them out via the matched-path callback —
+    // no gitlink entries, the directories stay untouched on disk.
+    let nested = untracked_nested_repo_dirs(&repo)?;
+    if !nested.is_empty() {
+        tracing::warn!(
+            path = %repo_path.display(),
+            skipped = ?nested,
+            "WIP snapshot: skipping untracked nested git repos/worktrees; they will not travel with the export"
+        );
+    }
+    let mut skip_nested = |path: &Path, _spec: &[u8]| -> i32 {
+        let rel = path.to_string_lossy();
+        if nested.iter().any(|n| n == rel.trim_end_matches('/')) {
+            1 // skip
+        } else {
+            0 // add
+        }
+    };
     index
-        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .add_all(
+            ["*"].iter(),
+            git2::IndexAddOption::DEFAULT,
+            Some(&mut skip_nested as &mut git2::IndexMatchedPath),
+        )
         .map_err(|e| Error::Internal(format!("stage all files failed: {e}")))?;
     index
         .write()
@@ -550,7 +574,9 @@ fn parse_index_tree_trailer(message: &str) -> Option<git2::Oid> {
 
 /// Whether a repository has uncommitted changes (staged, unstaged, or
 /// untracked). Local copy of the `sandbox_ops` helper — this module stays
-/// self-contained.
+/// self-contained. Untracked nested repos/worktrees do not count: they are
+/// skipped by [`snapshot_wip`], so a repo whose only anomaly is a nested repo
+/// must not produce an empty WIP commit.
 fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
@@ -559,7 +585,59 @@ fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
-    Ok(!statuses.is_empty())
+    let workdir = repo.workdir();
+    Ok(statuses.iter().any(|e| {
+        !(e.status().contains(git2::Status::WT_NEW)
+            && matches!(
+                (workdir, e.path().ok()),
+                (Some(wd), Some(p)) if is_nested_repo_path(wd, p)
+            ))
+    }))
+}
+
+/// Whether `rel` (a status/diff path, possibly with a trailing `/`) names a
+/// directory that is itself a git repository or worktree checkout — i.e. it
+/// contains a `.git` entry (a directory for a full repo, a file for a linked
+/// worktree). Mirrors `git add`'s embedded-repo detection.
+fn is_nested_repo_path(workdir: &Path, rel: &str) -> bool {
+    let full = workdir.join(rel.trim_end_matches('/'));
+    full.is_dir() && full.join(".git").exists()
+}
+
+/// Untracked directories inside the repo that are themselves git
+/// repositories/worktrees, as sorted workdir-relative paths (no trailing
+/// slash). These are what [`snapshot_wip`] skips when staging.
+fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<String>> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(Vec::new());
+    };
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
+    let mut dirs: Vec<String> = statuses
+        .iter()
+        .filter(|e| e.status().contains(git2::Status::WT_NEW))
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| is_nested_repo_path(workdir, p))
+        .map(|p| p.trim_end_matches('/').to_string())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    Ok(dirs)
+}
+
+/// Untracked nested git repositories/worktrees under the repo at `repo_path`,
+/// for the transfer plan's pre-flight warning. Degrades to an empty list when
+/// the repository cannot be read — a plan must not fail on this.
+pub(crate) fn nested_repo_dirs(repo_path: &Path) -> Vec<String> {
+    git2::Repository::open(repo_path)
+        .ok()
+        .and_then(|repo| untracked_nested_repo_dirs(&repo).ok())
+        .unwrap_or_default()
 }
 
 /// Resolve a commit signature, falling back to a stable default identity when
@@ -1129,6 +1207,146 @@ mod tests {
         assert_eq!(entry.head_sha, branch_tip, "clean branch tip bundled");
         // Sandbox untouched: dirty state stays on the other branch.
         assert_eq!(status_fingerprint(&sb_path), before);
+    }
+
+    /// Untracked nested repo like agents leave behind: a directory with its
+    /// own real `.git` directory and a commit.
+    fn make_nested_repo(parent: &Path, name: &str) -> PathBuf {
+        let nested = parent.join(name);
+        init_repo(&nested);
+        nested
+    }
+
+    /// Worktree-style nested checkout: `git worktree add` creates a directory
+    /// whose `.git` is a FILE pointing at the parent repo's worktree metadata.
+    fn make_nested_worktree(repo: &Path, name: &str) -> PathBuf {
+        run_git(repo, |cmd| {
+            cmd.args(["worktree", "add", "-b"])
+                .arg(format!("wt-{}", name.trim_start_matches('.')))
+                .arg(name);
+        })
+        .unwrap();
+        repo.join(name)
+    }
+
+    #[test]
+    fn snapshot_wip_skips_nested_repos_and_worktrees() {
+        let (_dir, repo) = temp_repo("nested");
+        // Untracked nested git repo (real `.git` dir) and a worktree-style
+        // checkout (`.git` FILE), alongside ordinary dirty state.
+        make_nested_repo(&repo, ".import-wt");
+        make_nested_worktree(&repo, ".roundtrip-wt");
+        fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let mut index = r.index().unwrap();
+            index.add_path(Path::new("staged.txt")).unwrap();
+            index.write().unwrap();
+        }
+        fs::write(repo.join("README.md"), "modified\n").unwrap();
+        fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds despite nested repos")
+            .expect("dirty repo snapshots");
+
+        // The WIP tree carries the ordinary dirty files but not the nested
+        // repos (no gitlink entries either).
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("staged.txt").is_some());
+            assert!(tree.get_name("untracked.txt").is_some());
+            assert!(
+                tree.get_name(".import-wt").is_none(),
+                "nested repo not in WIP tree"
+            );
+            assert!(
+                tree.get_name(".roundtrip-wt").is_none(),
+                "nested worktree not in WIP tree"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(
+            status_fingerprint(&repo),
+            before,
+            "exact pre-snapshot status restored"
+        );
+        // Nested dirs untouched on disk.
+        assert!(repo.join(".import-wt/.git").is_dir());
+        assert_eq!(
+            fs::read_to_string(repo.join(".import-wt/README.md")).unwrap(),
+            "hello\n"
+        );
+        assert!(
+            repo.join(".roundtrip-wt/.git").is_file(),
+            "worktree .git file intact"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join(".roundtrip-wt/README.md")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn nested_repo_as_only_anomaly_is_not_dirty() {
+        let (_dir, repo) = temp_repo("nested-only");
+        make_nested_repo(&repo, ".import-wt");
+        let base = head_sha(&repo);
+        assert_eq!(
+            snapshot_wip(&repo).unwrap(),
+            None,
+            "a nested repo alone must not force a WIP commit"
+        );
+        assert_eq!(head_sha(&repo), base, "no WIP commit created");
+    }
+
+    #[test]
+    fn bundle_workspace_with_nested_repo_succeeds() {
+        let (dir, repo) = temp_repo("ws-nested");
+        make_nested_repo(&repo, ".import-wt");
+        fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+
+        let ws = workspace_for_repo(&repo);
+        let (bundle_path, manifest) =
+            create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        assert!(bundle_path.exists());
+        let wip = manifest
+            .workspace_wip_commit_sha
+            .clone()
+            .expect("dirty worktree produces a WIP commit");
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("wip.txt").is_some());
+            assert!(
+                tree.get_name(".import-wt").is_none(),
+                "nested repo not in bundled WIP tree"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(status_fingerprint(&repo), before);
+        assert!(repo.join(".import-wt/.git").is_dir(), "nested repo intact");
+        assert_eq!(
+            fs::read_to_string(repo.join(".import-wt/README.md")).unwrap(),
+            "hello\n"
+        );
     }
 
     #[test]
