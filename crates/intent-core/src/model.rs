@@ -836,6 +836,7 @@ pub struct WorkspaceCreateInitialAgent {
     pub agent_type: Option<String>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
+    pub file_blocks: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -2277,6 +2278,12 @@ pub struct AgentSession {
     /// `imageBlocks`); an opaque JSON array persisted verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Session-level file blocks captured at spawn (FE top-level
+    /// `fileBlocks`); an opaque JSON array persisted verbatim. Entries carry
+    /// EITHER inline `data` or an attachment-registry `attachmentId`
+    /// reference (PROTOCOL §5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
     /// workspaces with CoW support). `None` for shared-mode agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2617,6 +2624,10 @@ pub struct AgentLite {
     /// absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Session-level file blocks persisted at spawn (PROTOCOL §5.5); omitted
+    /// when absent so pre-existing wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_blocks: Option<serde_json::Value>,
     /// Canonical stop/finish reason from the latest terminal stream/status event
     /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2714,6 +2725,7 @@ impl AgentLite {
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
+            file_blocks: session.file_blocks,
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
@@ -2750,6 +2762,10 @@ pub struct AgentCreateExtra {
     pub workspace_context: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
+    /// Session-level file blocks captured at spawn (PROTOCOL §5.5): entries
+    /// carry EITHER inline `data` or an attachment-registry `attachmentId`
+    /// reference; validated at the create seam like send/queue.
+    pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
     /// Internal override for the created session's `nameExplicitlySet` flag.
     /// Not accepted from the wire (`#[serde(skip)]`): `agent_delegate_op`
@@ -4226,6 +4242,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: true,
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
@@ -4314,6 +4331,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata,
             stop_reason: None,
@@ -4394,6 +4412,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stop_reason: None,

@@ -253,6 +253,92 @@ pub(crate) fn place_attachment(
     }))
 }
 
+/// MCP `ws.file.getAttachment` copy op (PROTOCOL §6.8): copy a registered
+/// attachment from the CANONICAL workspace store (`canonical_root` +
+/// `record.stored_path`) into the caller's working directory (`dest_root`,
+/// which is the sandbox clone for CoW-sandboxed callers) under `dest_dir`
+/// (default [`ATTACHMENTS_DIR`] — git-ignored by construction). Returns
+/// `{ path, fileName, mimeType?, size, uploadedAt }` with `path` relative to
+/// `dest_root`. The copy is skipped when the destination already holds an
+/// identical file (same size + bytes); a partial copy is removed on failure.
+///
+/// The deleted-from-disk case is a DISTINCT error from an unknown id (which
+/// the caller maps before reaching here): the registry row exists but the
+/// stored file is gone, so the error names the original `fileName` and
+/// `uploadedAt` and instructs the model to continue without the file rather
+/// than retry.
+pub(crate) fn get_attachment(
+    canonical_root: &str,
+    dest_root: &str,
+    record: &intent_store::AttachmentRecord,
+    dest_dir: Option<&str>,
+) -> Result<Value> {
+    if canonical_root.is_empty() || dest_root.is_empty() {
+        return Err(Error::Internal(
+            "workspace has no resolved filesystem root".to_string(),
+        ));
+    }
+    // Source side: the stored path must stay inside the canonical store —
+    // a tampered registry row must never read outside it.
+    let src = resolve_within(canonical_root, &record.stored_path)?;
+    if !src.is_file() {
+        return Err(Error::Internal(format!(
+            "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
+             longer exists on disk. Continue without this file — do not retry the download.",
+            record.file_name, record.uploaded_at
+        )));
+    }
+    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
+    let dest_dir_full = resolve_within(dest_root, dir)?;
+    std::fs::create_dir_all(&dest_dir_full).map_err(io_err)?;
+    // Keep retrieved copies out of git tracking (same ignore-all marker
+    // `place_attachment` drops), whatever directory the caller picked.
+    let marker = dest_dir_full.join(".gitignore");
+    if !marker.exists() {
+        std::fs::write(&marker, "*\n").map_err(io_err)?;
+    }
+    let dest = dest_dir_full.join(&record.file_name);
+    // resolve_within on the joined relative path guards a crafted fileName.
+    let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
+    let dest = {
+        let checked = resolve_within(dest_root, &rel)?;
+        debug_assert_eq!(checked, dest);
+        checked
+    };
+    let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
+        (Ok(s), Ok(d)) if s.len() == d.len() => {
+            // Same size — confirm contents before skipping the copy.
+            matches!(
+                (std::fs::read(&src), std::fs::read(&dest)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        }
+        _ => false,
+    };
+    if !identical {
+        std::fs::copy(&src, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(&dest);
+            Error::Internal(format!(
+                "failed to copy attachment \"{}\": {e}",
+                record.file_name
+            ))
+        })?;
+    }
+    let size = std::fs::metadata(&dest)
+        .map(|m| m.len())
+        .unwrap_or_default();
+    let mut result = json!({
+        "path": rel,
+        "fileName": record.file_name,
+        "size": size,
+        "uploadedAt": record.uploaded_at,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = json!(mime);
+    }
+    Ok(result)
+}
+
 /// `file.list` → bare array of `{ name, type }`.
 pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;

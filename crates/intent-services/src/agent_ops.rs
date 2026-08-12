@@ -1346,13 +1346,44 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
     priority == Some("interrupt")
 }
 
+/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
+/// must carry EXACTLY one of inline `data` (base64 payload) or an
+/// attachment-registry `attachmentId` reference, both non-empty strings when
+/// present. Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
+/// offending index. A non-array payload and non-object entries are tolerated
+/// (skipped downstream like every other malformed attachment entry) so
+/// legacy callers keep their fail-soft behavior.
+pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) -> Result<()> {
+    let Some(files) = file_blocks.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, file) in files.iter().enumerate() {
+        let Some(obj) = file.as_object() else {
+            continue;
+        };
+        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        let has_ref = obj
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_data == has_ref {
+            return Err(Error::InvalidParams(format!(
+                "{method}: fileBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The persisted content-block array for a user message: one `text` block
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
 /// them). Image entries require `data` + `mimeType` and file entries require
-/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
-/// assembly (`append_attachment_blocks`) enforces; malformed entries are
-/// silently skipped so a partial attachment array never breaks the persist.
+/// `fileName` plus EITHER inline `data` + `mimeType` OR an
+/// attachment-registry `attachmentId` reference (PROTOCOL §5.5) — the same
+/// attachment contract prompt assembly (`append_attachment_blocks`) enforces;
+/// malformed entries are silently skipped so a partial attachment array never
+/// breaks the persist.
 pub(crate) fn user_message_blocks(
     content: &str,
     image_blocks: Option<&Value>,
@@ -1373,7 +1404,21 @@ pub(crate) fn user_message_blocks(
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+            let attachment_id = file.get("attachmentId").and_then(Value::as_str);
+            if let (Some(id), Some(name)) = (attachment_id, name) {
+                let mut block = json!({
+                    "type": "file",
+                    "attachmentId": id,
+                    "fileName": name,
+                });
+                if let Some(mime) = mime {
+                    block["mimeType"] = json!(mime);
+                }
+                if let Some(size) = file.get("size").and_then(Value::as_u64) {
+                    block["size"] = json!(size);
+                }
+                blocks.push(block);
+            } else if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
                 blocks.push(json!({
                     "type": "file",
                     "data": data,
@@ -2321,6 +2366,7 @@ impl Services {
             workspace_context: _,
             context_references,
             image_blocks,
+            file_blocks,
             is_background,
             name_explicitly_set: _,
         } = extra;
@@ -2347,6 +2393,13 @@ impl Services {
         let image_blocks = image_blocks
             .or_else(|| meta_get("imageBlocks"))
             .filter(|v| !v.is_null());
+        let file_blocks = file_blocks
+            .or_else(|| meta_get("fileBlocks"))
+            .filter(|v| !v.is_null());
+        // Attachment-reference validation (PROTOCOL §5.5): every file block
+        // must carry exactly one of `data` / `attachmentId`. Runs before any
+        // side effect so a `-32602` rejection persists nothing.
+        validate_file_blocks("agent.create", file_blocks.as_ref())?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
@@ -2553,6 +2606,7 @@ impl Services {
             initial_message,
             context_references,
             image_blocks,
+            file_blocks,
             is_background,
             metadata,
             stop_reason: None,
@@ -3015,6 +3069,7 @@ impl Services {
             "initialMessage",
             "contextReferences",
             "imageBlocks",
+            "fileBlocks",
             "isBackground",
         ];
         for key in obj.keys() {
@@ -3126,6 +3181,14 @@ impl Services {
                     session.image_blocks = if value.is_null() {
                         None
                     } else {
+                        Some(value.clone())
+                    };
+                }
+                "fileBlocks" => {
+                    session.file_blocks = if value.is_null() {
+                        None
+                    } else {
+                        validate_file_blocks("agent.update", Some(value))?;
                         Some(value.clone())
                     };
                 }
@@ -3635,6 +3698,9 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
+        // Attachment-reference validation (PROTOCOL §5.5) before any state
+        // change, matching `agent.sendMessage`.
+        validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
         // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
@@ -3860,6 +3926,10 @@ impl Services {
                 )));
             }
         }
+        // Attachment-reference validation (PROTOCOL §5.5): every file block
+        // must carry exactly one of `data` / `attachmentId`, rejected before
+        // any state change.
+        validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
@@ -8275,6 +8345,7 @@ impl Services {
             workspace_context: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: None,
             name_explicitly_set: None,
         };
