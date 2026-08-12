@@ -1242,7 +1242,7 @@ pub struct NoteEditLinesInput {
 
 /// Result of `note.create` — the created (post-auto-convert) note plus the
 /// `@@@task` conversion outcome, matching the four content-write results.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteCreateResult {
     pub note: Note,
@@ -1256,6 +1256,55 @@ pub struct NoteCreateResult {
     /// [`TaskConvertBlocksResult::warnings`]).
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for NoteCreateResult {
+    /// Legacy-tolerant decode: `note.create` idempotency records persisted
+    /// before the conversion fields existed contain a serialized bare `Note`,
+    /// so a replay of a pre-upgrade key must still decode. A bare note maps
+    /// to a zeroed conversion outcome; the current `{ note, ... }` shape
+    /// decodes as derived (the count/id fields tolerate absence like the
+    /// `#[serde(default)]` vecs, for symmetry with older-daemon responses).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Current {
+            note: Note,
+            #[serde(default)]
+            converted_count: i64,
+            #[serde(default)]
+            created_task_note_ids: Vec<String>,
+            #[serde(default)]
+            created_tasks: Vec<CreatedTaskEntry>,
+            #[serde(default)]
+            warnings: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Compat {
+            Current(Current),
+            LegacyBareNote(Note),
+        }
+        match Compat::deserialize(deserializer)? {
+            Compat::Current(c) => Ok(NoteCreateResult {
+                note: c.note,
+                converted_count: c.converted_count,
+                created_task_note_ids: c.created_task_note_ids,
+                created_tasks: c.created_tasks,
+                warnings: c.warnings,
+            }),
+            Compat::LegacyBareNote(note) => Ok(NoteCreateResult {
+                note,
+                converted_count: 0,
+                created_task_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
+            }),
+        }
+    }
 }
 
 /// Result of `note.add` — mirrors the TS `ws.note.add` peer return shape.
@@ -4704,5 +4753,58 @@ mod tests {
         let update: WorkspaceUpdate =
             serde_json::from_value(json!({ "skipWorktree": false })).unwrap();
         assert_eq!(update.skip_isolation, Some(false));
+    }
+
+    #[test]
+    fn note_create_result_decodes_legacy_bare_note_idempotency_record() {
+        // `note.create` idempotency records persisted before the conversion
+        // fields existed contain a serialized bare `Note` — a replayed key
+        // must decode it as a zeroed conversion outcome, not fail.
+        let note_json = json!({
+            "id": "n-1",
+            "workspaceId": "ws-1",
+            "title": "T",
+            "content": "c",
+            "contentType": "markdown",
+            "tags": [],
+            "isPinned": false,
+            "isArchived": false,
+            "isDefault": false,
+            "parentId": null,
+            "visibility": "workspace",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "rev": 0,
+            "updatedAt": "2026-01-01T00:00:00Z"
+        });
+        let legacy: NoteCreateResult = serde_json::from_value(note_json.clone()).unwrap();
+        assert_eq!(legacy.note.id.0, "n-1");
+        assert_eq!(legacy.converted_count, 0);
+        assert!(legacy.created_task_note_ids.is_empty());
+        assert!(legacy.created_tasks.is_empty());
+        assert!(legacy.warnings.is_empty());
+
+        // The current shape round-trips (serialize → deserialize → equal).
+        let current = NoteCreateResult {
+            note: legacy.note.clone(),
+            converted_count: 2,
+            created_task_note_ids: vec!["t-1".into(), "t-2".into()],
+            created_tasks: vec![CreatedTaskEntry {
+                key: Some("k".into()),
+                title: "Child".into(),
+                note_id: "t-1".into(),
+            }],
+            warnings: vec!["w".into()],
+        };
+        let back: NoteCreateResult =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(back, current);
+
+        // An enveloped record missing the conversion fields (older-daemon
+        // response shape) also decodes with defaults.
+        let sparse: NoteCreateResult =
+            serde_json::from_value(json!({ "note": note_json })).unwrap();
+        assert_eq!(sparse.note.id.0, "n-1");
+        assert_eq!(sparse.converted_count, 0);
+        assert!(sparse.warnings.is_empty());
     }
 }
