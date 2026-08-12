@@ -11313,6 +11313,11 @@ async fn agent_failed_wakes_immediately_despite_active_hooks() {
     );
     let text = parent_messages_text(&svc, &parent).await;
     assert!(text.contains("failed"), "{text}");
+    // monorepo#2051: the ungrouped failure wake retired the watch and says so.
+    assert!(
+        text.contains("the watch is now retired") && text.contains("ws.agent.watch("),
+        "failure wake states the retirement with the re-arm pointer: {text}"
+    );
 }
 
 /// Idle-visibility deferral (d, continued): the immediate wake paths that
@@ -17793,6 +17798,12 @@ async fn grouped_child_failure_wakes_parent_immediately() {
         msgs.contains("failed") && msgs.contains("idle timeout"),
         "immediate failure wake with the error text expected, got: {msgs}"
     );
+    // monorepo#2051: the grouped watch stays armed for settlement, so the
+    // immediate wake must NOT claim the watch was retired.
+    assert!(
+        !msgs.contains("the watch is now retired"),
+        "grouped-failure wake carries no retirement note: {msgs}"
+    );
 
     // The group is still live (it still owns settlement) and both grouped
     // watches remain in place.
@@ -22546,6 +22557,19 @@ async fn agent_watch_delivers_once_and_is_retired() {
         svc.list_watches_for_parent(&watcher).is_empty(),
         "watch retired after the completion wake"
     );
+    // monorepo#2051: the retiring wake says so explicitly and points at the
+    // re-arm call.
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("the watch is now retired"),
+        "idle wake states the retirement: {text}"
+    );
+    // `parent_messages_text` returns the JSON-serialized blocks, so the
+    // quotes around the agent id are escaped.
+    assert!(
+        text.contains(&format!("ws.agent.watch(\\\"{}\\\")", target.0)),
+        "idle wake carries the re-arm instruction naming the target: {text}"
+    );
 
     // A second idle with no re-arm delivers nothing.
     svc.handle_completion_event(&completion_event(
@@ -22582,6 +22606,12 @@ async fn agent_watch_removed_after_target_deleted() {
     assert!(
         svc.list_watches_for_parent(&watcher).is_empty(),
         "persistent watch must not survive the target's deletion"
+    );
+    // monorepo#2051: the deleted-kind wake carries the same retirement note.
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("the watch is now retired"),
+        "deleted wake states the retirement: {text}"
     );
 }
 
@@ -22635,6 +22665,16 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     assert!(
         text.contains("reports a blocker: sandbox exploded"),
         "watcher wake is kind-flavored with the reason: {text}"
+    );
+    // monorepo#2051: the attention wake is non-terminal — it states the watch
+    // remains armed and never carries the retirement note.
+    assert!(
+        text.contains("remains armed"),
+        "attention wake states the watch remains armed: {text}"
+    );
+    assert!(
+        !text.contains("the watch is now retired"),
+        "attention wake carries no retirement note: {text}"
     );
     // Attention is not a completion: no watch is consumed by the fan-out.
     assert_eq!(

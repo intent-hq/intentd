@@ -5340,8 +5340,12 @@ impl Services {
             .into_iter()
             .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
         {
+            // Attention is not a completion, so the watch is left in place —
+            // say so explicitly (issue monorepo#2051) to avoid reading as
+            // terminal next to the retiring completion wake.
             let wake_text = format!(
-                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {}",
+                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {} (Your watch on this agent \
+                 remains armed; you will still be woken at its completion.)",
                 session.name, caller.0, wake_verb, reason
             );
             let metadata = json!({
