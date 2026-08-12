@@ -1241,8 +1241,9 @@ maxConcurrentAdapters = 6
 # 5.85 GB flat across 10 minutes of full idle, zero exits; the same tree at a
 # 2-minute TTL drained to 0 in 122 s. The default is now 10 minutes, so that
 # tree starts draining once the window passes instead of holding 5.85 GB for
-# another 20. Raising it trades memory reclaimed sooner for a warm process on
-# the next use. Only agents idle past the TTL are candidates, and the sweep
+# another 20. Raise it to keep processes warm for longer and reclaim their
+# memory later; lower it for the reverse. Only agents idle past the TTL are
+# candidates, and the sweep
 # skips any agent reported busy when it checks. An agent is selected within
 # the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
 # memory comes back as each kill completes, so a large idle set drains over a

@@ -711,6 +711,17 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 /// honour — the admission gate would simply never fire — so the bound also
 /// makes `settings.update` reject such a value (`-32602`) rather than storing
 /// a knob that silently does nothing.
+///
+/// This is the one catalog bound that deliberately does **not** match the
+/// `config.toml` parse bound, so a `config.toml` carrying a budget above this
+/// machine's RAM (hand-edited, or copied from a larger seat) still loads and
+/// is still reported by `settings.get` / `settings.list` — with a `value`
+/// above the advertised `max`. The alternative, tightening the parse bound to
+/// match, is worse: it would make a config file machine-dependent and fail
+/// `Config::resolve` — i.e. refuse to boot — on the smaller seat. The
+/// inconsistency is confined to configs the API itself will no longer create,
+/// and any write through `settings.update` brings the value back into range;
+/// a client should clamp its slider rather than assume `value <= max`.
 fn memory_budget_max_mb() -> f64 {
     memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes())
 }
@@ -2388,6 +2399,27 @@ mod tests {
             memory_budget_max_mb(),
             memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
         );
+    }
+
+    /// The catalog bound is deliberately tighter than the `config.toml` parse
+    /// bound, and the asymmetry is load-bearing: a config copied from a larger
+    /// seat must still **parse** here (tightening the parse bound would fail
+    /// `Config::resolve` and refuse to boot), while `settings.update` refuses
+    /// to newly create a budget the admission gate could never fire on. The
+    /// consequence a client has to tolerate is a reported `value` above the
+    /// advertised `max` for such a config.
+    #[test]
+    fn memory_budget_parse_bound_stays_looser_than_the_catalog_bound() {
+        let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
+        let over_ram = memory_budget_max_mb() + 1.0;
+
+        def.validate(&json!(over_ram))
+            .expect_err("settings.update must reject a budget above this machine's RAM");
+
+        let parsed =
+            SettingsFile::parse_str(&format!("[agents]\nmemoryBudgetMb = {}\n", over_ram as u64))
+                .expect("a config.toml from a larger seat must still parse, not refuse to boot");
+        assert_eq!(parsed.agents.memory_budget_mb, over_ram as u32);
     }
 
     /// The shipped idle-reap default is 10 minutes (lowered from 30,
