@@ -1376,23 +1376,37 @@ fn parse_fence_header(header: &str) -> Option<TaskBlockHeader> {
 fn set_scalar_attr(slot: &mut Option<String>, name: &str, value: &str, issues: &mut Vec<String>) {
     if value.is_empty() {
         issues.push(format!("empty value for attribute `{name}`"));
+    } else if value.contains(',') || value.contains('=') {
+        // A comma or `=` inside a scalar value is almost certainly a stray
+        // comma gluing attributes together (`key=a ,dependsOn=b`) or a list
+        // value on a scalar attribute (`key=a,b`) — flag it, don't guess.
+        issues.push(format!(
+            "malformed value `{value}` for attribute `{name}` (expected a single bare token; attributes are separated by whitespace)"
+        ));
     } else {
         *slot = Some(value.to_string());
     }
 }
 
 fn set_list_attr(slot: &mut Vec<String>, name: &str, value: &str, issues: &mut Vec<String>) {
-    let items: Vec<String> = value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if items.is_empty() {
-        issues.push(format!("empty value for attribute `{name}`"));
-    } else {
-        *slot = items;
+    let mut items: Vec<String> = Vec::new();
+    let mut any_item = false;
+    for item in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        any_item = true;
+        if item.contains('=') {
+            // A stray comma before another attribute glues `name=value` into
+            // this list (`dependsOn=a, key=b`) — flag and drop the item.
+            issues.push(format!(
+                "malformed item `{item}` in attribute `{name}` (attributes are separated by whitespace, not commas)"
+            ));
+        } else {
+            items.push(item.to_string());
+        }
     }
+    if !any_item {
+        issues.push(format!("empty value for attribute `{name}`"));
+    }
+    *slot = items;
 }
 
 /// Scan raw `@@@task` blocks. The fence line may carry optional header
@@ -1419,7 +1433,11 @@ fn scan_blocks(content: &str) -> Vec<ScannedBlock> {
             continue;
         };
         let line_end = j + line_end_rel;
-        let header_text = content[j..line_end].trim_end_matches('\r');
+        // Strip at most ONE trailing CR (CRLF line ending) — main's scanner
+        // consumed a single optional `\r`, so `@@@task\r\r\n` stays a
+        // non-fence via the interior-CR guard below.
+        let raw_header = &content[j..line_end];
+        let header_text = raw_header.strip_suffix('\r').unwrap_or(raw_header);
         let header = if header_text.contains('\r') {
             None
         } else {
@@ -2319,6 +2337,49 @@ mod tests {
         assert_eq!(t.issues.len(), 2);
         assert!(t.issues[0].contains("empty value for attribute `dependsOn`"));
         assert!(t.issues[1].contains("duplicate attribute `dependsOn`"));
+    }
+
+    #[test]
+    fn header_multiple_trailing_crs_stay_non_fence() {
+        // Main consumed at most one `\r` before requiring `\n`; extra CRs
+        // must keep disqualifying the fence.
+        assert!(!has_task_blocks("@@@task\r\r\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task \r\r\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task key=a\r\r\n# T\n@@@"));
+        assert!(has_task_blocks("@@@task\r\n# T\n@@@"));
+    }
+
+    #[test]
+    fn header_stray_comma_gluing_attributes_is_flagged() {
+        // A comma between attributes glues the next `name=value` into the
+        // previous value; that must surface as an issue, never silently.
+        let result = extract_task_blocks("@@@task dependsOn=a, key=b\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.depends_on, vec!["a"]);
+        assert_eq!(t.key, None);
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("malformed item `key=b` in attribute `dependsOn`"));
+
+        let result = extract_task_blocks("@@@task key=a ,dependsOn=b\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("malformed value `a,dependsOn=b` for attribute `key`"));
+    }
+
+    #[test]
+    fn header_scalar_values_reject_commas_and_equals() {
+        let result = extract_task_blocks("@@@task key=a,b effort=1h,2h\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert_eq!(t.effort, None);
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("malformed value `a,b` for attribute `key`"));
+        assert!(t.issues[1].contains("malformed value `1h,2h` for attribute `effort`"));
     }
 
     #[test]
