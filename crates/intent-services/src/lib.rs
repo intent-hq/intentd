@@ -89,6 +89,7 @@ mod hook_manager;
 mod line_attribution;
 mod linear_ops;
 mod model_catalog;
+mod nested_repos;
 mod note_ops;
 mod one_shot_acp;
 mod pagination;
