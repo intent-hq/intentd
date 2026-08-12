@@ -1372,6 +1372,15 @@ impl Services {
         if fresh.is_terminal() {
             let delivered = self.complete_pr_monitor(&updated, &fresh).await?;
             self.consume_pr_monitor_catch_up(&monitor.monitor_id);
+            // The PR just merged/closed: refresh the owning workspace's PR
+            // linkage right away (best-effort) so the persisted
+            // `prStatus`/`activePullRequest` flip within the monitor's poll
+            // cadence instead of waiting for the slower background sweep
+            // tier (intent-hq/monorepo#2094). Runs on BOTH complete
+            // outcomes — a lost guarded write only skips the wake, the PR
+            // is terminal either way.
+            self.refresh_workspace_pr_after_terminal(&monitor.workspace_id)
+                .await;
             return Ok(delivered);
         }
         if updated.pending_changes.is_empty() {
@@ -1554,6 +1563,42 @@ impl Services {
         self.maybe_emit_display_status_changed(&completed.workspace_id)
             .await;
         Ok(true)
+    }
+
+    /// Best-effort refresh of the owning workspace's PR linkage after its
+    /// monitored PR reached a terminal state (merged/closed), through
+    /// [`Services::refresh_workspace_pr`] — which persists the delta and
+    /// emits `pr:updated`/`pr:linked`/`pr:unlinked` itself. Bounded by
+    /// `pr_refresh_fetch_timeout` — the refresh sweep's *aggregate* budget
+    /// over one workspace's whole refresh (the linked-PR re-fetch, possible
+    /// relink discovery via `list_prs`, and the store writes; not a
+    /// per-request bound) — so a hung forge call can never wedge the
+    /// serialized monitor sweep; errors and timeouts are logged, never
+    /// propagated — the monitor's own terminal transition already persisted,
+    /// and the background refresh sweep remains the backstop. Timeout caveat
+    /// (shared with the sweep's wrap): the dropped future can land between
+    /// the store write and the event publish, persisting the delta without
+    /// `pr:updated` — rare (the client-level network timeouts fire first)
+    /// and self-limiting, since clients re-read on the next snapshot.
+    async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
+        match tokio::time::timeout(
+            self.pr_refresh_fetch_timeout,
+            self.refresh_workspace_pr(workspace_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(
+                workspace = %workspace_id.0,
+                error = %e,
+                "pr monitor terminal: workspace PR refresh failed"
+            ),
+            Err(_) => tracing::warn!(
+                workspace = %workspace_id.0,
+                timeout = ?self.pr_refresh_fetch_timeout,
+                "pr monitor terminal: workspace PR refresh timed out"
+            ),
+        }
     }
 
     /// Persist a failed poll's error without disturbing the baseline or the
@@ -2170,7 +2215,14 @@ mod tests {
             _: &RepoRef,
             _: PrQuery,
         ) -> intent_sourcecontrol::Result<Page<PullRequest>> {
-            unsupported("list_prs")
+            // Empty page (not `Unsupported`): the terminal-refresh path runs
+            // relink discovery for merged/closed linked PRs, and an empty
+            // page exercises the clean "no matching open PR" branch instead
+            // of the discovery-failure degrade arm.
+            Ok(Page {
+                items: vec![],
+                next_cursor: None,
+            })
         }
         async fn update_pr(
             &self,
@@ -3197,6 +3249,57 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Terminalizing a monitor also refreshes the owning workspace's PR
+    /// linkage (intent-hq/monorepo#2094): a linked PR that merges flips the
+    /// persisted `prStatus` within the monitor's poll cadence — no explicit
+    /// `pr.refresh` call — instead of waiting for the slower background
+    /// refresh sweep tier.
+    #[tokio::test]
+    async fn terminal_completion_refreshes_the_workspace_pr_linkage() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        // Link the fixture workspace to the monitored PR; the branch matches
+        // the stub PR's head ref so the refresh takes the update path.
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.branch = "feature".into();
+        row.pr_number = Some(42);
+        row.pr_url = Some("https://github.com/o/r/pull/42".into());
+        row.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().update_workspace(&row).await.unwrap();
+        register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+
+        let after = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged),
+            "terminal wake refreshed the linkage without an explicit pr.refresh"
+        );
+        assert_eq!(after.pr_number, Some(42), "link retained");
+        assert_eq!(
+            after
+                .active_pull_request
+                .expect("active PR persisted")
+                .status,
+            intent_core::PullRequestStatus::Merged
+        );
+        // The refresh emitted the linkage delta on the event bus.
+        let evs = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![intent_core::events::PR_UPDATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query pr:updated events");
+        assert!(
+            !evs.is_empty(),
+            "pr:updated emitted by the terminal refresh"
+        );
     }
 
     #[test]
