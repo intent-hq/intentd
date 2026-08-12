@@ -75,9 +75,11 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("workspace_context_item", "workspace_id = ?1"),
     ("workspace_ui_context", "workspace_id = ?1"),
     // Registry rows transfer; the files under `.intent/attachments/` are
-    // git-ignored so they do NOT ride the git bundle — rows are designed to
-    // survive a missing file (reads report `exists: false`), and
-    // `stored_path` is workspace-relative, so no import rewriting is needed.
+    // git-ignored so they do NOT ride the git bundle — the archive carries
+    // them explicitly as `attachments/<attachmentId>` entries (export skips
+    // rows whose stored file is already deleted; import materializes files
+    // before this row insert). `stored_path` is workspace-relative, so no
+    // import rewriting is needed.
     ("attachments", "workspace_id = ?1"),
 ];
 

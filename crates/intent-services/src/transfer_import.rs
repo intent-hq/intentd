@@ -16,7 +16,9 @@
 //! Archive layout (agreed with the export orchestrator):
 //! `manifest.json` (the [`TransferManifest`]), `rows/<table>.jsonl` (one JSON
 //! object per row, [`intent_store::TRANSFER_TABLES`] vocabulary),
-//! `assets/<assetId>`, and optionally `git/repo.bundle` + `git/refs.json`
+//! `assets/<assetId>`, `attachments/<attachmentId>` (registered attachment
+//! files; a registry row whose stored file was deleted rides the rows payload
+//! with no file entry), and optionally `git/repo.bundle` + `git/refs.json`
 //! (the [`crate::transfer_git::TransferRefsManifest`]).
 
 use std::collections::HashMap;
@@ -447,6 +449,30 @@ impl Services {
             .materialize_imported_git(&workspace_id, &extracted_dir, &mut outcome.rows)
             .await?;
 
+        // Materialize attachment files AFTER git (the destination root is
+        // the rewritten checkout) and BEFORE the rows land — same
+        // all-or-nothing contract. A failure unwinds the git checkout and
+        // fails the commit with nothing inserted.
+        let attachment_paths = match materialize_imported_attachments(
+            &extracted_dir.join("attachments"),
+            &outcome.rows,
+        )
+        .await
+        {
+            Ok(paths) => paths,
+            Err(e) => {
+                if let Some(out) = &materialized {
+                    crate::transfer_materialize::rollback_materialized(
+                        &self.store,
+                        out,
+                        &target_root.join(&workspace_id.0),
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
+        };
+
         // If the row insert fails AFTER materialization succeeded, unwind
         // the checkout/sandboxes and the known_repo registration so a
         // retried commit does not hit "materialize target already exists"
@@ -454,6 +480,7 @@ impl Services {
         let imported_rows = match self.store.transfer_import_rows(&outcome.rows).await {
             Ok(n) => n,
             Err(e) => {
+                rollback_materialized_attachments(&attachment_paths).await;
                 if let Some(out) = &materialized {
                     crate::transfer_materialize::rollback_materialized(
                         &self.store,
@@ -797,6 +824,126 @@ async fn load_row_files(rows_dir: &Path) -> Result<Vec<(String, Vec<serde_json::
         out.push((table.to_string(), rows));
     }
     Ok(out)
+}
+
+/// Materialize `attachments/<attachmentId>` archive entries into the target
+/// workspace's canonical `.intent/attachments/` store, at the `stored_path`
+/// each (transformed) registry row records. Runs AFTER git materialization
+/// (the workspace row already points at the target checkout) and BEFORE the
+/// row insert, preserving the commit's all-or-nothing contract: any failure
+/// returns `Err` and the caller unwinds. Returns every path created so
+/// [`rollback_materialized_attachments`] can delete them if a LATER commit
+/// step fails.
+///
+/// Registry rows with no matching file entry are the exported
+/// deleted-is-deleted state — nothing to place, `getAttachment` on the
+/// target reports the deleted-from-disk error. File entries with no
+/// matching registry row are skipped with a warning (defensive, mirroring
+/// `load_row_files`). A `stored_path` that escapes the workspace root fails
+/// the commit — a tampered row must never write outside the workspace.
+async fn materialize_imported_attachments(
+    attachments_dir: &Path,
+    rows: &[(String, Vec<serde_json::Value>)],
+) -> Result<Vec<PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(attachments_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()), // no attachments/ in the archive
+    };
+
+    // id → stored_path from the transformed registry rows.
+    let stored_paths: HashMap<&str, &str> = rows
+        .iter()
+        .filter(|(t, _)| t == "attachments")
+        .flat_map(|(_, objects)| objects)
+        .filter_map(|r| {
+            Some((
+                r.get("id").and_then(|v| v.as_str())?,
+                r.get("stored_path").and_then(|v| v.as_str())?,
+            ))
+        })
+        .collect();
+
+    // The canonical workspace root the runtime resolves attachments against
+    // (`file_ops::workspace_root`: worktree || repository), from the
+    // transformed (and git-materialized) workspace row; the workspace `path`
+    // column is the repo-less fallback.
+    let ws_row = rows
+        .iter()
+        .find(|(t, _)| t == "workspace")
+        .and_then(|(_, objects)| objects.first());
+    let root = ws_row
+        .and_then(|r| {
+            ["worktree_path", "repository_path", "path"]
+                .iter()
+                .find_map(|k| r.get(*k).and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        })
+        .map(str::to_string);
+
+    let mut created: Vec<PathBuf> = Vec::new();
+    let result: Result<()> = async {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let id = entry.file_name().to_string_lossy().to_string();
+            let Some(stored_path) = stored_paths.get(id.as_str()) else {
+                tracing::warn!(attachment = %id, "skipping archive attachment with no registry row");
+                continue;
+            };
+            let Some(root) = root.as_deref() else {
+                return Err(Error::InvalidParams(format!(
+                    "archive carries attachment {id} but the workspace row resolves no \
+                     filesystem root to place it under"
+                )));
+            };
+            let dest =
+                crate::file_ops::resolve_attachment_source(root, stored_path).map_err(|_| {
+                    Error::InvalidParams(format!(
+                        "attachment {id} stored_path {stored_path:?} escapes the workspace \
+                         root — import rejected"
+                    ))
+                })?;
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::Internal(format!("create attachments dir failed: {e}")))?;
+                // Same ignore-all marker `place_attachment` drops, so
+                // imported files stay out of git tracking on the target.
+                let marker = parent.join(".gitignore");
+                if !marker.exists() {
+                    tokio::fs::write(&marker, "*\n").await.map_err(|e| {
+                        Error::Internal(format!("write attachments marker failed: {e}"))
+                    })?;
+                    created.push(marker);
+                }
+            }
+            tokio::fs::copy(entry.path(), &dest)
+                .await
+                .map_err(|e| Error::Internal(format!("materialize attachment {id} failed: {e}")))?;
+            created.push(dest);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        // All-or-nothing on disk: a partial materialization never leaks.
+        rollback_materialized_attachments(&created).await;
+        return Err(e);
+    }
+    Ok(created)
+}
+
+/// Best-effort unwind of [`materialize_imported_attachments`]: delete every
+/// created file, then prune the (now possibly empty) parent directories.
+async fn rollback_materialized_attachments(created: &[PathBuf]) {
+    for path in created {
+        if let Err(e) = tokio::fs::remove_file(path).await {
+            tracing::warn!(path = %path.display(), error = %e, "attachment rollback failed");
+        }
+    }
+    for path in created {
+        if let Some(parent) = path.parent() {
+            // Fails (and is ignored) unless the directory is empty.
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
+    }
 }
 
 /// Rebuild the [`Workspace`] fields the materializer consumes from the
@@ -1514,6 +1661,7 @@ mod tests {
             created_at: "2026-08-11T00:00:00Z".to_string(),
             tables: vec![],
             assets: vec![],
+            attachments: vec![],
             git: intent_core::transfer::TransferGitSummary {
                 has_repository: false,
                 branch: None,
@@ -1525,7 +1673,7 @@ mod tests {
 
     /// Build a fixture archive: manifest.json + rows/*.jsonl (+ one asset).
     fn build_archive(m: &TransferManifest, rows: &[(&str, Vec<serde_json::Value>)]) -> Vec<u8> {
-        build_archive_with_git(m, rows, None)
+        build_archive_full(m, rows, None, &[])
     }
 
     /// [`build_archive`] plus an optional `git/repo.bundle` + `git/refs.json`
@@ -1534,6 +1682,17 @@ mod tests {
         m: &TransferManifest,
         rows: &[(&str, Vec<serde_json::Value>)],
         git: Option<(&Path, &TransferRefsManifest)>,
+    ) -> Vec<u8> {
+        build_archive_full(m, rows, git, &[])
+    }
+
+    /// [`build_archive`] plus optional git payload and
+    /// `attachments/<attachmentId>` file entries.
+    fn build_archive_full(
+        m: &TransferManifest,
+        rows: &[(&str, Vec<serde_json::Value>)],
+        git: Option<(&Path, &TransferRefsManifest)>,
+        attachments: &[(&str, &[u8])],
     ) -> Vec<u8> {
         use std::io::Write as _;
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1552,6 +1711,11 @@ mod tests {
         }
         zip.start_file("assets/img.png", options).expect("asset");
         zip.write_all(b"asset-bytes").expect("asset bytes");
+        for (id, bytes) in attachments {
+            zip.start_file(format!("attachments/{id}"), options)
+                .expect("attachment");
+            zip.write_all(bytes).expect("attachment bytes");
+        }
         if let Some((bundle_path, refs)) = git {
             zip.start_file("git/repo.bundle", options).expect("bundle");
             zip.write_all(&std::fs::read(bundle_path).expect("bundle bytes"))
@@ -1618,6 +1782,25 @@ mod tests {
                     "client_id": "client-x", "text": "d", "updated_at": t
                 })],
             ),
+            (
+                "attachments",
+                vec![
+                    serde_json::json!({
+                        "id": "att-live", "workspace_id": ws.0,
+                        "file_name": "doc.pdf", "mime_type": "application/pdf",
+                        "size": 16, "uploaded_at": t,
+                        "stored_path": ".intent/attachments/doc.pdf"
+                    }),
+                    // Deleted-is-deleted: a registry row with no matching
+                    // archive file entry imports as a row without a file.
+                    serde_json::json!({
+                        "id": "att-gone", "workspace_id": ws.0,
+                        "file_name": "gone.txt", "mime_type": null,
+                        "size": 3, "uploaded_at": t,
+                        "stored_path": ".intent/attachments/gone.txt"
+                    }),
+                ],
+            ),
         ]
     }
 
@@ -1634,7 +1817,12 @@ mod tests {
         let svc = fresh_services(&ws_root.0, &assets_root.0).await;
 
         let m = manifest(&ws);
-        let archive = build_archive(&m, &fixture_rows(&ws));
+        let archive = build_archive_full(
+            &m,
+            &fixture_rows(&ws),
+            None,
+            &[("att-live", b"attachment-bytes")],
+        );
         let sha = sha256_hex(&archive);
         let begin = svc
             .workspace_import_begin_op(
@@ -1715,6 +1903,22 @@ mod tests {
             std::fs::read(assets_root.0.join(&ws.0).join("img.png")).expect("asset"),
             b"asset-bytes"
         );
+
+        // Attachment registry rows landed; the existing file materialized at
+        // its stored path (under the re-rooted worktree) with the ignore-all
+        // marker, while the deleted one imported as a row without a file.
+        let atts = svc.store.list_attachments(&ws).await.expect("attachments");
+        assert_eq!(atts.len(), 2);
+        let att_dir = expected_wt.join(".intent/attachments");
+        assert_eq!(
+            std::fs::read(att_dir.join("doc.pdf")).expect("attachment file"),
+            b"attachment-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(att_dir.join(".gitignore")).expect("marker"),
+            "*\n"
+        );
+        assert!(!att_dir.join("gone.txt").exists(), "deleted-is-deleted");
 
         // Session retired: a second commit is NotFound.
         assert!(matches!(
@@ -2136,6 +2340,123 @@ mod tests {
         svc.workspace_import_abort_op(import_id)
             .await
             .expect("abort after failed commits");
+    }
+
+    /// If the row insert fails AFTER attachment materialization succeeded,
+    /// the commit unwinds the attachment files (and prunes the created
+    /// dirs), keeping the all-or-nothing contract; a tampered registry row
+    /// whose stored path escapes the workspace root fails the commit before
+    /// anything lands.
+    #[tokio::test]
+    async fn import_commit_rolls_back_attachments_on_row_failure() {
+        let ws = WorkspaceId("ws-att-rollback".to_string());
+        let ws_root = TempDir::new("import-att-rb-ws-root");
+        let assets_root = TempDir::new("import-att-rb-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let t = "2026-08-11T00:00:00Z";
+        let ws_row = serde_json::json!({
+            "id": ws.0, "title": "RB WS", "branch": "main", "status": "Active",
+            "worktree_path": "/src/ws/repo",
+            "created_at": t, "updated_at": t
+        });
+        let att_row = serde_json::json!({
+            "id": "att-live", "workspace_id": ws.0,
+            "file_name": "doc.pdf", "mime_type": null, "size": 16,
+            "uploaded_at": t, "stored_path": ".intent/attachments/doc.pdf"
+        });
+        // A note row with a column the schema does not have — the row
+        // insert fails after the attachment file has landed.
+        let bad_note = serde_json::json!({
+            "id": "note-1", "workspace_id": ws.0, "title": "N",
+            "no_such_column": "boom",
+            "created_at": t, "updated_at": t
+        });
+
+        let m = manifest(&ws);
+        let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            ("workspace", vec![ws_row.clone()]),
+            ("attachments", vec![att_row.clone()]),
+            ("note", vec![bad_note]),
+        ];
+        let archive = build_archive_full(&m, &rows, None, &[("att-live", b"attachment-bytes")]);
+        let sha = sha256_hex(&archive);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk");
+
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("commit must fail on the bad row");
+        assert!(
+            err.to_string().contains("no column"),
+            "row insert failure surfaced: {err}"
+        );
+
+        // The materialized attachment (and its marker) was unwound with the
+        // re-rooted worktree dir pruned; no rows landed.
+        let att_dir = ws_root.0.join(&ws.0).join("repo/.intent/attachments");
+        assert!(!att_dir.join("doc.pdf").exists(), "attachment rolled back");
+        assert!(!att_dir.exists(), "empty attachments dir pruned");
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+
+        svc.workspace_import_abort_op(import_id)
+            .await
+            .expect("abort after failed commit");
+
+        // Containment: a stored_path escaping the workspace root fails the
+        // commit before any row lands.
+        let hostile_att = serde_json::json!({
+            "id": "att-live", "workspace_id": ws.0,
+            "file_name": "evil", "mime_type": null, "size": 4,
+            "uploaded_at": t, "stored_path": "../../evil"
+        });
+        let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            ("workspace", vec![ws_row]),
+            ("attachments", vec![hostile_att]),
+        ];
+        let archive = build_archive_full(&m, &rows, None, &[("att-live", b"evil")]);
+        let sha = sha256_hex(&archive);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin hostile");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk hostile");
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("escaping stored_path rejected");
+        assert!(
+            err.to_string().contains("escapes the workspace root"),
+            "containment error surfaced: {err}"
+        );
+        assert!(matches!(
+            svc.store.get_workspace(&ws).await,
+            Err(Error::NotFound(_))
+        ));
+        svc.workspace_import_abort_op(import_id)
+            .await
+            .expect("abort hostile");
     }
 
     /// `begin` rejects: bad format version, version mismatch (naming both

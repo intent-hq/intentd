@@ -167,6 +167,7 @@ impl WorkspaceApi for FakeApi {
                         approx_bytes: 100,
                     }],
                     assets: vec![],
+                    attachments: vec![],
                     git: intent_core::transfer::TransferGitSummary {
                         has_repository: false,
                         branch: None,
@@ -177,6 +178,7 @@ impl WorkspaceApi for FakeApi {
                 total_size_bytes: 100,
                 db_row_bytes: 100,
                 asset_bytes: 0,
+                attachment_bytes: 0,
                 estimated_git_bundle_bytes: 0,
                 warnings: vec![],
             })
