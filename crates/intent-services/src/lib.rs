@@ -28,18 +28,19 @@ use intent_core::{
     CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, ContextItem, Draft, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, LineAttributionAuthor, LineAttributionComputeResult,
-    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -3900,7 +3901,10 @@ impl Services {
                 // `newly_recorded` guard ensures a reprocessed duplicate
                 // `agent:failed` cannot deliver a second immediate wake.
                 if newly_recorded && event.event_type == AGENT_FAILED {
-                    let wake = format_completion_wake(child_id, event, None);
+                    // The grouped watch stays armed (group settlement owns
+                    // it), so this immediate wake must NOT carry the
+                    // retirement suffix.
+                    let wake = format_completion_wake(child_id, event, None, false);
                     let metadata = build_event_notification_metadata(&[event]);
                     if let Err(e) = self
                         .deliver_parent_wake(
@@ -4002,7 +4006,9 @@ impl Services {
                 );
                 continue;
             }
-            let wake = format_completion_wake(child_id, event, stall.as_ref());
+            // `remove_watch` just retired the one-shot watch, so the wake
+            // carries the retirement + re-arm suffix (issue monorepo#2051).
+            let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
                 .deliver_parent_wake(
@@ -7392,6 +7398,16 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
     }
 }
 
+/// Publish a `workspace:created` event for a workspace row inserted outside
+/// the `Services` surface (the legacy importer writes through `Store`
+/// directly, so `create_workspace`'s own publish never fires). Best-effort
+/// like every change-event publish: failures are logged, never returned.
+pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
+    if let Err(e) = bus.publish(&workspace_created_event(ws)).await {
+        tracing::warn!(error = %e, "failed to publish workspace:created event");
+    }
+}
+
 /// Build a `workspace:updated` event for a workspace whose row was just
 /// mutated (§6.5). Payload `{ workspaceId, changes }` mirrors the reference
 /// FE emitter — `changes` is the caller-supplied `WorkspaceUpdate` diff (the
@@ -8337,7 +8353,7 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
 /// or the deterministic chat-stream 400 prompt rejection
 /// ([`is_deterministic_prompt_rejection`]). Single predicate shared by
 /// [`Services::session_poisoned`] and the `sessionCorrupted` event flag in
-/// `persist_error_and_requeue` so the two surfaces cannot drift.
+/// `persist_terminal_error_status` so the two surfaces cannot drift.
 pub(crate) fn is_session_fatal_error(error_text: &str) -> bool {
     is_session_fatal_stop_reason(error_text) || is_deterministic_prompt_rejection(error_text)
 }
@@ -8451,10 +8467,20 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// completion report wins over `lastResponseSummary` (SUB-2, mirroring
 /// `format_group_child_line`) so the single agent:idle-driven wake carries
 /// the child's `reportToParent` text end-to-end.
+///
+/// `watch_retired` — issue monorepo#2051, mirroring the #1520 hook-wake
+/// terminal/non-terminal clarity: `true` on the ungrouped delivery path
+/// (where `remove_watch` retired the one-shot watch just before delivery)
+/// appends an explicit "watch consumed / retired" note with a
+/// `ws.agent.watch` re-arm pointer (or, for `agent:deleted`, a "cannot be
+/// re-watched" note — a deleted agent is rejected by `agent.watch` and has
+/// no next completion); `false` on the immediate grouped-failure path,
+/// whose watch stays armed for group settlement.
 fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
     stall: Option<&StallSuspicion>,
+    watch_retired: bool,
 ) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
@@ -8501,6 +8527,23 @@ fn format_completion_wake(
     if let Some(stall) = stall {
         if !report_rendered {
             msg.push_str(&stall.annotation_suffix());
+        }
+    }
+    if watch_retired {
+        // A deleted agent fails closed in `agent.watch` (rejected as unknown)
+        // and has no next completion, so the deleted-kind wake must not carry
+        // the re-arm pointer — say the agent cannot be re-watched instead.
+        if event.event_type == AGENT_DELETED {
+            msg.push_str(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
+                 now retired. The agent was deleted, so it cannot be re-watched.",
+            );
+        } else {
+            msg.push_str(&format!(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+                 retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
+                child_id.0
+            ));
         }
     }
     msg
@@ -8716,6 +8759,75 @@ fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     msg
 }
 
+/// Human-readable identifier for a `@@@task` block in conversion warnings:
+/// the block title plus the declared `key=` when present.
+fn task_block_label(task: &note_ops::ParsedTaskBlock) -> String {
+    match &task.key {
+        Some(key) => format!("\"{}\" (key={key})", task.title),
+        None => format!("\"{}\"", task.title),
+    }
+}
+
+/// The bare validator message for a conversion warning: relation validators
+/// return `Error::Internal`, whose `Display` prefixes "internal error: " —
+/// noise inside a warning string that already names the block and reference.
+fn relation_error_text(e: &Error) -> String {
+    match e {
+        Error::Internal(msg) | Error::InvalidParams(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve one raw `dependsOn`/`conflictsWith` header value to a task-note id
+/// during block conversion: (1) a sibling block's `key=`, (2) a sibling
+/// block's exact (trimmed) title, (3) an existing task-note id in the
+/// workspace. `None` in a map slot marks an ambiguous key/title (declared by
+/// more than one sibling block). Unresolvable or ambiguous values return
+/// `None` after pushing a warning naming the block and the reference.
+fn resolve_block_relation_value(
+    value: &str,
+    id_by_key: &HashMap<String, Option<NoteId>>,
+    id_by_title: &HashMap<String, Option<NoteId>>,
+    all: &[Note],
+    field: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<NoteId> {
+    match id_by_key.get(value) {
+        Some(Some(id)) => return Some(id.clone()),
+        Some(None) => {
+            warnings.push(format!(
+                "task block {label}: {field} reference \"{value}\" is ambiguous — \
+                 multiple sibling blocks declare key={value}; edge skipped"
+            ));
+            return None;
+        }
+        None => {}
+    }
+    match id_by_title.get(value.trim()) {
+        Some(Some(id)) => return Some(id.clone()),
+        Some(None) => {
+            warnings.push(format!(
+                "task block {label}: {field} reference \"{value}\" is ambiguous — \
+                 multiple sibling blocks share that title; edge skipped"
+            ));
+            return None;
+        }
+        None => {}
+    }
+    if let Some(n) = all
+        .iter()
+        .find(|n| n.id.as_str() == value && n.metadata.task.is_some())
+    {
+        return Some(n.id.clone());
+    }
+    warnings.push(format!(
+        "task block {label}: {field} reference \"{value}\" does not match a sibling \
+         block key, a sibling block title, or an existing task note id; edge skipped"
+    ));
+    None
+}
+
 /// Outcome of the best-effort auto-conversion of `@@@task` blocks that runs
 /// after every note content-write path (reference `notes.service.ts` parity,
 /// L633-647): populated when the just-written content contained at least one
@@ -8724,12 +8836,19 @@ fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
 struct AutoConvertOutcome {
     converted_count: i64,
     created_note_ids: Vec<String>,
+    /// One `{ key?, title, noteId }` entry per created task note, in block
+    /// order (parallel to `created_note_ids`).
+    created_tasks: Vec<CreatedTaskEntry>,
     /// The full note refetched from the store after the conversion ran.
     /// `convert_task_blocks` performs a second store write (bumping `rev` and
     /// `updated_at`), so callers must return this refetched note — not the
     /// pre-conversion in-flight value — to match the reference, which
     /// refetches the note after conversion.
     refetched_note: Option<Note>,
+    /// Non-fatal conversion warnings (skipped relation edges, header parse
+    /// issues), surfaced on the note-write wire results and logged by the
+    /// auto-convert hook.
+    warnings: Vec<String>,
 }
 
 impl Services {
@@ -8758,11 +8877,22 @@ impl Services {
         {
             Ok(r) => {
                 let refetched_note = self.store.get_note(workspace_id, note_id).await.ok();
-                AutoConvertOutcome {
+                let outcome = AutoConvertOutcome {
                     converted_count: r.converted_count,
                     created_note_ids: r.created_note_ids,
+                    created_tasks: r.created_tasks,
                     refetched_note,
+                    warnings: r.warnings,
+                };
+                if !outcome.warnings.is_empty() {
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        note_id = %note_id,
+                        warnings = ?outcome.warnings,
+                        "task-block conversion produced warnings"
+                    );
                 }
+                outcome
             }
             Err(e) => {
                 tracing::warn!(
@@ -8795,6 +8925,8 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
             });
         }
         // Mirror the TS guard: only parse when a `@@@task` fence exists.
@@ -8817,7 +8949,10 @@ impl Services {
         // Start from the placeholder-substituted content; each valid block
         // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
         let mut working = parsed.content_without_blocks.clone();
+        let mut warnings: Vec<String> = Vec::new();
         let mut created_note_ids: Vec<String> = Vec::new();
+        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::new();
+        let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
         let mut peer_order = 100i64;
         for (i, task) in parsed.tasks.iter().enumerate() {
             let body = if task.content.is_empty() {
@@ -8827,7 +8962,20 @@ impl Services {
             };
             let normalized = task.title.trim().to_lowercase();
             let task_note_id = match existing_by_title.get(&normalized) {
-                Some(existing_id) => existing_id.clone(),
+                Some(existing_id) => {
+                    // Reused child: `effort=` only applies at creation — it
+                    // never overwrites a possibly user-edited estimate on the
+                    // existing note — so an explicit attribute is surfaced as
+                    // dropped rather than silently ignored.
+                    if task.effort.is_some() {
+                        warnings.push(format!(
+                            "task block {}: effort= ignored — a task note with this \
+                             title already exists and its estimate is preserved",
+                            task_block_label(task)
+                        ));
+                    }
+                    existing_id.clone()
+                }
                 None => {
                     let child = self
                         .create_child_task_note(
@@ -8837,11 +8985,17 @@ impl Services {
                             body,
                             TaskStatus::NotStarted,
                             Some(peer_order),
+                            task.effort.clone(),
                             caller_agent_id,
                         )
                         .await?;
                     existing_by_title.insert(normalized, child.id.clone());
                     created_note_ids.push(child.id.0.clone());
+                    created_tasks.push(CreatedTaskEntry {
+                        key: task.key.clone(),
+                        title: task.title.clone(),
+                        note_id: child.id.0.clone(),
+                    });
                     child.id
                 }
             };
@@ -8851,7 +9005,137 @@ impl Services {
                 task.title, task_note_id.0
             );
             working = working.replace(&placeholder, &linked);
+            block_note_ids.push(task_note_id);
             peer_order += 100;
+        }
+
+        // Convert-with-warnings: bad header attributes or relation references
+        // never fail the conversion — the blocks above already converted;
+        // every dropped attribute or skipped edge adds one warning entry.
+        for task in &parsed.tasks {
+            for issue in &task.issues {
+                warnings.push(format!("task block {}: {issue}", task_block_label(task)));
+            }
+        }
+        // Sibling resolution maps for `dependsOn`/`conflictsWith` values:
+        // `key=` declarations first, exact (trimmed) titles second. A slot
+        // holding `None` marks a key/title declared by more than one sibling
+        // block — references to it are ambiguous even when the duplicate
+        // declarations collapsed to one reused child via the title-reuse map,
+        // because the duplication itself makes the author's intent unclear.
+        let mut id_by_key: HashMap<String, Option<NoteId>> = HashMap::new();
+        let mut id_by_title: HashMap<String, Option<NoteId>> = HashMap::new();
+        for (i, task) in parsed.tasks.iter().enumerate() {
+            let id = &block_note_ids[i];
+            if let Some(key) = &task.key {
+                id_by_key
+                    .entry(key.clone())
+                    .and_modify(|slot| *slot = None)
+                    .or_insert_with(|| Some(id.clone()));
+            }
+            id_by_title
+                .entry(task.title.trim().to_string())
+                .and_modify(|slot| *slot = None)
+                .or_insert_with(|| Some(id.clone()));
+        }
+        // Seed resolved relations through the same validated writer as
+        // `task.setRelations`, one block at a time in declaration order.
+        // Each candidate edge is pre-checked individually (self/task-ness,
+        // cycle, tree ancestry) against a fresh workspace snapshot that
+        // includes the children created above and the edges seeded for
+        // earlier blocks; a rejected edge is skipped with a warning while the
+        // accepted ones still apply.
+        for (i, task) in parsed.tasks.iter().enumerate() {
+            if task.depends_on.is_empty() && task.conflicts_with.is_empty() {
+                continue;
+            }
+            let self_id = &block_note_ids[i];
+            let label = task_block_label(task);
+            let all = store.list_notes(&workspace_id).await?;
+            let mut deps: Vec<NoteId> = Vec::new();
+            for value in &task.depends_on {
+                let Some(dep) = resolve_block_relation_value(
+                    value,
+                    &id_by_key,
+                    &id_by_title,
+                    &all,
+                    "dependsOn",
+                    &label,
+                    &mut warnings,
+                ) else {
+                    continue;
+                };
+                let edge = [dep.clone()];
+                // A cycle through `self_id` uses exactly one of its outgoing
+                // edges, so checking each edge alone is equivalent to
+                // checking the combined list.
+                let checked = validate_relation_ids(self_id, &edge, &all, "dependsOn")
+                    .and_then(|_| match find_dependency_cycle(self_id, &edge, &all) {
+                        Some(cycle) => Err(Error::Internal(format!(
+                            "dependsOn would create a cycle: {}",
+                            cycle.join(" -> ")
+                        ))),
+                        None => Ok(()),
+                    })
+                    .and_then(|_| ensure_no_tree_relative_dependency(self_id, &edge, &all));
+                match checked {
+                    Ok(()) => deps.push(dep),
+                    Err(e) => warnings.push(format!(
+                        "task block {label}: dependsOn reference \"{value}\" rejected: {}; \
+                         edge skipped",
+                        relation_error_text(&e)
+                    )),
+                }
+            }
+            let mut conflicts: Vec<NoteId> = Vec::new();
+            for value in &task.conflicts_with {
+                let Some(conflict) = resolve_block_relation_value(
+                    value,
+                    &id_by_key,
+                    &id_by_title,
+                    &all,
+                    "conflictsWith",
+                    &label,
+                    &mut warnings,
+                ) else {
+                    continue;
+                };
+                match validate_relation_ids(
+                    self_id,
+                    std::slice::from_ref(&conflict),
+                    &all,
+                    "conflictsWith",
+                ) {
+                    Ok(()) => conflicts.push(conflict),
+                    Err(e) => warnings.push(format!(
+                        "task block {label}: conflictsWith reference \"{value}\" rejected: {}; \
+                         edge skipped",
+                        relation_error_text(&e)
+                    )),
+                }
+            }
+            if deps.is_empty() && conflicts.is_empty() {
+                continue;
+            }
+            // Same code path as `task.setRelations`, so the `note:updated` +
+            // `task:ready-tasks-changed` (`relations-changed`) emissions
+            // match §6.5. Empty accepted lists pass `None` (skip) rather than
+            // `Some([])` (clear), so a block whose references were all
+            // skipped never clobbers relations an existing child already has.
+            if let Err(e) = self
+                .task_set_relations(
+                    workspace_id.clone(),
+                    self_id.clone(),
+                    (!deps.is_empty()).then_some(deps),
+                    (!conflicts.is_empty()).then_some(conflicts),
+                )
+                .await
+            {
+                warnings.push(format!(
+                    "task block {label}: failed to seed relations: {}",
+                    relation_error_text(&e)
+                ));
+            }
         }
 
         let content_changed = working != note.content;
@@ -8860,6 +9144,8 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings,
             });
         }
         note.content = working;
@@ -8896,13 +9182,16 @@ impl Services {
             ok: true,
             converted_count: created_note_ids.len() as i64,
             created_note_ids,
+            created_tasks,
+            warnings,
         })
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
-    /// `status` (and optional `peer_order`). Shared by `createPrerequisite` and
-    /// `convertBlocks`. `caller_agent_id` attributes the emitted `task:created`
-    /// to the acting agent when the creation is agent-driven.
+    /// `status` (and optional `peer_order` / `estimated_effort`). Shared by
+    /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
+    /// the emitted `task:created` to the acting agent when the creation is
+    /// agent-driven.
     #[allow(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
@@ -8912,9 +9201,12 @@ impl Services {
         content: String,
         status: TaskStatus,
         peer_order: Option<i64>,
+        estimated_effort: Option<String>,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
         let now = now_iso();
+        let mut task_meta = fresh_task_metadata(status, &now, peer_order);
+        task_meta.estimated_effort = estimated_effort;
         let note = Note {
             id: NoteId::new(),
             workspace_id: workspace_id.clone(),
@@ -8928,7 +9220,7 @@ impl Services {
             parent_id: Some(parent_id.clone()),
             visibility: NoteVisibility::Workspace,
             metadata: NoteMetadata {
-                task: Some(fresh_task_metadata(status, &now, peer_order)),
+                task: Some(task_meta),
             },
             created_at: now.clone(),
             rev: 0,
@@ -10263,6 +10555,7 @@ impl WorkspaceApi for Services {
         file_name: String,
         data: Option<String>,
         source_path: Option<String>,
+        mime_type: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -10310,7 +10603,119 @@ impl WorkspaceApi for Services {
             // inside `attachments/` to cover repos with a customized
             // `.intent/.gitignore`.
             repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            file_ops::place_attachment(&root, &file_name, source)
+            let mut result = file_ops::place_attachment(&root, &file_name, source)?;
+            // Attachment registry (PROTOCOL §5.9): record the placed file
+            // under a daemon-minted UUID so agents can retrieve it later via
+            // `ws.file.getAttachment`, and return the registry fields
+            // additively (presence-detected; old clients unaffected).
+            let record = intent_store::AttachmentRecord {
+                id: new_uuid(),
+                workspace_id,
+                file_name: result["fileName"]
+                    .as_str()
+                    .unwrap_or(&file_name)
+                    .to_string(),
+                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
+                size: result["size"].as_i64().unwrap_or_default(),
+                uploaded_at: now_iso(),
+                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
+            };
+            if let Err(e) = store.insert_attachment(&record).await {
+                // Don't leave a durable-but-unregistered file behind: a
+                // retry would place a collision-suffixed second copy that
+                // no attachmentId can ever retrieve.
+                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
+                return Err(e);
+            }
+            result["attachmentId"] = serde_json::json!(record.id);
+            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
+            if let Some(mime) = &record.mime_type {
+                result["mimeType"] = serde_json::json!(mime);
+            }
+            Ok(result)
+        })
+    }
+
+    fn file_get_attachment_info(
+        &self,
+        attachment_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let record = store
+                .get_attachment(&attachment_id)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
+            // `exists` reflects the file on disk NOW (the user may have
+            // deleted it out-of-band); resolved against the canonical
+            // workspace root, never a sandbox, with the same within-root
+            // containment guard as the copy path — a tampered stored_path
+            // must not probe file existence outside the store.
+            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
+            let exists = !root.is_empty()
+                && file_ops::resolve_attachment_source(&root, &record.stored_path)
+                    .is_ok_and(|p| p.is_file());
+            let mut result = serde_json::json!({
+                "attachmentId": record.id,
+                "fileName": record.file_name,
+                "size": record.size,
+                "uploadedAt": record.uploaded_at,
+                "path": record.stored_path,
+                "exists": exists,
+            });
+            if let Some(mime) = &record.mime_type {
+                result["mimeType"] = serde_json::json!(mime);
+            }
+            Ok(result)
+        })
+    }
+
+    fn file_get_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        attachment_id: String,
+        caller_agent_id: Option<AgentId>,
+        dest_dir: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let record = store
+                .get_attachment(&attachment_id)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
+            if record.workspace_id != workspace_id {
+                // Cross-workspace probes read as unknown ids — the registry
+                // is workspace-scoped.
+                return Err(Error::NotFound(format!(
+                    "unknown attachment id: {attachment_id}"
+                )));
+            }
+            // Source side: ALWAYS the canonical workspace root (attachments
+            // are placed there by `file.placeAttachment`; a sandbox clone
+            // does not carry post-clone attachments).
+            let canonical_root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            if canonical_root.is_empty() {
+                return Err(Error::Internal(
+                    "workspace has no resolved filesystem root".to_string(),
+                ));
+            }
+            // Destination side: the CALLER's working directory — the sandbox
+            // clone for CoW-sandboxed agents, else the canonical checkout
+            // (same session-derived resolution as other sandbox-aware
+            // bindings).
+            let dest_root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            file_ops::get_attachment(&canonical_root, &dest_root, &record, dest_dir.as_deref())
         })
     }
 
@@ -12255,6 +12660,7 @@ impl WorkspaceApi for Services {
                                 .context_references
                                 .filter(|v| !v.is_null()),
                             image_blocks: agent.image_blocks.filter(|v| !v.is_null()),
+                            file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
                             // The initial agent is the workspace's
                             // foreground agent (top-level wins over any
                             // metadata.isBackground copy).
@@ -12290,22 +12696,31 @@ impl WorkspaceApi for Services {
                             .and_then(|a| a.get("imageBlocks"))
                             .filter(|v| !v.is_null())
                             .cloned();
+                        let created_file_blocks = created
+                            .get("agent")
+                            .and_then(|a| a.get("fileBlocks"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
                         let created_context_refs = created
                             .get("agent")
                             .and_then(|a| a.get("contextReferences"))
                             .filter(|v| !v.is_null())
                             .cloned();
                         // Deliver the prompt and start the first turn when a prompt OR
-                        // imageBlocks are supplied (STAB-69: image-only first messages
-                        // should start a turn, consistent with agent.sendMessage
-                        // semantics). The runtime `AgentManager` when attached, else the
-                        // store-only persist. Best-effort like the delegate path — the
-                        // agent holds `metadata.initialMessage` for resume.
-                        let has_content = prompt.is_some() || created_image_blocks.is_some();
+                        // attachment blocks are supplied (STAB-69: image-only first
+                        // messages should start a turn, consistent with
+                        // agent.sendMessage semantics). The runtime `AgentManager` when
+                        // attached, else the store-only persist. Best-effort like the
+                        // delegate path — the agent holds `metadata.initialMessage` for
+                        // resume.
+                        let has_content = prompt.is_some()
+                            || created_image_blocks.is_some()
+                            || created_file_blocks.is_some();
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
+                                file_blocks: created_file_blocks.clone(),
                                 context_references: created_context_refs,
                                 ..crate::agent_manager::TurnOptions::default()
                             };
@@ -12322,7 +12737,7 @@ impl WorkspaceApi for Services {
                                             prompt_text,
                                             None,
                                             created_image_blocks,
-                                            None,
+                                            created_file_blocks,
                                             None,
                                         )
                                         .await
@@ -15010,6 +15425,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15088,6 +15505,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15160,6 +15579,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15256,6 +15677,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -16302,6 +16725,7 @@ impl WorkspaceApi for Services {
                     &title,
                     content.unwrap_or_default(),
                     task_status,
+                    None,
                     None,
                     caller_agent_id.as_ref(),
                 )
@@ -19190,6 +19614,10 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Attachment-reference validation (PROTOCOL §5.5) up front: the
+            // runtime-manager path below never reaches
+            // `agent_send_message_op`'s check.
+            crate::agent_ops::validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -19334,6 +19762,12 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Attachment-reference validation (PROTOCOL §5.5), same seam as
+            // agent.sendMessage — before any state change.
+            crate::agent_ops::validate_file_blocks(
+                "agent.editAndRegenerate",
+                file_blocks.as_ref(),
+            )?;
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,

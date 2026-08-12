@@ -547,7 +547,7 @@ async fn cmd_import_legacy(
     // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
     // hermetic test harness) mean "legacy import disabled": return before
     // touching the store so no app-level blobs land and no completion marker
-    // is written — consistent with `maybe_import_on_first_boot`.
+    // is written — consistent with `decide_first_boot_import`.
     if roots.is_empty() {
         println!("legacy import disabled: no legacy roots to scan");
         return Ok(());
@@ -565,11 +565,18 @@ async fn cmd_import_legacy(
             force,
             assets_root: Some(config.data_dir.join("assets")),
             app_dir,
+            // Offline CLI: no daemon, no live subscribers — no events. A
+            // running daemon learns about the rows via `system.importLegacy`
+            // or its next boot, both of which publish.
+            event_bus: None,
         },
     )
     .await?;
     println!("{report}");
     if !dry_run {
+        // Keep the persisted failure summary in sync: a clean run (e.g. the
+        // documented `--force` retry) clears any stale row from a prior run.
+        legacy_import::persist_failure_summary(&store, &report).await;
         if !report.has_compatibility_failures() {
             // Marker write failure is a warning, not a command failure — the
             // import itself completed (mirrors the first-boot hook in `serve`).
@@ -862,20 +869,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             "auto_vacuum activation failed; continuing without incremental vacuum"
         ),
     }
-    // First-boot legacy workspace import: on a fresh DB with no completion
-    // marker, scan the legacy roots and import `.workspace/workspace.json`
-    // workspaces. Runs to completion inline after migrations (inside
-    // `Store::open`) and before any transport serves RPCs; it never fails
-    // startup, but a large legacy tree does delay this first boot (accepted
-    // one-time tradeoff — see `maybe_import_on_first_boot`).
-    legacy_import::maybe_import_on_first_boot(
-        &store,
-        db_existed,
-        legacy_import::default_roots(),
-        Some(config.data_dir.join("assets")),
-        legacy_import::default_app_dir(),
-    )
-    .await;
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().
@@ -883,6 +876,52 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
+    // Serializes import runs: shared between the first-boot background task
+    // below and the `system.importLegacy` RPC (via DaemonControl), so the two
+    // can never interleave workspace inserts — without the lock both could
+    // observe a missing row before either inserts it, turning the loser's
+    // idempotent skip into a spurious `insert failed` failure-summary entry.
+    let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // First-boot legacy workspace import: the eligibility decision (fresh DB
+    // / marker state) is made synchronously here, but the import itself runs
+    // in a spawned background task concurrently with the transports coming up
+    // — `serve` never awaits it, so a large legacy tree no longer delays
+    // first boot. `decide_first_boot_import` persists a pending marker before
+    // the run starts; a daemon killed mid-import resumes on the next boot
+    // (the importer is idempotent). A concurrent `system.importLegacy` RPC —
+    // a concurrency window the inline pre-transport import never had — is
+    // serialized behind `legacy_import_lock`. Aborted during shutdown before
+    // Store::close() — the pending marker then resumes the run next boot; the
+    // abort cancels the outer task at its current await point and detaches
+    // any in-flight per-workspace unit, which the pool close + idempotent
+    // resume make benign (bounding it would need cancellation plumbed through
+    // `run()` for no behavioral gain).
+    let legacy_import_handle = {
+        let roots = legacy_import::default_roots();
+        match legacy_import::decide_first_boot_import(&store, db_existed, &roots).await {
+            legacy_import::FirstBootDecision::Skip => None,
+            decision => {
+                let store = store.clone();
+                let assets_root = Some(config.data_dir.join("assets"));
+                let app_dir = legacy_import::default_app_dir();
+                let event_bus = Some(bus.clone());
+                let lock = legacy_import_lock.clone();
+                let resumed = decision == legacy_import::FirstBootDecision::Resume;
+                Some(tokio::spawn(async move {
+                    let _guard = lock.lock().await;
+                    legacy_import::run_first_boot_import(
+                        &store,
+                        roots,
+                        assets_root,
+                        app_dir,
+                        event_bus,
+                        resumed,
+                    )
+                    .await;
+                }))
+            }
+        }
+    };
     // Hold a store handle for the §10.2 retention sweep before the store is
     // moved into the services surface below.
     let retention_store = store.clone();
@@ -1358,7 +1397,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         route_info,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
-        legacy_import_lock: tokio::sync::Mutex::new(()),
+        legacy_import_lock: legacy_import_lock.clone(),
+        legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
     });
 
@@ -1650,6 +1690,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         );
     }
 
+    // Stop the background first-boot legacy import (if still running) before
+    // closing the store; the pending marker makes the next boot resume it.
+    if let Some(handle) = legacy_import_handle {
+        handle.abort();
+    }
+
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
 
@@ -1684,7 +1730,12 @@ struct DaemonControl {
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
     /// Prevent overlapping import runs from racing workspace inserts/copies.
-    legacy_import_lock: tokio::sync::Mutex<()>,
+    /// Shared with the first-boot background import task, which acquires it
+    /// for its whole run, so the RPC and the boot import never interleave.
+    legacy_import_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Event bus for `workspace:created` publishes on imported rows, so live
+    /// subscribers learn about workspaces the importer writes through `Store`.
+    legacy_import_bus: EventBus,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -1929,11 +1980,15 @@ impl SystemControl for DaemonControl {
                     force,
                     assets_root: Some(self.legacy_import_assets_root.clone()),
                     app_dir: legacy_import::default_app_dir(),
+                    event_bus: Some(self.legacy_import_bus.clone()),
                 },
             )
             .await
             .map_err(|e| e.to_string())?;
 
+            // Keep the persisted failure summary in sync: a clean run (e.g.
+            // the documented `--force` retry) clears any stale row.
+            legacy_import::persist_failure_summary(&self.legacy_import_store, &report).await;
             let compatibility_failures = report.has_compatibility_failures();
             let marker_written = if compatibility_failures {
                 false

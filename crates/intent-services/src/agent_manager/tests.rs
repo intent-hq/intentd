@@ -384,6 +384,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -428,6 +429,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -486,6 +488,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -573,6 +576,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -1878,6 +1882,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
@@ -2985,6 +2990,103 @@ async fn terminal_failure_events_carry_turn_id() {
             ev.data
         );
     }
+}
+
+/// Durable-before-observable (monorepo#2009): the terminal-failure handlers
+/// complete the `status = error` + `stop_reason` store write BEFORE the
+/// terminal `agent:failed`/`agent:stream:end` pair is published, so a client
+/// that reads `agent.getSession` upon observing either event is guaranteed
+/// the persisted Error. Runs the spawn handler on its own task and reads the
+/// store the moment `agent:failed` arrives — with the write ordered after the
+/// publish this read races the persist (the pre-#2009 flake in
+/// `pi_spawn_fails_fast_on_old_cli_over_wss`); with the write ordered first
+/// the read deterministically sees `error`. Also pins the unchanged wire
+/// order: agent:failed → agent:stream:end → agent:status-changed →
+/// agent:queue:updated.
+#[tokio::test]
+async fn terminal_failure_persists_error_before_publishing_events() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-dbo"), AgentId::from("a-dbo"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mgr = Arc::new(mgr);
+    let handler = {
+        let (mgr, ws, id) = (mgr.clone(), ws.clone(), id.clone());
+        tokio::spawn(async move {
+            let options = super::TurnOptions::default();
+            super::handle_terminal_spawn_failure(
+                &mgr,
+                &id,
+                &ws,
+                "retry me",
+                &options,
+                true,
+                &Error::Internal("boom".to_string()),
+            )
+            .await;
+        })
+    };
+
+    // Read the store the moment agent:failed lands on the bus: the persisted
+    // Error must already be visible.
+    let mut events = Vec::new();
+    'observed: loop {
+        let batch = timeout(Duration::from_secs(10), sub.recv())
+            .await
+            .expect("agent:failed within 10s")
+            .expect("bus open");
+        for event in batch {
+            let failed = event.event_type == "agent:failed";
+            events.push(event);
+            if failed {
+                break 'observed;
+            }
+        }
+    }
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "status is durably error when agent:failed is observable (monorepo#2009)"
+    );
+    assert!(
+        stored
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("boom")),
+        "stop_reason persisted alongside the status: {:?}",
+        stored.stop_reason
+    );
+    handler.await.unwrap();
+
+    // Wire order is unchanged by the persist reorder.
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let order: Vec<&str> = events
+        .iter()
+        .map(|e| e.event_type.as_str())
+        .filter(|t| {
+            matches!(
+                *t,
+                "agent:failed"
+                    | "agent:stream:end"
+                    | "agent:status-changed"
+                    | "agent:queue:updated"
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "agent:failed",
+            "agent:stream:end",
+            "agent:status-changed",
+            "agent:queue:updated"
+        ],
+        "terminal wire order unchanged"
+    );
 }
 
 /// Wire surface (monorepo#1022): the drain loop's `agent:queue:processing`
@@ -5374,6 +5476,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: now_iso(),
@@ -5766,6 +5869,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
@@ -8869,6 +8973,110 @@ fn user_message_blocks_appends_image_and_file_blocks() {
     assert_eq!(arr[2]["data"], json!("filedata"));
     assert_eq!(arr[2]["fileName"], json!("a.txt"));
     assert_eq!(arr[2]["mimeType"], json!("text/plain"));
+}
+
+/// Attachment-reference file blocks (PROTOCOL §5.5) persist with their
+/// `attachmentId` + metadata (no inline data) in the user-message shape;
+/// mimeType/size are optional and pass through when present.
+#[test]
+fn user_message_blocks_persists_attachment_reference_file_blocks() {
+    let files = json!([
+        { "type": "file", "attachmentId": "att-1", "fileName": "spec.pdf",
+          "mimeType": "application/pdf", "size": 123 },
+        { "type": "file", "attachmentId": "att-2", "fileName": "raw.bin" },
+    ]);
+    let blocks = user_message_blocks("see attached", None, Some(&files));
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[1]["type"], json!("file"));
+    assert_eq!(arr[1]["attachmentId"], json!("att-1"));
+    assert_eq!(arr[1]["fileName"], json!("spec.pdf"));
+    assert_eq!(arr[1]["mimeType"], json!("application/pdf"));
+    assert_eq!(arr[1]["size"], json!(123));
+    assert!(arr[1].get("data").is_none());
+    assert_eq!(arr[2]["attachmentId"], json!("att-2"));
+    assert!(arr[2].get("mimeType").is_none());
+    assert!(arr[2].get("size").is_none());
+}
+
+/// A blank `attachmentId` counts as absent everywhere: an entry carrying
+/// inline `data` plus a whitespace `attachmentId` passes validation as
+/// data-only, so persistence must keep the inline data rather than store a
+/// dangling blank reference (same non-blank filter as `validate_file_blocks`
+/// and prompt assembly).
+#[test]
+fn user_message_blocks_blank_attachment_id_persists_inline_data() {
+    let files = json!([
+        { "type": "file", "data": "aGk=", "mimeType": "text/plain",
+          "attachmentId": "  ", "fileName": "hi.txt" },
+    ]);
+    let blocks = user_message_blocks("msg", None, Some(&files));
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[1]["type"], json!("file"));
+    assert_eq!(arr[1]["data"], json!("aGk="));
+    assert_eq!(arr[1]["mimeType"], json!("text/plain"));
+    assert!(arr[1].get("attachmentId").is_none());
+}
+
+/// `validate_file_blocks` (PROTOCOL §5.5): exactly one of `data` /
+/// `attachmentId` per entry — both or neither is `-32602`; valid arrays,
+/// non-arrays, and non-object entries pass.
+#[test]
+fn validate_file_blocks_rejects_both_or_neither() {
+    use crate::agent_ops::validate_file_blocks;
+    // Valid: inline-data entry and attachment-reference entry.
+    let ok = json!([
+        { "type": "file", "data": "d", "mimeType": "t/p", "fileName": "a.txt" },
+        { "type": "file", "attachmentId": "att-1", "fileName": "b.pdf" },
+    ]);
+    assert!(validate_file_blocks("m", Some(&ok)).is_ok());
+    // Neither.
+    let neither = json!([{ "type": "file", "fileName": "x.txt" }]);
+    let err = validate_file_blocks("agent.sendMessage", Some(&neither)).unwrap_err();
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(_)),
+        "{err:?}"
+    );
+    // Both.
+    let both = json!([{ "type": "file", "data": "d", "attachmentId": "att-1", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&both)).is_err());
+    // Blank attachmentId counts as absent → data-only entry still valid.
+    let blank = json!([{ "type": "file", "data": "d", "attachmentId": " ", "fileName": "x" }]);
+    assert!(validate_file_blocks("m", Some(&blank)).is_ok());
+    // Non-array / absent / non-object entries are tolerated.
+    assert!(validate_file_blocks("m", None).is_ok());
+    assert!(validate_file_blocks("m", Some(&json!("nope"))).is_ok());
+    assert!(validate_file_blocks("m", Some(&json!(["str"]))).is_ok());
+}
+
+/// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
+/// becomes a `text` attachment notice naming the metadata and directing the
+/// model to `ws.file.getAttachment(attachmentId)`; inline-data file blocks
+/// keep the `resource` blob shape.
+#[test]
+fn append_attachment_blocks_renders_attachment_reference_notice() {
+    let options = super::TurnOptions {
+        file_blocks: Some(json!([
+            { "type": "file", "attachmentId": "att-9", "fileName": "big.har",
+              "mimeType": "application/json", "size": 4096 },
+            { "type": "file", "data": "aGk=", "mimeType": "text/plain", "fileName": "inline.txt" },
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let mut blocks = Vec::new();
+    super::append_attachment_blocks(&mut blocks, &options);
+    assert_eq!(blocks.len(), 2);
+    let notice = serde_json::to_value(&blocks[0]).unwrap();
+    assert_eq!(notice["type"], json!("text"));
+    let text = notice["text"].as_str().unwrap();
+    assert!(text.contains("big.har"), "{text}");
+    assert!(text.contains("application/json"), "{text}");
+    assert!(text.contains("4096 bytes"), "{text}");
+    assert!(text.contains("ws.file.getAttachment(\"att-9\")"), "{text}");
+    let inline = serde_json::to_value(&blocks[1]).unwrap();
+    assert_eq!(inline["type"], json!("resource"));
+    assert_eq!(inline["resource"]["blob"], json!("aGk="));
 }
 
 /// STAB-133: the queue-drain `persist_user` path appends the FE-supplied

@@ -7,13 +7,13 @@
 use std::path::{Path, PathBuf};
 
 use intent_core::transfer::{
-    TransferAsset, TransferGitSummary, TransferManifest, TransferPlan, TransferTableStat,
-    TransferWarning, TRANSFER_FORMAT_VERSION,
+    TransferAsset, TransferAttachment, TransferGitSummary, TransferManifest, TransferPlan,
+    TransferTableStat, TransferWarning, TRANSFER_FORMAT_VERSION,
 };
-use intent_core::{clock::now_iso, AgentStatus, Error, Result, WorkspaceId};
+use intent_core::{clock::now_iso, AgentStatus, Error, Result, Workspace, WorkspaceId};
 use intent_store::SandboxStatus;
 
-use crate::{git_ops, Services};
+use crate::{file_ops, git_ops, Services};
 
 impl Services {
     /// Build the transfer plan for `id`: per-table row stats (spec §1
@@ -31,6 +31,7 @@ impl Services {
 
         let tables = self.store.transfer_table_stats(&id).await?;
         let assets = self.transfer_assets(&id).await;
+        let attachments = self.transfer_attachments(&id, &ws).await?;
 
         // Sandbox branches ride in the bundle only while they can still hold
         // unmerged work; merged/discarded sandboxes may have deleted branches.
@@ -140,6 +141,7 @@ impl Services {
             .map(|t: &TransferTableStat| t.approx_bytes.max(0) as u64)
             .sum();
         let asset_bytes: u64 = assets.iter().map(|a| a.size_bytes).sum();
+        let attachment_bytes: u64 = attachments.iter().map(|a| a.size_bytes).sum();
 
         let manifest = TransferManifest {
             format_version: TRANSFER_FORMAT_VERSION,
@@ -148,17 +150,60 @@ impl Services {
             created_at: now_iso(),
             tables,
             assets,
+            attachments,
             git,
         };
 
         Ok(TransferPlan {
-            total_size_bytes: db_row_bytes + asset_bytes + estimated_git_bundle_bytes,
+            total_size_bytes: db_row_bytes
+                + asset_bytes
+                + attachment_bytes
+                + estimated_git_bundle_bytes,
             db_row_bytes,
             asset_bytes,
+            attachment_bytes,
             estimated_git_bundle_bytes,
             manifest,
             warnings,
         })
+    }
+
+    /// List the workspace's attachment-registry rows as manifest entries,
+    /// probing each stored file in the canonical workspace store. A row whose
+    /// file is gone (deleted-is-deleted) is listed with `exists: false` and 0
+    /// bytes — the row still transfers, the archive just carries no file
+    /// entry for it. A registry row whose `stored_path` escapes the workspace
+    /// root is treated the same way (never read outside the store).
+    pub(crate) async fn transfer_attachments(
+        &self,
+        id: &WorkspaceId,
+        ws: &Workspace,
+    ) -> Result<Vec<TransferAttachment>> {
+        let records = self.store.list_attachments(id).await?;
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = file_ops::workspace_root(ws);
+        Ok(records
+            .into_iter()
+            .map(|r| {
+                let size = if root.is_empty() {
+                    None
+                } else {
+                    file_ops::resolve_attachment_source(&root, &r.stored_path)
+                        .ok()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                };
+                TransferAttachment {
+                    id: r.id,
+                    file_name: r.file_name,
+                    size_bytes: size.unwrap_or(0),
+                    exists: size.is_some(),
+                }
+            })
+            .collect())
     }
 
     /// List `<assets_root>/<workspaceId>/` as manifest assets (id = file
@@ -306,6 +351,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stats: None,
@@ -406,6 +452,29 @@ mod tests {
         std::fs::create_dir_all(assets_root.0.join(&ws.0)).expect("mkdir assets");
         std::fs::write(assets_root.0.join(&ws.0).join("img.png"), b"12345").expect("asset");
 
+        // Two registry rows: one with its stored file present, one whose
+        // file was deleted out-of-band (deleted-is-deleted). The ignore-all
+        // marker mirrors place_attachment so the store stays out of git
+        // status (and out of dirtyFiles).
+        let att_dir = repo.0.join(".intent/attachments");
+        std::fs::create_dir_all(&att_dir).expect("attachments dir");
+        std::fs::write(att_dir.join(".gitignore"), "*\n").expect("marker");
+        std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
+        for (id, name) in [("att-1", "doc.pdf"), ("att-2", "gone.txt")] {
+            store
+                .insert_attachment(&intent_store::AttachmentRecord {
+                    id: id.to_string(),
+                    workspace_id: ws.clone(),
+                    file_name: name.to_string(),
+                    mime_type: None,
+                    size: 16,
+                    uploaded_at: intent_core::clock::now_iso(),
+                    stored_path: format!(".intent/attachments/{name}"),
+                })
+                .await
+                .expect("attachment row");
+        }
+
         let svc = Services::new(store).with_assets_root(assets_root.0.clone());
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
@@ -437,12 +506,24 @@ mod tests {
         assert_eq!(m.git.dirty_files, vec!["dirty.txt".to_string()]);
         assert_eq!(m.git.sandbox_branches, vec!["sandbox/agent-1".to_string()]);
 
+        assert_eq!(m.attachments.len(), 2);
+        let att = |id: &str| m.attachments.iter().find(|a| a.id == id).expect("att");
+        assert!(att("att-1").exists);
+        assert_eq!(att("att-1").size_bytes, 16);
+        assert_eq!(att("att-1").file_name, "doc.pdf");
+        assert!(!att("att-2").exists, "deleted file → exists: false");
+        assert_eq!(att("att-2").size_bytes, 0);
+
         assert!(plan.db_row_bytes > 0);
         assert_eq!(plan.asset_bytes, 5);
+        assert_eq!(plan.attachment_bytes, 16);
         assert!(plan.estimated_git_bundle_bytes > 0);
         assert_eq!(
             plan.total_size_bytes,
-            plan.db_row_bytes + plan.asset_bytes + plan.estimated_git_bundle_bytes
+            plan.db_row_bytes
+                + plan.asset_bytes
+                + plan.attachment_bytes
+                + plan.estimated_git_bundle_bytes
         );
 
         let codes: Vec<&str> = plan.warnings.iter().map(|w| w.code.as_str()).collect();
@@ -533,6 +614,12 @@ mod tests {
                     id: "a".to_string(),
                     size_bytes: 3,
                 }],
+                attachments: vec![intent_core::transfer::TransferAttachment {
+                    id: "att-1".to_string(),
+                    file_name: "spec.pdf".to_string(),
+                    size_bytes: 4,
+                    exists: true,
+                }],
                 git: intent_core::transfer::TransferGitSummary {
                     has_repository: true,
                     branch: Some("main".to_string()),
@@ -540,9 +627,10 @@ mod tests {
                     sandbox_branches: vec![],
                 },
             },
-            total_size_bytes: 5,
+            total_size_bytes: 9,
             db_row_bytes: 2,
             asset_bytes: 3,
+            attachment_bytes: 4,
             estimated_git_bundle_bytes: 0,
             warnings: vec![],
         };
@@ -552,10 +640,14 @@ mod tests {
         assert_eq!(v["manifest"]["tables"][0]["rowCount"], 1);
         assert_eq!(v["manifest"]["tables"][0]["approxBytes"], 2);
         assert_eq!(v["manifest"]["assets"][0]["sizeBytes"], 3);
+        assert_eq!(v["manifest"]["attachments"][0]["fileName"], "spec.pdf");
+        assert_eq!(v["manifest"]["attachments"][0]["sizeBytes"], 4);
+        assert_eq!(v["manifest"]["attachments"][0]["exists"], true);
         assert_eq!(v["manifest"]["git"]["hasRepository"], true);
-        assert_eq!(v["totalSizeBytes"], 5);
+        assert_eq!(v["totalSizeBytes"], 9);
         assert_eq!(v["dbRowBytes"], 2);
         assert_eq!(v["assetBytes"], 3);
+        assert_eq!(v["attachmentBytes"], 4);
         assert_eq!(v["estimatedGitBundleBytes"], 0);
     }
 }

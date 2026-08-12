@@ -485,6 +485,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: now_iso(),
