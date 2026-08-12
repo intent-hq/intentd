@@ -501,7 +501,7 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
 
 #[cfg(unix)]
 #[test]
-fn resolve_binary_path_finds_non_default_nvm_version() {
+fn resolve_binary_path_prefers_newest_nvm_node_version() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = unique_temp_dir("nvm-multi-version-home");
@@ -509,19 +509,41 @@ fn resolve_binary_path_finds_non_default_nvm_version() {
     let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
     std::fs::create_dir_all(&v20_bin).unwrap();
     std::fs::create_dir_all(&v24_bin).unwrap();
-    std::fs::write(v20_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
-
-    let name = format!(
-        "intent-nvm-binary-{}",
-        home.path().file_name().unwrap().to_string_lossy()
-    );
-    let binary = v24_bin.join(&name);
+    let older_binary = v20_bin.join("node");
+    std::fs::write(&older_binary, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&older_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = v24_bin.join("node");
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let resolved = resolve_binary_path_with_home(&name, &[], home.path());
+    let resolved = resolve_binary_path_with_home("node", &[], home.path());
 
     assert_eq!(resolved.as_deref(), Some(binary.as_path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_skips_non_executable_nvm_node_for_path_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_temp_dir("nvm-non-executable-home");
+    let nvm_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+    let path_bin = home.path().join("path-bin");
+    std::fs::create_dir_all(&nvm_bin).unwrap();
+    std::fs::create_dir_all(&path_bin).unwrap();
+    let non_executable = nvm_bin.join("node");
+    std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path_node = path_bin.join("node");
+    std::fs::write(&path_node, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool_dirs = vec![nvm_bin];
+
+    let resolved = resolve_binary_path_with_tool_dirs_and_lookup("node", &[], &tool_dirs, |_| {
+        Some(path_node.clone())
+    });
+
+    assert_eq!(resolved.as_deref(), Some(path_node.as_path()));
 }
 
 /// `find_binary_op` caches a POSITIVE resolution: removing the resolved
