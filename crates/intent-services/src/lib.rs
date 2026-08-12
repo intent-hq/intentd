@@ -703,7 +703,18 @@ pub struct Services {
     /// drops sessions (staging dirs are swept at boot and lazily by the next
     /// `start`), and the FE simply restarts the export.
     transfer_exports: Arc<Mutex<HashMap<String, transfer_export::ExportSession>>>,
+    /// Test seam: when set, consulted between export archive build stages
+    /// with the name of the stage about to run; returning an error fails the
+    /// build at that point, exercising the `workspace:transfer:failed`
+    /// cleanup path. Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `with_export_build_failpoint`.
+    export_build_failpoint: Option<ExportBuildFailpoint>,
 }
+
+/// Test-only export build failpoint (see
+/// [`Services::export_build_failpoint`]): given the name of the stage about
+/// to run, returning `Some(error)` fails the build there.
+pub(crate) type ExportBuildFailpoint = Arc<dyn Fn(&str) -> Option<Error> + Send + Sync>;
 
 /// Pause inserted between per-workspace iterations of the background sweeps
 /// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
@@ -803,6 +814,7 @@ impl Services {
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
+            export_build_failpoint: None,
         }
     }
 
@@ -2371,6 +2383,16 @@ impl Services {
     /// else `~/intent/workspaces`); tests inject a temp dir.
     pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
         self.workspaces_root = Some(root);
+        self
+    }
+
+    /// Test-only: fail the export archive build mid-flight. The closure is
+    /// consulted with the name of each build stage about to run; returning
+    /// `Some(error)` fails the build there, exercising the
+    /// `workspace:transfer:failed` cleanup path.
+    #[cfg(test)]
+    pub(crate) fn with_export_build_failpoint(mut self, failpoint: ExportBuildFailpoint) -> Self {
+        self.export_build_failpoint = Some(failpoint);
         self
     }
 

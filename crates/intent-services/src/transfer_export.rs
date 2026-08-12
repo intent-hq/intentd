@@ -337,6 +337,7 @@ impl Services {
         if self.export_aborted(export_id) {
             return Ok(None);
         }
+        self.check_export_failpoint("bundling-git")?;
 
         // Stage 3: git bundle (skipped when the workspace has no repository).
         // On success the WIP snapshot commits stay in place — they are what
@@ -397,6 +398,7 @@ impl Services {
         if self.export_aborted(export_id) {
             return Ok(None);
         }
+        self.check_export_failpoint("writing-archive")?;
 
         // Stage 4: write + seal the zip archive, hashing as it goes.
         self.emit_export_progress(&id, export_id, "writing-archive", None)
@@ -572,6 +574,17 @@ impl Services {
             "exportId": export_id,
             "aborted": true,
         }))
+    }
+
+    /// Consult the test-only failpoint before the named build stage; a
+    /// returned error fails the build through the normal
+    /// `workspace:transfer:failed` path. Always `Ok(())` in production
+    /// wiring (the seam is `None`).
+    fn check_export_failpoint(&self, stage: &str) -> Result<()> {
+        match self.export_build_failpoint.as_ref().and_then(|f| f(stage)) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// True when the session is gone or flagged aborted (build-task stage
@@ -1290,6 +1303,150 @@ mod tests {
                     && s.status() == git2::Status::WT_NEW),
             "dirty.txt is untracked again"
         );
+    }
+
+    /// Sorted (path, status) pairs — the exact staged/unstaged/untracked
+    /// split — for asserting a repo is restored bit-for-bit after an unwind.
+    fn status_fingerprint(repo_path: &Path) -> Vec<(String, git2::Status)> {
+        let repo = git2::Repository::open(repo_path).expect("open repo");
+        let statuses = repo
+            .statuses(Some(git2::StatusOptions::new().include_untracked(true)))
+            .expect("statuses");
+        let mut fingerprint: Vec<(String, git2::Status)> = statuses
+            .iter()
+            .map(|s| (s.path().unwrap_or_default().to_string(), s.status()))
+            .collect();
+        fingerprint.sort_by(|a, b| a.0.cmp(&b.0));
+        fingerprint
+    }
+
+    /// Failure contract (the branch intentd#1118 flagged as untested): the
+    /// build fails mid-flight AFTER bundling produced staging artifacts and
+    /// a WIP snapshot. Asserts staging is cleaned, `workspace:transfer:failed`
+    /// carries the right payload, the WIP snapshot is unwound (status
+    /// fingerprint identical, staged/unstaged split preserved), no session
+    /// stays registered, and a retry on the same workspace succeeds.
+    #[tokio::test]
+    async fn export_build_failure_cleans_up_and_allows_retry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ws_root = TempDir::new("export-ws-root");
+        let assets_root = TempDir::new("export-assets-root");
+        let db = std::env::temp_dir().join(format!("export-test-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&db).await.expect("open store");
+        let bus = crate::EventBus::new(store.clone());
+        let armed = Arc::new(AtomicBool::new(true));
+        let failpoint_armed = armed.clone();
+        let svc = Services::new(store)
+            .with_workspaces_root(ws_root.0.clone())
+            .with_assets_root(assets_root.0.clone())
+            .with_event_bus(bus.clone())
+            .with_export_build_failpoint(Arc::new(move |stage: &str| {
+                (stage == "writing-archive" && failpoint_armed.load(Ordering::SeqCst))
+                    .then(|| Error::Internal("injected archive-write failure".to_string()))
+            }));
+        let id = WorkspaceId("ws-fail".to_string());
+
+        // A repo with every dirty flavor: a staged new file, an unstaged
+        // modification, and an untracked file.
+        let repo_path = ws_root.0.join(&id.0).join("repo");
+        std::fs::create_dir_all(&repo_path).expect("repo dir");
+        {
+            let repo = git2::Repository::init_opts(
+                &repo_path,
+                git2::RepositoryInitOptions::new().initial_head("main"),
+            )
+            .expect("init");
+            std::fs::write(repo_path.join("README.md"), "hello\n").expect("file");
+            let sig = git2::Signature::now("Test", "test@example.com").expect("sig");
+            let tree_id = {
+                let mut index = repo.index().expect("index");
+                index.add_path(Path::new("README.md")).expect("add");
+                index.write().expect("write");
+                index.write_tree().expect("tree")
+            };
+            let tree = repo.find_tree(tree_id).expect("tree");
+            repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+                .expect("commit");
+            std::fs::write(repo_path.join("staged.txt"), "staged\n").expect("staged");
+            let mut index = repo.index().expect("index");
+            index.add_path(Path::new("staged.txt")).expect("add staged");
+            index.write().expect("write index");
+        }
+        std::fs::write(repo_path.join("README.md"), "hello\nmodified\n").expect("modify");
+        std::fs::write(repo_path.join("untracked.txt"), "untracked\n").expect("untracked");
+        let before = status_fingerprint(&repo_path);
+        assert_eq!(before.len(), 3, "three dirty entries seeded: {before:?}");
+
+        let mut ws = crate::tests::workspace(&id);
+        ws.repository_path = Some(repo_path.to_string_lossy().to_string());
+        svc.store.insert_workspace(&ws).await.expect("workspace");
+
+        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
+            workspace_id: Some(id.0.clone()),
+            ..Default::default()
+        });
+
+        let started = svc
+            .workspace_export_start_op(id.clone())
+            .await
+            .expect("start");
+        let export_id = started["exportId"].as_str().unwrap().to_string();
+
+        // The failed event is published AFTER cleanup, so receiving it means
+        // the failure path has fully settled.
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
+            .await
+            .expect("failed event delivered")
+            .expect("subscription open");
+        let failed = batch
+            .iter()
+            .find(|e| e.event_type == WORKSPACE_TRANSFER_FAILED)
+            .expect("workspace:transfer:failed event");
+        assert_eq!(failed.data["workspaceId"], serde_json::json!(id.as_str()));
+        assert_eq!(failed.data["exportId"], serde_json::json!(export_id));
+        let reason = failed.data["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("injected archive-write failure"),
+            "reason carries the build error: {reason}"
+        );
+
+        // No session left registered; staging is gone.
+        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(!svc.export_staging_root().join(&export_id).exists());
+
+        // The WIP snapshot (bundling had already run when the build failed)
+        // was unwound: HEAD is the original commit and the exact
+        // staged/unstaged/untracked split is restored.
+        {
+            let repo = git2::Repository::open(&repo_path).expect("reopen");
+            let head_msg = repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .message()
+                .unwrap_or("")
+                .to_string();
+            assert_eq!(head_msg.trim(), "Initial commit");
+        }
+        assert_eq!(status_fingerprint(&repo_path), before);
+
+        // The workspace stays usable: with the failpoint disarmed the same
+        // workspace exports successfully.
+        armed.store(false, Ordering::SeqCst);
+        let retried = svc
+            .workspace_export_start_op(id.clone())
+            .await
+            .expect("retry start");
+        let retry_id = retried["exportId"].as_str().unwrap().to_string();
+        assert!(wait_ready(&svc, &retry_id).await, "retry must succeed");
+        svc.workspace_export_abort_op(retry_id)
+            .await
+            .expect("abort");
+        assert_eq!(status_fingerprint(&repo_path), before);
     }
 
     /// The orphan sweep clears stale staging dirs but leaves dirs whose id
