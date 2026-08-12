@@ -8462,8 +8462,10 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// terminal/non-terminal clarity: `true` on the ungrouped delivery path
 /// (where `remove_watch` retired the one-shot watch just before delivery)
 /// appends an explicit "watch consumed / retired" note with a
-/// `ws.agent.watch` re-arm pointer; `false` on the immediate grouped-failure
-/// path, whose watch stays armed for group settlement.
+/// `ws.agent.watch` re-arm pointer (or, for `agent:deleted`, a "cannot be
+/// re-watched" note — a deleted agent is rejected by `agent.watch` and has
+/// no next completion); `false` on the immediate grouped-failure path,
+/// whose watch stays armed for group settlement.
 fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
@@ -8518,11 +8520,21 @@ fn format_completion_wake(
         }
     }
     if watch_retired {
-        msg.push_str(&format!(
-            " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
-             retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
-            child_id.0
-        ));
+        // A deleted agent fails closed in `agent.watch` (rejected as unknown)
+        // and has no next completion, so the deleted-kind wake must not carry
+        // the re-arm pointer — say the agent cannot be re-watched instead.
+        if event.event_type == AGENT_DELETED {
+            msg.push_str(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
+                 now retired. The agent was deleted, so it cannot be re-watched.",
+            );
+        } else {
+            msg.push_str(&format!(
+                " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
+                 retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
+                child_id.0
+            ));
+        }
     }
     msg
 }

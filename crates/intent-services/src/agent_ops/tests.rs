@@ -22607,11 +22607,21 @@ async fn agent_watch_removed_after_target_deleted() {
         svc.list_watches_for_parent(&watcher).is_empty(),
         "persistent watch must not survive the target's deletion"
     );
-    // monorepo#2051: the deleted-kind wake carries the same retirement note.
+    // monorepo#2051: the deleted-kind wake carries the same retirement note,
+    // but NOT the re-arm pointer — a deleted agent is rejected by
+    // `agent.watch` and has no next completion.
     let text = parent_messages_text(&svc, &watcher).await;
     assert!(
         text.contains("the watch is now retired"),
         "deleted wake states the retirement: {text}"
+    );
+    assert!(
+        text.contains("The agent was deleted, so it cannot be re-watched"),
+        "deleted wake states the target cannot be re-watched: {text}"
+    );
+    assert!(
+        !text.contains("ws.agent.watch("),
+        "deleted wake carries no dead-end re-arm pointer: {text}"
     );
 }
 
