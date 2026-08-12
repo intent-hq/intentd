@@ -68,6 +68,7 @@ use intent_core::{
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId,
     NoteMetadata, NoteVisibility, TaskMetadata, Workspace,
 };
+use intent_services::{publish_workspace_created, EventBus};
 use intent_store::Store;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -114,7 +115,7 @@ const MANAGED_BY_INTENTD: &str = "intentd";
 const MANAGED_SKIP_REASON: &str = "daemon-managed manifest";
 
 /// Inputs for one import run.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// Legacy roots to scan, in priority order (first occurrence of an id wins).
     pub roots: Vec<PathBuf>,
@@ -128,6 +129,24 @@ pub struct Options {
     /// Legacy Electron app-level dir holding `config.json` /
     /// `repo-registry.json`. `None` disables the app-level blob import.
     pub app_dir: Option<PathBuf>,
+    /// Event bus for `workspace:created` publishes on freshly inserted rows,
+    /// so live subscribers (FE clients, the `WatcherRegistry`) learn about
+    /// workspaces the importer writes directly through `Store`. `None`
+    /// (the CLI path, tests) disables event emission.
+    pub event_bus: Option<EventBus>,
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Options")
+            .field("roots", &self.roots)
+            .field("dry_run", &self.dry_run)
+            .field("force", &self.force)
+            .field("assets_root", &self.assets_root)
+            .field("app_dir", &self.app_dir)
+            .field("event_bus", &self.event_bus.is_some())
+            .finish()
+    }
 }
 
 /// Outcome for one candidate workspace directory.
@@ -622,6 +641,10 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                     }
                     report.entries.push(entry);
                 }
+                // A panicked unit never returns `claimed`, so its id is not
+                // recorded as seen — a same-id dir under a later root gets a
+                // fresh attempt instead of a duplicate skip (harmless: the
+                // importer is idempotent, so it is effectively a free retry).
                 Err(e) => {
                     let dir_id = dir
                         .file_name()
@@ -876,6 +899,15 @@ async fn import_one(
         Err(e) => Outcome::Skipped(format!("lookup failed: {e}")),
     };
     let landed = matches!(outcome, Outcome::Imported | Outcome::Updated);
+    // A freshly inserted row (not a `--force` overwrite of an existing one)
+    // is a new workspace as far as live subscribers are concerned: publish
+    // `workspace:created` so connected clients refresh their lists and the
+    // `WatcherRegistry` registers the workspace's watch roots at runtime.
+    if matches!(outcome, Outcome::Imported) && !opts.dry_run {
+        if let Some(bus) = &opts.event_bus {
+            publish_workspace_created(bus, &ws).await;
+        }
+    }
     let mut entry = WorkspaceReport::new(id, dir, outcome);
     if landed && !opts.dry_run {
         import_workspace_extras(store, &ws, dir, opts.assets_root.as_deref(), &mut entry).await;
@@ -2121,6 +2153,7 @@ pub async fn run_first_boot_import(
     roots: Vec<PathBuf>,
     assets_root: Option<PathBuf>,
     app_dir: Option<PathBuf>,
+    event_bus: Option<EventBus>,
     resumed: bool,
 ) {
     tracing::info!(
@@ -2133,6 +2166,7 @@ pub async fn run_first_boot_import(
         force: false,
         assets_root,
         app_dir,
+        event_bus,
     };
     match run(store, &opts).await {
         Ok(report) => {
@@ -2196,6 +2230,7 @@ pub async fn maybe_import_on_first_boot(
                 roots,
                 assets_root,
                 app_dir,
+                None,
                 decision == FirstBootDecision::Resume,
             )
             .await
@@ -2336,6 +2371,48 @@ mod tests {
             .await
             .unwrap();
         assert!(b.archived);
+    }
+
+    /// `workspace:created` is published once per freshly inserted row (and
+    /// only then: a re-run that skips existing rows publishes nothing).
+    #[tokio::test]
+    async fn publishes_workspace_created_only_for_fresh_inserts() {
+        let (root, _root_g) = temp_root("created-events");
+        write_legacy_workspace(&root, "ws-evt", json!({}));
+        let (store, _db_g) = open_store().await;
+        let bus = EventBus::new(store.clone());
+        let mut sub = bus.subscribe(intent_services::SubscriptionFilter {
+            event_types: vec!["workspace:created".to_string()],
+            ..Default::default()
+        });
+        let mut options = opts(vec![root.clone()]);
+        options.event_bus = Some(bus.clone());
+
+        let report = run(&store, &options).await.unwrap();
+        assert_eq!(report.imported(), 1, "{report}");
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("workspace:created not published")
+            .expect("subscription closed");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].event_type, "workspace:created");
+        assert_eq!(batch[0].workspace_id.as_str(), "ws-evt");
+        assert_eq!(batch[0].data["workspaceId"], "ws-evt");
+        assert!(
+            batch[0].data["workspace"].is_object(),
+            "{:?}",
+            batch[0].data
+        );
+
+        // Idempotent re-run: the row exists, so no second event.
+        let second = run(&store, &options).await.unwrap();
+        assert_eq!(second.skipped(), 1, "{second}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), sub.recv())
+                .await
+                .is_err(),
+            "skip must not publish workspace:created"
+        );
     }
 
     #[tokio::test]
@@ -2903,7 +2980,7 @@ mod tests {
             decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
             FirstBootDecision::Resume
         );
-        run_first_boot_import(&store, vec![root.clone()], None, None, true).await;
+        run_first_boot_import(&store, vec![root.clone()], None, None, None, true).await;
 
         // Both workspaces present (ws-a was skipped as already in DB), the
         // completion marker is written, and the pending marker is cleared.

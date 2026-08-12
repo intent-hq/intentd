@@ -7370,6 +7370,16 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
     }
 }
 
+/// Publish a `workspace:created` event for a workspace row inserted outside
+/// the `Services` surface (the legacy importer writes through `Store`
+/// directly, so `create_workspace`'s own publish never fires). Best-effort
+/// like every change-event publish: failures are logged, never returned.
+pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
+    if let Err(e) = bus.publish(&workspace_created_event(ws)).await {
+        tracing::warn!(error = %e, "failed to publish workspace:created event");
+    }
+}
+
 /// Build a `workspace:updated` event for a workspace whose row was just
 /// mutated (§6.5). Payload `{ workspaceId, changes }` mirrors the reference
 /// FE emitter — `changes` is the caller-supplied `WorkspaceUpdate` diff (the
