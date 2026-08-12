@@ -571,6 +571,14 @@ pub(crate) struct LiveTurn {
     /// live-turn slot so the throttle resets with the slot on stream
     /// end/failure/abort — the next turn's first activity is immediate again.
     pub(crate) last_activity_emit: Option<std::time::Instant>,
+    /// Pinned by [`pin_live_turn`](Services::pin_live_turn) on the teardown
+    /// paths (monorepo#2056): the slot stays published across the
+    /// `worker.abort()` → [`flush_partial_turn_on_interruption`] gap instead of
+    /// vanishing with the [`LiveTurnGuard`] drop, so a `chat.subscribe`
+    /// snapshot landing in that gap — busy still `true`, the interrupted row
+    /// not yet durable — can still reconstruct the partial turn. Cleared with
+    /// the slot itself by the flush.
+    pub(crate) flush_pending: bool,
 }
 
 /// Machine-readable cause of a turn interruption, stamped as
@@ -671,6 +679,14 @@ pub(crate) type TurnBookkeeping = Arc<Mutex<HashMap<AgentId, tokio::task::JoinHa
 /// the interrupt/abort path, where the worker future is dropped before
 /// `stream:end` is reached. Without it an aborted turn would leave a stale
 /// in-flight message in the snapshot forever.
+///
+/// One exception (monorepo#2056): a slot pinned by
+/// [`pin_live_turn`](Services::pin_live_turn) survives the drop, because the
+/// teardown path that pinned it is about to persist the same content via
+/// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
+/// — which clears the slot itself. That hands the slot's lifetime to the flush
+/// and closes the window in which the content was neither published nor
+/// durable.
 pub(crate) struct LiveTurnGuard<'a> {
     live_turns: &'a LiveTurns,
     agent_id: AgentId,
@@ -679,6 +695,12 @@ pub(crate) struct LiveTurnGuard<'a> {
 impl Drop for LiveTurnGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut slots) = self.live_turns.lock() {
+            // A pinned slot is owned by the in-progress interrupt flush; the
+            // orphan case the guard exists for (no flush coming — panic, plain
+            // abort) is unpinned and still cleared here.
+            if slots.get(&self.agent_id).is_some_and(|s| s.flush_pending) {
+                return;
+            }
             slots.remove(&self.agent_id);
         }
     }
@@ -1078,6 +1100,7 @@ impl Services {
                     final_text_block_open,
                     last_activity_at: now_iso(),
                     last_activity_emit: None,
+                    flush_pending: false,
                 },
             );
         }
@@ -1133,6 +1156,30 @@ impl Services {
         self.live_turns.lock().ok()?.get(agent_id).cloned()
     }
 
+    /// Snapshot an agent's in-flight turn slot AND pin it (monorepo#2056): the
+    /// [`LiveTurnGuard`] drop that follows `worker.abort()` leaves a pinned
+    /// slot published, so the partial content stays visible to `chat.subscribe`
+    /// until [`flush_partial_turn_on_interruption`](Self::flush_partial_turn_on_interruption)
+    /// makes it durable (that flush clears the slot, releasing the pin).
+    /// Without the pin the content is neither published nor persisted for the
+    /// width of the interrupt flush's INSERT, and a snapshot taken there drops
+    /// the whole partial turn — permanently, since nothing re-publishes it.
+    ///
+    /// Read-and-pin is one locked step so a slot can never be pinned without
+    /// the caller holding the snapshot it must flush. Callers are exactly the
+    /// three teardown paths (keep-alive interrupt, hard stop, graceful
+    /// shutdown), which call this INSTEAD of [`live_turn`](Self::live_turn)
+    /// immediately before aborting the worker; a `None` return means no slot
+    /// (nothing pinned, nothing to flush). Pinning is idempotent and never
+    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
+    /// replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> Option<LiveTurn> {
+        let mut slots = self.live_turns.lock().ok()?;
+        let slot = slots.get_mut(agent_id)?;
+        slot.flush_pending = true;
+        Some(slot.clone())
+    }
+
     /// Read just the text of the live-turn slot's `type: "text"` blocks
     /// (plus the slot's final-text-block-open flag) without cloning the full
     /// slot — the `AgentLite` preview overlay only needs the text strings, so
@@ -1167,14 +1214,16 @@ impl Services {
     /// is kept as a redundant tag) so the transcript keeps the streamed-so-far
     /// output across the restart. Reuses the turn's minted `message_id` (CS-0
     /// D1) so persisted block ids `{messageId}:{index}` match what streamed.
-    /// The caller snapshots the slot via [`live_turn`](Self::live_turn) BEFORE
-    /// aborting the turn worker (the abort drops [`LiveTurnGuard`], clearing
-    /// the slot) and flushes AFTER the abort so the worker cannot race the
-    /// append; if the worker already persisted the full turn, the append
-    /// collides on the UNIQUE id and is logged at debug (benign — the full row
-    /// won; the stale slot, if any, is cleared). Errors are logged and
-    /// swallowed: this must never block shutdown or the interrupted_agent row
-    /// insert.
+    /// The caller snapshots-and-pins the slot via
+    /// [`pin_live_turn`](Self::pin_live_turn) BEFORE aborting the turn worker
+    /// and flushes AFTER the abort so the worker cannot race the append; the
+    /// pin keeps the slot published across that gap (monorepo#2056) and this
+    /// flush owns releasing it. If the worker already persisted the full turn,
+    /// the append collides on the UNIQUE id and is logged at debug (benign —
+    /// the full row won; the stale slot, if any, is cleared). Errors are logged
+    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// row insert. On a genuine store error the slot is deliberately KEPT (pin
+    /// and all) as the only remaining copy of the content.
     ///
     /// The row also carries a machine-readable `interruptReason` (plus
     /// `interruptedBy` sender attribution for message preemption) so the FE
@@ -2133,6 +2182,7 @@ impl Services {
             final_text_block_open: false,
             last_activity_at: now_iso(),
             last_activity_emit: None,
+            flush_pending: false,
         };
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(

@@ -1765,3 +1765,246 @@ mod chat_message_delta {
         assert_eq!(terminal["updated"][0]["role"], "assistant");
     }
 }
+
+// --- chat_snapshot — the interrupt-flush drop window (monorepo#2056) -------
+
+mod chat_snapshot_interrupt_window {
+    use super::*;
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+
+    /// The three states an interrupted turn passes through, in order, as
+    /// `AgentManager::interrupt_inner` / `detach_with_redelivery` tear it down.
+    /// The busy claim is held across ALL of them — it is released by `end_turn`
+    /// only after the flush — so `agent_is_busy` is `true` throughout.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        /// Mid-turn: the live-turn slot carries the partial content, nothing
+        /// is persisted yet.
+        Streaming,
+        /// The window: `worker.abort()` dropped the `LiveTurnGuard` and
+        /// `flush_partial_turn_on_interruption` has not yet written the
+        /// interrupted assistant row. The teardown path pinned the slot before
+        /// the abort (monorepo#2056), so it is still published here.
+        PinnedRowNotYetPersisted,
+        /// The flush landed: the interrupted row is in the conversation page
+        /// and the flush cleared the slot (releasing the pin).
+        Flushed,
+    }
+
+    /// Minimal `WorkspaceApi` that replays the teardown sequence above
+    /// deterministically — no sleeps, no scheduler races: the test steps the
+    /// phase by hand and takes a snapshot at each step.
+    struct InterruptWindowApi {
+        phase: std::sync::Mutex<Phase>,
+    }
+
+    impl InterruptWindowApi {
+        fn new() -> Self {
+            Self {
+                phase: std::sync::Mutex::new(Phase::Streaming),
+            }
+        }
+
+        fn set(&self, phase: Phase) {
+            *self.phase.lock().unwrap() = phase;
+        }
+
+        fn phase(&self) -> Phase {
+            *self.phase.lock().unwrap()
+        }
+    }
+
+    impl WorkspaceApi for InterruptWindowApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let flushed = self.phase() == Phase::Flushed;
+            Box::pin(async move {
+                let mut messages = vec![json!({
+                    "id": "m-0",
+                    "role": "user",
+                    "seq": 0,
+                    "contentBlocks": [{ "id": "m-0:0", "type": "text", "text": "Run the tests" }],
+                })];
+                if flushed {
+                    messages.push(json!({
+                        "id": "msg-live",
+                        "role": "assistant",
+                        "seq": 1,
+                        "contentBlocks": [
+                            { "id": "msg-live:0", "type": "text", "text": "I'll run " }
+                        ],
+                        "metadata": { "interrupted": true, "interruptReason": "user_stop" },
+                    }));
+                }
+                let total = messages.len();
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": messages,
+                    "truncated": false,
+                    "totalMessages": total,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        /// Held across the whole teardown: `end_turn` runs only after the
+        /// flush, so the busy gate never opens inside the window.
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            true
+        }
+
+        /// Published until the flush clears it: mid-turn by the streaming
+        /// path, and across the abort→flush window by the teardown path's pin
+        /// (`Services::pin_live_turn`, which makes the slot survive the
+        /// `LiveTurnGuard` drop).
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            (self.phase() != Phase::Flushed).then(|| {
+                json!({
+                    "messageId": "msg-live",
+                    "contentBlocks": [
+                        { "id": "msg-live:0", "type": "text", "text": "I'll run " }
+                    ],
+                })
+            })
+        }
+    }
+
+    /// A genuinely orphaned slot: content is still published but no worker is
+    /// in flight (the turn died with no flush behind it, and the busy claim is
+    /// gone). Nothing may be merged from it.
+    struct OrphanSlotApi;
+
+    impl WorkspaceApi for OrphanSlotApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": "m-0",
+                        "role": "user",
+                        "seq": 0,
+                        "contentBlocks": [{ "id": "m-0:0", "type": "text", "text": "Run the tests" }],
+                    }],
+                    "truncated": false,
+                    "totalMessages": 1,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            false
+        }
+
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            Some(json!({
+                "messageId": "msg-orphan",
+                "contentBlocks": [
+                    { "id": "msg-orphan:0", "type": "text", "text": "I'll run " }
+                ],
+            }))
+        }
+    }
+
+    fn assistant_ids(snap: &Value) -> Vec<String> {
+        snap["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// monorepo#2056 — a `chat.subscribe` landing anywhere in an interrupt
+    /// teardown serves the partial turn, with no gap: mid-turn from the live
+    /// slot, across the abort→flush window from the SAME slot (kept published
+    /// by the teardown path's pin, since the interrupted row is not durable
+    /// yet), and after the flush from the persisted row. Before the pin the
+    /// middle snapshot carried no in-flight message at all, so a
+    /// wholesale-rebuilding reconciler dropped the whole partial turn — and
+    /// never healed, because a subscription that merged nothing learns no
+    /// `messageId` to reconcile the terminal `agent:stream:end` against.
+    ///
+    /// Note which gate is load-bearing: `agent_is_busy` is `true` in all three
+    /// phases (the busy slot is released by `end_turn` only AFTER the flush),
+    /// so the hypothesized "busy cleared before the row persisted" ordering was
+    /// never what opened the window — the live-turn slot vanishing before the
+    /// row landed was.
+    #[tokio::test]
+    async fn chat_snapshot_keeps_the_partial_turn_across_the_abort_to_flush_window() {
+        let api = InterruptWindowApi::new();
+
+        // Phase 1 — mid-turn: the partial turn is served from the live slot.
+        let mid = chat_snapshot(&api, &agent(), None).await;
+        assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
+        assert_eq!(mid["messages"][1]["isStreaming"], true);
+
+        // Phase 2 — the window: the guard dropped on abort and the row is not
+        // yet written, but the pinned slot is still published, so the snapshot
+        // carries the same in-flight message.
+        api.set(Phase::PinnedRowNotYetPersisted);
+        let gap = chat_snapshot(&api, &agent(), None).await;
+        assert_eq!(
+            assistant_ids(&gap),
+            vec!["msg-live".to_string()],
+            "monorepo#2056: the partial turn survives the abort→flush window: {gap}"
+        );
+        assert_eq!(
+            gap["messages"][1]["contentBlocks"],
+            json!([{ "id": "msg-live:0", "type": "text", "text": "I'll run " }]),
+            "…with the streamed-so-far blocks intact: {gap}"
+        );
+        assert_eq!(
+            gap["messages"][1]["isStreaming"], true,
+            "…still flagged in-flight (the turn's busy claim is still held): {gap}"
+        );
+        assert_eq!(
+            gap["totalMessages"], 2,
+            "…and counted, so the client's seq stays contiguous: {gap}"
+        );
+
+        // Phase 3 — the flush landed: the row is durable and the flush cleared
+        // the slot, so the content is served ONCE, as a persisted,
+        // NON-streaming row.
+        api.set(Phase::Flushed);
+        let after = chat_snapshot(&api, &agent(), None).await;
+        assert_eq!(assistant_ids(&after), vec!["msg-live".to_string()]);
+        assert_eq!(
+            after["totalMessages"], 2,
+            "the persisted row replaces the overlay rather than duplicating it: {after}"
+        );
+        assert!(
+            after["messages"][1].get("isStreaming").is_none(),
+            "the persisted interrupted row carries no streaming hint: {after}"
+        );
+    }
+
+    /// The invariant the pin must not break: a populated slot with no in-flight
+    /// worker behind it (a genuine orphan — the turn died without a flush) is
+    /// still NOT merged, so no phantom streaming message reaches the client.
+    /// `agent_is_busy` remains the gate; the pin only ever widens the window in
+    /// which a busy turn's own content stays published.
+    #[tokio::test]
+    async fn chat_snapshot_never_merges_an_orphaned_slot_from_an_idle_agent() {
+        let snap = chat_snapshot(&OrphanSlotApi, &agent(), None).await;
+        assert!(
+            assistant_ids(&snap).is_empty(),
+            "an idle agent's orphan slot must not surface as a streaming message: {snap}"
+        );
+        assert_eq!(snap["totalMessages"], 1, "…and does not inflate the count");
+    }
+}
