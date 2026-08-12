@@ -817,13 +817,20 @@ fn write_archive(
     for (attachment_id, source) in attachments {
         let mut file = match std::fs::File::open(source) {
             Ok(file) => file,
-            Err(e) => {
+            // Only a genuinely-gone file is the deleted state; any other
+            // open failure (permissions, I/O) must fail the export rather
+            // than silently shipping a live registry row without its file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(
                     attachment = %attachment_id,
-                    error = %e,
                     "export: attachment file vanished since plan — exporting row without file"
                 );
                 continue;
+            }
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "read attachment {attachment_id} failed: {e}"
+                )))
             }
         };
         zip.start_file(format!("attachments/{attachment_id}"), options)
