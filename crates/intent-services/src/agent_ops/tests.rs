@@ -24045,3 +24045,133 @@ async fn group_wake_stamps_all_settled_member_trigger_tasks() {
         "t2's task stamped: {metadata}"
     );
 }
+
+/// Group-wake trigger survives child deletion between settlement and group
+/// settlement: the trigger is captured on the RECORDED event when the child
+/// settles, so deleting the child session before the last member settles
+/// does not lose its task from the aggregated wake's trigger stamp.
+#[tokio::test]
+async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "One").await;
+    let t2 = create_agent(&svc, &ws, "Two").await;
+    let n1 = link_task_note(&svc, &ws, &t1, "Task one", "complete").await;
+    link_task_note(&svc, &ws, &t2, "Task two", "complete").await;
+
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![t1.0.clone(), t2.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    // t1 settles (recorded in the group), then its session is DELETED while
+    // t2 is still running.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "completionReport": "one done" }),
+    ))
+    .await;
+    svc.store()
+        .delete_agent_session(&ws, &t1)
+        .await
+        .expect("delete settled t1");
+    // t2 settles → the group fires; t1's trigger must still be present even
+    // though its session no longer exists at fire time.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "completionReport": "two done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    let ids: Vec<&str> = metadata[UNBLOCKED_TRIGGER_TASKS_KEY]
+        .as_array()
+        .expect("trigger array on group wake")
+        .iter()
+        .map(|t| t["taskNoteId"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&n1.0.as_str()),
+        "deleted t1's task still stamped: {metadata}"
+    );
+}
+
+/// The no-manager `agent.sendQueuedMessageNow` path (question-hold park →
+/// explicit send with no AgentManager attached) resolves the unblocked
+/// section at persist time — parity with the manager path and the store-only
+/// `deliver_parent_wake` branch.
+#[tokio::test]
+async fn no_manager_send_now_resolves_unblocked_section() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let done = seed_task(&svc, &ws, "Done task").await;
+    let gated = seed_task(&svc, &ws, "Gated task").await;
+    svc.task_set_relations(ws.clone(), gated.clone(), Some(vec![done.clone()]), None)
+        .await
+        .expect("gated dependsOn done");
+    svc.task_update_note_status(ws.clone(), done.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete done");
+
+    // A parked completion wake carrying only the trigger stamp (as the
+    // question-hold branch of `deliver_parent_wake` enqueues it).
+    let mut metadata = json!({ "type": "event_notification" });
+    crate::agent_ops::ready_delta::stamp_trigger_tasks(
+        &mut metadata,
+        &[(ws.0.clone(), done.0.clone())],
+    );
+    let (queued, _) = svc.enqueue_message(
+        &parent,
+        "[WORKSPACE EVENTS] child completed".into(),
+        None,
+        None,
+        Some(metadata),
+        None,
+        false,
+    );
+
+    let r = svc
+        .agent_send_queued_message_now_op(parent.clone(), queued.id.clone())
+        .await
+        .expect("send now");
+    assert_eq!(r["success"], json!(true));
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "one persisted message");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains(UNBLOCKED_SECTION_PREFIX),
+        "no-manager send-now persist carries the section: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "[Gated task](intent://local/task/{}) (deps satisfied)",
+            gated.0
+        )),
+        "section names the dependent task: {text}"
+    );
+}

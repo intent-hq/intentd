@@ -48,6 +48,40 @@ pub(crate) fn stamp_trigger_tasks(metadata: &mut serde_json::Value, triggers: &[
     }
 }
 
+/// Event-data key naming a settled group member's linked task note — a
+/// single `{ "workspaceId", "taskNoteId" }` object stamped at group RECORD
+/// time (when the child settles), so the aggregated wake's trigger set does
+/// not depend on the child session still existing when the group fires: a
+/// task-linked child deleted between its settlement and group settlement
+/// keeps its trigger. Persisted with the group's `raw_events`, so it also
+/// survives daemon restarts.
+pub(crate) const EVENT_TRIGGER_TASK_KEY: &str = "unblockedTriggerTask";
+
+/// Stamp a settled child's linked task onto its recorded group event data
+/// under [`EVENT_TRIGGER_TASK_KEY`]. No-op for non-object data.
+pub(crate) fn stamp_event_trigger_task(
+    data: &mut serde_json::Value,
+    workspace_id: &str,
+    task_note_id: &str,
+) {
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            EVENT_TRIGGER_TASK_KEY.to_string(),
+            json!({ "workspaceId": workspace_id, "taskNoteId": task_note_id }),
+        );
+    }
+}
+
+/// Read a recorded group event's [`EVENT_TRIGGER_TASK_KEY`] stamp back as a
+/// `(workspace_id, task_note_id)` pair.
+pub(crate) fn event_trigger_task(data: &serde_json::Value) -> Option<(String, String)> {
+    let t = data.get(EVENT_TRIGGER_TASK_KEY)?;
+    Some((
+        t.get("workspaceId")?.as_str()?.to_string(),
+        t.get("taskNoteId")?.as_str()?.to_string(),
+    ))
+}
+
 /// Whether a queued message's metadata carries any stamped trigger tasks.
 pub(crate) fn metadata_has_triggers(metadata: Option<&serde_json::Value>) -> bool {
     metadata
@@ -507,6 +541,24 @@ mod tests {
                 ("ws-1".to_string(), "t-b".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn event_trigger_task_stamp_round_trips_and_fails_soft() {
+        let mut data = json!({ "agentId": "agent-1" });
+        stamp_event_trigger_task(&mut data, "ws-1", "t-a");
+        assert_eq!(
+            event_trigger_task(&data),
+            Some(("ws-1".to_string(), "t-a".to_string()))
+        );
+        assert_eq!(event_trigger_task(&json!({})), None);
+        assert_eq!(
+            event_trigger_task(&json!({ EVENT_TRIGGER_TASK_KEY: "not-an-object" })),
+            None
+        );
+        let mut non_object = json!("scalar");
+        stamp_event_trigger_task(&mut non_object, "ws-1", "t-a");
+        assert_eq!(non_object, json!("scalar"));
     }
 
     #[test]

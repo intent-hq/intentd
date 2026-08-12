@@ -4084,6 +4084,24 @@ impl Services {
         if entry.persisted {
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
+        // Delivery-time unblocked hints (monorepo#2044): on the no-manager
+        // path this persist IS the delivery, so the section is resolved here
+        // — parity with the manager's `send_queued_message_now` and the
+        // store-only `deliver_parent_wake` branch. Same idempotency guard:
+        // a content that already carries the section is never re-annotated.
+        let mut entry = entry;
+        if !entry
+            .content
+            .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
+            && ready_delta::metadata_has_triggers(entry.message_metadata.as_ref())
+        {
+            if let Some(section) = self
+                .unblocked_section_for_delivery(std::iter::once(entry.message_metadata.as_ref()))
+                .await
+            {
+                entry.content = format!("{}\n\n{}", entry.content, section);
+            }
+        }
         // STAB-133: persist the entry's attachments alongside the text block.
         let blocks = user_message_blocks(
             &entry.content,

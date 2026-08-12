@@ -3890,20 +3890,43 @@ impl Services {
                         .clone()
                         .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
                 });
+                // Record-time trigger capture (intent-hq/monorepo#2044): a
+                // task-linked child's `agent:idle` stamps its linked task
+                // onto the RECORDED event, so the aggregated wake keeps the
+                // trigger even if the child session is deleted before the
+                // group settles (`try_fire_group` reads the stamp first and
+                // only falls back to a live session lookup).
+                let trigger = child_session.as_ref().and_then(|s| {
+                    (event.event_type == AGENT_IDLE)
+                        .then(|| {
+                            s.task_note_id
+                                .clone()
+                                .map(|n| (s.workspace_id.0.clone(), n.0))
+                        })
+                        .flatten()
+                });
                 let report = child_session.and_then(|s| s.completion_report);
-                let attention_annotated;
-                let event = match &attention {
-                    Some((kind, reason)) => {
-                        let mut e = event.clone();
+                let group_annotated;
+                let event = if attention.is_some() || trigger.is_some() {
+                    let mut e = event.clone();
+                    if let Some((kind, reason)) = &attention {
                         agent_subscriptions::annotate_attention_request(
                             &mut e.data,
                             Some(kind),
                             Some(reason),
                         );
-                        attention_annotated = e;
-                        &attention_annotated
                     }
-                    None => event,
+                    if let Some((ws, task)) = &trigger {
+                        crate::agent_ops::ready_delta::stamp_event_trigger_task(
+                            &mut e.data,
+                            ws,
+                            task,
+                        );
+                    }
+                    group_annotated = e;
+                    &group_annotated
+                } else {
+                    event
                 };
                 let summary =
                     format_group_child_line(child_id, event, report.as_deref(), stall.as_ref());
@@ -4145,10 +4168,18 @@ impl Services {
         // form: every group member that settled via a genuine `agent:idle`
         // completion and has a linked task note contributes its task id.
         // Only the triggering facts are stamped — the unblocked enumeration
-        // is computed fresh at delivery/render time.
+        // is computed fresh at delivery/render time. Prefer the record-time
+        // stamp on the raw event (captured when the child settled, so it
+        // survives the child's deletion before group settlement); the live
+        // session lookup is a fallback for events recorded before the stamp
+        // existed (pre-upgrade persisted groups).
         let mut trigger_tasks: Vec<(String, String)> = Vec::new();
         for event in &group.raw_events {
             if event.event_type != AGENT_IDLE {
+                continue;
+            }
+            if let Some(pair) = crate::agent_ops::ready_delta::event_trigger_task(&event.data) {
+                trigger_tasks.push(pair);
                 continue;
             }
             let Some(child) = completion_event_child_id(event) else {

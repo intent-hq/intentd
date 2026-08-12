@@ -8,6 +8,18 @@
 //! `intent://local/task/` link — computed at DELIVERY time — while the wake's
 //! `event_notification` metadata carries ONLY the enqueue-time trigger stamp
 //! (`unblockedTriggerTasks` naming the child's task), never the enumeration.
+//!
+//! Coverage split (deliberate): this e2e proves the full wire contract —
+//! delegation, watch registration, wake composition, section rendering, and
+//! metadata shape over a real WSS connection — with an idle parent, where
+//! delivery follows enqueue immediately. The between-enqueue-and-delivery
+//! recompute property (task state changing while the wake sits queued behind
+//! a busy parent) needs deterministic control of that interleaving, which the
+//! mock-ACP wire harness cannot schedule reliably; it is proven at the
+//! services level in `agent_ops/tests.rs`
+//! (`unblocked_section_reflects_state_at_render_time_not_enqueue`), which
+//! drives `unblocked_section_for_delivery` — the exact function every drain
+//! path calls at flush time — around live task-state mutations.
 
 #![cfg(unix)]
 
