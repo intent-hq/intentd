@@ -14,8 +14,9 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
-    GitStatusRefresher, PermissionPolicy, Services, WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, max_concurrent_agents,
+    recommended_memory_budget_bytes, AgentManager, BusEventSink, EventBus, GitStatusRefresher,
+    PermissionPolicy, Services, TreeMemoryProbe, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -1056,6 +1057,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (§6.7/M3.5).
     let permission_policy = resolve_permission_policy();
     tracing::info!(?permission_policy, "agent permission policy");
+    // Descendant-tree memory sample shared by `system.status` (intentd#1139) and
+    // the optional aggregate spawn budget below (monorepo#2063). Constructed
+    // here because the budget is installed on the registry right after the
+    // manager exists, while the sampler task that fills it needs that manager.
+    let child_usage = Arc::new(ChildTreeUsage::default());
     let manager = Arc::new(
         AgentManager::new(
             services.clone(),
@@ -1095,6 +1101,29 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
+    // Aggregate child-tree memory budget (monorepo#2063), off unless
+    // `agents.memoryBudgetMb` is set. `process_cap` bounds agent *slots*, which
+    // is not a memory bound: a single agent's subtree was measured from 436 MB
+    // idle to 9.6 GB running a test suite. When installed, the budget reads the
+    // same descendant-tree sampler `system.status` reports (intentd#1139) and
+    // gates new spawns only — see [`ProcessRegistry::acquire`].
+    match agent_memory_budget_bytes(&boot_settings.effective) {
+        Some(budget_bytes) => {
+            manager
+                .registry()
+                .set_memory_budget(budget_bytes, child_usage.clone());
+            tracing::info!(
+                budget_bytes,
+                recommended_bytes = {
+                    let mut sys = sysinfo::System::new();
+                    sys.refresh_memory();
+                    recommended_memory_budget_bytes(sys.total_memory())
+                },
+                "aggregate agent memory budget enabled"
+            );
+        }
+        None => tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)"),
+    }
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1387,7 +1416,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
-    let child_usage = spawn_child_tree_sampler(manager.clone());
+    spawn_child_tree_sampler(manager.clone(), child_usage.clone());
     let route_info = spawn_route_info_sampler();
 
     let control = Arc::new(DaemonControl {
@@ -1870,6 +1899,13 @@ struct ChildTreeSample {
     count: usize,
     memory_bytes: u64,
     peak_memory_bytes: u64,
+    /// Sweep counter, incremented on every store. Carried inside the sample for
+    /// the same reason the other three fields are published together: the spawn
+    /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
+    /// it has already corrected for, and pairing a sequence number from one
+    /// sweep with a byte total from the next would make it discard a correction
+    /// it should keep, or keep one it should discard.
+    seq: u64,
 }
 
 /// The three fields are published together under one lock rather than as
@@ -1889,15 +1925,25 @@ impl ChildTreeUsage {
         let peak_memory_bytes = guard.map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
         });
+        let seq = guard.map_or(1, |prev| prev.seq.wrapping_add(1));
         *guard = Some(ChildTreeSample {
             count,
             memory_bytes,
             peak_memory_bytes,
+            seq,
         });
     }
 
     fn load(&self) -> Option<ChildTreeSample> {
         *self.inner.read().expect("child tree usage lock poisoned")
+    }
+}
+
+impl TreeMemoryProbe for ChildTreeUsage {
+    fn sample(&self) -> Option<(u64, u64)> {
+        // One read of the whole sample: the bytes and the sequence number that
+        // identifies them come from the same sweep by construction.
+        self.load().map(|s| (s.memory_bytes, s.seq))
     }
 }
 
@@ -1981,13 +2027,12 @@ fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u
 /// triggered: it fires on the crossing and re-arms only after the tree falls
 /// back under the threshold, so a sustained overshoot costs one line, not one
 /// per tick.
-fn spawn_child_tree_sampler(manager: Arc<AgentManager>) -> Arc<ChildTreeUsage> {
+fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsage>) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
-    let usage = Arc::new(ChildTreeUsage::default());
     let Ok(pid) = sysinfo::get_current_pid() else {
         tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
-        return usage;
+        return;
     };
     let warn_threshold = {
         let mut sys = System::new();
@@ -2026,7 +2071,6 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>) -> Arc<ChildTreeUsage> {
             }
         }
     });
-    usage
 }
 
 /// Runtime control for the WSS listener, shared between DaemonControl and

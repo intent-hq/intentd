@@ -94,6 +94,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "workspaces.root",
     "logging.level",
     "agents.maxConcurrent",
+    "agents.memoryBudgetMb",
     "agents.idleReapMinutes",
     "agents.flushQueuedMessages",
     "events.streamRetentionHours",

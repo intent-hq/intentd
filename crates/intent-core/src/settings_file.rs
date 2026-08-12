@@ -515,6 +515,11 @@ pub struct AgentsSettings {
     /// `agents.maxConcurrent` — concurrent agent session cap (0 = auto based
     /// on system RAM; changes apply on daemon restart; max 200).
     pub max_concurrent: u32,
+    /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
+    /// daemon's whole child-process tree, above which new agent spawns queue
+    /// behind idle-process eviction instead of starting immediately (0 = off,
+    /// the default; changes apply on daemon restart; max 1,024,000).
+    pub memory_budget_mb: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
@@ -530,6 +535,7 @@ impl Default for AgentsSettings {
     fn default() -> Self {
         Self {
             max_concurrent: 0,
+            memory_budget_mb: 0,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
         }
@@ -914,6 +920,15 @@ impl SettingsFile {
                 ),
             ));
         }
+        if self.agents.memory_budget_mb > 1_024_000 {
+            return Err(bad(
+                "agents.memoryBudgetMb",
+                format!(
+                    "must be 0 (off) or between 1 and 1024000, got {}",
+                    self.agents.memory_budget_mb
+                ),
+            ));
+        }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
@@ -1168,6 +1183,11 @@ level = "info"
 # Max concurrent agents -- concurrent agent session cap (0 = auto based on
 # system RAM; changes apply on daemon restart; max 200).
 maxConcurrent = 0
+# Agent memory budget (MB) -- aggregate resident memory the daemon's whole
+# child-process tree may use before new agent spawns queue behind idle-process
+# eviction (0 = off; nothing running is ever killed; changes apply on daemon
+# restart).
+memoryBudgetMb = 0
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
@@ -1827,6 +1847,31 @@ mod tests {
         );
         assert!(
             SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+    }
+
+    /// `agents.memoryBudgetMb` defaults to 0 (off, so an untouched config
+    /// behaves exactly as before), parses an override, and enforces the same
+    /// upper bound the catalog does.
+    #[test]
+    fn memory_budget_mb_defaults_off_and_bounds_are_enforced() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.agents.memory_budget_mb, 0);
+
+        let overridden =
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 20480\n").expect("override parses");
+        assert_eq!(overridden.agents.memory_budget_mb, 20_480);
+
+        let err = SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 2000000\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agents.memoryBudgetMb") && msg.contains("2000000"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
             "the upper bound itself is legal"
         );
     }
