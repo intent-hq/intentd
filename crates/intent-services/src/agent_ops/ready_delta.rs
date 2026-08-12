@@ -14,9 +14,153 @@
 use std::collections::{HashMap, HashSet};
 
 use intent_core::TaskStatus;
+use serde_json::json;
 
 pub(crate) use super::batch::BatchTaskSnap;
 use super::batch::{classify_batch_tasks, BatchDisposition};
+
+/// `messageMetadata` key on a completion wake naming the trigger tasks —
+/// an array of `{ "workspaceId", "taskNoteId" }` objects recorded at ENQUEUE
+/// time. It carries only the triggering fact (which linked task notes the
+/// settled children had); the unblocked enumeration itself is never computed
+/// or stored at enqueue — delivery/render time resolves it fresh.
+pub(crate) const UNBLOCKED_TRIGGER_TASKS_KEY: &str = "unblockedTriggerTasks";
+
+/// Stable prefix of the rendered unblocked section, used by the delivery
+/// paths as an idempotency guard (a requeued entry whose content already
+/// carries a section is never re-annotated — same contract as the
+/// dequeue-wait note).
+pub(crate) const UNBLOCKED_SECTION_PREFIX: &str = "Tasks now unblocked by";
+
+/// Stamp `triggers` (`(workspace_id, task_note_id)` pairs) onto a wake's
+/// `event_notification` metadata under [`UNBLOCKED_TRIGGER_TASKS_KEY`].
+/// No-op for an empty trigger set or non-object metadata.
+pub(crate) fn stamp_trigger_tasks(metadata: &mut serde_json::Value, triggers: &[(String, String)]) {
+    if triggers.is_empty() {
+        return;
+    }
+    if let Some(obj) = metadata.as_object_mut() {
+        let arr: Vec<serde_json::Value> = triggers
+            .iter()
+            .map(|(ws, id)| json!({ "workspaceId": ws, "taskNoteId": id }))
+            .collect();
+        obj.insert(UNBLOCKED_TRIGGER_TASKS_KEY.to_string(), json!(arr));
+    }
+}
+
+/// Event-data key naming a settled group member's linked task note — a
+/// single `{ "workspaceId", "taskNoteId" }` object stamped at group RECORD
+/// time (when the child settles), so the aggregated wake's trigger set does
+/// not depend on the child session still existing when the group fires: a
+/// task-linked child deleted between its settlement and group settlement
+/// keeps its trigger. Persisted with the group's `raw_events`, so it also
+/// survives daemon restarts.
+pub(crate) const EVENT_TRIGGER_TASK_KEY: &str = "unblockedTriggerTask";
+
+/// Stamp a settled child's linked task onto its recorded group event data
+/// under [`EVENT_TRIGGER_TASK_KEY`]. No-op for non-object data.
+pub(crate) fn stamp_event_trigger_task(
+    data: &mut serde_json::Value,
+    workspace_id: &str,
+    task_note_id: &str,
+) {
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            EVENT_TRIGGER_TASK_KEY.to_string(),
+            json!({ "workspaceId": workspace_id, "taskNoteId": task_note_id }),
+        );
+    }
+}
+
+/// Read a recorded group event's [`EVENT_TRIGGER_TASK_KEY`] stamp back as a
+/// `(workspace_id, task_note_id)` pair.
+pub(crate) fn event_trigger_task(data: &serde_json::Value) -> Option<(String, String)> {
+    let t = data.get(EVENT_TRIGGER_TASK_KEY)?;
+    Some((
+        t.get("workspaceId")?.as_str()?.to_string(),
+        t.get("taskNoteId")?.as_str()?.to_string(),
+    ))
+}
+
+/// Whether a queued message's metadata carries any stamped trigger tasks.
+pub(crate) fn metadata_has_triggers(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|md| md.get(UNBLOCKED_TRIGGER_TASKS_KEY))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Collect the trigger `(workspace_id, task_note_id)` pairs stamped on a
+/// batch of message metadatas, deduplicated in first-seen order — the
+/// coalescing half of the delivery-time contract: several completion wakes
+/// draining in one batch contribute ONE merged trigger set (and thus one
+/// delta computation) instead of stitching per-event snapshots.
+pub(crate) fn collect_trigger_tasks<'a>(
+    metadatas: impl Iterator<Item = Option<&'a serde_json::Value>>,
+) -> Vec<(String, String)> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for md in metadatas.flatten() {
+        let Some(arr) = md
+            .get(UNBLOCKED_TRIGGER_TASKS_KEY)
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for t in arr {
+            let (Some(ws), Some(id)) = (
+                t.get("workspaceId").and_then(|v| v.as_str()),
+                t.get("taskNoteId").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let pair = (ws.to_string(), id.to_string());
+            if seen.insert(pair.clone()) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// Render the advisory "tasks now unblocked" section for a non-empty delta.
+/// Each row names the task as an `intent://local/task/{id}` link plus the
+/// reason it became ready; a task sitting in an attention status is annotated
+/// rather than dropped (`; currently blocked — needs attention`), since the
+/// delegator may want to resolve the attention state precisely because the
+/// task is otherwise unblocked. `multiple_triggers` flips the singular/plural
+/// framing when a coalesced batch covered more than one completion.
+pub(crate) fn render_unblocked_section(delta: &[UnblockedTask], multiple_triggers: bool) -> String {
+    let noun = if multiple_triggers {
+        "these completions"
+    } else {
+        "this completion"
+    };
+    let items = delta
+        .iter()
+        .map(|t| {
+            let reason = match t.reason {
+                UnblockedReason::DepsSatisfied => "deps satisfied",
+                UnblockedReason::ConflictCleared => "conflict cleared",
+            };
+            let attention = match t.attention {
+                Some(TaskStatus::Waiting) => "; currently waiting — needs attention",
+                Some(TaskStatus::DiscussionNeeded) => {
+                    "; currently discussion_needed — needs attention"
+                }
+                Some(TaskStatus::Blocked) => "; currently blocked — needs attention",
+                Some(TaskStatus::ReviewRequired) => "; currently review_required — needs attention",
+                _ => "",
+            };
+            format!(
+                "[{}](intent://local/task/{}) ({}{})",
+                t.title, t.note_id, reason, attention
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{UNBLOCKED_SECTION_PREFIX} {noun}: {items}.")
+}
 
 /// Why a task appears in the delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,12 +174,17 @@ pub(crate) enum UnblockedReason {
 }
 
 /// One row of the delta, ready for message rendering. `title` falls back to
-/// the note id when the caller has no title for it.
+/// the note id when the caller has no title for it. `attention` carries the
+/// task's attention status (`waiting` / `discussion_needed` / `blocked` /
+/// `review_required`) when it sits in one — such tasks stay in the delta by
+/// design (see [`ready_set_delta`]) and the renderer annotates them instead
+/// of dropping them; `None` for ordinary `not_started` candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnblockedTask {
     pub(crate) note_id: String,
     pub(crate) title: String,
     pub(crate) reason: UnblockedReason,
+    pub(crate) attention: Option<TaskStatus>,
 }
 
 /// Single-task readiness disposition against `snaps`: greedy-off, so
@@ -70,9 +219,9 @@ fn classify_one(id: &str, snaps: &HashMap<String, BatchTaskSnap>) -> Option<Batc
 /// first). Attention statuses (`waiting`, `discussion_needed`, `blocked`,
 /// `review_required`) remain candidates ON PURPOSE — batch-delegate
 /// classification treats them as delegable, and this helper keeps those
-/// semantics; whether to annotate or filter them in the rendered hint is the
-/// consumer's call. Output is sorted by title then note id for reproducible
-/// message rendering.
+/// semantics; their status is surfaced on [`UnblockedTask::attention`] so the
+/// renderer annotates them rather than silently dropping them. Output is
+/// sorted by title then note id for reproducible message rendering.
 pub(crate) fn ready_set_delta(
     trigger_completions: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
@@ -121,10 +270,18 @@ pub(crate) fn ready_set_delta(
             // Ready before the triggers too — not attributable to them.
             _ => continue,
         };
+        let attention = match snap.status {
+            TaskStatus::Waiting
+            | TaskStatus::DiscussionNeeded
+            | TaskStatus::Blocked
+            | TaskStatus::ReviewRequired => Some(snap.status),
+            _ => None,
+        };
         out.push(UnblockedTask {
             note_id: id.clone(),
             title: titles.get(id).cloned().unwrap_or_else(|| id.clone()),
             reason,
+            attention,
         });
     }
     out.sort_by(|a, b| {
@@ -276,7 +433,8 @@ mod tests {
     fn attention_statuses_remain_candidates() {
         // Pinned semantics: waiting/discussion_needed/blocked/review_required
         // tasks are delegable per batch classification, so they appear in the
-        // delta once their trigger dep completes.
+        // delta once their trigger dep completes — with their attention
+        // status surfaced for the renderer to annotate.
         let mut snaps = HashMap::new();
         snaps.insert("done".into(), snap(TaskStatus::Complete, &[], &[]));
         snaps.insert("w".into(), snap(TaskStatus::Waiting, &["done"], &[]));
@@ -286,14 +444,30 @@ mod tests {
         );
         snaps.insert("b".into(), snap(TaskStatus::Blocked, &["done"], &[]));
         snaps.insert("r".into(), snap(TaskStatus::ReviewRequired, &["done"], &[]));
+        snaps.insert("n".into(), snap(TaskStatus::NotStarted, &["done"], &[]));
         let delta = ready_set_delta(&ids(&["done"]), &snaps, &HashMap::new());
         assert_eq!(
             rows(&delta),
             vec![
                 ("b", UnblockedReason::DepsSatisfied),
                 ("d", UnblockedReason::DepsSatisfied),
+                ("n", UnblockedReason::DepsSatisfied),
                 ("r", UnblockedReason::DepsSatisfied),
                 ("w", UnblockedReason::DepsSatisfied),
+            ]
+        );
+        let attention: Vec<(&str, Option<TaskStatus>)> = delta
+            .iter()
+            .map(|u| (u.note_id.as_str(), u.attention))
+            .collect();
+        assert_eq!(
+            attention,
+            vec![
+                ("b", Some(TaskStatus::Blocked)),
+                ("d", Some(TaskStatus::DiscussionNeeded)),
+                ("n", None),
+                ("r", Some(TaskStatus::ReviewRequired)),
+                ("w", Some(TaskStatus::Waiting)),
             ]
         );
     }
@@ -345,6 +519,136 @@ mod tests {
         snaps.insert("d2".into(), snap(TaskStatus::Complete, &["d1"], &[]));
         let delta = ready_set_delta(&ids(&["d1", "d2"]), &snaps, &HashMap::new());
         assert!(delta.is_empty(), "{delta:?}");
+    }
+
+    #[test]
+    fn stamp_and_collect_round_trip_with_dedup_in_first_seen_order() {
+        let mut md1 = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(&mut md1, &[("ws-1".into(), "t-a".into())]);
+        let mut md2 = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(
+            &mut md2,
+            &[("ws-1".into(), "t-a".into()), ("ws-1".into(), "t-b".into())],
+        );
+        assert!(metadata_has_triggers(Some(&md1)));
+        assert!(!metadata_has_triggers(Some(&json!({}))));
+        assert!(!metadata_has_triggers(None));
+        let collected = collect_trigger_tasks([Some(&md1), None, Some(&md2)].into_iter());
+        assert_eq!(
+            collected,
+            vec![
+                ("ws-1".to_string(), "t-a".to_string()),
+                ("ws-1".to_string(), "t-b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn event_trigger_task_stamp_round_trips_and_fails_soft() {
+        let mut data = json!({ "agentId": "agent-1" });
+        stamp_event_trigger_task(&mut data, "ws-1", "t-a");
+        assert_eq!(
+            event_trigger_task(&data),
+            Some(("ws-1".to_string(), "t-a".to_string()))
+        );
+        assert_eq!(event_trigger_task(&json!({})), None);
+        assert_eq!(
+            event_trigger_task(&json!({ EVENT_TRIGGER_TASK_KEY: "not-an-object" })),
+            None
+        );
+        let mut non_object = json!("scalar");
+        stamp_event_trigger_task(&mut non_object, "ws-1", "t-a");
+        assert_eq!(non_object, json!("scalar"));
+    }
+
+    #[test]
+    fn stamp_is_a_noop_for_empty_triggers_and_malformed_entries_are_skipped() {
+        let mut md = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(&mut md, &[]);
+        assert!(md.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_none());
+        let malformed = json!({
+            UNBLOCKED_TRIGGER_TASKS_KEY: [
+                { "workspaceId": "ws-1" },
+                { "taskNoteId": "t-a" },
+                "not-an-object",
+                { "workspaceId": "ws-1", "taskNoteId": "t-ok" },
+            ]
+        });
+        assert_eq!(
+            collect_trigger_tasks(std::iter::once(Some(&malformed))),
+            vec![("ws-1".to_string(), "t-ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn render_section_links_tasks_and_flips_plural_framing() {
+        let delta = vec![
+            UnblockedTask {
+                note_id: "t3".into(),
+                title: "T3: Return a map".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: None,
+            },
+            UnblockedTask {
+                note_id: "t4".into(),
+                title: "T4: FE parity".into(),
+                reason: UnblockedReason::ConflictCleared,
+                attention: None,
+            },
+        ];
+        let single = render_unblocked_section(&delta, false);
+        assert_eq!(
+            single,
+            "Tasks now unblocked by this completion: \
+             [T3: Return a map](intent://local/task/t3) (deps satisfied), \
+             [T4: FE parity](intent://local/task/t4) (conflict cleared)."
+        );
+        let multi = render_unblocked_section(&delta, true);
+        assert!(multi.starts_with("Tasks now unblocked by these completions:"));
+        assert!(single.starts_with(UNBLOCKED_SECTION_PREFIX));
+    }
+
+    #[test]
+    fn render_section_annotates_attention_statuses_instead_of_dropping() {
+        let delta = vec![
+            UnblockedTask {
+                note_id: "tb".into(),
+                title: "Blocked one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::Blocked),
+            },
+            UnblockedTask {
+                note_id: "tw".into(),
+                title: "Waiting one".into(),
+                reason: UnblockedReason::ConflictCleared,
+                attention: Some(TaskStatus::Waiting),
+            },
+            UnblockedTask {
+                note_id: "td".into(),
+                title: "Discussion one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::DiscussionNeeded),
+            },
+            UnblockedTask {
+                note_id: "tr".into(),
+                title: "Review one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::ReviewRequired),
+            },
+        ];
+        let section = render_unblocked_section(&delta, false);
+        assert_eq!(
+            section,
+            "Tasks now unblocked by this completion: \
+             [Blocked one](intent://local/task/tb) \
+             (deps satisfied; currently blocked — needs attention), \
+             [Waiting one](intent://local/task/tw) \
+             (conflict cleared; currently waiting — needs attention), \
+             [Discussion one](intent://local/task/td) \
+             (deps satisfied; currently discussion_needed — needs attention), \
+             [Review one](intent://local/task/tr) \
+             (deps satisfied; currently review_required — needs attention)."
+        );
     }
 
     #[test]

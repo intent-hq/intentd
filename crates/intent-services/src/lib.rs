@@ -3824,6 +3824,25 @@ impl Services {
             }
             None => event,
         };
+        // Enqueue-time trigger record (intent-hq/monorepo#2044): a genuine
+        // `agent:idle` completion of a task-linked child stamps the child's
+        // linked task-note id onto the wake metadata — only the triggering
+        // fact. The "tasks now unblocked" enumeration is resolved at
+        // delivery/render time against CURRENT task state (never here), so a
+        // wake that sits queued behind a busy parent cannot carry a stale
+        // snapshot.
+        let trigger_tasks: Vec<(String, String)> =
+            if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
+                match self.store.get_agent_session(child_id).await {
+                    Ok(s) => match s.task_note_id {
+                        Some(n) => vec![(s.workspace_id.0, n.0)],
+                        None => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -3871,20 +3890,43 @@ impl Services {
                         .clone()
                         .map(|kind| (kind, s.attention_request_reason.clone().unwrap_or_default()))
                 });
+                // Record-time trigger capture (intent-hq/monorepo#2044): a
+                // task-linked child's `agent:idle` stamps its linked task
+                // onto the RECORDED event, so the aggregated wake keeps the
+                // trigger even if the child session is deleted before the
+                // group settles (`try_fire_group` reads the stamp first and
+                // only falls back to a live session lookup).
+                let trigger = child_session.as_ref().and_then(|s| {
+                    (event.event_type == AGENT_IDLE)
+                        .then(|| {
+                            s.task_note_id
+                                .clone()
+                                .map(|n| (s.workspace_id.0.clone(), n.0))
+                        })
+                        .flatten()
+                });
                 let report = child_session.and_then(|s| s.completion_report);
-                let attention_annotated;
-                let event = match &attention {
-                    Some((kind, reason)) => {
-                        let mut e = event.clone();
+                let group_annotated;
+                let event = if attention.is_some() || trigger.is_some() {
+                    let mut e = event.clone();
+                    if let Some((kind, reason)) = &attention {
                         agent_subscriptions::annotate_attention_request(
                             &mut e.data,
                             Some(kind),
                             Some(reason),
                         );
-                        attention_annotated = e;
-                        &attention_annotated
                     }
-                    None => event,
+                    if let Some((ws, task)) = &trigger {
+                        crate::agent_ops::ready_delta::stamp_event_trigger_task(
+                            &mut e.data,
+                            ws,
+                            task,
+                        );
+                    }
+                    group_annotated = e;
+                    &group_annotated
+                } else {
+                    event
                 };
                 let summary =
                     format_group_child_line(child_id, event, report.as_deref(), stall.as_ref());
@@ -4009,7 +4051,8 @@ impl Services {
             // `remove_watch` just retired the one-shot watch, so the wake
             // carries the retirement + re-arm suffix (issue monorepo#2051).
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
-            let metadata = build_event_notification_metadata(&[event]);
+            let mut metadata = build_event_notification_metadata(&[event]);
+            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             if let Err(e) = self
                 .deliver_parent_wake(
                     &parent_ws,
@@ -4120,7 +4163,35 @@ impl Services {
         }
         let wake = format_group_wake(&group);
         let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
-        let metadata = build_event_notification_metadata(&event_refs);
+        let mut metadata = build_event_notification_metadata(&event_refs);
+        // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
+        // form: every group member that settled via a genuine `agent:idle`
+        // completion and has a linked task note contributes its task id.
+        // Only the triggering facts are stamped — the unblocked enumeration
+        // is computed fresh at delivery/render time. Prefer the record-time
+        // stamp on the raw event (captured when the child settled, so it
+        // survives the child's deletion before group settlement); the live
+        // session lookup is a fallback for events recorded before the stamp
+        // existed (pre-upgrade persisted groups).
+        let mut trigger_tasks: Vec<(String, String)> = Vec::new();
+        for event in &group.raw_events {
+            if event.event_type != AGENT_IDLE {
+                continue;
+            }
+            if let Some(pair) = crate::agent_ops::ready_delta::event_trigger_task(&event.data) {
+                trigger_tasks.push(pair);
+                continue;
+            }
+            let Some(child) = completion_event_child_id(event) else {
+                continue;
+            };
+            if let Ok(s) = self.store.get_agent_session(&AgentId::from(child)).await {
+                if let Some(n) = s.task_note_id {
+                    trigger_tasks.push((s.workspace_id.0, n.0));
+                }
+            }
+        }
+        crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
         if let Err(e) = self
             .deliver_parent_wake(
                 workspace_id,
@@ -4865,6 +4936,23 @@ impl Services {
                     // trigger.
                     return Ok(result);
                 }
+                // Delivery-time unblocked hints (monorepo#2044): the
+                // store-only persist IS this path's delivery, so the section
+                // is resolved here — matching the manager path's direct-send
+                // arm.
+                let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+                    message_metadata.as_ref(),
+                ) {
+                    match self
+                        .unblocked_section_for_delivery(std::iter::once(message_metadata.as_ref()))
+                        .await
+                    {
+                        Some(section) => format!("{content}\n\n{section}"),
+                        None => content,
+                    }
+                } else {
+                    content
+                };
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
                 self.store
                     .append_agent_message_with_metadata(
