@@ -1344,11 +1344,22 @@ fn parse_fence_header(header: &str) -> Option<TaskBlockHeader> {
         attrs.push(acc);
         idx += 1;
     }
+    let mut seen: Vec<String> = Vec::new();
     for attr in attrs {
         let (name, value) = attr.split_once('=')?;
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }
+        // Duplicates are detected by attribute-name occurrence (not by a
+        // filled slot), so `key= key=second` is empty-value + duplicate and
+        // the second value is never silently accepted.
+        if seen.iter().any(|s| s == name) {
+            h.issues.push(format!(
+                "duplicate attribute `{name}` (first occurrence kept)"
+            ));
+            continue;
+        }
+        seen.push(name.to_string());
         match name {
             "key" => set_scalar_attr(&mut h.key, name, value, &mut h.issues),
             "effort" => set_scalar_attr(&mut h.effort, name, value, &mut h.issues),
@@ -1365,8 +1376,6 @@ fn parse_fence_header(header: &str) -> Option<TaskBlockHeader> {
 fn set_scalar_attr(slot: &mut Option<String>, name: &str, value: &str, issues: &mut Vec<String>) {
     if value.is_empty() {
         issues.push(format!("empty value for attribute `{name}`"));
-    } else if slot.is_some() {
-        issues.push(format!("duplicate attribute `{name}` (first value kept)"));
     } else {
         *slot = Some(value.to_string());
     }
@@ -1381,8 +1390,6 @@ fn set_list_attr(slot: &mut Vec<String>, name: &str, value: &str, issues: &mut V
         .collect();
     if items.is_empty() {
         issues.push(format!("empty value for attribute `{name}`"));
-    } else if !slot.is_empty() {
-        issues.push(format!("duplicate attribute `{name}` (first value kept)"));
     } else {
         *slot = items;
     }
@@ -2291,6 +2298,27 @@ mod tests {
         assert!(t.issues[0].contains("empty value for attribute `key`"));
         assert!(t.issues[1].contains("duplicate attribute `effort`"));
         assert!(t.issues[2].contains("empty value for attribute `dependsOn`"));
+    }
+
+    #[test]
+    fn header_duplicate_after_empty_first_value_is_not_accepted() {
+        // Duplicates are keyed on attribute-name occurrence: a later value
+        // never silently fills a slot the first (empty) occurrence left unset.
+        let result = extract_task_blocks("@@@task key= key=second\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("empty value for attribute `key`"));
+        assert!(t.issues[1].contains("duplicate attribute `key`"));
+
+        let result = extract_task_blocks("@@@task dependsOn= dependsOn=a\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("empty value for attribute `dependsOn`"));
+        assert!(t.issues[1].contains("duplicate attribute `dependsOn`"));
     }
 
     #[test]
