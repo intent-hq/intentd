@@ -4576,3 +4576,283 @@ async fn thought_text_is_absent_from_text_block_extraction() {
         "the live-turn snapshot carries the in-flight thinking block"
     );
 }
+
+// --- Group-tag-bearing turns (monorepo#2029 audit) -------------------------
+
+/// The FE opens a `<group:Name>` display section on the text block carrying the
+/// tag and swallows every LATER block in the message, so the daemon's ordering
+/// invariant is load-bearing for grouping: the text block that opened the group
+/// must sit at an index BEFORE the tool blocks it should contain, on BOTH the
+/// mid-turn snapshot path ([`Transcript::snapshot_blocks`], what a
+/// `chat.subscribe` arriving mid-turn reconstructs the in-flight message from)
+/// and the persisted path ([`Transcript::into_blocks`]) — with block ids stable
+/// (`{messageId}:{index}`, never renumbered) as the turn grows.
+///
+/// Drives the real shape: a group-opening text chunk (split mid-tag, as it
+/// streams) → `tool_call` → `tool_call_update(completed)` → more text → two
+/// more tool calls, asserting the invariant after EVERY step.
+#[tokio::test]
+async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persist() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    const GROUP_TEXT: &str =
+        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
+
+    let tool_note = |id: &str, title: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": title, "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+    let done_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    };
+
+    // Index 0 must stay the group-opening text block for the whole turn, and
+    // every tool block must land after it.
+    let assert_group_invariant = |blocks: &[Value], step: &str| {
+        assert_eq!(
+            blocks[0]["type"], "text",
+            "{step}: block 0 is the group-opening text block: {blocks:?}"
+        );
+        assert_eq!(
+            blocks[0]["id"], "m1:0",
+            "{step}: the group-opening block keeps its id"
+        );
+        assert_eq!(
+            blocks[0]["text"], GROUP_TEXT,
+            "{step}: the group tag + header text is intact"
+        );
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                block["id"],
+                json!(format!("m1:{index}")),
+                "{step}: block ids stay {{messageId}}:{{index}}"
+            );
+            if matches!(
+                block["type"].as_str(),
+                Some("tool_use") | Some("tool_result")
+            ) {
+                assert!(index > 0, "{step}: no tool block precedes the group open");
+            }
+        }
+    };
+
+    // The live-turn slot (the `chat.subscribe` mid-turn reconstruction source)
+    // must carry exactly the snapshot the transcript reports.
+    let assert_slot_matches = |step: &str, expected: &[Value]| {
+        let live = services.live_turn(&agent_id).expect("live turn slot open");
+        assert_eq!(
+            live.blocks, expected,
+            "{step}: the live-turn slot mirrors snapshot_blocks()"
+        );
+    };
+
+    // Step 1 — the group-opening text, streamed split across the `>` so the
+    // tag itself spans two chunks (they coalesce onto one block).
+    for chunk in ["<group:Prep", "ping>\nI'll set the workspace title "] {
+        services
+            .route_notification(
+                &message_note(chunk),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services
+        .route_notification(
+            &message_note("and dig into the debug bundle."),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let snap = transcript.snapshot_blocks();
+    assert_eq!(
+        snap,
+        vec![json!({ "type": "text", "id": "m1:0", "text": GROUP_TEXT })],
+        "the pending chunk buffer surfaces as the block index it will flush into"
+    );
+    assert_group_invariant(&snap, "after group-opening text");
+    assert_slot_matches("after group-opening text", &snap);
+
+    // Step 2 — first tool call: flushes the open text block at index 0 and
+    // appends `tool_use` at index 1.
+    services
+        .route_notification(
+            &tool_note("t1", "bash: title"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["text", "tool_use"]);
+    assert_group_invariant(&snap, "after first tool_call");
+    assert_slot_matches("after first tool_call", &snap);
+
+    // Step 3 — completion appends the `tool_result`; the text block does not move.
+    services
+        .route_notification(&done_note("t1"), &agent_id, &workspace_id, &mut transcript)
+        .await;
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["text", "tool_use", "tool_result"]);
+    assert_group_invariant(&snap, "after tool_call_update(completed)");
+    assert_slot_matches("after tool_call_update(completed)", &snap);
+
+    // Step 4 — more text lands in a NEW block after the tool blocks (the group
+    // opened at index 0 still spans everything after it).
+    services
+        .route_notification(
+            &message_note("Now reading the bundle."),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Step 5 — two more tool calls after that text.
+    for (id, title) in [("t2", "view: bundle.json"), ("t3", "bash: grep")] {
+        services
+            .route_notification(
+                &tool_note(id, title),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "text",
+            "tool_use",
+            "tool_result",
+            "text",
+            "tool_use",
+            "tool_use"
+        ],
+        "blocks accumulate in stream order"
+    );
+    assert_group_invariant(&snap, "after trailing text + tool calls");
+    assert_slot_matches("after trailing text + tool calls", &snap);
+
+    // The live `chat:stream:delta` / `agent:tool:call` block identities agree
+    // with the snapshot positions: the group-opening chunks all name `m1:0`,
+    // and every tool event names a strictly later index.
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let group_deltas: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "chat:stream:delta" && e.data["blockIndex"] == json!(0))
+        .collect();
+    assert_eq!(
+        group_deltas.len(),
+        3,
+        "the three group-opening chunks coalesce onto block 0"
+    );
+    for d in &group_deltas {
+        assert_eq!(d.data["blockId"], json!("m1:0"));
+        assert_eq!(d.data["blockType"], json!("text"));
+    }
+    for e in events.iter().filter(|e| e.event_type == "agent:tool:call") {
+        assert!(
+            e.data["blockIndex"].as_u64().unwrap() > 0,
+            "no tool event claims the group-opening block index: {:?}",
+            e.data
+        );
+    }
+
+    // The persisted block sequence matches the last snapshot exactly — the
+    // delta-accumulated, snapshot-reconstructed, and persisted views agree.
+    let persisted = transcript.into_blocks();
+    assert_eq!(
+        persisted, snap,
+        "into_blocks() equals the final snapshot_blocks()"
+    );
+    assert_group_invariant(&persisted, "persisted");
+}
+
+/// PARALLEL tools (Claude Code fires several before any completes) push a
+/// completion's `tool_result` to the CURRENT end of the block list — NOT to its
+/// `tool_use` index + 1 — because a later call's `tool_use` already took that
+/// slot. Pins the transcript-side indices the `chat.subscribe` forwarder's
+/// `tool_result` id prediction (`next_block_id`, tool_use index + 1) is checked
+/// against; the group-opening text block at index 0 is unaffected either way.
+#[tokio::test]
+async fn interleaved_tool_completions_append_results_at_the_current_end() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let tool_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": "bash: x", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+    let done_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    };
+
+    for note in [
+        message_note("<group:Prepping>\nHeader."),
+        tool_note("t1"),
+        tool_note("t2"),
+        done_note("t1"),
+        done_note("t2"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| {
+            (
+                b["type"].as_str().unwrap(),
+                b["id"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("tool_use", "m1:2"),
+            ("tool_result", "m1:3"),
+            ("tool_result", "m1:4"),
+        ],
+        "t1's result lands at index 3 (the end), not at its tool_use index + 1"
+    );
+    assert_eq!(blocks[3]["tool_use_id"], json!("t1"));
+    assert_eq!(blocks[4]["tool_use_id"], json!("t2"));
+}
