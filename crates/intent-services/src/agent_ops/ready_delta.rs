@@ -91,7 +91,10 @@ pub(crate) fn collect_trigger_tasks<'a>(
 
 /// Render the advisory "tasks now unblocked" section for a non-empty delta.
 /// Each row names the task as an `intent://local/task/{id}` link plus the
-/// reason it became ready; `multiple_triggers` flips the singular/plural
+/// reason it became ready; a task sitting in an attention status is annotated
+/// rather than dropped (`; currently blocked — needs attention`), since the
+/// delegator may want to resolve the attention state precisely because the
+/// task is otherwise unblocked. `multiple_triggers` flips the singular/plural
 /// framing when a coalesced batch covered more than one completion.
 pub(crate) fn render_unblocked_section(delta: &[UnblockedTask], multiple_triggers: bool) -> String {
     let noun = if multiple_triggers {
@@ -106,9 +109,18 @@ pub(crate) fn render_unblocked_section(delta: &[UnblockedTask], multiple_trigger
                 UnblockedReason::DepsSatisfied => "deps satisfied",
                 UnblockedReason::ConflictCleared => "conflict cleared",
             };
+            let attention = match t.attention {
+                Some(TaskStatus::Waiting) => "; currently waiting — needs attention",
+                Some(TaskStatus::DiscussionNeeded) => {
+                    "; currently discussion_needed — needs attention"
+                }
+                Some(TaskStatus::Blocked) => "; currently blocked — needs attention",
+                Some(TaskStatus::ReviewRequired) => "; currently review_required — needs attention",
+                _ => "",
+            };
             format!(
-                "[{}](intent://local/task/{}) ({})",
-                t.title, t.note_id, reason
+                "[{}](intent://local/task/{}) ({}{})",
+                t.title, t.note_id, reason, attention
             )
         })
         .collect::<Vec<_>>()
@@ -128,12 +140,17 @@ pub(crate) enum UnblockedReason {
 }
 
 /// One row of the delta, ready for message rendering. `title` falls back to
-/// the note id when the caller has no title for it.
+/// the note id when the caller has no title for it. `attention` carries the
+/// task's attention status (`waiting` / `discussion_needed` / `blocked` /
+/// `review_required`) when it sits in one — such tasks stay in the delta by
+/// design (see [`ready_set_delta`]) and the renderer annotates them instead
+/// of dropping them; `None` for ordinary `not_started` candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnblockedTask {
     pub(crate) note_id: String,
     pub(crate) title: String,
     pub(crate) reason: UnblockedReason,
+    pub(crate) attention: Option<TaskStatus>,
 }
 
 /// Single-task readiness disposition against `snaps`: greedy-off, so
@@ -168,9 +185,9 @@ fn classify_one(id: &str, snaps: &HashMap<String, BatchTaskSnap>) -> Option<Batc
 /// first). Attention statuses (`waiting`, `discussion_needed`, `blocked`,
 /// `review_required`) remain candidates ON PURPOSE — batch-delegate
 /// classification treats them as delegable, and this helper keeps those
-/// semantics; whether to annotate or filter them in the rendered hint is the
-/// consumer's call. Output is sorted by title then note id for reproducible
-/// message rendering.
+/// semantics; their status is surfaced on [`UnblockedTask::attention`] so the
+/// renderer annotates them rather than silently dropping them. Output is
+/// sorted by title then note id for reproducible message rendering.
 pub(crate) fn ready_set_delta(
     trigger_completions: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
@@ -219,10 +236,18 @@ pub(crate) fn ready_set_delta(
             // Ready before the triggers too — not attributable to them.
             _ => continue,
         };
+        let attention = match snap.status {
+            TaskStatus::Waiting
+            | TaskStatus::DiscussionNeeded
+            | TaskStatus::Blocked
+            | TaskStatus::ReviewRequired => Some(snap.status),
+            _ => None,
+        };
         out.push(UnblockedTask {
             note_id: id.clone(),
             title: titles.get(id).cloned().unwrap_or_else(|| id.clone()),
             reason,
+            attention,
         });
     }
     out.sort_by(|a, b| {
@@ -374,7 +399,8 @@ mod tests {
     fn attention_statuses_remain_candidates() {
         // Pinned semantics: waiting/discussion_needed/blocked/review_required
         // tasks are delegable per batch classification, so they appear in the
-        // delta once their trigger dep completes.
+        // delta once their trigger dep completes — with their attention
+        // status surfaced for the renderer to annotate.
         let mut snaps = HashMap::new();
         snaps.insert("done".into(), snap(TaskStatus::Complete, &[], &[]));
         snaps.insert("w".into(), snap(TaskStatus::Waiting, &["done"], &[]));
@@ -384,14 +410,30 @@ mod tests {
         );
         snaps.insert("b".into(), snap(TaskStatus::Blocked, &["done"], &[]));
         snaps.insert("r".into(), snap(TaskStatus::ReviewRequired, &["done"], &[]));
+        snaps.insert("n".into(), snap(TaskStatus::NotStarted, &["done"], &[]));
         let delta = ready_set_delta(&ids(&["done"]), &snaps, &HashMap::new());
         assert_eq!(
             rows(&delta),
             vec![
                 ("b", UnblockedReason::DepsSatisfied),
                 ("d", UnblockedReason::DepsSatisfied),
+                ("n", UnblockedReason::DepsSatisfied),
                 ("r", UnblockedReason::DepsSatisfied),
                 ("w", UnblockedReason::DepsSatisfied),
+            ]
+        );
+        let attention: Vec<(&str, Option<TaskStatus>)> = delta
+            .iter()
+            .map(|u| (u.note_id.as_str(), u.attention))
+            .collect();
+        assert_eq!(
+            attention,
+            vec![
+                ("b", Some(TaskStatus::Blocked)),
+                ("d", Some(TaskStatus::DiscussionNeeded)),
+                ("n", None),
+                ("r", Some(TaskStatus::ReviewRequired)),
+                ("w", Some(TaskStatus::Waiting)),
             ]
         );
     }
@@ -493,11 +535,13 @@ mod tests {
                 note_id: "t3".into(),
                 title: "T3: Return a map".into(),
                 reason: UnblockedReason::DepsSatisfied,
+                attention: None,
             },
             UnblockedTask {
                 note_id: "t4".into(),
                 title: "T4: FE parity".into(),
                 reason: UnblockedReason::ConflictCleared,
+                attention: None,
             },
         ];
         let single = render_unblocked_section(&delta, false);
@@ -510,6 +554,49 @@ mod tests {
         let multi = render_unblocked_section(&delta, true);
         assert!(multi.starts_with("Tasks now unblocked by these completions:"));
         assert!(single.starts_with(UNBLOCKED_SECTION_PREFIX));
+    }
+
+    #[test]
+    fn render_section_annotates_attention_statuses_instead_of_dropping() {
+        let delta = vec![
+            UnblockedTask {
+                note_id: "tb".into(),
+                title: "Blocked one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::Blocked),
+            },
+            UnblockedTask {
+                note_id: "tw".into(),
+                title: "Waiting one".into(),
+                reason: UnblockedReason::ConflictCleared,
+                attention: Some(TaskStatus::Waiting),
+            },
+            UnblockedTask {
+                note_id: "td".into(),
+                title: "Discussion one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::DiscussionNeeded),
+            },
+            UnblockedTask {
+                note_id: "tr".into(),
+                title: "Review one".into(),
+                reason: UnblockedReason::DepsSatisfied,
+                attention: Some(TaskStatus::ReviewRequired),
+            },
+        ];
+        let section = render_unblocked_section(&delta, false);
+        assert_eq!(
+            section,
+            "Tasks now unblocked by this completion: \
+             [Blocked one](intent://local/task/tb) \
+             (deps satisfied; currently blocked — needs attention), \
+             [Waiting one](intent://local/task/tw) \
+             (conflict cleared; currently waiting — needs attention), \
+             [Discussion one](intent://local/task/td) \
+             (deps satisfied; currently discussion_needed — needs attention), \
+             [Review one](intent://local/task/tr) \
+             (deps satisfied; currently review_required — needs attention)."
+        );
     }
 
     #[test]
