@@ -8902,6 +8902,26 @@ fn user_message_blocks_persists_attachment_reference_file_blocks() {
     assert!(arr[2].get("size").is_none());
 }
 
+/// A blank `attachmentId` counts as absent everywhere: an entry carrying
+/// inline `data` plus a whitespace `attachmentId` passes validation as
+/// data-only, so persistence must keep the inline data rather than store a
+/// dangling blank reference (same non-blank filter as `validate_file_blocks`
+/// and prompt assembly).
+#[test]
+fn user_message_blocks_blank_attachment_id_persists_inline_data() {
+    let files = json!([
+        { "type": "file", "data": "aGk=", "mimeType": "text/plain",
+          "attachmentId": "  ", "fileName": "hi.txt" },
+    ]);
+    let blocks = user_message_blocks("msg", None, Some(&files));
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[1]["type"], json!("file"));
+    assert_eq!(arr[1]["data"], json!("aGk="));
+    assert_eq!(arr[1]["mimeType"], json!("text/plain"));
+    assert!(arr[1].get("attachmentId").is_none());
+}
+
 /// `validate_file_blocks` (PROTOCOL §5.5): exactly one of `data` /
 /// `attachmentId` per entry — both or neither is `-32602`; valid arrays,
 /// non-arrays, and non-object entries pass.

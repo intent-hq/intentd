@@ -19450,6 +19450,90 @@ mod file_ops_service {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Containment: a tampered registry row (escaping `stored_path` or
+    /// `file_name`) must be rejected by the within-root guard — the copy path
+    /// never reads outside the canonical store or writes outside the caller
+    /// root, and the `getAttachmentInfo` exists-probe never leaks existence
+    /// of host paths. Cross-workspace ids read as unknown.
+    #[tokio::test]
+    async fn file_get_attachment_rejects_tampered_rows_and_cross_workspace() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir = std::env::temp_dir().join(format!("intentd-atttamper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+
+        // A file OUTSIDE the workspace root that a tampered row points at.
+        let outside = dir.parent().unwrap().join(format!(
+            "intentd-atttamper-outside-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let escaping = intent_store::AttachmentRecord {
+            id: "att-escape".to_string(),
+            workspace_id: ws.clone(),
+            file_name: "outside.txt".to_string(),
+            mime_type: None,
+            size: 6,
+            uploaded_at: "2026-08-12T00:00:00Z".to_string(),
+            stored_path: format!("../{}", outside.file_name().unwrap().to_string_lossy()),
+        };
+        store.insert_attachment(&escaping).await.expect("insert");
+        // Escaping file_name on an in-root stored path (three levels up from
+        // the default `.intent/attachments/` destination → outside the root).
+        let bad_name = intent_store::AttachmentRecord {
+            id: "att-badname".to_string(),
+            file_name: "../../../evil.txt".to_string(),
+            stored_path: ".intent/attachments/ok.txt".to_string(),
+            ..escaping.clone()
+        };
+        store.insert_attachment(&bad_name).await.expect("insert 2");
+        std::fs::create_dir_all(dir.join(".intent/attachments")).unwrap();
+        std::fs::write(dir.join(".intent/attachments/ok.txt"), b"ok").unwrap();
+
+        let svc = Services::new(store);
+
+        // Copy path: escaping stored_path → ACCESS_DENIED, file untouched.
+        let got = svc
+            .file_get_attachment(ws.clone(), "att-escape".to_string(), None, None)
+            .await;
+        assert!(matches!(got, Err(Error::Internal(_))), "{got:?}");
+        // Exists-probe: same guard — the row reads as not-existing rather
+        // than probing the host path (which IS on disk).
+        let info = svc
+            .file_get_attachment_info("att-escape".to_string())
+            .await
+            .expect("info");
+        assert_eq!(info["exists"], serde_json::json!(false));
+
+        // Copy path: escaping file_name → ACCESS_DENIED, nothing written
+        // outside the root.
+        let got2 = svc
+            .file_get_attachment(ws.clone(), "att-badname".to_string(), None, None)
+            .await;
+        assert!(matches!(got2, Err(Error::Internal(_))), "{got2:?}");
+        assert!(!dir.parent().unwrap().join("evil.txt").exists());
+
+        // Cross-workspace: a valid row read under a DIFFERENT workspace id
+        // reads as an unknown attachment id.
+        let other_ws = WorkspaceId::new();
+        let cross = svc
+            .file_get_attachment(other_ws, "att-badname".to_string(), None, None)
+            .await;
+        match cross {
+            Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (caller_agent_id → resolve_root),
     /// and assert the write landed in the sandbox and the user's directory is untouched.

@@ -129,6 +129,17 @@ fn io_err(e: std::io::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
+/// Resolve an attachment-registry `stored_path` against the canonical root
+/// with the within-workspace guard — shared by the `getAttachment` copy path
+/// and the `getAttachmentInfo` exists-probe so a tampered row can never read
+/// or probe outside the store.
+pub(crate) fn resolve_attachment_source(
+    canonical_root: &str,
+    stored_path: &str,
+) -> Result<PathBuf> {
+    resolve_within(canonical_root, stored_path)
+}
+
 /// `file.read` → bare UTF-8 string.
 pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
@@ -280,7 +291,7 @@ pub(crate) fn get_attachment(
     }
     // Source side: the stored path must stay inside the canonical store —
     // a tampered registry row must never read outside it.
-    let src = resolve_within(canonical_root, &record.stored_path)?;
+    let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
     if !src.is_file() {
         return Err(Error::Internal(format!(
             "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
@@ -297,14 +308,9 @@ pub(crate) fn get_attachment(
     if !marker.exists() {
         std::fs::write(&marker, "*\n").map_err(io_err)?;
     }
-    let dest = dest_dir_full.join(&record.file_name);
     // resolve_within on the joined relative path guards a crafted fileName.
     let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
-    let dest = {
-        let checked = resolve_within(dest_root, &rel)?;
-        debug_assert_eq!(checked, dest);
-        checked
-    };
+    let dest = resolve_within(dest_root, &rel)?;
     let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
         (Ok(s), Ok(d)) if s.len() == d.len() => {
             // Same size — confirm contents before skipping the copy.

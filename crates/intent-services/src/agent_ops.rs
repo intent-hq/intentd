@@ -1404,7 +1404,13 @@ pub(crate) fn user_message_blocks(
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            let attachment_id = file.get("attachmentId").and_then(Value::as_str);
+            // Same non-blank filter as `validate_file_blocks` and prompt
+            // assembly — a whitespace attachmentId must not shadow inline
+            // data into a dangling blank reference.
+            let attachment_id = file
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
             if let (Some(id), Some(name)) = (attachment_id, name) {
                 let mut block = json!({
                     "type": "file",

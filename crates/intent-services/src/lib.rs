@@ -10325,15 +10325,21 @@ impl WorkspaceApi for Services {
             let record = store
                 .get_attachment(&attachment_id)
                 .await
-                .map_err(|_| Error::NotFound(format!("unknown attachment id: {attachment_id}")))?;
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
             // `exists` reflects the file on disk NOW (the user may have
             // deleted it out-of-band); resolved against the canonical
-            // workspace root, never a sandbox.
+            // workspace root, never a sandbox, with the same within-root
+            // containment guard as the copy path — a tampered stored_path
+            // must not probe file existence outside the store.
             let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
             let exists = !root.is_empty()
-                && std::path::Path::new(&root)
-                    .join(&record.stored_path)
-                    .is_file();
+                && file_ops::resolve_attachment_source(&root, &record.stored_path)
+                    .is_ok_and(|p| p.is_file());
             let mut result = serde_json::json!({
                 "attachmentId": record.id,
                 "fileName": record.file_name,
@@ -10361,7 +10367,12 @@ impl WorkspaceApi for Services {
             let record = store
                 .get_attachment(&attachment_id)
                 .await
-                .map_err(|_| Error::NotFound(format!("unknown attachment id: {attachment_id}")))?;
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
             if record.workspace_id != workspace_id {
                 // Cross-workspace probes read as unknown ids — the registry
                 // is workspace-scoped.
