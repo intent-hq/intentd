@@ -23778,3 +23778,270 @@ async fn batch_delegate_skips_terminal_and_flags_cancelled_deps() {
         json!([] as [String; 0])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Delivery-time "tasks now unblocked" hints (intent-hq/monorepo#2044)
+// ---------------------------------------------------------------------------
+
+use crate::agent_ops::ready_delta::{UNBLOCKED_SECTION_PREFIX, UNBLOCKED_TRIGGER_TASKS_KEY};
+
+/// A task-linked child's genuine `agent:idle` completion stamps ONLY the
+/// trigger task id on the wake metadata (no unblocked enumeration at enqueue),
+/// and the store-only delivery path (no AgentManager attached — delivery IS
+/// the persist) resolves the section fresh: the dependent task's row names it
+/// with an `intent://local/task/` link and the deps-satisfied reason.
+#[tokio::test]
+async fn completion_wake_carries_delivery_time_unblocked_section() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let done = link_task_note(&svc, &ws, &child, "Done task", "complete").await;
+    let gated = seed_task(&svc, &ws, "Gated task").await;
+    svc.task_set_relations(ws.clone(), gated.clone(), Some(vec![done.clone()]), None)
+        .await
+        .expect("gated dependsOn done");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "did the work" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "exactly one wake");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains(UNBLOCKED_SECTION_PREFIX),
+        "wake carries the unblocked section: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "[Gated task](intent://local/task/{}) (deps satisfied)",
+            gated.0
+        )),
+        "section names the dependent with a task link + reason: {text}"
+    );
+    // Enqueue-time metadata carries ONLY the triggering fact.
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata[UNBLOCKED_TRIGGER_TASKS_KEY],
+        json!([{ "workspaceId": ws.0, "taskNoteId": done.0 }]),
+        "trigger stamped at enqueue: {metadata}"
+    );
+    assert!(
+        !serde_json::to_string(metadata).unwrap().contains(&gated.0),
+        "no unblocked enumeration persisted in metadata: {metadata}"
+    );
+}
+
+/// A child with no linked task note produces a wake with no trigger stamp and
+/// no section — byte-for-byte the pre-2044 wake. Same for a completion whose
+/// task unlocks nothing.
+#[tokio::test]
+async fn taskless_and_no_delta_wakes_are_unannotated() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Case 1: no linked task at all.
+    let free = create_agent(&svc, &ws, "Free").await;
+    // Case 2: linked complete task with no dependents.
+    let loner = create_agent(&svc, &ws, "Loner").await;
+    link_task_note(&svc, &ws, &loner, "Standalone task", "complete").await;
+
+    for child in [&free, &loner] {
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            None,
+        )
+        .expect("register watch");
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            child,
+            json!({ "agentId": child.0, "completionReport": "done" }),
+        ))
+        .await;
+    }
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 2, "two wakes");
+    let free_text = session.messages[0].content.to_string();
+    assert!(
+        !free_text.contains(UNBLOCKED_SECTION_PREFIX),
+        "taskless wake unannotated: {free_text}"
+    );
+    let free_md = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        free_md.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_none(),
+        "taskless wake has no trigger stamp: {free_md}"
+    );
+    let loner_text = session.messages[1].content.to_string();
+    assert!(
+        !loner_text.contains(UNBLOCKED_SECTION_PREFIX),
+        "empty-delta wake unannotated: {loner_text}"
+    );
+    let loner_md = session.messages[1].metadata.as_ref().expect("metadata");
+    assert!(
+        loner_md.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_some(),
+        "trigger IS stamped (the fact happened) even when the delta is empty: {loner_md}"
+    );
+}
+
+/// The between-enqueue-and-delivery property at the services level: the
+/// stamped trigger metadata carries no readiness snapshot, so a task whose
+/// remaining dependency completes AFTER the trigger stamp but BEFORE the
+/// section is rendered appears in the delivered section (delivery-time state
+/// wins). Rendered here via `unblocked_section_for_delivery`, the exact
+/// function the drain paths call at flush time.
+#[tokio::test]
+async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
+    let (_t, svc, ws) = setup().await;
+    let a = seed_task(&svc, &ws, "Task A").await;
+    let b = seed_task(&svc, &ws, "Task B").await;
+    let gated = seed_task(&svc, &ws, "Gated").await;
+    svc.task_set_relations(
+        ws.clone(),
+        gated.clone(),
+        Some(vec![a.clone(), b.clone()]),
+        None,
+    )
+    .await
+    .expect("gated dependsOn a+b");
+    svc.task_update_note_status(ws.clone(), a.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete a");
+
+    // Enqueue-time stamp for A's completion: at this instant `gated` is NOT
+    // unblocked (b incomplete) — and nothing about that is recorded.
+    let mut metadata = json!({ "type": "event_notification" });
+    crate::agent_ops::ready_delta::stamp_trigger_tasks(
+        &mut metadata,
+        &[(ws.0.clone(), a.0.clone())],
+    );
+
+    // No section yet: rendering now yields nothing attributable… to a stale
+    // reader this wake would have said nothing forever.
+    assert!(
+        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+            .await
+            .is_none(),
+        "b still incomplete → no delta"
+    );
+
+    // B completes while the wake is still queued.
+    svc.task_update_note_status(ws.clone(), b.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete b");
+
+    // Delivery/render time: the section reflects CURRENT state — `gated` is
+    // now attributable to trigger A (its last unmet dep set includes A in the
+    // counterfactual where A is still running).
+    let section = svc
+        .unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        .await
+        .expect("delta non-empty at render time");
+    assert!(
+        section.contains(&format!("[Gated](intent://local/task/{})", gated.0)),
+        "render-time recompute includes the now-unblocked task: {section}"
+    );
+
+    // Inverse direction: the task got claimed (in_progress) before delivery →
+    // excluded again, even though the trigger stamp is unchanged.
+    svc.task_update_note_status(ws.clone(), gated.clone(), "in_progress".into(), None, None)
+        .await
+        .expect("claim gated");
+    assert!(
+        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+            .await
+            .is_none(),
+        "a claimed task is no longer surfaced at delivery"
+    );
+}
+
+/// after_all aggregated wake: every idle-settled task-linked member
+/// contributes its trigger id to the group wake's metadata (the enumeration
+/// still resolves at delivery).
+#[tokio::test]
+async fn group_wake_stamps_all_settled_member_trigger_tasks() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "One").await;
+    let t2 = create_agent(&svc, &ws, "Two").await;
+    let n1 = link_task_note(&svc, &ws, &t1, "Task one", "complete").await;
+    let n2 = link_task_note(&svc, &ws, &t2, "Task two", "complete").await;
+
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![t1.0.clone(), t2.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "completionReport": "one done" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "completionReport": "two done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    let triggers = metadata[UNBLOCKED_TRIGGER_TASKS_KEY]
+        .as_array()
+        .expect("trigger array on group wake");
+    let ids: Vec<&str> = triggers
+        .iter()
+        .map(|t| t["taskNoteId"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&n1.0.as_str()),
+        "t1's task stamped: {metadata}"
+    );
+    assert!(
+        ids.contains(&n2.0.as_str()),
+        "t2's task stamped: {metadata}"
+    );
+}

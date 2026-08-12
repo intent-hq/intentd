@@ -3824,6 +3824,25 @@ impl Services {
             }
             None => event,
         };
+        // Enqueue-time trigger record (intent-hq/monorepo#2044): a genuine
+        // `agent:idle` completion of a task-linked child stamps the child's
+        // linked task-note id onto the wake metadata — only the triggering
+        // fact. The "tasks now unblocked" enumeration is resolved at
+        // delivery/render time against CURRENT task state (never here), so a
+        // wake that sits queued behind a busy parent cannot carry a stale
+        // snapshot.
+        let trigger_tasks: Vec<(String, String)> =
+            if !watches.is_empty() && event.event_type == AGENT_IDLE && !interim_idle {
+                match self.store.get_agent_session(child_id).await {
+                    Ok(s) => match s.task_note_id {
+                        Some(n) => vec![(s.workspace_id.0, n.0)],
+                        None => Vec::new(),
+                    },
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
         for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -4009,7 +4028,8 @@ impl Services {
             // `remove_watch` just retired the one-shot watch, so the wake
             // carries the retirement + re-arm suffix (issue monorepo#2051).
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
-            let metadata = build_event_notification_metadata(&[event]);
+            let mut metadata = build_event_notification_metadata(&[event]);
+            crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             if let Err(e) = self
                 .deliver_parent_wake(
                     &parent_ws,
@@ -4120,7 +4140,27 @@ impl Services {
         }
         let wake = format_group_wake(&group);
         let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
-        let metadata = build_event_notification_metadata(&event_refs);
+        let mut metadata = build_event_notification_metadata(&event_refs);
+        // Enqueue-time trigger record (intent-hq/monorepo#2044), aggregated
+        // form: every group member that settled via a genuine `agent:idle`
+        // completion and has a linked task note contributes its task id.
+        // Only the triggering facts are stamped — the unblocked enumeration
+        // is computed fresh at delivery/render time.
+        let mut trigger_tasks: Vec<(String, String)> = Vec::new();
+        for event in &group.raw_events {
+            if event.event_type != AGENT_IDLE {
+                continue;
+            }
+            let Some(child) = completion_event_child_id(event) else {
+                continue;
+            };
+            if let Ok(s) = self.store.get_agent_session(&AgentId::from(child)).await {
+                if let Some(n) = s.task_note_id {
+                    trigger_tasks.push((s.workspace_id.0, n.0));
+                }
+            }
+        }
+        crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
         if let Err(e) = self
             .deliver_parent_wake(
                 workspace_id,
@@ -4865,6 +4905,23 @@ impl Services {
                     // trigger.
                     return Ok(result);
                 }
+                // Delivery-time unblocked hints (monorepo#2044): the
+                // store-only persist IS this path's delivery, so the section
+                // is resolved here — matching the manager path's direct-send
+                // arm.
+                let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+                    message_metadata.as_ref(),
+                ) {
+                    match self
+                        .unblocked_section_for_delivery(std::iter::once(message_metadata.as_ref()))
+                        .await
+                    {
+                        Some(section) => format!("{content}\n\n{section}"),
+                        None => content,
+                    }
+                } else {
+                    content
+                };
                 let blocks = serde_json::json!([{ "type": "text", "text": content }]);
                 self.store
                     .append_agent_message_with_metadata(
