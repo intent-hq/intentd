@@ -10238,7 +10238,7 @@ mod dequeue_wait_tests {
     use super::*;
     use crate::agent_ops::QueuedMessage;
 
-    fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
+    pub(super) fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
             id: "qm-wait-test".to_string(),
             turn_id: "qm-wait-test".to_string(),
@@ -10477,6 +10477,149 @@ mod dequeue_wait_tests {
             text, "direct hello",
             "immediate deliveries carry no dequeue-wait note"
         );
+    }
+}
+
+/// Delivery-time "tasks now unblocked" annotation (intent-hq/monorepo#2044):
+/// [`super::annotate_unblocked_hints`] resolves the stamped trigger ids
+/// against CURRENT task state as a batch drains, coalescing all
+/// trigger-carrying entries into one section on the last of them.
+#[cfg(test)]
+mod unblocked_hints_tests {
+    use super::dequeue_wait_tests::queued_msg;
+    use super::*;
+    use crate::agent_ops::ready_delta::{stamp_trigger_tasks, UNBLOCKED_SECTION_PREFIX};
+    use intent_core::{NoteCreate, NoteId, WorkspaceApi};
+
+    async fn seed_task(services: &Services, ws: &WorkspaceId, title: &str, status: &str) -> NoteId {
+        let note = services
+            .create_note(
+                ws.clone(),
+                NoteCreate {
+                    title: title.into(),
+                    content: Some("body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note");
+        WorkspaceApi::mark_as_task(
+            services,
+            ws.clone(),
+            note.id.clone(),
+            status.into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("mark as task");
+        note.id
+    }
+
+    /// Two completion wakes draining in one batch coalesce into ONE section
+    /// appended to the LAST trigger-carrying entry; the delta reflects task
+    /// state at annotation time (both deps complete → the gated task rows
+    /// once, not per-wake).
+    #[tokio::test]
+    async fn batch_coalesces_triggers_into_one_section_on_last_entry() {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::from("ws-unblocked");
+        seed_agent(&mgr, &ws, &AgentId::from("seed-unblocked")).await;
+        let services = &mgr.services;
+        let a = seed_task(services, &ws, "Task A", "complete").await;
+        let b = seed_task(services, &ws, "Task B", "complete").await;
+        let gated = seed_task(services, &ws, "Gated", "not_started").await;
+        services
+            .task_set_relations(
+                ws.clone(),
+                gated.clone(),
+                Some(vec![a.clone(), b.clone()]),
+                None,
+            )
+            .await
+            .expect("gated dependsOn a+b");
+
+        let mut wake_a = queued_msg("[WORKSPACE EVENTS] Child A completed.", &now_iso(), false);
+        let mut md_a = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(&mut md_a, &[(ws.0.clone(), a.0.clone())]);
+        wake_a.message_metadata = Some(md_a);
+        let mut wake_b = queued_msg("[WORKSPACE EVENTS] Child B completed.", &now_iso(), false);
+        let mut md_b = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(&mut md_b, &[(ws.0.clone(), b.0.clone())]);
+        wake_b.message_metadata = Some(md_b);
+        let plain = queued_msg("unrelated user message", &now_iso(), false);
+
+        let mut entries = vec![wake_a, plain, wake_b];
+        super::super::annotate_unblocked_hints(services, &mut entries).await;
+
+        assert!(
+            !entries[0].content.contains(UNBLOCKED_SECTION_PREFIX),
+            "first wake is not annotated (coalesced onto the last): {}",
+            entries[0].content
+        );
+        assert!(
+            !entries[1].content.contains(UNBLOCKED_SECTION_PREFIX),
+            "non-trigger entry untouched: {}",
+            entries[1].content
+        );
+        let last = &entries[2].content;
+        assert!(
+            last.contains("Tasks now unblocked by these completions:"),
+            "last trigger-carrying entry carries the plural section: {last}"
+        );
+        assert!(
+            last.contains(&format!("[Gated](intent://local/task/{})", gated.0)),
+            "section names the unblocked task once with a link: {last}"
+        );
+        assert_eq!(
+            last.matches("[Gated]").count(),
+            1,
+            "coalesced delta lists the task once: {last}"
+        );
+    }
+
+    /// Idempotency + persisted guards: an entry whose content already carries
+    /// the section (terminal-failure requeue) and a `persisted: true` entry
+    /// are never (re)annotated.
+    #[tokio::test]
+    async fn requeued_and_persisted_entries_are_not_reannotated() {
+        let (_tmp, mgr) = manager().await;
+        let ws = WorkspaceId::from("ws-unblocked-idem");
+        seed_agent(&mgr, &ws, &AgentId::from("seed-unblocked-idem")).await;
+        let services = &mgr.services;
+        let a = seed_task(services, &ws, "Task A", "complete").await;
+        let gated = seed_task(services, &ws, "Gated", "not_started").await;
+        services
+            .task_set_relations(ws.clone(), gated.clone(), Some(vec![a.clone()]), None)
+            .await
+            .expect("gated dependsOn a");
+        let mut md = json!({ "type": "event_notification" });
+        stamp_trigger_tasks(&mut md, &[(ws.0.clone(), a.0.clone())]);
+
+        // Already-annotated content (requeue after a failed turn).
+        let mut annotated = queued_msg(
+            &format!("wake\n\n{UNBLOCKED_SECTION_PREFIX} this completion: x."),
+            &now_iso(),
+            false,
+        );
+        annotated.message_metadata = Some(md.clone());
+        let before = annotated.content.clone();
+        let mut entries = vec![annotated];
+        super::super::annotate_unblocked_hints(services, &mut entries).await;
+        assert_eq!(entries[0].content, before, "no double annotation");
+
+        // Persisted rows stay byte-identical to the transcript.
+        let mut persisted = queued_msg("wake", &now_iso(), true);
+        persisted.message_metadata = Some(md);
+        let mut entries = vec![persisted];
+        super::super::annotate_unblocked_hints(services, &mut entries).await;
+        assert_eq!(entries[0].content, "wake", "persisted rows never rewritten");
     }
 }
 
