@@ -14,9 +14,10 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, max_concurrent_adapters,
-    max_concurrent_agents, recommended_memory_budget_bytes, AgentManager, BusEventSink, EventBus,
-    GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe, WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
+    max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
+    BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe,
+    WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -1924,8 +1925,9 @@ struct ChildTreeSample {
 /// separate atomics: they are only meaningful as a set, and a reader that
 /// paired a count from one sweep with a byte total from the next would report
 /// a tree that never existed. Same shape as [`RouteInfo`] above, and the
-/// contention is nil — one writer every
-/// [`CHILD_TREE_SAMPLE_SECS`], readers only on a `system.status` call.
+/// contention is nil — one writer every [`CHILD_TREE_BASE_PERIOD`] (plus the
+/// peak-only writer of [`Self::observe_burst`] during a burst), readers only on
+/// a `system.status` call.
 #[derive(Default)]
 struct ChildTreeUsage {
     inner: std::sync::RwLock<Option<ChildTreeSample>>,
@@ -1946,6 +1948,34 @@ impl ChildTreeUsage {
         });
     }
 
+    /// Raise the high-water mark from a burst-cadence reading, without
+    /// publishing it as the current sample (monorepo#2107).
+    ///
+    /// Only `peak_memory_bytes` moves. `count` / `memory_bytes` / `seq` keep the
+    /// [`CHILD_TREE_BASE_PERIOD`] cadence they have always had, because `seq` is
+    /// the spawn budget's "this reading is new" signal: seeing it change is what
+    /// makes [`intent_services::ProcessRegistry`] drop the provisional charge it
+    /// holds for spawns admitted since the last sample (monorepo#2063). At
+    /// sub-second cadence that correction would be cleared before an admitted
+    /// spawn is resident in the tree at all, and a whole burst would be admitted
+    /// against one stale total — a bound that was just validated, silently
+    /// loosened in the name of a telemetry field. The peak has no such consumer:
+    /// it is a max over every reading ever taken, so extra readings can only
+    /// make it more true.
+    ///
+    /// A no-op before the first full sample lands: there is no tree reading to
+    /// raise yet, and seeding one here would publish a peak while
+    /// `childProcesses` / `childMemoryBytes` are still `null`, breaking the
+    /// all-null-or-all-present contract §5.7 gives the three fields. The
+    /// sampler's first sweep is always a full one, so the window is the first
+    /// few hundred milliseconds of daemon life.
+    fn observe_burst(&self, memory_bytes: u64) {
+        let mut guard = self.inner.write().expect("child tree usage lock poisoned");
+        if let Some(sample) = guard.as_mut() {
+            sample.peak_memory_bytes = sample.peak_memory_bytes.max(memory_bytes);
+        }
+    }
+
     fn load(&self) -> Option<ChildTreeSample> {
         *self.inner.read().expect("child tree usage lock poisoned")
     }
@@ -1959,16 +1989,59 @@ impl TreeMemoryProbe for ChildTreeUsage {
     }
 }
 
-/// Sweep interval for the descendant-tree sampler. Slower than the ~1s
-/// own-process tick because this one needs a full-system process refresh to
-/// reconstruct the parent/child links, but deliberately not much slower: the
-/// tree is not only long-lived agent sessions. Every `agent.completeOnce` /
-/// `agent.enhancePrompt` quick action and every model probe spawns an
-/// ephemeral adapter chain that lives for **seconds** — measured at ~7 s for a
-/// trivial completion — so a coarse tick aliases those away entirely. Measured
-/// on a 1008-process macOS host, one refresh + walk costs ~10 ms, i.e. 0.2% of
-/// one core at this cadence.
-const CHILD_TREE_SAMPLE_SECS: u64 = 5;
+/// Baseline sweep interval for the descendant-tree sampler — the cadence at
+/// which the published sample (`childProcesses` / `childMemoryBytes`) is
+/// refreshed, to the [`CHILD_TREE_BURST_PERIOD`] granularity the loop polls at.
+/// Slower than the ~1s own-process tick because this one needs a full-system
+/// process refresh to reconstruct the parent/child links: ~10 ms on a
+/// 1008-process macOS host (intentd#1139), re-measured at 12.5 ms median /
+/// 19.9 ms p95 on a 1105-process one, i.e. ~0.25% of one core at this cadence.
+const CHILD_TREE_BASE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Sweep interval while an ephemeral adapter chain is live, and the cadence at
+/// which the sampler checks whether one is (monorepo#2107).
+///
+/// The baseline is too coarse for the case `childMemoryPeakBytes` exists to
+/// serve. Every `agent.completeOnce` / `agent.enhancePrompt` quick action and
+/// every model probe spawns an adapter chain that lives for **seconds**, and
+/// those bursts are large and sharp: measured, 16 concurrent one-shots reached
+/// 6.97 GB and were spawned and fully reaped inside 3.3 s, entirely between two
+/// baseline ticks. The sampler saw `childProcesses: 0` throughout and the peak
+/// never moved — a 99% under-report of a burst that a 1 Hz `ps` walk had no
+/// trouble seeing, and low enough that the same burst *unbounded* read cheaper
+/// than it did under the `agents.maxConcurrentAdapters` bound.
+///
+/// 500 ms is half the cadence that was already shown sufficient (the `ps` walk
+/// the field was validated against ran at 1 Hz), which leaves margin for a
+/// chain whose ramp is sharper than the ones measured. It is not free: at
+/// 12.5 ms a sweep, sweeping this fast costs ~2.5% of one core, measured in
+/// situ as daemon CPU going from 1.65% to 3.84% mean across the same 16-chain
+/// burst. So it is spent only while chains are actually live — with none live
+/// the poll is one atomic read of the adapter bound and no sweep happens at
+/// all, leaving an idle or steadily-working daemon exactly as cheap as before.
+///
+/// The cadence holds for as long as chains are live, so a one-shot that sits
+/// there until its own timeout pays it for its whole life: measured over a 25 s
+/// chain, 3.2% of one core against 0.6% idle — one core of sixteen, for the
+/// duration of a call that is already the pathological case.
+///
+/// Two residual blind spots, worth stating rather than leaving for the next
+/// person to measure their way to (which is how monorepo#2107 was found):
+///
+/// 1. A chain born *and* reaped inside one 500 ms poll gap. Nothing observed
+///    comes close — the shortest measured chain lived 2.5 s.
+/// 2. Everything in the tree that never takes a slot in the adapter bound is
+///    still sampled at [`CHILD_TREE_BASE_PERIOD`] only. The fast cadence keys
+///    off [`intent_services::live_adapters`], so it covers the two
+///    [`intent_services`] paths that go through the bound — the one-shot ACP
+///    runner and the model probe — and nothing else. The auggie route of the
+///    same quick actions spawns its CLI directly and takes no slot; so do
+///    `host.exec` children, PTY sessions, MCP bridge servers, the Unsloth
+///    server, and the tool children a long-lived agent runs. Those are mostly
+///    long-lived enough for the baseline to see (an agent subtree lives for
+///    minutes to hours), but a short, sharp excursion from one of them can
+///    still be missed the way an adapter burst used to be.
+const CHILD_TREE_BURST_PERIOD: Duration = Duration::from_millis(500);
 
 /// Fraction of total system RAM the descendant tree may occupy before each
 /// sample logs a WARN. Agents are budgeted ~1 GB each by
@@ -2026,6 +2099,32 @@ fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u
     walk_descendants(&children, &|pid| sys.process(pid).map(|p| p.memory()), root)
 }
 
+/// What one poll of the descendant-tree sampler should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildTreeSweep {
+    /// Nothing worth the process-table refresh: no ephemeral chain is live and
+    /// the baseline sample is not due yet.
+    Skip,
+    /// Walk the tree and fold the reading into the high-water mark only.
+    Peak,
+    /// Walk the tree and publish it as the current sample.
+    Full,
+}
+
+/// Decide a poll (monorepo#2107). A due baseline sample always wins — the
+/// published sample keeps its cadence whether or not a burst is in flight, so
+/// `childProcesses` / `childMemoryBytes` / the budget's sample sequence behave
+/// exactly as they did before the burst cadence existed.
+fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep {
+    if since_full >= CHILD_TREE_BASE_PERIOD {
+        ChildTreeSweep::Full
+    } else if live_chains > 0 {
+        ChildTreeSweep::Peak
+    } else {
+        ChildTreeSweep::Skip
+    }
+}
+
 /// Spawn the descendant-tree memory sampler backing `system.status`'s
 /// `childProcesses` / `childMemoryBytes`. The daemon's own RSS
 /// is a poor proxy for what it costs the machine: a single claude-code agent
@@ -2038,7 +2137,14 @@ fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u
 /// crosses [`CHILD_TREE_WARN_FRACTION`] of total RAM. The WARN is edge-
 /// triggered: it fires on the crossing and re-arms only after the tree falls
 /// back under the threshold, so a sustained overshoot costs one line, not one
-/// per tick.
+/// per tick. Burst sweeps are checked against the threshold too — the same
+/// edge-trigger, so still one line per crossing — which is how a transient
+/// overshoot leaves a trace even though it never becomes the published sample.
+///
+/// The loop polls at [`CHILD_TREE_BURST_PERIOD`] and [`child_tree_sweep`]
+/// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
+/// a peak-only sweep in between while an ephemeral adapter chain is live, and
+/// nothing at all otherwise.
 fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsage>) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -2060,14 +2166,32 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
         let refresh_kind = ProcessRefreshKind::nothing().with_memory();
         let mut sys = System::new();
         let mut warned = false;
-        let period = Duration::from_secs(CHILD_TREE_SAMPLE_SECS);
-        let mut tick = tokio::time::interval(period);
+        let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `None` reads as "the baseline sample is due", so the first poll —
+        // which `interval` fires immediately — always publishes a full sample.
+        let mut last_full: Option<std::time::Instant> = None;
         loop {
-            tick.tick().await;
+            let polled_at = tick.tick().await.into_std();
+            let since_full = last_full.map_or(CHILD_TREE_BASE_PERIOD, |at: std::time::Instant| {
+                polled_at.saturating_duration_since(at)
+            });
+            let publish = match child_tree_sweep(live_adapters(), since_full) {
+                ChildTreeSweep::Skip => continue,
+                ChildTreeSweep::Full => true,
+                ChildTreeSweep::Peak => false,
+            };
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
             let (count, bytes) = descendant_tree_usage(&sys, pid);
-            task_usage.store(count, bytes);
+            if publish {
+                task_usage.store(count, bytes);
+                // Stamped from the poll instant, not from here: dating the
+                // baseline from when the sweep *finished* would add its own
+                // ~12 ms to every period and let the published cadence drift.
+                last_full = Some(polled_at);
+            } else {
+                task_usage.observe_burst(bytes);
+            }
             if bytes >= warn_threshold && !warned {
                 warned = true;
                 tracing::warn!(
@@ -4583,6 +4707,75 @@ mod tests {
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
             (0, 0, 5_000_000_000),
             "instantaneous drains to zero; the peak does not"
+        );
+    }
+
+    /// The failure monorepo#2107 filed: a burst that lives entirely between two
+    /// baseline sweeps. Measured, 16 one-shot chains reached 6.97 GB and were
+    /// gone in 3.3 s, and the peak reported 0.01 GB — low enough that the
+    /// unbounded run read *cheaper* than the same burst under the adapter
+    /// bound. The burst reading has to reach the peak.
+    #[test]
+    fn child_tree_usage_burst_reading_reaches_the_peak() {
+        let usage = ChildTreeUsage::default();
+        usage.store(0, 10_000_000);
+        usage.observe_burst(6_970_000_000);
+        usage.store(0, 10_000_000);
+        let sample = usage.load().expect("sampled");
+        assert_eq!(
+            sample.peak_memory_bytes, 6_970_000_000,
+            "a burst seen only between baseline sweeps must still set the peak"
+        );
+    }
+
+    /// A burst reading raises the peak and touches nothing else. `seq` in
+    /// particular must not move: the spawn budget (monorepo#2063) reads a
+    /// changed `seq` as "the tree has been re-measured since I admitted those
+    /// spawns" and drops its provisional charge for them. Bumping it every
+    /// 500 ms would clear that correction before an admitted spawn is resident,
+    /// admitting a whole burst against one stale total.
+    #[test]
+    fn child_tree_usage_burst_reading_moves_only_the_peak() {
+        let usage = ChildTreeUsage::default();
+        usage.store(4, 1_000_000_000);
+        let before = usage.load().expect("sampled");
+        usage.observe_burst(7_000_000_000);
+        let after = usage.load().expect("sampled");
+        assert_eq!(after.peak_memory_bytes, 7_000_000_000);
+        assert_eq!(
+            (after.count, after.memory_bytes, after.seq),
+            (before.count, before.memory_bytes, before.seq),
+            "the published sample and its sequence number keep the baseline cadence"
+        );
+    }
+
+    /// A burst reading before the first full sweep is dropped rather than
+    /// published: §5.7 promises the three descendant-tree fields are all-null or
+    /// all-present, and a peak beside a null count would be neither.
+    #[test]
+    fn child_tree_usage_burst_reading_before_the_first_sample_is_dropped() {
+        let usage = ChildTreeUsage::default();
+        usage.observe_burst(7_000_000_000);
+        assert_eq!(usage.load(), None);
+    }
+
+    /// The cadence decision. A due baseline sweep always publishes, burst or
+    /// not; between baselines a live adapter chain buys a peak-only sweep and
+    /// an idle daemon buys nothing at all — the ~10 ms process-table refresh is
+    /// only spent while there is something to catch.
+    #[test]
+    fn child_tree_sweep_spends_the_refresh_only_when_it_can_pay() {
+        let mid = CHILD_TREE_BASE_PERIOD / 2;
+        assert_eq!(child_tree_sweep(0, mid), ChildTreeSweep::Skip);
+        assert_eq!(child_tree_sweep(1, mid), ChildTreeSweep::Peak);
+        assert_eq!(
+            child_tree_sweep(0, CHILD_TREE_BASE_PERIOD),
+            ChildTreeSweep::Full
+        );
+        assert_eq!(
+            child_tree_sweep(16, CHILD_TREE_BASE_PERIOD),
+            ChildTreeSweep::Full,
+            "a due baseline sample is never downgraded to peak-only"
         );
     }
 

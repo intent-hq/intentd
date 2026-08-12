@@ -71,7 +71,7 @@ impl Services {
                         Err(_) => (intent_git::status::current_branch_at(&root), Vec::new()),
                     };
                     let bundle = estimate_bundle_bytes(&root, &branches);
-                    let nested = crate::transfer_git::nested_repo_dirs(&root);
+                    let nested = crate::nested_repos::nested_repo_dirs(&root);
                     (
                         TransferGitSummary {
                             has_repository: true,

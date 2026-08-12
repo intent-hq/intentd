@@ -8,6 +8,7 @@ use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
+use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
 use crate::now_iso;
 
 /// Test hook: artificial delay (milliseconds) at the top of
@@ -405,9 +406,17 @@ pub async fn merge_sandbox(
         let mut index = sandbox_repo
             .index()
             .map_err(|e| Error::Internal(format!("get sandbox index failed: {e}")))?;
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .map_err(|e| Error::Internal(format!("stage sandbox changes failed: {e}")))?;
+        // Untracked nested repos/worktrees cannot be staged: libgit2's
+        // add_all rejects their paths (`invalid path`), and `git add` skips
+        // embedded repos too.
+        let skipped = stage_all_skipping_nested(&sandbox_repo, &mut index)?;
+        if !skipped.is_empty() {
+            tracing::warn!(
+                sandbox = %sandbox_path.display(),
+                skipped = ?skipped,
+                "sandbox auto-commit: skipping untracked nested git repos/worktrees"
+            );
+        }
         index
             .write()
             .map_err(|e| Error::Internal(format!("write sandbox index failed: {e}")))?;
@@ -889,18 +898,6 @@ fn signature_or_fallback(
     }
 }
 
-/// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).
-fn is_dirty(repo: &git2::Repository) -> Result<bool> {
-    let mut opts = git2::StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-    let statuses = repo
-        .statuses(Some(&mut opts))
-        .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
-    Ok(!statuses.is_empty())
-}
-
 /// Create a snapshot commit of the current dirty state in the repository.
 /// Stages all changes (tracked and untracked) and commits them with a snapshot message.
 fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result<String> {
@@ -909,10 +906,17 @@ fn create_snapshot_commit(repo: &git2::Repository, agent_id: &AgentId) -> Result
         .index()
         .map_err(|e| Error::Internal(format!("get index failed: {e}")))?;
 
-    // Add all files (including untracked)
-    index
-        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-        .map_err(|e| Error::Internal(format!("stage all files failed: {e}")))?;
+    // Add all files (including untracked), skipping untracked nested git
+    // repos/worktrees: libgit2's add_all rejects their paths (`invalid
+    // path`), and `git add` skips embedded repos too.
+    let skipped = stage_all_skipping_nested(repo, &mut index)?;
+    if !skipped.is_empty() {
+        tracing::warn!(
+            path = ?repo.workdir(),
+            skipped = ?skipped,
+            "sandbox snapshot: skipping untracked nested git repos/worktrees"
+        );
+    }
 
     index
         .write()
@@ -3148,6 +3152,195 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(msg.contains("failed to parse config file"));
+    }
+
+    /// Untracked nested repo like agents leave behind: a directory with its
+    /// own real `.git` directory and file content (an empty worktree would
+    /// not even show up in the parent's status).
+    fn make_nested_repo(parent: &Path, name: impl AsRef<Path>) -> PathBuf {
+        let nested = parent.join(name);
+        init_test_repo(&nested);
+        fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+        nested
+    }
+
+    /// Worktree-style nested checkout: `git worktree add` creates a directory
+    /// whose `.git` is a FILE pointing at the parent repo's worktree metadata.
+    fn make_nested_worktree(repo_path: &Path, name: &str) -> PathBuf {
+        let out = std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["worktree", "add", "-b"])
+            .arg(format!("wt-{}", name.trim_start_matches('.')))
+            .arg(name)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        repo_path.join(name)
+    }
+
+    #[test]
+    fn is_dirty_ignores_exclusively_untracked_nested_repos() {
+        let (_dir, repo_path) = temp_repo("dirty-nested-only");
+        make_nested_repo(&repo_path, ".import-wt");
+
+        // A repo whose only anomaly is an untracked nested repo is not dirty:
+        // the nested checkout cannot be staged, so a snapshot commit would be
+        // empty (or fail outright).
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        assert!(!is_dirty(&repo).unwrap());
+
+        // Ordinary untracked files still count.
+        fs::write(repo_path.join("new.txt"), "x").unwrap();
+        assert!(is_dirty(&repo).unwrap());
+    }
+
+    #[test]
+    fn create_snapshot_commit_skips_nested_repos_and_worktrees() {
+        let (_dir, repo_path) = temp_repo("snapshot-nested");
+        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
+        // Untracked nested git repo (real `.git` dir) and a worktree-style
+        // checkout (`.git` FILE), alongside ordinary dirty state.
+        make_nested_repo(&repo_path, ".import-wt");
+        make_nested_worktree(&repo_path, ".roundtrip-wt");
+        fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
+        fs::write(repo_path.join("tracked.txt"), "modified").unwrap();
+
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        assert!(is_dirty(&repo).unwrap());
+
+        let agent_id = AgentId::from("agent-nested-snapshot");
+        let sha = create_snapshot_commit(&repo, &agent_id)
+            .expect("snapshot must not fail on untracked nested repos");
+
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&sha).unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_name("dirty.txt").is_some());
+        assert!(tree.get_name("tracked.txt").is_some());
+        // No gitlink entries for the nested checkouts...
+        assert!(tree.get_name(".import-wt").is_none());
+        assert!(tree.get_name(".roundtrip-wt").is_none());
+        // ...and the directories stay intact on disk.
+        assert!(repo_path.join(".import-wt/.git").is_dir());
+        assert!(repo_path.join(".roundtrip-wt/.git").is_file());
+    }
+
+    /// Nested repos with non-UTF-8 directory names must still be detected
+    /// and skipped: `StatusEntry::path()` returns `None` for such names, so
+    /// the detection goes through `path_bytes` instead.
+    #[cfg(unix)]
+    #[test]
+    fn create_snapshot_commit_skips_non_utf8_nested_repo_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, repo_path) = temp_repo("snapshot-nested-non-utf8");
+        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
+        let name = std::ffi::OsStr::from_bytes(b"bad-\xff-wt");
+        make_nested_repo(&repo_path, Path::new(name));
+        fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
+
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let agent_id = AgentId::from("agent-nested-non-utf8");
+        let sha = create_snapshot_commit(&repo, &agent_id)
+            .expect("snapshot must not fail on a non-UTF-8 nested repo name");
+
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&sha).unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_name("dirty.txt").is_some());
+        assert_eq!(
+            tree.iter()
+                .filter(|e| e.name_bytes().starts_with(b"bad-"))
+                .count(),
+            0
+        );
+        assert!(repo_path.join(name).join(".git").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_auto_commit_skips_nested_repos() {
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("merge-nested");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{branch_name}"))
+                .unwrap();
+        }
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        // Dirty state alongside untracked nested checkouts: the merge's
+        // auto-commit must stage the ordinary file and skip the embedded
+        // repos instead of failing with `invalid path`.
+        make_nested_repo(&sandbox_path, ".import-wt");
+        make_nested_worktree(&sandbox_path, ".roundtrip-wt");
+        fs::write(sandbox_path.join("wip.txt"), "wip").unwrap();
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("merge must not fail on untracked nested repos");
+        match outcome {
+            MergeOutcome::Merged { .. } => {}
+            other => panic!("Expected Merged outcome, got {other:?}"),
+        }
+        assert!(canonical_path.join("agent.txt").exists());
+        assert!(canonical_path.join("wip.txt").exists());
+        assert!(!canonical_path.join(".import-wt").exists());
+        assert!(!canonical_path.join(".roundtrip-wt").exists());
+
+        // No gitlink entries in the auto-commit; nested checkouts survive
+        // untouched on disk.
+        let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+        let head_tree = sandbox_repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(head_tree.get_name("wip.txt").is_some());
+        assert!(head_tree.get_name(".import-wt").is_none());
+        assert!(head_tree.get_name(".roundtrip-wt").is_none());
+        assert!(sandbox_path.join(".import-wt/.git").is_dir());
+        assert!(sandbox_path.join(".roundtrip-wt/.git").is_file());
+
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     // P0-2: Completion-interception tests — BLOCKER IDENTIFIED
