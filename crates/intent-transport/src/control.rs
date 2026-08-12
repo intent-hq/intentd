@@ -64,6 +64,18 @@ pub struct SystemStatus {
     pub cpu_percent: f32,
     /// Resident memory of the daemon process, in bytes.
     pub memory_bytes: u64,
+    /// Number of OS processes in the daemon's descendant tree — every agent
+    /// provider CLI plus whatever it spawns (ACP adapters, MCP bridges, the
+    /// tool children an agent runs), the Unsloth server, and `host.exec`
+    /// children. `None` until the background sampler has taken its first
+    /// sample, or on platforms where the tree cannot be walked.
+    pub child_processes: Option<usize>,
+    /// Aggregate resident memory of [`Self::child_processes`], in bytes. This
+    /// is the daemon's *real* memory footprint from the OS's point of view —
+    /// [`Self::memory_bytes`] covers only the daemon binary itself, which is a
+    /// small fraction of it once agents are live. `None` alongside
+    /// `child_processes`.
+    pub child_memory_bytes: Option<u64>,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -196,6 +208,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "uptimeSeconds": status.uptime_seconds,
         "cpuPercent": status.cpu_percent,
         "memoryBytes": status.memory_bytes,
+        "childProcesses": status.child_processes,
+        "childMemoryBytes": status.child_memory_bytes,
         "fingerprint": status.fingerprint,
         "localIps": status.local_ips,
         "hostname": status.hostname,

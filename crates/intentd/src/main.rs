@@ -3,6 +3,7 @@
 //! This binary is the composition root (§3.2 rule 5): it is the only place that
 //! wires concrete implementations together (store → services → transport).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
@@ -1386,6 +1387,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
+    let child_usage = spawn_child_tree_sampler(manager.clone());
     let route_info = spawn_route_info_sampler();
 
     let control = Arc::new(DaemonControl {
@@ -1394,6 +1396,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
         proc_usage,
+        child_usage,
         route_info,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
@@ -1723,6 +1726,9 @@ struct DaemonControl {
     start_time: std::time::Instant,
     /// Latest own-process CPU/memory sample from the background sampler.
     proc_usage: Arc<ProcUsage>,
+    /// Latest descendant-tree memory sample (agent child processes and
+    /// everything they spawn) from the background sampler.
+    child_usage: Arc<ChildTreeUsage>,
     /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
     /// background sampler, so `status()` never enumerates interfaces inline.
     route_info: Arc<RouteInfo>,
@@ -1846,6 +1852,165 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     usage
 }
 
+/// Latest descendant-process-tree sample for `system.status`,
+/// written by the background sampler task and read lock-free from `status()`.
+/// `memory_bytes` is the aggregate resident memory of every process descended
+/// from the daemon — agent provider CLIs dominate it, so the daemon's own
+/// `memoryBytes` badly understates what the daemon costs the machine.
+/// `has_sample` stays false until the first walk lands, so a status read that
+/// beats the sampler reports `null` rather than a misleading zero.
+#[derive(Default)]
+struct ChildTreeUsage {
+    has_sample: std::sync::atomic::AtomicBool,
+    count: std::sync::atomic::AtomicUsize,
+    memory_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl ChildTreeUsage {
+    fn store(&self, count: usize, memory_bytes: u64) {
+        use std::sync::atomic::Ordering;
+        self.count.store(count, Ordering::Relaxed);
+        self.memory_bytes.store(memory_bytes, Ordering::Relaxed);
+        // Released last: a reader that sees `has_sample` also sees the values.
+        self.has_sample.store(true, Ordering::Release);
+    }
+
+    fn load(&self) -> Option<(usize, u64)> {
+        use std::sync::atomic::Ordering;
+        if !self.has_sample.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((
+            self.count.load(Ordering::Relaxed),
+            self.memory_bytes.load(Ordering::Relaxed),
+        ))
+    }
+}
+
+/// Sweep interval for the descendant-tree sampler. Unlike the own-process
+/// sampler this needs a full-system process refresh to reconstruct the
+/// parent/child tree, so it runs two orders of magnitude slower than the ~1s
+/// own-process tick — memory footprint moves on a scale of minutes, not
+/// seconds, and the point of the sample is a bundle-readable trend line.
+const CHILD_TREE_SAMPLE_SECS: u64 = 30;
+
+/// Fraction of total system RAM the descendant tree may occupy before each
+/// sample logs a WARN. Agents are budgeted ~1 GB each by
+/// [`intent_services::compute_process_cap`], and the process cap lets that
+/// reach most of RAM on a large machine, so crossing half of total RAM means
+/// the daemon's children are a first-order contributor to system memory
+/// pressure and the log should say so before the OS starts swapping.
+const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
+
+/// Absolute WARN threshold used when total system RAM cannot be determined.
+const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Aggregate `(process count, resident bytes)` of every pid reachable from
+/// `root` through the `pid -> children` adjacency, excluding `root` itself —
+/// the root is already reported as `memoryBytes`, and counting it twice would
+/// inflate every bundle's tree total.
+///
+/// Split from [`descendant_tree_usage`] so the traversal is testable without a
+/// live process table. The walk is iterative and visited-guarded: a pid table
+/// sampled while processes exit and get reparented can contain a cycle, and
+/// recursion over a deep chain could blow the stack.
+fn walk_descendants(
+    children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
+    memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
+    root: sysinfo::Pid,
+) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        for child in children.get(&pid).into_iter().flatten() {
+            if !seen.insert(*child) {
+                continue;
+            }
+            if let Some(memory) = memory_of(*child) {
+                count += 1;
+                bytes = bytes.saturating_add(memory);
+            }
+            stack.push(*child);
+        }
+    }
+    (count, bytes)
+}
+
+/// Walk `root`'s descendants in the refreshed process table, returning
+/// `(process count, aggregate resident bytes)`.
+fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u64) {
+    let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+    for (pid, proc) in sys.processes() {
+        if let Some(parent) = proc.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+    walk_descendants(&children, &|pid| sys.process(pid).map(|p| p.memory()), root)
+}
+
+/// Spawn the descendant-tree memory sampler backing `system.status`'s
+/// `childProcesses` / `childMemoryBytes`. The daemon's own RSS
+/// is a poor proxy for what it costs the machine: a single claude-code agent
+/// subtree measures ~650–750 MB resident, so N live agents dwarf the ~230 MB
+/// daemon. Sampling the tree is what lets a debug bundle attribute system-wide
+/// memory pressure to agents instead of inferring it.
+///
+/// Each sample refreshes the whole process table (needed for the parent links)
+/// with memory only — no CPU, no disk, no env — and logs a WARN when the tree
+/// crosses [`CHILD_TREE_WARN_FRACTION`] of total RAM. The WARN is edge-
+/// triggered: it fires on the crossing and re-arms only after the tree falls
+/// back under the threshold, so a sustained overshoot costs one line, not one
+/// per tick.
+fn spawn_child_tree_sampler(manager: Arc<AgentManager>) -> Arc<ChildTreeUsage> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let usage = Arc::new(ChildTreeUsage::default());
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
+        return usage;
+    };
+    let warn_threshold = {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        match sys.total_memory() {
+            0 => CHILD_TREE_WARN_FALLBACK_BYTES,
+            total => (total as f64 * CHILD_TREE_WARN_FRACTION) as u64,
+        }
+    };
+
+    let task_usage = usage.clone();
+    tokio::spawn(async move {
+        let refresh_kind = ProcessRefreshKind::nothing().with_memory();
+        let mut sys = System::new();
+        let mut warned = false;
+        let period = Duration::from_secs(CHILD_TREE_SAMPLE_SECS);
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+            let (count, bytes) = descendant_tree_usage(&sys, pid);
+            task_usage.store(count, bytes);
+            if bytes >= warn_threshold && !warned {
+                warned = true;
+                tracing::warn!(
+                    child_processes = count,
+                    child_memory_bytes = bytes,
+                    warn_threshold_bytes = warn_threshold,
+                    agents = manager.registry().size(),
+                    max_agents = manager.registry().cap(),
+                    "daemon child processes are a first-order source of system memory pressure"
+                );
+            } else if bytes < warn_threshold {
+                warned = false;
+            }
+        }
+    });
+    usage
+}
+
 /// Runtime control for the WSS listener, shared between DaemonControl and
 /// the lifecycle hooks (§5.12). Holds WsApiServer construction args plus mutable
 /// state guarded by a Mutex so settings.update can start/stop the listener.
@@ -1925,6 +2090,8 @@ impl SystemControl for DaemonControl {
         };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
+        // `None` until the slower descendant-tree sampler lands its first walk.
+        let child_tree = self.child_usage.load();
         // Alternative routes for remote clients: same sources as
         // `server.pairingInfo`, so a remote caller can refresh its stored
         // host list from `system.status` alone. Served from the background
@@ -1956,6 +2123,8 @@ impl SystemControl for DaemonControl {
             hostname,
             cpu_percent,
             memory_bytes,
+            child_processes: child_tree.map(|(count, _)| count),
+            child_memory_bytes: child_tree.map(|(_, bytes)| bytes),
         }
     }
 
@@ -4306,6 +4475,79 @@ mod tests {
         assert_eq!(
             parse_permission_policy(Some("bogus")),
             PermissionPolicy::AllowAll
+        );
+    }
+
+    /// A status read that beats the (30s-tick) sampler must report `null`, not
+    /// zero — a bundle reading `childMemoryBytes: 0` would conclude the daemon
+    /// has no children, which is the opposite of what an unsampled tree means.
+    #[test]
+    fn child_tree_usage_is_none_until_the_first_sample() {
+        let usage = ChildTreeUsage::default();
+        assert_eq!(usage.load(), None);
+        usage.store(6, 4_294_967_296);
+        assert_eq!(usage.load(), Some((6, 4_294_967_296)));
+    }
+
+    /// Build a `pid -> children` adjacency from `(parent, child)` edges.
+    fn adjacency(edges: &[(usize, usize)]) -> HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> {
+        let mut map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+        for (parent, child) in edges {
+            map.entry(sysinfo::Pid::from(*parent))
+                .or_default()
+                .push(sysinfo::Pid::from(*child));
+        }
+        map
+    }
+
+    /// The walk must reach grandchildren, not just direct children: an agent's
+    /// provider CLI sits three levels below the daemon (`npm exec` → node ACP
+    /// adapter → the CLI), and the CLI's own RSS is the bulk of the ~700 MB an
+    /// agent costs. Counting only direct children would report ~90 MB/agent.
+    #[test]
+    fn walk_descendants_sums_the_whole_subtree_excluding_the_root() {
+        // 1 (daemon) → 2 (npm exec) → 3 (node adapter) → 4 (provider CLI),
+        // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
+        // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
+        assert_eq!(bytes, 1400);
+    }
+
+    /// A pid table sampled while processes exit and get reparented can contain
+    /// a cycle. The visited guard must make the walk terminate rather than
+    /// hanging the sampler task (and with it every later `system.status` read).
+    #[test]
+    fn walk_descendants_terminates_on_a_cycle() {
+        let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        assert_eq!(count, 2, "each pid is counted exactly once");
+        assert_eq!(bytes, 20);
+    }
+
+    /// A pid that vanished between the table refresh and the walk contributes
+    /// nothing, but its subtree is still traversed — a dead intermediate must
+    /// not hide the live grandchildren underneath it.
+    #[test]
+    fn walk_descendants_skips_pids_that_exited_mid_walk() {
+        let children = adjacency(&[(1, 2), (2, 3)]);
+        let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
+        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        assert_eq!(count, 1);
+        assert_eq!(bytes, 700);
+    }
+
+    /// A leaf root reports an empty tree — the daemon before any agent spawns.
+    #[test]
+    fn walk_descendants_reports_zero_for_a_childless_root() {
+        let children = adjacency(&[(9, 10)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        assert_eq!(
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1)),
+            (0, 0)
         );
     }
 }
