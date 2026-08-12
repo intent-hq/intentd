@@ -158,11 +158,13 @@ pub(crate) fn critical_path_priorities(
 }
 
 /// Remaining serial work: the longest effort-weighted `dependsOn` chain
-/// through the requested tasks (their critical-path priority already spans
-/// all downstream dependents). `Some` only when the chain attaining the
-/// reported max carries at least one parsed estimate — a number that is pure
-/// 30-min defaults is suppressed even if an unrelated requested subtree has
-/// an estimate. Deliberately downstream-only: an incomplete upstream dep
+/// through the requested tasks whose max-attaining chain carries at least
+/// one parsed estimate (their critical-path priority already spans all
+/// downstream dependents). Chains that are pure 30-min defaults never
+/// contribute — a graph with no estimates anywhere returns `None`, and a
+/// longer unestimated chain does not suppress (or inflate) the estimated
+/// one, so the reported number can understate when an unestimated chain is
+/// longer. Deliberately downstream-only: an incomplete upstream dep
 /// outside the requested set does NOT count toward the estimate, so partial
 /// batches can understate total remaining serial time.
 pub(crate) fn serial_remaining_minutes(
@@ -170,13 +172,13 @@ pub(crate) fn serial_remaining_minutes(
     snaps: &HashMap<String, BatchTaskSnap>,
 ) -> Option<u64> {
     let details = critical_path_details(snaps);
-    let requested_details: Vec<&PathDetail> =
-        requested.iter().filter_map(|id| details.get(id)).collect();
-    let minutes = requested_details.iter().map(|(p, _)| *p).max()?;
-    let estimated = requested_details
+    let minutes = requested
         .iter()
-        .any(|(p, estimated)| *p == minutes && *estimated);
-    (minutes > 0 && estimated).then_some(minutes)
+        .filter_map(|id| details.get(id))
+        .filter(|(_, estimated)| *estimated)
+        .map(|(p, _)| *p)
+        .max()?;
+    (minutes > 0).then_some(minutes)
 }
 
 /// Classified disposition for one requested task.
@@ -790,7 +792,7 @@ mod tests {
 
     #[test]
     fn serial_remaining_minutes_requires_estimates_and_spans_downstream() {
-        // No estimates anywhere → suppressed.
+        // No estimates anywhere (pure-defaults graph) → suppressed.
         let mut snaps = HashMap::new();
         snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &[]));
         snaps.insert("b".into(), snap(TaskStatus::NotStarted, &["a"], &[]));
@@ -809,25 +811,37 @@ mod tests {
     }
 
     #[test]
-    fn serial_remaining_suppressed_when_max_chain_is_pure_defaults() {
-        // `a` is isolated with a real estimate; `b` (no estimate) heads a
-        // longer chain of pure 30-min defaults that attains the max. The
-        // reported number would say nothing real → suppressed.
+    fn serial_remaining_reports_estimated_chain_despite_longer_defaults_chain() {
+        // Regression for monorepo#2128 (dogfood shape): an estimated chain
+        // b(10) → d(15) → e(5) = 30 min alongside a longer pure-defaults
+        // chain g → h = 60 min. The unestimated chain must not suppress the
+        // estimated one — report the estimated chain's 30, understating the
+        // true remaining serial work.
         let mut snaps = HashMap::new();
         snaps.insert(
-            "a".into(),
+            "b".into(),
             with_effort(snap(TaskStatus::NotStarted, &[], &[]), 10),
         );
-        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        snaps.insert("b1".into(), snap(TaskStatus::NotStarted, &["b"], &[]));
-        snaps.insert("b2".into(), snap(TaskStatus::NotStarted, &["b1"], &[]));
-        snaps.insert("b3".into(), snap(TaskStatus::NotStarted, &["b2"], &[]));
-        assert_eq!(serial_remaining_minutes(&ids(&["a", "b"]), &snaps), None);
-        // Estimating anywhere on the max-attaining chain surfaces it.
-        snaps.get_mut("b2").unwrap().effort_minutes = Some(30);
+        snaps.insert(
+            "d".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["b"], &[]), 15),
+        );
+        snaps.insert(
+            "e".into(),
+            with_effort(snap(TaskStatus::NotStarted, &["d"], &[]), 5),
+        );
+        snaps.insert("g".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("h".into(), snap(TaskStatus::NotStarted, &["g"], &[]));
         assert_eq!(
-            serial_remaining_minutes(&ids(&["a", "b"]), &snaps),
-            Some(120)
+            serial_remaining_minutes(&ids(&["b", "g"]), &snaps),
+            Some(30)
+        );
+        // Estimating anywhere on the longer chain makes it eligible and it
+        // takes over as the max.
+        snaps.get_mut("h").unwrap().effort_minutes = Some(45);
+        assert_eq!(
+            serial_remaining_minutes(&ids(&["b", "g"]), &snaps),
+            Some(75)
         );
     }
 
