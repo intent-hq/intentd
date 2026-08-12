@@ -25561,12 +25561,15 @@ mod delete_grace_window {
 
     /// Schedule → deadline expiry commits the delete through the existing
     /// cascade, and `pendingDeleteAt` projects on list/get while pending.
+    /// The projections are asserted under a comfortably long window (then
+    /// cancelled), and the deadline commit is exercised by a separate short
+    /// re-schedule — so no assertion ever races a sub-second timer.
     #[tokio::test]
     async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
         let h = harness().await;
         let delete_at = h
             .services
-            .schedule_workspace_delete(h.ws.clone(), 200)
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
             .await
             .expect("schedule");
         assert!(!delete_at.is_empty(), "ISO deadline returned");
@@ -25578,6 +25581,19 @@ mod delete_grace_window {
         let row = listed.iter().find(|w| w.id == h.ws).expect("row listed");
         assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
 
+        // Cancel the long window, then re-schedule short and let the timer
+        // commit — only eventual deletion is asserted past this point.
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "long window cancelled before the short re-schedule"
+        );
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 50)
+            .await
+            .expect("re-schedule short");
         wait_deleted(&h).await;
     }
 
@@ -25938,12 +25954,15 @@ mod agent_delete_grace_window {
     /// `agent_delete_op` cascade, and while pending the session stays fully
     /// served — status untouched (the agent is NOT stopped) with
     /// `pendingDeleteAt` on all three projections (list/get/getSession).
+    /// The projections are asserted under a comfortably long window (then
+    /// cancelled), and the deadline commit is exercised by a separate short
+    /// re-schedule — so no assertion ever races a sub-second timer.
     #[tokio::test]
     async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
         let h = harness().await;
         let delete_at = h
             .services
-            .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 300)
+            .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 60_000)
             .await
             .expect("schedule");
         assert!(!delete_at.is_empty(), "ISO deadline returned");
@@ -25971,6 +25990,19 @@ mod agent_delete_grace_window {
             Some(delete_at.as_str())
         );
 
+        // Cancel the long window, then re-schedule short and let the timer
+        // commit — only eventual deletion is asserted past this point.
+        assert!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), None)
+                .await
+                .expect("cancel"),
+            "long window cancelled before the short re-schedule"
+        );
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 50)
+            .await
+            .expect("re-schedule short");
         wait_deleted(&h).await;
     }
 
