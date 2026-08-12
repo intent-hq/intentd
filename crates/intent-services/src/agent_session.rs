@@ -1136,10 +1136,35 @@ impl Services {
         }
     }
 
-    /// Clear an agent's live-turn slot (happy-path turn end + test seam). The
+    /// Clear an agent's live-turn slot unconditionally — the interrupt flush's
+    /// own release (it owns the pin it clears) and the test seam. The
     /// [`LiveTurnGuard`] also clears on drop for the interrupt/abort path.
     pub fn clear_live_turn(&self, agent_id: &AgentId) {
         if let Ok(mut slots) = self.live_turns.lock() {
+            slots.remove(agent_id);
+        }
+    }
+
+    /// Clear an agent's live-turn slot at a NORMAL turn end, leaving a pinned
+    /// slot alone — the same rule [`LiveTurnGuard::drop`] applies, for the same
+    /// reason: a pinned slot belongs to the teardown flush that is about to
+    /// persist it.
+    ///
+    /// Without this the pin's invariant had a hole (monorepo#2110 review): a
+    /// turn completing normally in the pin→flush gap unpublished the slot, and
+    /// because `run_prompt_turn` persists an assistant row only for a turn that
+    /// produced blocks, a ZERO-OUTPUT completion left nothing at all behind —
+    /// no durable row and no slot. The teardown flush then had no content to
+    /// record, costing the interruption both its marker row and (via
+    /// `had_output`) the zero-output stop-redelivery arm. Holding the pinned
+    /// slot means the flush always sees the turn as it really ended: empty
+    /// blocks flush as the marker row, and a completion that DID persist a full
+    /// row is absorbed by the flush's `agent_message.id` UNIQUE collision path.
+    pub(crate) fn clear_unpinned_live_turn(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if slots.get(agent_id).is_some_and(|s| s.flush_pending) {
+                return;
+            }
             slots.remove(agent_id);
         }
     }
@@ -1184,22 +1209,21 @@ impl Services {
     ///
     /// Callers are exactly the three teardown paths (keep-alive interrupt,
     /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
-    /// the worker and flush AFTER it. Deliberately returns only whether a slot
-    /// was pinned, not a snapshot of it (monorepo#2110): the flush re-reads the
-    /// slot — which the pin guarantees is still there — so a `session/update`
-    /// processed in the pin→abort gap is persisted rather than trimmed off a
-    /// stale pre-abort clone. Pinning is idempotent and never outlives the
-    /// turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
+    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
+    /// the flush re-reads the slot — which the pin guarantees is still there,
+    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
+    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
+    /// `session/update` processed in the pin→abort gap is persisted rather than
+    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
+    /// the flush's `None` says so on its own. Pinning is idempotent and never
+    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
     /// replaces the slot wholesale.
-    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) -> bool {
-        let Ok(mut slots) = self.live_turns.lock() else {
-            return false;
-        };
-        let Some(slot) = slots.get_mut(agent_id) else {
-            return false;
-        };
-        slot.flush_pending = true;
-        true
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.flush_pending = true;
+            }
+        }
     }
 
     /// Read just the text of the live-turn slot's `type: "text"` blocks
@@ -1981,8 +2005,10 @@ impl Services {
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
-        // remains as the abort-path fallback.
-        self.clear_live_turn(agent_id);
+        // remains as the abort-path fallback. A PINNED slot is left for the
+        // teardown flush that owns it (monorepo#2110) — see
+        // [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn).
+        self.clear_unpinned_live_turn(agent_id);
         // Turn-end usage bookkeeping, detached (monorepo#738): the global
         // usage-stats recording (fold this turn's token delta + run counters
         // into the current UTC hour bucket of `usage_stats_hourly`) and the
@@ -2472,7 +2498,8 @@ impl Services {
         if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
-        self.clear_live_turn(agent_id);
+        // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
+        self.clear_unpinned_live_turn(agent_id);
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
             end_data["messageId"] = json!(message_id);

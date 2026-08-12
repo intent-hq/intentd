@@ -4243,7 +4243,11 @@ async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clea
         services.set_live_turn(&agent_id, "m1", blocks.clone());
         // The teardown path pins the slot, then aborts the worker — which
         // drops the guard, as this scope end does.
-        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
     }
 
     // The window: the guard has dropped and the interrupted row is not durable
@@ -4320,7 +4324,11 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
     {
         let _guard = services.begin_live_turn(&agent_id, "m1");
         services.set_live_turn(&agent_id, "m1", partial_blocks());
-        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
     }
     // The aborted worker's own append won the race: the full row is durable.
     services
@@ -4388,7 +4396,11 @@ async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
             )
             .await;
         // The teardown path pins the slot…
-        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
         // …and the notification already in flight is routed in the pin→abort
         // gap: broadcast to every subscriber AND folded into the live slot.
         services
@@ -4425,6 +4437,68 @@ async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
         json!([{ "id": "m1:0", "type": "text", "text": "I'll run the tests.\n" }]),
         "the durable row carries the chunk routed after the pin, \
          not the pre-abort clone's \"I'll run \""
+    );
+}
+
+/// monorepo#2110 review — a ZERO-OUTPUT normal completion landing in the
+/// abort gap must not look like a turn that produced output.
+///
+/// `run_prompt_turn` persists an assistant row only when the turn produced
+/// blocks (`if !blocks.is_empty()`), but its turn-end slot clear is
+/// unconditional. So a turn that completes normally having streamed nothing
+/// writes NO row and drops the slot. If the teardown path treats every
+/// vanished-but-pinned slot as "the worker persisted a full row", a user stop
+/// racing that completion loses both halves of the zero-output contract: no
+/// interrupted marker row for the FE to anchor the Stopped indicator on, and
+/// no prompt-only stop-redelivery armed for the next turn (#1757) — the
+/// stopped prompt is silently dropped.
+///
+/// The pin is what prevents it: a pinned slot survives the turn-end clear
+/// exactly as it survives the `LiveTurnGuard` drop, so the flush still finds
+/// it, still records the empty-blocks marker row, and still reports
+/// `had_output: false`.
+#[tokio::test]
+async fn zero_output_completion_in_the_abort_gap_still_flushes_a_marker_row() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    {
+        // Mid-turn: a slot is open but nothing has streamed into it yet.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        // The teardown path pins the slot…
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
+        // …and in the pin→abort gap the turn completes normally with zero
+        // blocks: `run_prompt_turn` persists nothing and clears the slot.
+        services.clear_unpinned_live_turn(&agent_id);
+    }
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pin keeps the slot alive through a zero-output turn end");
+    assert!(
+        !flushed.had_output,
+        "a zero-block turn produced no output — the stop-redelivery arm depends on this"
+    );
+    assert_eq!(
+        flushed.message_id.as_deref(),
+        Some("m1"),
+        "the interrupted marker row is still recorded"
+    );
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1, "exactly the marker row");
+    assert_eq!(messages[0].content, json!([]), "empty blocks, as flushed");
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("metadata")["interrupted"],
+        json!(true)
     );
 }
 

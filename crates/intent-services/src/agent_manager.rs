@@ -3268,7 +3268,7 @@ impl AgentManager {
         // (monorepo#2110). The busy flag is snapshotted alongside (before
         // `end_turn` below releases it) for the zero-output stop-redelivery
         // arm at the bottom of this method.
-        let pinned = self.services.pin_live_turn(agent_id);
+        self.services.pin_live_turn(agent_id);
         let turn_in_flight = self.is_busy(agent_id);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
@@ -3294,18 +3294,16 @@ impl AgentManager {
             .services
             .flush_pinned_turn_on_interruption(agent_id, reason, interrupted_by.as_ref())
             .await;
+        // `None` means nothing was pinned — no turn in flight, hence no output.
+        // A pinned slot cannot vanish before the flush: `LiveTurnGuard::drop`
+        // and the normal turn-end clear both leave a pinned slot to the flush
+        // that owns it, so a turn that ends in the abort gap is still read here
+        // as it really ended (monorepo#2110) — including the zero-output
+        // completion that persists no row of its own and must therefore still
+        // produce the marker row and arm the redelivery below.
         let (interrupted_message_id, interrupted_text_blocks, had_output) = match flushed {
             Some(f) => (f.message_id, f.text_blocks, f.had_output),
-            // No slot at flush time. Either nothing was pinned — no turn in
-            // flight, so genuinely no output — or the worker completed the turn
-            // in the abort gap and cleared the slot after persisting the full
-            // row itself, which is emphatically NOT a zero-output turn: `pinned`
-            // separates the two so the redelivery arm below keeps its pre-#2110
-            // answer. The preview fields go unstamped in that second case (the
-            // durable content lives in the worker's row, not in any snapshot
-            // reachable from here) rather than echoing a partial the durable
-            // row already supersedes.
-            None => (None, Vec::new(), pinned),
+            None => (None, Vec::new(), false),
         };
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
         // provider turn dropped the stopped message before producing any
