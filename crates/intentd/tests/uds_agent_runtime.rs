@@ -224,7 +224,8 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
                 None,
             )
             .await
-            .expect("create note");
+            .expect("create note")
+            .note;
         note.id.0
     };
 

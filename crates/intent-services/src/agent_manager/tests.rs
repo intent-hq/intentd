@@ -10726,7 +10726,8 @@ mod unblocked_hints_tests {
                 None,
             )
             .await
-            .expect("create note");
+            .expect("create note")
+            .note;
         WorkspaceApi::mark_as_task(
             services,
             ws.clone(),
