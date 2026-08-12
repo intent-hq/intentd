@@ -547,7 +547,7 @@ async fn cmd_import_legacy(
     // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
     // hermetic test harness) mean "legacy import disabled": return before
     // touching the store so no app-level blobs land and no completion marker
-    // is written — consistent with `maybe_import_on_first_boot`.
+    // is written — consistent with `decide_first_boot_import`.
     if roots.is_empty() {
         println!("legacy import disabled: no legacy roots to scan");
         return Ok(());
@@ -570,6 +570,9 @@ async fn cmd_import_legacy(
     .await?;
     println!("{report}");
     if !dry_run {
+        // Keep the persisted failure summary in sync: a clean run (e.g. the
+        // documented `--force` retry) clears any stale row from a prior run.
+        legacy_import::persist_failure_summary(&store, &report).await;
         if !report.has_compatibility_failures() {
             // Marker write failure is a warning, not a command failure — the
             // import itself completed (mirrors the first-boot hook in `serve`).
@@ -862,20 +865,37 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             "auto_vacuum activation failed; continuing without incremental vacuum"
         ),
     }
-    // First-boot legacy workspace import: on a fresh DB with no completion
-    // marker, scan the legacy roots and import `.workspace/workspace.json`
-    // workspaces. Runs to completion inline after migrations (inside
-    // `Store::open`) and before any transport serves RPCs; it never fails
-    // startup, but a large legacy tree does delay this first boot (accepted
-    // one-time tradeoff — see `maybe_import_on_first_boot`).
-    legacy_import::maybe_import_on_first_boot(
-        &store,
-        db_existed,
-        legacy_import::default_roots(),
-        Some(config.data_dir.join("assets")),
-        legacy_import::default_app_dir(),
-    )
-    .await;
+    // First-boot legacy workspace import: the eligibility decision (fresh DB
+    // / marker state) is made synchronously here, but the import itself runs
+    // in a spawned background task concurrently with the transports coming up
+    // — `serve` never awaits it, so a large legacy tree no longer delays
+    // first boot. `decide_first_boot_import` persists a pending marker before
+    // the run starts; a daemon killed mid-import resumes on the next boot
+    // (the importer is idempotent, which also makes a concurrent
+    // `system.importLegacy` RPC safe). Aborted during shutdown before
+    // Store::close() — the pending marker then resumes the run next boot.
+    let legacy_import_handle = {
+        let roots = legacy_import::default_roots();
+        match legacy_import::decide_first_boot_import(&store, db_existed, &roots).await {
+            legacy_import::FirstBootDecision::Skip => None,
+            decision => {
+                let store = store.clone();
+                let assets_root = Some(config.data_dir.join("assets"));
+                let app_dir = legacy_import::default_app_dir();
+                let resumed = decision == legacy_import::FirstBootDecision::Resume;
+                Some(tokio::spawn(async move {
+                    legacy_import::run_first_boot_import(
+                        &store,
+                        roots,
+                        assets_root,
+                        app_dir,
+                        resumed,
+                    )
+                    .await;
+                }))
+            }
+        }
+    };
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().
@@ -1650,6 +1670,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         );
     }
 
+    // Stop the background first-boot legacy import (if still running) before
+    // closing the store; the pending marker makes the next boot resume it.
+    if let Some(handle) = legacy_import_handle {
+        handle.abort();
+    }
+
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
 
@@ -1934,6 +1960,9 @@ impl SystemControl for DaemonControl {
             .await
             .map_err(|e| e.to_string())?;
 
+            // Keep the persisted failure summary in sync: a clean run (e.g.
+            // the documented `--force` retry) clears any stale row.
+            legacy_import::persist_failure_summary(&self.legacy_import_store, &report).await;
             let compatibility_failures = report.has_compatibility_failures();
             let marker_written = if compatibility_failures {
                 false
