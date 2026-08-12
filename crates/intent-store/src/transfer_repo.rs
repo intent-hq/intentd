@@ -654,14 +654,18 @@ mod tests {
         let transferred: Vec<&str> = TRANSFER_TABLES.iter().map(|(t, _)| *t).collect();
         let excluded: Vec<&str> = TRANSFER_EXCLUDED_TABLES.iter().map(|(t, _)| *t).collect();
 
-        let both: Vec<&&str> = transferred
+        let mut seen = std::collections::BTreeSet::new();
+        let duplicated: Vec<&&str> = transferred
             .iter()
-            .filter(|t| excluded.contains(t))
+            .chain(excluded.iter())
+            .filter(|t| !seen.insert(**t))
             .collect();
         assert!(
-            both.is_empty(),
-            "tables listed in BOTH TRANSFER_TABLES and TRANSFER_EXCLUDED_TABLES: \
-             {both:?} — a table must be in exactly one"
+            duplicated.is_empty(),
+            "tables listed more than once across TRANSFER_TABLES and \
+             TRANSFER_EXCLUDED_TABLES: {duplicated:?} — each table must appear \
+             exactly once in exactly one list (a duplicated TRANSFER_TABLES \
+             entry would export/import its rows twice)"
         );
 
         let undecided: Vec<&String> = live
