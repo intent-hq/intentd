@@ -4752,6 +4752,55 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
     );
 }
 
+/// The abandoned mark must not widen either pin-respecting clear
+/// ([`LiveTurn::flush_failed`]'s contract): the aborted worker's
+/// [`LiveTurnGuard`] drop can run AFTER the flush gave up — `worker.abort()`
+/// cancels at the next await point, unordered against the interrupt path's
+/// flush — and both it and the normal turn-end clear key on `flush_pending`
+/// alone. A slot that is pinned AND abandoned is the only copy of the
+/// content, so both must leave it; only a new turn's claim may reap it
+/// (`try_begin_drops_a_slot_whose_flush_already_gave_up`).
+#[tokio::test]
+async fn abandoned_slot_survives_guard_drop_and_turn_end_clear() {
+    let (_tmp, services, _bus, _seeded, _ws) = setup().await;
+    // Deliberately NOT the seeded agent: no agent_session row, so the flush's
+    // INSERT fails the `agent_message.agent_id` foreign key — the genuine
+    // store error that drives the give-up arm.
+    let agent_id = AgentId::from("agent-abandoned");
+
+    let guard = services.begin_live_turn(&agent_id, "m-abandoned");
+    services.set_live_turn(&agent_id, "m-abandoned", partial_blocks());
+    services.pin_live_turn(&agent_id);
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot was there to flush");
+    assert!(
+        flushed.message_id.is_none(),
+        "precondition: the store rejected the append, so nothing was persisted"
+    );
+    assert!(
+        services
+            .live_turn(&agent_id)
+            .is_some_and(|s| s.flush_pending && s.flush_failed),
+        "precondition: the give-up arm kept the slot pinned and marked it abandoned"
+    );
+
+    // The aborted worker's delayed guard drop…
+    drop(guard);
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the guard drop leaves an abandoned slot alone — it is the only copy of the content"
+    );
+
+    // …and a turn end reaching the pin-respecting clear.
+    services.clear_unpinned_live_turn(&agent_id);
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the turn-end clear leaves an abandoned slot alone too"
+    );
+}
+
 /// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
 /// tool calls and no assistant text still emits `agent:stream:activity`, each
 /// ping carrying `lastToolUse { name, status }` for the call just recorded.
