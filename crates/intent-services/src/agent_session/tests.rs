@@ -4236,19 +4236,15 @@ async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clea
     let (_tmp, services, _bus, agent_id, _ws) = setup().await;
     let blocks = partial_blocks();
 
-    let pinned = {
+    {
         // Mid-turn: the worker holds the guard, the slot carries the partial
         // content.
         let _guard = services.begin_live_turn(&agent_id, "m1");
         services.set_live_turn(&agent_id, "m1", blocks.clone());
-        // The teardown path snapshots AND pins the slot, then aborts the
-        // worker — which drops the guard, as this scope end does.
-        let pinned = services
-            .pin_live_turn(&agent_id)
-            .expect("slot open mid-turn");
-        assert_eq!(pinned.blocks, blocks, "the pin returns the live snapshot");
-        pinned
-    };
+        // The teardown path pins the slot, then aborts the worker — which
+        // drops the guard, as this scope end does.
+        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+    }
 
     // The window: the guard has dropped and the interrupted row is not durable
     // yet — the pin keeps the slot published, so a snapshot landing here still
@@ -4262,14 +4258,10 @@ async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clea
     // The flush lands: the row is durable and the slot (pin included) clears,
     // so later snapshots serve the persisted row alone — no duplicate overlay.
     let flushed = services
-        .flush_partial_turn_on_interruption(
-            &agent_id,
-            pinned,
-            super::InterruptReason::UserStop,
-            None,
-        )
-        .await;
-    assert_eq!(flushed.as_deref(), Some("m1"));
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
         "the flush releases the pin with the slot"
@@ -4325,13 +4317,11 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
         { "id": "m1:0", "type": "text", "text": "I'll run the tests." }
     ]);
 
-    let pinned = {
+    {
         let _guard = services.begin_live_turn(&agent_id, "m1");
         services.set_live_turn(&agent_id, "m1", partial_blocks());
-        services
-            .pin_live_turn(&agent_id)
-            .expect("slot open mid-turn")
-    };
+        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+    }
     // The aborted worker's own append won the race: the full row is durable.
     services
         .store
@@ -4347,14 +4337,13 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
         .expect("worker append");
 
     let flushed = services
-        .flush_partial_turn_on_interruption(
-            &agent_id,
-            pinned,
-            super::InterruptReason::AgentStopped,
-            None,
-        )
-        .await;
-    assert!(flushed.is_none(), "the durable full row won the collision");
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::AgentStopped, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert!(
+        flushed.message_id.is_none(),
+        "the durable full row won the collision"
+    );
     assert!(
         services.agent_live_turn(agent_id.clone()).is_none(),
         "the collision path releases the pin with the stale slot"
@@ -4366,6 +4355,77 @@ async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_
         .expect("read messages");
     assert_eq!(messages.len(), 1, "exactly one row survives the race");
     assert_eq!(messages[0].content, full_blocks, "the full row is intact");
+}
+
+/// monorepo#2110 — the flush persists the slot AS OF FLUSH TIME, not the clone
+/// the teardown path used to take before `worker.abort()`. The abort cannot
+/// recall a `session/update` already being routed, so a final chunk can land
+/// after the pin: flushing the pre-abort clone trimmed it out of the durable
+/// row even though every subscriber had already been sent it, leaving the
+/// reloaded transcript short of what clients watched stream.
+#[tokio::test]
+async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    let chunk = |text: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    };
+
+    {
+        // Mid-turn: the worker holds the guard and streams the first chunk.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services
+            .route_notification(
+                &chunk("I'll run "),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        // The teardown path pins the slot…
+        assert!(services.pin_live_turn(&agent_id), "slot open mid-turn");
+        // …and the notification already in flight is routed in the pin→abort
+        // gap: broadcast to every subscriber AND folded into the live slot.
+        services
+            .route_notification(
+                &chunk("the tests.\n"),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        // Scope end = the `worker.abort()` that drops the LiveTurnGuard.
+    }
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert!(flushed.had_output, "the flushed slot carried blocks");
+    assert_eq!(
+        flushed.text_blocks,
+        vec!["I'll run the tests.\n".to_string()],
+        "the terminal preview reads the flush-time content too"
+    );
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].content,
+        json!([{ "id": "m1:0", "type": "text", "text": "I'll run the tests.\n" }]),
+        "the durable row carries the chunk routed after the pin, \
+         not the pre-abort clone's \"I'll run \""
+    );
 }
 
 /// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three

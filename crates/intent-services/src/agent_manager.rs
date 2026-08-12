@@ -3137,30 +3137,24 @@ impl AgentManager {
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
     ) -> (bool, Option<(Child, Option<u32>)>) {
-        // Snapshot-and-pin the live-turn slot BEFORE aborting the worker (the
-        // abort drops LiveTurnGuard; the pin keeps the slot published until
-        // the flush below persists the row — monorepo#2056), then flush the
-        // partial in-flight assistant content AFTER the abort — same
-        // convention as the graceful-shutdown flush. A worker append already
-        // in flight at abort time can still land, but the `agent_message.id`
-        // PK keeps the outcome convergent (exactly one row; the UNIQUE
-        // collision is absorbed inside the flush). No-op when the slot is
-        // empty or was already flushed by a caller (e.g. shutdown(), which
-        // flushes before delegating here).
-        let partial_turn = self.services.pin_live_turn(agent_id);
+        // Pin the live-turn slot BEFORE aborting the worker (the abort drops
+        // LiveTurnGuard; the pin keeps the slot published until the flush
+        // below persists the row — monorepo#2056), then flush the partial
+        // in-flight assistant content AFTER the abort — same convention as the
+        // graceful-shutdown flush. The flush re-reads the pinned slot, so an
+        // update processed in the pin→abort gap is persisted too
+        // (monorepo#2110). A worker append already in flight at abort time can
+        // still land, but the `agent_message.id` PK keeps the outcome
+        // convergent (exactly one row; the UNIQUE collision is absorbed inside
+        // the flush). No-op when the slot is empty or was already flushed by a
+        // caller (e.g. shutdown(), which flushes before delegating here).
+        self.services.pin_live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
-        if let Some(live) = partial_turn {
-            self.services
-                .flush_partial_turn_on_interruption(
-                    agent_id,
-                    live,
-                    InterruptReason::AgentStopped,
-                    None,
-                )
-                .await;
-        }
+        self.services
+            .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
+            .await;
         // Drop any pending recreate/prepend flags: the next spawn re-decides
         // resume vs recreate from scratch, so stale flags must not survive a
         // teardown (a session/load resume must not fire a stale prepend).
@@ -3265,20 +3259,17 @@ impl AgentManager {
         let Some(acp_session_id) = acp_session_id else {
             return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
         };
-        // Snapshot-and-pin the live-turn slot BEFORE aborting the worker: the
-        // abort drops the worker future and with it the LiveTurnGuard, so
-        // reading after the abort would race that drop and frequently lose the
-        // partial content, and the pin keeps the slot published to
-        // `chat.subscribe` until the flush below persists the row
-        // (monorepo#2056). The busy flag is snapshotted alongside (before
+        // Pin the live-turn slot BEFORE aborting the worker: the abort drops
+        // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
+        // read after the abort would race that drop and frequently lose the
+        // partial content. The pin keeps the slot published to `chat.subscribe`
+        // until the flush below persists the row (monorepo#2056) and lets that
+        // flush read the slot as it stands rather than a clone taken here
+        // (monorepo#2110). The busy flag is snapshotted alongside (before
         // `end_turn` below releases it) for the zero-output stop-redelivery
         // arm at the bottom of this method.
-        let partial_turn = self.services.pin_live_turn(agent_id);
+        let pinned = self.services.pin_live_turn(agent_id);
         let turn_in_flight = self.is_busy(agent_id);
-        let had_output = partial_turn
-            .as_ref()
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
@@ -3299,22 +3290,22 @@ impl AgentManager {
         // the STAB-114 phantom-row-free zero-output preemption; the
         // combined-delivery re-queue check in `preempt_busy_turn` excludes
         // this row by id).
-        let interrupted_text_blocks = partial_turn
-            .as_ref()
-            .map(|live| crate::agent_session::text_block_strings(&live.blocks))
-            .unwrap_or_default();
-        let interrupted_message_id = match partial_turn {
-            Some(live) => {
-                self.services
-                    .flush_partial_turn_on_interruption(
-                        agent_id,
-                        live,
-                        reason,
-                        interrupted_by.as_ref(),
-                    )
-                    .await
-            }
-            None => None,
+        let flushed = self
+            .services
+            .flush_pinned_turn_on_interruption(agent_id, reason, interrupted_by.as_ref())
+            .await;
+        let (interrupted_message_id, interrupted_text_blocks, had_output) = match flushed {
+            Some(f) => (f.message_id, f.text_blocks, f.had_output),
+            // No slot at flush time. Either nothing was pinned — no turn in
+            // flight, so genuinely no output — or the worker completed the turn
+            // in the abort gap and cleared the slot after persisting the full
+            // row itself, which is emphatically NOT a zero-output turn: `pinned`
+            // separates the two so the redelivery arm below keeps its pre-#2110
+            // answer. The preview fields go unstamped in that second case (the
+            // durable content lives in the worker's row, not in any snapshot
+            // reachable from here) rather than echoing a partial the durable
+            // row already supersedes.
+            None => (None, Vec::new(), pinned),
         };
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
         // provider turn dropped the stopped message before producing any
@@ -5966,13 +5957,14 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
-            // Snapshot-and-pin the live-turn slot BEFORE aborting the worker:
-            // the abort drops the worker future and with it the LiveTurnGuard,
-            // so reading after the abort would race that drop and frequently
-            // lose the partial content, and the pin keeps the slot published
-            // to `chat.subscribe` until the flush below persists the row
-            // (monorepo#2056).
-            let partial_turn = self.services.pin_live_turn(id);
+            // Pin the live-turn slot BEFORE aborting the worker: the abort
+            // drops the worker future and with it the LiveTurnGuard, so an
+            // UNPINNED slot read after the abort would race that drop and
+            // frequently lose the partial content. The pin both keeps the slot
+            // published to `chat.subscribe` until the flush below persists the
+            // row (monorepo#2056) and lets that flush re-read the slot as it
+            // stands (monorepo#2110).
+            self.services.pin_live_turn(id);
             // Abort the turn worker BEFORE flushing so it cannot race the
             // partial flush by persisting the full turn under the same minted
             // message id (which would leave the transcript stuck on the partial
@@ -5982,19 +5974,12 @@ impl AgentManager {
                 worker.abort();
             }
             // Best-effort: persist any partial in-flight assistant content from
-            // the snapshot so the transcript keeps the streamed-so-far output
-            // across the restart. Runs before the status guards below so a
-            // degenerate status read/encode failure never drops the content.
-            if let Some(live) = partial_turn {
-                self.services
-                    .flush_partial_turn_on_interruption(
-                        id,
-                        live,
-                        InterruptReason::DaemonShutdown,
-                        None,
-                    )
-                    .await;
-            }
+            // the pinned slot so the transcript keeps the streamed-so-far
+            // output across the restart. Runs before the status guards below so
+            // a degenerate status read/encode failure never drops the content.
+            self.services
+                .flush_pinned_turn_on_interruption(id, InterruptReason::DaemonShutdown, None)
+                .await;
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
