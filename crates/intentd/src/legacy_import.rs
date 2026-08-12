@@ -1708,6 +1708,7 @@ fn session_from_legacy_json(
         initial_message,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,

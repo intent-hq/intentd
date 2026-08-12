@@ -1067,6 +1067,7 @@ This is a test skill.
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,

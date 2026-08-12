@@ -3733,3 +3733,275 @@ async fn note_payloads_project_unmet_depends_on_over_wss() {
         "cancelled dep is unmet: {updated_c}"
     );
 }
+
+/// End-to-end `task.convertBlocks` relation seeding (monorepo#2018) over WSS:
+/// `@@@task` header attributes resolve at conversion time (sibling `key=` →
+/// sibling title → existing task-note id) and seed `dependsOn` through the
+/// same validated writer as `task.setRelations`, so `task:ready-tasks-changed`
+/// fires with the `relations-changed` trigger; the explicit RPC result carries
+/// the additive `createdTasks` array (`{ key?, title, noteId }` in block
+/// order) and `warnings` array naming skipped references. Auto-conversion on
+/// `note.create` is asserted first, then `note.restoreVersion` (which does not
+/// auto-convert) restores the fence content so the explicit `task.convertBlocks`
+/// arm serializes `{ ok, convertedCount, createdNoteIds, createdTasks,
+/// warnings }` on the wire. A final `note.setContent` arm asserts the
+/// note-write results surface the same additive fields alongside
+/// `convertedCount`/`createdTaskNoteIds`, with the seeded relation verifiable
+/// via `note.get`.
+#[tokio::test]
+async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ConvertRelations", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["task:ready-tasks-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Author: `note.create` auto-converts; Beta's `dependsOn=a` resolves via
+    // Alpha's `key=` and seeds, `ghost` is unknown and skipped with a warning
+    // (logged on this path; surfaced on the wire by the explicit RPC below).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Plan",
+            "content": "@@@task key=a\n# Alpha\nbody\n@@@\n@@@task dependsOn=a,ghost\n# Beta\nbody\n@@@",
+        }),
+    )
+    .await;
+    let parent_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let content = created["note"]["content"].as_str().expect("content");
+    assert!(
+        !content.contains("@@@task"),
+        "fences not removed: {content}"
+    );
+
+    // The seeded edge recomputed the ready set with the relations-changed
+    // trigger; Beta (unmet dep on Alpha) is not in `readyTaskIds`.
+    let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+    assert_eq!(
+        evt["data"]["triggeredBy"]["reason"],
+        json!("relations-changed"),
+        "auto-convert seeding trigger: {evt}"
+    );
+    let beta_id = evt["data"]["triggeredBy"]["noteId"]
+        .as_str()
+        .expect("triggering note id")
+        .to_string();
+    let ready = evt["data"]["readyTaskIds"]
+        .as_array()
+        .expect("readyTaskIds array");
+    assert!(
+        !ready.iter().any(|v| v == &json!(beta_id)),
+        "dep-blocked task still ready: {evt}"
+    );
+
+    // The seeded relation is visible on the child task note.
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": beta_id }),
+    )
+    .await;
+    assert_eq!(got["note"]["title"], json!("Beta"), "child: {got}");
+    let deps = got["note"]["metadata"]["task"]["dependsOn"]
+        .as_array()
+        .expect("dependsOn array");
+    assert_eq!(deps.len(), 1, "seeded dep: {got}");
+
+    // Explicit-RPC arm: delete the converted children, then restore v1 (the
+    // pre-conversion snapshot — `note.restoreVersion` does not auto-convert),
+    // leaving fence content in place for `task.convertBlocks` to consume.
+    let tasks = wss_rpc(
+        &mut rpc,
+        4,
+        "note.listTasks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    let rows = tasks.as_array().expect("bare array");
+    assert_eq!(rows.len(), 2, "rows: {tasks}");
+    for (i, row) in rows.iter().enumerate() {
+        let child_id = row["taskNoteId"].as_str().expect("child id");
+        let del = wss_rpc(
+            &mut rpc,
+            5 + i as i64,
+            "note.delete",
+            json!({ "workspaceId": ws_id, "noteId": child_id }),
+        )
+        .await;
+        assert_eq!(del["ok"], json!(true), "delete: {del}");
+    }
+    let restored = wss_rpc(
+        &mut rpc,
+        7,
+        "note.restoreVersion",
+        json!({ "workspaceId": ws_id, "noteId": parent_id, "v": 1 }),
+    )
+    .await;
+    let content = restored["note"]["content"].as_str().expect("content");
+    assert!(content.contains("@@@task"), "fences restored: {content}");
+
+    let conv = wss_rpc(
+        &mut rpc,
+        8,
+        "task.convertBlocks",
+        json!({ "workspaceId": ws_id, "noteId": parent_id }),
+    )
+    .await;
+    assert_eq!(conv["ok"], json!(true), "convert: {conv}");
+    assert_eq!(conv["convertedCount"], json!(2), "convert: {conv}");
+    assert_eq!(
+        conv["createdNoteIds"].as_array().map(|a| a.len()),
+        Some(2),
+        "convert: {conv}"
+    );
+    let warnings = conv["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "convert: {conv}");
+    let w = warnings[0].as_str().expect("warning string");
+    assert!(
+        w.contains("\"Beta\"") && w.contains("ghost"),
+        "warning names block and reference: {w}"
+    );
+    let created_tasks = conv["createdTasks"].as_array().expect("createdTasks array");
+    assert_eq!(created_tasks.len(), 2, "convert: {conv}");
+    assert_eq!(created_tasks[0]["key"], json!("a"), "convert: {conv}");
+    assert_eq!(created_tasks[0]["title"], json!("Alpha"), "convert: {conv}");
+    assert_eq!(
+        created_tasks[0]["noteId"], conv["createdNoteIds"][0],
+        "createdTasks parallels createdNoteIds: {conv}"
+    );
+    assert!(
+        created_tasks[1].get("key").is_none(),
+        "no key= → field omitted: {conv}"
+    );
+    assert_eq!(created_tasks[1]["title"], json!("Beta"), "convert: {conv}");
+    assert_eq!(
+        created_tasks[1]["noteId"], conv["createdNoteIds"][1],
+        "createdTasks parallels createdNoteIds: {conv}"
+    );
+
+    // The re-seeded edge recomputes readiness again, triggered by the new
+    // Beta child. Child deletions above may also have emitted recomputes;
+    // scan past them to the relations-changed trigger.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for relations-changed recompute"
+        );
+        let evt = next_event(&mut sub, &["task:ready-tasks-changed"], 10).await;
+        if evt["data"]["triggeredBy"]["reason"] == json!("relations-changed") {
+            let new_beta = evt["data"]["triggeredBy"]["noteId"]
+                .as_str()
+                .expect("triggering note id");
+            assert_ne!(new_beta, beta_id, "fresh child triggered: {evt}");
+            assert!(
+                conv["createdNoteIds"]
+                    .as_array()
+                    .expect("createdNoteIds")
+                    .iter()
+                    .any(|v| v == &json!(new_beta)),
+                "trigger is a created child: {evt}"
+            );
+            break;
+        }
+    }
+
+    // Note-write surface: a `note.setContent` write containing fences
+    // carries the same additive `createdTasks`/`warnings` fields alongside
+    // the existing `convertedCount`/`createdTaskNoteIds`.
+    let plan2 = wss_rpc(
+        &mut rpc,
+        9,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Plan2", "content": "placeholder" }),
+    )
+    .await;
+    let plan2_id = plan2["note"]["id"].as_str().expect("note id").to_string();
+    let set = wss_rpc(
+        &mut rpc,
+        10,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": plan2_id,
+            "content": "@@@task key=g\n# Gamma\nbody\n@@@\n@@@task dependsOn=g,phantom\n# Delta\nbody\n@@@",
+        }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "setContent: {set}");
+    assert_eq!(set["convertedCount"], json!(2), "setContent: {set}");
+    let ids = set["createdTaskNoteIds"]
+        .as_array()
+        .expect("createdTaskNoteIds array");
+    assert_eq!(ids.len(), 2, "setContent: {set}");
+    let created = set["createdTasks"].as_array().expect("createdTasks array");
+    assert_eq!(created.len(), 2, "setContent: {set}");
+    assert_eq!(created[0]["key"], json!("g"), "setContent: {set}");
+    assert_eq!(created[0]["title"], json!("Gamma"), "setContent: {set}");
+    assert_eq!(
+        created[0]["noteId"], ids[0],
+        "createdTasks parallels createdTaskNoteIds: {set}"
+    );
+    assert!(
+        created[1].get("key").is_none(),
+        "no key= → field omitted: {set}"
+    );
+    assert_eq!(created[1]["title"], json!("Delta"), "setContent: {set}");
+    assert_eq!(
+        created[1]["noteId"], ids[1],
+        "createdTasks parallels createdTaskNoteIds: {set}"
+    );
+    let set_warnings = set["warnings"].as_array().expect("warnings array");
+    assert_eq!(set_warnings.len(), 1, "setContent: {set}");
+    let w = set_warnings[0].as_str().expect("warning string");
+    assert!(
+        w.contains("\"Delta\"") && w.contains("phantom"),
+        "warning names block and reference: {w}"
+    );
+    let new_content = set["newContent"].as_str().expect("newContent");
+    assert!(
+        !new_content.contains("@@@task"),
+        "fences converted: {new_content}"
+    );
+
+    // The `key=`-resolved edge seeded by the write is visible via `note.get`.
+    let gamma_id = created[0]["noteId"].as_str().expect("gamma id");
+    let delta_id = created[1]["noteId"].as_str().expect("delta id");
+    let got = wss_rpc(
+        &mut rpc,
+        11,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": delta_id }),
+    )
+    .await;
+    assert_eq!(got["note"]["title"], json!("Delta"), "child: {got}");
+    assert_eq!(
+        got["note"]["metadata"]["task"]["dependsOn"],
+        json!([gamma_id]),
+        "seeded dep: {got}"
+    );
+}

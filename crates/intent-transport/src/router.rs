@@ -1314,6 +1314,7 @@ async fn dispatch(
                 workspace_context: opt_value(params, "workspaceContext"),
                 context_references: opt_value(params, "contextReferences"),
                 image_blocks: opt_value(params, "imageBlocks"),
+                file_blocks: opt_value(params, "fileBlocks"),
                 is_background: opt_bool(params, "isBackground"),
                 name_explicitly_set,
             };
@@ -3127,7 +3128,14 @@ async fn dispatch(
             let file_name = require_str_param(params, "fileName")?;
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
-            api.file_place_attachment(ws, file_name, data, source_path)
+            let mime_type = opt_str(params, "mimeType");
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.getAttachmentInfo" => {
+            let attachment_id = require_str_param(params, "attachmentId")?;
+            api.file_get_attachment_info(attachment_id)
                 .await
                 .map_err(domain_to_rpc)
         }

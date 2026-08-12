@@ -7199,6 +7199,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         messages: vec![],
@@ -7490,12 +7491,18 @@ async fn wss_workspace_transfer_plan_round_trip() {
         "event log is excluded from the manifest: {resp}"
     );
     assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["attachments"].is_array(), "{resp}");
     assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
     let total = plan["totalSizeBytes"].as_u64().expect("total");
     let db = plan["dbRowBytes"].as_u64().expect("db");
     let assets = plan["assetBytes"].as_u64().expect("assets");
+    let attachments = plan["attachmentBytes"].as_u64().expect("attachments");
     let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
-    assert_eq!(total, db + assets + bundle, "size breakdown sums: {resp}");
+    assert_eq!(
+        total,
+        db + assets + attachments + bundle,
+        "size breakdown sums: {resp}"
+    );
     assert!(plan["warnings"].is_array(), "{resp}");
 
     // Unknown workspace → the standard workspace-not-found mapping.
@@ -7533,21 +7540,39 @@ async fn wss_file_place_attachment_round_trip() {
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}","mimeType":"application/json"}}}}"#,
         ws.0
     );
     let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
     assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true), "{resp}");
     assert_eq!(
-        resp["result"],
-        serde_json::json!({
-            "ok": true,
-            "path": ".intent/attachments/trace.har",
-            "fileName": "trace.har",
-            "size": 26
-        }),
-        "result: {resp}"
+        resp["result"]["path"],
+        serde_json::json!(".intent/attachments/trace.har"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["fileName"],
+        serde_json::json!("trace.har"),
+        "{resp}"
+    );
+    assert_eq!(resp["result"]["size"], serde_json::json!(26), "{resp}");
+    // v6.12 additive attachment-registry fields.
+    let attachment_id = resp["result"]["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+    assert_eq!(
+        resp["result"]["mimeType"],
+        serde_json::json!("application/json"),
+        "{resp}"
+    );
+    assert!(
+        resp["result"]["uploadedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{resp}"
     );
     assert_eq!(
         std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
@@ -7578,6 +7603,43 @@ async fn wss_file_place_attachment_round_trip() {
     );
     let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
     assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
+
+    // `file.getAttachmentInfo` (v6.12) serves the registry row with `exists`.
+    let frame4 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.getAttachmentInfo","params":{{"attachmentId":"{attachment_id}"}}}}"#
+    );
+    let resp4 = wss_call(srv.port, srv.cfg.clone(), &frame4).await;
+    assert_eq!(
+        resp4["result"]["attachmentId"],
+        serde_json::json!(attachment_id),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["fileName"],
+        serde_json::json!("trace.har"),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["path"],
+        serde_json::json!(".intent/attachments/trace.har"),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["exists"],
+        serde_json::json!(true),
+        "{resp4}"
+    );
+
+    // Unknown attachment id → -32602 ("unknown attachment id").
+    let frame5 = r#"{"jsonrpc":"2.0","id":5,"method":"file.getAttachmentInfo","params":{"attachmentId":"nope"}}"#;
+    let resp5 = wss_call(srv.port, srv.cfg.clone(), frame5).await;
+    assert_eq!(resp5["error"]["code"].as_i64(), Some(-32602), "{resp5}");
+    assert!(
+        resp5["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown attachment id")),
+        "{resp5}"
+    );
 
     srv.ws.stop().await;
 }

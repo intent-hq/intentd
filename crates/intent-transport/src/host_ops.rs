@@ -130,13 +130,13 @@ fn resolve_binary_path_with_tool_dirs(
     if name.is_empty() {
         return None;
     }
-    // 1. PATH which (lookup_in_path uses which/where)
+    // 1. PATH which/where (ranked so Windows prefers a runnable extension)
     if let Some(path) = lookup_in_path(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
         }
     }
-    // 2. Caller-supplied common_paths hints
+    // 2. Caller-supplied common_paths hints (checked verbatim, like the FE)
     for candidate in common_paths {
         let candidate = PathBuf::from(candidate);
         if candidate.is_file() || candidate.is_symlink() {
@@ -144,24 +144,67 @@ fn resolve_binary_path_with_tool_dirs(
         }
     }
     // 3. Enriched tool directories (hardcoded + login-shell PATH)
-    for dir in enriched_tool_dirs {
-        let candidate = dir.join(binary_filename(name));
-        if candidate.is_file() || candidate.is_symlink() {
-            return Some(candidate);
-        }
+    if let Some(path) = find_in_dir_candidates(name, enriched_tool_dirs) {
+        return Some(path);
     }
     // 4. Common OS directories (fallback)
-    for dir in common_dirs() {
-        let candidate = dir.join(binary_filename(name));
-        if candidate.is_file() || candidate.is_symlink() {
-            return Some(candidate);
+    if let Some(path) = find_in_dir_candidates(name, &common_dirs()) {
+        return Some(path);
+    }
+    None
+}
+
+/// Extensions Windows can actually run (`CreateProcess` / `cmd.exe`-runnable),
+/// in resolution-preference order. Mirrors the provider-discovery policy in
+/// `intent_providers::discover` so `host.findBinary` and provider spawning
+/// agree on what "runnable" means.
+const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+/// True when `path` carries a Windows-runnable executable extension
+/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
+fn has_windows_exec_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            WINDOWS_EXEC_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+        })
+}
+
+/// Candidate filenames to try when resolving `name` in a directory, mirroring
+/// `intent_providers::discover::name_candidates_for`. POSIX uses the bare name.
+/// Windows probes only runnable entry points (`.exe`/`.cmd`/`.bat`) and never
+/// the bare extensionless name — `CreateProcess` cannot run it and npm shim
+/// pairs (`pi` next to `pi.cmd`) must resolve the `.cmd` shim — unless `name`
+/// itself already carries a runnable extension.
+fn name_candidates_for(name: &str, is_windows: bool) -> Vec<String> {
+    if !is_windows || has_windows_exec_extension(Path::new(name)) {
+        return vec![name.to_string()];
+    }
+    WINDOWS_EXEC_EXTENSIONS
+        .iter()
+        .map(|ext| format!("{name}.{ext}"))
+        .collect()
+}
+
+/// Scan `dirs` for the first existing runnable candidate of `name`, using the
+/// platform-appropriate candidate set from [`name_candidates_for`].
+fn find_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let candidates = name_candidates_for(name, cfg!(windows));
+    for dir in dirs {
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if full.is_file() || full.is_symlink() {
+                return Some(full);
+            }
         }
     }
     None
 }
 
-/// Run `which`/`where` to consult PATH. Returns the first non-empty trimmed
-/// line of stdout as a `PathBuf`.
+/// Run `which`/`where` to consult PATH, then rank the results so a
+/// CreateProcess-runnable path wins on Windows.
 fn lookup_in_path(name: &str) -> Option<PathBuf> {
     let probe = if cfg!(windows) { "where" } else { "which" };
     let output = Command::new(probe)
@@ -175,11 +218,43 @@ fn lookup_in_path(name: &str) -> Option<PathBuf> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    let lines: Vec<&str> = stdout
         .lines()
         .map(str::trim)
-        .find(|s| !s.is_empty())
-        .map(PathBuf::from)
+        .filter(|s| !s.is_empty())
+        .collect();
+    select_path_lookup_line(name, &lines, cfg!(windows)).map(PathBuf::from)
+}
+
+/// Choose which `which`/`where` output line to trust, parametrized on the
+/// platform (test seam — Windows CI is disabled, so both arms are exercised on
+/// POSIX). On non-Windows, `which` prints a single line and the first non-empty
+/// one is taken verbatim. On Windows, `where` lists every PATH match in PATH
+/// order (npm installs the bare POSIX shim `pi` ahead of the runnable
+/// `pi.cmd`); the bare extensionless shim is not CreateProcess-runnable, so the
+/// first line carrying a runnable extension (`.exe`/`.cmd`/`.bat`, in
+/// [`WINDOWS_EXEC_EXTENSIONS`] preference order) is preferred. When `name`
+/// itself already carries a runnable extension, the first line is kept as-is;
+/// when no line is runnable, resolution fails here (bare alone does not
+/// resolve, matching provider discovery).
+fn select_path_lookup_line(name: &str, lines: &[&str], is_windows: bool) -> Option<String> {
+    if !is_windows {
+        return lines.first().map(|s| s.to_string());
+    }
+    if has_windows_exec_extension(Path::new(name)) {
+        return lines.first().map(|s| s.to_string());
+    }
+    for ext in WINDOWS_EXEC_EXTENSIONS {
+        if let Some(line) = lines.iter().find(|line| {
+            Path::new(line)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        }) {
+            return Some(line.to_string());
+        }
+    }
+    None
 }
 
 /// OS-common directories to scan after PATH (task spec). Mirrors the FE: the
@@ -205,16 +280,6 @@ fn common_dirs() -> Vec<PathBuf> {
             PathBuf::from("/bin"),
             PathBuf::from("/usr/local/bin"),
         ]
-    }
-}
-
-/// Append `.exe` on Windows so `dir.join(name)` resolves the real executable
-/// when scanning common dirs.
-fn binary_filename(name: &str) -> String {
-    if cfg!(windows) && !name.to_lowercase().ends_with(".exe") {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
     }
 }
 

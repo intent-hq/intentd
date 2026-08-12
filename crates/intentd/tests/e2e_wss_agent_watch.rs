@@ -937,6 +937,16 @@ async fn agent_watch_wakes_on_target_idle_completion_over_wss() {
         text.contains("completed."),
         "idle wake reports the target completed: {text}"
     );
+    // monorepo#2051: the retiring wake says so explicitly and points at the
+    // re-arm call.
+    assert!(
+        text.contains("the watch is now retired"),
+        "idle wake states the watch retirement: {text}"
+    );
+    assert!(
+        text.contains(&format!("ws.agent.watch(\\\"{}\\\")", fx.target)),
+        "idle wake carries the re-arm instruction naming the target: {text}"
+    );
     await_watch_count(
         &mut fx.setup.rpc,
         &mut fx.req_id,
@@ -981,6 +991,12 @@ async fn agent_watch_wakes_on_blocker_and_discussion_attention_over_wss() {
     assert!(
         text.contains(BLOCKER_REASON),
         "blocker wake carries the reason: {text}"
+    );
+    // monorepo#2051: the attention wake is non-terminal — it states the
+    // watch remains armed.
+    assert!(
+        text.contains("remains armed"),
+        "blocker wake states the watch remains armed: {text}"
     );
 
     // The trailing idle of the blocker turn consumed the watch; re-arm, then
@@ -1155,6 +1171,15 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     assert!(
         text.contains(&format!("Child agent {}", fx.target)),
         "failure wake names the target: {text}"
+    );
+    // monorepo#2051: the terminal failure wake retired the watch and says so.
+    assert!(
+        text.contains("the watch is now retired"),
+        "failure wake states the watch retirement: {text}"
+    );
+    assert!(
+        text.contains(&format!("ws.agent.watch(\\\"{}\\\")", fx.target)),
+        "failure wake carries the re-arm instruction naming the target: {text}"
     );
 }
 

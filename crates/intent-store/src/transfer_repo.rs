@@ -19,6 +19,27 @@ use crate::Store;
 /// and `agent_queue` have no `workspace_id` column and scope through their
 /// owning `agent_session`; `completion_watch` is workspace-scoped from either
 /// end of the parent/child pair.
+///
+/// **Adding workspace state? Transfer checklist.** Every table in the live
+/// schema must appear here or in [`TRANSFER_EXCLUDED_TABLES`] — the
+/// `every_live_table_has_an_explicit_transfer_decision` test fails otherwise.
+/// When adding a table (or a column to a table listed here), decide:
+///
+/// 1. Does it ride the archive? Add it here with a workspace-scoping
+///    predicate, or to [`TRANSFER_EXCLUDED_TABLES`] with a rationale.
+/// 2. Does any column hold machine-local values (absolute paths, client ids,
+///    daemon-local ids)? If so, add an import-side transformation in
+///    `intent-services/src/transfer_import.rs` (see its path/ID rewriting).
+/// 3. Is there matching non-DB state? Assets dir and git bundle ride the
+///    archive separately (`transfer_export.rs` / `transfer_git.rs`); runtime
+///    state (hooks, PR monitors, agent queues) is rehydrated from these rows
+///    on the target at import — make sure the rehydration path picks the new
+///    state up.
+///
+/// Note: `sqlx::migrate!()` embeds migrations at compile time, so after
+/// adding a bare `.sql` migration these tests only see it once `intent-store`
+/// recompiles — if they unexpectedly pass locally, force a rebuild (CI's
+/// fresh builds always pick it up).
 pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("workspace", "id = ?1"),
     ("note", "workspace_id = ?1"),
@@ -53,6 +74,90 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("agent_metrics", "workspace_id = ?1"),
     ("workspace_context_item", "workspace_id = ?1"),
     ("workspace_ui_context", "workspace_id = ?1"),
+    // Registry rows transfer; the files under `.intent/attachments/` are
+    // git-ignored so they do NOT ride the git bundle — the archive carries
+    // them explicitly as `attachments/<attachmentId>` entries (export skips
+    // rows whose stored file is already deleted; import materializes files
+    // before this row insert). `stored_path` is workspace-relative, so no
+    // import rewriting is needed.
+    ("attachments", "workspace_id = ?1"),
+];
+
+/// Tables deliberately **excluded** from a transfer, each with the rationale.
+/// Together with [`TRANSFER_TABLES`] this must cover the entire live schema
+/// (enforced by `every_live_table_has_an_explicit_transfer_decision`), so a
+/// new table cannot silently skip the transfer decision.
+pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    (
+        "_sqlx_migrations",
+        "sqlx's own migration bookkeeping; every database maintains its own",
+    ),
+    (
+        "event",
+        "event history stays on the source (spec 'Resolved Design Decisions' #3); \
+         the target starts a fresh event log",
+    ),
+    (
+        "settings",
+        "daemon-global key/value settings, not workspace-scoped",
+    ),
+    (
+        "mcp_oauth_tokens",
+        "per-daemon OAuth secrets; credentials never leave the source machine",
+    ),
+    (
+        "known_repo",
+        "daemon-global repository registry; the target daemon discovers repos itself",
+    ),
+    (
+        "client",
+        "connected FE clients are per-daemon; imported draft rows referencing them \
+         are dropped by the import transform layer",
+    ),
+    (
+        "idempotency_key",
+        "per-daemon RPC replay-protection bookkeeping, not workspace state",
+    ),
+    (
+        "deleted_workspace_id",
+        "source-local tombstones guarding workspace-id reuse, not live workspace state",
+    ),
+    (
+        "usage_stats_hourly",
+        "daemon-global usage accounting, not workspace-scoped",
+    ),
+    (
+        "usage_rate_minutely",
+        "daemon-global usage-rate accounting, not workspace-scoped",
+    ),
+    (
+        "agent_stop_redelivery",
+        "write-through mirror of transient in-memory stop-redelivery runtime state; \
+         an armed payload is deliberately dropped on transfer (it is derivable from \
+         the transferred `agent_message` rows), while the agents themselves are \
+         captured in `interrupted_agent`",
+    ),
+    (
+        "agent_message_fts",
+        "derived FTS5 index over `agent_message`; the target's insert triggers \
+         rebuild it from the imported rows",
+    ),
+    (
+        "agent_message_fts_config",
+        "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
+    ),
+    (
+        "agent_message_fts_data",
+        "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
+    ),
+    (
+        "agent_message_fts_docsize",
+        "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
+    ),
+    (
+        "agent_message_fts_idx",
+        "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
+    ),
 ];
 
 impl Store {
@@ -350,7 +455,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::TRANSFER_TABLES;
+    use super::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
     use crate::Store;
     use intent_core::WorkspaceId;
     use uuid::Uuid;
@@ -422,6 +527,7 @@ mod tests {
             format!("INSERT INTO agent_metrics (agent_id, workspace_id, updated_at) VALUES ('{agent}', '{ws}', '{t}')"),
             format!("INSERT INTO workspace_context_item (workspace_id, id, ordinal, payload) VALUES ('{ws}', 'ci', 0, '{{}}')"),
             format!("INSERT INTO workspace_ui_context (workspace_id, payload) VALUES ('{ws}', '{{}}')"),
+            format!("INSERT INTO attachments (id, workspace_id, file_name, size, uploaded_at, stored_path) VALUES ('at-{ws}', '{ws}', 'f.txt', 3, '{t}', '.intent/attachments/at-{ws}')"),
         ] {
             run(store, sql).await;
         }
@@ -541,5 +647,140 @@ mod tests {
             let err = store.transfer_import_rows(&rows).await.expect_err(table);
             assert!(matches!(err, intent_core::Error::InvalidParams(_)));
         }
+    }
+
+    /// Schema-parity tripwire: every table in the live post-migration schema
+    /// must appear in exactly one of [`TRANSFER_TABLES`] /
+    /// [`TRANSFER_EXCLUDED_TABLES`], and neither list may name a table that
+    /// no longer exists. A new migration that adds a table fails here until
+    /// its transfer fate is decided explicitly.
+    #[tokio::test]
+    async fn every_live_table_has_an_explicit_transfer_decision() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        let live: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(store.read_pool())
+        .await
+        .expect("list live tables");
+
+        let transferred: Vec<&str> = TRANSFER_TABLES.iter().map(|(t, _)| *t).collect();
+        let excluded: Vec<&str> = TRANSFER_EXCLUDED_TABLES.iter().map(|(t, _)| *t).collect();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let duplicated: Vec<&&str> = transferred
+            .iter()
+            .chain(excluded.iter())
+            .filter(|t| !seen.insert(**t))
+            .collect();
+        assert!(
+            duplicated.is_empty(),
+            "tables listed more than once across TRANSFER_TABLES and \
+             TRANSFER_EXCLUDED_TABLES: {duplicated:?} — each table must appear \
+             exactly once in exactly one list (a duplicated TRANSFER_TABLES \
+             entry would export/import its rows twice)"
+        );
+
+        let undecided: Vec<&String> = live
+            .iter()
+            .filter(|t| !transferred.contains(&t.as_str()) && !excluded.contains(&t.as_str()))
+            .collect();
+        assert!(
+            undecided.is_empty(),
+            "tables in the live schema with NO transfer decision: {undecided:?}.\n\
+             You added a table without deciding its transfer fate. Either:\n\
+             - add it to TRANSFER_TABLES with a predicate scoping its rows to \
+             one workspace (`?1` = workspace id), or\n\
+             - add it to TRANSFER_EXCLUDED_TABLES with a rationale for why it \
+             does not ride the transfer archive.\n\
+             If it transfers and any column holds machine-local values \
+             (absolute paths, client ids, daemon-local ids), also add an \
+             import-side transformation in \
+             intent-services/src/transfer_import.rs, and update the column \
+             snapshot in transferred_table_columns_match_snapshot. See the \
+             'Transfer checklist' on TRANSFER_TABLES."
+        );
+
+        let stale: Vec<&&str> = transferred
+            .iter()
+            .chain(excluded.iter())
+            .filter(|t| !live.iter().any(|l| l == **t))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "tables listed in TRANSFER_TABLES / TRANSFER_EXCLUDED_TABLES but \
+             absent from the live schema: {stale:?} — remove the stale entries \
+             (and any import-side transformation for them)"
+        );
+    }
+
+    /// Expected column list of every [`TRANSFER_TABLES`] table, in
+    /// declaration order. Regenerate from the failure output of
+    /// `transferred_table_columns_match_snapshot` after deciding what the
+    /// column change means for transfer (see that test's message).
+    const TRANSFERRED_COLUMNS: &str = "\
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled
+note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
+note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content
+note_line_attribution: note_id, workspace_id, computed_at, attributions_json
+comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
+draft: workspace_id, agent_id, client_id, text, updated_at, attachments
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks
+agent_message: id, agent_id, seq, role, content, created_at, metadata
+agent_queue: id, agent_id, position, payload, created_at, turn_id
+interrupted_agent: agent_id, workspace_id, prev_status, interrupted_at, resolution, resolved_at, reason
+delegation_group: group_id, workspace_id, parent_agent_id, await_mode, expected_agent_ids, completed_agent_ids, deleted_agent_ids, sealed, delivered, event_summaries, raw_events, created_at, updated_at
+completion_watch: id, parent_workspace_id, child_workspace_id, parent_agent_id, parent_agent_name, child_agent_id, group_id, report_delivered, wake_on_attention, created_at
+event_subscription: id, workspace_id, subscriber_agent_id, event_types, exclude_self, batch_window_ms, created_at
+hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, last_run_at, next_run_at, run_count, last_error, last_logs, last_state, expires_at, perpetual, dispatch_count
+pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot
+script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running
+task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
+sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
+tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at
+diffs: id, workspace_id, file_path, staged, old_content, new_content, hunks_json, created_at, updated_at
+workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at
+agent_metrics: agent_id, workspace_id, additions, deletions, files_changed, updated_at
+workspace_context_item: workspace_id, id, ordinal, payload
+workspace_ui_context: workspace_id, payload
+attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path";
+
+    /// Column-drift tripwire: the live columns of every transferred table
+    /// must match [`TRANSFERRED_COLUMNS`]. Adding/removing a column on a
+    /// transferred table fails here until the snapshot is consciously
+    /// updated — forcing a decision on import-side rewriting.
+    #[tokio::test]
+    async fn transferred_table_columns_match_snapshot() {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open");
+        let mut actual = String::new();
+        for (table, _) in TRANSFER_TABLES {
+            let cols: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .fetch_all(store.read_pool())
+            .await
+            .expect("table_info");
+            actual.push_str(&format!("{table}: {}\n", cols.join(", ")));
+        }
+        let actual = actual.trim_end();
+
+        assert_eq!(
+            TRANSFERRED_COLUMNS.trim(),
+            actual,
+            "\ncolumns of a transferred table changed.\n\
+             Before updating the snapshot, decide what the change means for \
+             transfer:\n\
+             - does the new column hold machine-local values (absolute paths, \
+             client ids, daemon-local ids)? If so, add an import-side \
+             transformation in intent-services/src/transfer_import.rs (see \
+             its existing path/ID rewriting);\n\
+             - exported archives created before this change lack the column — \
+             make sure the import path tolerates its absence (or defaults it);\n\
+             then replace TRANSFERRED_COLUMNS with the actual snapshot \
+             below:\n\n{actual}\n"
+        );
     }
 }

@@ -1683,6 +1683,8 @@ mod mcp_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6085,6 +6087,8 @@ mod wsapi3_bindings_tests {
                     new_content: content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6114,6 +6118,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6141,6 +6147,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.new,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6170,6 +6178,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6367,6 +6377,8 @@ mod wsapi3_bindings_tests {
                     ok: true,
                     converted_count: 0,
                     created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -7770,6 +7782,7 @@ mod wsapi4_bindings_tests {
             last_message_id: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
