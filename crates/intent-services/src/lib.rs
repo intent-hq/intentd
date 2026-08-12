@@ -128,13 +128,14 @@ pub mod workspace_vocabulary;
 #[cfg(test)]
 mod tests;
 
+pub use acp_adapter::{adapter_slot_limit, init_adapter_slots};
 pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_agents, migrate_default_vocabulary, migrate_quick_action_settings,
-    InMemorySecretStore, SecretStore,
+    max_concurrent_adapters, max_concurrent_agents, migrate_default_vocabulary,
+    migrate_quick_action_settings, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,

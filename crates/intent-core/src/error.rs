@@ -97,6 +97,25 @@ pub enum Error {
     /// of prose. Deliberately not queued: the caller fires and forgets.
     #[error("repo cache warm already in flight for {owner}/{repo}")]
     WarmInFlight { owner: String, repo: String },
+
+    /// An `agent.completeOnce` call gave up waiting for a slot in the
+    /// daemon-wide ephemeral-adapter bound (`agents.maxConcurrentAdapters`):
+    /// the daemon was already running its full complement of adapter chains
+    /// and the caller's own `timeoutMs` elapsed while queued. Surfaces as
+    /// `-32603` with machine-readable
+    /// `error.data = { code: "adapter-busy", provider, waitedMs, limit }` so a
+    /// client can distinguish "the daemon is saturated, retry later" from "the
+    /// model was slow" without matching on prose (monorepo#2062). Nothing was
+    /// spawned and no model was asked, so a retry is always safe.
+    #[error(
+        "no free adapter slot for {provider} after {waited_ms}ms \
+         (agents.maxConcurrentAdapters = {limit})"
+    )]
+    AdapterBusy {
+        provider: String,
+        waited_ms: u64,
+        limit: u32,
+    },
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -167,7 +186,8 @@ impl Error {
             Error::Internal(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
-            | Error::WarmInFlight { .. } => -32603,
+            | Error::WarmInFlight { .. }
+            | Error::AdapterBusy { .. } => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
         }

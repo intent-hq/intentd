@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter,
+    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter, SpawnError,
 };
 
 /// The probe's launch description (shared with the one-shot runner).
@@ -32,6 +32,10 @@ const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
 /// Machine-readable probe failure reasons.
 #[derive(Debug)]
 pub(super) enum ProbeError {
+    /// The probe's budget expired while queued for a slot in the daemon-wide
+    /// adapter bound — nothing was spawned (monorepo#2062). Treated like any
+    /// other probe failure by the caller: the static model list stands in.
+    QueueTimeout { waited_ms: u64, limit: u32 },
     /// The adapter process could not be spawned.
     Spawn(String),
     /// A handshake request failed at the transport level or timed out.
@@ -51,6 +55,10 @@ pub(super) enum ProbeError {
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProbeError::QueueTimeout { waited_ms, limit } => write!(
+                f,
+                "timed out after {waited_ms}ms waiting for a free adapter slot (limit {limit})"
+            ),
             ProbeError::Spawn(e) => write!(f, "failed to spawn adapter: {e}"),
             ProbeError::Transport(e) => write!(f, "probe transport failed: {e}"),
             ProbeError::Rpc(e) => write!(f, "adapter returned an error: {e}"),
@@ -63,7 +71,15 @@ impl std::fmt::Display for ProbeError {
     }
 }
 
-/// Spawn the adapter, drive the probe handshake, and reap the child.
+/// Claim a slot in the daemon-wide adapter bound, spawn the adapter, drive the
+/// probe handshake, and reap the child.
+///
+/// A probe queues for at most its own setup budget — the window it already
+/// accepts for the handshake — and reports the expiry as
+/// [`ProbeError::QueueTimeout`] rather than spawning late or hanging. Probes
+/// share the bound with one-shot completions because they are the same
+/// ~610 MB adapter chain (monorepo#2062); under contention this is visible as
+/// a `models.list` refresh falling back to the static list.
 pub(super) async fn run_acp_probe<F>(
     cmd: AcpProbeCommand,
     extract: F,
@@ -71,7 +87,15 @@ pub(super) async fn run_acp_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    let mut adapter = spawn_adapter(&cmd).map_err(ProbeError::Spawn)?;
+    let mut adapter = spawn_adapter(&cmd, cmd.setup_timeout())
+        .await
+        .map_err(|e| match e {
+            SpawnError::QueueTimeout { waited, limit } => ProbeError::QueueTimeout {
+                waited_ms: waited.as_millis() as u64,
+                limit,
+            },
+            SpawnError::Spawn(detail) => ProbeError::Spawn(detail),
+        })?;
 
     let result = tokio::time::timeout(
         cmd.setup_timeout(),
@@ -102,7 +126,10 @@ async fn attribute_early_exit(
     child: &mut tokio::process::Child,
     conn: &Connection,
 ) -> ProbeError {
-    if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
+    if matches!(
+        err,
+        ProbeError::Spawn(_) | ProbeError::Rpc(_) | ProbeError::QueueTimeout { .. }
+    ) {
         return err;
     }
     let status = observe_exit_status(child, conn).await;
