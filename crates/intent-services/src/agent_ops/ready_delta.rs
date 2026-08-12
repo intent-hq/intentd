@@ -41,6 +41,13 @@ pub(crate) struct UnblockedTask {
 /// Single-task readiness disposition against `snaps`: greedy-off, so
 /// `conflictsWith` overlap with running work reports as held, and classifying
 /// one id at a time keeps candidates from holding each other.
+///
+/// Cost: each call rebuilds the conflict adjacency and (greedy-off) runs the
+/// critical-path pass over the whole snapshot, so [`ready_set_delta`] is
+/// O(candidates x (V+E)) with up to two calls per candidate. Acceptable at
+/// workspace task counts and off the hot RPC paths (it runs once per
+/// completion-wake delivery); revisit with a single-id fast path in
+/// [`classify_batch_tasks`] if that ever changes.
 fn classify_one(id: &str, snaps: &HashMap<String, BatchTaskSnap>) -> Option<BatchDisposition> {
     classify_batch_tasks(&[id.to_string()], snaps, false)
         .into_iter()
@@ -60,8 +67,12 @@ fn classify_one(id: &str, snaps: &HashMap<String, BatchTaskSnap>) -> Option<Batc
 /// were deleted or reopened between enqueue and delivery are skipped
 /// gracefully. A task held before on both a trigger dep and a trigger
 /// conflict reports [`UnblockedReason::DepsSatisfied`] (the dep check runs
-/// first). Output is sorted by title then note id for reproducible message
-/// rendering.
+/// first). Attention statuses (`waiting`, `discussion_needed`, `blocked`,
+/// `review_required`) remain candidates ON PURPOSE — batch-delegate
+/// classification treats them as delegable, and this helper keeps those
+/// semantics; whether to annotate or filter them in the rendered hint is the
+/// consumer's call. Output is sorted by title then note id for reproducible
+/// message rendering.
 pub(crate) fn ready_set_delta(
     trigger_completions: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
@@ -247,6 +258,44 @@ mod tests {
         );
         let delta = ready_set_delta(&ids(&["done"]), &snaps, &HashMap::new());
         assert_eq!(rows(&delta), vec![("t", UnblockedReason::ConflictCleared)]);
+    }
+
+    #[test]
+    fn candidate_declared_conflict_edge_also_reports_conflict_cleared() {
+        // Reverse direction of the edge: the CANDIDATE declares
+        // `conflictsWith: ["done"]`; symmetric closure (inherited from
+        // `classify_batch_tasks`) must still surface it.
+        let mut snaps = HashMap::new();
+        snaps.insert("done".into(), snap(TaskStatus::Complete, &[], &[]));
+        snaps.insert("t".into(), snap(TaskStatus::NotStarted, &[], &["done"]));
+        let delta = ready_set_delta(&ids(&["done"]), &snaps, &HashMap::new());
+        assert_eq!(rows(&delta), vec![("t", UnblockedReason::ConflictCleared)]);
+    }
+
+    #[test]
+    fn attention_statuses_remain_candidates() {
+        // Pinned semantics: waiting/discussion_needed/blocked/review_required
+        // tasks are delegable per batch classification, so they appear in the
+        // delta once their trigger dep completes.
+        let mut snaps = HashMap::new();
+        snaps.insert("done".into(), snap(TaskStatus::Complete, &[], &[]));
+        snaps.insert("w".into(), snap(TaskStatus::Waiting, &["done"], &[]));
+        snaps.insert(
+            "d".into(),
+            snap(TaskStatus::DiscussionNeeded, &["done"], &[]),
+        );
+        snaps.insert("b".into(), snap(TaskStatus::Blocked, &["done"], &[]));
+        snaps.insert("r".into(), snap(TaskStatus::ReviewRequired, &["done"], &[]));
+        let delta = ready_set_delta(&ids(&["done"]), &snaps, &HashMap::new());
+        assert_eq!(
+            rows(&delta),
+            vec![
+                ("b", UnblockedReason::DepsSatisfied),
+                ("d", UnblockedReason::DepsSatisfied),
+                ("r", UnblockedReason::DepsSatisfied),
+                ("w", UnblockedReason::DepsSatisfied),
+            ]
+        );
     }
 
     #[test]
