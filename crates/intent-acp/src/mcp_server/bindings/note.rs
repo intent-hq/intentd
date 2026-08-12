@@ -157,7 +157,7 @@ async fn create(
     let idempotency_key = opt_str(args, "idempotencyKey")
         .filter(|k| !k.trim().is_empty())
         .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
-    let note = api
+    let result = api
         .create_note(
             ws.clone(),
             NoteCreate {
@@ -171,6 +171,7 @@ async fn create(
         )
         .await
         .map_err(map_err)?;
+    let note = result.note;
     let link = format!("intent://local/{}/note/{}", ws.as_str(), note.id.as_str());
     let markdown_link = format!("[{}]({})", note.title, link);
     Ok(json!({
@@ -179,6 +180,10 @@ async fn create(
         "tags": note.tags,
         "link": link,
         "markdownLink": markdown_link,
+        "convertedCount": result.converted_count,
+        "createdTaskNoteIds": result.created_task_note_ids,
+        "createdTasks": result.created_tasks,
+        "warnings": result.warnings,
     }))
 }
 

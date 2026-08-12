@@ -302,7 +302,8 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     services
         .mark_as_task(
             ws.clone(),

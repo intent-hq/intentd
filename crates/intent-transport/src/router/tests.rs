@@ -5,12 +5,13 @@ use intent_core::{
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
     CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileStatus,
     GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
-    ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
+    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -396,12 +397,18 @@ impl WorkspaceApi for FakeApi {
         input: NoteCreate,
         _idempotency_key: Option<String>,
         _caller_agent_id: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<Note>> {
+    ) -> BoxFuture<'_, Result<NoteCreateResult>> {
         Box::pin(async move {
             let mut note = sample_note(&workspace_id);
             note.id = NoteId::from("created");
             note.title = input.title;
-            Ok(note)
+            Ok(NoteCreateResult {
+                note,
+                converted_count: 0,
+                created_task_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
+            })
         })
     }
 
@@ -3083,6 +3090,11 @@ async fn note_create_wraps_note_with_title() {
     .await
     .unwrap();
     assert_eq!(v["result"]["note"]["title"], serde_json::json!("Hi"));
+    // Additive conversion fields over the old `{note}` shape.
+    assert_eq!(v["result"]["convertedCount"], serde_json::json!(0));
+    assert_eq!(v["result"]["createdTaskNoteIds"], serde_json::json!([]));
+    assert_eq!(v["result"]["createdTasks"], serde_json::json!([]));
+    assert_eq!(v["result"]["warnings"], serde_json::json!([]));
 }
 
 #[tokio::test]

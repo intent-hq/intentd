@@ -701,11 +701,13 @@ async fn dispatch(
             // Transport (UDS + WSS) is the user-originated JSON-RPC path; no
             // caller-agent context is threaded here, so note-version author
             // resolves to the user. Agent writes come through MCP bindings.
-            let note = api
+            // Result is `{note, convertedCount, createdTaskNoteIds,
+            // createdTasks, warnings}` — additive over the old `{note}` shape.
+            let result = api
                 .create_note(ws, input, idempotency_key, None)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(json!({ "note": note }))
+            to_result_value(&result)
         }
         "note.update" => {
             let ws = require_ws_note(params)?;
