@@ -752,7 +752,9 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// the missed `pr:*` event is not replayed (the next sweep diffs against the
 /// already-persisted snapshot).
 ///
-/// Sweep-only by design: the on-demand `pr.refresh` RPC path
+/// Background-callers-only by design: besides the refresh sweep, the
+/// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`) wraps
+/// its refresh in the same budget. The on-demand `pr.refresh` RPC path
 /// ([`Services::refresh_workspace_pr`]) is caller-scoped — a hang there
 /// blocks only the calling RPC, which the client-level network timeouts
 /// already bound — so it is deliberately not wrapped in this timeout.
