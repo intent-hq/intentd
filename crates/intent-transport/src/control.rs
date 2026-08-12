@@ -76,11 +76,18 @@ pub struct SystemStatus {
     /// small fraction of it once agents are live. `None` alongside
     /// `child_processes`.
     pub child_memory_bytes: Option<u64>,
-    /// High-water mark of [`Self::child_memory_bytes`] since daemon start.
-    /// The instantaneous value is not enough on its own: quick-action and
-    /// model-probe adapters live for seconds, and by the time a debug bundle
-    /// is captured any overshoot has drained back to baseline. `None`
+    /// High-water mark of the daemon's descendant-tree memory since daemon
+    /// start. The instantaneous value is not enough on its own: quick-action
+    /// and model-probe adapters live for seconds, and by the time a debug
+    /// bundle is captured any overshoot has drained back to baseline. `None`
     /// alongside `child_processes`.
+    ///
+    /// Sampled more often than [`Self::child_memory_bytes`], so it can exceed
+    /// any value that field ever published: the tree is swept every 500 ms
+    /// while an ephemeral adapter chain is live, against the 5 s baseline the
+    /// published sample keeps (monorepo#2107). Bursts are short and steep
+    /// enough that the baseline alone missed them almost entirely — measured,
+    /// a 16-chain burst peaking at 6.97 GB reported 0.01 GB.
     pub child_memory_peak_bytes: Option<u64>,
 }
 

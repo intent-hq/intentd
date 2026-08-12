@@ -128,7 +128,7 @@ pub mod workspace_vocabulary;
 #[cfg(test)]
 mod tests;
 
-pub use acp_adapter::{adapter_slot_limit, init_adapter_slots};
+pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
