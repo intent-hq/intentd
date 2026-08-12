@@ -430,6 +430,28 @@ async fn seed_source(
     let dir = assets_root.join(&id.0);
     std::fs::create_dir_all(&dir).expect("assets dir");
     std::fs::write(dir.join("img.png"), b"asset-bytes").expect("asset");
+
+    // Two attachment-registry rows: one with its stored file present in the
+    // git-ignored `.intent/attachments/` store, one whose file was deleted
+    // out-of-band (deleted-is-deleted — the row transfers, no file rides).
+    let att_dir = repo.join(".intent/attachments");
+    std::fs::create_dir_all(&att_dir).expect("attachments dir");
+    std::fs::write(att_dir.join(".gitignore"), "*\n").expect("marker");
+    std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
+    for (att_id, name) in [("att-live", "doc.pdf"), ("att-gone", "gone.txt")] {
+        svc.store
+            .insert_attachment(&intent_store::AttachmentRecord {
+                id: att_id.to_string(),
+                workspace_id: id.clone(),
+                file_name: name.to_string(),
+                mime_type: None,
+                size: 16,
+                uploaded_at: t.clone(),
+                stored_path: format!(".intent/attachments/{name}"),
+            })
+            .await
+            .expect("attachment row");
+    }
     for i in 0..3 {
         svc.store
             .insert_event(&intent_store::NewEvent {
@@ -696,6 +718,26 @@ async fn transfer_round_trip_between_two_stacks() {
         std::fs::read(dst_assets_root.0.join(&id.0).join("img.png")).expect("asset"),
         b"asset-bytes"
     );
+
+    // Attachments: both registry rows landed; the live file materialized in
+    // the re-rooted checkout's git-ignored store (with the ignore-all
+    // marker), the deleted one imported as a row without a file.
+    let atts = target
+        .store
+        .list_attachments(&id)
+        .await
+        .expect("attachments");
+    assert_eq!(atts.len(), 2);
+    let att_dir = checkout.join(".intent/attachments");
+    assert_eq!(
+        std::fs::read(att_dir.join("doc.pdf")).expect("attachment file"),
+        b"attachment-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(att_dir.join(".gitignore")).expect("marker"),
+        "*\n"
+    );
+    assert!(!att_dir.join("gone.txt").exists(), "deleted-is-deleted");
 
     // ---- rehydration counts ---------------------------------------------------
     assert_eq!(committed["rehydrated"]["hooks"], 1);

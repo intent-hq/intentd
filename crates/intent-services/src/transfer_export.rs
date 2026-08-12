@@ -21,9 +21,12 @@
 //!
 //! Archive layout (agreed with [`crate::transfer_import`]): `manifest.json`
 //! (the [`TransferManifest`]), `rows/<table>.jsonl`
-//! ([`intent_store::TRANSFER_TABLES`] vocabulary), `assets/<assetId>`, and —
-//! when the workspace has a repository — `git/repo.bundle` + `git/refs.json`
-//! (the [`TransferRefsManifest`]).
+//! ([`intent_store::TRANSFER_TABLES`] vocabulary), `assets/<assetId>`,
+//! `attachments/<attachmentId>` (the registered attachment files that still
+//! exist in the canonical `.intent/attachments/` store — a registry row whose
+//! file was deleted rides the rows payload with NO file entry), and — when
+//! the workspace has a repository — `git/repo.bundle` + `git/refs.json` (the
+//! [`TransferRefsManifest`]).
 
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -334,6 +337,30 @@ impl Services {
             .await;
         let manifest = self.workspace_transfer_plan_op(id.clone()).await?.manifest;
         let rows = self.store.transfer_export_rows(&id).await?;
+        // Resolve the attachment files the manifest promises (`exists: true`)
+        // to their canonical on-disk paths for the archive writer. Rows whose
+        // file is already gone carry no entry — deleted-is-deleted transfers
+        // as a row without a file and must never fail the export.
+        let attachment_sources: Vec<(String, PathBuf)> = {
+            let root = crate::file_ops::workspace_root(&ws);
+            if root.is_empty() || manifest.attachments.iter().all(|a| !a.exists) {
+                Vec::new()
+            } else {
+                let records = self.store.list_attachments(&id).await?;
+                manifest
+                    .attachments
+                    .iter()
+                    .filter(|a| a.exists)
+                    .filter_map(|a| {
+                        let record = records.iter().find(|r| r.id == a.id)?;
+                        let path =
+                            crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
+                                .ok()?;
+                        Some((a.id.clone(), path))
+                    })
+                    .collect()
+            }
+        };
         if self.export_aborted(export_id) {
             return Ok(None);
         }
@@ -412,6 +439,7 @@ impl Services {
                 &manifest_for_zip,
                 &rows,
                 assets_dir.as_deref(),
+                &attachment_sources,
                 git_payload.as_ref().map(|(p, r)| (p.as_path(), r)),
             )
         })
@@ -722,15 +750,17 @@ fn transfer_event(
 }
 
 /// Write the transfer zip (`archive.zip` in the staging dir): manifest,
-/// `rows/<table>.jsonl`, `assets/<assetId>`, and the optional
-/// `git/repo.bundle` + `git/refs.json`. Returns the path, size, and SHA-256
-/// (hashed from the sealed file, the exact bytes `read` serves). Blocking
-/// (sync file I/O + zip deflation) — callers run it via `spawn_blocking`.
+/// `rows/<table>.jsonl`, `assets/<assetId>`, `attachments/<attachmentId>`,
+/// and the optional `git/repo.bundle` + `git/refs.json`. Returns the path,
+/// size, and SHA-256 (hashed from the sealed file, the exact bytes `read`
+/// serves). Blocking (sync file I/O + zip deflation) — callers run it via
+/// `spawn_blocking`.
 fn write_archive(
     staging_dir: &Path,
     manifest: &TransferManifest,
     rows: &[(String, Vec<serde_json::Value>)],
     assets_dir: Option<&Path>,
+    attachments: &[(String, PathBuf)],
     git: Option<(&Path, &crate::transfer_git::TransferRefsManifest)>,
 ) -> Result<(PathBuf, u64, String)> {
     let archive_path = staging_dir.join("archive.zip");
@@ -778,6 +808,34 @@ fn write_archive(
                 .map_err(|e| zerr("asset entry", e))?;
             zip.write_all(&bytes).map_err(|e| werr("asset write", e))?;
         }
+    }
+
+    // Attachments: unlike assets, a file that vanished between the manifest
+    // build and this write is SKIPPED, not an error — deletion is a
+    // first-class attachment state (the registry row still rides the rows
+    // payload, and the target reports `exists: false`).
+    for (attachment_id, source) in attachments {
+        let mut file = match std::fs::File::open(source) {
+            Ok(file) => file,
+            // Only a genuinely-gone file is the deleted state; any other
+            // open failure (permissions, I/O) must fail the export rather
+            // than silently shipping a live registry row without its file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    attachment = %attachment_id,
+                    "export: attachment file vanished since plan — exporting row without file"
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "read attachment {attachment_id} failed: {e}"
+                )))
+            }
+        };
+        zip.start_file(format!("attachments/{attachment_id}"), options)
+            .map_err(|e| zerr("attachment entry", e))?;
+        std::io::copy(&mut file, &mut zip).map_err(|e| werr("attachment write", e))?;
     }
 
     if let Some((bundle_path, refs)) = git {
@@ -896,10 +954,31 @@ mod tests {
     }
 
     /// Seed a repo-less workspace with a note, an in-flight agent session,
-    /// a queued message, and one asset file.
-    async fn seed_workspace(svc: &Services, assets_root: &Path, id: &WorkspaceId) {
-        let ws = crate::tests::workspace(id);
+    /// a queued message, one asset file, and two attachment-registry rows —
+    /// one whose stored file exists under the workspace's (non-git)
+    /// worktree dir, one whose file was deleted out-of-band.
+    async fn seed_workspace(svc: &Services, assets_root: &Path, ws_dir: &Path, id: &WorkspaceId) {
+        let mut ws = crate::tests::workspace(id);
+        std::fs::create_dir_all(ws_dir).expect("ws dir");
+        ws.worktree_path = Some(ws_dir.to_string_lossy().to_string());
         svc.store.insert_workspace(&ws).await.expect("workspace");
+        let att_dir = ws_dir.join(".intent/attachments");
+        std::fs::create_dir_all(&att_dir).expect("attachments dir");
+        std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
+        for (att_id, name) in [("att-live", "doc.pdf"), ("att-gone", "gone.txt")] {
+            svc.store
+                .insert_attachment(&intent_store::AttachmentRecord {
+                    id: att_id.to_string(),
+                    workspace_id: id.clone(),
+                    file_name: name.to_string(),
+                    mime_type: None,
+                    size: 16,
+                    uploaded_at: now_iso(),
+                    stored_path: format!(".intent/attachments/{name}"),
+                })
+                .await
+                .expect("attachment row");
+        }
         let agent = AgentId("agent-exp".to_string());
         svc.store
             .insert_agent_session(&session(&agent, id, AgentStatus::Active))
@@ -963,7 +1042,7 @@ mod tests {
         let assets_root = TempDir::new("export-assets-root");
         let svc = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-export".to_string());
-        seed_workspace(&svc, &assets_root.0, &id).await;
+        seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
         let started = svc
             .workspace_export_start_op(id.clone())
@@ -1028,8 +1107,20 @@ mod tests {
         assert!(names.contains(&"rows/note.jsonl".to_string()));
         assert!(names.contains(&"rows/agent_session.jsonl".to_string()));
         assert!(names.contains(&"rows/interrupted_agent.jsonl".to_string()));
+        assert!(names.contains(&"rows/attachments.jsonl".to_string()));
         assert!(names.contains(&"assets/img.png".to_string()));
+        // The existing attachment file rides as attachments/<id>; the
+        // deleted one transfers as a row only (deleted-is-deleted never
+        // fails the export).
+        assert!(names.contains(&"attachments/att-live".to_string()));
+        assert!(!names.contains(&"attachments/att-gone".to_string()));
         assert!(!names.iter().any(|n| n.starts_with("git/")));
+        let mut attachment_bytes = Vec::new();
+        zip.by_name("attachments/att-live")
+            .unwrap()
+            .read_to_end(&mut attachment_bytes)
+            .unwrap();
+        assert_eq!(attachment_bytes, b"attachment-bytes");
         let mut manifest_bytes = Vec::new();
         zip.by_name("manifest.json")
             .unwrap()
@@ -1039,6 +1130,17 @@ mod tests {
             serde_json::from_slice(&manifest_bytes).expect("manifest parses");
         assert_eq!(embedded.workspace_id, id);
         assert!(!embedded.git.has_repository);
+        assert_eq!(embedded.attachments.len(), 2);
+        let att = |aid: &str| {
+            embedded
+                .attachments
+                .iter()
+                .find(|a| a.id == aid)
+                .expect("attachment entry")
+        };
+        assert!(att("att-live").exists);
+        assert_eq!(att("att-live").size_bytes, 16);
+        assert!(!att("att-gone").exists);
 
         // The in-flight agent was captured as a pending interrupted row —
         // it rides the archive and covers the source on abort.
@@ -1085,7 +1187,7 @@ mod tests {
         let assets_root = TempDir::new("export-assets-root");
         let svc = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-guards".to_string());
-        seed_workspace(&svc, &assets_root.0, &id).await;
+        seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
         assert!(svc
             .workspace_export_start_op(WorkspaceId::chief())
@@ -1138,7 +1240,7 @@ mod tests {
         let assets_root = TempDir::new("export-assets-root");
         let svc = fresh_services(&ws_root.0, &assets_root.0).await;
         let id = WorkspaceId("ws-fin".to_string());
-        seed_workspace(&svc, &assets_root.0, &id).await;
+        seed_workspace(&svc, &assets_root.0, &ws_root.0.join("checkout"), &id).await;
 
         let started = svc
             .workspace_export_start_op(id.clone())
