@@ -4747,7 +4747,8 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     svc.mark_as_task(
         ws.clone(),
         note.id.clone(),
@@ -4811,7 +4812,8 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     svc.mark_as_task(
         ws.clone(),
         note.id.clone(),
@@ -4880,7 +4882,8 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     svc.mark_as_task(
         ws.clone(),
         note.id.clone(),
@@ -5020,7 +5023,8 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
             None,
         )
         .await
-        .expect("create foreign note");
+        .expect("create foreign note")
+        .note;
 
     let input = AgentDelegateInput {
         task_note_id: Some(foreign.id.clone()),
@@ -5081,7 +5085,8 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
             None,
         )
         .await
-        .expect("create foreign note");
+        .expect("create foreign note")
+        .note;
     svc.mark_as_task(
         ws_b.clone(),
         foreign.id.clone(),
@@ -10440,7 +10445,8 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         ..Default::default()
@@ -10481,7 +10487,8 @@ async fn delegate_appends_task_note_preamble_to_first_message() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         agent_instructions: Some("do the work".into()),
@@ -10557,7 +10564,8 @@ async fn delegate_omits_commit_instruction_when_skip_auto_commit_true() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         agent_instructions: Some("do the work".into()),
@@ -10609,7 +10617,8 @@ async fn delegate_omits_skip_auto_commit_instruction_when_false() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         agent_instructions: Some("do the work".into()),
@@ -10659,7 +10668,8 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         agent_instructions: Some("do the work".into()),
@@ -10737,7 +10747,8 @@ async fn delegate_task_note_only_injects_preamble_below_note_body() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         ..Default::default()
@@ -10832,7 +10843,8 @@ async fn delegate_names_child_from_task_note_title() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         task_note_id: Some(note.id.clone()),
         ..Default::default()
@@ -10870,7 +10882,8 @@ async fn delegate_names_child_from_task_text() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let input = AgentDelegateInput {
         note_id: Some(note.id.clone()),
         task_text: Some("Fix the flaky delegate test".into()),
@@ -16011,7 +16024,8 @@ async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     svc.mark_as_task(
         ws.clone(),
         note.id.clone(),
@@ -20355,7 +20369,8 @@ async fn link_task_note(
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
     WorkspaceApi::mark_as_task(
         svc,
         ws.clone(),

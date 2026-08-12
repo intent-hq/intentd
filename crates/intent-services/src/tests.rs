@@ -2723,9 +2723,10 @@ async fn note_add_falls_back_to_agent_id_when_session_missing() {
 // method that mutates a note's content invokes `convert_task_blocks` when the
 // resulting content contains a `@@@task` fence. `note.add` / `note.edit` /
 // `note.editLines` / `note.setContent` surface the conversion counts +
-// fence-free content in their result payloads; `note.create` / `note.update`
-// return the refetched `Note` (fence-free content, fresh rev/updated_at)
-// without count fields.
+// fence-free content in their result payloads; `note.create` carries the
+// same conversion fields alongside the refetched note; `note.update` returns
+// the refetched `Note` (fence-free content, fresh rev/updated_at) without
+// count fields.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2736,7 +2737,7 @@ async fn create_note_with_task_block_auto_converts() {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let svc = Services::new(store);
 
-    let created = svc
+    let result = svc
         .create_note(
             ws.clone(),
             NoteCreate {
@@ -2750,6 +2751,18 @@ async fn create_note_with_task_block_auto_converts() {
         )
         .await
         .expect("create");
+    // The result carries the conversion outcome (parity with the four
+    // content-write ops).
+    assert_eq!(result.converted_count, 1);
+    assert_eq!(result.created_task_note_ids.len(), 1);
+    assert_eq!(result.created_tasks.len(), 1);
+    assert_eq!(result.created_tasks[0].title, "Child One");
+    assert_eq!(
+        result.created_tasks[0].note_id,
+        result.created_task_note_ids[0]
+    );
+    assert!(result.warnings.is_empty(), "no warnings expected");
+    let created = result.note;
     assert!(!created.content.contains("@@@task"));
     assert!(created
         .content
@@ -5005,7 +5018,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(
@@ -5036,7 +5050,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("first create");
+            .expect("first create")
+            .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
 
@@ -5056,7 +5071,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("replay create");
+            .expect("replay create")
+            .note;
         assert_eq!(second.id.0, first.id.0, "replay returns the original note");
 
         // No second event is published (the replay short-circuits before mutate).
@@ -5079,12 +5095,14 @@ mod change_event_parity {
             .services
             .create_note(h.ws.clone(), mk(), None, None)
             .await
-            .expect("first create");
+            .expect("first create")
+            .note;
         let b = h
             .services
             .create_note(h.ws.clone(), mk(), None, None)
             .await
-            .expect("second create");
+            .expect("second create")
+            .note;
         assert_ne!(
             a.id.0, b.id.0,
             "missing key must not dedupe — both creates run"

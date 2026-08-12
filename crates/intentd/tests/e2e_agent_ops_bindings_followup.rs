@@ -158,7 +158,8 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark it as a task
     services
@@ -278,7 +279,8 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark it as a task
     services
@@ -372,7 +374,8 @@ async fn agent_delegate_creates_new_agent_for_task() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark as task
     services

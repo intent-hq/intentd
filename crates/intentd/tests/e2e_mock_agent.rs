@@ -117,7 +117,8 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let agent_val = services
         .agent_create(
             ws.clone(),

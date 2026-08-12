@@ -1240,6 +1240,24 @@ pub struct NoteEditLinesInput {
     pub content: String,
 }
 
+/// Result of `note.create` — the created (post-auto-convert) note plus the
+/// `@@@task` conversion outcome, matching the four content-write results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteCreateResult {
+    pub note: Note,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 /// Result of `note.add` — mirrors the TS `ws.note.add` peer return shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

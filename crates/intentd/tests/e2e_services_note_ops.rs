@@ -106,7 +106,8 @@ async fn note_add_edit_edit_lines() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let note_id = note.id.clone();
 
     // Test note.add
@@ -190,7 +191,8 @@ async fn note_list_tasks() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     // List tasks
     let tasks = services
@@ -226,7 +228,8 @@ async fn note_update_metadata() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     // Update metadata (title and tags)
     let update_result = services

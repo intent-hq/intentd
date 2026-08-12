@@ -907,7 +907,8 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
     services
         .mark_as_task(
             ws.clone(),
@@ -1499,7 +1500,8 @@ async fn note_bindings_edit_and_edit_lines() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let agent_val = services
         .agent_create(
