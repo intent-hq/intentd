@@ -8338,7 +8338,7 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
 /// or the deterministic chat-stream 400 prompt rejection
 /// ([`is_deterministic_prompt_rejection`]). Single predicate shared by
 /// [`Services::session_poisoned`] and the `sessionCorrupted` event flag in
-/// `persist_error_and_requeue` so the two surfaces cannot drift.
+/// `persist_terminal_error_status` so the two surfaces cannot drift.
 pub(crate) fn is_session_fatal_error(error_text: &str) -> bool {
     is_session_fatal_stop_reason(error_text) || is_deterministic_prompt_rejection(error_text)
 }

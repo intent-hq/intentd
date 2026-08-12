@@ -2992,6 +2992,103 @@ async fn terminal_failure_events_carry_turn_id() {
     }
 }
 
+/// Durable-before-observable (monorepo#2009): the terminal-failure handlers
+/// complete the `status = error` + `stop_reason` store write BEFORE the
+/// terminal `agent:failed`/`agent:stream:end` pair is published, so a client
+/// that reads `agent.getSession` upon observing either event is guaranteed
+/// the persisted Error. Runs the spawn handler on its own task and reads the
+/// store the moment `agent:failed` arrives — with the write ordered after the
+/// publish this read races the persist (the pre-#2009 flake in
+/// `pi_spawn_fails_fast_on_old_cli_over_wss`); with the write ordered first
+/// the read deterministically sees `error`. Also pins the unchanged wire
+/// order: agent:failed → agent:stream:end → agent:status-changed →
+/// agent:queue:updated.
+#[tokio::test]
+async fn terminal_failure_persists_error_before_publishing_events() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-dbo"), AgentId::from("a-dbo"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mgr = Arc::new(mgr);
+    let handler = {
+        let (mgr, ws, id) = (mgr.clone(), ws.clone(), id.clone());
+        tokio::spawn(async move {
+            let options = super::TurnOptions::default();
+            super::handle_terminal_spawn_failure(
+                &mgr,
+                &id,
+                &ws,
+                "retry me",
+                &options,
+                true,
+                &Error::Internal("boom".to_string()),
+            )
+            .await;
+        })
+    };
+
+    // Read the store the moment agent:failed lands on the bus: the persisted
+    // Error must already be visible.
+    let mut events = Vec::new();
+    'observed: loop {
+        let batch = timeout(Duration::from_secs(10), sub.recv())
+            .await
+            .expect("agent:failed within 10s")
+            .expect("bus open");
+        for event in batch {
+            let failed = event.event_type == "agent:failed";
+            events.push(event);
+            if failed {
+                break 'observed;
+            }
+        }
+    }
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "status is durably error when agent:failed is observable (monorepo#2009)"
+    );
+    assert!(
+        stored
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("boom")),
+        "stop_reason persisted alongside the status: {:?}",
+        stored.stop_reason
+    );
+    handler.await.unwrap();
+
+    // Wire order is unchanged by the persist reorder.
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let order: Vec<&str> = events
+        .iter()
+        .map(|e| e.event_type.as_str())
+        .filter(|t| {
+            matches!(
+                *t,
+                "agent:failed"
+                    | "agent:stream:end"
+                    | "agent:status-changed"
+                    | "agent:queue:updated"
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "agent:failed",
+            "agent:stream:end",
+            "agent:status-changed",
+            "agent:queue:updated"
+        ],
+        "terminal wire order unchanged"
+    );
+}
+
 /// Wire surface (monorepo#1022): the drain loop's `agent:queue:processing`
 /// names the entry being flipped to in-flight, including its `turnId` — the
 /// drain-start signal that covers `persisted: true` redrives which skip the
