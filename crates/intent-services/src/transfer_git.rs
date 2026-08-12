@@ -574,9 +574,12 @@ fn parse_index_tree_trailer(message: &str) -> Option<git2::Oid> {
 
 /// Whether a repository has uncommitted changes (staged, unstaged, or
 /// untracked). Local copy of the `sandbox_ops` helper — this module stays
-/// self-contained. Untracked nested repos/worktrees do not count: they are
-/// skipped by [`snapshot_wip`], so a repo whose only anomaly is a nested repo
-/// must not produce an empty WIP commit.
+/// self-contained. Exclusively-untracked nested repos/worktrees do not count:
+/// they are skipped by [`snapshot_wip`], so a repo whose only anomaly is a
+/// nested repo must not produce an empty WIP commit. The check requires the
+/// status to be *exactly* `WT_NEW` — an entry that also carries index bits
+/// (e.g. a tracked submodule staged for removal while its checkout remains on
+/// disk, `INDEX_DELETED | WT_NEW`) is real dirt whose staged side must travel.
 fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
@@ -587,26 +590,34 @@ fn is_dirty(repo: &git2::Repository) -> Result<bool> {
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
     let workdir = repo.workdir();
     Ok(statuses.iter().any(|e| {
-        !(e.status().contains(git2::Status::WT_NEW)
+        let ignorable_nested = e.status() == git2::Status::WT_NEW
             && matches!(
                 (workdir, e.path().ok()),
                 (Some(wd), Some(p)) if is_nested_repo_path(wd, p)
-            ))
+            );
+        !ignorable_nested
     }))
 }
 
 /// Whether `rel` (a status/diff path, possibly with a trailing `/`) names a
 /// directory that is itself a git repository or worktree checkout — i.e. it
 /// contains a `.git` entry (a directory for a full repo, a file for a linked
-/// worktree). Mirrors `git add`'s embedded-repo detection.
+/// worktree). Mirrors `git add`'s embedded-repo detection. Uses
+/// `symlink_metadata` so an untracked symlink pointing at a repo directory is
+/// not misclassified — git stages such a link as a symlink blob.
 fn is_nested_repo_path(workdir: &Path, rel: &str) -> bool {
     let full = workdir.join(rel.trim_end_matches('/'));
-    full.is_dir() && full.join(".git").exists()
+    std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) && full.join(".git").exists()
 }
 
 /// Untracked directories inside the repo that are themselves git
 /// repositories/worktrees, as sorted workdir-relative paths (no trailing
-/// slash). These are what [`snapshot_wip`] skips when staging.
+/// slash). These are what [`snapshot_wip`] skips when staging. Deliberately
+/// broader than [`is_dirty`]'s exclusion (`contains` vs exact `WT_NEW`): a
+/// tracked submodule staged for removal with its checkout still on disk
+/// (`INDEX_DELETED | WT_NEW`) must ALSO be skipped by add_all — re-adding it
+/// would fail or undo the staged deletion — while still counting as dirt so
+/// the WIP commit captures the removal.
 fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<String>> {
     let Some(workdir) = repo.workdir() else {
         return Ok(Vec::new());
@@ -1294,6 +1305,103 @@ mod tests {
             fs::read_to_string(repo.join(".roundtrip-wt/README.md")).unwrap(),
             "hello\n"
         );
+    }
+
+    /// A tracked submodule staged for removal while its checkout remains on
+    /// disk (`INDEX_DELETED` + `WT_NEW`) is real dirt: the staged deletion
+    /// must travel in the WIP commit, while add_all still skips re-adding the
+    /// on-disk checkout (which would fail or undo the removal).
+    #[test]
+    fn staged_submodule_removal_still_counts_as_dirty() {
+        let (_dir, repo) = temp_repo("sub-rm");
+        make_nested_repo(&repo, "vendor");
+        // Record the nested repo as a gitlink, commit, then stage its removal
+        // leaving the checkout on disk.
+        run_git(&repo, |cmd| {
+            cmd.args(["add", "vendor"]);
+        })
+        .unwrap();
+        run_git(&repo, |cmd| {
+            cmd.args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "add gitlink",
+            ]);
+        })
+        .unwrap();
+        run_git(&repo, |cmd| {
+            cmd.args(["rm", "--cached", "vendor"]);
+        })
+        .unwrap();
+
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds")
+            .expect("staged submodule removal is dirt, not an ignorable nested repo");
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(
+                tree.get_name("vendor").is_none(),
+                "WIP tree captures the staged removal"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(status_fingerprint(&repo), before);
+        assert!(
+            repo.join("vendor/.git").is_dir(),
+            "checkout untouched on disk"
+        );
+    }
+
+    /// An untracked symlink pointing at a directory that contains `.git` is
+    /// NOT a nested repo — git stages it as a symlink blob — so it must count
+    /// as dirt and travel in the WIP commit.
+    #[cfg(unix)]
+    #[test]
+    fn untracked_symlink_to_repo_dir_is_dirt_not_nested_repo() {
+        let (dir, repo) = temp_repo("symlink");
+        // Target repo lives OUTSIDE the workdir; only the symlink is inside.
+        let target = make_nested_repo(dir.path(), "target-repo");
+        std::os::unix::fs::symlink(&target, repo.join("link")).unwrap();
+
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds")
+            .expect("untracked symlink is dirt");
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            let entry = tree.get_name("link").expect("symlink travels in WIP");
+            assert_eq!(
+                entry.filemode(),
+                i32::from(git2::FileMode::Link),
+                "staged as a symlink blob, not a gitlink"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(status_fingerprint(&repo), before);
+        assert!(repo.join("link").exists(), "symlink intact on disk");
     }
 
     #[test]
