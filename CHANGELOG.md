@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.10] - 2026-08-12
+
+### 🐛 Bug Fixes
+
+- Drop fork-only deflate feature request so cargo package resolves against crates.io ([#1155](https://github.com/intent-hq/intentd/pull/1155))
+- *(chat)* Heal a snapshot-missed turn at stream:end ([#1154](https://github.com/intent-hq/intentd/pull/1154))
+
+### 📚 Documentation
+
+- *(config)* Describe the agent memory knobs in the config template ([#1152](https://github.com/intent-hq/intentd/pull/1152))
+
 ## [0.6.9] - 2026-08-12
 
 ### 🐛 Bug Fixes
