@@ -240,7 +240,12 @@ pub(crate) fn place_attachment(
                     src.display()
                 )));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `NotADirectory`: an intermediate path component is a file
+            // (e.g. `/tmp/file/child`) — client-invalid, same as NotFound.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
+            {
                 return Err(Error::InvalidParams(format!(
                     "sourcePath does not exist: {}",
                     src.display()
@@ -302,11 +307,18 @@ pub(crate) fn place_attachment(
         AttachmentSource::CopyFrom(src) => std::fs::copy(src, &full).map_err(|e| {
             let _ = std::fs::remove_file(&full);
             match e.kind() {
-                std::io::ErrorKind::NotFound => {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
                     Error::InvalidParams(format!("sourcePath does not exist: {}", src.display()))
                 }
                 std::io::ErrorKind::PermissionDenied => Error::InvalidParams(format!(
-                    "sourcePath is not readable (permission denied): {}",
+                    "sourcePath is not readable by the daemon (permission denied): {}",
+                    src.display()
+                )),
+                // `fs::copy` reports a non-regular-file source (e.g. the
+                // path swapped to a directory between stat and copy) as
+                // InvalidInput.
+                std::io::ErrorKind::InvalidInput => Error::InvalidParams(format!(
+                    "sourcePath is not a regular file: {}",
                     src.display()
                 )),
                 _ => Error::Internal(format!("failed to copy sourcePath {}: {e}", src.display())),
@@ -1007,6 +1019,25 @@ mod tests {
         assert!(!std::path::Path::new(&root)
             .join(".intent/attachments/some-folder")
             .exists());
+    }
+
+    /// An intermediate path component that is a file (e.g. `/tmp/file/child`)
+    /// stats as `NotADirectory` — classified as the same client-invalid
+    /// "does not exist" as a plain missing path, never `-32603 Internal`.
+    #[test]
+    fn place_attachment_copy_from_file_intermediate_component_is_classified() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let file = std::path::Path::new(&root).join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let bogus = file.join("child.txt");
+        let err = place_attachment(&root, "child.txt", AttachmentSource::CopyFrom(&bogus));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
     }
 
     /// A symlink to a regular file is accepted: `fs::metadata` follows links,
