@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9] - 2026-08-12
+
+### 🐛 Bug Fixes
+
+- *(chat)* Keep the live-turn slot published across the interrupt abort→flush gap ([#1150](https://github.com/intent-hq/intentd/pull/1150))
+- Add version requirement to tokio-tungstenite git dep for release-plz packaging ([#1151](https://github.com/intent-hq/intentd/pull/1151))
+
 ## [0.6.8] - 2026-08-12
 
 ### 🚀 Features
