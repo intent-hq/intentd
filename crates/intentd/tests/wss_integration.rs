@@ -3954,6 +3954,163 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    // The daemon-wide ephemeral-adapter bound over the real wire (§5.32,
+    // monorepo#2062). With the bound saturated by parked adapters, a call
+    // whose own `timeoutMs` expires while queued comes back as -32603 with
+    // OBJECT-shaped `error.data` — `{ code: "adapter-busy", provider,
+    // waitedMs, limit }` — which is what distinguishes queueing pressure from
+    // every other completeOnce failure on this method, all of which carry a
+    // bare STRING `data` (see the adapter-failure test above). The parked
+    // callers then finish normally: the bound queues work, it does not shed
+    // it.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping adapter-busy e2e: node not on PATH");
+        return;
+    }
+    // Adapters that hold their slot for ~10s before answering the turn, so the
+    // bound is saturated for a wide, non-racy window. The wrapper records one
+    // line per adapter actually launched: the assertions below count it rather
+    // than inferring from the response which branch ran, so a queue timeout
+    // that quietly spawned (or a `-32603` arriving from some unrelated
+    // failure) cannot pass as a bound that held.
+    use std::os::unix::fs::PermissionsExt;
+    let adapter_dir = test_tempdir("intentd-wss-acp-busy-");
+    let spawn_log = adapter_dir.path().join("spawns.log");
+    let bin = adapter_dir.path().join("codex-acp");
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho $$ >> {log:?}\n\
+             MOCK_AGENT_BEHAVIOR='{{\"firstTurnDelayMs\":10000,\"response\":\"🤖\\nparked-reply\"}}' \
+             exec node {fixture:?} \"$@\"\n",
+            log = spawn_log.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawned_count = || -> usize {
+        std::fs::read_to_string(&spawn_log)
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    };
+    let spawned = |what: &str| -> usize {
+        let n = spawned_count();
+        eprintln!("adapter-busy e2e: {what}: {n} adapter(s) launched");
+        n
+    };
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": bin.to_string_lossy() }),
+    );
+
+    // The bound is a process-global installed once; ask for 1 and fill
+    // whatever is actually in force, so this holds under any test runner.
+    intent_services::init_adapter_slots(1);
+    let limit = intent_services::adapter_slot_limit() as usize;
+
+    let parked: Vec<_> = (0..limit)
+        .map(|i| {
+            let (port, cfg) = (srv.port, srv.cfg.clone());
+            tokio::spawn(async move {
+                wss_call(
+                    port,
+                    cfg,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"method":"agent.completeOnce","params":{{"prompt":"park","timeoutMs":30000}}}}"#,
+                        600 + i
+                    ),
+                )
+                .await
+            })
+        })
+        .collect();
+    // Wait for the bound to be OBSERVABLY saturated rather than sleeping a
+    // guessed interval: provider discovery before the spawn takes seconds on
+    // some hosts, and a fixed sleep would probe the queue before the parked
+    // calls hold their slots — the probe would then measure nothing and the
+    // test would pass or fail on timing luck.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while spawned_count() < limit && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if spawned("bound saturated") != limit {
+        // Name the actual failure instead of just "0 != 1": a parked call that
+        // never launched an adapter has an answer (a gate/unavailable result,
+        // or an error), and that answer is the diagnosis.
+        let mut outcomes = Vec::new();
+        for run in parked {
+            outcomes.push(
+                match tokio::time::timeout(std::time::Duration::from_secs(5), run).await {
+                    Ok(Ok(v)) => v.to_string(),
+                    Ok(Err(e)) => format!("<join error: {e}>"),
+                    Err(_) => "<still in flight>".to_string(),
+                },
+            );
+        }
+        panic!(
+            "the parked calls launched {} of {limit} adapters, so the queue was \
+             never saturated and the probe below would measure nothing; parked \
+             call outcomes: {outcomes:?}",
+            spawned_count()
+        );
+    }
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":50,"method":"agent.completeOnce","params":{"prompt":"slug","timeoutMs":500}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 50);
+    assert_eq!(
+        resp["error"]["code"], -32603,
+        "a queue timeout is an error, not a result: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["code"], "adapter-busy",
+        "machine-readable discriminator so clients never match on prose: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["provider"], "codex");
+    assert_eq!(resp["error"]["data"]["limit"], limit as u64);
+    assert!(
+        resp["error"]["data"]["waitedMs"].as_u64().unwrap_or(0) >= 400,
+        "the caller waited out its own budget before giving up: {resp}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("codex"),
+        "human message names the provider: {resp}"
+    );
+    // The point of the bound: the rejected call spawned NOTHING, which is also
+    // why retrying it is safe.
+    assert_eq!(
+        spawned("after the adapter-busy rejection"),
+        limit,
+        "a queue-timed-out call must not have launched an adapter: {resp}"
+    );
+
+    // Everything that held a slot still completes — queued, not shed.
+    for (i, run) in parked.into_iter().enumerate() {
+        let r = run.await.expect("parked call joins");
+        assert_eq!(
+            r["result"]["text"], "parked-reply",
+            "parked one-shot #{i} must complete normally: {r}"
+        );
+    }
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn wss_agent_complete_once_unavailable_when_adapter_unresolvable() {
     // The resolution tier of the gate: a one-shot-capable provider whose
     // adapter resolves to nothing (no binary, no npx for the pinned fallback

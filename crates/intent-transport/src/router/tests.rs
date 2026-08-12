@@ -2286,6 +2286,36 @@ fn voice_not_configured_maps_to_structured_error_data() {
     );
 }
 
+#[test]
+fn adapter_busy_maps_to_structured_error_data() {
+    // An `agent.completeOnce` that queued past its own timeout at the
+    // daemon-wide ephemeral-adapter bound (PROTOCOL §5.32, monorepo#2062)
+    // keeps -32603 but carries `error.data = { code: "adapter-busy",
+    // provider, waitedMs, limit }`, so a client tells daemon saturation apart
+    // from a slow model — and from every other one-shot failure, which stay
+    // bare `Internal` — without matching on prose.
+    let rpc = super::domain_to_rpc(intent_core::Error::AdapterBusy {
+        provider: "claude-code".to_string(),
+        waited_ms: 30_000,
+        limit: 6,
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "adapter-busy",
+            "provider": "claude-code",
+            "waitedMs": 30_000,
+            "limit": 6,
+        })
+    );
+    assert!(
+        rpc.message.contains("claude-code") && rpc.message.contains("30000ms"),
+        "human message names the provider and the wait: {}",
+        rpc.message
+    );
+}
+
 #[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the

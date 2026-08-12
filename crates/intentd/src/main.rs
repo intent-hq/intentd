@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    agent_memory_budget_bytes, default_process_cap, max_concurrent_agents,
-    recommended_memory_budget_bytes, AgentManager, BusEventSink, EventBus, GitStatusRefresher,
-    PermissionPolicy, Services, TreeMemoryProbe, WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, max_concurrent_adapters,
+    max_concurrent_agents, recommended_memory_budget_bytes, AgentManager, BusEventSink, EventBus,
+    GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -986,6 +986,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
     let process_cap =
         max_concurrent_agents(&boot_settings.effective).unwrap_or_else(default_process_cap);
+    // Install the daemon-wide ephemeral-adapter bound before anything can
+    // spawn one. One-shot completions and model probes hold no agent slot, so
+    // this — not `process_cap` — is what stops a quick-action fan-out from
+    // running the host out of memory (monorepo#2062). Applies on restart, like
+    // `agents.maxConcurrent`.
+    let adapter_cap = max_concurrent_adapters(&boot_settings.effective);
+    if !init_adapter_slots(adapter_cap) {
+        tracing::warn!(
+            limit = adapter_cap,
+            "ephemeral adapter bound was already installed; keeping the existing one"
+        );
+    }
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
