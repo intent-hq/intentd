@@ -301,6 +301,7 @@ async fn interrupted_agents_persisted_across_restart() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             messages: vec![],

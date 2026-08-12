@@ -97,10 +97,19 @@
 //! `workspace:transfer:progress` / `:ready` / `:failed` events, §6.5),
 //! chunked idempotent download, and a finalize that applies the
 //! post-transfer source state (status message + optional archive) — 286
-//! router methods, 325 total.
+//! router methods, 325 total. Version 6.12 adds the attachment registry
+//! (additive; §5.9): `file.placeAttachment` records each placed file under a
+//! daemon-minted UUID and additively returns `{ attachmentId, mimeType?,
+//! uploadedAt }`, the new `file.getAttachmentInfo` router method serves the
+//! registry row (`{ attachmentId, fileName, mimeType?, size, uploadedAt,
+//! path, exists }`), file blocks gain the attachment-reference variant
+//! (`{ type: "file", attachmentId, fileName, mimeType?, size? }` — exactly
+//! one of `data` / `attachmentId`, §5.5), and the MCP `ws.file.getAttachment`
+//! binding copies a registered attachment into the calling agent's working
+//! directory (§6.8) — 287 router methods, 326 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.11";
+pub const PROTOCOL_VERSION: &str = "6.12";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

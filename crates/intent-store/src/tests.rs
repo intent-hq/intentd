@@ -98,7 +98,8 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+            91, 92
         ]
     );
     assert_eq!(
@@ -107,7 +108,8 @@ async fn migration_status_reports_current_after_open() {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+            91, 92
         ]
     );
 }
@@ -3232,6 +3234,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         stop_reason: None,
@@ -3856,6 +3859,46 @@ async fn agent_message_metadata_round_trip() {
     assert!(session.messages[1].metadata.is_none());
 }
 
+/// Attachment-registry rows round-trip (insert → get), an unknown id is
+/// `NotFound`, and the optional `mime_type` persists as NULL when absent
+/// (PROTOCOL §5.9).
+#[tokio::test]
+async fn attachment_registry_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+
+    let record = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000001".to_string(),
+        workspace_id: ws.clone(),
+        file_name: "report.pdf".to_string(),
+        mime_type: Some("application/pdf".to_string()),
+        size: 12345,
+        uploaded_at: "2026-08-12T00:00:00Z".to_string(),
+        stored_path: ".intent/attachments/report.pdf".to_string(),
+    };
+    store.insert_attachment(&record).await.expect("insert");
+    let loaded = store.get_attachment(&record.id).await.expect("get");
+    assert_eq!(loaded, record);
+
+    // Absent mime_type stays None.
+    let no_mime = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000002".to_string(),
+        mime_type: None,
+        ..record.clone()
+    };
+    store.insert_attachment(&no_mime).await.expect("insert 2");
+    let loaded2 = store.get_attachment(&no_mime.id).await.expect("get 2");
+    assert_eq!(loaded2.mime_type, None);
+
+    // Unknown id → NotFound.
+    let missing = store.get_attachment("no-such-id").await;
+    assert!(
+        matches!(missing, Err(intent_core::Error::NotFound(_))),
+        "{missing:?}"
+    );
+}
+
 /// The P3-1.2b persistence-gap fields round-trip through insert → get →
 /// update → get: `completion_report(_timestamp)`, `delegation_depth`,
 /// `initial_message`, the JSON `context_references` / `image_blocks`, and
@@ -3876,6 +3919,8 @@ async fn agent_session_gap_fields_round_trip() {
     session.initial_message = Some("kick off".to_string());
     session.context_references = Some(json!([{ "type": "file", "path": "src/a.rs" }]));
     session.image_blocks = Some(json!([{ "type": "image", "data": "abc" }]));
+    session.file_blocks =
+        Some(json!([{ "type": "file", "attachmentId": "att-1", "fileName": "r.pdf" }]));
     session.is_background = true;
     store
         .insert_agent_session(&session)
@@ -3893,6 +3938,10 @@ async fn agent_session_gap_fields_round_trip() {
     assert_eq!(
         loaded.image_blocks,
         Some(json!([{ "type": "image", "data": "abc" }]))
+    );
+    assert_eq!(
+        loaded.file_blocks,
+        Some(json!([{ "type": "file", "attachmentId": "att-1", "fileName": "r.pdf" }]))
     );
     assert_eq!(loaded.completion_report, None);
 

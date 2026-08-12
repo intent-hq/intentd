@@ -6397,15 +6397,41 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
-/// Push one `resource` content block per well-formed
-/// `{ data, mimeType, fileName }` entry.
+/// Push one content block per well-formed file entry: inline
+/// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
+/// the blob; attachment-reference `{ attachmentId, fileName }` entries
+/// (PROTOCOL §5.5) become a `text` attachment notice naming the metadata and
+/// directing the model to `ws.file.getAttachment(attachmentId)` — the file
+/// bytes never ride the prompt for reference blocks.
 fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>) {
     if let Some(files) = file_blocks.and_then(Value::as_array) {
         for file in files {
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+            let attachment_id = file
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if let (Some(id), Some(name)) = (attachment_id, name) {
+                let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
+                let size_note = file
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .map(|s| format!(", {s} bytes"))
+                    .unwrap_or_default();
+                let text = format!(
+                    "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
+                     file is NOT inlined in this message. Call \
+                     ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
+                     then read it from the returned path.]"
+                );
+                if let Ok(block) =
+                    serde_json::from_value::<ContentBlock>(json!({ "type": "text", "text": text }))
+                {
+                    blocks.push(block);
+                }
+            } else if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
                     "type": "resource",
                     "resource": {
@@ -8774,6 +8800,7 @@ mod role_reminder_tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -10659,6 +10686,7 @@ mod agent_retry_tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),

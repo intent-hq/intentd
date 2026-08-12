@@ -14,6 +14,7 @@ pub use intent_core::{Error, Result};
 
 mod agent_queue_repo;
 mod agent_repo;
+mod attachment_repo;
 mod client_repo;
 mod comment_repo;
 mod completion_watch_repo;
@@ -49,6 +50,7 @@ pub use agent_repo::{
     AgentUsageRow, InterruptedAgent, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
     PROJECTION_TEXT_BLOCK_CAP,
 };
+pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};

@@ -22,7 +22,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
+    file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
@@ -32,8 +32,8 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, \
-    sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
+    initial_message, context_references, image_blocks, file_blocks, is_background, metadata, sandbox_id, \
+    sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -358,7 +358,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 35-column `agent_session` insert value list onto `query`, in
+/// Bind the full 36-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
@@ -393,6 +393,7 @@ fn bind_session_insert<'q>(
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
+        .bind(json_col_to_db(&s.file_blocks)?)
         .bind(s.is_background as i64)
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -416,7 +417,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
@@ -475,7 +476,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s)?
                 .execute(&mut *tx)
@@ -1102,9 +1103,9 @@ impl Store {
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
-             initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=?, \
-             stop_reason_timestamp=?, reasoning_effort=? \
+             initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
+             is_background=?, metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
+             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -1127,6 +1128,7 @@ impl Store {
         .bind(&s.initial_message)
         .bind(json_col_to_db(&s.context_references)?)
         .bind(json_col_to_db(&s.image_blocks)?)
+        .bind(json_col_to_db(&s.file_blocks)?)
         .bind(s.is_background as i64)
         .bind(encode_metadata(s.metadata.as_ref())?)
         .bind(&s.sandbox_id)
@@ -1887,6 +1889,7 @@ fn map_session_row_with_system_prompt(
             "context_references",
         )?,
         image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        file_blocks: json_col_from_db(col(row, "file_blocks")?, "file_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
         stop_reason: col(row, "stop_reason")?,
@@ -2850,6 +2853,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             sandbox_id: None,
@@ -2966,6 +2970,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             sandbox_id: None,
@@ -3123,6 +3128,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             sandbox_id: None,
@@ -4592,6 +4598,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             sandbox_id: None,
@@ -4751,6 +4758,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             sandbox_id: None,
@@ -5037,6 +5045,7 @@ mod tests {
                 initial_message: None,
                 context_references: None,
                 image_blocks: None,
+                file_blocks: None,
                 is_background: false,
                 metadata: None,
                 sandbox_id: None,

@@ -7771,6 +7771,7 @@ mod wsapi4_bindings_tests {
             last_message_id: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
