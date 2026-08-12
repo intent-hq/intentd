@@ -1218,7 +1218,10 @@ maxConcurrent = 0
 # the configured value as the transient. The overshoot is a fixed offset, not
 # proportional to demand -- at 1500 MB a 20-agent burst peaked the same as an
 # 8-agent one (3.06 vs 3.09 GB) where the same 20-agent burst unbounded
-# reached 12.37 GB.
+# reached 12.37 GB. That 2x rule sizes the admission transient for a burst of
+# comparable agents; the gate runs at spawn only, so an already-admitted agent
+# whose own workload grows (a test suite) is never re-checked and can carry
+# the tree past the budget by itself.
 memoryBudgetMb = 0
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
@@ -1237,9 +1240,11 @@ maxConcurrentAdapters = 6
 # Measured at the default: 40 procs / 5.85 GB flat across 10 minutes of full
 # idle, zero exits; the same tree at a 2-minute TTL drained to 0 in 122 s.
 # Lowering it trades a warm process on the next use for memory reclaimed
-# sooner. Reaping never interrupts a running turn, and a reaped tree is
-# released within the TTL plus one sweep (sweep interval is ttl/4, clamped to
-# 30-300 s).
+# sooner. Only agents idle past the TTL are candidates, and the sweep skips
+# any agent reported busy when it checks. An agent is selected within the TTL
+# plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the memory
+# comes back as each kill completes, so a large idle set drains over a tail
+# rather than all at once.
 idleReapMinutes = 30
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
