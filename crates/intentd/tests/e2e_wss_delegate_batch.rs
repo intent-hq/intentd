@@ -289,8 +289,9 @@ fn row_for<'a>(resp: &'a Value, id: &str) -> &'a Value {
 }
 
 /// The full batch request/response shape over the wire: start + hold + skip
-/// dispositions, unlock plan, idempotent re-call, greedy override, and the
-/// mixed-addressing rejection.
+/// dispositions, unlock plan (including the mixed-estimate shadowing shape
+/// for `criticalPathMinutes`, monorepo#2128), idempotent re-call, greedy
+/// override, and the mixed-addressing rejection.
 #[tokio::test]
 async fn batch_delegate_request_response_shape_over_wss() {
     let Some(script) = gate() else {
@@ -468,5 +469,39 @@ async fn batch_delegate_request_response_shape_over_wss() {
             .unwrap()
             .contains("mutually exclusive"),
         "{err}"
+    );
+
+    // Mixed-estimate shadowing (monorepo#2128): an estimated chain
+    // s1(10) → s2(15) → s3(5) = 30 min alongside a longer pure-defaults
+    // chain u1 → u2 = 60 min. The unestimated chain must not suppress the
+    // number — the plan reports the estimated chain's 30.
+    let s1 = seed_task(&mut ws, 70, &ws_id, "S1", &[], &[], Some("10 min")).await;
+    let s2 = seed_task(&mut ws, 72, &ws_id, "S2", &[&s1], &[], Some("15 min")).await;
+    let _s3 = seed_task(&mut ws, 74, &ws_id, "S3", &[&s2], &[], Some("5 min")).await;
+    let u1 = seed_task(&mut ws, 76, &ws_id, "U1", &[], &[], None).await;
+    let _u2 = seed_task(&mut ws, 78, &ws_id, "U2", &[&u1], &[], None).await;
+    let shadowed = wss_rpc(
+        &mut ws,
+        90,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "tasks": [s1, u1],
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert_eq!(shadowed["ok"], json!(true), "{shadowed}");
+    assert_eq!(
+        shadowed["unlockPlan"]["criticalPathMinutes"],
+        json!(30),
+        "estimated chain reported despite longer defaults chain: {shadowed}"
+    );
+    assert!(
+        shadowed["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("~30 min of serial work remains on the critical path"),
+        "{shadowed}"
     );
 }
