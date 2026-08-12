@@ -1266,18 +1266,22 @@ impl Services {
     /// pinned slot survives the [`LiveTurnGuard`] drop, so it is still there to
     /// read.
     ///
-    /// `None` means there was no slot to flush: either nothing was pinned (no
-    /// turn in flight) or the worker completed the turn in the abort gap and
-    /// cleared the slot itself, having persisted the full row. Callers that
-    /// distinguish those two use [`pin_live_turn`](Self::pin_live_turn)'s
-    /// return value.
+    /// `None` means nothing was pinned — no turn in flight. A pinned slot
+    /// cannot vanish before this flush ([`LiveTurnGuard::drop`] and the normal
+    /// turn-end clear both leave it to the flush that owns it), and the
+    /// `flush_pending` filter below keeps this flush off a slot it does NOT
+    /// own: the next turn's [`begin_live_turn`](Self::begin_live_turn) landing
+    /// in the pin→flush window replaces the slot wholesale (unpinned), and
+    /// persisting THAT content here would record a live turn as interrupted
+    /// under its freshly minted id — poisoning the id the worker's own append
+    /// still needs.
     pub(crate) async fn flush_pinned_turn_on_interruption(
         &self,
         agent_id: &AgentId,
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
     ) -> Option<FlushedTurn> {
-        let live = self.live_turn(agent_id)?;
+        let live = self.live_turn(agent_id).filter(|live| live.flush_pending)?;
         // Derived before the flush consumes the blocks; `text_block_strings`
         // copies only the text, leaving mid-turn tool payloads uncloned.
         let had_output = !live.blocks.is_empty();

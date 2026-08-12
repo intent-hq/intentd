@@ -462,6 +462,89 @@ fn connect_with_prompt_result(
     (conn, note_rx, agent)
 }
 
+/// [`connect_with`] whose mock HOLDS the `session/prompt` response until the
+/// caller fires the returned release sender — freezing the turn mid-flight so
+/// a test can act in the window where the live-turn slot is open (e.g. pin it
+/// the way the teardown paths do) before the real turn end runs.
+fn connect_gated_prompt(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_gated_mock_agent(c2a_agent, a2c_agent, updates, release_rx);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, release_tx)
+}
+
+/// Mock agent for [`connect_gated_prompt`]: streams `updates` on
+/// `session/prompt`, then awaits the release signal before answering
+/// `end_turn`; other methods answer like the standard mock.
+fn spawn_gated_mock_agent<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut release = Some(release);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                write.flush().await.unwrap();
+                if let Some(release) = release.take() {
+                    let _ = release.await;
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
 /// Mock agent whose `session/new` / `session/load` responses carry a
 /// caller-supplied payload (e.g. `configOptions` for the D13 effective-model
 /// resolution); other methods answer like the standard mock.
@@ -4499,6 +4582,108 @@ async fn zero_output_completion_in_the_abort_gap_still_flushes_a_marker_row() {
     assert_eq!(
         messages[0].metadata.as_ref().expect("metadata")["interrupted"],
         json!(true)
+    );
+}
+
+/// monorepo#2110 — the REAL prompt-turn end must leave a pinned slot to the
+/// teardown flush, not just the `clear_unpinned_live_turn` helper the
+/// simulation above calls directly. Drives `run_prompt_turn` against a mock
+/// whose `session/prompt` response is held open, pins in that window (as the
+/// teardown paths do before `worker.abort()`), then releases the turn to
+/// complete normally with zero output: `run_prompt_turn` persists no row and
+/// its turn-end clear runs for real — the pinned slot must survive it for the
+/// flush that owns it.
+#[tokio::test]
+async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flush() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release) = connect_gated_prompt(Vec::new());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    None,
+                )
+                .await
+        })
+    };
+    // The slot opens at turn start; the gate holds the turn there.
+    timeout(Duration::from_secs(2), async {
+        while services.live_turn(&agent_id).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the turn opens its live slot");
+    // The teardown path pins…
+    services.pin_live_turn(&agent_id);
+    // …and the turn completes normally with zero blocks.
+    release.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("prompt turn ok");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let slot = services
+        .live_turn(&agent_id)
+        .expect("the real turn-end clear leaves the pinned slot to the teardown flush");
+    assert!(slot.flush_pending, "the pin survives the turn end");
+    assert!(slot.blocks.is_empty(), "zero-output turn");
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert!(!flushed.had_output, "a zero-block turn produced no output");
+    assert!(
+        flushed.message_id.is_some(),
+        "the interrupted marker row is recorded"
+    );
+}
+
+/// The teardown flush only owns a PINNED slot. An unpinned slot present at
+/// flush time is not this teardown's turn — it is the NEXT turn's, begun in
+/// the pin→flush window (`begin_live_turn` replaces the slot wholesale,
+/// unpinned) — and flushing it would persist a live turn as interrupted under
+/// its freshly minted id, poisoning the id the worker's own append still
+/// needs. The flush must leave it untouched and report nothing pinned.
+#[tokio::test]
+async fn interrupt_flush_leaves_an_unpinned_slot_alone() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    // The next turn's slot: begun after the teardown's pinned slot was
+    // replaced — never pinned by this teardown.
+    services.set_live_turn(&agent_id, "m2", partial_blocks());
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await;
+    assert!(
+        flushed.is_none(),
+        "an unpinned slot is not this flush's to persist"
+    );
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the live turn's slot stays published"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert!(
+        messages.is_empty(),
+        "no interrupted row was recorded for the live turn"
     );
 }
 
