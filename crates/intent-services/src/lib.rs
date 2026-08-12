@@ -10764,7 +10764,19 @@ impl WorkspaceApi for Services {
             // inside `attachments/` to cover repos with a customized
             // `.intent/.gitignore`.
             repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            let mut result = file_ops::place_attachment(&root, &file_name, source)?;
+            let mut result =
+                file_ops::place_attachment(&root, &file_name, source).map_err(|e| {
+                    // Surface placement failures in the daemon log so field
+                    // reports are diagnosable without a client-side trace
+                    // (monorepo#2144).
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        file_name = %file_name,
+                        error = %e,
+                        "file.placeAttachment failed"
+                    );
+                    e
+                })?;
             // Attachment registry (PROTOCOL §5.9): record the placed file
             // under a daemon-minted UUID so agents can retrieve it later via
             // `ws.file.getAttachment`, and return the registry fields
