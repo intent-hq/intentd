@@ -2008,3 +2008,196 @@ mod chat_snapshot_interrupt_window {
         assert_eq!(snap["totalMessages"], 1, "…and does not inflate the count");
     }
 }
+
+/// monorepo#2105 — the terminal reconcile falls back to the `stream:end`
+/// payload's `messageId` when the turn's id was never learned live, so a
+/// subscription whose seq-0 snapshot missed the in-flight message self-heals at
+/// turn end instead of staying short a whole turn until the client resubscribes.
+mod chat_terminal_message_id_fallback {
+    use super::*;
+    use intent_core::events::AGENT_STREAM_END;
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal `WorkspaceApi` serving the persisted transcript the terminal
+    /// reconcile re-reads, counting reads.
+    struct ConvApi {
+        calls: AtomicUsize,
+        conversation: Value,
+    }
+
+    impl ConvApi {
+        fn new(conversation: Value) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                conversation,
+            }
+        }
+    }
+
+    impl WorkspaceApi for ConvApi {
+        fn agent_get_conversation(
+            &self,
+            _agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let conv = self.conversation.clone();
+            Box::pin(async move { Ok(conv) })
+        }
+    }
+
+    /// The turn's persisted assistant row (plus the user row that prompted it).
+    fn conversation() -> Value {
+        json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "user-msg-1",
+                    "role": "user",
+                    "seq": 7,
+                    "timestamp": "2026-08-11T00:00:00Z",
+                    "contentBlocks": [ { "type": "text", "id": "user-msg-1:0", "text": "Run it" } ]
+                },
+                {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "seq": 8,
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "contentBlocks": [
+                        { "type": "text", "id": "msg-1:0", "text": "Working on it" },
+                        { "type": "text", "id": "msg-1:1", "text": "Interrupted" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 9,
+            "nextToken": Value::Null,
+        })
+    }
+
+    /// The terminal `agent:stream:end` as `run_prompt_turn` /
+    /// `flush_partial_turn_on_interruption` emit it: `messageId` present when
+    /// the turn persisted an assistant row, absent when it did not.
+    fn end_event(message_id: Option<&str>) -> Event {
+        let mut data = json!({ "agentId": "agent-1" });
+        if let Some(id) = message_id {
+            data["messageId"] = json!(id);
+        }
+        Event {
+            id: "evt-end".into(),
+            event_type: AGENT_STREAM_END.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: Some("agent-1".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_miss_recovers_the_whole_turn_at_stream_end() {
+        // The subscription opened inside the interrupt window (monorepo#2056):
+        // the seq-0 snapshot carried no in-flight message, so `seed_from_snapshot`
+        // learned no id, and no further chunk arrives for the already-dead turn.
+        // Pre-fix the terminal event mapped to `None` and the partial turn stayed
+        // missing for the rest of the subscription's life.
+        let api = ConvApi::new(conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        s.seed_from_snapshot(&conversation()); // no `isStreaming` row → no id learned
+        let d = s
+            .delta(&api, &end_event(Some("msg-1")))
+            .await
+            .expect("stream:end must reconcile against the event's messageId");
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1, "one bounded re-read");
+        let added = d["added"].as_array().unwrap();
+        assert_eq!(added.len(), 2, "every persisted block is delivered: {d}");
+        for e in added {
+            assert_eq!(e["agentId"], "agent-1");
+            assert_eq!(e["messageId"], "msg-1");
+            assert_eq!(e["role"], "assistant");
+            assert_eq!(e["messageSeq"], 8);
+            assert_eq!(e["timestamp"], "2026-08-11T00:00:01Z");
+            assert_eq!(e["streamingComplete"], true);
+        }
+        assert_eq!(added[0]["block"]["id"], "msg-1:0");
+        assert_eq!(added[1]["block"]["text"], "Interrupted");
+        assert!(
+            d["updated"].as_array().unwrap().is_empty(),
+            "nothing was emitted live, so nothing is an update: {d}"
+        );
+        assert_eq!(
+            d["removedIds"],
+            json!([]),
+            "no live-emitted ids means no orphans: {d}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_learned_id_wins_and_the_turn_is_delivered_once() {
+        // The normal case is untouched: the id learned from the live stream is
+        // used (not the event's), the blocks the client already saw come back as
+        // `updated` — one terminal frame, no re-added duplicates.
+        let api = ConvApi::new(conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Working")))
+            .expect("first chunk");
+        let d = s
+            .delta(&api, &end_event(Some("other-msg")))
+            .await
+            .expect("terminal reconcile");
+        assert_eq!(
+            d["updated"][0]["messageId"], "msg-1",
+            "the live-learned id must win over the event payload: {d}"
+        );
+        assert_eq!(
+            d["updated"].as_array().unwrap().len(),
+            1,
+            "the live-emitted block returns as an update, not an add: {d}"
+        );
+        assert_eq!(
+            d["added"].as_array().unwrap().len(),
+            1,
+            "msg-1:1 is new: {d}"
+        );
+        assert_eq!(d["added"][0]["block"]["id"], "msg-1:1");
+    }
+
+    #[tokio::test]
+    async fn an_end_event_without_a_message_id_still_emits_nothing() {
+        // A turn that persisted no assistant row (e.g. an empty interrupted
+        // turn) omits `messageId` — there is nothing to reconcile against.
+        let api = ConvApi::new(conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        assert!(s.delta(&api, &end_event(None)).await.is_none());
+        assert_eq!(
+            api.calls.load(Ordering::SeqCst),
+            0,
+            "no id, no conversation read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fallback_id_does_not_leak_into_the_next_turn() {
+        // `finalize` resets the per-turn accumulation whichever way the id was
+        // resolved, so the recovered id cannot reconcile a later turn.
+        let api = ConvApi::new(conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        s.delta(&api, &end_event(Some("msg-1")))
+            .await
+            .expect("first turn recovered");
+        assert!(
+            s.delta(&api, &end_event(None)).await.is_none(),
+            "the next turn starts with no id"
+        );
+    }
+}

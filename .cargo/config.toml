@@ -1,0 +1,23 @@
+# Redirect crates.io resolution of tokio-tungstenite to the intent-hq fork.
+#
+# The workspace consumes tokio-tungstenite as a git dependency (the fork's
+# `deflate` branch), so normal builds never touch crates.io for it and this
+# patch is inert. It exists for `cargo package` verification: packaging
+# sanitizes manifests by stripping git sources, so the packaged
+# intent-transport resolves `tokio-tungstenite ^0.30.0` against crates.io,
+# where the fork-only extension-negotiation APIs (DeflateConfig,
+# ExtensionsConfig, from_raw_socket_with_extensions) don't exist and the
+# verify build fails. release-plz's git_only version detection runs exactly
+# that `cargo package` in a worktree of the latest release tag, killing the
+# Release-plz PR job (intent-hq/monorepo#2112). With this patch the sanitized
+# manifest still resolves to the fork and verification compiles. The patch
+# applies via cargo's config discovery from the invocation directory, not by
+# being copied into the verify dir.
+#
+# Expected noise: `cargo package` prints `warning: patch tokio-tungstenite
+# v0.30.0 (...) was not used in the crate graph` once per packaged crate
+# during the packaging phase — the workspace resolves the git dep directly
+# and only the sanitized verify builds consume the patch. Those warnings do
+# NOT mean the patch is broken; do not "fix" them by removing this file.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/intent-hq/tokio-tungstenite", branch = "deflate" }

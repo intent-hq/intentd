@@ -664,7 +664,7 @@ impl ChatDeltaState {
         match event.event_type.as_str() {
             CHAT_STREAM_DELTA => self.chunk_delta(event),
             AGENT_TOOL_CALL => self.tool_delta(event),
-            AGENT_STREAM_END => self.finalize(api).await,
+            AGENT_STREAM_END => self.finalize(api, event).await,
             AGENT_MESSAGE => self.message_row_delta(api, event).await,
             _ => None,
         }
@@ -918,7 +918,28 @@ impl ChatDeltaState {
     /// Finalize the turn on `agent:stream:end`: reconcile against the persisted
     /// message, then reset the per-turn accumulation so the next turn on this
     /// subscription starts clean.
-    async fn finalize(&mut self, api: &dyn WorkspaceApi) -> Option<Value> {
+    ///
+    /// The turn's message id is normally learned live (`seed_from_snapshot` or
+    /// the first chunk/tool delta), but a subscription that opened after the
+    /// last chunk and merged no in-flight message never learns it — and would
+    /// then emit no terminal frame at all, leaving the turn missing from its
+    /// transcript until the client resubscribes or refetches
+    /// ([monorepo#2105](https://github.com/intent-hq/monorepo/issues/2105)).
+    /// The terminal event already names the row it closes, so fall back to its
+    /// `messageId`: the reconcile below re-reads the same bounded page a fresh
+    /// snapshot would, and with no live-emitted ids every persisted block
+    /// arrives as `added` with no orphan `removedIds` — the client converges on
+    /// the fresh-snapshot state, which is exactly the §7.1 invariant. The
+    /// fallback is inert whenever the id is already known (the normal case) and
+    /// when the event carries none (a turn that persisted no assistant row).
+    async fn finalize(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+        if self.message_id.is_none() {
+            self.message_id = event
+                .data
+                .get("messageId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         let delta = self.reconcile(api).await;
         self.text_acc.clear();
         self.seen_ids.clear();
