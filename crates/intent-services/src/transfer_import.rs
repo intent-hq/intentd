@@ -974,10 +974,13 @@ async fn materialize_imported_attachments(
                     .map_err(|e| Error::Internal(format!("write attachments marker failed: {e}")))?;
                 created.push(marker);
             }
+            // Record BEFORE copying: a copy that fails partway can leave a
+            // partial dest, and rollback must remove it (it tolerates a
+            // missing file).
+            created.push(dest.clone());
             tokio::fs::copy(entry.path(), &dest)
                 .await
                 .map_err(|e| Error::Internal(format!("materialize attachment {id} failed: {e}")))?;
-            created.push(dest);
         }
         Ok(())
     }
@@ -992,10 +995,14 @@ async fn materialize_imported_attachments(
 
 /// Best-effort unwind of [`materialize_imported_attachments`]: delete every
 /// created file, then prune the (now possibly empty) parent directories.
+/// A missing file is fine — destinations are recorded before the copy, so
+/// the last entry may never have been written.
 async fn rollback_materialized_attachments(created: &[PathBuf]) {
     for path in created {
         if let Err(e) = tokio::fs::remove_file(path).await {
-            tracing::warn!(path = %path.display(), error = %e, "attachment rollback failed");
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e, "attachment rollback failed");
+            }
         }
     }
     for path in created {
