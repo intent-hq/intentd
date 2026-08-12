@@ -387,6 +387,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             messages: vec![],

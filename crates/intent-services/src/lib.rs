@@ -10513,6 +10513,7 @@ impl WorkspaceApi for Services {
         file_name: String,
         data: Option<String>,
         source_path: Option<String>,
+        mime_type: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -10560,7 +10561,119 @@ impl WorkspaceApi for Services {
             // inside `attachments/` to cover repos with a customized
             // `.intent/.gitignore`.
             repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            file_ops::place_attachment(&root, &file_name, source)
+            let mut result = file_ops::place_attachment(&root, &file_name, source)?;
+            // Attachment registry (PROTOCOL §5.9): record the placed file
+            // under a daemon-minted UUID so agents can retrieve it later via
+            // `ws.file.getAttachment`, and return the registry fields
+            // additively (presence-detected; old clients unaffected).
+            let record = intent_store::AttachmentRecord {
+                id: new_uuid(),
+                workspace_id,
+                file_name: result["fileName"]
+                    .as_str()
+                    .unwrap_or(&file_name)
+                    .to_string(),
+                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
+                size: result["size"].as_i64().unwrap_or_default(),
+                uploaded_at: now_iso(),
+                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
+            };
+            if let Err(e) = store.insert_attachment(&record).await {
+                // Don't leave a durable-but-unregistered file behind: a
+                // retry would place a collision-suffixed second copy that
+                // no attachmentId can ever retrieve.
+                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
+                return Err(e);
+            }
+            result["attachmentId"] = serde_json::json!(record.id);
+            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
+            if let Some(mime) = &record.mime_type {
+                result["mimeType"] = serde_json::json!(mime);
+            }
+            Ok(result)
+        })
+    }
+
+    fn file_get_attachment_info(
+        &self,
+        attachment_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let record = store
+                .get_attachment(&attachment_id)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
+            // `exists` reflects the file on disk NOW (the user may have
+            // deleted it out-of-band); resolved against the canonical
+            // workspace root, never a sandbox, with the same within-root
+            // containment guard as the copy path — a tampered stored_path
+            // must not probe file existence outside the store.
+            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
+            let exists = !root.is_empty()
+                && file_ops::resolve_attachment_source(&root, &record.stored_path)
+                    .is_ok_and(|p| p.is_file());
+            let mut result = serde_json::json!({
+                "attachmentId": record.id,
+                "fileName": record.file_name,
+                "size": record.size,
+                "uploadedAt": record.uploaded_at,
+                "path": record.stored_path,
+                "exists": exists,
+            });
+            if let Some(mime) = &record.mime_type {
+                result["mimeType"] = serde_json::json!(mime);
+            }
+            Ok(result)
+        })
+    }
+
+    fn file_get_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        attachment_id: String,
+        caller_agent_id: Option<AgentId>,
+        dest_dir: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let record = store
+                .get_attachment(&attachment_id)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::NotFound(format!("unknown attachment id: {attachment_id}"))
+                    }
+                    other => other,
+                })?;
+            if record.workspace_id != workspace_id {
+                // Cross-workspace probes read as unknown ids — the registry
+                // is workspace-scoped.
+                return Err(Error::NotFound(format!(
+                    "unknown attachment id: {attachment_id}"
+                )));
+            }
+            // Source side: ALWAYS the canonical workspace root (attachments
+            // are placed there by `file.placeAttachment`; a sandbox clone
+            // does not carry post-clone attachments).
+            let canonical_root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            if canonical_root.is_empty() {
+                return Err(Error::Internal(
+                    "workspace has no resolved filesystem root".to_string(),
+                ));
+            }
+            // Destination side: the CALLER's working directory — the sandbox
+            // clone for CoW-sandboxed agents, else the canonical checkout
+            // (same session-derived resolution as other sandbox-aware
+            // bindings).
+            let dest_root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            file_ops::get_attachment(&canonical_root, &dest_root, &record, dest_dir.as_deref())
         })
     }
 
@@ -12505,6 +12618,7 @@ impl WorkspaceApi for Services {
                                 .context_references
                                 .filter(|v| !v.is_null()),
                             image_blocks: agent.image_blocks.filter(|v| !v.is_null()),
+                            file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
                             // The initial agent is the workspace's
                             // foreground agent (top-level wins over any
                             // metadata.isBackground copy).
@@ -12540,22 +12654,31 @@ impl WorkspaceApi for Services {
                             .and_then(|a| a.get("imageBlocks"))
                             .filter(|v| !v.is_null())
                             .cloned();
+                        let created_file_blocks = created
+                            .get("agent")
+                            .and_then(|a| a.get("fileBlocks"))
+                            .filter(|v| !v.is_null())
+                            .cloned();
                         let created_context_refs = created
                             .get("agent")
                             .and_then(|a| a.get("contextReferences"))
                             .filter(|v| !v.is_null())
                             .cloned();
                         // Deliver the prompt and start the first turn when a prompt OR
-                        // imageBlocks are supplied (STAB-69: image-only first messages
-                        // should start a turn, consistent with agent.sendMessage
-                        // semantics). The runtime `AgentManager` when attached, else the
-                        // store-only persist. Best-effort like the delegate path — the
-                        // agent holds `metadata.initialMessage` for resume.
-                        let has_content = prompt.is_some() || created_image_blocks.is_some();
+                        // attachment blocks are supplied (STAB-69: image-only first
+                        // messages should start a turn, consistent with
+                        // agent.sendMessage semantics). The runtime `AgentManager` when
+                        // attached, else the store-only persist. Best-effort like the
+                        // delegate path — the agent holds `metadata.initialMessage` for
+                        // resume.
+                        let has_content = prompt.is_some()
+                            || created_image_blocks.is_some()
+                            || created_file_blocks.is_some();
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
+                                file_blocks: created_file_blocks.clone(),
                                 context_references: created_context_refs,
                                 ..crate::agent_manager::TurnOptions::default()
                             };
@@ -12572,7 +12695,7 @@ impl WorkspaceApi for Services {
                                             prompt_text,
                                             None,
                                             created_image_blocks,
-                                            None,
+                                            created_file_blocks,
                                             None,
                                         )
                                         .await
@@ -19449,6 +19572,10 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Attachment-reference validation (PROTOCOL §5.5) up front: the
+            // runtime-manager path below never reaches
+            // `agent_send_message_op`'s check.
+            crate::agent_ops::validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -19593,6 +19720,12 @@ impl WorkspaceApi for Services {
         model: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Attachment-reference validation (PROTOCOL §5.5), same seam as
+            // agent.sendMessage — before any state change.
+            crate::agent_ops::validate_file_blocks(
+                "agent.editAndRegenerate",
+                file_blocks.as_ref(),
+            )?;
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,

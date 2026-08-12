@@ -74,6 +74,7 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         stats: None,

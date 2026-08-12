@@ -165,6 +165,7 @@ fn session(
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
