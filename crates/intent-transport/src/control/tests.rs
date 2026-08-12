@@ -35,6 +35,9 @@ impl FakeControl {
                 hostname: "studio.local".to_string(),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
+                child_processes: Some(4),
+                child_memory_bytes: Some(2_684_354_560),
+                child_memory_peak_bytes: Some(5_368_709_120),
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -154,6 +157,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         hostname: "intent".to_string(),
         cpu_percent: 0.0,
         memory_bytes: 0,
+        child_processes: None,
+        child_memory_bytes: None,
+        child_memory_peak_bytes: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -162,6 +168,28 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     // No routable interfaces still yields an (empty) array, never null.
     assert_eq!(v["localIps"], json!([]));
     assert_eq!(v["hostname"], "intent");
+    // An unsampled child tree is explicitly null — never a misleading 0, which
+    // a bundle would read as "the daemon has no child processes".
+    assert_eq!(v["childProcesses"], Value::Null);
+    assert_eq!(v["childMemoryBytes"], Value::Null);
+    assert_eq!(v["childMemoryPeakBytes"], Value::Null);
+}
+
+/// The descendant-tree fields ride `system.status` so a debug
+/// bundle can attribute system memory pressure to agent child processes: the
+/// daemon's own `memoryBytes` is a small fraction of what its tree costs.
+#[test]
+fn status_json_carries_the_child_process_tree_sample() {
+    let control = FakeControl::new();
+    let v = status_json(&control.status, true);
+    assert_eq!(v["childProcesses"], 4);
+    assert_eq!(v["childMemoryBytes"], 2_684_354_560u64);
+    // The peak is a separate field, not a copy of the instantaneous value: a
+    // bundle captured after a burst drains sees baseline in `childMemoryBytes`
+    // and the overshoot only in `childMemoryPeakBytes`.
+    assert_eq!(v["childMemoryPeakBytes"], 5_368_709_120u64);
+    // Own-RSS and tree-RSS are distinct fields; the tree dwarfs the daemon.
+    assert_eq!(v["memoryBytes"], 104_857_600u64);
 }
 
 #[tokio::test]

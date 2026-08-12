@@ -106,10 +106,21 @@
 //! (`{ type: "file", attachmentId, fileName, mimeType?, size? }` — exactly
 //! one of `data` / `attachmentId`, §5.5), and the MCP `ws.file.getAttachment`
 //! binding copies a registered attachment into the calling agent's working
-//! directory (§6.8) — 287 router methods, 326 total.
+//! directory (§6.8) — 287 router methods, 326 total. Version 6.13 adds the
+//! additive `childProcesses` / `childMemoryBytes` / `childMemoryPeakBytes`
+//! result fields to `system.status` (§5.7): the process count, aggregate
+//! resident memory, and since-start high-water mark of the daemon's whole
+//! descendant tree, sampled every 5s. The existing `memoryBytes` covers only
+//! the daemon binary and understates its real cost by more than an order of
+//! magnitude once agents are live — measured on a dev seat, a 183 MB daemon
+//! owned a 21.5 GB process tree — so a client cannot attribute system memory
+//! pressure to agents without these. The peak is carried separately because
+//! ephemeral quick-action and model-probe adapters live only seconds and have
+//! drained by the time a debug bundle is captured. All three are `null` until
+//! the first sample lands; no new methods — 287 router methods, 326 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.12";
+pub const PROTOCOL_VERSION: &str = "6.13";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

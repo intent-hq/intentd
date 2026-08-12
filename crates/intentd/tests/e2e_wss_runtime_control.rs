@@ -758,4 +758,41 @@ async fn runtime_toggled_wss_serves_system_status() {
     assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
     assert!(r["version"].is_string(), "version is string: {r}");
     assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+
+    // The descendant-tree fields ride the real WSS wire, not just
+    // `status_json`. All three are sampled together, so the contract is
+    // all-null (sampler has not ticked yet) or all-present — never a mix,
+    // which would let a bundle read a count without a byte total. Asserting
+    // the pair rather than a concrete value keeps this deterministic: the
+    // first tick fires at startup but a fast test can still beat it.
+    for field in ["childProcesses", "childMemoryBytes", "childMemoryPeakBytes"] {
+        assert!(
+            r.get(field).is_some(),
+            "{field} must ride the WSS status result: {r}"
+        );
+    }
+    let sampled = [
+        &r["childProcesses"],
+        &r["childMemoryBytes"],
+        &r["childMemoryPeakBytes"],
+    ];
+    let nulls = sampled.iter().filter(|v| v.is_null()).count();
+    assert!(
+        nulls == 0 || nulls == 3,
+        "descendant-tree fields must be all-null or all-present, got {nulls} nulls: {r}"
+    );
+    if nulls == 0 {
+        let bytes = r["childMemoryBytes"].as_u64().expect("bytes when sampled");
+        let peak = r["childMemoryPeakBytes"]
+            .as_u64()
+            .expect("peak when sampled");
+        assert!(
+            r["childProcesses"].is_u64(),
+            "childProcesses is u64 when sampled: {r}"
+        );
+        assert!(
+            peak >= bytes,
+            "peak {peak} must be >= instantaneous {bytes}"
+        );
+    }
 }
