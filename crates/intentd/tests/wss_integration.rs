@@ -7491,12 +7491,18 @@ async fn wss_workspace_transfer_plan_round_trip() {
         "event log is excluded from the manifest: {resp}"
     );
     assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["attachments"].is_array(), "{resp}");
     assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
     let total = plan["totalSizeBytes"].as_u64().expect("total");
     let db = plan["dbRowBytes"].as_u64().expect("db");
     let assets = plan["assetBytes"].as_u64().expect("assets");
+    let attachments = plan["attachmentBytes"].as_u64().expect("attachments");
     let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
-    assert_eq!(total, db + assets + bundle, "size breakdown sums: {resp}");
+    assert_eq!(
+        total,
+        db + assets + attachments + bundle,
+        "size breakdown sums: {resp}"
+    );
     assert!(plan["warnings"].is_array(), "{resp}");
 
     // Unknown workspace → the standard workspace-not-found mapping.

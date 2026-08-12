@@ -33,6 +33,22 @@ pub struct TransferAsset {
     pub size_bytes: u64,
 }
 
+/// One attachment-registry entry (the `attachments` table rides in the row
+/// payload; this mirrors it into the manifest for size estimates and the
+/// archive's `attachments/<attachmentId>` file entries). `exists: false`
+/// means the stored file was already deleted from the canonical
+/// `.intent/attachments/` store at plan time — the row still transfers
+/// (deleted-is-deleted is a first-class state) but the archive carries no
+/// file entry and `size_bytes` is 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferAttachment {
+    pub id: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub exists: bool,
+}
+
 /// Git state summary for the manifest: the checked-out branch, dirty paths
 /// (snapshotted as WIP commits at export time), and the sandbox branches that
 /// ride in the bundle. `has_repository: false` means the workspace has no
@@ -60,6 +76,12 @@ pub struct TransferManifest {
     pub created_at: String,
     pub tables: Vec<TransferTableStat>,
     pub assets: Vec<TransferAsset>,
+    /// Attachment-registry entries (additive to format v1: exact intentd
+    /// version gating means no pre-attachments archive can be imported by a
+    /// daemon that expects this field, so `default` tolerance is enough — no
+    /// format-version bump).
+    #[serde(default)]
+    pub attachments: Vec<TransferAttachment>,
     pub git: TransferGitSummary,
 }
 
@@ -75,7 +97,8 @@ pub struct TransferWarning {
 
 /// `workspace.transfer.plan` result: the manifest preview plus the size
 /// estimate shown by the FE wizard before starting a transfer.
-/// `total_size_bytes = db_row_bytes + asset_bytes + estimated_git_bundle_bytes`.
+/// `total_size_bytes = db_row_bytes + asset_bytes + attachment_bytes +
+/// estimated_git_bundle_bytes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferPlan {
@@ -83,6 +106,9 @@ pub struct TransferPlan {
     pub total_size_bytes: u64,
     pub db_row_bytes: u64,
     pub asset_bytes: u64,
+    /// Summed size of the attachment FILES the archive will carry (rows with
+    /// a deleted stored file contribute 0).
+    pub attachment_bytes: u64,
     pub estimated_git_bundle_bytes: u64,
     pub warnings: Vec<TransferWarning>,
 }

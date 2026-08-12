@@ -53,14 +53,33 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("get attachment failed: {e}")))?
             .ok_or_else(|| Error::NotFound(format!("attachment {id}")))?;
-        Ok(AttachmentRecord {
-            id: row.get("id"),
-            workspace_id: WorkspaceId(row.get("workspace_id")),
-            file_name: row.get("file_name"),
-            mime_type: row.get("mime_type"),
-            size: row.get("size"),
-            uploaded_at: row.get("uploaded_at"),
-            stored_path: row.get("stored_path"),
-        })
+        Ok(row_to_record(&row))
+    }
+
+    /// All attachment rows for one workspace, ordered by id (stable manifest
+    /// ordering for the transfer pipeline).
+    pub async fn list_attachments(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AttachmentRecord>> {
+        let sql = format!("SELECT {COLUMNS} FROM attachments WHERE workspace_id = ? ORDER BY id");
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list attachments failed: {e}")))?;
+        Ok(rows.iter().map(row_to_record).collect())
+    }
+}
+
+fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> AttachmentRecord {
+    AttachmentRecord {
+        id: row.get("id"),
+        workspace_id: WorkspaceId(row.get("workspace_id")),
+        file_name: row.get("file_name"),
+        mime_type: row.get("mime_type"),
+        size: row.get("size"),
+        uploaded_at: row.get("uploaded_at"),
+        stored_path: row.get("stored_path"),
     }
 }
