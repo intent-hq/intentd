@@ -22667,10 +22667,15 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
         "watcher wake is kind-flavored with the reason: {text}"
     );
     // monorepo#2051: the attention wake is non-terminal — it states the watch
-    // remains armed and never carries the retirement note.
+    // remains armed and never carries the retirement note. The ungrouped
+    // watch promises a wake at this agent's own completion.
     assert!(
         text.contains("remains armed"),
         "attention wake states the watch remains armed: {text}"
+    );
+    assert!(
+        text.contains("you will still be woken at its completion"),
+        "ungrouped attention wake promises a completion wake: {text}"
     );
     assert!(
         !text.contains("the watch is now retired"),
@@ -22708,6 +22713,69 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     assert!(
         svc.list_watches_for_parent(&parent).is_empty(),
         "parent's watch retired at completion"
+    );
+}
+
+/// An explicit watch adopted into an `after_all` delegation group wakes at
+/// group settlement, not the target's individual completion — its attention
+/// wake must promise the settlement wake instead (monorepo#2051 review).
+#[tokio::test]
+async fn agent_watch_attention_wake_states_group_settlement_for_grouped_watch() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    // Explicit watch (wake_on_attention), then a grouped registration for the
+    // same (watcher, child) pair adopts the group onto that watch —
+    // strengthen-only, so the attention flag survives.
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch");
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        watcher.clone(),
+        "Watcher".into(),
+        child.clone(),
+        Some("group-1".into()),
+    )
+    .expect("grouped adoption");
+    let baseline = parent_message_count(&svc, &watcher).await;
+
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("request attention");
+
+    assert_eq!(parent_message_count(&svc, &watcher).await, baseline + 1);
+    let text = parent_messages_text(&svc, &watcher).await;
+    assert!(
+        text.contains("remains armed"),
+        "grouped attention wake still states the watch remains armed: {text}"
+    );
+    assert!(
+        text.contains("you will be woken when its delegation group settles"),
+        "grouped attention wake promises the settlement wake: {text}"
+    );
+    assert!(
+        !text.contains("you will still be woken at its completion"),
+        "grouped attention wake must not promise an individual completion wake: {text}"
     );
 }
 
