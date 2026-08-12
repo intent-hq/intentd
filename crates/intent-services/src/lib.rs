@@ -10306,7 +10306,13 @@ impl WorkspaceApi for Services {
                 uploaded_at: now_iso(),
                 stored_path: result["path"].as_str().unwrap_or_default().to_string(),
             };
-            store.insert_attachment(&record).await?;
+            if let Err(e) = store.insert_attachment(&record).await {
+                // Don't leave a durable-but-unregistered file behind: a
+                // retry would place a collision-suffixed second copy that
+                // no attachmentId can ever retrieve.
+                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
+                return Err(e);
+            }
             result["attachmentId"] = serde_json::json!(record.id);
             result["uploadedAt"] = serde_json::json!(record.uploaded_at);
             if let Some(mime) = &record.mime_type {

@@ -19519,6 +19519,25 @@ mod file_ops_service {
         assert!(matches!(got2, Err(Error::Internal(_))), "{got2:?}");
         assert!(!dir.parent().unwrap().join("evil.txt").exists());
 
+        // Sibling-prefix escape: with root `<parent>/<name>`, a destDir of
+        // `../<name>-escape` resolves to a SIBLING sharing the root's string
+        // prefix — the boundary-aware is_within must still reject it.
+        let sibling_dir = format!("../{}-escape", dir.file_name().unwrap().to_string_lossy());
+        let sib = svc
+            .file_get_attachment(
+                ws.clone(),
+                "att-badname".to_string(),
+                None,
+                Some(sibling_dir.clone()),
+            )
+            .await;
+        assert!(matches!(sib, Err(Error::Internal(_))), "{sib:?}");
+        let sibling_path = dir.parent().unwrap().join(format!(
+            "{}-escape",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!sibling_path.exists());
+
         // Cross-workspace: a valid row read under a DIFFERENT workspace id
         // reads as an unknown attachment id.
         let other_ws = WorkspaceId::new();

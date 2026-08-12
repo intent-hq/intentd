@@ -96,10 +96,20 @@ fn node_resolve(base: &str, rel: &str) -> PathBuf {
     normalize_lexical(&combined)
 }
 
-/// TS `isWithinWorkspace`: raw string prefix of the resolved path against the
-/// workspace root (an empty root matches everything, as in JS).
+/// TS `isWithinWorkspace`, hardened to a path-boundary check: the resolved
+/// path must BE the root or sit under it across a path separator — a raw
+/// string prefix would let `/tmp/ws-escape` pass for root `/tmp/ws`. An
+/// empty root matches everything (as in JS).
 fn is_within(root: &str, full: &Path) -> bool {
-    full.to_string_lossy().starts_with(root)
+    let root = root.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        return true;
+    }
+    let full = full.to_string_lossy();
+    match full.strip_prefix(root) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'),
+        None => false,
+    }
 }
 
 /// Workspace-relative, forward-slash form of `path` for attribution rows:
