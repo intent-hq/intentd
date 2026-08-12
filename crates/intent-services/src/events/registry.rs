@@ -964,6 +964,57 @@ mod tests {
         );
     }
 
+    /// Deterministically settle every in-flight refresh for the workspace
+    /// under test before a negative probe, by flushing the shared
+    /// [`GitStatusRefresher`] pipeline with a marker workspace
+    /// (monorepo#2012). A fixed quiet-gap drain is a race: a refresh from
+    /// earlier churn traverses FSEvents delivery, the 1s debounce, and a
+    /// blocking-pool recompute, and under load its `changes:git-status` can
+    /// publish arbitrarily later than any fixed gap.
+    ///
+    /// One round = trigger the (unwatched, non-repo) marker workspace and
+    /// await its status event, noting whether any non-marker event arrived
+    /// before it. The refresh loop is sequential and the bus broadcasts a
+    /// single publisher's events in order, so a marker event bounds every
+    /// publish enqueued before its own — EXCEPT a workspace refresh due in
+    /// the same debounce batch, which can be processed (and published) after
+    /// the marker's (per-batch HashMap order), and a straggler trigger that
+    /// raced in just after the marker's. Both stragglers surface during the
+    /// NEXT round, so the pipeline is settled once two consecutive rounds
+    /// observe nothing but their marker. Panics if settlement never happens
+    /// within `LIVENESS` — a real leak, not slowness.
+    async fn flush_refresher(
+        refresher: &GitStatusRefresher,
+        sub: &mut super::super::bus::Subscription,
+        marker_id: &WorkspaceId,
+    ) {
+        let deadline = Instant::now() + LIVENESS;
+        let mut clean_rounds = 0;
+        while clean_rounds < 2 {
+            refresher.trigger(marker_id.clone());
+            let mut clean = true;
+            'round: loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "refresher never settled within LIVENESS"
+                );
+                match timeout(remaining, sub.recv()).await {
+                    Ok(Some(batch)) => {
+                        for ev in batch {
+                            if &ev.workspace_id == marker_id {
+                                break 'round;
+                            }
+                            clean = false;
+                        }
+                    }
+                    _ => panic!("marker status event never arrived"),
+                }
+            }
+            clean_rounds = if clean { clean_rounds + 1 } else { 0 };
+        }
+    }
+
     /// Archive/unarchive lifecycle against the refcounted common-dir registry
     /// (monorepo#1663): archiving a linked-worktree workspace deregisters it
     /// from the shared common-dir watch (last one out tears the watch down)
@@ -1008,9 +1059,33 @@ mod tests {
 
         let mut ws = test_workspace("ws-wt-archived", &wt_path);
         ws.worktree_path = ws.path.clone();
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let api = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let registry = start_registry(&bus, api).await;
+        // The refresher is built explicitly (rather than via `start_registry`)
+        // so the flushes below can inject marker triggers into the same
+        // debounced pipeline the common-dir watch feeds.
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            Arc::clone(&api) as Arc<dyn WorkspaceApi>,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let registry = WatcherRegistry::start(
+            bus.clone(),
+            Arc::clone(&api) as Arc<dyn WorkspaceApi>,
+            Arc::clone(&refresher),
+        )
+        .await;
+
+        // Marker workspace for the refresher flushes: pushed AFTER the
+        // registry snapshot so it is never watched, but resolvable via the
+        // api so a marker trigger recomputes (non-repo worktree → minimal
+        // status) and publishes a `changes:git-status` event for it.
+        let marker_root = TempDir::new("wt-arch-flush");
+        let mut marker = test_workspace("ws-wt-arch-flush", &marker_root.path);
+        marker.worktree_path = marker.path.clone();
+        let marker_id = marker.id.clone();
+        api.workspaces.lock().unwrap().push(marker);
+
         wait_for_root(&registry, &wt_path, true).await;
         assert_eq!(
             registry.common_dir_watch_count(),
@@ -1036,10 +1111,6 @@ mod tests {
             ev.is_some(),
             "common-dir ref change must refresh the worktree workspace before archiving"
         );
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
 
         // Archive: the watcher drop must deregister the workspace — it was
         // the only rider, so the shared watch tears down entirely.
@@ -1050,11 +1121,12 @@ mod tests {
         wait_for_common_dir_watch_count(&registry, 0).await;
 
         // A common-dir ref change while archived must not trigger anything.
-        // Drain whatever the archive transition itself had in flight first.
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
+        // The watch is gone (count 0), so no NEW triggers can arrive for the
+        // workspace — but refreshes from the pre-archive branch churn can
+        // still be in flight and publish arbitrarily late under load
+        // (monorepo#2012). Settle them deterministically before asserting
+        // absence; a fixed quiet-gap drain here is a race, not a guarantee.
+        flush_refresher(&refresher, &mut status_sub, &marker_id).await;
         repo.branch("while-archived", &head_commit, true).unwrap();
         let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2)).await;
         assert!(
@@ -1068,12 +1140,9 @@ mod tests {
             .expect("publish unarchived");
         wait_for_root(&registry, &wt_path, true).await;
         wait_for_common_dir_watch_count(&registry, 1).await;
-        // Drain the unarchive catch-up refresh so it cannot masquerade as the
-        // watch-driven event asserted below.
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
+        // Settle the unarchive catch-up refresh deterministically so it
+        // cannot masquerade as the watch-driven event asserted below.
+        flush_refresher(&refresher, &mut status_sub, &marker_id).await;
 
         // Common-dir ref changes trigger again. Retried for the same
         // delivery-start race as the other real-watcher tests.
