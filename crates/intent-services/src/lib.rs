@@ -132,8 +132,9 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents,
-    migrate_default_vocabulary, migrate_quick_action_settings, InMemorySecretStore, SecretStore,
+    agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
+    max_concurrent_agents, migrate_default_vocabulary, migrate_quick_action_settings,
+    InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
@@ -150,7 +151,8 @@ pub mod auggie_discovery {
 }
 
 pub use agent_manager::{
-    compute_process_cap, default_process_cap, AgentManager, BusEventSink, ProcessRegistry,
+    compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
+    BusEventSink, ProcessRegistry, TreeMemoryProbe,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via

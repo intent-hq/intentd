@@ -1237,6 +1237,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             0.0,
         ),
         number(
+            "agents.memoryBudgetMb",
+            "Agent memory budget (MB)",
+            "Aggregate resident memory the daemon's whole child-process tree may use before new agent spawns queue behind idle-process eviction (0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            "agents",
+            Some(0.0),
+            Some(1_024_000.0),
+            0.0,
+        ),
+        number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
             "Minutes before an idle agent is reaped",
@@ -1394,6 +1403,16 @@ pub(crate) fn worktrees_location(settings: &SettingsFile) -> String {
 pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
     let n = settings.agents.max_concurrent;
     (n > 0).then_some(n as usize)
+}
+
+/// The effective `agents.memoryBudgetMb` setting in bytes: a positive value
+/// installs the aggregate child-tree memory budget (monorepo#2063); 0 (the
+/// default) leaves it off entirely. See
+/// [`intent_services::recommended_memory_budget_bytes`] for the value this
+/// would default to if it were enabled.
+pub fn agent_memory_budget_bytes(settings: &SettingsFile) -> Option<u64> {
+    let mb = settings.agents.memory_budget_mb;
+    (mb > 0).then(|| mb as u64 * 1024 * 1024)
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the SQLite
@@ -2249,6 +2268,37 @@ mod tests {
         // Positive integer → Some(cap).
         settings.agents.max_concurrent = 12;
         assert_eq!(max_concurrent_agents(&settings), Some(12));
+    }
+
+    /// `agents.memoryBudgetMb` is a TOML-backed bounded number defaulting to 0
+    /// (off), and `agent_memory_budget_bytes` converts MB to bytes only when it
+    /// is set — a 0 must stay `None` rather than becoming a 0-byte budget that
+    /// would refuse every spawn.
+    #[test]
+    fn agent_memory_budget_is_off_by_default_and_converts_mb_to_bytes() {
+        let def = find_definition("agents.memoryBudgetMb")
+            .expect("agents.memoryBudgetMb missing from catalog");
+        assert!(!def.sensitive);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(1_024_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(settings.agents.memory_budget_mb, 0);
+        assert_eq!(agent_memory_budget_bytes(&settings), None);
+
+        settings.agents.memory_budget_mb = 20_480;
+        assert_eq!(
+            agent_memory_budget_bytes(&settings),
+            Some(20 * 1024 * 1024 * 1024),
+        );
     }
 
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
