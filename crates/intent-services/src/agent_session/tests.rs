@@ -4711,6 +4711,7 @@ async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
         last_activity_at: "2026-01-01T00:00:00Z".to_string(),
         last_activity_emit: None,
         flush_pending: false,
+        flush_failed: false,
     };
     let enrolled = services
         .flush_partial_turn_on_interruption(

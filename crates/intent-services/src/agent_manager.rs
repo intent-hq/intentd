@@ -3691,7 +3691,17 @@ impl AgentManager {
                 // reason). Lock order is busy → live_turns, consistent with the
                 // busy → agent_ws invariant above; nothing acquires `live_turns`
                 // and then `busy`.
-                self.services.clear_live_turn(agent_id);
+                //
+                // A slot whose teardown flush is still IN FLIGHT is left alone:
+                // that flush re-reads it at flush time (monorepo#2110), and
+                // `interrupt_inner` pins without a busy claim, so a stop against
+                // an idle agent can have a flush in flight while this claim
+                // wins. Clearing there would drop the content and make the flush
+                // misread the vanished slot as "the worker persisted the full
+                // row". A flush that already GAVE UP is not coming back, so the
+                // slot it kept is cleared like any other orphan.
+                self.services
+                    .clear_live_turn_unless_flush_in_flight(agent_id);
                 busy.insert(agent_id.clone());
                 self.agent_ws
                     .lock()
