@@ -221,6 +221,42 @@ pub(crate) fn place_attachment(
     let name = sanitize_attachment_name(file_name).ok_or_else(|| {
         Error::InvalidParams(format!("invalid attachment fileName: {file_name:?}"))
     })?;
+    // Classify a doomed `sourcePath` up front (before the directory and the
+    // destination name are claimed) so the caller gets an actionable -32602
+    // instead of an opaque -32603 "Internal error" from the copy step: a
+    // dragged FOLDER is the common real-world case, alongside a vanished or
+    // unreadable file (intent-hq/monorepo#2144).
+    if let AttachmentSource::CopyFrom(src) = &source {
+        match std::fs::metadata(src) {
+            Ok(md) if md.is_dir() => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is a directory — only individual files can be attached: {}",
+                    src.display()
+                )));
+            }
+            Ok(md) if !md.is_file() => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is not a regular file: {}",
+                    src.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath does not exist: {}",
+                    src.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is not readable by the daemon (permission denied): {}",
+                    src.display()
+                )));
+            }
+            // Any other stat outcome falls through to the copy below, whose
+            // error carries the I/O detail.
+            _ => {}
+        }
+    }
     let dir = resolve_within(root, ATTACHMENTS_DIR)?;
     std::fs::create_dir_all(&dir).map_err(io_err)?;
     // Belt-and-braces exclusion: an ignore-all `.gitignore` inside the
@@ -260,9 +296,21 @@ pub(crate) fn place_attachment(
             std::fs::write(&full, bytes).map_err(io_err)?;
             bytes.len() as u64
         }
+        // The stat above classified the common cases; this residual arm
+        // covers races (file replaced/removed between stat and copy) and
+        // genuine I/O failures.
         AttachmentSource::CopyFrom(src) => std::fs::copy(src, &full).map_err(|e| {
             let _ = std::fs::remove_file(&full);
-            Error::Internal(format!("Failed to read sourcePath {}: {e}", src.display()))
+            match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    Error::InvalidParams(format!("sourcePath does not exist: {}", src.display()))
+                }
+                std::io::ErrorKind::PermissionDenied => Error::InvalidParams(format!(
+                    "sourcePath is not readable (permission denied): {}",
+                    src.display()
+                )),
+                _ => Error::Internal(format!("failed to copy sourcePath {}: {e}", src.display())),
+            }
         })?,
     };
     let rel = format!("{ATTACHMENTS_DIR}/{chosen}");
@@ -925,13 +973,57 @@ mod tests {
             std::fs::read(std::path::Path::new(&root).join(".intent/attachments/src.bin")).unwrap(),
             b"copied bytes"
         );
-        // A missing source fails without leaving the claimed placeholder behind.
+        // A missing source fails as classified InvalidParams (monorepo#2144)
+        // without leaving the claimed placeholder behind.
         let missing = std::path::Path::new(&root).join("nope.bin");
         let err = place_attachment(&root, "gone.bin", AttachmentSource::CopyFrom(&missing));
-        assert!(matches!(err, Err(Error::Internal(_))));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
         assert!(!std::path::Path::new(&root)
             .join(".intent/attachments/gone.bin")
             .exists());
+    }
+
+    /// Regression (monorepo#2144): a dragged FOLDER used to fail the copy step
+    /// with an opaque -32603 "Internal error"; it must be rejected up front as
+    /// InvalidParams naming the cause, with no placeholder left behind.
+    #[test]
+    fn place_attachment_copy_from_directory_is_classified() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let subdir = std::path::Path::new(&root).join("some-folder");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let err = place_attachment(&root, "some-folder", AttachmentSource::CopyFrom(&subdir));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("directory"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        assert!(!std::path::Path::new(&root)
+            .join(".intent/attachments/some-folder")
+            .exists());
+    }
+
+    /// A symlink to a regular file is accepted: `fs::metadata` follows links,
+    /// matching the Finder/Explorer drag behavior for aliased files.
+    #[cfg(unix)]
+    #[test]
+    fn place_attachment_copy_from_symlink_to_file() {
+        use std::os::unix::fs::symlink;
+        let t = TempRoot::new();
+        let root = t.root();
+        let target = std::path::Path::new(&root).join("real.txt");
+        std::fs::write(&target, b"linked").unwrap();
+        let link = std::path::Path::new(&root).join("alias.txt");
+        symlink(&target, &link).unwrap();
+        let r = place_attachment(&root, "alias.txt", AttachmentSource::CopyFrom(&link)).unwrap();
+        assert_eq!(r["fileName"], json!("alias.txt"));
+        assert_eq!(r["size"], json!(6));
     }
 
     #[cfg(unix)]
