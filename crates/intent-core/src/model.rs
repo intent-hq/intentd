@@ -1613,6 +1613,12 @@ pub struct TaskConvertBlocksResult {
     pub ok: bool,
     pub converted_count: i64,
     pub created_note_ids: Vec<String>,
+    /// Non-fatal conversion problems: header parse issues, unresolvable or
+    /// ambiguous `dependsOn`/`conflictsWith` references, and validator-
+    /// rejected edges. Conversion never fails on these — the blocks still
+    /// convert and each skipped edge/attribute adds one entry here.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `task.createPrerequisite`.

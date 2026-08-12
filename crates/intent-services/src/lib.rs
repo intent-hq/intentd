@@ -8716,6 +8716,75 @@ fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     msg
 }
 
+/// Human-readable identifier for a `@@@task` block in conversion warnings:
+/// the block title plus the declared `key=` when present.
+fn task_block_label(task: &note_ops::ParsedTaskBlock) -> String {
+    match &task.key {
+        Some(key) => format!("\"{}\" (key={key})", task.title),
+        None => format!("\"{}\"", task.title),
+    }
+}
+
+/// The bare validator message for a conversion warning: relation validators
+/// return `Error::Internal`, whose `Display` prefixes "internal error: " —
+/// noise inside a warning string that already names the block and reference.
+fn relation_error_text(e: &Error) -> String {
+    match e {
+        Error::Internal(msg) | Error::InvalidParams(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve one raw `dependsOn`/`conflictsWith` header value to a task-note id
+/// during block conversion: (1) a sibling block's `key=`, (2) a sibling
+/// block's exact (trimmed) title, (3) an existing task-note id in the
+/// workspace. `None` in a map slot marks an ambiguous key/title (declared by
+/// more than one sibling block). Unresolvable or ambiguous values return
+/// `None` after pushing a warning naming the block and the reference.
+fn resolve_block_relation_value(
+    value: &str,
+    id_by_key: &HashMap<String, Option<NoteId>>,
+    id_by_title: &HashMap<String, Option<NoteId>>,
+    all: &[Note],
+    field: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<NoteId> {
+    match id_by_key.get(value) {
+        Some(Some(id)) => return Some(id.clone()),
+        Some(None) => {
+            warnings.push(format!(
+                "task block {label}: {field} reference \"{value}\" is ambiguous — \
+                 multiple sibling blocks declare key={value}; edge skipped"
+            ));
+            return None;
+        }
+        None => {}
+    }
+    match id_by_title.get(value.trim()) {
+        Some(Some(id)) => return Some(id.clone()),
+        Some(None) => {
+            warnings.push(format!(
+                "task block {label}: {field} reference \"{value}\" is ambiguous — \
+                 multiple sibling blocks share that title; edge skipped"
+            ));
+            return None;
+        }
+        None => {}
+    }
+    if let Some(n) = all
+        .iter()
+        .find(|n| n.id.as_str() == value && n.metadata.task.is_some())
+    {
+        return Some(n.id.clone());
+    }
+    warnings.push(format!(
+        "task block {label}: {field} reference \"{value}\" does not match a sibling \
+         block key, a sibling block title, or an existing task note id; edge skipped"
+    ));
+    None
+}
+
 /// Outcome of the best-effort auto-conversion of `@@@task` blocks that runs
 /// after every note content-write path (reference `notes.service.ts` parity,
 /// L633-647): populated when the just-written content contained at least one
@@ -8730,6 +8799,10 @@ struct AutoConvertOutcome {
     /// pre-conversion in-flight value — to match the reference, which
     /// refetches the note after conversion.
     refetched_note: Option<Note>,
+    /// Non-fatal conversion warnings (skipped relation edges, header parse
+    /// issues). Carried here so the note-write wire results can surface them;
+    /// until that lands they are logged by the auto-convert hook.
+    warnings: Vec<String>,
 }
 
 impl Services {
@@ -8758,11 +8831,21 @@ impl Services {
         {
             Ok(r) => {
                 let refetched_note = self.store.get_note(workspace_id, note_id).await.ok();
-                AutoConvertOutcome {
+                let outcome = AutoConvertOutcome {
                     converted_count: r.converted_count,
                     created_note_ids: r.created_note_ids,
                     refetched_note,
+                    warnings: r.warnings,
+                };
+                if !outcome.warnings.is_empty() {
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        note_id = %note_id,
+                        warnings = ?outcome.warnings,
+                        "task-block conversion produced warnings"
+                    );
                 }
+                outcome
             }
             Err(e) => {
                 tracing::warn!(
@@ -8795,6 +8878,7 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                warnings: Vec::new(),
             });
         }
         // Mirror the TS guard: only parse when a `@@@task` fence exists.
@@ -8818,6 +8902,7 @@ impl Services {
         // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
         let mut working = parsed.content_without_blocks.clone();
         let mut created_note_ids: Vec<String> = Vec::new();
+        let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
         let mut peer_order = 100i64;
         for (i, task) in parsed.tasks.iter().enumerate() {
             let body = if task.content.is_empty() {
@@ -8837,6 +8922,7 @@ impl Services {
                             body,
                             TaskStatus::NotStarted,
                             Some(peer_order),
+                            task.effort.clone(),
                             caller_agent_id,
                         )
                         .await?;
@@ -8851,7 +8937,144 @@ impl Services {
                 task.title, task_note_id.0
             );
             working = working.replace(&placeholder, &linked);
+            block_note_ids.push(task_note_id);
             peer_order += 100;
+        }
+
+        // Convert-with-warnings: bad header attributes or relation references
+        // never fail the conversion — the blocks above already converted;
+        // every dropped attribute or skipped edge adds one warning entry.
+        let mut warnings: Vec<String> = Vec::new();
+        for task in &parsed.tasks {
+            for issue in &task.issues {
+                warnings.push(format!("task block {}: {issue}", task_block_label(task)));
+            }
+        }
+        // Sibling resolution maps for `dependsOn`/`conflictsWith` values:
+        // `key=` declarations first, exact (trimmed) titles second. A slot
+        // holding `None` marks a key/title declared by more than one sibling
+        // block resolving to different notes — references to it are ambiguous.
+        let mut id_by_key: HashMap<String, Option<NoteId>> = HashMap::new();
+        let mut id_by_title: HashMap<String, Option<NoteId>> = HashMap::new();
+        for (i, task) in parsed.tasks.iter().enumerate() {
+            let id = &block_note_ids[i];
+            if let Some(key) = &task.key {
+                id_by_key
+                    .entry(key.clone())
+                    .and_modify(|slot| {
+                        if slot.as_ref() != Some(id) {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(id.clone()));
+            }
+            id_by_title
+                .entry(task.title.trim().to_string())
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(id) {
+                        *slot = None;
+                    }
+                })
+                .or_insert_with(|| Some(id.clone()));
+        }
+        // Seed resolved relations through the same validated writer as
+        // `task.setRelations`, one block at a time in declaration order.
+        // Each candidate edge is pre-checked individually (self/task-ness,
+        // cycle, tree ancestry) against a fresh workspace snapshot that
+        // includes the children created above and the edges seeded for
+        // earlier blocks; a rejected edge is skipped with a warning while the
+        // accepted ones still apply.
+        for (i, task) in parsed.tasks.iter().enumerate() {
+            if task.depends_on.is_empty() && task.conflicts_with.is_empty() {
+                continue;
+            }
+            let self_id = &block_note_ids[i];
+            let label = task_block_label(task);
+            let all = store.list_notes(&workspace_id).await?;
+            let mut deps: Vec<NoteId> = Vec::new();
+            for value in &task.depends_on {
+                let Some(dep) = resolve_block_relation_value(
+                    value,
+                    &id_by_key,
+                    &id_by_title,
+                    &all,
+                    "dependsOn",
+                    &label,
+                    &mut warnings,
+                ) else {
+                    continue;
+                };
+                let edge = [dep.clone()];
+                // A cycle through `self_id` uses exactly one of its outgoing
+                // edges, so checking each edge alone is equivalent to
+                // checking the combined list.
+                let checked = validate_relation_ids(self_id, &edge, &all, "dependsOn")
+                    .and_then(|_| match find_dependency_cycle(self_id, &edge, &all) {
+                        Some(cycle) => Err(Error::Internal(format!(
+                            "dependsOn would create a cycle: {}",
+                            cycle.join(" -> ")
+                        ))),
+                        None => Ok(()),
+                    })
+                    .and_then(|_| ensure_no_tree_relative_dependency(self_id, &edge, &all));
+                match checked {
+                    Ok(()) => deps.push(dep),
+                    Err(e) => warnings.push(format!(
+                        "task block {label}: dependsOn reference \"{value}\" rejected: {}; \
+                         edge skipped",
+                        relation_error_text(&e)
+                    )),
+                }
+            }
+            let mut conflicts: Vec<NoteId> = Vec::new();
+            for value in &task.conflicts_with {
+                let Some(conflict) = resolve_block_relation_value(
+                    value,
+                    &id_by_key,
+                    &id_by_title,
+                    &all,
+                    "conflictsWith",
+                    &label,
+                    &mut warnings,
+                ) else {
+                    continue;
+                };
+                match validate_relation_ids(
+                    self_id,
+                    std::slice::from_ref(&conflict),
+                    &all,
+                    "conflictsWith",
+                ) {
+                    Ok(()) => conflicts.push(conflict),
+                    Err(e) => warnings.push(format!(
+                        "task block {label}: conflictsWith reference \"{value}\" rejected: {}; \
+                         edge skipped",
+                        relation_error_text(&e)
+                    )),
+                }
+            }
+            if deps.is_empty() && conflicts.is_empty() {
+                continue;
+            }
+            // Same code path as `task.setRelations`, so the `note:updated` +
+            // `notes:ready-tasks-changed` (`relations-changed`) emissions
+            // match §6.5. Empty accepted lists pass `None` (skip) rather than
+            // `Some([])` (clear), so a block whose references were all
+            // skipped never clobbers relations an existing child already has.
+            if let Err(e) = self
+                .task_set_relations(
+                    workspace_id.clone(),
+                    self_id.clone(),
+                    (!deps.is_empty()).then_some(deps),
+                    (!conflicts.is_empty()).then_some(conflicts),
+                )
+                .await
+            {
+                warnings.push(format!(
+                    "task block {label}: failed to seed relations: {}",
+                    relation_error_text(&e)
+                ));
+            }
         }
 
         let content_changed = working != note.content;
@@ -8860,6 +9083,7 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                warnings,
             });
         }
         note.content = working;
@@ -8896,13 +9120,15 @@ impl Services {
             ok: true,
             converted_count: created_note_ids.len() as i64,
             created_note_ids,
+            warnings,
         })
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
-    /// `status` (and optional `peer_order`). Shared by `createPrerequisite` and
-    /// `convertBlocks`. `caller_agent_id` attributes the emitted `task:created`
-    /// to the acting agent when the creation is agent-driven.
+    /// `status` (and optional `peer_order` / `estimated_effort`). Shared by
+    /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
+    /// the emitted `task:created` to the acting agent when the creation is
+    /// agent-driven.
     #[allow(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
@@ -8912,9 +9138,12 @@ impl Services {
         content: String,
         status: TaskStatus,
         peer_order: Option<i64>,
+        estimated_effort: Option<String>,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
         let now = now_iso();
+        let mut task_meta = fresh_task_metadata(status, &now, peer_order);
+        task_meta.estimated_effort = estimated_effort;
         let note = Note {
             id: NoteId::new(),
             workspace_id: workspace_id.clone(),
@@ -8928,7 +9157,7 @@ impl Services {
             parent_id: Some(parent_id.clone()),
             visibility: NoteVisibility::Workspace,
             metadata: NoteMetadata {
-                task: Some(fresh_task_metadata(status, &now, peer_order)),
+                task: Some(task_meta),
             },
             created_at: now.clone(),
             rev: 0,
@@ -16302,6 +16531,7 @@ impl WorkspaceApi for Services {
                     &title,
                     content.unwrap_or_default(),
                     task_status,
+                    None,
                     None,
                     caller_agent_id.as_ref(),
                 )
