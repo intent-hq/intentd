@@ -31,12 +31,12 @@ use intent_core::{
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
     LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
-    NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata, NoteRestoreVersionResult,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
-    NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult,
-    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
-    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
+    ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript,
+    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
     TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
@@ -15356,7 +15356,7 @@ impl WorkspaceApi for Services {
         input: NoteCreate,
         idempotency_key: Option<String>,
         caller_agent_id: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<Note>> {
+    ) -> BoxFuture<'_, Result<NoteCreateResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
@@ -15419,7 +15419,13 @@ impl WorkspaceApi for Services {
                         ),
                     )
                     .await;
-                    Ok(note)
+                    Ok(NoteCreateResult {
+                        note,
+                        converted_count: outcome.converted_count,
+                        created_task_note_ids: outcome.created_note_ids,
+                        created_tasks: outcome.created_tasks,
+                        warnings: outcome.warnings,
+                    })
                 },
             )
             .await

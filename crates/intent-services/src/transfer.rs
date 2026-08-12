@@ -52,7 +52,7 @@ impl Services {
             live_sandboxes.iter().map(|s| s.branch.clone()).collect();
 
         let worktree = git_ops::worktree_path(&ws);
-        let (git, estimated_git_bundle_bytes) = match worktree {
+        let (git, estimated_git_bundle_bytes, nested_repo_dirs) = match worktree {
             Some(root) if intent_git::is_repository(&root) => {
                 let branches = sandbox_branches.clone();
                 tokio::task::spawn_blocking(move || {
@@ -71,6 +71,7 @@ impl Services {
                         Err(_) => (intent_git::status::current_branch_at(&root), Vec::new()),
                     };
                     let bundle = estimate_bundle_bytes(&root, &branches);
+                    let nested = crate::transfer_git::nested_repo_dirs(&root);
                     (
                         TransferGitSummary {
                             has_repository: true,
@@ -79,6 +80,7 @@ impl Services {
                             sandbox_branches: branches,
                         },
                         bundle,
+                        nested,
                     )
                 })
                 .await
@@ -92,6 +94,7 @@ impl Services {
                     sandbox_branches,
                 },
                 0,
+                Vec::new(),
             ),
         };
 
@@ -132,6 +135,16 @@ impl Services {
                     "{} unmerged sandbox(es); their branches ride in the bundle and are \
                      re-provisioned on the target",
                     live_sandboxes.len()
+                ),
+            });
+        }
+        if !nested_repo_dirs.is_empty() {
+            warnings.push(TransferWarning {
+                code: "nested-repos-skipped".to_string(),
+                message: format!(
+                    "{} nested git repo(s)/worktree(s) will not travel with the export: {}",
+                    nested_repo_dirs.len(),
+                    nested_repo_dirs.join(", ")
                 ),
             });
         }
@@ -530,6 +543,52 @@ mod tests {
         assert!(codes.contains(&"agents-running"));
         assert!(codes.contains(&"uncommitted-changes"));
         assert!(codes.contains(&"unmerged-sandboxes"));
+    }
+
+    /// A repo whose only anomaly is an untracked nested git repo plans
+    /// cleanly: the nested dir never reaches `dirtyFiles` (so no
+    /// `uncommitted-changes` warning) but the `nested-repos-skipped` warning
+    /// names it so the user knows it will not travel.
+    #[tokio::test]
+    async fn transfer_plan_warns_on_nested_repos() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+
+        let repo = TempDir::new("intentd-transfer-nested");
+        run_git(&repo.0, &["init", "-b", "main"]);
+        std::fs::write(repo.0.join("a.txt"), "committed content").expect("write");
+        run_git(&repo.0, &["add", "."]);
+        run_git(&repo.0, &["commit", "-m", "init"]);
+        let nested = repo.0.join(".import-wt");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        run_git(&nested, &["init", "-b", "main"]);
+        std::fs::write(nested.join("inner.txt"), "inner").expect("write");
+
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(repo.0.to_string_lossy().to_string());
+        store.insert_workspace(&w).await.expect("ws");
+
+        let svc = Services::new(store);
+        let plan = svc
+            .workspace_transfer_plan_op(ws.clone())
+            .await
+            .expect("plan");
+
+        assert!(plan.manifest.git.dirty_files.is_empty());
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.code == "uncommitted-changes"),
+            "nested repo alone is not an uncommitted change"
+        );
+        let warn = plan
+            .warnings
+            .iter()
+            .find(|w| w.code == "nested-repos-skipped")
+            .expect("nested-repos-skipped warning");
+        assert!(warn.message.contains(".import-wt"), "{}", warn.message);
     }
 
     /// A workspace with no git repository and no assets still plans cleanly:

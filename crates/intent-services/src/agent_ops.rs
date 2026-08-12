@@ -6284,8 +6284,10 @@ impl Services {
             )
         };
         // Effort-weighted critical-path estimate (response text only, no wake
-        // changes): surfaced only when at least one involved task carries a
-        // parseable estimate — otherwise the number is pure defaults.
+        // changes): surfaced only when at least one requested chain carries a
+        // parseable estimate — pure-defaults graphs stay silent, and the
+        // number reflects only estimated chains, so it can understate when
+        // an unestimated chain is longer.
         let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
         if let Some(minutes) = critical_path_minutes {
             unlock_message.push_str(&format!(

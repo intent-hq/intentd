@@ -7607,7 +7607,10 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
 /// the result carries `{ plan }` with the versioned manifest (formatVersion,
 /// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
 /// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
-/// never listed; unknown workspace ids map to `-32602 Workspace not found`.
+/// never listed; a repo holding an untracked nested git repo surfaces the
+/// `nested-repos-skipped` warning naming the dir (and no spurious
+/// `uncommitted-changes`); unknown workspace ids map to
+/// `-32602 Workspace not found`.
 #[tokio::test]
 async fn wss_workspace_transfer_plan_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -7662,11 +7665,81 @@ async fn wss_workspace_transfer_plan_round_trip() {
     );
     assert!(plan["warnings"].is_array(), "{resp}");
 
+    // A git-backed workspace whose repo holds an untracked nested git repo:
+    // the plan's warnings carry the `nested-repos-skipped` code naming the
+    // directory, and the nested dir never shows up in `dirtyFiles`.
+    let repo_dir = test_tempdir("intentd-wss-transfer-nested-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let nested = repo.join(".import-wt");
+    std::fs::create_dir_all(&nested).unwrap();
+    let ok = std::process::Command::new("git")
+        .current_dir(&nested)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .expect("run git")
+        .success();
+    assert!(ok, "nested git init failed");
+    std::fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.create","params":{{"title":"WSS Transfer Nested","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let nested_ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.transfer.plan","params":{{"workspaceId":"{nested_ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let plan = &resp["result"]["plan"];
+    assert_eq!(plan["manifest"]["git"]["hasRepository"], true, "{resp}");
+    assert_eq!(
+        plan["manifest"]["git"]["dirtyFiles"],
+        serde_json::json!([]),
+        "nested repo dir must not appear as a dirty file: {resp}"
+    );
+    let warnings = plan["warnings"].as_array().expect("warnings array");
+    let nested_warn = warnings
+        .iter()
+        .find(|w| w["code"] == "nested-repos-skipped")
+        .unwrap_or_else(|| panic!("nested-repos-skipped warning missing: {resp}"));
+    assert!(
+        nested_warn["message"]
+            .as_str()
+            .expect("message string")
+            .contains(".import-wt"),
+        "warning names the skipped dir: {resp}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w["code"] == "uncommitted-changes"),
+        "nested repo alone is not an uncommitted change: {resp}"
+    );
+
     // Unknown workspace → the standard workspace-not-found mapping.
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");

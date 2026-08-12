@@ -798,6 +798,21 @@ async fn task_block_author_list_assign_flow_over_wss() {
         content.contains("- [ ] [Ship It](intent://local/task/"),
         "no task link: {content}"
     );
+    // The result surfaces the conversion outcome alongside the note (parity
+    // with the four content-write ops): `convertedCount`, `createdTaskNoteIds`,
+    // `createdTasks`, `warnings`.
+    assert_eq!(created["convertedCount"], json!(1), "result: {created}");
+    let created_ids = created["createdTaskNoteIds"]
+        .as_array()
+        .expect("createdTaskNoteIds array");
+    assert_eq!(created_ids.len(), 1, "result: {created}");
+    let created_tasks = created["createdTasks"]
+        .as_array()
+        .expect("createdTasks array");
+    assert_eq!(created_tasks.len(), 1, "result: {created}");
+    assert_eq!(created_tasks[0]["title"], json!("Ship It"));
+    assert_eq!(created_tasks[0]["noteId"], created_ids[0]);
+    assert_eq!(created["warnings"], json!([]), "result: {created}");
 
     // List: the converted block is a linked task row.
     let tasks = wss_rpc(
