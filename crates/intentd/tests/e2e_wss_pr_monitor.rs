@@ -269,7 +269,13 @@ impl SourceControl for StubForge {
         })
     }
     async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
-        unsupported("list_prs")
+        // Empty page (not `Unsupported`): a merged/closed linked PR triggers
+        // relink discovery inside the terminal refresh, and an empty page
+        // exercises the clean "no matching open PR" branch.
+        Ok(Page {
+            items: vec![],
+            next_cursor: None,
+        })
     }
     async fn update_pr(&self, _: &RepoRef, _: u64, _: PrPatch) -> ScResult<PullRequest> {
         unsupported("update_pr")
@@ -995,6 +1001,61 @@ async fn merged_pr_completes_the_monitor_but_keeps_it_listed_over_wss() {
     assert_eq!(metadata["prNumber"], 42);
     assert_eq!(metadata["reason"], "completed");
     assert_eq!(metadata["url"], "https://github.com/o/r/pull/42");
+}
+
+/// A merged PR on a LINKED workspace refreshes the persisted PR linkage as
+/// part of the terminal completion (intent-hq/monorepo#2094): `pr:updated`
+/// fires over the wire and `workspace.get` serves `prStatus: "Merged"` +
+/// the refreshed `activePullRequest` — with no explicit `pr.refresh` call.
+#[tokio::test]
+async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
+    let fx = boot().await;
+    // Link the fixture workspace to the monitored PR up front (the fixture
+    // branch "feature" matches the stub PR's head ref).
+    let mut row = fx.services.store().get_workspace(&fx.ws_id).await.unwrap();
+    row.pr_number = Some(42);
+    row.pr_url = Some("https://github.com/o/r/pull/42".into());
+    row.pr_status = Some(intent_core::PullRequestStatus::Open);
+    fx.services.store().update_workspace(&row).await.unwrap();
+    fx.services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["pr:updated"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    fx.forge.edit(|s| s.merged = true);
+    fx.services.poll_pr_monitors().await;
+
+    // The terminal completion itself emitted the linkage delta — no
+    // `pr.refresh` call anywhere in this test.
+    let evt = next_event(&mut sub, "pr:updated").await;
+    assert_eq!(evt["data"]["workspaceId"], fx.ws_id.as_str());
+    assert_eq!(evt["data"]["prNumber"], 42);
+    assert_eq!(evt["data"]["prStatus"], "Merged");
+    assert_eq!(evt["data"]["activePullRequest"]["status"], "Merged");
+
+    // The client-visible read path serves the refreshed linkage.
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let got = wss_rpc(
+        &mut rpc,
+        2,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let ws = &got["workspace"];
+    assert_eq!(ws["prStatus"], "Merged", "workspace.get: {got}");
+    assert_eq!(ws["prNumber"], 42, "link retained (empty discovery page)");
+    assert_eq!(ws["activePullRequest"]["status"], "Merged");
 }
 
 /// Active-monitor `displayStatus` promotion over the wire (PROTOCOL §6.5,

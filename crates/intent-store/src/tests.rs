@@ -604,6 +604,59 @@ async fn workspace_pull_requests_round_trip_and_clear() {
     assert!(reread.pull_requests.is_none());
 }
 
+/// `update_workspace_pr_linkage` writes ONLY the PR columns + `updated_at`:
+/// a stale snapshot carrying old values for other columns (title, archived)
+/// must never clobber a concurrent mutation of those columns.
+#[tokio::test]
+async fn workspace_pr_linkage_update_is_scoped() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Before", false))
+        .await
+        .expect("insert");
+    // Stale snapshot taken before a concurrent full-row mutation.
+    let mut stale = store.get_workspace(&id).await.expect("snapshot");
+
+    let mut concurrent = store.get_workspace(&id).await.expect("get");
+    concurrent.title = "Renamed meanwhile".to_string();
+    concurrent.archived = true;
+    concurrent.archived_at = Some(now_iso());
+    concurrent.status = WorkspaceStatus::Archived;
+    store
+        .update_workspace(&concurrent)
+        .await
+        .expect("concurrent mutation");
+
+    stale.pr_number = Some(99);
+    stale.pr_url = Some("https://example.com/pr/99".to_string());
+    stale.pr_status = Some(intent_core::PullRequestStatus::Merged);
+    stale.updated_at = now_iso();
+    store
+        .update_workspace_pr_linkage(&stale)
+        .await
+        .expect("scoped pr write");
+
+    let after = store.get_workspace(&id).await.expect("re-get");
+    assert_eq!(after.pr_number, Some(99), "pr columns written");
+    assert_eq!(
+        after.pr_status,
+        Some(intent_core::PullRequestStatus::Merged)
+    );
+    assert_eq!(
+        after.title, "Renamed meanwhile",
+        "stale snapshot must not clobber a concurrent title edit"
+    );
+    assert!(after.archived, "stale snapshot must not resurrect archived");
+
+    let missing = store
+        .update_workspace_pr_linkage(&sample_workspace(&WorkspaceId::new(), "?", false))
+        .await;
+    assert!(matches!(missing, Err(crate::Error::NotFound(_))));
+}
+
 /// `delete_workspace` records a tombstone so `workspace_id_ever_used` keeps
 /// reporting the id as used after the row is gone — `workspace.create` relies
 /// on this to never recycle a deleted workspace id.

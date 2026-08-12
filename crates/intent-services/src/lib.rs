@@ -752,7 +752,9 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// the missed `pr:*` event is not replayed (the next sweep diffs against the
 /// already-persisted snapshot).
 ///
-/// Sweep-only by design: the on-demand `pr.refresh` RPC path
+/// Background-callers-only by design: besides the refresh sweep, the
+/// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`) wraps
+/// its refresh in the same budget. The on-demand `pr.refresh` RPC path
 /// ([`Services::refresh_workspace_pr`]) is caller-scoped — a hang there
 /// blocks only the calling RPC, which the client-level network timeouts
 /// already bound — so it is deliberately not wrapped in this timeout.
@@ -2556,11 +2558,12 @@ impl Services {
     /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
     ///
-    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`]: this path is
-    /// caller-scoped (`pr.refresh` RPC) — a hang here blocks only the calling
-    /// RPC, which the client-level network timeouts already bound. The
-    /// timeout guards only the background sweep
-    /// ([`Services::refresh_all_workspace_prs`]).
+    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`] here: the
+    /// `pr.refresh` RPC path is caller-scoped — a hang blocks only the
+    /// calling RPC, which the client-level network timeouts already bound.
+    /// The background callers wrap this future in that timeout themselves:
+    /// the refresh sweep ([`Services::refresh_all_workspace_prs`]) and the
+    /// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`).
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -2587,11 +2590,12 @@ impl Services {
     /// re-reading the workspace row — on every call: the background sweep
     /// resolves the provider once per cycle and passes each workspace from its
     /// sweep-start `list_workspaces` snapshot (avoiding a redundant per-workspace
-    /// point read, intent-hq/monorepo#703). Accepted tradeoff: when a PR delta
-    /// is persisted, `update_workspace` writes back the (possibly stale)
-    /// snapshot row, so concurrent workspace mutations made after the snapshot
-    /// was taken can be clobbered — callers who need fresh-read semantics must
-    /// fetch immediately before calling (as [`refresh_workspace_pr`] does).
+    /// point read, intent-hq/monorepo#703). Persistence goes through the
+    /// scoped `update_workspace_pr_linkage` (PR columns + `updated_at` only),
+    /// so a possibly-stale snapshot row never clobbers concurrent mutations of
+    /// other columns (archive, title edit, attention) — the PR columns
+    /// themselves are last-writer-wins, which refreshes tolerate by design
+    /// (idempotent against the forge; the next sweep converges).
     async fn refresh_workspace_pr_with_sc(
         &self,
         mut ws: Workspace,
@@ -2624,7 +2628,7 @@ impl Services {
                     ws.pr_status = None;
                     ws.active_pull_request = None;
                     ws.updated_at = now_iso();
-                    self.store.update_workspace(&ws).await?;
+                    self.store.update_workspace_pr_linkage(&ws).await?;
                     publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Unlinked);
@@ -2672,7 +2676,7 @@ impl Services {
                         ws.pr_status = Some(open_info.status);
                         ws.active_pull_request = Some(open_info);
                         ws.updated_at = now_iso();
-                        self.store.update_workspace(&ws).await?;
+                        self.store.update_workspace_pr_linkage(&ws).await?;
                         publish_event(&self.event_bus, pr_linked_event(&ws)).await;
                         self.maybe_emit_display_status_changed(&ws.id).await;
                         return Ok(PrRefreshOutcome::Linked);
@@ -2689,7 +2693,7 @@ impl Services {
                 ws.pr_url = Some(pr.url.clone());
                 ws.active_pull_request = Some(info);
                 ws.updated_at = now_iso();
-                self.store.update_workspace(&ws).await?;
+                self.store.update_workspace_pr_linkage(&ws).await?;
                 publish_event(&self.event_bus, pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
                 Ok(PrRefreshOutcome::Updated)
@@ -2718,7 +2722,7 @@ impl Services {
                         ws.pr_status = Some(info.status);
                         ws.active_pull_request = Some(info);
                         ws.updated_at = now_iso();
-                        self.store.update_workspace(&ws).await?;
+                        self.store.update_workspace_pr_linkage(&ws).await?;
                         publish_event(&self.event_bus, pr_linked_event(&ws)).await;
                         self.maybe_emit_display_status_changed(&ws.id).await;
                         Ok(PrRefreshOutcome::Linked)
