@@ -127,6 +127,23 @@ fn resolve_binary_path_with_tool_dirs(
     common_paths: &[String],
     enriched_tool_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs_and_lookup(
+        name,
+        common_paths,
+        enriched_tool_dirs,
+        lookup_in_path,
+    )
+}
+
+fn resolve_binary_path_with_tool_dirs_and_lookup<F>(
+    name: &str,
+    common_paths: &[String],
+    enriched_tool_dirs: &[PathBuf],
+    path_lookup: F,
+) -> Option<PathBuf>
+where
+    F: FnOnce(&str) -> Option<PathBuf>,
+{
     if name.is_empty() {
         return None;
     }
@@ -139,12 +156,12 @@ fn resolve_binary_path_with_tool_dirs(
             .filter(|dir| is_nvm_node_bin_dir(dir))
             .cloned()
             .collect();
-        if let Some(path) = find_in_dir_candidates(name, &nvm_dirs) {
+        if let Some(path) = find_executable_in_dir_candidates(name, &nvm_dirs) {
             return Some(path);
         }
     }
     // 1. PATH which/where (ranked so Windows prefers a runnable extension)
-    if let Some(path) = lookup_in_path(name) {
+    if let Some(path) = path_lookup(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
         }
@@ -233,6 +250,37 @@ fn find_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn find_executable_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let candidates = name_candidates_for(name, cfg!(windows));
+    for dir in dirs {
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if is_executable_file(&full) {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        has_windows_exec_extension(path)
+    }
 }
 
 /// Run `which`/`where` to consult PATH, then rank the results so a

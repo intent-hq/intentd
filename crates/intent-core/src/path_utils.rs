@@ -445,14 +445,15 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
-fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64)> {
+fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
     let version = path.file_name()?.to_str()?.strip_prefix('v')?;
     let core = version.split(['-', '+']).next()?;
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
-    (parts.next().is_none()).then_some((major, minor, patch))
+    let is_stable = !version.contains('-');
+    (parts.next().is_none()).then_some((major, minor, patch, is_stable))
 }
 
 /// Injectable core - accepts the home directory and a function that returns
@@ -765,17 +766,25 @@ mod tests {
         );
         let home = std::env::temp_dir().join(unique);
         let v20_bin = home.join(".nvm/versions/node/v20.19.0/bin");
+        let v24_rc_bin = home.join(".nvm/versions/node/v24.5.0-rc.1/bin");
         let v24_bin = home.join(".nvm/versions/node/v24.5.0/bin");
         std::fs::create_dir_all(&v20_bin).unwrap();
+        std::fs::create_dir_all(&v24_rc_bin).unwrap();
         std::fs::create_dir_all(&v24_bin).unwrap();
 
         let dirs = enriched_tool_dirs_impl(Some(&home), || &[]);
 
         assert!(dirs.contains(&v20_bin));
+        assert!(dirs.contains(&v24_rc_bin));
         assert!(dirs.contains(&v24_bin));
         let v20_position = dirs.iter().position(|dir| dir == &v20_bin).unwrap();
+        let v24_rc_position = dirs.iter().position(|dir| dir == &v24_rc_bin).unwrap();
         let v24_position = dirs.iter().position(|dir| dir == &v24_bin).unwrap();
         assert!(v24_position < v20_position, "newest nvm Node must be first");
+        assert!(
+            v24_position < v24_rc_position,
+            "stable nvm Node must sort ahead of a matching prerelease"
+        );
         assert!(dirs.contains(&home.join(".local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
         std::fs::remove_dir_all(&home).unwrap();

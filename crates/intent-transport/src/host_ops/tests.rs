@@ -521,6 +521,31 @@ fn resolve_binary_path_prefers_newest_nvm_node_version() {
     assert_eq!(resolved.as_deref(), Some(binary.as_path()));
 }
 
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_skips_non_executable_nvm_node_for_path_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_temp_dir("nvm-non-executable-home");
+    let nvm_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+    let path_bin = home.path().join("path-bin");
+    std::fs::create_dir_all(&nvm_bin).unwrap();
+    std::fs::create_dir_all(&path_bin).unwrap();
+    let non_executable = nvm_bin.join("node");
+    std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path_node = path_bin.join("node");
+    std::fs::write(&path_node, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool_dirs = vec![nvm_bin];
+
+    let resolved = resolve_binary_path_with_tool_dirs_and_lookup("node", &[], &tool_dirs, |_| {
+        Some(path_node.clone())
+    });
+
+    assert_eq!(resolved.as_deref(), Some(path_node.as_path()));
+}
+
 /// `find_binary_op` caches a POSITIVE resolution: removing the resolved
 /// binary after the first call must not flip a second, cached call to
 /// unavailable within the TTL.
