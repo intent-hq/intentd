@@ -6796,6 +6796,7 @@ mod wsapi3_bindings_tests {
         // Conversion outcome is appended to the binding result (parity with
         // the content-write ops).
         assert_eq!(v["convertedCount"], json!(0));
+        assert_eq!(v["createdTaskNoteIds"], json!([]));
         assert_eq!(v["createdTasks"], json!([]));
         assert_eq!(v["warnings"], json!([]));
         let created = api.create_note_calls.lock().unwrap();

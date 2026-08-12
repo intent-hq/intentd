@@ -181,6 +181,7 @@ async fn create(
         "link": link,
         "markdownLink": markdown_link,
         "convertedCount": result.converted_count,
+        "createdTaskNoteIds": result.created_task_note_ids,
         "createdTasks": result.created_tasks,
         "warnings": result.warnings,
     }))
