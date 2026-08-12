@@ -1098,6 +1098,206 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     assert!(reg.is_registered(&active), "active process kept");
 }
 
+/// monorepo#2104 (#1161 review) — a live-turn slot that outlived its turn must
+/// not outlive it INTO the next turn. `flush_partial_turn_on_interruption`
+/// deliberately keeps the slot on a non-UNIQUE store error (it is the only copy
+/// of the streamed content), and `end_turn` then releases busy. The next turn
+/// claims busy here, but its worker replaces the slot only in `begin_live_turn`
+/// — after the user row INSERT, the task spawn and the ACP session setup. For
+/// that whole window the pair (busy = true, slot = the PREVIOUS turn's content)
+/// would otherwise be readable, and `chat_snapshot` would serve the old content
+/// as `isStreaming: true`. Claiming the slot drops it.
+#[tokio::test]
+async fn try_begin_drops_a_live_turn_slot_that_outlived_its_turn() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-stale-slot");
+    let id = AgentId::from("a-stale-slot");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+
+    // The orphan a failed flush leaves behind: content, no busy claim.
+    mgr.services.set_live_turn(
+        &id,
+        "msg-previous-turn",
+        vec![json!({ "type": "text", "id": "msg-previous-turn:0", "text": "I'll run " })],
+    );
+    assert!(
+        mgr.services.live_turn(&id).is_some(),
+        "precondition: the orphan slot is published while the agent is idle"
+    );
+
+    assert!(mgr.try_begin(&id, &ws).await, "the next turn claims busy");
+
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "the previous turn's slot must not survive the new turn's claim"
+    );
+    assert!(mgr.is_busy(&id), "…and the claim itself still stands");
+}
+
+/// intentd#1157 composition corner: the claim must leave a slot whose teardown
+/// flush is IN FLIGHT alone.
+///
+/// `interrupt_inner` pins WITHOUT a busy claim — its gates are a live connection
+/// handle and a persisted `acpSessionId` — so a stop against an idle agent can
+/// have a pin+flush in flight while a concurrent message wins `try_begin`. Since
+/// monorepo#2110 the flush re-reads the slot AS OF FLUSH TIME, so clearing it
+/// here would do double damage: drop the content, and make the flush read the
+/// pinned slot as vanished — which it interprets as "the worker already
+/// persisted the full row", silently losing the turn instead of recording it.
+#[tokio::test]
+async fn try_begin_leaves_a_slot_whose_teardown_flush_is_in_flight() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-pinned-slot");
+    let id = AgentId::from("a-pinned-slot");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+
+    mgr.services.set_live_turn(
+        &id,
+        "msg-being-flushed",
+        vec![json!({ "type": "text", "id": "msg-being-flushed:0", "text": "I'll run " })],
+    );
+    // The teardown path pins immediately before aborting the worker; its flush
+    // has not run yet.
+    mgr.services.pin_live_turn(&id);
+
+    assert!(mgr.try_begin(&id, &ws).await, "the new message claims busy");
+
+    let live = mgr
+        .services
+        .live_turn(&id)
+        .expect("a pin with a flush still in flight owns the slot: the claim must not clear it");
+    assert_eq!(live.message_id, "msg-being-flushed");
+    assert!(live.flush_pending, "…and the pin is untouched");
+}
+
+/// The other side of that guard, and the reason it cannot simply be "skip
+/// anything pinned": the deliberate flush-failure keep stays pinned FOREVER, so
+/// a blanket pin-skip would sail it into the next turn and re-expose the
+/// monorepo#2138 stale-gilding this clear exists to prevent.
+///
+/// Driven through the real give-up arm — the flush targets an agent with no
+/// `agent_session` row, so the append fails the `agent_message.agent_id` foreign
+/// key (a genuine store error, NOT the UNIQUE-id collision), which is the arm
+/// that keeps the slot.
+#[tokio::test]
+async fn try_begin_drops_a_slot_whose_flush_already_gave_up() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-flush-gave-up");
+    // Deliberately NOT seeded: no agent_session row, so the flush's INSERT
+    // violates agent_message's foreign key.
+    let id = AgentId::from("a-flush-gave-up");
+    track(&mgr, &id);
+
+    mgr.services.set_live_turn(
+        &id,
+        "msg-stranded",
+        vec![json!({ "type": "text", "id": "msg-stranded:0", "text": "I'll run " })],
+    );
+    mgr.services.pin_live_turn(&id);
+
+    let flushed = mgr
+        .services
+        .flush_pinned_turn_on_interruption(
+            &id,
+            crate::agent_session::InterruptReason::UserStop,
+            None,
+        )
+        .await
+        .expect("the pinned slot was there to flush");
+    assert!(
+        flushed.message_id.is_none(),
+        "precondition: the store rejected the append, so nothing was persisted"
+    );
+    let kept = mgr
+        .services
+        .live_turn(&id)
+        .expect("the give-up arm keeps the slot as the only copy of the content");
+    assert!(
+        kept.flush_pending,
+        "the pin is kept too, so the guard drop and the normal turn-end clear still leave it alone"
+    );
+    assert!(
+        kept.flush_failed,
+        "…but it is marked abandoned: no flush is coming back for it"
+    );
+
+    assert!(mgr.try_begin(&id, &ws).await, "the next turn claims busy");
+
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "an abandoned slot must not outlive its turn into the next one (monorepo#2138)"
+    );
+}
+
+/// A later teardown re-pinning an abandoned slot gives it a real second chance:
+/// the fresh pin clears the abandoned mark, so the claim guard protects that
+/// flush exactly as it protects a first attempt.
+#[tokio::test]
+async fn re_pinning_an_abandoned_slot_makes_it_in_flight_again() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-repin");
+    let id = AgentId::from("a-repin");
+    track(&mgr, &id);
+
+    mgr.services.set_live_turn(
+        &id,
+        "msg-stranded",
+        vec![json!({ "type": "text", "id": "msg-stranded:0", "text": "I'll run " })],
+    );
+    mgr.services.pin_live_turn(&id);
+    let _ = mgr
+        .services
+        .flush_pinned_turn_on_interruption(
+            &id,
+            crate::agent_session::InterruptReason::UserStop,
+            None,
+        )
+        .await;
+    assert!(mgr.services.live_turn(&id).is_some_and(|s| s.flush_failed));
+
+    // A second teardown (e.g. graceful shutdown) reaches the same stranded content.
+    mgr.services.pin_live_turn(&id);
+
+    assert!(
+        mgr.services.live_turn(&id).is_some_and(|s| !s.flush_failed),
+        "a fresh pin means a fresh attempt is in flight"
+    );
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(
+        mgr.services.live_turn(&id).is_some(),
+        "…so the claim leaves it to that flush again"
+    );
+}
+
+/// The claim must not disturb a slot when it does NOT win: a second `try_begin`
+/// against an agent whose turn is already running is a no-op, so a live turn's
+/// own slot survives a losing claim.
+#[tokio::test]
+async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-losing-claim");
+    let id = AgentId::from("a-losing-claim");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(
+        &id,
+        "msg-running",
+        vec![json!({ "type": "text", "id": "msg-running:0", "text": "streaming…" })],
+    );
+
+    assert!(!mgr.try_begin(&id, &ws).await, "the second claim loses");
+
+    let live = mgr
+        .services
+        .live_turn(&id)
+        .expect("the running turn's slot survives a losing claim");
+    assert_eq!(live.message_id, "msg-running");
+}
+
 #[tokio::test]
 async fn reap_idle_older_than_skips_in_flight_agents() {
     let (_tmp, mgr) = manager().await;
