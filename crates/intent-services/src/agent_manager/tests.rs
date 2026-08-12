@@ -4010,9 +4010,9 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
 
 /// Regression: the keep-alive interrupt (`agent.stop` mid-turn) must persist
 /// the streamed-so-far assistant content instead of dropping it. The live-turn
-/// slot is snapshotted BEFORE the worker abort (the abort drops
-/// `LiveTurnGuard`, clearing the slot) and flushed via
-/// `flush_partial_turn_on_interruption` — same convention as the graceful
+/// slot is pinned BEFORE the worker abort (the abort drops `LiveTurnGuard`,
+/// which would otherwise clear the slot) and flushed after it via
+/// `flush_pinned_turn_on_interruption` — same convention as the graceful
 /// shutdown flush: the turn's minted message id, `metadata.interrupted = true`
 /// + `stopReason = "interrupted"`.
 #[tokio::test]
