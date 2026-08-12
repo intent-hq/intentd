@@ -1096,10 +1096,15 @@ mod tests {
         // Confirm the common-dir watch actually delivers BEFORE archiving —
         // the while-archived absence assertion below would otherwise pass
         // vacuously against a watch that never worked. Retried for the same
-        // delivery-start race as the other real-watcher tests.
+        // delivery-start race as the other real-watcher tests; attempt count
+        // sized so the total confirmation budget (attempts x 1500ms) reaches
+        // `LIVENESS` — a pure-liveness bound (monorepo#1630), where a fixed
+        // 20-attempt budget gave up under full parallel test load
+        // (monorepo#2012).
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let attempts = LIVENESS.as_millis() / 1500;
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("pre-archive-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
@@ -1145,9 +1150,13 @@ mod tests {
         flush_refresher(&refresher, &mut status_sub, &marker_id).await;
 
         // Common-dir ref changes trigger again. Retried for the same
-        // delivery-start race as the other real-watcher tests.
+        // delivery-start race as the other real-watcher tests, with the same
+        // liveness-sized attempt budget as the pre-archive confirmation — the
+        // re-created shared watch's registration and delivery start both lag
+        // under load, and the fixed 20-attempt budget is what flaked in
+        // monorepo#2012.
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("after-unarchive-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
@@ -1228,10 +1237,13 @@ mod tests {
 
         // Common-dir ref changes must still trigger for the workspace.
         // Retried for the same delivery-start race as the other real-watcher
-        // tests.
+        // tests; attempt count sized so the total confirmation budget
+        // (attempts x 1500ms) reaches `LIVENESS` — a pure-liveness bound
+        // (monorepo#1630, flaked as a fixed budget in monorepo#2012).
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let attempts = LIVENESS.as_millis() / 1500;
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("post-replace-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
