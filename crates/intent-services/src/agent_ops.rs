@@ -138,6 +138,12 @@ pub(crate) struct AssignedAgentScan {
 
 mod batch;
 
+// Delivery-time ready-set delta for completion wakes
+// (intent-hq/monorepo#2044). Pure helper only — the wake path consumes it in
+// a follow-up, so it is unreferenced outside its tests until then.
+#[allow(dead_code)]
+pub(crate) mod ready_delta;
+
 #[cfg(test)]
 mod tests;
 
