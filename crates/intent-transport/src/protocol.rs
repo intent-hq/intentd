@@ -118,9 +118,19 @@
 //! ephemeral quick-action and model-probe adapters live only seconds and have
 //! drained by the time a debug bundle is captured. All three are `null` until
 //! the first sample lands; no new methods — 287 router methods, 326 total.
+//! Version 6.14 adds the additive `adapter-busy` error shape to
+//! `agent.completeOnce` (§5.32): the daemon now bounds concurrently live
+//! ephemeral ACP adapters (`agents.maxConcurrentAdapters`, default 6), so an
+//! over-limit call queues instead of spawning, and one whose own `timeoutMs`
+//! expires while queued is rejected with `-32603` carrying
+//! `error.data = { code: "adapter-busy", provider, waitedMs, limit }`. Each
+//! adapter chain costs ~610 MB and holds no agent slot, so before the bound a
+//! quick-action fan-out could spawn until `server.maxOutstandingRpcs`
+//! (monorepo#2062). Nothing was spawned when this error is returned, so a
+//! retry is always safe — no new methods, 287 router methods, 326 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.13";
+pub const PROTOCOL_VERSION: &str = "6.14";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
