@@ -6,9 +6,32 @@
 //! Used by the transfer/export WIP snapshot (`transfer_git`) and the sandbox
 //! staging paths (`sandbox_ops`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use intent_core::{Error, Result};
+
+/// Convert a status-entry path (`StatusEntry::path_bytes`) into a `PathBuf`,
+/// dropping any trailing `/`. Uses the raw bytes rather than
+/// `StatusEntry::path()` because the latter returns `None` for non-UTF-8
+/// names — a nested repo with such a name must still be detected and
+/// skipped, not silently fall through to `add_all`. On Unix the bytes map
+/// losslessly onto the filesystem path; elsewhere (Windows, where libgit2
+/// paths are UTF-8) a lossy conversion is equivalent.
+fn status_path(bytes: &[u8]) -> PathBuf {
+    let trimmed = match bytes.split_last() {
+        Some((b'/', rest)) => rest,
+        _ => bytes,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(trimmed))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(trimmed).into_owned())
+    }
+}
 
 /// Whether a repository has uncommitted changes (staged, unstaged, or
 /// untracked). Exclusively-untracked nested repos/worktrees do not count:
@@ -29,22 +52,19 @@ pub(crate) fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let workdir = repo.workdir();
     Ok(statuses.iter().any(|e| {
         let ignorable_nested = e.status() == git2::Status::WT_NEW
-            && matches!(
-                (workdir, e.path().ok()),
-                (Some(wd), Some(p)) if is_nested_repo_path(wd, p)
-            );
+            && workdir.is_some_and(|wd| is_nested_repo_path(wd, &status_path(e.path_bytes())));
         !ignorable_nested
     }))
 }
 
-/// Whether `rel` (a status/diff path, possibly with a trailing `/`) names a
-/// directory that is itself a git repository or worktree checkout — i.e. it
-/// contains a `.git` entry (a directory for a full repo, a file for a linked
-/// worktree). Mirrors `git add`'s embedded-repo detection. Uses
-/// `symlink_metadata` so an untracked symlink pointing at a repo directory is
-/// not misclassified — git stages such a link as a symlink blob.
-fn is_nested_repo_path(workdir: &Path, rel: &str) -> bool {
-    let full = workdir.join(rel.trim_end_matches('/'));
+/// Whether `rel` (a workdir-relative status/diff path) names a directory that
+/// is itself a git repository or worktree checkout — i.e. it contains a
+/// `.git` entry (a directory for a full repo, a file for a linked worktree).
+/// Mirrors `git add`'s embedded-repo detection. Uses `symlink_metadata` so an
+/// untracked symlink pointing at a repo directory is not misclassified — git
+/// stages such a link as a symlink blob.
+fn is_nested_repo_path(workdir: &Path, rel: &Path) -> bool {
+    let full = workdir.join(rel);
     std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) && full.join(".git").exists()
 }
 
@@ -56,7 +76,7 @@ fn is_nested_repo_path(workdir: &Path, rel: &str) -> bool {
 /// on disk (`INDEX_DELETED | WT_NEW`) must ALSO be skipped by add_all —
 /// re-adding it would fail or undo the staged deletion — while still counting
 /// as dirt so the snapshot commit captures the removal.
-pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<String>> {
+pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<PathBuf>> {
     let Some(workdir) = repo.workdir() else {
         return Ok(Vec::new());
     };
@@ -67,12 +87,11 @@ pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| Error::Internal(format!("git status failed: {e}")))?;
-    let mut dirs: Vec<String> = statuses
+    let mut dirs: Vec<PathBuf> = statuses
         .iter()
         .filter(|e| e.status().contains(git2::Status::WT_NEW))
-        .filter_map(|e| e.path().ok().map(str::to_string))
+        .map(|e| status_path(e.path_bytes()))
         .filter(|p| is_nested_repo_path(workdir, p))
-        .map(|p| p.trim_end_matches('/').to_string())
         .collect();
     dirs.sort();
     dirs.dedup();
@@ -88,11 +107,12 @@ pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<
 pub(crate) fn stage_all_skipping_nested(
     repo: &git2::Repository,
     index: &mut git2::Index,
-) -> Result<Vec<String>> {
+) -> Result<Vec<PathBuf>> {
     let nested = untracked_nested_repo_dirs(repo)?;
+    // `Path` equality compares components, so a trailing `/` on the matched
+    // path is ignored.
     let mut skip_nested = |path: &Path, _spec: &[u8]| -> i32 {
-        let rel = path.to_string_lossy();
-        if nested.iter().any(|n| n == rel.trim_end_matches('/')) {
+        if nested.iter().any(|n| n == path) {
             1 // skip
         } else {
             0 // add
@@ -109,11 +129,15 @@ pub(crate) fn stage_all_skipping_nested(
 }
 
 /// Untracked nested git repositories/worktrees under the repo at `repo_path`,
-/// for the transfer plan's pre-flight warning. Degrades to an empty list when
-/// the repository cannot be read — a plan must not fail on this.
+/// for the transfer plan's pre-flight warning (display strings; lossy for
+/// non-UTF-8 names). Degrades to an empty list when the repository cannot be
+/// read — a plan must not fail on this.
 pub(crate) fn nested_repo_dirs(repo_path: &Path) -> Vec<String> {
     git2::Repository::open(repo_path)
         .ok()
         .and_then(|repo| untracked_nested_repo_dirs(&repo).ok())
         .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }

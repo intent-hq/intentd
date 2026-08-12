@@ -3157,7 +3157,7 @@ mod tests {
     /// Untracked nested repo like agents leave behind: a directory with its
     /// own real `.git` directory and file content (an empty worktree would
     /// not even show up in the parent's status).
-    fn make_nested_repo(parent: &Path, name: &str) -> PathBuf {
+    fn make_nested_repo(parent: &Path, name: impl AsRef<Path>) -> PathBuf {
         let nested = parent.join(name);
         init_test_repo(&nested);
         fs::write(nested.join("inner.txt"), "inner\n").unwrap();
@@ -3228,6 +3228,39 @@ mod tests {
         // ...and the directories stay intact on disk.
         assert!(repo_path.join(".import-wt/.git").is_dir());
         assert!(repo_path.join(".roundtrip-wt/.git").is_file());
+    }
+
+    /// Nested repos with non-UTF-8 directory names must still be detected
+    /// and skipped: `StatusEntry::path()` returns `None` for such names, so
+    /// the detection goes through `path_bytes` instead.
+    #[cfg(unix)]
+    #[test]
+    fn create_snapshot_commit_skips_non_utf8_nested_repo_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_dir, repo_path) = temp_repo("snapshot-nested-non-utf8");
+        commit_file(&repo_path, "tracked.txt", "base", "Add tracked");
+        let name = std::ffi::OsStr::from_bytes(b"bad-\xff-wt");
+        make_nested_repo(&repo_path, Path::new(name));
+        fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
+
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let agent_id = AgentId::from("agent-nested-non-utf8");
+        let sha = create_snapshot_commit(&repo, &agent_id)
+            .expect("snapshot must not fail on a non-UTF-8 nested repo name");
+
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&sha).unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        assert!(tree.get_name("dirty.txt").is_some());
+        assert_eq!(
+            tree.iter()
+                .filter(|e| e.name_bytes().starts_with(b"bad-"))
+                .count(),
+            0
+        );
+        assert!(repo_path.join(name).join(".git").is_dir());
     }
 
     #[tokio::test]
