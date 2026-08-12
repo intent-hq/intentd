@@ -2485,7 +2485,15 @@ mod tests {
             .expect("abort after failed commit");
 
         // Containment: a stored_path escaping the workspace root fails the
-        // commit before any row lands.
+        // commit before any row lands. A good attachment rides the same
+        // archive so — depending on read_dir order — the internal
+        // partial-materialization rollback is exercised: whichever entry is
+        // processed first, NOTHING may survive the failed commit.
+        let good_att = serde_json::json!({
+            "id": "att-good", "workspace_id": ws.0,
+            "file_name": "good.txt", "mime_type": null, "size": 4,
+            "uploaded_at": t, "stored_path": ".intent/attachments/good.txt"
+        });
         let hostile_att = serde_json::json!({
             "id": "att-live", "workspace_id": ws.0,
             "file_name": "evil", "mime_type": null, "size": 4,
@@ -2493,9 +2501,14 @@ mod tests {
         });
         let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
             ("workspace", vec![ws_row]),
-            ("attachments", vec![hostile_att]),
+            ("attachments", vec![good_att, hostile_att]),
         ];
-        let archive = build_archive_full(&m, &rows, None, &[("att-live", b"evil")]);
+        let archive = build_archive_full(
+            &m,
+            &rows,
+            None,
+            &[("att-good", b"good"), ("att-live", b"evil")],
+        );
         let sha = sha256_hex(&archive);
         let begin = svc
             .workspace_import_begin_op(
@@ -2516,6 +2529,16 @@ mod tests {
         assert!(
             err.to_string().contains("escapes the workspace root"),
             "containment error surfaced: {err}"
+        );
+        // Whichever entry read_dir served first, the good file (if placed)
+        // was unwound and the escape target never materialized.
+        assert!(
+            !att_dir.join("good.txt").exists(),
+            "partially materialized attachment rolled back"
+        );
+        assert!(
+            !ws_root.0.join("evil").exists() && !ws_root.0.join(&ws.0).join("evil").exists(),
+            "escaping stored_path never landed"
         );
         assert!(matches!(
             svc.store.get_workspace(&ws).await,
