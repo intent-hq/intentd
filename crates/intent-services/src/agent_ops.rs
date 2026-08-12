@@ -5605,6 +5605,11 @@ impl Services {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // Resolved ACP provider persisted on the created session (AgentLite
+        // `provider`, skip-if-none) — surfaced on the delegate result so
+        // clients can render the provider immediately (PROTOCOL §5.5). Absent
+        // when the session has none (provider CLI default applies).
+        let provider = created["agent"]["provider"].as_str().map(str::to_string);
 
         // Track effective isolation mode for the result. Provisioning runs in
         // a background task (monorepo#871), so an eligible CoW request reports
@@ -5806,6 +5811,12 @@ impl Services {
 
         // Include effective isolation in the result when isolation was requested
         let mut result = json!({ "ok": true, "agentId": agent_id, "name": name });
+        if let Some(provider) = provider {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("provider".to_string(), json!(provider));
+        }
         if let Some(eff_iso) = effective_isolation {
             result
                 .as_object_mut()
