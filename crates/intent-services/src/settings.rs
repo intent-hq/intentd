@@ -1246,6 +1246,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             0.0,
         ),
         number(
+            "agents.maxConcurrentAdapters",
+            "Max concurrent one-shot adapters",
+            "Daemon-wide cap on concurrently live ephemeral ACP adapters (one-shot completions and model probes). Each costs ~610 MB and holds no agent slot; over-limit calls queue and fail with error.data.code \"adapter-busy\" if their own timeout expires first (changes apply on daemon restart)",
+            "agents",
+            Some(1.0),
+            Some(intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT as f64),
+            intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS as f64,
+        ),
+        number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
             "Minutes before an idle agent is reaped",
@@ -1413,6 +1422,21 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 pub fn agent_memory_budget_bytes(settings: &SettingsFile) -> Option<u64> {
     let mb = settings.agents.memory_budget_mb;
     (mb > 0).then(|| mb as u64 * 1024 * 1024)
+}
+
+/// The effective `agents.maxConcurrentAdapters` setting: the daemon-wide cap
+/// on concurrently live ephemeral ACP adapters (monorepo#2062). Unlike
+/// `maxConcurrent` there is no "auto" and no unlimited value, so this always
+/// yields a usable bound — a `0` that predates the schema bound (or survived a
+/// hand-edited file) falls back to the default rather than admitting an
+/// unbounded spawn.
+pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
+    let n = settings.agents.max_concurrent_adapters;
+    if n == 0 {
+        intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS
+    } else {
+        n
+    }
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the SQLite
@@ -2298,6 +2322,47 @@ mod tests {
         assert_eq!(
             agent_memory_budget_bytes(&settings),
             Some(20 * 1024 * 1024 * 1024),
+        );
+    }
+
+    /// `agents.maxConcurrentAdapters` is a bounded catalog entry with no
+    /// "auto" and no unlimited value, and the resolver never yields `0` —
+    /// a zero that slipped past the schema would deadlock every adapter run,
+    /// so it falls back to the shipped default instead (monorepo#2062).
+    #[test]
+    fn max_concurrent_adapters_catalog_entry_and_resolver() {
+        let def = find_definition("agents.maxConcurrentAdapters")
+            .expect("agents.maxConcurrentAdapters missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(1.0),
+                max: Some(64.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(6.0)));
+        assert!(
+            def.description.contains("daemon restart"),
+            "description must state the restart requirement: {}",
+            def.description
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.maxConcurrentAdapters"));
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            max_concurrent_adapters(&settings),
+            intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS
+        );
+        settings.agents.max_concurrent_adapters = 4;
+        assert_eq!(max_concurrent_adapters(&settings), 4);
+        settings.agents.max_concurrent_adapters = 0;
+        assert_eq!(
+            max_concurrent_adapters(&settings),
+            intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS,
+            "a 0 must never reach the semaphore as an unbounded cap"
         );
     }
 

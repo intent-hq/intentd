@@ -15,6 +15,15 @@
 //! session ([`crate::one_shot_acp`]), and anything else — including
 //! unset/undecidable settings and a provider whose adapter cannot be resolved
 //! — returns `{ available: false, reason }` rather than an error.
+//!
+//! The ACP route is bounded: adapters are claimed from the daemon-wide
+//! ephemeral-adapter semaphore ([`crate::acp_adapter`],
+//! `agents.maxConcurrentAdapters`, monorepo#2062), so a fan-out of quick
+//! actions queues instead of spawning a ~610 MB provider-CLI chain per call.
+//! A call that spends its whole `timeoutMs` queued fails with
+//! [`Error::AdapterBusy`] (`error.data.code = "adapter-busy"`), which is
+//! deliberately distinguishable from a model/prompt timeout: nothing was
+//! spawned, so the client may retry as soon as the daemon drains.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,7 +35,7 @@ use crate::enhance_ops::{
     clean_agent_message, run_auggie_print, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS,
 };
 use crate::file_ops;
-use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand};
+use crate::one_shot_acp::{run_one_shot_acp, OneShotCommand, OneShotError};
 use crate::Services;
 
 /// Providers served by the ephemeral ACP one-shot runner. Every other
@@ -388,6 +397,15 @@ impl Services {
         .await
         {
             Ok(reply) => Ok(json!({ "text": clean_agent_message(&reply) })),
+            // Queueing pressure is its own error shape, not a generic internal
+            // failure: the caller waited out its whole timeout for a slot in
+            // the daemon-wide adapter bound and no provider was ever launched,
+            // so the client can back off and retry safely (monorepo#2062).
+            Err(OneShotError::QueueTimeout { waited_ms, limit }) => Err(Error::AdapterBusy {
+                provider: provider_id.to_string(),
+                waited_ms,
+                limit,
+            }),
             Err(err) => Err(Error::Internal(format!("{provider_id}: {err}"))),
         }
     }

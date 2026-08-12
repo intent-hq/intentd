@@ -35,11 +35,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -520,6 +521,14 @@ pub struct AgentsSettings {
     /// behind idle-process eviction instead of starting immediately (0 = off,
     /// the default; changes apply on daemon restart; max 1,024,000).
     pub memory_budget_mb: u32,
+    /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
+    /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
+    /// model probes; changes apply on daemon restart; range 1–64). Unlike
+    /// `maxConcurrent` this has no "auto" value and no unlimited setting: the
+    /// bound exists because each chain costs ~610 MB and one-shots hold no
+    /// agent slot, so removing the ceiling is exactly the failure being
+    /// fixed (monorepo#2062).
+    pub max_concurrent_adapters: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
@@ -536,6 +545,7 @@ impl Default for AgentsSettings {
         Self {
             max_concurrent: 0,
             memory_budget_mb: 0,
+            max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
         }
@@ -929,6 +939,16 @@ impl SettingsFile {
                 ),
             ));
         }
+        // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
+        // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
+        // config.toml cannot boot without a ceiling.
+        let adapters = self.agents.max_concurrent_adapters;
+        if !(1..=MAX_CONCURRENT_ADAPTERS_LIMIT).contains(&adapters) {
+            return Err(bad(
+                "agents.maxConcurrentAdapters",
+                format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
+            ));
+        }
         let chars = self.workspace_api.max_output_chars;
         if chars != 0 && !(1_000..=10_000_000).contains(&chars) {
             return Err(bad(
@@ -1188,6 +1208,11 @@ maxConcurrent = 0
 # eviction (0 = off; nothing running is ever killed; changes apply on daemon
 # restart).
 memoryBudgetMb = 0
+# Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
+# adapters (one-shot completions and model probes). Each costs ~610 MB and
+# holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
+# their own timeout expires first (1-64; changes apply on daemon restart).
+maxConcurrentAdapters = 6
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
 # reaping).
 idleReapMinutes = 30
@@ -1872,6 +1897,57 @@ mod tests {
         );
         assert!(
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+    }
+
+    /// The ephemeral-adapter bound ships enabled: an empty file and the
+    /// shipped template both resolve to the same in-range default, so a daemon
+    /// that has never been configured still has a ceiling (monorepo#2062).
+    #[test]
+    fn max_concurrent_adapters_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.max_concurrent_adapters,
+            DEFAULT_MAX_CONCURRENT_ADAPTERS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("maxConcurrentAdapters"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.agents.max_concurrent_adapters,
+            DEFAULT_MAX_CONCURRENT_ADAPTERS
+        );
+        assert!(
+            (4..=8).contains(&DEFAULT_MAX_CONCURRENT_ADAPTERS),
+            "the shipped default must stay inside the agreed 4-8 range"
+        );
+    }
+
+    /// Unlike `maxOutstandingRpcs`, this key has no `0` = unlimited escape
+    /// hatch: an unbounded adapter spawn is the failure the bound exists to
+    /// prevent, so a hand-edited file cannot reintroduce it.
+    #[test]
+    fn max_concurrent_adapters_range_is_enforced_with_no_unlimited_value() {
+        let parsed = SettingsFile::parse_str("[agents]\nmaxConcurrentAdapters = 4\n")
+            .expect("in-range override parses");
+        assert_eq!(parsed.agents.max_concurrent_adapters, 4);
+
+        for bad_value in ["0", "65"] {
+            let err = SettingsFile::parse_str(&format!(
+                "[agents]\nmaxConcurrentAdapters = {bad_value}\n"
+            ))
+            .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.maxConcurrentAdapters") && msg.contains(bad_value),
+                "error names the offending key and value: {msg}"
+            );
+        }
+        assert!(
+            SettingsFile::parse_str(&format!(
+                "[agents]\nmaxConcurrentAdapters = {MAX_CONCURRENT_ADAPTERS_LIMIT}\n"
+            ))
+            .is_ok(),
             "the upper bound itself is legal"
         );
     }

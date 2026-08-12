@@ -137,6 +137,25 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "warm-in-flight", "owner": owner, "repo": repo })),
         },
+        // `agent.completeOnce` queued past its own timeout at the daemon-wide
+        // ephemeral-adapter bound: -32603 with machine-readable
+        // `data = { code: "adapter-busy", provider, waitedMs, limit }` so a
+        // client tells daemon saturation apart from a slow model — and knows
+        // the retry is safe, since nothing was spawned (monorepo#2062).
+        ref e @ Error::AdapterBusy {
+            ref provider,
+            waited_ms,
+            limit,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "adapter-busy",
+                "provider": provider,
+                "waitedMs": waited_ms,
+                "limit": limit,
+            })),
+        },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
         e @ Error::NotFound(_) => not_found(e.to_string()),
