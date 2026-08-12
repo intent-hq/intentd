@@ -4687,6 +4687,70 @@ async fn interrupt_flush_leaves_an_unpinned_slot_alone() {
     );
 }
 
+/// monorepo#2140 — the suspend-enrollment flush must not release a pin a
+/// concurrent teardown holds. It flushes caller-held content (its synthetic
+/// turn never enters the slots map), so its slot clear is pin-respecting: the
+/// pinned slot survives to the teardown's flush, which absorbs the
+/// `agent_message.id` UNIQUE collision with the enrollment's row and keeps the
+/// slot-derived `had_output` — instead of reading `None` as "no turn in
+/// flight" and arming a zero-output stop-redelivery for a turn that DID
+/// produce output.
+#[tokio::test]
+async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    // A teardown pinned the in-flight slot…
+    services.set_live_turn(&agent_id, "m1", partial_blocks());
+    services.pin_live_turn(&agent_id);
+    // …and in the abort gap the worker classifies a suspend interrupt and
+    // flushes its caller-held content (the enroll path: `owns_slot: false`).
+    let live = super::LiveTurn {
+        message_id: "m1".to_string(),
+        blocks: partial_blocks(),
+        final_text_block_open: false,
+        last_activity_at: "2026-01-01T00:00:00Z".to_string(),
+        last_activity_emit: None,
+        flush_pending: false,
+    };
+    let enrolled = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            live,
+            super::InterruptReason::SystemSuspend,
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(
+        enrolled.as_deref(),
+        Some("m1"),
+        "the enrollment row is durable"
+    );
+    assert!(
+        services
+            .live_turn(&agent_id)
+            .is_some_and(|l| l.flush_pending),
+        "the enrollment flush leaves the foreign pin in place"
+    );
+
+    // The teardown's own flush still finds its pinned slot: the UNIQUE
+    // collision with the enrollment row is absorbed and `had_output` keeps
+    // the truth — the turn produced output, so no stop-redelivery.
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot survived to its owner");
+    assert!(
+        flushed.message_id.is_none(),
+        "the enrollment row won the collision"
+    );
+    assert!(flushed.had_output, "the turn really did produce output");
+    assert!(
+        services.live_turn(&agent_id).is_none(),
+        "the owning flush releases the pin"
+    );
+}
+
 /// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
 /// tool calls and no assistant text still emits `agent:stream:activity`, each
 /// ping carrying `lastToolUse { name, status }` for the call just recorded.

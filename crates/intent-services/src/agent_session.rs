@@ -1287,7 +1287,7 @@ impl Services {
         let had_output = !live.blocks.is_empty();
         let text_blocks = text_block_strings(&live.blocks);
         let message_id = self
-            .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by)
+            .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
             .await;
         Some(FlushedTurn {
             message_id,
@@ -1334,12 +1334,19 @@ impl Services {
     /// Returns the persisted interrupted row's message id (`Some` only when
     /// this flush appended the row), so the interrupt path can carry
     /// `messageId` on the terminal `agent:stream:end`.
+    /// `owns_slot` says whose slot this flush may release: the teardown flush
+    /// owns the pin it is flushing and clears unconditionally; the suspend
+    /// enrollment flushes caller-held content and must NOT release a pin a
+    /// concurrent teardown holds on the agent's slot — clearing it would cost
+    /// that teardown's flush the true `had_output` (the same monorepo#2110
+    /// zero-output flip, resurfacing through this side door).
     pub(crate) async fn flush_partial_turn_on_interruption(
         &self,
         agent_id: &AgentId,
         live: LiveTurn,
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
+        owns_slot: bool,
     ) -> Option<String> {
         let mut metadata = json!({
             "interrupted": true,
@@ -1374,7 +1381,11 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                     self.invalidate_agent_list_cache(&session.workspace_id);
                 }
-                self.clear_live_turn(agent_id);
+                if owns_slot {
+                    self.clear_live_turn(agent_id);
+                } else {
+                    self.clear_unpinned_live_turn(agent_id);
+                }
                 Some(live.message_id)
             }
             // Only the `agent_message.id` violation means "the worker already
@@ -1385,8 +1396,13 @@ impl Services {
                 if e.to_string()
                     .contains("UNIQUE constraint failed: agent_message.id") =>
             {
-                // The durable full row exists — drop the now-stale overlay too.
-                self.clear_live_turn(agent_id);
+                // The durable full row exists — drop the now-stale overlay too
+                // (same ownership rule as the success arm).
+                if owns_slot {
+                    self.clear_live_turn(agent_id);
+                } else {
+                    self.clear_unpinned_live_turn(agent_id);
+                }
                 tracing::debug!(
                     agent = %agent_id,
                     error = %e,
@@ -2270,7 +2286,10 @@ impl Services {
         let preview_text_blocks = text_block_strings(&blocks);
         // Persist the partial turn tagged as suspend-interrupted. Reuses the
         // shared interrupt-flush path so the persisted row carries the
-        // `interruptReason` metadata (and clears the live-turn slot).
+        // `interruptReason` metadata (and clears the live-turn slot — but only
+        // an UNPINNED one: this path flushes caller-held content, it does not
+        // own the agent's slot, and a pin there belongs to a concurrent
+        // teardown whose flush absorbs the resulting UNIQUE collision).
         let live = LiveTurn {
             message_id,
             blocks,
@@ -2285,6 +2304,7 @@ impl Services {
                 live,
                 InterruptReason::SystemSuspend,
                 None,
+                false,
             )
             .await;
         // Capture the session's running status for restore-on-resume, serialized
