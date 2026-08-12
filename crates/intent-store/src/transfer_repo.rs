@@ -35,6 +35,11 @@ use crate::Store;
 ///    state (hooks, PR monitors, agent queues) is rehydrated from these rows
 ///    on the target at import — make sure the rehydration path picks the new
 ///    state up.
+///
+/// Note: `sqlx::migrate!()` embeds migrations at compile time, so after
+/// adding a bare `.sql` migration these tests only see it once `intent-store`
+/// recompiles — if they unexpectedly pass locally, force a rebuild (CI's
+/// fresh builds always pick it up).
 pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("workspace", "id = ?1"),
     ("note", "workspace_id = ?1"),
@@ -121,7 +126,9 @@ pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     (
         "agent_stop_redelivery",
         "write-through mirror of transient in-memory stop-redelivery runtime state; \
-         export stops agents and captures them in `interrupted_agent` instead",
+         an armed payload is deliberately dropped on transfer (it is derivable from \
+         the transferred `agent_message` rows), while the agents themselves are \
+         captured in `interrupted_agent`",
     ),
     (
         "agent_message_fts",
