@@ -509,7 +509,9 @@ fn resolve_binary_path_prefers_newest_nvm_node_version() {
     let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
     std::fs::create_dir_all(&v20_bin).unwrap();
     std::fs::create_dir_all(&v24_bin).unwrap();
-    std::fs::write(v20_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
+    let older_binary = v20_bin.join("node");
+    std::fs::write(&older_binary, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&older_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     let binary = v24_bin.join("node");
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
