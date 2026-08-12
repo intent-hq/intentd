@@ -1568,11 +1568,18 @@ impl Services {
     /// Best-effort refresh of the owning workspace's PR linkage after its
     /// monitored PR reached a terminal state (merged/closed), through
     /// [`Services::refresh_workspace_pr`] — which persists the delta and
-    /// emits `pr:updated`/`pr:linked`/`pr:unlinked` itself. Bounded by the
-    /// sweep's per-fetch timeout so a hung forge fetch can never wedge the
-    /// serialized monitor sweep; errors and timeouts are logged, never
-    /// propagated — the monitor's own terminal transition already
-    /// persisted, and the background refresh sweep remains the backstop.
+    /// emits `pr:updated`/`pr:linked`/`pr:unlinked` itself. Bounded by
+    /// `pr_monitor_fetch_timeout` as an *aggregate* budget over the whole
+    /// refresh (the linked-PR re-fetch, possible relink discovery via
+    /// `list_prs`, and the store writes — not a per-request bound) so a hung
+    /// forge call can never wedge the serialized monitor sweep; errors and
+    /// timeouts are logged, never propagated — the monitor's own terminal
+    /// transition already persisted, and the background refresh sweep remains
+    /// the backstop. Timeout caveat (shared with the sweep's wrap): the
+    /// dropped future can land between the store write and the event
+    /// publish, persisting the delta without `pr:updated` — rare (the
+    /// client-level network timeouts fire first) and self-limiting, since
+    /// clients re-read on the next snapshot.
     async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
         match tokio::time::timeout(
             self.pr_monitor_fetch_timeout,
@@ -2208,7 +2215,14 @@ mod tests {
             _: &RepoRef,
             _: PrQuery,
         ) -> intent_sourcecontrol::Result<Page<PullRequest>> {
-            unsupported("list_prs")
+            // Empty page (not `Unsupported`): the terminal-refresh path runs
+            // relink discovery for merged/closed linked PRs, and an empty
+            // page exercises the clean "no matching open PR" branch instead
+            // of the discovery-failure degrade arm.
+            Ok(Page {
+                items: vec![],
+                next_cursor: None,
+            })
         }
         async fn update_pr(
             &self,
