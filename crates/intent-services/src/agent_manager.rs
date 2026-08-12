@@ -3137,16 +3137,17 @@ impl AgentManager {
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
     ) -> (bool, Option<(Child, Option<u32>)>) {
-        // Snapshot the live-turn slot BEFORE aborting the worker (the abort
-        // drops LiveTurnGuard, clearing the slot), then flush the partial
-        // in-flight assistant content AFTER the abort — same convention as
-        // the graceful-shutdown flush. A worker append already in flight at
-        // abort time can still land, but the `agent_message.id` PK keeps the
-        // outcome convergent (exactly one row; the UNIQUE collision is
-        // absorbed inside the flush). No-op when the slot is empty or was
-        // already flushed by a caller (e.g. shutdown(), which flushes before
-        // delegating here).
-        let partial_turn = self.services.live_turn(agent_id);
+        // Snapshot-and-pin the live-turn slot BEFORE aborting the worker (the
+        // abort drops LiveTurnGuard; the pin keeps the slot published until
+        // the flush below persists the row — monorepo#2056), then flush the
+        // partial in-flight assistant content AFTER the abort — same
+        // convention as the graceful-shutdown flush. A worker append already
+        // in flight at abort time can still land, but the `agent_message.id`
+        // PK keeps the outcome convergent (exactly one row; the UNIQUE
+        // collision is absorbed inside the flush). No-op when the slot is
+        // empty or was already flushed by a caller (e.g. shutdown(), which
+        // flushes before delegating here).
+        let partial_turn = self.services.pin_live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
@@ -3264,13 +3265,15 @@ impl AgentManager {
         let Some(acp_session_id) = acp_session_id else {
             return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
         };
-        // Snapshot the live-turn slot BEFORE aborting the worker: the abort
-        // drops the worker future and with it the LiveTurnGuard, which clears
-        // the slot — reading after the abort would race that drop and
-        // frequently lose the partial content. The busy flag is snapshotted
-        // alongside (before `end_turn` below releases it) for the zero-output
-        // stop-redelivery arm at the bottom of this method.
-        let partial_turn = self.services.live_turn(agent_id);
+        // Snapshot-and-pin the live-turn slot BEFORE aborting the worker: the
+        // abort drops the worker future and with it the LiveTurnGuard, so
+        // reading after the abort would race that drop and frequently lose the
+        // partial content, and the pin keeps the slot published to
+        // `chat.subscribe` until the flush below persists the row
+        // (monorepo#2056). The busy flag is snapshotted alongside (before
+        // `end_turn` below releases it) for the zero-output stop-redelivery
+        // arm at the bottom of this method.
+        let partial_turn = self.services.pin_live_turn(agent_id);
         let turn_in_flight = self.is_busy(agent_id);
         let had_output = partial_turn
             .as_ref()
@@ -5963,11 +5966,13 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
-            // Snapshot the live-turn slot BEFORE aborting the worker: the abort
-            // drops the worker future and with it the LiveTurnGuard, which
-            // clears the slot — reading after the abort would race that drop
-            // and frequently lose the partial content.
-            let partial_turn = self.services.live_turn(id);
+            // Snapshot-and-pin the live-turn slot BEFORE aborting the worker:
+            // the abort drops the worker future and with it the LiveTurnGuard,
+            // so reading after the abort would race that drop and frequently
+            // lose the partial content, and the pin keeps the slot published
+            // to `chat.subscribe` until the flush below persists the row
+            // (monorepo#2056).
+            let partial_turn = self.services.pin_live_turn(id);
             // Abort the turn worker BEFORE flushing so it cannot race the
             // partial flush by persisting the full turn under the same minted
             // message id (which would leave the transcript stuck on the partial

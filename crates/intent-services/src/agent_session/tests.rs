@@ -4217,6 +4217,157 @@ async fn activity_throttle_leading_edge_window_and_reset() {
     );
 }
 
+/// The partial blocks a mid-turn interrupt has streamed so far.
+fn partial_blocks() -> Vec<Value> {
+    vec![json!({ "id": "m1:0", "type": "text", "text": "I'll run " })]
+}
+
+/// monorepo#2056 — the interrupt teardown's abort→flush gap must not unpublish
+/// the in-flight turn. `pin_live_turn` (called before `worker.abort()`) makes
+/// the slot survive the `LiveTurnGuard` drop the abort triggers, so
+/// `agent_live_turn` — the `chat.subscribe` snapshot's in-flight source — keeps
+/// serving the streamed-so-far content until the flush persists it. Without the
+/// pin the content is neither published nor durable for the width of that
+/// INSERT, and a snapshot taken there drops the whole partial turn.
+#[tokio::test]
+async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clears_it() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let blocks = partial_blocks();
+
+    let pinned = {
+        // Mid-turn: the worker holds the guard, the slot carries the partial
+        // content.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", blocks.clone());
+        // The teardown path snapshots AND pins the slot, then aborts the
+        // worker — which drops the guard, as this scope end does.
+        let pinned = services
+            .pin_live_turn(&agent_id)
+            .expect("slot open mid-turn");
+        assert_eq!(pinned.blocks, blocks, "the pin returns the live snapshot");
+        pinned
+    };
+
+    // The window: the guard has dropped and the interrupted row is not durable
+    // yet — the pin keeps the slot published, so a snapshot landing here still
+    // reconstructs the partial turn.
+    assert_eq!(
+        services.agent_live_turn(agent_id.clone()),
+        Some(json!({ "messageId": "m1", "contentBlocks": blocks })),
+        "the pinned slot stays published across the abort→flush gap"
+    );
+
+    // The flush lands: the row is durable and the slot (pin included) clears,
+    // so later snapshots serve the persisted row alone — no duplicate overlay.
+    let flushed = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            pinned,
+            super::InterruptReason::UserStop,
+            None,
+        )
+        .await;
+    assert_eq!(flushed.as_deref(), Some("m1"));
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "the flush releases the pin with the slot"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "m1");
+    assert_eq!(messages[0].content, json!(blocks));
+}
+
+/// The other half of the monorepo#2056 contract: an UNPINNED slot still clears
+/// on the guard drop. A turn that dies with no teardown flush behind it (worker
+/// panic, a plain abort) leaves no orphan slot, so no phantom in-flight message
+/// can be merged into a later snapshot — the reason the guard exists.
+#[tokio::test]
+async fn unpinned_live_turn_slot_still_clears_on_the_guard_drop() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    {
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", partial_blocks());
+        assert!(
+            services.agent_live_turn(agent_id.clone()).is_some(),
+            "the turn is published while it streams"
+        );
+    }
+    assert!(
+        services.live_turn(&agent_id).is_none(),
+        "an unpinned slot is cleared by the guard drop"
+    );
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "…so no orphan overlay survives the aborted turn"
+    );
+}
+
+/// The pin is released on the flush's collision path too: when the worker
+/// already persisted the full turn under the minted id, the flush's append
+/// loses on the `agent_message.id` UNIQUE constraint and drops the now-stale
+/// slot. Otherwise the pin would keep a superseded partial overlay published
+/// for the rest of the turn's absence.
+#[tokio::test]
+async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_turn() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let full_blocks = json!([
+        { "id": "m1:0", "type": "text", "text": "I'll run the tests." }
+    ]);
+
+    let pinned = {
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", partial_blocks());
+        services
+            .pin_live_turn(&agent_id)
+            .expect("slot open mid-turn")
+    };
+    // The aborted worker's own append won the race: the full row is durable.
+    services
+        .store
+        .append_agent_message_with_id(
+            &agent_id,
+            "m1",
+            "assistant",
+            &full_blocks,
+            None,
+            &intent_core::now_iso(),
+        )
+        .await
+        .expect("worker append");
+
+    let flushed = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            pinned,
+            super::InterruptReason::AgentStopped,
+            None,
+        )
+        .await;
+    assert!(flushed.is_none(), "the durable full row won the collision");
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "the collision path releases the pin with the stale slot"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1, "exactly one row survives the race");
+    assert_eq!(messages[0].content, full_blocks, "the full row is intact");
+}
+
 /// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
 /// tool calls and no assistant text still emits `agent:stream:activity`, each
 /// ping carrying `lastToolUse { name, status }` for the call just recorded.
