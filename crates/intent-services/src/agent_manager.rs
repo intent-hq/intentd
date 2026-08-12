@@ -299,8 +299,8 @@ pub struct TurnOptions {
     /// entry's `turn_id`; direct sends mint one in `send_message` (before the
     /// user-row persist, so the RPC result and `agent:message` echo carry it),
     /// with [`AgentManager::spawn_worker`] as the fallback mint site.
-    /// `persist_error_and_requeue` threads it onto the requeued entry so a
-    /// retry of the same logical turn keeps the original id.
+    /// `publish_error_status_and_requeue` threads it onto the requeued entry
+    /// so a retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
     /// Who originated this delivery (question hold, PROTOCOL §5.5):
     /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
@@ -8215,32 +8215,35 @@ async fn publish_terminal_failure_events(
         .await;
 }
 
-/// Persist `AgentStatus::Error` (emitting `agent:status-changed`) and requeue
-/// the failed message to the front of the queue so `agent.retry` — or a future
-/// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
-/// turn-failure paths. The `error_text` argument is persisted into
-/// `agent_session.stop_reason` (stamping `stop_reason_timestamp`) and included
-/// in the `agent:status-changed` event's `stopReason` / `stopReasonTimestamp`
-/// fields (durable-before-observable). `persisted` reports whether the failed
-/// turn's user row durably reached the transcript (STAB-51). A system-role
-/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
-/// the InterruptionNotice shape, §5.35) is appended best-effort for each
-/// DISTINCT terminal failure — a repeat of the identical failure text with
-/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
-/// fresh redrive of the same message that fails again the same way) skips
-/// the append so the transcript never stacks duplicate cards. `agent.retry`
-/// clears the streak (the deliberate quarantine escape hatch), so a failure
-/// with the SAME text immediately after a retry still gets its own card —
-/// the user acted and it failed again, which is new information.
-async fn persist_error_and_requeue(
+/// Durable slice of the terminal-failure path (monorepo#2009): record the
+/// identical-failure streak and complete the `status = Error` + `stop_reason`
+/// store write WITHOUT touching the event bus. Every terminal-failure handler
+/// awaits this BEFORE publishing the terminal `agent:failed` +
+/// `agent:stream:end` pair (durable-before-observable), so a client that
+/// reads `agent.get`/`agent.getSession` upon observing either event is
+/// guaranteed the persisted Error. Returns the context the observable half
+/// ([`publish_error_status_and_requeue`]) needs to emit the matching events.
+struct PersistedTerminalError {
+    /// The failure text persisted into `agent_session.stop_reason`.
+    error_text: String,
+    /// Identical-failure streak AFTER recording this failure (monorepo#840).
+    streak: u32,
+    /// Whether the failure classifies the session as corrupted/poisoned
+    /// (monorepo#940), surfaced as `sessionCorrupted` on the wire.
+    session_corrupted: bool,
+    /// Timestamp persisted as `stop_reason_timestamp` alongside the status.
+    ts: String,
+    /// Whether the store write landed; `agent:status-changed` is only
+    /// emitted for a durable write.
+    status_persisted: bool,
+}
+
+async fn persist_terminal_error_status(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
-    content: &str,
-    options: &TurnOptions,
-    persisted: bool,
     error_text: &str,
-) {
+) -> PersistedTerminalError {
     // monorepo#840: record the identical-failure streak BEFORE persisting so
     // `session_poisoned` sees a consistent (status, streak) pair as soon as
     // the Error status lands.
@@ -8258,11 +8261,12 @@ async fn persist_error_and_requeue(
             "session classified as poisoned; deliveries will park in the queue until agent.retry or a fresh agent (monorepo#840)"
         );
     }
-    // Persist agent status as Error WITH stop_reason and emit agent:status-changed.
-    // Durable-before-observable: the store write completes BEFORE the event is published,
-    // so subscribers see the canonical field immediately via agent.get/getSession.
+    // Persist agent status as Error WITH stop_reason. Durable-before-observable
+    // (monorepo#2009): this write completes BEFORE any terminal event reaches
+    // the bus, so subscribers see the canonical fields immediately via
+    // agent.get/getSession.
     let ts = now_iso();
-    if let Err(e) = mgr
+    let status_persisted = match mgr
         .services
         .store
         .set_agent_session_status(
@@ -8275,8 +8279,59 @@ async fn persist_error_and_requeue(
         )
         .await
     {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
-    } else {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
+            false
+        }
+    };
+    PersistedTerminalError {
+        error_text: error_text.to_string(),
+        streak,
+        session_corrupted,
+        ts,
+        status_persisted,
+    }
+}
+
+/// Observable half of the terminal-failure path: emit `agent:status-changed`
+/// for the Error persisted by [`persist_terminal_error_status`] and requeue
+/// the failed message to the front of the queue so `agent.retry` — or a
+/// future `agent.sendMessage` — can redrive it. Shared by the terminal spawn-
+/// and turn-failure paths; runs AFTER the terminal `agent:failed` +
+/// `agent:stream:end` pair so the wire order (`agent:failed` →
+/// `agent:stream:end` → `agent:status-changed` → `agent:queue:updated`) is
+/// unchanged by the monorepo#2009 persist reorder. The persisted `error_text`
+/// is included in the `agent:status-changed` event's `stopReason` /
+/// `stopReasonTimestamp` fields. `persisted` reports whether the failed
+/// turn's user row durably reached the transcript (STAB-51). A system-role
+/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
+/// the InterruptionNotice shape, §5.35) is appended best-effort for each
+/// DISTINCT terminal failure — a repeat of the identical failure text with
+/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
+/// fresh redrive of the same message that fails again the same way) skips
+/// the append so the transcript never stacks duplicate cards. `agent.retry`
+/// clears the streak (the deliberate quarantine escape hatch), so a failure
+/// with the SAME text immediately after a retry still gets its own card —
+/// the user acted and it failed again, which is new information.
+async fn publish_error_status_and_requeue(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    persisted: bool,
+    error: PersistedTerminalError,
+) {
+    let PersistedTerminalError {
+        error_text,
+        streak,
+        session_corrupted,
+        ts,
+        status_persisted,
+    } = error;
+    let error_text = error_text.as_str();
+    if status_persisted {
         // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
         // subscribers get the canonical fields (the timestamp matches the value
         // persisted alongside stop_reason by `set_agent_session_status`).
@@ -8407,10 +8462,39 @@ async fn persist_error_and_requeue(
     }
 }
 
-/// Handle terminal spawn failure after all retries are exhausted. Publishes
-/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
-/// status as `Error` with the error text into `stop_reason`, requeues the
-/// failed message to the front of the queue, and stops draining further messages.
+/// Single-call composition of [`persist_terminal_error_status`] +
+/// [`publish_error_status_and_requeue`] — the exact production halves in
+/// production order, minus the terminal `agent:failed`/`agent:stream:end`
+/// pair the handlers publish in between. Kept for the unit suite, which
+/// exercises the persist + requeue contract without the terminal pair.
+#[cfg(test)]
+async fn persist_error_and_requeue(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    persisted: bool,
+    error_text: &str,
+) {
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, error_text).await;
+    publish_error_status_and_requeue(
+        mgr,
+        agent_id,
+        workspace_id,
+        content,
+        options,
+        persisted,
+        persist,
+    )
+    .await;
+}
+
+/// Handle terminal spawn failure after all retries are exhausted. Persists
+/// the agent status as `Error` with the error text into `stop_reason`
+/// (durable-before-observable, monorepo#2009), publishes terminal
+/// `agent:failed` and `agent:stream:end` events, requeues the failed message
+/// to the front of the queue, and stops draining further messages.
 async fn handle_terminal_spawn_failure(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -8421,6 +8505,10 @@ async fn handle_terminal_spawn_failure(
     error: &Error,
 ) {
     let error_text = error.to_string();
+    // Durable-before-observable (monorepo#2009): the Error + stop_reason store
+    // write completes before the terminal pair reaches the bus, so a client
+    // reading agent.getSession on agent:stream:end sees the persisted `error`.
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
     publish_terminal_failure_events(
         mgr,
         agent_id,
@@ -8429,14 +8517,14 @@ async fn handle_terminal_spawn_failure(
         options.turn_id.as_deref(),
     )
     .await;
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         persisted,
-        &error_text,
+        persist,
     )
     .await;
 }
@@ -8456,6 +8544,9 @@ async fn handle_drain_persist_failure(
 ) {
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
     tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
+    // Durable-before-observable (monorepo#2009): persist Error + stop_reason
+    // before the terminal pair reaches the bus.
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
     publish_terminal_failure_events(
         mgr,
         agent_id,
@@ -8464,14 +8555,14 @@ async fn handle_drain_persist_failure(
         options.turn_id.as_deref(),
     )
     .await;
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         false,
-        &error_text,
+        persist,
     )
     .await;
 }
@@ -8658,9 +8749,10 @@ fn idle_timeout_warning_text(window: std::time::Duration) -> String {
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
-/// cancel): tear down the dead child, ensure the terminal `agent:failed` +
-/// `agent:stream:end` pair reached the bus, persist `AgentStatus::Error` with
-/// the error text into `stop_reason`, and requeue the message for `agent.retry`.
+/// cancel): tear down the dead child, persist `AgentStatus::Error` with the
+/// error text into `stop_reason` (durable-before-observable, monorepo#2009),
+/// ensure the terminal `agent:failed` + `agent:stream:end` pair reached the
+/// bus, and requeue the message for `agent.retry`.
 /// Mirrors [`handle_terminal_spawn_failure`] but does NOT auto-retry inline —
 /// the prompt may have been partially processed, so redriving it is a user
 /// decision (the STAB-6 Retry surface).
@@ -8678,6 +8770,11 @@ async fn handle_terminal_turn_failure(
     mgr.kill_child_only(agent_id).await;
 
     let error_text = error.to_string();
+    // Durable-before-observable (monorepo#2009): persist Error + stop_reason
+    // before the terminal pair (when this path still owes it) reaches the bus.
+    // When the streaming path already emitted the pair, the persist is the
+    // earliest this handler can make the status durable.
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(
             mgr,
@@ -8688,14 +8785,14 @@ async fn handle_terminal_turn_failure(
         )
         .await;
     }
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         persisted,
-        &error_text,
+        persist,
     )
     .await;
 }

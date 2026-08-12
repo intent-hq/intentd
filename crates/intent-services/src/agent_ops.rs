@@ -656,8 +656,9 @@ pub(crate) struct QueuedMessage {
     pub id: String,
     /// Turn correlation id (monorepo#1022): stable across terminal-failure
     /// requeues so retries of the same logical turn share one id. Fresh
-    /// enqueues set `turn_id = id`; `persist_error_and_requeue` mints a new
-    /// entry `id` but carries the failed turn's original `turn_id` forward.
+    /// enqueues set `turn_id = id`; `publish_error_status_and_requeue` mints
+    /// a new entry `id` but carries the failed turn's original `turn_id`
+    /// forward.
     /// `#[serde(default)]` keeps legacy persisted payloads decodable —
     /// rehydration backfills an empty `turn_id` with the entry `id`.
     #[serde(default)]

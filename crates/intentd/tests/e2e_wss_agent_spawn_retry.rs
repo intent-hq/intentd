@@ -1031,6 +1031,9 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     );
 
     // The persisted session carries the same gate reason as stopReason.
+    // Deliberately a read-right-after-the-event: the daemon persists the
+    // Error status BEFORE publishing the terminal pair (monorepo#2009,
+    // durable-before-observable), so this read must never race the write.
     let session = wss_rpc(
         &mut rpc,
         12,
@@ -1040,7 +1043,7 @@ async fn pi_spawn_fails_fast_on_old_cli_over_wss() {
     .await;
     assert_eq!(
         session["session"]["status"], "error",
-        "session status is error after the pi gate fail-fast"
+        "session status is error after the pi gate fail-fast (persisted before agent:stream:end, monorepo#2009)"
     );
     let stop_reason = session["session"]["stopReason"]
         .as_str()
