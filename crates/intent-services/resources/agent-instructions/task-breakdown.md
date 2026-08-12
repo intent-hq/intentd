@@ -94,7 +94,26 @@ Task notes carry first-class relations that batch delegation uses to order and s
 - **`conflictsWith`** (advisory): the tasks should not run concurrently. Declare it for any pair of tasks touching the same files — and default to declaring it for same-repo tasks sharing a checkout, since concurrent agents in one checkout step on each other even without direct file overlap.
 - Prefer **more, smaller tasks with explicit relations** over fewer large ones: everything whose dependencies are met can start in parallel while conflicting work is held, so fine-grained splits parallelize better than hand-serialized big tasks.
 
-`@@@task` blocks don't carry relations; after the blocks are materialized into Task Notes, set relations by id with `ws.task.setRelations(noteId, { dependsOn: [...], conflictsWith: [...] })` (or seed them via `ws.task.markAsTask` when marking an existing note).
+Declare relations inline on the `@@@task` fence line — the block header takes optional `key=`, `dependsOn=`, `conflictsWith=`, and `effort=` attributes, so a breakdown ships with its ordering built in:
+
+```markdown
+@@@task key=contract
+# Define the payload contract in @src/lib/types/Payload.ts
+@@@
+
+@@@task key=backend dependsOn=contract effort=2h
+# Implement the daemon handler against the contract
+@@@
+
+@@@task key=frontend dependsOn=contract conflictsWith=backend
+# Implement the FE view against the contract
+@@@
+```
+
+- `key=<token>` names a block so sibling blocks can reference it; `dependsOn=<a,b>` and `conflictsWith=<c>` take comma-separated lists; `effort=<token>` seeds the estimated effort.
+- References resolve against sibling block `key=`s first, then exact sibling titles, then existing task-note ids — so a block can depend on an already-materialized task by id.
+- Conversion never fails on bad attributes: every block still becomes a Task Note, and unresolvable/ambiguous references or rejected edges (cycles, tree ancestor/descendant) are skipped with a warning. Check the `warnings` in the note-write / `ws.task.convertBlocks` result and fix anything skipped.
+- To adjust relations after materialization, use `ws.task.setRelations(noteId, { dependsOn: [...], conflictsWith: [...] })` (or seed them via `ws.task.markAsTask` when marking an existing note).
 
 ## Breakdown Process
 
@@ -116,7 +135,7 @@ Task notes carry first-class relations that batch delegation uses to order and s
 
 - Break down into logical phases (research → implement → test → integrate)
 - Ensure each subtask has a single clear objective
-- Order subtasks by dependencies (what needs to happen first) and declare the ordering as `dependsOn` edges once the tasks are materialized
+- Order subtasks by dependencies (what needs to happen first) and declare the ordering as `dependsOn=` attributes on the task blocks
 - Validate that subtasks are appropriately scoped
 
 ### 4. Validation Phase
@@ -130,14 +149,14 @@ Task notes carry first-class relations that batch delegation uses to order and s
 
 	Replace the original task with one `@@@task` block per subtask (one block = one task). Do not use markdown checkbox lists to create tasks; checkboxes are only progress markers inside a note.
 
-	Example (two subtasks):
+	Example (two subtasks, ordered with an inline relation):
 
 	```markdown
-	@@@task
+	@@@task key=research
 	# Research existing patterns in @src/features/auth/
 	@@@
 
-	@@@task
+	@@@task dependsOn=research
 	# Implement validation in @src/lib/validators/UserValidator.ts
 	@@@
 	```
@@ -152,7 +171,7 @@ Task notes carry first-class relations that batch delegation uses to order and s
 
 	- Create subtasks using separate task blocks (one subtask per block).
 	- Do not use markdown checkbox lists (- [ ] ...) to create tasks; checkboxes are progress markers only.
-	- When you are editing the spec note (noteId="spec") and the spec is stable, call the `convert_task_blocks` MCP tool with noteId `"spec"` to materialize the task blocks into real Task Notes (assignable + trackable).
+	- When you are editing the spec note (noteId="spec") and the spec is stable, call `ws.task.convertBlocks("spec")` to materialize the task blocks into real Task Notes (assignable + trackable).
 
 ### Before Finalizing Breakdown
 
