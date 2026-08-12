@@ -2556,11 +2556,12 @@ impl Services {
     /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
     ///
-    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`]: this path is
-    /// caller-scoped (`pr.refresh` RPC) — a hang here blocks only the calling
-    /// RPC, which the client-level network timeouts already bound. The
-    /// timeout guards only the background sweep
-    /// ([`Services::refresh_all_workspace_prs`]).
+    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`] here: the
+    /// `pr.refresh` RPC path is caller-scoped — a hang blocks only the
+    /// calling RPC, which the client-level network timeouts already bound.
+    /// The background callers wrap this future in that timeout themselves:
+    /// the refresh sweep ([`Services::refresh_all_workspace_prs`]) and the
+    /// PR-monitor terminal path (`refresh_workspace_pr_after_terminal`).
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,

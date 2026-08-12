@@ -1569,20 +1569,20 @@ impl Services {
     /// monitored PR reached a terminal state (merged/closed), through
     /// [`Services::refresh_workspace_pr`] — which persists the delta and
     /// emits `pr:updated`/`pr:linked`/`pr:unlinked` itself. Bounded by
-    /// `pr_monitor_fetch_timeout` as an *aggregate* budget over the whole
-    /// refresh (the linked-PR re-fetch, possible relink discovery via
-    /// `list_prs`, and the store writes — not a per-request bound) so a hung
-    /// forge call can never wedge the serialized monitor sweep; errors and
-    /// timeouts are logged, never propagated — the monitor's own terminal
-    /// transition already persisted, and the background refresh sweep remains
-    /// the backstop. Timeout caveat (shared with the sweep's wrap): the
-    /// dropped future can land between the store write and the event
-    /// publish, persisting the delta without `pr:updated` — rare (the
-    /// client-level network timeouts fire first) and self-limiting, since
-    /// clients re-read on the next snapshot.
+    /// `pr_refresh_fetch_timeout` — the refresh sweep's *aggregate* budget
+    /// over one workspace's whole refresh (the linked-PR re-fetch, possible
+    /// relink discovery via `list_prs`, and the store writes; not a
+    /// per-request bound) — so a hung forge call can never wedge the
+    /// serialized monitor sweep; errors and timeouts are logged, never
+    /// propagated — the monitor's own terminal transition already persisted,
+    /// and the background refresh sweep remains the backstop. Timeout caveat
+    /// (shared with the sweep's wrap): the dropped future can land between
+    /// the store write and the event publish, persisting the delta without
+    /// `pr:updated` — rare (the client-level network timeouts fire first)
+    /// and self-limiting, since clients re-read on the next snapshot.
     async fn refresh_workspace_pr_after_terminal(&self, workspace_id: &WorkspaceId) {
         match tokio::time::timeout(
-            self.pr_monitor_fetch_timeout,
+            self.pr_refresh_fetch_timeout,
             self.refresh_workspace_pr(workspace_id),
         )
         .await
@@ -1595,7 +1595,7 @@ impl Services {
             ),
             Err(_) => tracing::warn!(
                 workspace = %workspace_id.0,
-                timeout = ?self.pr_monitor_fetch_timeout,
+                timeout = ?self.pr_refresh_fetch_timeout,
                 "pr monitor terminal: workspace PR refresh timed out"
             ),
         }
