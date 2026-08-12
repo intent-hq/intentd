@@ -680,6 +680,11 @@ pub struct Services {
     /// compress it via the `#[cfg(test)]`-only `with_pr_monitor_fetch_timeout`
     /// so hung-fetch coverage completes in milliseconds.
     pr_monitor_fetch_timeout: std::time::Duration,
+    /// Upper bound on one workspace's PR refresh within the background sweep
+    /// (60 s in production; see [`PR_REFRESH_FETCH_TIMEOUT`]). Tests compress
+    /// it via the `#[cfg(test)]`-only `with_pr_refresh_fetch_timeout` so
+    /// hung-fetch coverage completes in milliseconds.
+    pr_refresh_fetch_timeout: std::time::Duration,
     /// In-memory pending workspace deletions for the delete grace window
     /// (§5.1): `workspace.delete` with `undoDelayMs > 0` registers the timer
     /// here; `workspace.cancelDelete` removes it. Never persisted — a daemon
@@ -727,6 +732,31 @@ pub(crate) type ExportBuildFailpoint = Arc<dyn Fn(&str) -> Option<Error> + Send 
 /// workspaces (intent-hq/monorepo#703).
 pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
     std::time::Duration::from_millis(50);
+
+/// Upper bound on one workspace's PR refresh within the background sweep
+/// ([`Services::refresh_all_workspace_prs`]) — defense in depth above the
+/// client-level network timeouts, mirroring the PR-monitor sweep's
+/// [`pr_monitor::PR_MONITOR_FETCH_TIMEOUT`] (intent-hq/monorepo#1988
+/// lineage), so a forge call that pends indefinitely (e.g. a TCP connection
+/// that went dark) surfaces as a logged per-workspace warning while the sweep
+/// proceeds to the next workspace, instead of permanently wedging the single
+/// serialized [`Services::spawn_pr_refresh_loop`] task for every workspace.
+///
+/// This is an *aggregate* budget over one workspace's whole refresh (the
+/// linked-PR re-fetch plus, when that PR ended, relink discovery via
+/// `list_prs`), not a per-request bound — a legitimately slow forge could
+/// exceed it without any dead connection, in which case the workspace is
+/// skipped this tick and retried on the next sweep. Because the budget also
+/// spans the refresh's store writes, cancellation on expiry can land between
+/// a store write and its event publish; the persisted state is correct, and
+/// the missed `pr:*` event is not replayed (the next sweep diffs against the
+/// already-persisted snapshot).
+///
+/// Sweep-only by design: the on-demand `pr.refresh` RPC path
+/// ([`Services::refresh_workspace_pr`]) is caller-scoped — a hang there
+/// blocks only the calling RPC, which the client-level network timeouts
+/// already bound — so it is deliberately not wrapped in this timeout.
+pub(crate) const PR_REFRESH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Services {
     /// Wire the services surface over a persistence handle.
@@ -814,6 +844,7 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
+            pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
@@ -849,6 +880,14 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_pr_monitor_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.pr_monitor_fetch_timeout = timeout;
+        self
+    }
+
+    /// Test-only: compress the per-workspace timeout of the PR-refresh sweep
+    /// so hung-fetch coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_pr_refresh_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pr_refresh_fetch_timeout = timeout;
         self
     }
 
@@ -2516,6 +2555,12 @@ impl Services {
     /// daemon-owned `pull_requests` list. Remote/archived workspaces, and
     /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
+    ///
+    /// Deliberately not wrapped in [`PR_REFRESH_FETCH_TIMEOUT`]: this path is
+    /// caller-scoped (`pr.refresh` RPC) — a hang here blocks only the calling
+    /// RPC, which the client-level network timeouts already bound. The
+    /// timeout guards only the background sweep
+    /// ([`Services::refresh_all_workspace_prs`]).
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -2705,6 +2750,10 @@ impl Services {
     /// as-is instead of being re-read per iteration, and the sweep pauses
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
     /// monopolizes SQLite pool slots (intent-hq/monorepo#703).
+    ///
+    /// Each per-workspace refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
+    /// so a hung forge call maps into the existing log-and-continue error
+    /// path instead of wedging the loop (intent-hq/monorepo#1988 lineage).
     async fn refresh_all_workspace_prs(&self, tick: u64) {
         let mut workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
@@ -2737,7 +2786,23 @@ impl Services {
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
             let ws_id = ws.id.clone();
-            if let Err(e) = self.refresh_workspace_pr_with_sc(ws, &sc).await {
+            // The timeout is defense in depth above the client-level network
+            // timeouts: a refresh that pends indefinitely maps to the same
+            // log-and-continue path as any other per-workspace error instead
+            // of wedging the sweep for every other workspace.
+            let refreshed = match tokio::time::timeout(
+                self.pr_refresh_fetch_timeout,
+                self.refresh_workspace_pr_with_sc(ws, &sc),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::Internal(format!(
+                    "PR refresh timed out after {:?}",
+                    self.pr_refresh_fetch_timeout
+                ))),
+            };
+            if let Err(e) = refreshed {
                 tracing::warn!(
                     workspace = %ws_id.as_str(),
                     error = %e,
