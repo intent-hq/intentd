@@ -394,29 +394,6 @@ fn classify_drops_non_object_params() {
     }
 }
 
-// --- next_block_id ---------------------------------------------------------
-
-#[test]
-fn next_block_id_increments_trailing_index() {
-    assert_eq!(
-        next_block_id("msg-1:5").as_deref(),
-        Some("msg-1:6"),
-        "increments after the last `:`",
-    );
-    assert_eq!(next_block_id("foo:bar:0").as_deref(), Some("foo:bar:1"));
-}
-
-#[test]
-fn next_block_id_rejects_missing_colon_or_non_numeric() {
-    assert_eq!(next_block_id("no-colon"), None);
-    assert_eq!(next_block_id("msg-1:abc"), None);
-    assert_eq!(
-        next_block_id("msg-1:-1"),
-        None,
-        "negative reject by parse()"
-    );
-}
-
 // --- ChatDeltaState — pure (sync) paths -----------------------------------
 
 fn agent() -> AgentId {
@@ -446,6 +423,11 @@ fn chunk_event(message_id: &str, block_id: &str, block_type: &str, content: Valu
     }
 }
 
+/// An `agent:tool:call` in the SEQUENTIAL layout — the result / proposal block
+/// ids follow the `tool_use` id by one and two, the shape `record_tool`
+/// produces when nothing interleaves between the call and its completion. Use
+/// [`tool_event_with_ids`] for the interleaved / parallel layouts where they do
+/// not follow.
 fn tool_event(
     message_id: &str,
     block_id: &str,
@@ -453,9 +435,42 @@ fn tool_event(
     status: &str,
     output: Option<Value>,
 ) -> Event {
+    let (prefix, idx) = block_id.rsplit_once(':').expect("block id `{msg}:{index}`");
+    let n: usize = idx.parse().expect("numeric block index");
+    tool_event_with_ids(
+        message_id,
+        block_id,
+        tool_call_id,
+        status,
+        output,
+        Some(format!("{prefix}:{}", n + 1)),
+        vec![format!("{prefix}:{}", n + 2), format!("{prefix}:{}", n + 3)],
+    )
+}
+
+/// An `agent:tool:call` with the real (`record_tool`-assigned) result and
+/// proposal block ids stated explicitly.
+fn tool_event_with_ids(
+    message_id: &str,
+    block_id: &str,
+    tool_call_id: &str,
+    status: &str,
+    output: Option<Value>,
+    result_block_id: Option<String>,
+    proposal_block_ids: Vec<String>,
+) -> Event {
     let mut data = serde_json::Map::new();
     data.insert("messageId".into(), Value::String(message_id.into()));
     data.insert("blockId".into(), Value::String(block_id.into()));
+    if let Some(rid) = result_block_id {
+        data.insert("resultBlockId".into(), Value::String(rid));
+    }
+    if !proposal_block_ids.is_empty() {
+        data.insert(
+            "proposalBlockIds".into(),
+            Value::Array(proposal_block_ids.into_iter().map(Value::String).collect()),
+        );
+    }
     data.insert("toolCallId".into(), Value::String(tool_call_id.into()));
     data.insert("status".into(), Value::String(status.into()));
     data.insert("toolName".into(), Value::String("shell".into()));
@@ -795,6 +810,181 @@ fn chat_tool_delta_use_then_completed_marks_use_as_updated() {
     assert_eq!(added[0]["block"]["type"], "tool_result");
     assert_eq!(updated.len(), 1, "tool_use is re-emitted as updated");
     assert_eq!(updated[0]["block"]["type"], "tool_use");
+}
+
+/// An id-keyed client's view of the live stream: every delta's entities folded
+/// into an ordered `(blockId, type)` list, `added` appending and `updated`
+/// replacing in place — exactly what `ChatTranscriptReconciler.upsertBlock`
+/// does on the FE.
+fn reduce_deltas(deltas: &[Value]) -> Vec<(String, String)> {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for delta in deltas {
+        for key in ["added", "updated"] {
+            for entity in delta[key].as_array().into_iter().flatten() {
+                let block = &entity["block"];
+                let id = block["id"].as_str().expect("block id").to_string();
+                let ty = block["type"].as_str().unwrap_or("").to_string();
+                match blocks.iter_mut().find(|(bid, _)| bid == &id) {
+                    Some(slot) => slot.1 = ty,
+                    None => blocks.push((id, ty)),
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// monorepo#2029, shape (a): text INTERLEAVES between a tool call and its
+/// completion. The durable transcript flushes that text into `{mid}:2` and
+/// puts the real `tool_result` at `{mid}:3`; the mapper stamps the event's
+/// `resultBlockId`, so the live ids equal the durable ones and the interleaved
+/// text block — the one that can carry a `<group:Name>` opener — is never
+/// overwritten. Predicting `tool_use + 1` clobbered it for the rest of the turn.
+#[test]
+fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
+    let mut s = ChatDeltaState::new(&agent());
+    let deltas = vec![
+        s.chunk_delta(&chunk_event(
+            "msg-i",
+            "msg-i:0",
+            "text",
+            json!("I'll run it. "),
+        ))
+        .expect("opening text"),
+        s.tool_delta(&tool_event_with_ids(
+            "msg-i",
+            "msg-i:1",
+            "tc-i",
+            "started",
+            None,
+            None,
+            Vec::new(),
+        ))
+        .expect("tool started"),
+        s.chunk_delta(&chunk_event(
+            "msg-i",
+            "msg-i:2",
+            "text",
+            json!("<group:Setup>\nChecking output. "),
+        ))
+        .expect("interleaved text"),
+        s.tool_delta(&tool_event_with_ids(
+            "msg-i",
+            "msg-i:1",
+            "tc-i",
+            "completed",
+            Some(json!("12 passed")),
+            Some("msg-i:3".to_string()),
+            Vec::new(),
+        ))
+        .expect("tool completed"),
+    ];
+    // The durable layout `record_tool` writes for this turn, verbatim.
+    assert_eq!(
+        reduce_deltas(&deltas),
+        vec![
+            ("msg-i:0".to_string(), "text".to_string()),
+            ("msg-i:1".to_string(), "tool_use".to_string()),
+            ("msg-i:2".to_string(), "text".to_string()),
+            ("msg-i:3".to_string(), "tool_result".to_string()),
+        ],
+        "the live ids match the durable transcript; msg-i:2 stays the text block"
+    );
+}
+
+/// monorepo#2029, shape (b): two PARALLEL calls completing in order. Both
+/// `tool_use` blocks precede either result, so `tool_use + 1` named the second
+/// call's `tool_use` — live, t2's tool row was replaced by t1's result until
+/// `stream:end`. With the real ids on the event both rows survive.
+#[test]
+fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
+    let mut s = ChatDeltaState::new(&agent());
+    let started = |block_id: &str, tc: &str| {
+        tool_event_with_ids("msg-p2", block_id, tc, "started", None, None, Vec::new())
+    };
+    let done = |block_id: &str, tc: &str, result_id: &str| {
+        tool_event_with_ids(
+            "msg-p2",
+            block_id,
+            tc,
+            "completed",
+            Some(json!("ok")),
+            Some(result_id.to_string()),
+            Vec::new(),
+        )
+    };
+    let deltas = vec![
+        s.chunk_delta(&chunk_event("msg-p2", "msg-p2:0", "text", json!("Both. ")))
+            .expect("opening text"),
+        s.tool_delta(&started("msg-p2:1", "t1"))
+            .expect("t1 started"),
+        s.tool_delta(&started("msg-p2:2", "t2"))
+            .expect("t2 started"),
+        s.tool_delta(&done("msg-p2:1", "t1", "msg-p2:3"))
+            .expect("t1 done"),
+        s.tool_delta(&done("msg-p2:2", "t2", "msg-p2:4"))
+            .expect("t2 done"),
+    ];
+    assert_eq!(
+        reduce_deltas(&deltas),
+        vec![
+            ("msg-p2:0".to_string(), "text".to_string()),
+            ("msg-p2:1".to_string(), "tool_use".to_string()),
+            ("msg-p2:2".to_string(), "tool_use".to_string()),
+            ("msg-p2:3".to_string(), "tool_result".to_string()),
+            ("msg-p2:4".to_string(), "tool_result".to_string()),
+        ],
+        "t2's tool_use at msg-p2:2 survives t1's completion"
+    );
+}
+
+/// The proposal-resource block ids come off the event too — they are NOT
+/// chained from the `tool_result` id, which is wrong for the same reasons.
+#[test]
+fn chat_tool_delta_proposal_ids_come_from_the_event() {
+    let mut s = ChatDeltaState::new(&agent());
+    let output = json!([proposal_output_item()]);
+    let d = s
+        .tool_delta(&tool_event_with_ids(
+            "msg-pi",
+            "msg-pi:1",
+            "tc-pi",
+            "completed",
+            Some(output),
+            Some("msg-pi:4".to_string()),
+            vec!["msg-pi:5".to_string()],
+        ))
+        .expect("tool completed delta");
+    let added = d["added"].as_array().unwrap();
+    assert_eq!(added.len(), 3, "tool_use + tool_result + proposal resource");
+    assert_eq!(added[1]["block"]["id"], "msg-pi:4");
+    assert_eq!(added[2]["block"]["type"], "resource");
+    assert_eq!(
+        added[2]["block"]["id"], "msg-pi:5",
+        "the proposal block carries the id record_tool gave it"
+    );
+}
+
+/// Defensive: an event carrying output but no `resultBlockId` (no result block
+/// was materialized) synthesizes no result block live rather than inventing an
+/// id — the terminal reconcile delivers whatever the turn actually persisted.
+#[test]
+fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
+    let mut s = ChatDeltaState::new(&agent());
+    let d = s
+        .tool_delta(&tool_event_with_ids(
+            "msg-nr",
+            "msg-nr:1",
+            "tc-nr",
+            "completed",
+            Some(json!("ok")),
+            None,
+            Vec::new(),
+        ))
+        .expect("tool completed delta");
+    let added = d["added"].as_array().unwrap();
+    assert_eq!(added.len(), 1, "no result block without a real id");
+    assert_eq!(added[0]["block"]["type"], "tool_use");
 }
 
 #[test]

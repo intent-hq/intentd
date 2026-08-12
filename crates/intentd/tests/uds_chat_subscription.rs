@@ -566,7 +566,8 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 2,
+            "resultBlockId": format!("{mid}:2"),
         }),
     )
     .await;
@@ -806,7 +807,8 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 2,
+            "resultBlockId": format!("{mid}:2"),
         }),
     )
     .await;
@@ -1215,19 +1217,21 @@ async fn chat_subscription_coexists_with_events_firehose() {
     let _ = server.await;
 }
 
-/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call so the
-/// live mapper's optimistic block layout diverges from the durable transcript,
-/// forcing the terminal reconcile to emit a NON-EMPTY `removedIds`. Two distinct
-/// self-heal paths are exercised at once: (1) the mispredicted `tool_result`
-/// index — the live mapper appends the result right after the `tool_use`
-/// (`{mid}:2`), but the persisted transcript flushed the interleaved text into
-/// `{mid}:2` and placed the real `tool_result` at `{mid}:3`, so `{mid}:2` heals
-/// from `tool_result` back to `text` via an `updated` entity; and (2) a trailing
-/// partial text block (`{mid}:4`) the model streamed live but the durable turn
-/// dropped — it exists in no persisted block, so reconcile lists it in
-/// `removedIds`. The assertion is the reconciliation invariant: the seq-0
-/// snapshot reduced with every delta (HONORING `removedIds`) equals a fresh
-/// `agent.getConversation` snapshot, and the terminal `removedIds` is non-empty.
+/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call and a
+/// trailing partial text block (`{mid}:4`) the model streamed live but the
+/// durable turn dropped — it exists in no persisted block, so the terminal
+/// reconcile lists it in a NON-EMPTY `removedIds`. The assertion is the
+/// reconciliation invariant: the seq-0 snapshot reduced with every delta
+/// (HONORING `removedIds`) equals a fresh `agent.getConversation` snapshot, and
+/// the terminal `removedIds` is non-empty.
+///
+/// The `tool_result` id is NOT part of the divergence any more (monorepo#2029):
+/// the completion event carries the real `resultBlockId` (`{mid}:3`, what
+/// `record_tool` assigned after flushing the interleaved text into `{mid}:2`),
+/// so the live mapper stamps it verbatim instead of predicting `tool_use + 1`
+/// and clobbering the interleaved text block for the rest of the turn. This
+/// test asserts that too — `{mid}:2` must never be emitted as a `tool_result` —
+/// while still exercising the genuine-orphan self-heal path via `{mid}:4`.
 #[tokio::test]
 async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
@@ -1328,9 +1332,9 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         chunk(2, "Checking output. "),
     )
     .await;
-    // 4) Tool completes WITH output: the mapper appends the predicted tool_result
-    //    right after the tool_use ({mid}:2), MISPREDICTING the index (it overwrites
-    //    the interleaved text block at {mid}:2 live).
+    // 4) Tool completes WITH output. The event carries the REAL result id the
+    //    durable transcript assigned ({mid}:3 — the interleaved text took
+    //    {mid}:2), so the mapper stamps it instead of predicting {mid}:2.
     publish_stream(
         &bus,
         &ws_id,
@@ -1340,7 +1344,8 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 3,
+            "resultBlockId": format!("{mid}:3"),
         }),
     )
     .await;
@@ -1391,6 +1396,19 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         let frame = read_json(&mut sub_reader).await;
         assert_eq!(frame["params"]["kind"], "delta");
         let delta = frame["params"]["delta"].clone();
+        // monorepo#2029: no live delta may stamp a `tool_result` onto the
+        // interleaved text block's id — the completion event named the real
+        // {mid}:3 and the mapper must not derive {mid}:2 from the tool_use.
+        for key in ["added", "updated"] {
+            for entity in delta[key].as_array().into_iter().flatten() {
+                let block = &entity["block"];
+                assert!(
+                    !(block["id"] == json!(format!("{mid}:2"))
+                        && block["type"] == json!("tool_result")),
+                    "the interleaved text block {{mid}}:2 is never overwritten live: {entity}"
+                );
+            }
+        }
         let terminal = is_terminal_delta(&delta);
         if terminal {
             terminal_removed = delta["removedIds"]
