@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.11] - 2026-08-12
+
+### 🐛 Bug Fixes
+
+- Patch crates-io tokio-tungstenite to the fork for cargo package verification ([#1158](https://github.com/intent-hq/intentd/pull/1158))
+- Report criticalPathMinutes for mixed-estimate graphs ([#1160](https://github.com/intent-hq/intentd/pull/1160))
+
 ## [0.6.10] - 2026-08-12
 
 ### 🐛 Bug Fixes
