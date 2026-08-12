@@ -3739,10 +3739,15 @@ async fn note_payloads_project_unmet_depends_on_over_wss() {
 /// sibling title → existing task-note id) and seed `dependsOn` through the
 /// same validated writer as `task.setRelations`, so `task:ready-tasks-changed`
 /// fires with the `relations-changed` trigger; the explicit RPC result carries
-/// the additive `warnings` array naming skipped references. Auto-conversion on
+/// the additive `createdTasks` array (`{ key?, title, noteId }` in block
+/// order) and `warnings` array naming skipped references. Auto-conversion on
 /// `note.create` is asserted first, then `note.restoreVersion` (which does not
 /// auto-convert) restores the fence content so the explicit `task.convertBlocks`
-/// arm serializes `{ ok, convertedCount, createdNoteIds, warnings }` on the wire.
+/// arm serializes `{ ok, convertedCount, createdNoteIds, createdTasks,
+/// warnings }` on the wire. A final `note.setContent` arm asserts the
+/// note-write results surface the same additive fields alongside
+/// `convertedCount`/`createdTaskNoteIds`, with the seeded relation verifiable
+/// via `note.get`.
 #[tokio::test]
 async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -3880,6 +3885,23 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         w.contains("\"Beta\"") && w.contains("ghost"),
         "warning names block and reference: {w}"
     );
+    let created_tasks = conv["createdTasks"].as_array().expect("createdTasks array");
+    assert_eq!(created_tasks.len(), 2, "convert: {conv}");
+    assert_eq!(created_tasks[0]["key"], json!("a"), "convert: {conv}");
+    assert_eq!(created_tasks[0]["title"], json!("Alpha"), "convert: {conv}");
+    assert_eq!(
+        created_tasks[0]["noteId"], conv["createdNoteIds"][0],
+        "createdTasks parallels createdNoteIds: {conv}"
+    );
+    assert!(
+        created_tasks[1].get("key").is_none(),
+        "no key= → field omitted: {conv}"
+    );
+    assert_eq!(created_tasks[1]["title"], json!("Beta"), "convert: {conv}");
+    assert_eq!(
+        created_tasks[1]["noteId"], conv["createdNoteIds"][1],
+        "createdTasks parallels createdNoteIds: {conv}"
+    );
 
     // The re-seeded edge recomputes readiness again, triggered by the new
     // Beta child. Child deletions above may also have emitted recomputes;
@@ -3907,4 +3929,79 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
             break;
         }
     }
+
+    // Note-write surface: a `note.setContent` write containing fences
+    // carries the same additive `createdTasks`/`warnings` fields alongside
+    // the existing `convertedCount`/`createdTaskNoteIds`.
+    let plan2 = wss_rpc(
+        &mut rpc,
+        9,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Plan2", "content": "placeholder" }),
+    )
+    .await;
+    let plan2_id = plan2["note"]["id"].as_str().expect("note id").to_string();
+    let set = wss_rpc(
+        &mut rpc,
+        10,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": plan2_id,
+            "content": "@@@task key=g\n# Gamma\nbody\n@@@\n@@@task dependsOn=g,phantom\n# Delta\nbody\n@@@",
+        }),
+    )
+    .await;
+    assert_eq!(set["ok"], json!(true), "setContent: {set}");
+    assert_eq!(set["convertedCount"], json!(2), "setContent: {set}");
+    let ids = set["createdTaskNoteIds"]
+        .as_array()
+        .expect("createdTaskNoteIds array");
+    assert_eq!(ids.len(), 2, "setContent: {set}");
+    let created = set["createdTasks"].as_array().expect("createdTasks array");
+    assert_eq!(created.len(), 2, "setContent: {set}");
+    assert_eq!(created[0]["key"], json!("g"), "setContent: {set}");
+    assert_eq!(created[0]["title"], json!("Gamma"), "setContent: {set}");
+    assert_eq!(
+        created[0]["noteId"], ids[0],
+        "createdTasks parallels createdTaskNoteIds: {set}"
+    );
+    assert!(
+        created[1].get("key").is_none(),
+        "no key= → field omitted: {set}"
+    );
+    assert_eq!(created[1]["title"], json!("Delta"), "setContent: {set}");
+    assert_eq!(
+        created[1]["noteId"], ids[1],
+        "createdTasks parallels createdTaskNoteIds: {set}"
+    );
+    let set_warnings = set["warnings"].as_array().expect("warnings array");
+    assert_eq!(set_warnings.len(), 1, "setContent: {set}");
+    let w = set_warnings[0].as_str().expect("warning string");
+    assert!(
+        w.contains("\"Delta\"") && w.contains("phantom"),
+        "warning names block and reference: {w}"
+    );
+    let new_content = set["newContent"].as_str().expect("newContent");
+    assert!(
+        !new_content.contains("@@@task"),
+        "fences converted: {new_content}"
+    );
+
+    // The `key=`-resolved edge seeded by the write is visible via `note.get`.
+    let gamma_id = created[0]["noteId"].as_str().expect("gamma id");
+    let delta_id = created[1]["noteId"].as_str().expect("delta id");
+    let got = wss_rpc(
+        &mut rpc,
+        11,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": delta_id }),
+    )
+    .await;
+    assert_eq!(got["note"]["title"], json!("Delta"), "child: {got}");
+    assert_eq!(
+        got["note"]["metadata"]["task"]["dependsOn"],
+        json!([gamma_id]),
+        "seeded dep: {got}"
+    );
 }
