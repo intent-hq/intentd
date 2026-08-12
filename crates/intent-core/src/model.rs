@@ -1252,6 +1252,14 @@ pub struct NoteAddResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.edit` — first exact-match replacement.
@@ -1268,6 +1276,14 @@ pub struct NoteEditResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.editLines` — 1-based inclusive replace/delete/insert.
@@ -1284,6 +1300,14 @@ pub struct NoteEditLinesResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.setContent` — full replace with the reduction guard.
@@ -1301,6 +1325,14 @@ pub struct NoteSetContentResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.updateMetadata`. Either a normal title/tags update or a
@@ -1606,6 +1638,17 @@ pub struct TaskSetRelationsResult {
     pub conflicts_with: Vec<NoteId>,
 }
 
+/// One task note created by `@@@task` block conversion: the block's `key=`
+/// header attribute (when authored), its title, and the created note's id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedTaskEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub title: String,
+    pub note_id: String,
+}
+
 /// Result of `task.convertBlocks`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1613,6 +1656,11 @@ pub struct TaskConvertBlocksResult {
     pub ok: bool,
     pub converted_count: i64,
     pub created_note_ids: Vec<String>,
+    /// One entry per task note created by this conversion, in block order
+    /// (parallel to `created_note_ids`); reused existing children are not
+    /// listed.
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
     /// Non-fatal conversion problems: header parse issues, unresolvable or
     /// ambiguous `dependsOn`/`conflictsWith` references, and validator-
     /// rejected edges. Conversion never fails on these — the blocks still

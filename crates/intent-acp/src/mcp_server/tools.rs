@@ -200,7 +200,7 @@ API:
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
   ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
   ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle or reference a tree ancestor/descendant of the task are rejected with the offending path/relationship named.
-  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
+  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds, createdTasks, warnings }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion. `createdTasks` is `[{ key?, title, noteId }]` in block order; `warnings` names skipped relation references.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.
 
@@ -422,7 +422,7 @@ API:
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
   ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
   ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle or reference a tree ancestor/descendant of the task are rejected with the offending path/relationship named.
-  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
+  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds, createdTasks, warnings }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion. `createdTasks` is `[{ key?, title, noteId }]` in block order; `warnings` names skipped relation references.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.
 

@@ -450,6 +450,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -472,6 +474,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.new,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -495,6 +499,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -519,6 +525,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
