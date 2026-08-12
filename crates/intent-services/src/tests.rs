@@ -8684,6 +8684,9 @@ mod pr {
         /// without the signals (the trait default `Unsupported`), exercising
         /// the degraded checklist path.
         merge_signals: Option<MergeRequirementSignals>,
+        /// PR number whose `get_pr` pends forever (hung-connection
+        /// regression, intent-hq/monorepo#1988 lineage).
+        hang_get_pr: Option<u64>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -8844,6 +8847,10 @@ mod pr {
             })
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            if self.hang_get_pr == Some(number) {
+                // A TCP connection that went dark: the future never resolves.
+                std::future::pending::<()>().await;
+            }
             if self.missing_pr == Some(number) {
                 return Err(ScError::NotFound("no such PR".into()));
             }
@@ -10414,6 +10421,66 @@ mod pr {
             let after = svc.store().get_workspace(id).await.unwrap();
             assert_eq!(after.pr_number, Some(42));
         }
+    }
+
+    /// Regression for intent-hq/monorepo#2094 (intent-hq/monorepo#1988
+    /// lineage): a forge fetch that pends forever (a TCP connection gone
+    /// dark) must not wedge the PR-refresh sweep. The per-workspace timeout
+    /// maps the hang to the existing log-and-continue error path — the hung
+    /// workspace is skipped untouched — and the sweep proceeds to refresh
+    /// the remaining workspaces.
+    #[tokio::test]
+    async fn a_hung_fetch_times_out_and_the_sweep_still_refreshes_other_workspaces() {
+        let forge = StubForge {
+            discover: true,
+            hang_get_pr: Some(42),
+            ..Default::default()
+        };
+        // The hung workspace is inserted FIRST so the sweep (created_at
+        // order) hits the hang before the healthy workspace — forward
+        // progress past the hang is exactly what the test proves. It is
+        // linked to PR #42, whose `get_pr` pends forever; the healthy
+        // workspace is unlinked and discovers via `list_prs`, which stays
+        // responsive.
+        let (_t, svc, hung_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        // 500 ms, not lower: unlike the monitor-sweep precedent this budget
+        // also bounds the HEALTHY workspace's whole refresh (SQLite writes +
+        // event publish), so leave headroom for a saturated CI machine. The
+        // hung future pends forever, so any compressed value proves the same
+        // thing — runtime just scales with the timeout.
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(500));
+        let healthy_id = WorkspaceId::new();
+        let mut healthy = workspace(&healthy_id);
+        healthy.branch = "feature".to_string();
+        healthy.repository_owner = Some("o".into());
+        healthy.repository_name = Some("r".into());
+        healthy.updated_at = now_iso();
+        svc.store().insert_workspace(&healthy).await.expect("ws2");
+
+        svc.refresh_all_workspace_prs(0).await;
+
+        // The hung workspace was skipped untouched: no status persisted, no
+        // event emitted.
+        let hung_after = svc.store().get_workspace(&hung_id).await.unwrap();
+        assert_eq!(hung_after.pr_number, Some(42));
+        assert_eq!(hung_after.pr_status, None, "hung refresh persisted nothing");
+        let hung_evs = svc.store().events_by_workspace(&hung_id, 10).await.unwrap();
+        assert!(hung_evs.is_empty(), "no event for the hung workspace");
+
+        // The sweep proceeded past the hang: the healthy workspace was
+        // discovered and linked.
+        let healthy_after = svc.store().get_workspace(&healthy_id).await.unwrap();
+        assert_eq!(healthy_after.pr_number, Some(42));
+        assert_eq!(
+            healthy_after.pr_status,
+            Some(intent_core::PullRequestStatus::Open)
+        );
+        let evs = svc
+            .store()
+            .events_by_type(&healthy_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
     }
 
     // ------------------------------------------------------------------------
