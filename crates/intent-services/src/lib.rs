@@ -28,18 +28,19 @@ use intent_core::{
     CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, ContextItem, Draft, Event, EventQueryParams, EventSubscribeResult,
-    EventUnsubscribeResult, FileActivity, LineAttributionAuthor, LineAttributionComputeResult,
-    LineAttributionData, LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
-    NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    Workspace, WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata, NoteRestoreVersionResult,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
+    NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
@@ -8793,6 +8794,9 @@ fn resolve_block_relation_value(
 struct AutoConvertOutcome {
     converted_count: i64,
     created_note_ids: Vec<String>,
+    /// One `{ key?, title, noteId }` entry per created task note, in block
+    /// order (parallel to `created_note_ids`).
+    created_tasks: Vec<CreatedTaskEntry>,
     /// The full note refetched from the store after the conversion ran.
     /// `convert_task_blocks` performs a second store write (bumping `rev` and
     /// `updated_at`), so callers must return this refetched note — not the
@@ -8800,8 +8804,8 @@ struct AutoConvertOutcome {
     /// refetches the note after conversion.
     refetched_note: Option<Note>,
     /// Non-fatal conversion warnings (skipped relation edges, header parse
-    /// issues). Carried here so the note-write wire results can surface them;
-    /// until that lands they are logged by the auto-convert hook.
+    /// issues), surfaced on the note-write wire results and logged by the
+    /// auto-convert hook.
     warnings: Vec<String>,
 }
 
@@ -8834,6 +8838,7 @@ impl Services {
                 let outcome = AutoConvertOutcome {
                     converted_count: r.converted_count,
                     created_note_ids: r.created_note_ids,
+                    created_tasks: r.created_tasks,
                     refetched_note,
                     warnings: r.warnings,
                 };
@@ -8878,6 +8883,7 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
                 warnings: Vec::new(),
             });
         }
@@ -8903,6 +8909,7 @@ impl Services {
         let mut working = parsed.content_without_blocks.clone();
         let mut warnings: Vec<String> = Vec::new();
         let mut created_note_ids: Vec<String> = Vec::new();
+        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::new();
         let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
         let mut peer_order = 100i64;
         for (i, task) in parsed.tasks.iter().enumerate() {
@@ -8942,6 +8949,11 @@ impl Services {
                         .await?;
                     existing_by_title.insert(normalized, child.id.clone());
                     created_note_ids.push(child.id.0.clone());
+                    created_tasks.push(CreatedTaskEntry {
+                        key: task.key.clone(),
+                        title: task.title.clone(),
+                        note_id: child.id.0.clone(),
+                    });
                     child.id
                 }
             };
@@ -9090,6 +9102,7 @@ impl Services {
                 ok: true,
                 converted_count: 0,
                 created_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
                 warnings,
             });
         }
@@ -9127,6 +9140,7 @@ impl Services {
             ok: true,
             converted_count: created_note_ids.len() as i64,
             created_note_ids,
+            created_tasks,
             warnings,
         })
     }
@@ -15369,6 +15383,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15447,6 +15463,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15519,6 +15537,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
@@ -15615,6 +15635,8 @@ impl WorkspaceApi for Services {
                 new_content: final_content,
                 converted_count: outcome.converted_count,
                 created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
             })
         })
     }
