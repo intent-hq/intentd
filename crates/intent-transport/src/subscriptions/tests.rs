@@ -2028,6 +2028,62 @@ mod chat_snapshot_interrupt_window {
         }
     }
 
+    /// Replays the exact interleaving from the #1161 review: a following turn
+    /// claims `busy` in the instant BETWEEN the snapshot's two reads, while the
+    /// slot still holds the PREVIOUS turn's flush-failure orphan (its worker
+    /// replaces the slot only in `begin_live_turn`, many awaits later).
+    ///
+    /// The claim is modelled as a side effect of the SLOT read: whichever read
+    /// `chat_snapshot` performs first, the claim lands immediately after it. So
+    /// the order is what the assertion actually pins — read the slot first and
+    /// the busy read that follows returns the new turn's claim, labelling the old
+    /// turn's content `isStreaming: true`; read busy first and it cannot be
+    /// influenced by the claim at all.
+    struct ClaimsBusyBetweenReadsApi {
+        busy: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkspaceApi for ClaimsBusyBetweenReadsApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": "m-0",
+                        "role": "user",
+                        "seq": 0,
+                        "contentBlocks": [{ "id": "m-0:0", "type": "text", "text": "Run the tests" }],
+                    }],
+                    "truncated": false,
+                    "totalMessages": 1,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            self.busy.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Reading the slot lets the next turn win the claim right afterwards.
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            self.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(json!({
+                "messageId": "msg-previous-turn",
+                "contentBlocks": [
+                    { "id": "msg-previous-turn:0", "type": "text", "text": "I'll run " }
+                ],
+            }))
+        }
+    }
+
     fn assistant_ids(snap: &Value) -> Vec<String> {
         snap["messages"]
             .as_array()
@@ -2144,6 +2200,37 @@ mod chat_snapshot_interrupt_window {
             "an empty orphan slot must not surface at all: {snap}"
         );
         assert_eq!(snap["totalMessages"], 1, "…and does not inflate the count");
+    }
+
+    /// #1161 review, medium: the busy read must come BEFORE the slot read.
+    ///
+    /// Both reads take their own lock, so a following turn can claim `busy`
+    /// between them. In the reversed order the snapshot would pair the previous
+    /// turn's orphaned content with the new turn's claim and serve it as
+    /// `isStreaming: true` — exactly the phantom-streaming state the merge rule
+    /// promises to prevent, and the one case where showing orphan content could
+    /// be worse than hiding it. Reading busy first makes that pairing
+    /// unrepresentable, and `try_begin` clears a stale slot under the busy lock
+    /// before publishing the claim, so `busy == true` implies the stale slot is
+    /// already gone.
+    #[tokio::test]
+    async fn chat_snapshot_reads_busy_before_the_slot_so_a_new_claim_cannot_gild_stale_content() {
+        let api = ClaimsBusyBetweenReadsApi {
+            busy: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let snap = chat_snapshot(&api, &agent(), None).await;
+
+        assert_eq!(
+            assistant_ids(&snap),
+            vec!["msg-previous-turn".to_string()],
+            "the orphaned content is still served: {snap}"
+        );
+        assert_eq!(
+            snap["messages"][1]["isStreaming"], false,
+            "a turn claiming busy after the snapshot's busy read must NOT relabel \
+             the previous turn's content as streaming: {snap}"
+        );
     }
 
     /// monorepo#2104, the case that makes this worth changing: the flush hit a

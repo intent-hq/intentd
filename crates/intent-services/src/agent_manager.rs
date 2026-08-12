@@ -3671,8 +3671,28 @@ impl AgentManager {
         // `list_busy` never observes a busy agent without its workspace.
         let claimed = {
             let mut busy = self.busy.lock().unwrap();
-            let claimed = busy.insert(agent_id.clone());
+            let claimed = !busy.contains(agent_id);
             if claimed {
+                // Drop a live-turn slot that outlived its turn BEFORE the claim
+                // becomes visible (monorepo#2104). A slot can survive its turn:
+                // when `flush_partial_turn_on_interruption` hits a non-UNIQUE
+                // store error it deliberately keeps the slot as the only copy of
+                // the streamed content. This turn's worker replaces the slot only
+                // in `begin_live_turn`, which is many awaits away — the user row
+                // INSERT, the task spawn, the ACP session setup — so without this
+                // clear the pair (busy = true, slot = the PREVIOUS turn's content)
+                // would be readable for that whole window, and `chat_snapshot`
+                // would serve stale content labelled `isStreaming: true`.
+                //
+                // Ordering is the point: clearing under the `busy` lock and
+                // BEFORE publishing the claim means any reader that observes
+                // `busy == true` is guaranteed to observe the stale slot already
+                // gone (`chat_snapshot` reads busy first for exactly this
+                // reason). Lock order is busy → live_turns, consistent with the
+                // busy → agent_ws invariant above; nothing acquires `live_turns`
+                // and then `busy`.
+                self.services.clear_live_turn(agent_id);
+                busy.insert(agent_id.clone());
                 self.agent_ws
                     .lock()
                     .unwrap()

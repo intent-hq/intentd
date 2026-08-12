@@ -481,8 +481,17 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
+    // Read busy BEFORE the slot, never after. The two reads are separate lock
+    // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
+    // stale slot under the busy lock before publishing the claim, which makes
+    // `busy == true` ⇒ "the stale slot is already gone" — but only for a reader
+    // in this order. Reversed, a snapshot could read the PREVIOUS turn's content
+    // and then a freshly-claimed `busy`, and label stale content `isStreaming:
+    // true` — the phantom-streaming state this whole gate exists to prevent. In
+    // this order the residual interleaving is the harmless mirror: the new turn's
+    // content labelled settled, which the next delta or snapshot corrects.
+    let is_streaming = api.agent_is_busy(agent_id.clone());
     if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-        let is_streaming = api.agent_is_busy(agent_id.clone());
         merge_live_turn(&mut snapshot, agent_id, &live, is_streaming);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client

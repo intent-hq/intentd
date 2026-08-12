@@ -1098,6 +1098,70 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     assert!(reg.is_registered(&active), "active process kept");
 }
 
+/// monorepo#2104 (#1161 review) — a live-turn slot that outlived its turn must
+/// not outlive it INTO the next turn. `flush_partial_turn_on_interruption`
+/// deliberately keeps the slot on a non-UNIQUE store error (it is the only copy
+/// of the streamed content), and `end_turn` then releases busy. The next turn
+/// claims busy here, but its worker replaces the slot only in `begin_live_turn`
+/// — after the user row INSERT, the task spawn and the ACP session setup. For
+/// that whole window the pair (busy = true, slot = the PREVIOUS turn's content)
+/// would otherwise be readable, and `chat_snapshot` would serve the old content
+/// as `isStreaming: true`. Claiming the slot drops it.
+#[tokio::test]
+async fn try_begin_drops_a_live_turn_slot_that_outlived_its_turn() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-stale-slot");
+    let id = AgentId::from("a-stale-slot");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+
+    // The orphan a failed flush leaves behind: content, no busy claim.
+    mgr.services.set_live_turn(
+        &id,
+        "msg-previous-turn",
+        vec![json!({ "type": "text", "id": "msg-previous-turn:0", "text": "I'll run " })],
+    );
+    assert!(
+        mgr.services.live_turn(&id).is_some(),
+        "precondition: the orphan slot is published while the agent is idle"
+    );
+
+    assert!(mgr.try_begin(&id, &ws).await, "the next turn claims busy");
+
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "the previous turn's slot must not survive the new turn's claim"
+    );
+    assert!(mgr.is_busy(&id), "…and the claim itself still stands");
+}
+
+/// The claim must not disturb a slot when it does NOT win: a second `try_begin`
+/// against an agent whose turn is already running is a no-op, so a live turn's
+/// own slot survives a losing claim.
+#[tokio::test]
+async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-losing-claim");
+    let id = AgentId::from("a-losing-claim");
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services.set_live_turn(
+        &id,
+        "msg-running",
+        vec![json!({ "type": "text", "id": "msg-running:0", "text": "streaming…" })],
+    );
+
+    assert!(!mgr.try_begin(&id, &ws).await, "the second claim loses");
+
+    let live = mgr
+        .services
+        .live_turn(&id)
+        .expect("the running turn's slot survives a losing claim");
+    assert_eq!(live.message_id, "msg-running");
+}
+
 #[tokio::test]
 async fn reap_idle_older_than_skips_in_flight_agents() {
     let (_tmp, mgr) = manager().await;
