@@ -501,7 +501,7 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
 
 #[cfg(unix)]
 #[test]
-fn resolve_binary_path_finds_non_default_nvm_version() {
+fn resolve_binary_path_prefers_newest_nvm_node_version() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = unique_temp_dir("nvm-multi-version-home");
@@ -510,16 +510,11 @@ fn resolve_binary_path_finds_non_default_nvm_version() {
     std::fs::create_dir_all(&v20_bin).unwrap();
     std::fs::create_dir_all(&v24_bin).unwrap();
     std::fs::write(v20_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
-
-    let name = format!(
-        "intent-nvm-binary-{}",
-        home.path().file_name().unwrap().to_string_lossy()
-    );
-    let binary = v24_bin.join(&name);
+    let binary = v24_bin.join("node");
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let resolved = resolve_binary_path_with_home(&name, &[], home.path());
+    let resolved = resolve_binary_path_with_home("node", &[], home.path());
 
     assert_eq!(resolved.as_deref(), Some(binary.as_path()));
 }

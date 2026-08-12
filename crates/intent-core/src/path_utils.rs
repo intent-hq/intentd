@@ -6,7 +6,7 @@
 //! volta, asdf, etc.) so that tools and their dependencies can be discovered.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -445,6 +445,16 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
+fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64)> {
+    let version = path.file_name()?.to_str()?.strip_prefix('v')?;
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    (parts.next().is_none()).then_some((major, minor, patch))
+}
+
 /// Injectable core - accepts the home directory and a function that returns
 /// login-shell dirs, so tests can avoid spawning the real shell.
 fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) -> Vec<PathBuf>
@@ -490,12 +500,21 @@ where
         }
     }
 
-    // Add all nvm-managed node versions
+    // Prefer the newest installed nvm Node. read_dir order is unspecified and
+    // often put an older installation first, which made first-match discovery
+    // report an obsolete Node even when a current version was installed.
     if let Some(home) = home {
         let nvm_dir = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
-            for entry in entries.flatten() {
-                push_dir(&mut dirs, &mut seen, entry.path().join("bin"));
+            let mut version_dirs: Vec<PathBuf> =
+                entries.flatten().map(|entry| entry.path()).collect();
+            version_dirs.sort_by(|a, b| {
+                nvm_node_version(b)
+                    .cmp(&nvm_node_version(a))
+                    .then_with(|| b.file_name().cmp(&a.file_name()))
+            });
+            for version_dir in version_dirs {
+                push_dir(&mut dirs, &mut seen, version_dir.join("bin"));
             }
         }
     }
@@ -735,7 +754,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn enriched_tool_dirs_scans_every_nvm_node_version() {
+    fn enriched_tool_dirs_scans_every_nvm_node_version_newest_first() {
         let unique = format!(
             "intent-path-utils-nvm-{}-{}",
             std::process::id(),
@@ -754,6 +773,9 @@ mod tests {
 
         assert!(dirs.contains(&v20_bin));
         assert!(dirs.contains(&v24_bin));
+        let v20_position = dirs.iter().position(|dir| dir == &v20_bin).unwrap();
+        let v24_position = dirs.iter().position(|dir| dir == &v24_bin).unwrap();
+        assert!(v24_position < v20_position, "newest nvm Node must be first");
         assert!(dirs.contains(&home.join(".local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
         std::fs::remove_dir_all(&home).unwrap();

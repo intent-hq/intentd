@@ -28,7 +28,7 @@
 //! root so they unit-test cleanly with a temp directory.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -130,6 +130,19 @@ fn resolve_binary_path_with_tool_dirs(
     if name.is_empty() {
         return None;
     }
+    // nvm can leave several Node versions installed while the inherited PATH
+    // still names an older one. enriched_tool_dirs orders nvm installs newest
+    // first, so honor that order before consulting PATH for Node specifically.
+    if name == "node" {
+        let nvm_dirs: Vec<PathBuf> = enriched_tool_dirs
+            .iter()
+            .filter(|dir| is_nvm_node_bin_dir(dir))
+            .cloned()
+            .collect();
+        if let Some(path) = find_in_dir_candidates(name, &nvm_dirs) {
+            return Some(path);
+        }
+    }
     // 1. PATH which/where (ranked so Windows prefers a runnable extension)
     if let Some(path) = lookup_in_path(name) {
         if path.is_file() || path.is_symlink() {
@@ -152,6 +165,25 @@ fn resolve_binary_path_with_tool_dirs(
         return Some(path);
     }
     None
+}
+
+fn is_nvm_node_bin_dir(path: &Path) -> bool {
+    let Some(version_dir) = path.parent() else {
+        return false;
+    };
+    let Some(node_dir) = version_dir.parent() else {
+        return false;
+    };
+    let Some(versions_dir) = node_dir.parent() else {
+        return false;
+    };
+    let Some(nvm_dir) = versions_dir.parent() else {
+        return false;
+    };
+    path.file_name() == Some(OsStr::new("bin"))
+        && node_dir.file_name() == Some(OsStr::new("node"))
+        && versions_dir.file_name() == Some(OsStr::new("versions"))
+        && nvm_dir.file_name() == Some(OsStr::new(".nvm"))
 }
 
 /// Extensions Windows can actually run (`CreateProcess` / `cmd.exe`-runnable),
