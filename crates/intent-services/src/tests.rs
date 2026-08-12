@@ -10443,7 +10443,12 @@ mod pr {
         // workspace is unlinked and discovers via `list_prs`, which stays
         // responsive.
         let (_t, svc, hung_id) = refresh_setup(forge, "feature", Some(42), false).await;
-        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(50));
+        // 500 ms, not lower: unlike the monitor-sweep precedent this budget
+        // also bounds the HEALTHY workspace's whole refresh (SQLite writes +
+        // event publish), so leave headroom for a saturated CI machine. The
+        // hung future pends forever, so any compressed value proves the same
+        // thing — runtime just scales with the timeout.
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(500));
         let healthy_id = WorkspaceId::new();
         let mut healthy = workspace(&healthy_id);
         healthy.branch = "feature".to_string();

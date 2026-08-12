@@ -746,7 +746,11 @@ pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
 /// linked-PR re-fetch plus, when that PR ended, relink discovery via
 /// `list_prs`), not a per-request bound — a legitimately slow forge could
 /// exceed it without any dead connection, in which case the workspace is
-/// skipped this tick and retried on the next sweep.
+/// skipped this tick and retried on the next sweep. Because the budget also
+/// spans the refresh's store writes, cancellation on expiry can land between
+/// a store write and its event publish; the persisted state is correct, and
+/// the missed `pr:*` event is not replayed (the next sweep diffs against the
+/// already-persisted snapshot).
 ///
 /// Sweep-only by design: the on-demand `pr.refresh` RPC path
 /// ([`Services::refresh_workspace_pr`]) is caller-scoped — a hang there
