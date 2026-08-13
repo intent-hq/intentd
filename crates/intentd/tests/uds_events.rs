@@ -425,11 +425,14 @@ async fn crud_mutations_emit_change_events_over_uds() {
         json!({ "noteId": note_id, "commentId": comment_id })
     );
 
-    // Raise then dismiss attention. `workspace.update` now emits
-    // `workspace:updated` (§6.5) with the applied `WorkspaceUpdate` delta,
-    // followed by the `workspace:displayStatus-changed` promotion the unread
-    // flag drives (§6.5 step 9); `workspace.dismissAttention` follows with
-    // `workspace:attention-changed` plus the demotion.
+    // Raise then dismiss attention. `workspace.update` emits
+    // `workspace:updated` (§6.5) with the applied `WorkspaceUpdate` delta;
+    // `workspace.dismissAttention` follows with
+    // `workspace:attention-changed`. The unread flag is not a displayStatus
+    // axis (§6.5), so neither mutation emits a
+    // `workspace:displayStatus-changed` — the stream is sequential, so the
+    // dismiss's attention-changed arriving directly after the update's
+    // workspace:updated proves no displayStatus event interleaved.
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -446,13 +449,6 @@ async fn crud_mutations_emit_change_events_over_uds() {
         e["data"],
         json!({ "workspaceId": ws_id, "changes": { "attention": "unread" } }),
     );
-    let ev = read_json(&mut sub_reader).await;
-    let e = &ev["params"]["event"];
-    assert_eq!(e["type"], "workspace:displayStatus-changed");
-    assert_eq!(
-        e["data"],
-        json!({ "workspaceId": ws_id, "displayStatus": "unread" })
-    );
 
     rpc(
         &mut rpc_write,
@@ -468,13 +464,6 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(
         e["data"],
         json!({ "workspaceId": ws_id, "attention": "none" })
-    );
-    let ev = read_json(&mut sub_reader).await;
-    let e = &ev["params"]["event"];
-    assert_eq!(e["type"], "workspace:displayStatus-changed");
-    assert_eq!(
-        e["data"],
-        json!({ "workspaceId": ws_id, "displayStatus": "idle" })
     );
 
     let _ = shutdown_tx.send(());

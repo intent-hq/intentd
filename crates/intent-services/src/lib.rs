@@ -2187,8 +2187,7 @@ impl Services {
     /// Raising `unread` never downgrades a persistent `review_required` flag
     /// (which only `workspace.dismissAttention` retires): the write is guarded
     /// on `attention = none`, so a completed turn on a review-required
-    /// workspace is a no-op — no event, no `needs_attention → unread`
-    /// demotion in the derived displayStatus.
+    /// workspace is a no-op — no event.
     pub(crate) async fn raise_attention(
         &self,
         workspace_id: &WorkspaceId,
@@ -2219,10 +2218,14 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // The attention flag feeds the derived displayStatus (`unread` /
-        // `review_required` axes, §6.5): recompute-and-compare after the
-        // flag change so the transition emits.
-        self.maybe_emit_display_status_changed(workspace_id).await;
+        // The `unread` flag is not a displayStatus axis (§6.5), so the
+        // turn-end unread raise (the sole caller) never moves the derived
+        // rollup — skip the recompute (it would be a guaranteed no-op). A
+        // non-`unread` raise can move the `review_required` axis, so
+        // recompute-and-compare for those so the transition emits.
+        if level != WorkspaceAttention::Unread {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         Ok(())
     }
 
@@ -15572,8 +15575,8 @@ impl WorkspaceApi for Services {
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The cleared flag feeds the derived displayStatus (`unread` /
-                // `review_required` axes, §6.5): recompute-and-compare.
+                // The cleared flag feeds the derived displayStatus
+                // (`review_required` axis, §6.5): recompute-and-compare.
                 this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
@@ -15612,10 +15615,9 @@ impl WorkspaceApi for Services {
                 )
                 .await?;
             if changed {
+                // The unread flag is not a displayStatus axis (§6.5), so
+                // clearing it never moves the derived rollup — no recompute.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The retired unread flag feeds the derived displayStatus
-                // (`unread` axis, §6.5): recompute-and-compare.
-                this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation

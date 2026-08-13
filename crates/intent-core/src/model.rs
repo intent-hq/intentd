@@ -113,18 +113,18 @@ pub enum NoteVisibility {
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
-/// `taskStats`, live agent activity, the per-workspace attention axes, and
-/// the dismissible workspace attention flag. Wire values are the snake_case
-/// variant names, matching the FE union exactly. Canonical precedence
-/// (§6.5): `Failed` (a top-level agent parked in `error`) > `Blocked` (a
-/// top-level pending `blocker` attention request) > `NeedsAttention`
-/// (discussion requests, pending structured questions, or the
-/// `review_required` attention flag) > `InProgress` (running agent) >
-/// `Unread` (the `unread` attention flag, promoting only over the
-/// idle/terminal bases `Idle`/`Complete`/`PrMerged`) > the PR/task rollup.
-/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
-/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
-/// never reach the wire on their own.
+/// `taskStats`, live agent activity, and the per-workspace attention axes.
+/// Wire values are the snake_case variant names, matching the FE union
+/// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
+/// in `error`) > `Blocked` (a top-level pending `blocker` attention
+/// request) > `NeedsAttention` (discussion requests, pending structured
+/// questions, or the `review_required` attention flag) > `InProgress`
+/// (running agent) > the PR/task rollup. The dismissible `unread` attention
+/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
+/// is the flag's own contract, not a display status. Without a running
+/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
+/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
+/// on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -133,7 +133,6 @@ pub enum WorkspaceDisplayStatus {
     NeedsAttention,
     Failed,
     Blocked,
-    Unread,
     Idle,
     Complete,
     PrReady,
