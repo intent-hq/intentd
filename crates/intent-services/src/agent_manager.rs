@@ -1667,6 +1667,22 @@ impl AgentManager {
         &self.registry
     }
 
+    /// Snapshot of `spawned child pid -> agent id` for every live handle that
+    /// owns a child process (monorepo#2063 Phase A). Handles without a known
+    /// pid (fake/transport-only handles) are omitted. The descendant-tree
+    /// sampler uses this to bucket subtree RSS by nearest registered agent
+    /// root; it is a point-in-time snapshot, so a pid may already be dead by
+    /// the time the caller walks the process table — the walk simply finds no
+    /// process for it.
+    pub fn agent_root_pids(&self) -> HashMap<u32, AgentId> {
+        self.handles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(agent_id, handle)| handle.child_pid.map(|pid| (pid, agent_id.clone())))
+            .collect()
+    }
+
     /// Resolve an outstanding interactive permission prompt (`agent.respondPermission`,
     /// PROTOCOL §8): deliver `outcome` to the blocked client handler. Returns
     /// `false` when no such prompt is outstanding (already answered or timed out).
@@ -10230,6 +10246,35 @@ mod dead_child_respawn_tests {
             );
         }
         mgr.stop(&agent_id).await;
+    }
+
+    /// `agent_root_pids` maps each handle's spawned child pid to its agent id
+    /// (monorepo#2063 Phase A) and omits handles with no known pid — the
+    /// descendant-tree sampler must not bucket under a root it cannot place
+    /// in the process table.
+    #[tokio::test]
+    async fn agent_root_pids_maps_child_pids_and_skips_pidless_handles() {
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+
+        // A live child whose pid is known: it must appear in the map.
+        let with_pid = AgentId::from("agent-root-pid");
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeping child");
+        let pid = child.id().expect("live child has a pid");
+        let _ends_a = install_fake_handle(&mgr, &with_pid, Some(child));
+
+        // A transport-only handle with no child process: omitted.
+        let pidless = AgentId::from("agent-no-pid");
+        let _ends_b = install_fake_handle(&mgr, &pidless, None);
+
+        let roots = mgr.agent_root_pids();
+        assert_eq!(roots.get(&pid), Some(&with_pid));
+        assert_eq!(roots.len(), 1, "pidless handle contributes no entry");
+
+        mgr.stop(&with_pid).await;
+        mgr.stop(&pidless).await;
     }
 }
 
