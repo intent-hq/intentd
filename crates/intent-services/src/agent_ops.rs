@@ -5383,10 +5383,14 @@ impl Services {
                  remains armed; {completion_promise}.)",
                 session.name, caller.0, wake_verb, reason
             );
+            // `watchStillArmed: true` (monorepo#2060) is the machine-readable
+            // twin of the "remains armed" note above, mirroring the hook
+            // wakes' `hookStillActive` flag.
             let metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
                 "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "watchStillArmed": true,
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
                     "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
