@@ -2132,6 +2132,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "toml",

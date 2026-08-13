@@ -34,6 +34,9 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use intent_core::path_utils::{
+    has_windows_exec_extension, is_executable_file, WINDOWS_EXEC_EXTENSIONS,
+};
 use intent_core::{path_utils, DiscoveryCache};
 use serde_json::{json, Map, Value};
 
@@ -203,24 +206,6 @@ fn is_nvm_node_bin_dir(path: &Path) -> bool {
         && nvm_dir.file_name() == Some(OsStr::new(".nvm"))
 }
 
-/// Extensions Windows can actually run (`CreateProcess` / `cmd.exe`-runnable),
-/// in resolution-preference order. Mirrors the provider-discovery policy in
-/// `intent_providers::discover` so `host.findBinary` and provider spawning
-/// agree on what "runnable" means.
-const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
-
-/// True when `path` carries a Windows-runnable executable extension
-/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
-fn has_windows_exec_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            WINDOWS_EXEC_EXTENSIONS
-                .iter()
-                .any(|e| ext.eq_ignore_ascii_case(e))
-        })
-}
-
 /// Candidate filenames to try when resolving `name` in a directory, mirroring
 /// `intent_providers::discover::name_candidates_for`. POSIX uses the bare name.
 /// Windows probes only runnable entry points (`.exe`/`.cmd`/`.bat`) and never
@@ -263,24 +248,6 @@ fn find_executable_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<Pat
         }
     }
     None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(windows)]
-    {
-        has_windows_exec_extension(path)
-    }
 }
 
 /// Run `which`/`where` to consult PATH, then rank the results so a
