@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.13] - 2026-08-13
+
+### 🔧 Refactor
+
+- *(core)* Unify Windows runnable-extension policy in path_utils ([#1176](https://github.com/intent-hq/intentd/pull/1176))
+
+
 ## [0.6.12] - 2026-08-13
 
 ### 🚀 Features
