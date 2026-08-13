@@ -4,8 +4,8 @@
 #
 # Usage: publish-channel-manifest.sh <channel> <manifest-file> [repo]
 #
-# <channel> is "stable" or "beta"; the manifest lands as an asset on the
-# `channel-<channel>` release (created with --latest=false so it never shadows
+# <channel> is "stable", "beta", or "alpha"; the manifest lands as an asset on
+# the `channel-<channel>` release (created with --latest=false so it never shadows
 # real releases). [repo] defaults to GITHUB_REPOSITORY; pass it explicitly to
 # publish to another repo (e.g. the public intent-hq/intentd-releases mirror).
 # Requires: gh (authenticated via GH_TOKEN) and an explicit repo — no default,
@@ -17,8 +17,8 @@ CHANNEL="${1:?$usage}"
 MANIFEST="${2:?$usage}"
 REPO="${3:-${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set (or pass [repo])}}"
 
-if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
-  echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
+if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" && "$CHANNEL" != "alpha" ]]; then
+  echo "error: channel must be 'stable', 'beta', or 'alpha', got: $CHANNEL" >&2
   exit 1
 fi
 if [[ ! -f "$MANIFEST" ]]; then

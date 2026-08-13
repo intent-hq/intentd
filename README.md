@@ -406,8 +406,13 @@ temporary bridge until this repo is open-sourced.
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
 
-- **Beta**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the beta channel automatically.
+- **Alpha**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the alpha channel automatically.
   The GitHub release is published as a **Pre-release** (also on the mirror).
+- **Beta**: a manual **promotion** of an existing release — run the
+  [Promote beta](.github/workflows/promote-beta.yml) workflow (Actions → Promote beta)
+  with the version to promote; it validates that the release exists and is not a draft
+  and updates the beta channel manifest to point at it. Beta promotion never touches
+  the Pre-release/Latest flags — those move only on stable promotion.
 - **Stable**: a manual **promotion** of an existing release — run the
   [Promote stable](.github/workflows/promote-stable.yml) workflow (Actions → Promote
   stable) with the version to promote; it validates that the release exists and is not a
@@ -453,10 +458,11 @@ manual step (repo Settings → Secrets and variables → Actions).
 ### Channel manifests
 
 After each release, CI updates a machine-readable channel manifest on a fixed release:
-every tag updates the `beta.json` asset on the `channel-beta` release
+every tag updates the `alpha.json` asset on the `channel-alpha` release
 (`.github/workflows/publish-channel-manifest.yml`, run as a dist post-announce hook),
-and promoting a version updates `stable.json` on `channel-stable`
-(`.github/workflows/promote-stable.yml`). Each manifest is published **twice**: on the
+promoting a version to beta updates `beta.json` on `channel-beta`
+(`.github/workflows/promote-beta.yml`), and promoting to stable updates `stable.json`
+on `channel-stable` (`.github/workflows/promote-stable.yml`). Each manifest is published **twice**: on the
 public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
 mirror with platform `url`s pointing at the mirrored assets there, and on this repo
 with `url`s pointing at this repo's releases (byte-identical to the pre-mirror
