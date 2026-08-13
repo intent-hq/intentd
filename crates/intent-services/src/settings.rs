@@ -25,7 +25,7 @@
 //! [`cleanup_retired_settings`] deletes their stale rows on boot.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::SettingsFile;
@@ -695,6 +695,74 @@ fn number(
     }
 }
 
+/// Catalog max for `agents.memoryBudgetMb` when total RAM cannot be detected
+/// (RAM detection supports Linux and macOS only), and the ceiling on the
+/// detected value. Matches the static bound
+/// [`intent_core::settings_file::SettingsFile`] enforces when parsing
+/// `config.toml`, which stays machine-independent on purpose: a config file
+/// written on one seat must not fail to parse on another.
+const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
+
+/// Catalog max for `agents.memoryBudgetMb`: total physical RAM in MB, so the
+/// FE renders a slider over the range the setting can meaningfully take,
+/// falling back to [`MEMORY_BUDGET_MAX_MB_FALLBACK`] where detection is
+/// unavailable.
+///
+/// Budgeting more than the machine has is not a configuration this daemon can
+/// honour — the admission gate would simply never fire — so the bound also
+/// makes `settings.update` reject such a value (`-32602`) rather than storing
+/// a knob that silently does nothing.
+///
+/// This is the one catalog bound that deliberately does **not** match the
+/// `config.toml` parse bound, so a `config.toml` carrying a budget above this
+/// machine's RAM (hand-edited, or copied from a larger seat) still loads and
+/// is still reported by `settings.get` / `settings.list` — with a `value`
+/// above the advertised `max`. The alternative, tightening the parse bound to
+/// match, is worse: it would make a config file machine-dependent and fail
+/// `Config::resolve` — i.e. refuse to boot — on the smaller seat. The
+/// inconsistency is confined to configs the API itself will no longer create,
+/// and any write through `settings.update` brings the value back into range;
+/// a client should clamp its slider rather than assume `value <= max`.
+///
+/// The divergence is **one-directional**: this bound is never looser than the
+/// parse bound. See [`memory_budget_max_mb_for`] for why that matters.
+///
+/// Detected **once** and cached: `definitions()` is rebuilt by every
+/// `settings.list` / `settings.get`, and the Linux detection reads
+/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
+/// a client-facing read path. Installed physical RAM cannot change under a live
+/// process, so this is the degenerate case of the derived-field ladder — the
+/// value is invalidated by nothing, and one read off the first call is enough.
+fn memory_budget_max_mb() -> f64 {
+    static DETECTED: OnceLock<f64> = OnceLock::new();
+    *DETECTED.get_or_init(|| memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()))
+}
+
+/// [`memory_budget_max_mb`] against an explicit detection result, so every
+/// branch is testable on a host where detection itself always succeeds and
+/// reports one particular size.
+///
+/// A zero reading counts as "undetected": a max of 0 would collapse the slider
+/// onto its own minimum and lock the setting off.
+///
+/// Detected RAM is **clamped** to [`MEMORY_BUDGET_MAX_MB_FALLBACK`], which is
+/// also the `config.toml` parse bound. Without the clamp, a host with more
+/// than 1,024,000 MB of RAM (a 1 TiB seat reports 1,048,576) would advertise a
+/// max that `settings.update` accepts here and `SettingsFile::validate` then
+/// rejects inside `SettingsRegistry::apply` — the catalog would be telling
+/// clients a value is settable that the write path refuses. Clamping keeps the
+/// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
+/// the invariant every claim in these doc comments depends on.
+fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
+    match total_memory_bytes.filter(|&bytes| bytes > 0) {
+        // INVARIANT: this bound may be tighter than the `config.toml` parse
+        // bound, never looser. Dropping the `.min` advertises a max the write
+        // path rejects; see the doc comment above before changing it.
+        Some(bytes) => ((bytes / (1024 * 1024)) as f64).min(MEMORY_BUDGET_MAX_MB_FALLBACK),
+        None => MEMORY_BUDGET_MAX_MB_FALLBACK,
+    }
+}
+
 fn enumerated(
     path: &'static str,
     label: &'static str,
@@ -1242,7 +1310,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Aggregate resident memory the daemon's whole child-process tree may use before new agent spawns queue behind idle-process eviction (0 = off; nothing running is ever killed; changes apply on daemon restart)",
             "agents",
             Some(0.0),
-            Some(1_024_000.0),
+            Some(memory_budget_max_mb()),
             0.0,
         ),
         number(
@@ -1257,11 +1325,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "agents.idleReapMinutes",
             "Idle reap minutes",
-            "Minutes before an idle agent is reaped",
+            "Minutes before an idle agent is reaped (0 disables idle reaping)",
             "agents",
             Some(0.0),
             None,
-            30.0,
+            intent_core::config::DEFAULT_IDLE_REAP_MINUTES as f64,
         ),
         enumerated(
             "agents.flushQueuedMessages",
@@ -2304,13 +2372,15 @@ mod tests {
             .expect("agents.memoryBudgetMb missing from catalog");
         assert!(!def.sensitive);
         assert_eq!(def.category, "agents");
-        assert!(matches!(
-            def.ty,
-            SettingType::Number {
-                min: Some(0.0),
-                max: Some(1_024_000.0)
-            }
-        ));
+        let SettingType::Number { min, max } = def.ty else {
+            panic!("agents.memoryBudgetMb is not a number");
+        };
+        assert_eq!(min, Some(0.0));
+        // The max is the detected RAM bound, not a static figure — assert the
+        // catalog carries whatever this host resolves to, and that it is a
+        // usable range rather than a degenerate 0..0.
+        assert_eq!(max, Some(memory_budget_max_mb()));
+        assert!(max.expect("bounded") > 0.0);
         assert_eq!(def.default_value, Some(json!(0.0)));
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
@@ -2323,6 +2393,111 @@ mod tests {
             agent_memory_budget_bytes(&settings),
             Some(20 * 1024 * 1024 * 1024),
         );
+    }
+
+    /// The `agents.memoryBudgetMb` catalog max is the machine's own RAM in MB
+    /// where detection works, and the static fallback where it does not —
+    /// a slider running to 1 TB on a 48 GB seat is unusable. Both branches are
+    /// exercised through the injectable form, since detection on this host
+    /// always succeeds; a zero reading is treated as undetected so the max
+    /// never collapses onto the minimum.
+    #[test]
+    fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
+        assert_eq!(
+            memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
+            49_152.0
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(Some(16 * 1024 * 1024 * 1024)),
+            16_384.0
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(None),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        assert_eq!(
+            memory_budget_max_mb_for(Some(0)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+        // A seat larger than the parse bound is clamped to it: advertising
+        // 1,048,576 on a 1 TiB host would be a max the write path rejects.
+        assert_eq!(
+            memory_budget_max_mb_for(Some(1024 * 1024 * 1024 * 1024)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
+
+        // The wired-up form agrees with the injectable one on this host.
+        assert_eq!(
+            memory_budget_max_mb(),
+            memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()),
+        );
+    }
+
+    /// The catalog bound may be tighter than the `config.toml` parse bound but
+    /// must never be looser, and the direction is load-bearing in both senses:
+    ///
+    /// - **Never looser** — everything the catalog advertises as settable must
+    ///   survive the write path. `settings.update` re-validates through
+    ///   `SettingsFile::validate` inside `SettingsRegistry::apply`, so a max
+    ///   above the parse bound would advertise values that path rejects.
+    /// - **May be tighter** — a config copied from a larger seat must still
+    ///   parse here (tightening the parse bound would fail `Config::resolve`
+    ///   and refuse to boot), while `settings.update` declines to newly create
+    ///   a budget the admission gate could never fire on. The cost a client
+    ///   tolerates is a reported `value` above the advertised `max`.
+    ///
+    /// The host-independent half is asserted unconditionally; the window that
+    /// demonstrates the tighter-than case only exists on a seat smaller than
+    /// the parse bound, which is every real one but need not be assumed.
+    #[test]
+    fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
+        let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
+        let max = memory_budget_max_mb();
+
+        assert!(
+            max <= MEMORY_BUDGET_MAX_MB_FALLBACK,
+            "catalog advertised {max} above the parse bound — settings.update would accept a \
+             value SettingsFile::validate then rejects in SettingsRegistry::apply",
+        );
+
+        // Whatever the catalog advertises as its ceiling must be settable
+        // through both gates the write path runs.
+        def.validate(&json!(max))
+            .expect("the advertised max must pass catalog validation");
+        SettingsFile::parse_str(&format!("[agents]\nmemoryBudgetMb = {}\n", max as u64))
+            .expect("the advertised max must pass the config.toml parse bound");
+
+        // Tighter-than case: a value in the gap parses but is refused by the API.
+        if max < MEMORY_BUDGET_MAX_MB_FALLBACK {
+            let over_ram = max + 1.0;
+            def.validate(&json!(over_ram))
+                .expect_err("settings.update must reject a budget above this machine's RAM");
+            let parsed = SettingsFile::parse_str(&format!(
+                "[agents]\nmemoryBudgetMb = {}\n",
+                over_ram as u64
+            ))
+            .expect("a config.toml from a larger seat must still parse, not refuse to boot");
+            assert_eq!(parsed.agents.memory_budget_mb, over_ram as u32);
+        }
+    }
+
+    /// The shipped idle-reap default is 10 minutes (lowered from 30,
+    /// monorepo#2109) and the catalog advertises the same constant the
+    /// config-file layer defaults to — the two drifting apart is exactly how
+    /// the FE ends up showing a default the daemon does not use. `0` stays
+    /// valid as the disable value.
+    #[test]
+    fn idle_reap_catalog_default_matches_the_shipped_constant() {
+        let def = find_definition("agents.idleReapMinutes")
+            .expect("agents.idleReapMinutes missing from catalog");
+        assert_eq!(intent_core::config::DEFAULT_IDLE_REAP_MINUTES, 10);
+        assert_eq!(def.default_value, Some(json!(10.0)));
+        assert_eq!(
+            SettingsFile::default().agents.idle_reap_minutes,
+            intent_core::config::DEFAULT_IDLE_REAP_MINUTES,
+        );
+        assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
+        def.validate(&json!(0)).expect("0 disables idle reaping");
     }
 
     /// `agents.maxConcurrentAdapters` is a bounded catalog entry with no
