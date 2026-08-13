@@ -126,9 +126,10 @@ impl Services {
         let staging_dir = self.attachment_upload_staging_root().join(&upload_id);
 
         // Register the session BEFORE any directory exists, so every early
-        // return leaves nothing on disk. `live_ids` snapshots the registry
-        // for the orphan sweep below.
-        let live_ids: Vec<String> = {
+        // return leaves nothing on disk — and so the orphan sweep (which
+        // checks the registry at removal time) can never classify this
+        // upload's directory as an orphan.
+        {
             let mut uploads = self
                 .attachment_uploads
                 .lock()
@@ -144,13 +145,12 @@ impl Services {
                 committing: false,
             };
             uploads.insert(upload_id.clone(), session);
-            uploads.keys().cloned().collect()
-        };
+        }
 
         // Lazy sweep: staging dirs with no live session are orphans (a
         // daemon restart drops the in-memory registry). Best-effort — a
         // failed sweep never fails begin.
-        self.sweep_orphaned_upload_staging_dirs(&live_ids).await;
+        self.sweep_orphaned_upload_staging_dirs().await;
 
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
             self.attachment_uploads
@@ -170,7 +170,11 @@ impl Services {
 
     /// Delete `.attachment-upload-staging/<id>` directories whose id has no
     /// live session (orphans from a daemon restart mid-upload). Best-effort.
-    async fn sweep_orphaned_upload_staging_dirs(&self, live_ids: &[String]) {
+    /// Liveness is checked against the registry immediately before each
+    /// removal — not against a snapshot taken before the directory listing —
+    /// so a `begin` that registers concurrently with a sweep in flight can
+    /// never have its staging directory removed.
+    async fn sweep_orphaned_upload_staging_dirs(&self) {
         let root = self.attachment_upload_staging_root();
         let mut entries = match tokio::fs::read_dir(&root).await {
             Ok(entries) => entries,
@@ -178,7 +182,12 @@ impl Services {
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if live_ids.contains(&name) {
+            let live = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned")
+                .contains_key(&name);
+            if live {
                 continue;
             }
             tracing::info!(staging = %name, "sweeping orphaned attachment upload staging dir");
@@ -309,32 +318,15 @@ impl Services {
         &self,
         upload_id: String,
     ) -> Result<serde_json::Value> {
-        let result = self.file_attachment_upload_commit_inner(&upload_id).await;
-        if result.is_err() {
-            // The session survives a failed commit — clear the in-flight
-            // flag so a retry (or abort) is accepted.
-            if let Some(session) = self
-                .attachment_uploads
-                .lock()
-                .expect("attachment upload registry poisoned")
-                .get_mut(&upload_id)
-            {
-                session.committing = false;
-            }
-        }
-        result
-    }
-
-    async fn file_attachment_upload_commit_inner(
-        &self,
-        upload_id: &str,
-    ) -> Result<serde_json::Value> {
-        let (staging_dir, declared_size, declared_sha, workspace_id, file_name, mime_type, seqs) = {
+        // Phase 1 — validate and CLAIM the `committing` flag under one lock
+        // hold. Errors here (unknown id, already committing, incomplete,
+        // gaps) never touch a flag another commit owns.
+        let claim = {
             let mut uploads = self
                 .attachment_uploads
                 .lock()
                 .expect("attachment upload registry poisoned");
-            let session = uploads.get_mut(upload_id).ok_or_else(|| {
+            let session = uploads.get_mut(&upload_id).ok_or_else(|| {
                 Error::NotFound(format!("no attachment upload in progress: {upload_id}"))
             })?;
             if session.committing {
@@ -367,6 +359,41 @@ impl Services {
                 seqs,
             )
         };
+
+        // Phase 2 — the fallible work. On failure, clear the flag THIS call
+        // set (phase 1 claimed it exclusively), so the session survives for
+        // retry or abort without racing a concurrent commit's flag.
+        let result = self
+            .file_attachment_upload_commit_body(&upload_id, claim)
+            .await;
+        if result.is_err() {
+            if let Some(session) = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned")
+                .get_mut(&upload_id)
+            {
+                session.committing = false;
+            }
+        }
+        result
+    }
+
+    async fn file_attachment_upload_commit_body(
+        &self,
+        upload_id: &str,
+        claim: (
+            PathBuf,
+            u64,
+            String,
+            WorkspaceId,
+            String,
+            Option<String>,
+            Vec<u64>,
+        ),
+    ) -> Result<serde_json::Value> {
+        let (staging_dir, declared_size, declared_sha, workspace_id, file_name, mime_type, seqs) =
+            claim;
 
         // Reassemble + hash on the blocking pool (sync I/O), landing the
         // assembled payload next to the chunks so the final placement copies
@@ -812,5 +839,106 @@ mod tests {
         // The next begin sweeps the orphan.
         let _new_id = begin(&svc2, &WorkspaceId("ws-up-restart-2".to_string()), &payload).await;
         assert!(!orphan_dir.exists(), "orphan staging dir swept");
+    }
+
+    /// Regression: the sweep checks session liveness against the registry at
+    /// removal time, so a session registered while a sweep is in flight (its
+    /// id absent from any pre-listing snapshot) keeps its staging dir; only
+    /// truly session-less dirs are removed.
+    #[tokio::test]
+    async fn sweep_spares_live_sessions_registered_after_listing() {
+        let ws = WorkspaceId("ws-up-sweep".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let staging_root = ws_root.0.join(".attachment-upload-staging");
+        let live_dir = staging_root.join("upload-live");
+        let orphan_dir = staging_root.join("upload-orphan");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        // Register `upload-live` directly (as a begin racing the sweep
+        // would), so it is live in the registry but absent from any snapshot
+        // taken before its directory existed.
+        svc.attachment_uploads.lock().unwrap().insert(
+            "upload-live".to_string(),
+            super::AttachmentUploadSession {
+                workspace_id: ws.clone(),
+                file_name: "live.bin".to_string(),
+                mime_type: None,
+                staging_dir: live_dir.clone(),
+                declared_size: 1,
+                declared_sha256: "a".repeat(64),
+                chunk_sizes: std::collections::HashMap::new(),
+                committing: false,
+            },
+        );
+
+        svc.sweep_orphaned_upload_staging_dirs().await;
+        assert!(live_dir.exists(), "live session dir must survive the sweep");
+        assert!(!orphan_dir.exists(), "orphan dir must be swept");
+    }
+
+    /// Regression: a commit rejected with "already committing" must NOT
+    /// clear the `committing` flag owned by the in-flight commit — chunks
+    /// and aborts stay rejected while the first commit runs.
+    #[tokio::test]
+    async fn rejected_concurrent_commit_leaves_committing_flag_intact() {
+        let ws = WorkspaceId("ws-up-flag".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"flag-owner".to_vec();
+        let upload_id = begin(&svc, &ws, &payload).await;
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+        // Simulate an in-flight first commit holding the claim.
+        svc.attachment_uploads
+            .lock()
+            .unwrap()
+            .get_mut(&upload_id)
+            .unwrap()
+            .committing = true;
+
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect_err("second commit rejected");
+        assert!(err.to_string().contains("already committing"), "got {err}");
+        // The rejection did not release the first commit's claim: the flag
+        // is still set, and chunk/abort remain rejected.
+        assert!(
+            svc.attachment_uploads
+                .lock()
+                .unwrap()
+                .get(&upload_id)
+                .unwrap()
+                .committing,
+            "committing flag must still be held"
+        );
+        let err = svc
+            .file_attachment_upload_chunk_op(upload_id.clone(), 1, b64(b"x"))
+            .await
+            .expect_err("chunk during commit");
+        assert!(err.to_string().contains("committing"), "got {err}");
+        let err = svc
+            .file_attachment_upload_abort_op(upload_id.clone())
+            .await
+            .expect_err("abort during commit");
+        assert!(err.to_string().contains("committing"), "got {err}");
+
+        // Release the claim (as the first commit's failure path would) and
+        // the retry path works end to end.
+        svc.attachment_uploads
+            .lock()
+            .unwrap()
+            .get_mut(&upload_id)
+            .unwrap()
+            .committing = false;
+        svc.file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("commit after release");
     }
 }
