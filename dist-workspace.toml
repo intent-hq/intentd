@@ -34,7 +34,7 @@ tag-namespace = "v"
 github-releases-repo = "intent-hq/intentd"
 # Whether to install an updater program
 install-updater = false
-# Post-announce: publish/update the stable.json / beta.json channel manifests
+# Post-announce: publish/update the alpha.json channel manifest
 post-announce-jobs = ["./publish-channel-manifest"]
 # The reusable publish-channel-manifest.yml job requests
 # {contents: write, pull-requests: read} (notifier reads squash-merged PR
@@ -44,7 +44,7 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # be restated.
 github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read" } }
 # v-release.yml is hand-edited: `gh release create` always passes --prerelease
-# so every tagged release lands as a beta Pre-release (promote-stable.yml clears
+# so every tagged release lands as an alpha Pre-release (promote-stable.yml clears
 # the flag and marks the promoted version Latest). dist has no config knob for
 # that, and `dist plan` fails the PR check on any hand edit, so the CI freshness
 # check is relaxed here. Re-apply the customization after any `dist init` /
