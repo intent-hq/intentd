@@ -8079,6 +8079,152 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `file.attachmentUpload.begin` / `.chunk` / `.commit` / `.abort` (§5.9,
+/// v6.16): the staged chunked attachment upload lifecycle over the real WSS
+/// transport. A two-chunk payload is staged and committed; the commit result
+/// is byte-shape-identical to a successful `file.placeAttachment` result
+/// (registry fields included) and the reassembled bytes land under
+/// `.intent/attachments/`. An unknown uploadId is the documented -32602, and
+/// `abort` retires a pending session idempotently.
+#[tokio::test]
+async fn wss_file_attachment_upload_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-attup-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
+    let sha = format!("{:x}", Sha256::digest(&payload));
+    let mid = payload.len() / 2;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    // begin → { uploadId, maxChunkBytes }.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"big.bin","sizeBytes":{},"sha256":"{sha}","mimeType":"application/octet-stream"}}}}"#,
+        ws.0,
+        payload.len()
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let upload_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    assert_eq!(
+        resp["result"]["maxChunkBytes"].as_u64(),
+        Some(16 * 1024 * 1024),
+        "{resp}"
+    );
+
+    // Two chunks; receivedBytes accumulates.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":0,"data":"{}"}}}}"#,
+        b64(&payload[..mid])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["seq"].as_u64(), Some(0), "{resp}");
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(mid as u64),
+        "{resp}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":1,"data":"{}"}}}}"#,
+        b64(&payload[mid..])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+
+    // commit → byte-shape-identical to a placeAttachment success.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.attachmentUpload.commit","params":{{"uploadId":"{upload_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["path"],
+        serde_json::json!(".intent/attachments/big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["fileName"],
+        serde_json::json!("big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["size"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+    assert!(resp["result"]["attachmentId"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["mimeType"],
+        serde_json::json!("application/octet-stream"),
+        "{resp}"
+    );
+    assert!(
+        resp["result"]["uploadedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/big.bin")).expect("placed file"),
+        payload
+    );
+
+    // The settled uploadId is unknown now → -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":2,"data":"{}"}}}}"#,
+        b64(b"late")
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no attachment upload in progress")),
+        "{resp}"
+    );
+
+    // abort retires a pending session; a second abort is the idempotent
+    // non-error (`aborted: false`).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"other.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let abort_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["aborted"], serde_json::json!(true), "{resp}");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["aborted"],
+        serde_json::json!(false),
+        "{resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;

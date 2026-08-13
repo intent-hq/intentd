@@ -54,6 +54,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod attachment_upload;
 mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
@@ -721,6 +722,14 @@ pub struct Services {
     /// restart drops pending imports (staging dirs are swept lazily by the
     /// next `begin`), and the FE simply restarts the upload.
     transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
+    /// In-flight staged attachment uploads (`file.attachmentUpload.*`, keyed
+    /// by `uploadId`): destination + declared size/sha + chunk cursor
+    /// between `begin` and `commit`/`abort`. Shared across clones so chunks
+    /// arriving over any connection stage into the same session. In-memory
+    /// only — a daemon restart drops pending uploads (staging dirs are swept
+    /// lazily by the next `begin`), and the client simply restarts the
+    /// upload.
+    attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -866,6 +875,7 @@ impl Services {
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
+            attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -2201,8 +2211,7 @@ impl Services {
     /// Raising `unread` never downgrades a persistent `review_required` flag
     /// (which only `workspace.dismissAttention` retires): the write is guarded
     /// on `attention = none`, so a completed turn on a review-required
-    /// workspace is a no-op — no event, no `needs_attention → unread`
-    /// demotion in the derived displayStatus.
+    /// workspace is a no-op — no event.
     pub(crate) async fn raise_attention(
         &self,
         workspace_id: &WorkspaceId,
@@ -2233,10 +2242,14 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // The attention flag feeds the derived displayStatus (`unread` /
-        // `review_required` axes, §6.5): recompute-and-compare after the
-        // flag change so the transition emits.
-        self.maybe_emit_display_status_changed(workspace_id).await;
+        // The `unread` flag is not a displayStatus axis (§6.5), so the
+        // turn-end unread raise (the sole caller) never moves the derived
+        // rollup — skip the recompute (it would be a guaranteed no-op). A
+        // non-`unread` raise can move the `review_required` axis, so
+        // recompute-and-compare for those so the transition emits.
+        if level != WorkspaceAttention::Unread {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         Ok(())
     }
 
@@ -11461,6 +11474,52 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_attachment_upload_begin(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+        mime_type: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_begin_op(
+                workspace_id,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+            )
+            .await
+        })
+    }
+
+    fn file_attachment_upload_chunk(
+        &self,
+        upload_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_chunk_op(upload_id, seq, data)
+                .await
+        })
+    }
+
+    fn file_attachment_upload_commit(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_commit_op(upload_id).await })
+    }
+
+    fn file_attachment_upload_abort(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_abort_op(upload_id).await })
+    }
+
     fn file_get_attachment_info(
         &self,
         attachment_id: String,
@@ -15627,8 +15686,8 @@ impl WorkspaceApi for Services {
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The cleared flag feeds the derived displayStatus (`unread` /
-                // `review_required` axes, §6.5): recompute-and-compare.
+                // The cleared flag feeds the derived displayStatus
+                // (`review_required` axis, §6.5): recompute-and-compare.
                 this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
@@ -15667,10 +15726,9 @@ impl WorkspaceApi for Services {
                 )
                 .await?;
             if changed {
+                // The unread flag is not a displayStatus axis (§6.5), so
+                // clearing it never moves the derived rollup — no recompute.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The retired unread flag feeds the derived displayStatus
-                // (`unread` axis, §6.5): recompute-and-compare.
-                this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
