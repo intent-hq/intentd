@@ -1088,7 +1088,7 @@ async fn evict_idle_older_than_evicts_only_stale_idle() {
     reg.mark_active(&active);
 
     let evicted = reg
-        .evict_idle_older_than(Duration::from_secs(60), |_| true)
+        .evict_idle_older_than(Duration::from_secs(60), |_| true, |_| {})
         .await;
 
     assert_eq!(evicted, 1, "only the stale idle process is reaped");
@@ -1301,6 +1301,7 @@ async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
 #[tokio::test]
 async fn reap_idle_older_than_skips_in_flight_agents() {
     let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let (busy, idle) = (AgentId::from("busy"), AgentId::from("idle"));
     track(&mgr, &busy);
     track(&mgr, &idle);
@@ -1318,6 +1319,122 @@ async fn reap_idle_older_than_skips_in_flight_agents() {
     );
     assert!(!mgr.contains(&idle));
     assert_eq!(mgr.registry().size(), 1);
+}
+
+/// monorepo#2118 — the idle-reap TOCTOU. The sweep must CLAIM a candidate
+/// atomically against `try_begin` before killing it: with the old bare busy
+/// check, a turn starting between the eligibility check and the `kill().await`
+/// had its freshly-spawned child tree killed mid-turn. This drives the exact
+/// interleaving deterministically: the kill blocks on a channel, and while it
+/// is mid-kill a `try_begin` must LOSE (the message parks on the queue) rather
+/// than start a turn. After the sweep the claim is gone and `try_begin` wins
+/// again.
+#[tokio::test]
+async fn reap_claim_blocks_try_begin_during_kill_window() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-claim");
+    let id = AgentId::from("a-reap-claim");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // A kill that signals entry and then blocks until the test releases it,
+    // exposing the mid-kill window.
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let kill: KillFn = Arc::new(move || {
+        let entered_tx = entered_tx.clone();
+        let release_rx = release_rx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(());
+            let rx = release_rx.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+        })
+    });
+    mgr.registry().register(id.clone(), kill);
+    mgr.registry().set_last_active(&id, 1);
+
+    let sweep = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move { mgr.reap_idle_older_than(Duration::from_secs(60)).await })
+    };
+    entered_rx.recv().await.expect("kill entered");
+
+    // Mid-kill: the claim must make this turn LOSE, exactly like busy.
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "try_begin must lose against a held reap claim (the TOCTOU)"
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(sweep.await.unwrap(), 1);
+    assert!(!mgr.registry().is_registered(&id), "candidate was reaped");
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "claim is released after the kill; the next turn starts normally"
+    );
+}
+
+/// monorepo#2118 — the candidate snapshot is stale by the time earlier kills
+/// in the same sweep have awaited, so each claimed candidate is re-validated
+/// under the registry lock before its kill. An agent that ran a whole turn
+/// mid-sweep (fresh `last_active_ms`) must be released and kept, not killed
+/// off the stale snapshot.
+#[tokio::test]
+async fn reap_revalidates_candidate_after_earlier_kills_await() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-revalidate");
+    let (a, b) = (AgentId::from("a-first"), AgentId::from("b-second"));
+    seed_agent(&mgr, &ws, &b).await;
+
+    // `a` kills first (older timestamp) and blocks; while it blocks, `b`
+    // runs a turn (fresh `last_active_ms`), invalidating `b`'s candidacy.
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let kill_a: KillFn = Arc::new(move || {
+        let entered_tx = entered_tx.clone();
+        let release_rx = release_rx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(());
+            let rx = release_rx.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+        })
+    });
+    mgr.registry().register(a.clone(), kill_a);
+    mgr.registry().set_last_active(&a, 1);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry()
+        .register(b.clone(), recording_kill(b.clone(), log.clone()));
+    mgr.registry().set_last_active(&b, 2);
+
+    let sweep = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move { mgr.reap_idle_older_than(Duration::from_secs(60)).await })
+    };
+    entered_rx.recv().await.expect("a's kill entered");
+
+    // While `a`'s kill blocks, `b` runs a whole turn and goes idle again.
+    mgr.registry().mark_active(&b);
+    mgr.registry().mark_idle(&b);
+
+    release_tx.send(()).unwrap();
+    assert_eq!(sweep.await.unwrap(), 1, "only `a` is reaped");
+    assert!(!mgr.registry().is_registered(&a));
+    assert!(
+        mgr.registry().is_registered(&b),
+        "`b` re-validated fresh and kept"
+    );
+    assert!(log.lock().unwrap().is_empty(), "`b`'s kill never ran");
+    assert!(
+        mgr.try_begin(&b, &ws).await,
+        "`b`'s claim was released on the re-validation reject"
+    );
 }
 
 /// Track a mock agent whose handle owns a REAL child process (a long sleep),

@@ -1099,12 +1099,26 @@ impl ProcessRegistry {
     }
 
     /// TTL-based idle reaping (§5.6/§6.7): evict every idle process whose last
-    /// activity is older than `ttl`, skipping any the `eligible` predicate
-    /// rejects (e.g. an agent with an in-flight prompt). Active processes and
-    /// those within the TTL are always kept. Returns the number evicted.
-    pub async fn evict_idle_older_than<F>(&self, ttl: Duration, eligible: F) -> usize
+    /// activity is older than `ttl`. Active processes and those within the TTL
+    /// are always kept. Returns the number evicted.
+    ///
+    /// Claim-before-kill (monorepo#2118): `try_claim` must atomically claim
+    /// the candidate against whatever can start work on it (the manager wires
+    /// it to check-and-claim under the same lock `try_begin` uses), and
+    /// `release` drops that claim after the kill — or immediately when the
+    /// re-validation below rejects the candidate. A plain eligibility check
+    /// here would be a TOCTOU: earlier kills in the sweep await (SIGTERM
+    /// grace + descendant sweep), so a turn could start between the check and
+    /// the kill and have its child tree killed.
+    pub async fn evict_idle_older_than<C, R>(
+        &self,
+        ttl: Duration,
+        try_claim: C,
+        release: R,
+    ) -> usize
     where
-        F: Fn(&AgentId) -> bool,
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
         let candidates = {
@@ -1113,11 +1127,28 @@ impl ProcessRegistry {
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
-            if !eligible(&id) {
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock: the candidate snapshot is
+            // stale by the time earlier kills in this sweep have awaited, so
+            // the entry may have run a whole turn (fresh `last_active_ms`),
+            // be actively streaming again, or be gone. With the claim held
+            // nothing can start new work on it after this check.
+            let still_stale = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .entries
+                    .get(&id)
+                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+            };
+            if !still_stale {
+                release(&id);
                 continue;
             }
             kill().await;
             self.deregister(&id);
+            release(&id);
             evicted += 1;
         }
         evicted
@@ -1369,6 +1400,14 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents claimed by the idle-reap sweep for the duration of their kill
+    /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
+    /// busy → reap_claims, matching `try_begin`'s read), so "not busy →
+    /// claimed" is atomic against a concurrent `try_begin`: a send racing the
+    /// sweep queues instead of starting a turn whose child tree the sweep is
+    /// about to kill. Released (no `busy` lock needed) after the kill, when
+    /// the sweep kicks the queue drain for anything that parked meanwhile.
+    reap_claims: Arc<Mutex<HashSet<AgentId>>>,
     /// Workspace each in-flight agent belongs to, recorded when the agent claims
     /// its in-flight slot so the slot release can recompute the workspace's
     /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
@@ -1516,6 +1555,7 @@ impl AgentManager {
             agent_config_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
@@ -3671,7 +3711,13 @@ impl AgentManager {
         // `list_busy` never observes a busy agent without its workspace.
         let claimed = {
             let mut busy = self.busy.lock().unwrap();
-            let claimed = !busy.contains(agent_id);
+            // An agent claimed by the idle-reap sweep (monorepo#2118) counts
+            // as busy: the sweep is about to (or is mid-way through) killing
+            // its child tree, so starting a turn now would hand that turn's
+            // fresh children to the kill. The caller's queue fallback parks
+            // the message; the sweep kicks the drain after releasing.
+            let claimed =
+                !busy.contains(agent_id) && !self.reap_claims.lock().unwrap().contains(agent_id);
             if claimed {
                 // Drop a live-turn slot that outlived its turn BEFORE the claim
                 // becomes visible (monorepo#2104). A slot can survive its turn:
@@ -6098,11 +6144,58 @@ impl AgentManager {
     /// activity is older than `ttl`, skipping any with an in-flight prompt (a
     /// live turn loop in `busy`). Active streaming agents are protected by the
     /// registry's `is_active` flag. Returns the number reaped.
-    pub async fn reap_idle_older_than(&self, ttl: Duration) -> usize {
-        let busy = self.busy.clone();
-        self.registry
-            .evict_idle_older_than(ttl, move |id| !busy.lock().unwrap().contains(id))
-            .await
+    ///
+    /// Claim-before-kill (monorepo#2118): instead of a bare busy check, each
+    /// candidate is CLAIMED into `reap_claims` under the `busy` lock (the
+    /// same lock `try_begin` claims under), so no turn can start between the
+    /// eligibility check and the `kill().await` — a send racing the sweep
+    /// loses `try_begin` and parks its message on the queue instead. After
+    /// the sweep, any released agent with a ready queue gets a drain kick so
+    /// a message that parked behind the claim starts a fresh turn (the agent
+    /// respawns on demand) rather than stranding until the next queue event.
+    pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+        let try_claim = {
+            let busy = self.busy.clone();
+            let claims = self.reap_claims.clone();
+            move |id: &AgentId| {
+                // Lock order busy → reap_claims, matching `try_begin`, so
+                // "not busy → claimed" is atomic against a concurrent claim.
+                let busy = busy.lock().unwrap();
+                if busy.contains(id) {
+                    return false;
+                }
+                claims.lock().unwrap().insert(id.clone());
+                true
+            }
+        };
+        let release = {
+            let claims = self.reap_claims.clone();
+            let released = released.clone();
+            move |id: &AgentId| {
+                claims.lock().unwrap().remove(id);
+                released.lock().unwrap().push(id.clone());
+            }
+        };
+        let reaped = self
+            .registry
+            .evict_idle_older_than(ttl, try_claim, release)
+            .await;
+        // Drain kick for messages that parked behind a claim: with the claim
+        // released, a ready queue would otherwise sit unworked until the next
+        // external queue event (PROTOCOL §5.5 "never sits unworked").
+        let released = std::mem::take(&mut *released.lock().unwrap());
+        for id in released {
+            if !self.services.has_ready_to_send(&id) {
+                continue;
+            }
+            if let Ok(session) = self.services.store.get_agent_session(&id).await {
+                Arc::clone(self)
+                    .try_drain_queue(id, session.workspace_id)
+                    .await;
+            }
+        }
+        reaped
     }
 
     /// Tear down only the agent's child process + handle, without touching the
