@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.12] - 2026-08-13
+
+### 🚀 Features
+
+- Surface conversion createdTasks + warnings on note.create ([#1162](https://github.com/intent-hq/intentd/pull/1162))
+- *(settings)* Bound memoryBudgetMb by real RAM and reap idle agents at 10min ([#1166](https://github.com/intent-hq/intentd/pull/1166))
+
+### 🐛 Bug Fixes
+
+- *(chat)* Flush the live-turn slot as of flush time, not the pre-abort clone ([#1157](https://github.com/intent-hq/intentd/pull/1157))
+- Skip nested git repos in sandbox staging (add_all) ([#1168](https://github.com/intent-hq/intentd/pull/1168))
+- Prefer newest nvm Node during discovery ([#1169](https://github.com/intent-hq/intentd/pull/1169))
+- *(intent-context)* Require runnable extension in auggie discovery on Windows ([#1171](https://github.com/intent-hq/intentd/pull/1171))
+- Skip nested git repos/worktrees when snapshotting WIP for transfer ([#1159](https://github.com/intent-hq/intentd/pull/1159))
+- *(system.status)* Catch sub-5s bursts in childMemoryPeakBytes ([#1167](https://github.com/intent-hq/intentd/pull/1167))
+- *(chat)* Serve orphaned live-turn content instead of hiding it ([#1161](https://github.com/intent-hq/intentd/pull/1161))
+- Classify placeAttachment copy failures and log them at WARN ([#1165](https://github.com/intent-hq/intentd/pull/1165))
+
+
 ## [0.6.11] - 2026-08-12
 
 ### 🐛 Bug Fixes
