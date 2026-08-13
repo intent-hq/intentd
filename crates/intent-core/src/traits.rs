@@ -2818,6 +2818,49 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.git.registerRoot` (MCP-only): register an existing local git
+    /// repository root for the workspace's multi git root tracking
+    /// (monorepo#2053). `path` must exist and contain a `.git` entry; it is
+    /// canonicalized and may live anywhere on the host (no worktree
+    /// containment). The workspace's own primary root is rejected (it is
+    /// tracked implicitly). Registration is idempotent by canonical path —
+    /// re-registration appends `agent_id` to the row's attribution, and an
+    /// auto-detected row is upgraded to `source: "agent"` in place. Returns
+    /// the stored row in the `gitRoot.list` row shape (persisted fields plus
+    /// a live-read `branch`). Invalid paths are `InvalidParams` (`-32602`); a
+    /// missing workspace is `NotFound`.
+    fn git_root_register(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_register not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.git.unregisterRoot` (MCP-only): remove the git root registered for
+    /// `path` (canonicalized when the directory still exists, so the same
+    /// spelling that registered it resolves; the raw path is matched
+    /// otherwise). Returns `{ ok, gitRootId, path }`. A path with no
+    /// registered root is `NotFound` (monorepo#2053).
+    fn git_root_unregister(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_unregister not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.getConfig`: read the raw `.git/config` file content from the
     /// workspace's repository (STAB-10 — retire FE filesystem reads). Returns
     /// `{ config: String }` where `config` is the entire file content.

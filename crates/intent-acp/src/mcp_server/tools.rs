@@ -144,7 +144,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — git.commit = attributed commit helper
+  ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
@@ -239,6 +239,9 @@ API:
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
+  ws.git.registerRoot(path) → { id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }  // Register a secondary git repository (submodule checkout, sibling clone) for the workspace's git root tracking. `path` must be an existing git repo root (has a `.git` entry); it is canonicalized and may live anywhere on the host. The workspace's own primary root is rejected (tracked implicitly). Idempotent by canonical path — re-registering merges attribution and upgrades an auto-detected row to `source: "agent"`.
+  ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path. Errors when no root is registered for the path.
+  ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
@@ -346,7 +349,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — git.commit = attributed commit helper
+  ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
@@ -461,6 +464,9 @@ API:
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
+  ws.git.registerRoot(path) → { id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }  // Register a secondary git repository (submodule checkout, sibling clone) for the workspace's git root tracking. `path` must be an existing git repo root (has a `.git` entry); it is canonicalized and may live anywhere on the host. The workspace's own primary root is rejected (tracked implicitly). Idempotent by canonical path — re-registering merges attribution and upgrades an auto-detected row to `source: "agent"`.
+  ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path. Errors when no root is registered for the path.
+  ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.

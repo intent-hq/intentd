@@ -8033,6 +8033,20 @@ pub(crate) fn git_root_changed_event(
     }
 }
 
+/// Serialize a persisted [`intent_core::WorkspaceGitRoot`] into its wire row
+/// — the persisted fields plus a live-read `branch` (never persisted; HEAD
+/// moves outside the daemon's control, so it is read per call like the FE's
+/// own branch display). Shared by `gitRoot.list` and `ws.git.registerRoot`
+/// so the two surfaces cannot drift (monorepo#2053).
+pub(crate) fn git_root_wire_row(root: &intent_core::WorkspaceGitRoot) -> serde_json::Value {
+    let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path));
+    let mut v = serde_json::to_value(root).unwrap_or_default();
+    if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
+        obj.insert("branch".to_string(), serde_json::Value::String(branch));
+    }
+    v
+}
+
 /// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
 /// removed root's id and path so clients drop the row without a re-list.
 pub(crate) fn git_root_unregistered_event(
@@ -18198,22 +18212,111 @@ impl WorkspaceApi for Services {
             // with no registered roots is an empty list (monorepo#2053).
             let _ = store.get_workspace(&workspace_id).await?;
             let roots = store.list_workspace_git_roots(&workspace_id).await?;
-            // Serialize the persisted row and graft on the live-read `branch`
-            // (never persisted — HEAD moves outside the daemon's control, so
-            // it is read per call like the FE's own branch display).
-            let git_roots: Vec<serde_json::Value> = roots
-                .into_iter()
-                .map(|root| {
-                    let branch =
-                        intent_git::status::current_branch_at(std::path::Path::new(&root.path));
-                    let mut v = serde_json::to_value(&root).unwrap_or_default();
-                    if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
-                        obj.insert("branch".to_string(), serde_json::Value::String(branch));
-                    }
-                    v
-                })
-                .collect();
+            let git_roots: Vec<serde_json::Value> = roots.iter().map(git_root_wire_row).collect();
             Ok(serde_json::json!({ "gitRoots": git_roots }))
+        })
+    }
+
+    fn git_root_register(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            let ws = svc.store.get_workspace(&workspace_id).await?;
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(Error::InvalidParams("path is required".to_string()));
+            }
+            // Canonicalize first — registration is idempotent by canonical
+            // path, and the path may live anywhere on the host (no worktree
+            // containment, monorepo#2053).
+            let canonical = tokio::fs::canonicalize(trimmed)
+                .await
+                .map_err(|_| Error::InvalidParams(format!("Path does not exist: {trimmed}")))?;
+            // A repo root has a `.git` entry — a directory for a normal
+            // clone, a file for linked worktrees and submodule checkouts.
+            if !canonical.join(".git").exists() {
+                return Err(Error::InvalidParams(format!(
+                    "Not a git repository root (no .git entry): {}",
+                    canonical.display()
+                )));
+            }
+            // The workspace's own primary root is tracked implicitly; only
+            // secondary roots are registrable.
+            if let Some(primary) = git_ops::worktree_path(&ws) {
+                if let Ok(primary) = tokio::fs::canonicalize(&primary).await {
+                    if primary == canonical {
+                        return Err(Error::InvalidParams(
+                            "The workspace's primary git root is tracked implicitly; \
+                             only secondary roots can be registered"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            // Best-effort repo owner/name detection from the root's `origin`
+            // remote — nullable, non-github remotes are left unset.
+            let (repo_owner, repo_name) = intent_git::remote::origin_url(&canonical)
+                .ok()
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+            let ts = now_iso();
+            let root = intent_core::WorkspaceGitRoot {
+                id: WorkspaceGitRootId::new(),
+                workspace_id,
+                path: canonical.to_string_lossy().into_owned(),
+                source: intent_core::WorkspaceGitRootSource::Agent,
+                repo_owner,
+                repo_name,
+                registered_by_agent_ids: vec![agent_id],
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: ts.clone(),
+                updated_at: ts,
+            };
+            let stored = svc.register_git_root(&root).await?;
+            Ok(git_root_wire_row(&stored))
+        })
+    }
+
+    fn git_root_unregister(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            let _ = svc.store.get_workspace(&workspace_id).await?;
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(Error::InvalidParams("path is required".to_string()));
+            }
+            // Canonicalize when the directory still exists so the same
+            // spelling that registered the root resolves; fall back to the
+            // raw path for roots whose directory is already gone.
+            let lookup = match tokio::fs::canonicalize(trimmed).await {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => trimmed.to_string(),
+            };
+            let root = svc
+                .store
+                .find_workspace_git_root_by_path(&workspace_id, &lookup)
+                .await?
+                .ok_or_else(|| {
+                    Error::NotFound(format!("No git root registered for path: {lookup}"))
+                })?;
+            svc.unregister_git_root(&root.id).await?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "gitRootId": root.id.as_str(),
+                "path": root.path,
+            }))
         })
     }
 

@@ -13408,6 +13408,160 @@ mod file_tracking {
         assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
     }
 
+    /// `ws.git.registerRoot` registers a secondary repo: the path is
+    /// canonicalized, the row is `source: "agent"` with the caller
+    /// attributed, owner/name are detected from a GitHub `origin` remote,
+    /// and the returned wire row carries the live-read `branch`.
+    /// Re-registration is idempotent and appends the new caller
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_registers_secondary_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        {
+            let r = Repository::open(&secondary.dir).unwrap();
+            r.remote("origin", "git@github.com:intent-hq/intentd.git")
+                .unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row["source"], "agent");
+        assert_eq!(row["workspaceId"], ws_id.0);
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&secondary.dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(row["repoOwner"], "intent-hq");
+        assert_eq!(row["repoName"], "intentd");
+        assert_eq!(row["registeredByAgentIds"], serde_json::json!(["agent-1"]));
+        assert!(row["branch"].is_string(), "live-read branch: {row:?}");
+
+        // Idempotent by canonical path — a second caller merges in.
+        let again = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-2".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["id"], row["id"], "merged into the existing row");
+        assert_eq!(
+            again["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"].as_array().unwrap().len(), 1);
+    }
+
+    /// `ws.git.registerRoot` validation: a missing path, a non-repo
+    /// directory, and the workspace's own primary root are all
+    /// `InvalidParams`; an unknown workspace is `NotFound` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_rejects_invalid_paths() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let agent = AgentId("agent-1".into());
+
+        // Nonexistent path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "/nonexistent/xyz".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Empty path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "  ".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Directory without a `.git` entry.
+        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                plain.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&plain);
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // The workspace's own primary root is tracked implicitly.
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                primary.dir.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Unknown workspace.
+        let secondary = init_git_repo();
+        let err = svc
+            .git_root_register(
+                WorkspaceId::new(),
+                secondary.dir.to_string_lossy().into_owned(),
+                agent,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `ws.git.unregisterRoot` removes the root registered for the path
+    /// (canonicalized, so the registering spelling resolves) and returns
+    /// `{ ok, gitRootId, path }`; an unregistered path is `NotFound`
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_unregister_removes_by_path() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        assert_eq!(removed["path"], row["path"]);
+        let listed = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+
+        // A path with no registered root is NotFound.
+        let err = svc
+            .git_root_unregister(ws_id, secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
     /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
     /// its first parent (PROTOCOL §5.6 extension).
     #[tokio::test]

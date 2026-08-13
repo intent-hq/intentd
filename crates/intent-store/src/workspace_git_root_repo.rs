@@ -82,8 +82,11 @@ impl Store {
     /// merged in place and the merged row returned: `root`'s agent ids are
     /// appended (deduped, registration order preserved), `repo_owner` /
     /// `repo_name` are refreshed when `root` carries them (kept otherwise),
-    /// and `updated_at` is taken from `root`. The existing row's `id`,
-    /// `source`, PR fields, and `created_at` are retained.
+    /// `source` is upgraded `auto` → `agent` when `root` is agent-registered
+    /// (never downgraded — an explicit registration takes over an
+    /// auto-detected row in place, monorepo#2053), and `updated_at` is taken
+    /// from `root`. The existing row's `id`, PR fields, and `created_at` are
+    /// retained.
     pub async fn upsert_workspace_git_root(
         &self,
         root: &WorkspaceGitRoot,
@@ -116,14 +119,20 @@ impl Store {
                     if root.repo_name.is_some() {
                         current.repo_name = root.repo_name.clone();
                     }
+                    if current.source == WorkspaceGitRootSource::Auto
+                        && root.source == WorkspaceGitRootSource::Agent
+                    {
+                        current.source = WorkspaceGitRootSource::Agent;
+                    }
                     current.updated_at = root.updated_at.clone();
                     sqlx::query(
                         "UPDATE workspace_git_root SET registered_by_agent_ids = ?, \
-                         repo_owner = ?, repo_name = ?, updated_at = ? WHERE id = ?",
+                         repo_owner = ?, repo_name = ?, source = ?, updated_at = ? WHERE id = ?",
                     )
                     .bind(agent_ids_to_db(&current.registered_by_agent_ids)?)
                     .bind(&current.repo_owner)
                     .bind(&current.repo_name)
+                    .bind(enum_to_db(&current.source)?)
                     .bind(&current.updated_at)
                     .bind(&current.id.0)
                     .execute(&mut *tx)
@@ -445,6 +454,38 @@ mod tests {
             merged.registered_by_agent_ids,
             vec![AgentId("agent-1".into())]
         );
+    }
+
+    /// A merge upsert upgrades `source` `auto` → `agent` when the candidate
+    /// is agent-registered, and never downgrades an `agent` row back to
+    /// `auto` (monorepo#2053).
+    #[tokio::test]
+    async fn upsert_upgrades_source_auto_to_agent_never_downgrades() {
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let mut auto_root = test_root(&ws_id, "/tmp/clone-c", &[], &now_iso());
+        auto_root.source = WorkspaceGitRootSource::Auto;
+        let inserted = store
+            .upsert_workspace_git_root(&auto_root)
+            .await
+            .expect("insert");
+        assert_eq!(inserted.source, WorkspaceGitRootSource::Auto);
+
+        // An agent registration takes over the auto-detected row in place.
+        let upgraded = store
+            .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/clone-c", &["agent-1"], &now_iso()))
+            .await
+            .expect("upgrade");
+        assert_eq!(upgraded.id, inserted.id, "row taken over in place");
+        assert_eq!(upgraded.source, WorkspaceGitRootSource::Agent);
+
+        // A later auto-detection pass must not downgrade it back.
+        let mut auto_again = test_root(&ws_id, "/tmp/clone-c", &[], &now_iso());
+        auto_again.source = WorkspaceGitRootSource::Auto;
+        let kept = store
+            .upsert_workspace_git_root(&auto_again)
+            .await
+            .expect("merge");
+        assert_eq!(kept.source, WorkspaceGitRootSource::Agent, "no downgrade");
     }
 
     /// get/list/find/delete round-trip: roots list oldest-first and scoped to
