@@ -696,7 +696,8 @@ fn number(
 }
 
 /// Catalog max for `agents.memoryBudgetMb` when total RAM cannot be detected
-/// (RAM detection supports Linux and macOS only). Matches the static bound
+/// (RAM detection supports Linux and macOS only), and the ceiling on the
+/// detected value. Matches the static bound
 /// [`intent_core::settings_file::SettingsFile`] enforces when parsing
 /// `config.toml`, which stays machine-independent on purpose: a config file
 /// written on one seat must not fail to parse on another.
@@ -722,17 +723,31 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 /// inconsistency is confined to configs the API itself will no longer create,
 /// and any write through `settings.update` brings the value back into range;
 /// a client should clamp its slider rather than assume `value <= max`.
+///
+/// The divergence is **one-directional**: this bound is never looser than the
+/// parse bound. See [`memory_budget_max_mb_for`] for why that matters.
 fn memory_budget_max_mb() -> f64 {
     memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes())
 }
 
-/// [`memory_budget_max_mb`] against an explicit detection result, so both
-/// branches are testable on a host where detection itself always succeeds.
-/// A zero reading counts as "undetected": a max of 0 would collapse the
-/// slider onto its own minimum and lock the setting off.
+/// [`memory_budget_max_mb`] against an explicit detection result, so every
+/// branch is testable on a host where detection itself always succeeds and
+/// reports one particular size.
+///
+/// A zero reading counts as "undetected": a max of 0 would collapse the slider
+/// onto its own minimum and lock the setting off.
+///
+/// Detected RAM is **clamped** to [`MEMORY_BUDGET_MAX_MB_FALLBACK`], which is
+/// also the `config.toml` parse bound. Without the clamp, a host with more
+/// than 1,024,000 MB of RAM (a 1 TiB seat reports 1,048,576) would advertise a
+/// max that `settings.update` accepts here and `SettingsFile::validate` then
+/// rejects inside `SettingsRegistry::apply` — the catalog would be telling
+/// clients a value is settable that the write path refuses. Clamping keeps the
+/// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
+/// the invariant every claim in these doc comments depends on.
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
-        Some(bytes) => (bytes / (1024 * 1024)) as f64,
+        Some(bytes) => ((bytes / (1024 * 1024)) as f64).min(MEMORY_BUDGET_MAX_MB_FALLBACK),
         None => MEMORY_BUDGET_MAX_MB_FALLBACK,
     }
 }
@@ -2393,6 +2408,12 @@ mod tests {
             memory_budget_max_mb_for(Some(0)),
             MEMORY_BUDGET_MAX_MB_FALLBACK
         );
+        // A seat larger than the parse bound is clamped to it: advertising
+        // 1,048,576 on a 1 TiB host would be a max the write path rejects.
+        assert_eq!(
+            memory_budget_max_mb_for(Some(1024 * 1024 * 1024 * 1024)),
+            MEMORY_BUDGET_MAX_MB_FALLBACK
+        );
 
         // The wired-up form agrees with the injectable one on this host.
         assert_eq!(
@@ -2401,25 +2422,52 @@ mod tests {
         );
     }
 
-    /// The catalog bound is deliberately tighter than the `config.toml` parse
-    /// bound, and the asymmetry is load-bearing: a config copied from a larger
-    /// seat must still **parse** here (tightening the parse bound would fail
-    /// `Config::resolve` and refuse to boot), while `settings.update` refuses
-    /// to newly create a budget the admission gate could never fire on. The
-    /// consequence a client has to tolerate is a reported `value` above the
-    /// advertised `max` for such a config.
+    /// The catalog bound may be tighter than the `config.toml` parse bound but
+    /// must never be looser, and the direction is load-bearing in both senses:
+    ///
+    /// - **Never looser** — everything the catalog advertises as settable must
+    ///   survive the write path. `settings.update` re-validates through
+    ///   `SettingsFile::validate` inside `SettingsRegistry::apply`, so a max
+    ///   above the parse bound would advertise values that path rejects.
+    /// - **May be tighter** — a config copied from a larger seat must still
+    ///   parse here (tightening the parse bound would fail `Config::resolve`
+    ///   and refuse to boot), while `settings.update` declines to newly create
+    ///   a budget the admission gate could never fire on. The cost a client
+    ///   tolerates is a reported `value` above the advertised `max`.
+    ///
+    /// The host-independent half is asserted unconditionally; the window that
+    /// demonstrates the tighter-than case only exists on a seat smaller than
+    /// the parse bound, which is every real one but need not be assumed.
     #[test]
-    fn memory_budget_parse_bound_stays_looser_than_the_catalog_bound() {
+    fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
-        let over_ram = memory_budget_max_mb() + 1.0;
+        let max = memory_budget_max_mb();
 
-        def.validate(&json!(over_ram))
-            .expect_err("settings.update must reject a budget above this machine's RAM");
+        assert!(
+            max <= MEMORY_BUDGET_MAX_MB_FALLBACK,
+            "catalog advertised {max} above the parse bound — settings.update would accept a \
+             value SettingsFile::validate then rejects in SettingsRegistry::apply",
+        );
 
-        let parsed =
-            SettingsFile::parse_str(&format!("[agents]\nmemoryBudgetMb = {}\n", over_ram as u64))
-                .expect("a config.toml from a larger seat must still parse, not refuse to boot");
-        assert_eq!(parsed.agents.memory_budget_mb, over_ram as u32);
+        // Whatever the catalog advertises as its ceiling must be settable
+        // through both gates the write path runs.
+        def.validate(&json!(max))
+            .expect("the advertised max must pass catalog validation");
+        SettingsFile::parse_str(&format!("[agents]\nmemoryBudgetMb = {}\n", max as u64))
+            .expect("the advertised max must pass the config.toml parse bound");
+
+        // Tighter-than case: a value in the gap parses but is refused by the API.
+        if max < MEMORY_BUDGET_MAX_MB_FALLBACK {
+            let over_ram = max + 1.0;
+            def.validate(&json!(over_ram))
+                .expect_err("settings.update must reject a budget above this machine's RAM");
+            let parsed = SettingsFile::parse_str(&format!(
+                "[agents]\nmemoryBudgetMb = {}\n",
+                over_ram as u64
+            ))
+            .expect("a config.toml from a larger seat must still parse, not refuse to boot");
+            assert_eq!(parsed.agents.memory_budget_mb, over_ram as u32);
+        }
     }
 
     /// The shipped idle-reap default is 10 minutes (lowered from 30,
