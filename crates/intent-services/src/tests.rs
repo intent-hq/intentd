@@ -25101,9 +25101,9 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss: attention-changed (plus the displayStatus demotion for
-        // the retired unread flag, §6.5) — no updated_at bump, so no
-        // debounced workspace:updated { lastActivity } follows.
+        // Dismiss: attention-changed — no updated_at bump, so no debounced
+        // workspace:updated { lastActivity } follows. (The unread flag is
+        // not a displayStatus axis, §6.5, so no demotion emits either.)
         h.services
             .dismiss_attention(h.ws.clone())
             .await
