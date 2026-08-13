@@ -14,7 +14,7 @@
 # tags only), rebuilt with ASSET_REPO so their platform URLs point at the
 # mirrored assets. Each channel republish runs in its own job that shares the
 # concurrency group of the workflow that normally publishes that channel
-# (publish-channel-manifest.yml for beta, promote-stable.yml for stable), so
+# (promote-beta.yml for beta, promote-stable.yml for stable), so
 # the "current manifest points at this tag" guard and the mirror publish are
 # serialized with releases/promotions in flight — a backfill of an older tag
 # can never move a mirror channel manifest backwards.
@@ -146,7 +146,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     concurrency:
-      group: intentd-beta-manifest-publish
+      group: intentd-beta-promotion
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

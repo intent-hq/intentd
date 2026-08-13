@@ -17,8 +17,8 @@
 # best-effort).
 #
 # This script is best-effort by design: callers (publish-channel-manifest.yml,
-# promote-stable.yml) run it fail-soft so a notification failure never blocks
-# a release or promotion.
+# promote-beta.yml, promote-stable.yml) run it fail-soft so a notification
+# failure never blocks a release or promotion.
 # Requires: git (a checkout with full history for the range) and gh
 # (authenticated via GH_TOKEN for the SOURCE_REPO PR-body reads).
 #
@@ -73,8 +73,8 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
   echo "error: version must look like [v]X.Y.Z[-<prerelease>] (prerelease limited to [0-9A-Za-z.-])" >&2
   exit 1
 fi
-if [[ "$CHANNEL" != "beta" && "$CHANNEL" != "stable" ]]; then
-  echo "error: channel must be beta or stable" >&2
+if [[ "$CHANNEL" != "alpha" && "$CHANNEL" != "beta" && "$CHANNEL" != "stable" ]]; then
+  echo "error: channel must be alpha, beta, or stable" >&2
   exit 1
 fi
 repo_name_re='^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'
@@ -141,8 +141,10 @@ fi
 echo "issues referenced in $range: $(tr '\n' ' ' <<<"$issue_nums")" >&2
 
 marker="<!-- release-notifier: ${COMPONENT} v${VERSION} ${CHANNEL} -->"
-if [[ "$CHANNEL" == "beta" ]]; then
-  message="Fixed in ${COMPONENT} v${VERSION} (beta)."
+if [[ "$CHANNEL" == "alpha" ]]; then
+  message="Fixed in ${COMPONENT} v${VERSION} (alpha)."
+elif [[ "$CHANNEL" == "beta" ]]; then
+  message="${COMPONENT} v${VERSION} promoted to beta."
 else
   message="${COMPONENT} v${VERSION} promoted to stable."
 fi
