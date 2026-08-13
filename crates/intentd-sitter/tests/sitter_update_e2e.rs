@@ -283,6 +283,7 @@ fn check_honors_flag_and_env_channel_precedence() {
     let (base_url, requests) = serve_recording(Arc::clone(&routes));
     publish_stable(&routes, &base_url, "0.1.0", b"stable daemon 0.1.0");
     publish_channel(&routes, &base_url, "beta", "0.2.0", b"beta daemon 0.2.0");
+    publish_channel(&routes, &base_url, "alpha", "0.3.0", b"alpha daemon 0.3.0");
 
     // Env override selects beta.
     let output = run_sitter_with_channel_env(dir.path(), &base_url, "beta", &["update", "--check"]);
@@ -295,6 +296,21 @@ fn check_honors_flag_and_env_channel_precedence() {
     let stdout = stdout_of(&output);
     assert!(
         stdout.contains("latest on channel beta: intentd 0.2.0"),
+        "stdout: {stdout}"
+    );
+
+    // Env override selects alpha.
+    let output =
+        run_sitter_with_channel_env(dir.path(), &base_url, "alpha", &["update", "--check"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("latest on channel alpha: intentd 0.3.0"),
         "stdout: {stdout}"
     );
 
@@ -322,6 +338,7 @@ fn check_honors_flag_and_env_channel_precedence() {
         requests.lock().unwrap().as_slice(),
         [
             "/channel-beta/beta.json".to_string(),
+            "/channel-alpha/alpha.json".to_string(),
             "/channel-stable/stable.json".to_string(),
         ],
         "each check must fetch exactly the resolved channel's manifest"
