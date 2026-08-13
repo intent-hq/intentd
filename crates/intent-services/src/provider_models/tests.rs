@@ -388,7 +388,7 @@ fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
         rows[0],
         json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex",
                 "description": "Flagship coding model",
-                "effortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] })
+                "effortLevels": ["low", "medium", "high", "xhigh"] })
     );
     assert_eq!(
         rows[1],
@@ -404,8 +404,21 @@ fn parse_codex_models_effort_levels_without_description() {
     assert_eq!(
         rows[0],
         json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex",
-                "effortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] })
+                "effortLevels": ["low", "medium", "high", "xhigh"] })
     );
+}
+
+#[test]
+fn parse_codex_models_all_legacy_fallbacks_use_four_levels() {
+    for model_id in ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max"] {
+        let payload = json!({ "models": { "availableModels": [{ "modelId": model_id }] } });
+        let rows = parse_codex_acp_models(&payload);
+        assert_eq!(
+            rows[0]["effortLevels"],
+            json!(["low", "medium", "high", "xhigh"]),
+            "unexpected fallback for {model_id}"
+        );
+    }
 }
 
 #[test]
@@ -487,8 +500,21 @@ fn parse_codex_models_collapse_live_bracket_effort_ids() {
     assert_eq!(
         rows[0],
         json!({ "id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "provider": "codex",
-                "description": "Low effort",
                 "effortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] })
+    );
+}
+
+#[test]
+fn parse_codex_models_none_only_variant_uses_known_fallback() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.6-sol[none]", "name": "GPT-5.6-Sol" }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(
+        rows[0]["effortLevels"],
+        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
     );
 }
 
@@ -576,7 +602,7 @@ fn parse_codex_config_options_carry_effort_levels() {
     assert_eq!(rows[0]["id"], "gpt-5.3-codex");
     assert_eq!(
         rows[0]["effortLevels"],
-        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        json!(["low", "medium", "high", "xhigh"])
     );
 }
 

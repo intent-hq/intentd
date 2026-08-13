@@ -16,15 +16,16 @@ use serde_json::{json, Map, Value};
 
 /// Reasoning effort levels used by codex model variants.
 const CODEX_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+const LEGACY_CODEX_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
 /// Codex base models known to support reasoning effort even when an adapter
 /// reports only the unsuffixed base row. Expanded catalogs are detected and
 /// collapsed generically, so new families do not need to appear here.
-const CODEX_EFFORT_VARIANT_MODELS: [&str; 4] = [
-    "gpt-5.6-sol",
-    "gpt-5.3-codex",
-    "gpt-5.2-codex",
-    "gpt-5.1-codex-max",
+const CODEX_EFFORT_VARIANT_MODELS: [(&str, &[&str]); 4] = [
+    ("gpt-5.6-sol", &CODEX_EFFORTS),
+    ("gpt-5.3-codex", &LEGACY_CODEX_EFFORTS),
+    ("gpt-5.2-codex", &LEGACY_CODEX_EFFORTS),
+    ("gpt-5.1-codex-max", &LEGACY_CODEX_EFFORTS),
 ];
 
 /// Extract the raw model-entry array from any ACP payload shape.
@@ -272,6 +273,13 @@ fn push_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = Str
     }
 }
 
+fn known_codex_effort_levels(id: &str) -> Option<Vec<String>> {
+    CODEX_EFFORT_VARIANT_MODELS
+        .iter()
+        .find(|(model, _)| id.eq_ignore_ascii_case(model))
+        .map(|(_, efforts)| efforts.iter().map(|effort| effort.to_string()).collect())
+}
+
 struct CodexModelGroup {
     id: String,
     name: String,
@@ -337,7 +345,7 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
             });
             groups.last_mut().expect("just pushed")
         };
-        if group.description.is_none() {
+        if inferred_effort.is_none() && group.description.is_none() {
             group.description = description;
         }
         if let Some(levels) = entry_effort_levels(entry) {
@@ -370,16 +378,13 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
                         .into_iter()
                         .filter(|level| codex_effort(level).is_none()),
                 );
-                (!levels.is_empty()).then_some(levels)
+                if levels.is_empty() {
+                    known_codex_effort_levels(&group.id)
+                } else {
+                    Some(levels)
+                }
             } else {
-                CODEX_EFFORT_VARIANT_MODELS
-                    .contains(&group.id.as_str())
-                    .then(|| {
-                        CODEX_EFFORTS
-                            .iter()
-                            .map(|effort| effort.to_string())
-                            .collect()
-                    })
+                known_codex_effort_levels(&group.id)
             };
             with_effort_levels(
                 wire_row(
