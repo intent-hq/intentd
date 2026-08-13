@@ -158,6 +158,13 @@ pub const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
         "agent_message_fts_idx",
         "FTS5 shadow table of `agent_message_fts` (derived, rebuilt on the target)",
     ),
+    (
+        "workspace_git_root",
+        "registered git roots point at machine-local canonical paths (often outside \
+         the workspace checkout) that do not exist on the target host; the sweep \
+         would immediately auto-prune them, and submodule roots are re-detected \
+         (agents re-register explicit roots) on the target",
+    ),
 ];
 
 impl Store {

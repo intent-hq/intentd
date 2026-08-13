@@ -51,7 +51,10 @@ pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
@@ -89,7 +92,8 @@ pub use model::{
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
     WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
