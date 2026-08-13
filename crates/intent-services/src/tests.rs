@@ -10923,6 +10923,325 @@ mod pr {
         let ur = svc.github_unresolve_thread("RT1".into()).await.unwrap();
         assert_eq!(ur["isResolved"], false);
     }
+
+    // ------------------------------------------------------------------------
+    // Git-root sweep (monorepo#2053): submodule auto-registration, auto-prune,
+    // and per-root PR refresh against the stubbed forge (no network).
+    // ------------------------------------------------------------------------
+
+    /// Self-cleaning temp git repository whose unborn HEAD points at `branch`
+    /// (`current_branch_at` reads the symbolic target, so no commit is needed).
+    struct SweepRepo {
+        dir: PathBuf,
+    }
+
+    impl SweepRepo {
+        fn init(branch: &str, origin: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = git2::Repository::init(&dir).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            if let Some(url) = origin {
+                repo.remote("origin", url).unwrap();
+            }
+            Self { dir }
+        }
+    }
+
+    impl Drop for SweepRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Bus-wired service plus a seeded workspace whose worktree is `worktree`.
+    /// The bus persists `gitRoot:*` events to the durable log we assert on.
+    async fn sweep_setup(worktree: &std::path::Path) -> (TempDb, Services, intent_core::Workspace) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        (tmp, svc, ws)
+    }
+
+    /// Build an unlinked `WorkspaceGitRoot` row at `dir` (canonicalized, so it
+    /// matches the sweep's path keying).
+    fn sweep_root(
+        ws_id: &WorkspaceId,
+        dir: &std::path::Path,
+        owner_repo: Option<(&str, &str)>,
+    ) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: std::fs::canonicalize(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: owner_repo.map(|(o, _)| o.to_string()),
+            repo_name: owner_repo.map(|(_, n)| n.to_string()),
+            registered_by_agent_ids: vec![],
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// The sweep auto-registers the worktree's initialized submodules as
+    /// `source: "auto"` roots with owner/name detected from `origin`, prunes
+    /// roots whose directory is gone, and is idempotent on re-run.
+    #[tokio::test]
+    async fn sweep_auto_registers_submodules_and_prunes_missing_roots() {
+        let parent = SweepRepo::init("main", None);
+        let sub_dir = parent.dir.join("packages").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub = git2::Repository::init(&sub_dir).unwrap();
+        sub.remote("origin", "https://github.com/o/r.git").unwrap();
+        std::fs::write(
+            parent.dir.join(".gitmodules"),
+            "[submodule \"packages/sub\"]\n\tpath = packages/sub\n\turl = https://github.com/o/r.git\n",
+        )
+        .unwrap();
+
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Seed a root whose directory no longer exists (auto-prune target).
+        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone = sweep_root(&ws.id, &gone_dir, None);
+        svc.store().upsert_workspace_git_root(&gone).await.unwrap();
+        std::fs::remove_dir_all(&gone_dir).unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let root = &roots[0];
+        assert_eq!(root.source, intent_core::WorkspaceGitRootSource::Auto);
+        assert!(root.path.ends_with("sub"), "{}", root.path);
+        assert_eq!(root.repo_owner.as_deref(), Some("o"));
+        assert_eq!(root.repo_name.as_deref(), Some("r"));
+
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].data["gitRoot"]["source"], "auto");
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 1);
+        assert_eq!(unregistered[0].data["gitRootId"], gone.id.as_str());
+
+        // Re-sweeping is idempotent: the tracked submodule is not re-upserted
+        // (no `gitRoot:registered`/`gitRoot:updated` churn).
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 0);
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    /// Auto-prune fires only on a genuine path-gone (`NotFound` /
+    /// `NotADirectory`): a transient stat failure of any other kind
+    /// (`PermissionDenied` here, standing in for EIO on a flaky mount) must
+    /// never delete an agent-registered root with its attribution and PR
+    /// history — the sweep logs and skips it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_does_not_prune_root_on_transient_stat_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Root at guard/repo where `guard` is later made unsearchable, so a
+        // stat of the root's path fails with PermissionDenied, not NotFound.
+        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let repo_dir = guard.join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let root = sweep_root(&ws.id, &repo_dir, None);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root.path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&guard);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "root must survive the transient error");
+        assert_eq!(roots[0].id, root.id);
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 0, "no prune event");
+    }
+
+    /// An unlinked root with a detected repo discovers an open PR by its
+    /// current branch (emitting `gitRoot:updated`); a re-sweep with identical
+    /// forge state is a no-op.
+    #[tokio::test]
+    async fn sweep_links_root_pr_by_branch_discovery() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            discover: true,
+            ..Default::default()
+        });
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
+
+        // Identical forge state on the next sweep: no new event.
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A root without a detected GitHub repo is skipped before any forge call.
+    #[tokio::test]
+    async fn root_refresh_skips_without_detected_repo() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", None);
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, None);
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
+    }
+
+    /// A linked root whose current branch positively mismatches the PR head
+    /// clears the stale link (root analogue of the workspace unlink path).
+    #[tokio::test]
+    async fn root_refresh_unlinks_on_positive_branch_mismatch() {
+        let primary = SweepRepo::init("main", None);
+        // Root repo is on "main"; the linked PR #42's head is "feature".
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, None);
+        assert_eq!(after.pr_url, None);
+        assert_eq!(after.pr_status, None);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A linked PR fetched as merged stays recorded in `pull_requests` and the
+    /// root relinks to a newer open PR on the same branch.
+    #[tokio::test]
+    async fn root_refresh_relinks_after_linked_pr_merges() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            open_pr_number: Some(77),
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(77));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/77")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+        assert!(list.iter().any(|p| p.number == 77));
+    }
 }
 
 /// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table
@@ -12146,7 +12465,10 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         // Page size 1 → newest commit only, with a token for the older page.
-        let page1 = svc.git_commits(ws_id.clone(), Some(1), None).await.unwrap();
+        let page1 = svc
+            .git_commits(ws_id.clone(), Some(1), None, None)
+            .await
+            .unwrap();
         let items = page1["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         let head = &items[0];
@@ -12162,7 +12484,7 @@ mod file_tracking {
 
         // Following the token yields the older (seed) commit, then no more.
         let page2 = svc
-            .git_commits(ws_id, Some(1), Some(token.to_string()))
+            .git_commits(ws_id, Some(1), Some(token.to_string()), None)
             .await
             .unwrap();
         let items2 = page2["items"].as_array().unwrap();
@@ -12183,7 +12505,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let changes = svc.git_changes(ws_id).await.unwrap();
+        let changes = svc.git_changes(ws_id, None).await.unwrap();
         let arr = changes.as_array().unwrap();
         let seed = arr.iter().find(|c| c["path"] == "seed.txt").unwrap();
         assert_eq!(seed["status"], serde_json::json!("M"));
@@ -12201,7 +12523,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -12235,7 +12557,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -12266,7 +12588,7 @@ mod file_tracking {
         };
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, true, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, true, None, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "sub").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -12327,7 +12649,7 @@ mod file_tracking {
         let first = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The leader is inside the walk (flight registered, probe parked).
         wait_until("leader to enter the walk", || {
@@ -12338,10 +12660,10 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The identical call joined the in-flight walk as a follower.
-        let key = (ws_id.clone(), None, false, None);
+        let key = (ws_id.clone(), None, false, None, None);
         wait_until("second call to join as follower", || {
             svc.git_diffs_waiters(&key) == 1
         })
@@ -12388,13 +12710,13 @@ mod file_tracking {
         let unstaged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
         let staged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, true, None).await }
+            async move { svc.git_diffs(ws, None, true, None, None).await }
         });
         // The non-identical request must start its own walk while the first
         // is still parked.
@@ -12439,7 +12761,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         // The leader is inside the scan (flight registered, probe parked).
         wait_until("leader to enter the scan", || {
@@ -12451,7 +12773,7 @@ mod file_tracking {
             .map(|_| {
                 let svc = svc.clone();
                 let ws = ws_id.clone();
-                tokio::spawn(async move { svc.git_status(ws).await })
+                tokio::spawn(async move { svc.git_status(ws, None).await })
             })
             .collect();
         wait_until("followers to join the in-flight scan", || {
@@ -12500,7 +12822,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12620,12 +12942,12 @@ mod file_tracking {
 
         let first = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_a).await }
+            async move { svc.git_status(ws_a, None).await }
         });
         wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
         let second = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_b).await }
+            async move { svc.git_status(ws_b, None).await }
         });
         // The other worktree must start its own scan while the first is parked.
         wait_until("second independent scan", || {
@@ -12660,8 +12982,8 @@ mod file_tracking {
             })
         });
 
-        assert!(svc.git_status(ws_id.clone()).await.is_err());
-        assert!(svc.git_status(ws_id).await.is_err());
+        assert!(svc.git_status(ws_id.clone(), None).await.is_err());
+        assert!(svc.git_status(ws_id, None).await.is_err());
         assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
     }
 
@@ -12693,7 +13015,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12702,7 +13024,7 @@ mod file_tracking {
         let changes = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_changes(ws).await }
+            async move { svc.git_changes(ws, None).await }
         });
         wait_until("git.changes to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12750,7 +13072,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12759,7 +13081,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12810,7 +13132,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12819,7 +13141,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12858,17 +13180,17 @@ mod file_tracking {
             })
         });
 
-        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        let first = svc.git_status(ws_id.clone(), None).await.unwrap();
         for _ in 0..4 {
             assert_eq!(
-                svc.git_status(ws_id.clone()).await.unwrap(),
+                svc.git_status(ws_id.clone(), None).await.unwrap(),
                 first,
                 "cached reads return the same status"
             );
         }
         assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
         // The other scan-backed reads serve the same entry.
-        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.git_changes(ws_id.clone(), None).await.unwrap();
         svc.accept_changes_get_status(ws_id).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
@@ -12896,7 +13218,7 @@ mod file_tracking {
             })
         });
 
-        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        let before = svc.git_status(ws_id.clone(), None).await.unwrap();
         assert!(
             before.files.iter().any(|f| !f.staged),
             "the edit starts unstaged"
@@ -12904,7 +13226,7 @@ mod file_tracking {
         svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
             .await
             .unwrap();
-        let after = svc.git_status(ws_id).await.unwrap();
+        let after = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -12937,7 +13259,7 @@ mod file_tracking {
             });
 
         assert!(svc
-            .git_status(ws_id.clone())
+            .git_status(ws_id.clone(), None)
             .await
             .unwrap()
             .files
@@ -12945,7 +13267,7 @@ mod file_tracking {
         // Out-of-band edit: no `file:*` event, no daemon mutation.
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         assert!(
-            svc.git_status(ws_id.clone())
+            svc.git_status(ws_id.clone(), None)
                 .await
                 .unwrap()
                 .files
@@ -12955,7 +13277,7 @@ mod file_tracking {
         assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let expired = svc.git_status(ws_id).await.unwrap();
+        let expired = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -12994,7 +13316,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -13007,7 +13329,7 @@ mod file_tracking {
         release.store(true, Ordering::SeqCst);
         leader.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -13046,7 +13368,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -13061,7 +13383,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the flight", || {
             svc.git_status_waiters(&repo.dir) > 0
@@ -13072,7 +13394,7 @@ mod file_tracking {
         leader.await.unwrap().unwrap();
         follower.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -13090,14 +13412,16 @@ mod file_tracking {
     async fn git_reads_empty_for_non_repo_workspace() {
         let (_t, svc, ws) = ft_setup().await;
         assert_eq!(
-            svc.git_changes(ws.clone()).await.unwrap(),
+            svc.git_changes(ws.clone(), None).await.unwrap(),
             serde_json::json!([])
         );
         assert_eq!(
-            svc.git_diffs(ws.clone(), None, false, None).await.unwrap(),
+            svc.git_diffs(ws.clone(), None, false, None, None)
+                .await
+                .unwrap(),
             serde_json::json!([])
         );
-        let commits = svc.git_commits(ws.clone(), None, None).await.unwrap();
+        let commits = svc.git_commits(ws.clone(), None, None, None).await.unwrap();
         assert_eq!(commits["items"], serde_json::json!([]));
         assert_eq!(commits["nextToken"], serde_json::Value::Null);
         // git.commitDetails degrades to an empty envelope (graceful) — same as
@@ -13184,6 +13508,507 @@ mod file_tracking {
         assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
+    /// Build a `WorkspaceGitRoot` row for the given workspace + path
+    /// (monorepo#2053 read-surface tests).
+    fn git_root_row(ws_id: &WorkspaceId, path: &std::path::Path) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![AgentId("agent-1".into())],
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// `gitRoot.list` returns every registered root for the workspace with a
+    /// live-read `branch` grafted on, and an empty list when none are
+    /// registered (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_list_returns_registered_roots_with_branch() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let empty = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(empty["gitRoots"], serde_json::json!([]));
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        let roots = listed["gitRoots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["id"], root.id.as_str());
+        assert_eq!(roots[0]["path"], root.path);
+        assert_eq!(roots[0]["source"], "agent");
+        assert_eq!(
+            roots[0]["registeredByAgentIds"],
+            serde_json::json!(["agent-1"])
+        );
+        assert!(
+            roots[0]["branch"].is_string(),
+            "live-read branch grafted on: {:?}",
+            roots[0]
+        );
+    }
+
+    /// `gitRoot.list` on an unknown workspace is `NotFound` (router → -32602).
+    #[tokio::test]
+    async fn git_root_list_unknown_workspace_is_not_found() {
+        let repo = init_git_repo();
+        let (_t, svc, _ws) = svc_with_repo(&repo).await;
+        let err = svc.git_root_list(WorkspaceId::new()).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// A `gitRootId` on the workspace-scoped reads targets the registered
+    /// root's path instead of the workspace worktree (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_scoped_to_registered_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        std::fs::write(secondary.dir.join("root-only.txt"), "hi\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // git.status against the secondary root sees its untracked file...
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            status.files.iter().any(|f| f.path == "root-only.txt"),
+            "{status:?}"
+        );
+        // ...while the primary-worktree scan (no gitRootId) does not.
+        let primary_status = svc.git_status(ws_id.clone(), None).await.unwrap();
+        assert!(
+            !primary_status
+                .files
+                .iter()
+                .any(|f| f.path == "root-only.txt"),
+            "{primary_status:?}"
+        );
+
+        // git.changes projects the same root-scoped file list.
+        let changes = svc
+            .git_changes(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "root-only.txt"));
+
+        // git.commits walks the secondary root's history.
+        let commits = svc
+            .git_commits(ws_id.clone(), None, None, Some(root.id.clone()))
+            .await
+            .unwrap();
+        let items = commits["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("seed commit"));
+
+        // git.showFile reads blobs at the secondary root's HEAD.
+        let shown = svc
+            .git_show_file(
+                ws_id,
+                "seed.txt".to_string(),
+                "HEAD".to_string(),
+                Some(root.id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown["content"], "seed\n");
+    }
+
+    /// An unknown `gitRootId` — or one registered to a different workspace —
+    /// is `InvalidParams` (-32602), not an empty fallback (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_unknown_or_foreign_git_root_id_is_invalid_params() {
+        let repo = init_git_repo();
+        let other_repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        // Unknown id.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // A root registered to a *different* workspace.
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        let foreign = git_root_row(&other_ws, &other_repo.dir);
+        svc.store()
+            .upsert_workspace_git_root(&foreign)
+            .await
+            .unwrap();
+        let err = svc
+            .git_changes(ws_id, Some(foreign.id.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+    }
+
+    /// On a remote workspace the git reads still validate `gitRootId` before
+    /// the remote early-return: an unknown id is `InvalidParams` (-32602),
+    /// while a valid id degrades to the same empty result the primary gets
+    /// (monorepo#2053 review).
+    #[tokio::test]
+    async fn git_reads_remote_workspace_still_validates_git_root_id() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        ws.is_remote = true;
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Unknown id → -32602 even though the workspace is remote.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        let err = svc
+            .git_changes(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Valid id → the remote empty fallback, not an error.
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(status.files.is_empty(), "{status:?}");
+        let changes = svc.git_changes(ws_id, Some(root.id.clone())).await.unwrap();
+        assert_eq!(changes, serde_json::json!([]));
+    }
+
+    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
+    /// optional user and numeric port) alongside https and scp-like remotes,
+    /// and keeps the strict `github.com` host check for all three
+    /// (monorepo#2053 review).
+    #[test]
+    fn parse_github_owner_repo_handles_ssh_url_form() {
+        let parse = Services::parse_github_owner_repo;
+        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
+
+        // ssh:// forms.
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
+        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
+
+        // Strict host check on ssh:// too.
+        assert_eq!(
+            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
+        // A non-numeric "port" stays part of the host and is rejected.
+        assert_eq!(
+            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(
+            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
+            None
+        );
+        // No owner/repo path.
+        assert_eq!(parse("ssh://git@github.com"), None);
+        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
+
+        // The existing https and scp-like forms still parse.
+        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
+        assert_eq!(
+            parse("https://github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
+    }
+
+    /// `register_git_root` emits `gitRoot:registered` on first registration
+    /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
+    /// `gitRoot:unregistered` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_unregister_emit_events() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(ws_id.0.clone()),
+            ..Default::default()
+        });
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        let stored = svc.register_git_root(&root).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("registered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:registered");
+        assert_eq!(batch[0].data["gitRoot"]["id"], stored.id.as_str());
+
+        // Re-registering the same path merges and emits `gitRoot:updated`.
+        let mut again = git_root_row(&ws_id, &secondary.dir);
+        again.registered_by_agent_ids = vec![AgentId("agent-2".into())];
+        let merged = svc.register_git_root(&again).await.unwrap();
+        assert_eq!(merged.id, stored.id, "merged into the existing row");
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("updated event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:updated");
+        assert_eq!(
+            batch[0].data["gitRoot"]["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+
+        svc.unregister_git_root(&stored.id).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("unregistered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:unregistered");
+        assert_eq!(batch[0].data["gitRootId"], stored.id.as_str());
+        assert_eq!(batch[0].data["path"], stored.path);
+
+        // Unregistering an unknown id is NotFound.
+        let err = svc.unregister_git_root(&stored.id).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `ws.git.registerRoot` registers a secondary repo: the path is
+    /// canonicalized, the row is `source: "agent"` with the caller
+    /// attributed, owner/name are detected from a GitHub `origin` remote,
+    /// and the returned wire row carries the live-read `branch`.
+    /// Re-registration is idempotent and appends the new caller
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_registers_secondary_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        {
+            let r = Repository::open(&secondary.dir).unwrap();
+            r.remote("origin", "git@github.com:intent-hq/intentd.git")
+                .unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row["source"], "agent");
+        assert_eq!(row["workspaceId"], ws_id.0);
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&secondary.dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(row["repoOwner"], "intent-hq");
+        assert_eq!(row["repoName"], "intentd");
+        assert_eq!(row["registeredByAgentIds"], serde_json::json!(["agent-1"]));
+        assert!(row["branch"].is_string(), "live-read branch: {row:?}");
+
+        // Idempotent by canonical path — a second caller merges in.
+        let again = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-2".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["id"], row["id"], "merged into the existing row");
+        assert_eq!(
+            again["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"].as_array().unwrap().len(), 1);
+    }
+
+    /// A RELATIVE `ws.git.registerRoot` path resolves against the workspace
+    /// worktree — not the daemon's cwd — so an agent whose cwd is the
+    /// worktree can register `vendor/lib` directly; the same relative
+    /// spelling unregisters it (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_resolves_relative_path_against_worktree() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        // A nested repo inside the worktree, registered by relative path.
+        let nested = primary.dir.join("vendor").join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        Repository::init(&nested).unwrap();
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                "vendor/lib".into(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&nested)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "resolved against the worktree, not the daemon cwd"
+        );
+
+        // The same relative spelling unregisters the root.
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), "vendor/lib".into())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+    }
+
+    /// `ws.git.registerRoot` validation: a missing path, a non-repo
+    /// directory, and the workspace's own primary root are all
+    /// `InvalidParams`; an unknown workspace is `NotFound` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_rejects_invalid_paths() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let agent = AgentId("agent-1".into());
+
+        // Nonexistent path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "/nonexistent/xyz".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Empty path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "  ".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Directory without a `.git` entry.
+        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                plain.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&plain);
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // The workspace's own primary root is tracked implicitly.
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                primary.dir.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Unknown workspace.
+        let secondary = init_git_repo();
+        let err = svc
+            .git_root_register(
+                WorkspaceId::new(),
+                secondary.dir.to_string_lossy().into_owned(),
+                agent,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `ws.git.unregisterRoot` removes the root registered for the path
+    /// (canonicalized, so the registering spelling resolves) and returns
+    /// `{ ok, gitRootId, path }`; an unregistered path is `NotFound`
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_unregister_removes_by_path() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        assert_eq!(removed["path"], row["path"]);
+        let listed = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+
+        // A path with no registered root is NotFound.
+        let err = svc
+            .git_root_unregister(ws_id, secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
     /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
     /// its first parent (PROTOCOL §5.6 extension).
     #[tokio::test]
@@ -13217,7 +14042,13 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), false, Some(head))
+            .git_diffs(
+                ws_id,
+                Some(vec!["seed.txt".to_string()]),
+                false,
+                Some(head),
+                None,
+            )
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13303,7 +14134,7 @@ mod file_tracking {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
 
         // Legacy two-pass reference: one full scan for the file list, then
         // one scan per file for its hunks (binary → empty hunks).
@@ -13345,11 +14176,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
-            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = narrowed.as_array().unwrap();
@@ -13373,7 +14204,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
@@ -13381,6 +14212,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["b.txt".to_string(), "new.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13408,11 +14240,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let empty_paths = svc
-            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None)
+            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None, None)
             .await
             .unwrap();
         assert_eq!(empty_paths, full);
@@ -13422,6 +14254,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["no-such-file.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13453,6 +14286,7 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string(), "third.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -13474,7 +14308,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13501,7 +14335,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13520,12 +14354,18 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let relative = svc
-            .git_diffs(ws_id.clone(), Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(
+                ws_id.clone(),
+                Some(vec!["b.txt".to_string()]),
+                false,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let abs = repo.dir.join("b.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None)
+            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative, "absolute form narrows like relative");
@@ -13540,12 +14380,13 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
         let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id, Some(vec![abs]), true, None)
+            .git_diffs(ws_id, Some(vec![abs]), true, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative);
@@ -13564,6 +14405,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["/no/such/root/b.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13600,7 +14442,7 @@ mod file_tracking {
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
-                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None)
+                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None, None)
                     .await
             }
         });
@@ -13613,7 +14455,7 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, Some(vec![abs]), false, None).await }
+            async move { svc.git_diffs(ws, Some(vec![abs]), false, None, None).await }
         });
         // The absolute request normalized onto the relative request's key and
         // joined the in-flight walk as a follower.
@@ -13621,6 +14463,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("absolute request to join as follower", || {
@@ -13670,6 +14513,7 @@ mod file_tracking {
                     Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -13692,6 +14536,7 @@ mod file_tracking {
                     ]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -13702,6 +14547,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("reordered request to join as follower", || {
