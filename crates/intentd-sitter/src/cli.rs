@@ -14,17 +14,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ChannelOrigin, ResolvedChannel};
 
-/// Environment variable selecting the release channel (`stable` | `beta`).
+/// Environment variable selecting the release channel
+/// (`stable` | `beta` | `alpha`).
 pub const CHANNEL_ENV: &str = "INTENTD_CHANNEL";
 
 /// Release channel the sitter tracks. Serialized lowercase to match the
-/// `stable.json` / `beta.json` channel-manifest naming.
+/// `stable.json` / `beta.json` / `alpha.json` channel-manifest naming.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     #[default]
     Stable,
     Beta,
+    Alpha,
 }
 
 impl Channel {
@@ -32,6 +34,7 @@ impl Channel {
         match s {
             "stable" => Ok(Channel::Stable),
             "beta" => Ok(Channel::Beta),
+            "alpha" => Ok(Channel::Alpha),
             other => Err(CliError::InvalidChannel(other.to_string())),
         }
     }
@@ -42,6 +45,7 @@ impl fmt::Display for Channel {
         match self {
             Channel::Stable => f.write_str("stable"),
             Channel::Beta => f.write_str("beta"),
+            Channel::Alpha => f.write_str("alpha"),
         }
     }
 }
@@ -49,22 +53,22 @@ impl fmt::Display for Channel {
 /// Errors from parsing the sitter-owned flag namespace.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CliError {
-    #[error("invalid channel {0:?}: expected \"stable\" or \"beta\"")]
+    #[error("invalid channel {0:?}: expected \"stable\", \"beta\", or \"alpha\"")]
     InvalidChannel(String),
-    #[error("--sitter-channel requires a value (stable|beta)")]
+    #[error("--sitter-channel requires a value (stable|beta|alpha)")]
     MissingChannelValue,
     #[error(
         "unknown sitter flag {0:?} (the sitter owns only --sitter-channel and --sitter-version)"
     )]
     UnknownSitterFlag(String),
     #[error(
-        "missing sitter subcommand: usage: intentd sitter channel [stable|beta] [--redownload]"
+        "missing sitter subcommand: usage: intentd sitter channel [stable|beta|alpha] [--redownload]"
     )]
     MissingSitterSubcommand,
     #[error("unknown sitter subcommand {0:?} (supported sitter subcommands: channel)")]
     UnknownSitterSubcommand(String),
     #[error(
-        "--redownload requires a channel value: intentd sitter channel <stable|beta> --redownload"
+        "--redownload requires a channel value: intentd sitter channel <stable|beta|alpha> --redownload"
     )]
     RedownloadWithoutChannel,
     #[error("unexpected argument {0:?} to `intentd sitter channel`")]
@@ -81,8 +85,8 @@ pub enum CliError {
 /// `--` before it still forwards everything verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SitterCommand {
-    /// `intentd sitter channel [stable|beta] [--redownload]` — get or set
-    /// the persistent channel pin in `<data_dir>/sitter/config.toml`.
+    /// `intentd sitter channel [stable|beta|alpha] [--redownload]` — get or
+    /// set the persistent channel pin in `<data_dir>/sitter/config.toml`.
     Channel {
         /// Channel to pin; `None` is the get form (print the effective
         /// channel and its origin).
@@ -281,6 +285,22 @@ mod tests {
     }
 
     #[test]
+    fn alpha_channel_from_env_and_flag() {
+        assert_eq!(
+            parse(&[], Some("alpha")).unwrap().channel,
+            resolved(Channel::Alpha, ChannelOrigin::Env)
+        );
+        assert_eq!(
+            parse(&["--sitter-channel", "alpha"], None).unwrap().channel,
+            resolved(Channel::Alpha, ChannelOrigin::Flag)
+        );
+        assert_eq!(
+            parse(&["--sitter-channel=alpha"], None).unwrap().channel,
+            resolved(Channel::Alpha, ChannelOrigin::Flag)
+        );
+    }
+
+    #[test]
     fn channel_flag_overrides_env() {
         let args = parse(&["--sitter-channel", "stable"], Some("beta")).unwrap();
         assert_eq!(args.channel, resolved(Channel::Stable, ChannelOrigin::Flag));
@@ -412,6 +432,13 @@ mod tests {
             sitter_cmd(&["sitter", "channel", "beta"]),
             Some(Ok(SitterCommand::Channel {
                 set: Some(Channel::Beta),
+                redownload: false,
+            }))
+        );
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "alpha"]),
+            Some(Ok(SitterCommand::Channel {
+                set: Some(Channel::Alpha),
                 redownload: false,
             }))
         );
@@ -586,10 +613,16 @@ mod tests {
     fn channel_display_and_serde_are_lowercase() {
         assert_eq!(Channel::Stable.to_string(), "stable");
         assert_eq!(Channel::Beta.to_string(), "beta");
+        assert_eq!(Channel::Alpha.to_string(), "alpha");
         assert_eq!(serde_json::to_string(&Channel::Beta).unwrap(), "\"beta\"");
+        assert_eq!(serde_json::to_string(&Channel::Alpha).unwrap(), "\"alpha\"");
         assert_eq!(
             serde_json::from_str::<Channel>("\"stable\"").unwrap(),
             Channel::Stable
+        );
+        assert_eq!(
+            serde_json::from_str::<Channel>("\"alpha\"").unwrap(),
+            Channel::Alpha
         );
     }
 }

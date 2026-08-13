@@ -430,8 +430,8 @@ pub(crate) async fn channel_snapshot(
 /// Materialize the chat channel's seq-0 snapshot: the newest page of
 /// `agent.getConversation` as the `{ agentId, messages, truncated,
 /// totalMessages, nextToken }` OBJECT (CS-0 D3), reused verbatim from the
-/// existing paginated read, then — when a turn is currently streaming —
-/// the in-flight partial assistant message merged in (CS-0 D5) so a
+/// existing paginated read, then — when the live-turn slot holds a message not
+/// yet in that page — its partial assistant message merged in (CS-0 D5) so a
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
@@ -440,11 +440,16 @@ pub(crate) async fn channel_snapshot(
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
 /// Older pages stay client-pulled via `agent.getConversation { nextToken }`.
-/// The merge is gated on [`WorkspaceApi::agent_is_busy`]: a lingering
-/// `agent_live_turn` slot whose worker is gone (mid-turn crash, race between
-/// abort and slot release) MUST NOT surface a phantom "streaming" message
-/// when a client opens the chat. On a read error the snapshot degrades to an
-/// empty messages page rather than failing the subscription (matching
+/// [`WorkspaceApi::agent_is_busy`] decides the merged message's `isStreaming`
+/// flag, NOT whether to merge at all (monorepo#2104): a populated
+/// `agent_live_turn` slot whose worker is gone (mid-turn crash, a flush that
+/// failed with a non-UNIQUE store error and kept the slot as the only copy of
+/// the content) still holds real output the user watched arrive, so it is
+/// served — just never as "streaming". The invariant that survives is the one
+/// that mattered: an orphaned slot MUST NOT surface a phantom *streaming*
+/// message. An EMPTY orphan slot is skipped entirely, so a dead turn that
+/// streamed nothing adds no blank row. On a read error the snapshot degrades to
+/// an empty messages page rather than failing the subscription (matching
 /// [`channel_snapshot`]'s degrade-to-empty pattern).
 ///
 /// **Resume (§7.1).** When `since_message_id` is provided, the same bounded
@@ -476,10 +481,18 @@ pub(crate) async fn chat_snapshot(
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    if api.agent_is_busy(agent_id.clone()) {
-        if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-            merge_live_turn(&mut snapshot, agent_id, &live);
-        }
+    // Read busy BEFORE the slot, never after. The two reads are separate lock
+    // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
+    // stale slot under the busy lock before publishing the claim, which makes
+    // `busy == true` ⇒ "the stale slot is already gone" — but only for a reader
+    // in this order. Reversed, a snapshot could read the PREVIOUS turn's content
+    // and then a freshly-claimed `busy`, and label stale content `isStreaming:
+    // true` — the phantom-streaming state this whole gate exists to prevent. In
+    // this order the residual interleaving is the harmless mirror: the new turn's
+    // content labelled settled, which the next delta or snapshot corrects.
+    let is_streaming = api.agent_is_busy(agent_id.clone());
+    if let Some(live) = api.agent_live_turn(agent_id.clone()) {
+        merge_live_turn(&mut snapshot, agent_id, &live, is_streaming);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -533,13 +546,22 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
     }
 }
 
-/// Append the in-flight assistant message to a chat snapshot's `messages` page
+/// Append the live turn's assistant message to a chat snapshot's `messages` page
 /// (CS-0 D5). Its `seq` is the next monotonic value (`totalMessages`, since seq
-/// is contiguous from 0) and it carries `isStreaming: true` as a render hint the
-/// terminal reconcile clears via `streamingComplete`. Idempotent: if the turn's
-/// message already persisted (id present in the page) it is left untouched, so a
-/// snapshot taken in the window between persist and slot-clear never duplicates.
-fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
+/// is contiguous from 0) and it carries `isStreaming: is_streaming` — `true`
+/// while a worker still holds the turn's busy claim, as a render hint the
+/// terminal reconcile clears via `streamingComplete`; `false` for an orphaned
+/// slot (monorepo#2104), whose content is real but final. Idempotent: if the
+/// turn's message already persisted (id present in the page) it is left
+/// untouched, so a snapshot taken in the window between persist and slot-clear
+/// never duplicates.
+///
+/// An orphaned slot with NO content blocks is skipped: there is nothing to show,
+/// and a dead turn that streamed nothing must not add a blank assistant row. A
+/// still-streaming turn keeps merging empty — a turn that has only just begun
+/// legitimately has no blocks yet, and the client needs the id to reconcile
+/// against.
+fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_streaming: bool) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
     };
@@ -547,6 +569,10 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
         .get("contentBlocks")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let populated = blocks.as_array().is_some_and(|b| !b.is_empty());
+    if !is_streaming && !populated {
+        return;
+    }
     let Some(obj) = snapshot.as_object_mut() else {
         return;
     };
@@ -571,7 +597,7 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
         "role": "assistant",
         "contentBlocks": blocks,
         "timestamp": now_iso(),
-        "isStreaming": true,
+        "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
 }

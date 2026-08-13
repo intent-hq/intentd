@@ -7607,7 +7607,10 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
 /// the result carries `{ plan }` with the versioned manifest (formatVersion,
 /// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
 /// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
-/// never listed; unknown workspace ids map to `-32602 Workspace not found`.
+/// never listed; a repo holding an untracked nested git repo surfaces the
+/// `nested-repos-skipped` warning naming the dir (and no spurious
+/// `uncommitted-changes`); unknown workspace ids map to
+/// `-32602 Workspace not found`.
 #[tokio::test]
 async fn wss_workspace_transfer_plan_round_trip() {
     let srv = start(WsOptions::default()).await;
@@ -7662,11 +7665,81 @@ async fn wss_workspace_transfer_plan_round_trip() {
     );
     assert!(plan["warnings"].is_array(), "{resp}");
 
+    // A git-backed workspace whose repo holds an untracked nested git repo:
+    // the plan's warnings carry the `nested-repos-skipped` code naming the
+    // directory, and the nested dir never shows up in `dirtyFiles`.
+    let repo_dir = test_tempdir("intentd-wss-transfer-nested-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let nested = repo.join(".import-wt");
+    std::fs::create_dir_all(&nested).unwrap();
+    let ok = std::process::Command::new("git")
+        .current_dir(&nested)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .expect("run git")
+        .success();
+    assert!(ok, "nested git init failed");
+    std::fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.create","params":{{"title":"WSS Transfer Nested","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let nested_ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.transfer.plan","params":{{"workspaceId":"{nested_ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let plan = &resp["result"]["plan"];
+    assert_eq!(plan["manifest"]["git"]["hasRepository"], true, "{resp}");
+    assert_eq!(
+        plan["manifest"]["git"]["dirtyFiles"],
+        serde_json::json!([]),
+        "nested repo dir must not appear as a dirty file: {resp}"
+    );
+    let warnings = plan["warnings"].as_array().expect("warnings array");
+    let nested_warn = warnings
+        .iter()
+        .find(|w| w["code"] == "nested-repos-skipped")
+        .unwrap_or_else(|| panic!("nested-repos-skipped warning missing: {resp}"));
+    assert!(
+        nested_warn["message"]
+            .as_str()
+            .expect("message string")
+            .contains(".import-wt"),
+        "warning names the skipped dir: {resp}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w["code"] == "uncommitted-changes"),
+        "nested repo alone is not an uncommitted change: {resp}"
+    );
+
     // Unknown workspace → the standard workspace-not-found mapping.
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
-        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
     )
     .await;
     assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
@@ -7760,6 +7833,48 @@ async fn wss_file_place_attachment_round_trip() {
     );
     let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
     assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
+
+    // `sourcePath` classification over the wire (monorepo#2144): a directory
+    // source is the documented -32602 with the reason in the message, not a
+    // -32603 Internal.
+    let dir_source = root.join("some-dir");
+    std::fs::create_dir_all(&dir_source).expect("mkdir dir source");
+    let frame_dir = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"some-dir","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(dir_source.to_string_lossy())
+    );
+    let resp_dir = wss_call(srv.port, srv.cfg.clone(), &frame_dir).await;
+    assert_eq!(
+        resp_dir["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_dir}"
+    );
+    assert!(
+        resp_dir["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath is a directory")),
+        "{resp_dir}"
+    );
+
+    // A missing source is equally -32602 ("does not exist").
+    let frame_missing = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"gone.txt","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(root.join("gone.txt").to_string_lossy())
+    );
+    let resp_missing = wss_call(srv.port, srv.cfg.clone(), &frame_missing).await;
+    assert_eq!(
+        resp_missing["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_missing}"
+    );
+    assert!(
+        resp_missing["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath does not exist")),
+        "{resp_missing}"
+    );
 
     // `file.getAttachmentInfo` (v6.12) serves the registry row with `exists`.
     let frame4 = format!(

@@ -893,13 +893,17 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
-/// Iter#1c heal-gate regression: a live-turn slot whose worker is gone (mid-turn
-/// crash, or a race between abort and the slot's `LiveTurnGuard` drop) MUST NOT
-/// produce a phantom in-flight "streaming" message in the seq-0 snapshot. The
-/// gate is [`WorkspaceApi::agent_is_busy`]: without a claim, `chat_snapshot`
-/// returns only the durable conversation page.
+/// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
+/// superseding the Iter#1c heal-gate assertion this test used to make (that a
+/// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
+/// encoded was to labelling orphan content "streaming", not to showing it: a
+/// mid-turn crash or a flush that failed and kept the slot leaves real streamed
+/// output in the daemon that no snapshot could otherwise ever show. So the slot
+/// is merged and `agent_is_busy` only decides the flag — over the wire, the
+/// orphan arrives as a NON-streaming message, and the STAB-125 turn-liveness
+/// fields stay gated on the busy claim, so nothing claims a turn is in flight.
 #[tokio::test]
-async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
+async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -939,8 +943,8 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
         .await
         .expect("append user message");
 
-    // A lingering live-turn slot with NO busy claim — the orphan shape this fix
-    // guards against. `chat_snapshot` must NOT merge it.
+    // A lingering live-turn slot with NO busy claim — the orphan shape: real
+    // streamed content the daemon still holds, with nothing coming for it.
     let mid = Uuid::now_v7().to_string();
     services.set_live_turn(
         &agent,
@@ -964,27 +968,41 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(
-        snap["params"]["snapshot"]["totalMessages"], 1,
-        "the orphan live-turn slot must not inflate totalMessages"
+        snap["params"]["snapshot"]["totalMessages"], 2,
+        "the orphan slot's content is served, and counted so seq stays contiguous"
     );
     let messages = snap["params"]["snapshot"]["messages"]
         .as_array()
         .cloned()
         .expect("snapshot messages");
-    assert_eq!(messages.len(), 1, "only the persisted user message");
+    assert_eq!(
+        messages.len(),
+        2,
+        "the user message plus the orphan content"
+    );
     assert_eq!(messages[0]["id"], user_id.as_str());
     assert!(
         messages[0].get("isStreaming").is_none()
             || messages[0]["isStreaming"] == Value::Bool(false),
         "no streaming flag on the durable user message"
     );
+    assert_eq!(messages[1]["id"], mid.as_str());
+    assert_eq!(
+        messages[1]["contentBlocks"][0]["text"], "I'll run ",
+        "…with the streamed-so-far blocks intact: {snap}"
+    );
+    assert_eq!(
+        messages[1]["isStreaming"],
+        Value::Bool(false),
+        "an orphaned slot must never claim to be streaming: {snap}"
+    );
     // STAB-125: the orphan slot must not report a phantom in-flight turn
-    // either — liveness is gated on the busy claim like the merge above.
+    // either — liveness stays gated on the busy claim.
     assert_eq!(snap["params"]["snapshot"]["turnInFlight"], false);
     assert!(snap["params"]["snapshot"]["lastStreamActivityAt"].is_null());
 
-    // Claiming the busy slot now restores the merge: re-subscribing on a fresh
-    // connection sees the in-flight assistant message exactly as before.
+    // Claiming the busy slot flips the SAME merged message to streaming:
+    // re-subscribing on a fresh connection sees it flagged in-flight.
     services.set_test_busy(&agent, true);
     let (sub2_read, mut sub2_write) = connect_retry(&socket).await.into_split();
     let mut sub2_reader = tokio::io::BufReader::new(sub2_read);

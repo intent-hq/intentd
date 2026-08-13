@@ -1117,7 +1117,7 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
         "messageId": "msg-live",
         "contentBlocks": [{ "id": "msg-live:0", "type": "text", "text": "partial" }],
     });
-    merge_live_turn(&mut snapshot, &agent(), &live);
+    merge_live_turn(&mut snapshot, &agent(), &live, true);
     let messages = snapshot["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["id"], "msg-live");
@@ -1126,15 +1126,65 @@ fn merge_live_turn_appends_in_flight_message_idempotently() {
     assert_eq!(messages[0]["role"], "assistant");
     assert_eq!(snapshot["totalMessages"], 1);
     // Idempotent re-merge: same message id already present → no duplicate, no seq bump.
-    merge_live_turn(&mut snapshot, &agent(), &live);
+    merge_live_turn(&mut snapshot, &agent(), &live, true);
     assert_eq!(snapshot["messages"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["totalMessages"], 1);
+}
+
+/// monorepo#2104 — an orphaned (not-busy) slot's content is merged, flagged
+/// `isStreaming: false`: real output, but nothing is coming for it.
+#[test]
+fn merge_live_turn_merges_an_orphan_slot_as_not_streaming() {
+    let mut snapshot = json!({
+        "agentId": "agent-1",
+        "messages": [],
+        "totalMessages": 0,
+    });
+    let live = json!({
+        "messageId": "msg-orphan",
+        "contentBlocks": [{ "id": "msg-orphan:0", "type": "text", "text": "partial" }],
+    });
+    merge_live_turn(&mut snapshot, &agent(), &live, false);
+    let messages = snapshot["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["id"], "msg-orphan");
+    assert_eq!(
+        messages[0]["isStreaming"], false,
+        "an orphaned slot must never claim to be streaming: {snapshot}"
+    );
+    assert_eq!(snapshot["totalMessages"], 1);
+}
+
+/// An orphan with nothing streamed is skipped — no blank assistant row — while a
+/// still-streaming turn that has not produced blocks yet is still merged, so the
+/// client learns the message id to reconcile the terminal event against.
+#[test]
+fn merge_live_turn_skips_an_empty_orphan_but_not_an_empty_live_turn() {
+    let empty = json!({ "messageId": "msg-live", "contentBlocks": [] });
+
+    let mut orphan = json!({ "messages": [], "totalMessages": 0 });
+    merge_live_turn(&mut orphan, &agent(), &empty, false);
+    assert!(
+        orphan["messages"].as_array().unwrap().is_empty(),
+        "an empty orphan slot adds no row: {orphan}"
+    );
+    assert_eq!(orphan["totalMessages"], 0);
+
+    let mut streaming = json!({ "messages": [], "totalMessages": 0 });
+    merge_live_turn(&mut streaming, &agent(), &empty, true);
+    assert_eq!(streaming["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(streaming["messages"][0]["isStreaming"], true);
 }
 
 #[test]
 fn merge_live_turn_noop_when_message_id_missing() {
     let mut snapshot = json!({ "messages": [], "totalMessages": 0 });
-    merge_live_turn(&mut snapshot, &agent(), &json!({ "contentBlocks": [] }));
+    merge_live_turn(
+        &mut snapshot,
+        &agent(),
+        &json!({ "contentBlocks": [] }),
+        true,
+    );
     assert!(snapshot["messages"].as_array().unwrap().is_empty());
     assert_eq!(snapshot["totalMessages"], 0);
 }
@@ -1146,6 +1196,7 @@ fn merge_live_turn_noop_when_snapshot_is_not_object() {
         &mut snapshot,
         &agent(),
         &json!({ "messageId": "m", "contentBlocks": [] }),
+        true,
     );
     assert_eq!(snapshot, json!([]));
 }
@@ -1877,8 +1928,11 @@ mod chat_snapshot_interrupt_window {
 
     /// A genuinely orphaned slot: content is still published but no worker is
     /// in flight (the turn died with no flush behind it, and the busy claim is
-    /// gone). Nothing may be merged from it.
-    struct OrphanSlotApi;
+    /// gone). Its content is real and is served — just never as "streaming".
+    struct OrphanSlotApi {
+        /// `false` for a turn that died before streaming anything.
+        populated: bool,
+    }
 
     impl WorkspaceApi for OrphanSlotApi {
         fn agent_get_conversation(
@@ -1910,10 +1964,121 @@ mod chat_snapshot_interrupt_window {
         }
 
         fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            let blocks = if self.populated {
+                json!([{ "id": "msg-orphan:0", "type": "text", "text": "I'll run " }])
+            } else {
+                json!([])
+            };
             Some(json!({
                 "messageId": "msg-orphan",
+                "contentBlocks": blocks,
+            }))
+        }
+    }
+
+    /// The permanent variant of the same hole: `flush_partial_turn_on_interruption`
+    /// hit a non-UNIQUE store error, so it warned and deliberately KEPT the slot
+    /// as the only copy of the content — then `end_turn` released the busy claim.
+    /// The conversation page never gains the row, and the slot never goes away
+    /// on its own.
+    struct FlushFailureApi {
+        /// `true` once `end_turn` has released the busy claim (post-flush-failure).
+        flush_failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkspaceApi for FlushFailureApi {
+        /// The interrupted assistant row is NEVER written — the store rejected it.
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": "m-0",
+                        "role": "user",
+                        "seq": 0,
+                        "contentBlocks": [{ "id": "m-0:0", "type": "text", "text": "Run the tests" }],
+                    }],
+                    "truncated": false,
+                    "totalMessages": 1,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            !self.flush_failed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Kept forever: on a store error the flush leaves the slot in place
+        /// precisely because it is the only copy of the streamed content.
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            Some(json!({
+                "messageId": "msg-live",
                 "contentBlocks": [
-                    { "id": "msg-orphan:0", "type": "text", "text": "I'll run " }
+                    { "id": "msg-live:0", "type": "text", "text": "I'll run " }
+                ],
+            }))
+        }
+    }
+
+    /// Replays the exact interleaving from the #1161 review: a following turn
+    /// claims `busy` in the instant BETWEEN the snapshot's two reads, while the
+    /// slot still holds the PREVIOUS turn's flush-failure orphan (its worker
+    /// replaces the slot only in `begin_live_turn`, many awaits later).
+    ///
+    /// The claim is modelled as a side effect of the SLOT read: whichever read
+    /// `chat_snapshot` performs first, the claim lands immediately after it. So
+    /// the order is what the assertion actually pins — read the slot first and
+    /// the busy read that follows returns the new turn's claim, labelling the old
+    /// turn's content `isStreaming: true`; read busy first and it cannot be
+    /// influenced by the claim at all.
+    struct ClaimsBusyBetweenReadsApi {
+        busy: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkspaceApi for ClaimsBusyBetweenReadsApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [{
+                        "id": "m-0",
+                        "role": "user",
+                        "seq": 0,
+                        "contentBlocks": [{ "id": "m-0:0", "type": "text", "text": "Run the tests" }],
+                    }],
+                    "truncated": false,
+                    "totalMessages": 1,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            self.busy.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Reading the slot lets the next turn win the claim right afterwards.
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            self.busy.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(json!({
+                "messageId": "msg-previous-turn",
+                "contentBlocks": [
+                    { "id": "msg-previous-turn:0", "type": "text", "text": "I'll run " }
                 ],
             }))
         }
@@ -1993,19 +2158,117 @@ mod chat_snapshot_interrupt_window {
         );
     }
 
-    /// The invariant the pin must not break: a populated slot with no in-flight
-    /// worker behind it (a genuine orphan — the turn died without a flush) is
-    /// still NOT merged, so no phantom streaming message reaches the client.
-    /// `agent_is_busy` remains the gate; the pin only ever widens the window in
-    /// which a busy turn's own content stays published.
+    /// monorepo#2104 — deliberately supersedes #1150's
+    /// `chat_snapshot_never_merges_an_orphaned_slot_from_an_idle_agent`, which
+    /// asserted an orphaned slot is not merged AT ALL. The objection it encoded
+    /// was to labelling orphan content `isStreaming`, not to showing it: a
+    /// crashed or failed-to-flush turn's partial output is real content the user
+    /// watched arrive. So the merge now always happens and `agent_is_busy` only
+    /// decides the flag — the invariant that survives, asserted below, is that an
+    /// orphaned slot never claims to be streaming.
     #[tokio::test]
-    async fn chat_snapshot_never_merges_an_orphaned_slot_from_an_idle_agent() {
-        let snap = chat_snapshot(&OrphanSlotApi, &agent(), None).await;
+    async fn chat_snapshot_serves_an_orphaned_slot_as_a_non_streaming_message() {
+        let snap = chat_snapshot(&OrphanSlotApi { populated: true }, &agent(), None).await;
+        assert_eq!(
+            assistant_ids(&snap),
+            vec!["msg-orphan".to_string()],
+            "an orphan slot's streamed content is real and must be served: {snap}"
+        );
+        assert_eq!(
+            snap["messages"][1]["isStreaming"], false,
+            "…but never as a phantom streaming message: {snap}"
+        );
+        assert_eq!(
+            snap["messages"][1]["contentBlocks"],
+            json!([{ "id": "msg-orphan:0", "type": "text", "text": "I'll run " }]),
+            "…with the streamed-so-far blocks intact: {snap}"
+        );
+        assert_eq!(
+            snap["totalMessages"], 2,
+            "…and counted, so the client's seq stays contiguous: {snap}"
+        );
+    }
+
+    /// The other half of that invariant: an orphaned slot with nothing streamed
+    /// adds no blank assistant row (there is no content to rescue, and an empty
+    /// bubble is strictly worse than nothing).
+    #[tokio::test]
+    async fn chat_snapshot_skips_an_empty_orphaned_slot() {
+        let snap = chat_snapshot(&OrphanSlotApi { populated: false }, &agent(), None).await;
         assert!(
             assistant_ids(&snap).is_empty(),
-            "an idle agent's orphan slot must not surface as a streaming message: {snap}"
+            "an empty orphan slot must not surface at all: {snap}"
         );
         assert_eq!(snap["totalMessages"], 1, "…and does not inflate the count");
+    }
+
+    /// #1161 review, medium: the busy read must come BEFORE the slot read.
+    ///
+    /// Both reads take their own lock, so a following turn can claim `busy`
+    /// between them. In the reversed order the snapshot would pair the previous
+    /// turn's orphaned content with the new turn's claim and serve it as
+    /// `isStreaming: true` — exactly the phantom-streaming state the merge rule
+    /// promises to prevent, and the one case where showing orphan content could
+    /// be worse than hiding it. Reading busy first makes that pairing
+    /// unrepresentable, and `try_begin` clears a stale slot under the busy lock
+    /// before publishing the claim, so `busy == true` implies the stale slot is
+    /// already gone.
+    #[tokio::test]
+    async fn chat_snapshot_reads_busy_before_the_slot_so_a_new_claim_cannot_gild_stale_content() {
+        let api = ClaimsBusyBetweenReadsApi {
+            busy: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let snap = chat_snapshot(&api, &agent(), None).await;
+
+        assert_eq!(
+            assistant_ids(&snap),
+            vec!["msg-previous-turn".to_string()],
+            "the orphaned content is still served: {snap}"
+        );
+        assert_eq!(
+            snap["messages"][1]["isStreaming"], false,
+            "a turn claiming busy after the snapshot's busy read must NOT relabel \
+             the previous turn's content as streaming: {snap}"
+        );
+    }
+
+    /// monorepo#2104, the case that makes this worth changing: the flush hit a
+    /// non-UNIQUE store error, kept the slot as the only copy of the content, and
+    /// `end_turn` then cleared busy. Under the old busy-as-merge-gate the daemon
+    /// held real streamed output that NO snapshot could ever show — permanently,
+    /// not for a millisecond. Now it is visible, as a non-streaming message.
+    #[tokio::test]
+    async fn chat_snapshot_shows_content_the_failed_flush_left_in_the_slot() {
+        let api = FlushFailureApi {
+            flush_failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        // Mid-turn: served from the slot as usual, flagged in-flight.
+        let mid = chat_snapshot(&api, &agent(), None).await;
+        assert_eq!(assistant_ids(&mid), vec!["msg-live".to_string()]);
+        assert_eq!(mid["messages"][1]["isStreaming"], true);
+
+        // The flush failed and `end_turn` released the busy claim. The row is
+        // not in the page and never will be; the slot is the only copy.
+        api.flush_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let after = chat_snapshot(&api, &agent(), None).await;
+        assert_eq!(
+            assistant_ids(&after),
+            vec!["msg-live".to_string()],
+            "content kept in the slot by a failed flush must stay visible: {after}"
+        );
+        assert_eq!(
+            after["messages"][1]["contentBlocks"],
+            json!([{ "id": "msg-live:0", "type": "text", "text": "I'll run " }]),
+            "…with the streamed-so-far blocks intact: {after}"
+        );
+        assert_eq!(
+            after["messages"][1]["isStreaming"], false,
+            "…and not as a phantom streaming message — the turn is over: {after}"
+        );
+        assert_eq!(after["totalMessages"], 2);
     }
 }
 
