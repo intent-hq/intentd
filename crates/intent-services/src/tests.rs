@@ -10923,6 +10923,274 @@ mod pr {
         let ur = svc.github_unresolve_thread("RT1".into()).await.unwrap();
         assert_eq!(ur["isResolved"], false);
     }
+
+    // ------------------------------------------------------------------------
+    // Git-root sweep (monorepo#2053): submodule auto-registration, auto-prune,
+    // and per-root PR refresh against the stubbed forge (no network).
+    // ------------------------------------------------------------------------
+
+    /// Self-cleaning temp git repository whose unborn HEAD points at `branch`
+    /// (`current_branch_at` reads the symbolic target, so no commit is needed).
+    struct SweepRepo {
+        dir: PathBuf,
+    }
+
+    impl SweepRepo {
+        fn init(branch: &str, origin: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = git2::Repository::init(&dir).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            if let Some(url) = origin {
+                repo.remote("origin", url).unwrap();
+            }
+            Self { dir }
+        }
+    }
+
+    impl Drop for SweepRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Bus-wired service plus a seeded workspace whose worktree is `worktree`.
+    /// The bus persists `gitRoot:*` events to the durable log we assert on.
+    async fn sweep_setup(worktree: &std::path::Path) -> (TempDb, Services, intent_core::Workspace) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        (tmp, svc, ws)
+    }
+
+    /// Build an unlinked `WorkspaceGitRoot` row at `dir` (canonicalized, so it
+    /// matches the sweep's path keying).
+    fn sweep_root(
+        ws_id: &WorkspaceId,
+        dir: &std::path::Path,
+        owner_repo: Option<(&str, &str)>,
+    ) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: std::fs::canonicalize(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: owner_repo.map(|(o, _)| o.to_string()),
+            repo_name: owner_repo.map(|(_, n)| n.to_string()),
+            registered_by_agent_ids: vec![],
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// The sweep auto-registers the worktree's initialized submodules as
+    /// `source: "auto"` roots with owner/name detected from `origin`, prunes
+    /// roots whose directory is gone, and is idempotent on re-run.
+    #[tokio::test]
+    async fn sweep_auto_registers_submodules_and_prunes_missing_roots() {
+        let parent = SweepRepo::init("main", None);
+        let sub_dir = parent.dir.join("packages").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub = git2::Repository::init(&sub_dir).unwrap();
+        sub.remote("origin", "https://github.com/o/r.git").unwrap();
+        std::fs::write(
+            parent.dir.join(".gitmodules"),
+            "[submodule \"packages/sub\"]\n\tpath = packages/sub\n\turl = https://github.com/o/r.git\n",
+        )
+        .unwrap();
+
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Seed a root whose directory no longer exists (auto-prune target).
+        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone = sweep_root(&ws.id, &gone_dir, None);
+        svc.store().upsert_workspace_git_root(&gone).await.unwrap();
+        std::fs::remove_dir_all(&gone_dir).unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let root = &roots[0];
+        assert_eq!(root.source, intent_core::WorkspaceGitRootSource::Auto);
+        assert!(root.path.ends_with("sub"), "{}", root.path);
+        assert_eq!(root.repo_owner.as_deref(), Some("o"));
+        assert_eq!(root.repo_name.as_deref(), Some("r"));
+
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].data["gitRoot"]["source"], "auto");
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 1);
+        assert_eq!(unregistered[0].data["gitRootId"], gone.id.as_str());
+
+        // Re-sweeping is idempotent: the tracked submodule is not re-upserted
+        // (no `gitRoot:registered`/`gitRoot:updated` churn).
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 0);
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    /// An unlinked root with a detected repo discovers an open PR by its
+    /// current branch (emitting `gitRoot:updated`); a re-sweep with identical
+    /// forge state is a no-op.
+    #[tokio::test]
+    async fn sweep_links_root_pr_by_branch_discovery() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            discover: true,
+            ..Default::default()
+        });
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
+
+        // Identical forge state on the next sweep: no new event.
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A root without a detected GitHub repo is skipped before any forge call.
+    #[tokio::test]
+    async fn root_refresh_skips_without_detected_repo() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", None);
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, None);
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
+    }
+
+    /// A linked root whose current branch positively mismatches the PR head
+    /// clears the stale link (root analogue of the workspace unlink path).
+    #[tokio::test]
+    async fn root_refresh_unlinks_on_positive_branch_mismatch() {
+        let primary = SweepRepo::init("main", None);
+        // Root repo is on "main"; the linked PR #42's head is "feature".
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, None);
+        assert_eq!(after.pr_url, None);
+        assert_eq!(after.pr_status, None);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A linked PR fetched as merged stays recorded in `pull_requests` and the
+    /// root relinks to a newer open PR on the same branch.
+    #[tokio::test]
+    async fn root_refresh_relinks_after_linked_pr_merges() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            open_pr_number: Some(77),
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(77));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/77")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+        assert!(list.iter().any(|p| p.number == 77));
+    }
 }
 
 /// `file-tracking.*` reads + stage/unstage over the M4.7 `tracked_changes` table

@@ -150,6 +150,45 @@ pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Worktree-relative submodule `path` entries parsed from `.gitmodules`
+/// content (multi git root tracking, monorepo#2053). A tolerant INI-ish
+/// parse: only `path = <value>` lines inside `[submodule "..."]` sections
+/// count, order is preserved, duplicates are dropped, and unsafe values
+/// (empty, absolute, containing `..`) are skipped — the background sweep
+/// joins these against the worktree root, so a hostile `.gitmodules` must
+/// never escape it.
+pub(crate) fn parse_gitmodules_paths(content: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_submodule_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_submodule_section = line.starts_with("[submodule");
+            continue;
+        }
+        if !in_submodule_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "path" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty()
+            || value.starts_with('/')
+            || value.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            continue;
+        }
+        if !paths.iter().any(|p| p == value) {
+            paths.push(value.to_string());
+        }
+    }
+    paths
+}
+
 /// Normalize `git.diffs` `paths` entries against the worktree root
 /// (defense-in-depth, mirroring `git.showFile`'s absolute→relative
 /// conversion): an entry under `<worktree>/` is stripped to its
@@ -683,6 +722,40 @@ fn line_to_value(l: &intent_git::diff::DiffLine) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_gitmodules_paths_extracts_submodule_paths() {
+        let content = "[submodule \"packages/intentd\"]\n\
+             \tpath = packages/intentd\n\
+             \turl = https://github.com/intent-hq/intentd.git\n\
+             [submodule \"packages/fe\"]\n\
+             \tpath = packages/fe\n\
+             \turl = git@github.com:intent-hq/cloudlands-fe.git\n\
+             \tupdate = none\n";
+        assert_eq!(
+            parse_gitmodules_paths(content),
+            vec!["packages/intentd".to_string(), "packages/fe".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_gitmodules_paths_skips_unsafe_and_foreign_entries() {
+        // `path` keys outside a submodule section, absolute paths, traversal
+        // segments, empty values, and duplicates are all dropped.
+        let content = "[core]\n\
+             \tpath = not-a-submodule\n\
+             [submodule \"a\"]\n\
+             \tpath = /abs/path\n\
+             [submodule \"b\"]\n\
+             \tpath = ../escape\n\
+             [submodule \"c\"]\n\
+             \tpath =\n\
+             [submodule \"d\"]\n\
+             \tpath = sub\n\
+             [submodule \"e\"]\n\
+             \tpath = sub\n";
+        assert_eq!(parse_gitmodules_paths(content), vec!["sub".to_string()]);
+    }
 
     #[test]
     fn normalize_diff_paths_strips_absolute_entries_under_the_worktree() {

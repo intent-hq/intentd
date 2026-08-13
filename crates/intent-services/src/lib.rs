@@ -2613,6 +2613,283 @@ impl Services {
         Ok(())
     }
 
+    /// Sweep one workspace's tracked git roots (monorepo#2053), run by the
+    /// background PR-refresh loop after the workspace's own PR refresh:
+    /// 1. auto-detect the worktree's initialized git submodules (`.gitmodules`
+    ///    entries with a nested `.git`) and register them as `source: "auto"`
+    ///    roots — idempotent: already-tracked paths are left untouched, and a
+    ///    root removed via `ws.git.unregisterRoot` is re-added by the scan
+    ///    while the submodule exists on disk;
+    /// 2. auto-prune roots whose path no longer exists on disk (emitting
+    ///    `gitRoot:unregistered` via [`Services::unregister_git_root`]);
+    /// 3. refresh each remaining root's PR linkage by its current branch
+    ///    against its detected repo ([`Services::refresh_git_root_pr`]).
+    ///
+    /// Fail-soft per root: every per-root error is logged and never aborts
+    /// the sweep, so a bad root never fails the workspace refresh. Each
+    /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
+    /// like the workspace refresh itself.
+    async fn sweep_workspace_git_roots(
+        &self,
+        ws: &Workspace,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) {
+        if ws.is_remote || ws.archived {
+            return;
+        }
+        if let Some(worktree) = git_ops::worktree_path(ws) {
+            let gitmodules = tokio::fs::read_to_string(worktree.join(".gitmodules"))
+                .await
+                .unwrap_or_default();
+            let primary = tokio::fs::canonicalize(&worktree).await.ok();
+            for rel in git_ops::parse_gitmodules_paths(&gitmodules) {
+                let Ok(canonical) = tokio::fs::canonicalize(worktree.join(&rel)).await else {
+                    continue;
+                };
+                // Only initialized submodules (a nested `.git` entry) are
+                // registrable roots; the primary root stays implicit.
+                if !canonical.join(".git").exists() || primary.as_ref() == Some(&canonical) {
+                    continue;
+                }
+                let path = canonical.to_string_lossy().into_owned();
+                match self
+                    .store
+                    .find_workspace_git_root_by_path(&ws.id, &path)
+                    .await
+                {
+                    // Already tracked — no churn (a re-register upsert would
+                    // emit `gitRoot:updated` on every sweep).
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "git root sweep: root lookup failed"
+                        );
+                        continue;
+                    }
+                }
+                // Best-effort repo detection, mirroring `ws.git.registerRoot`;
+                // non-GitHub remotes leave owner/name unset.
+                let (repo_owner, repo_name) = intent_git::remote::origin_url(&canonical)
+                    .ok()
+                    .flatten()
+                    .and_then(|url| Self::parse_github_owner_repo(&url))
+                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                let ts = now_iso();
+                let root = intent_core::WorkspaceGitRoot {
+                    id: WorkspaceGitRootId::new(),
+                    workspace_id: ws.id.clone(),
+                    path,
+                    source: intent_core::WorkspaceGitRootSource::Auto,
+                    repo_owner,
+                    repo_name,
+                    registered_by_agent_ids: vec![],
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    pull_requests: None,
+                    created_at: ts.clone(),
+                    updated_at: ts,
+                };
+                if let Err(e) = self.register_git_root(&root).await {
+                    tracing::warn!(
+                        workspace = %ws.id.as_str(),
+                        path = %root.path,
+                        error = %e,
+                        "git root sweep: submodule auto-register failed"
+                    );
+                }
+            }
+        }
+        let roots = match self.store.list_workspace_git_roots(&ws.id).await {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    error = %e,
+                    "git root sweep: listing roots failed"
+                );
+                return;
+            }
+        };
+        for root in roots {
+            if tokio::fs::metadata(&root.path).await.is_err() {
+                if let Err(e) = self.unregister_git_root(&root.id).await {
+                    tracing::warn!(
+                        workspace = %ws.id.as_str(),
+                        git_root = %root.id.as_str(),
+                        error = %e,
+                        "git root sweep: auto-prune failed"
+                    );
+                }
+                continue;
+            }
+            let root_id = root.id.clone();
+            let refreshed = match tokio::time::timeout(
+                self.pr_refresh_fetch_timeout,
+                self.refresh_git_root_pr(root, sc),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::Internal(format!(
+                    "git root PR refresh timed out after {:?}",
+                    self.pr_refresh_fetch_timeout
+                ))),
+            };
+            if let Err(e) = refreshed {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    git_root = %root_id.as_str(),
+                    error = %e,
+                    "git root sweep: root refresh failed"
+                );
+            }
+        }
+    }
+
+    /// Refresh one tracked git root's PR linkage against the forge
+    /// (monorepo#2053) — the per-root analogue of
+    /// [`Services::refresh_workspace_pr_with_sc`], keyed by the root's
+    /// live-read current branch (roots have no `baseRef`). Roots without a
+    /// detected GitHub repo are skipped before any forge call — they stay
+    /// listed for changes browsing. Same semantics as the workspace flow
+    /// otherwise: a linked PR is re-fetched and its snapshot diffed
+    /// (unlinking only on a positive branch mismatch), a linked PR fetched
+    /// as merged/closed stays recorded in `pull_requests` and triggers
+    /// discovery of a newer open PR on the same branch, and an unlinked
+    /// root discovers an open PR by branch. Persists via the scoped
+    /// `update_workspace_git_root_pr` and emits `gitRoot:updated` only on
+    /// change.
+    async fn refresh_git_root_pr(
+        &self,
+        mut root: intent_core::WorkspaceGitRoot,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        use pr_ops::PrRefreshOutcome;
+        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+            return Ok(PrRefreshOutcome::Skipped);
+        };
+        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
+        let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path))
+            .unwrap_or_default();
+        match root.pr_number {
+            Some(number) => {
+                let pr = sc
+                    .get_pr(&repo_ref, number)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+                // Clear a stale link only on a positive mismatch against the
+                // root's current branch; an unreadable HEAD (empty branch)
+                // never unlinks.
+                if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                    root.pr_number = None;
+                    root.pr_url = None;
+                    root.pr_status = None;
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        &self.event_bus,
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    return Ok(PrRefreshOutcome::Unlinked);
+                }
+                let info = pr_ops::build_pr_info(&pr);
+                let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                // A merged/closed linked PR stays recorded in `pull_requests`
+                // but no longer blocks discovery: relink to a newer open PR on
+                // the same branch. A discovery failure degrades to the plain
+                // update path below so the status delta is never lost.
+                if matches!(
+                    info.status,
+                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+                ) && !branch.is_empty()
+                {
+                    let discovered = match pr_ops::discover_matching_open_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &branch,
+                        None,
+                        Some(number),
+                    )
+                    .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            tracing::warn!(
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root refresh: relink discovery failed, persisting status only"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(open_pr) = discovered {
+                        let open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        root.pr_number = Some(open_pr.number);
+                        root.pr_url = Some(open_pr.url.clone());
+                        root.pr_status = Some(open_info.status);
+                        root.updated_at = now_iso();
+                        self.store.update_workspace_git_root_pr(&root).await?;
+                        publish_event(
+                            &self.event_bus,
+                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                        )
+                        .await;
+                        return Ok(PrRefreshOutcome::Linked);
+                    }
+                }
+                let changed = list_changed
+                    || root.pr_status != Some(info.status)
+                    || root.pr_url.as_deref() != Some(pr.url.as_str());
+                if !changed {
+                    return Ok(PrRefreshOutcome::Unchanged);
+                }
+                root.pr_status = Some(info.status);
+                root.pr_url = Some(pr.url.clone());
+                root.updated_at = now_iso();
+                self.store.update_workspace_git_root_pr(&root).await?;
+                publish_event(
+                    &self.event_bus,
+                    git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                )
+                .await;
+                Ok(PrRefreshOutcome::Updated)
+            }
+            None => {
+                if branch.is_empty() {
+                    return Ok(PrRefreshOutcome::Skipped);
+                }
+                let found =
+                    pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                match found {
+                    Some(pr) => {
+                        let info = pr_ops::build_pr_info(&pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                        root.pr_number = Some(pr.number);
+                        root.pr_url = Some(pr.url.clone());
+                        root.pr_status = Some(info.status);
+                        root.updated_at = now_iso();
+                        self.store.update_workspace_git_root_pr(&root).await?;
+                        publish_event(
+                            &self.event_bus,
+                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                        )
+                        .await;
+                        Ok(PrRefreshOutcome::Linked)
+                    }
+                    None => Ok(PrRefreshOutcome::Unchanged),
+                }
+            }
+        }
+    }
+
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
     /// any change and emitting the matching `pr:*` event. Used both on demand
     /// and by the background loop. The matching rule is `pr.head.ref ==
@@ -2866,7 +3143,7 @@ impl Services {
             // of wedging the sweep for every other workspace.
             let refreshed = match tokio::time::timeout(
                 self.pr_refresh_fetch_timeout,
-                self.refresh_workspace_pr_with_sc(ws, &sc),
+                self.refresh_workspace_pr_with_sc(ws.clone(), &sc),
             )
             .await
             {
@@ -2883,6 +3160,10 @@ impl Services {
                     "pr refresh: workspace refresh failed"
                 );
             }
+            // After the workspace's own refresh, sweep its tracked git roots
+            // (submodule auto-detect, auto-prune, per-root PR refresh;
+            // monorepo#2053). Fail-soft internally, per-root timeouts inside.
+            self.sweep_workspace_git_roots(&ws, &sc).await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
