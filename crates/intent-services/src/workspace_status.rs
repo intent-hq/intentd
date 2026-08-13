@@ -276,15 +276,16 @@ impl Services {
     ///   dismissed, so a question the user walked away from keeps the
     ///   workspace flagged across the agent's later turns and daemon
     ///   restarts), or the workspace `attention` flag at `review_required`.
-    /// - `unread` — the workspace `attention` flag at `unread`.
     ///
+    /// The `unread` workspace attention flag never feeds the signals — it
+    /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
     /// the parent/subscriber (attention-retire taxonomy). The cheap metadata
     /// checks run over every candidate first, so the per-session hold reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
     /// (and `question_hold_active` fails open itself) so list/get emission
-    /// is never wedged; the flag-derived signals need no store read.
+    /// is never wedged; the flag-derived signal needs no store read.
     pub(crate) async fn workspace_attention_signals(
         &self,
         workspace_id: &WorkspaceId,
@@ -292,7 +293,6 @@ impl Services {
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
-            unread: attention == WorkspaceAttention::Unread,
             ..AttentionSignals::default()
         };
         let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
@@ -331,7 +331,7 @@ impl Services {
 /// Attention-axis inputs to [`compute_display_status`], probed by
 /// [`Services::workspace_attention_signals`]. Each field is one canonical
 /// precedence rung (§6.5): `failed` > `blocked` > `needs_attention` >
-/// (running agent) > `unread` > the PR/task rollup.
+/// (running agent) > the PR/task rollup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AttentionSignals {
     /// A top-level non-background agent is parked in `error`.
@@ -341,9 +341,6 @@ pub(crate) struct AttentionSignals {
     /// A top-level pending `discussion` request, pending structured
     /// questions, or the `review_required` workspace attention flag.
     pub(crate) needs_attention: bool,
-    /// The `unread` workspace attention flag; promotes only over the
-    /// idle/terminal bases (`idle` / `complete` / `pr_merged`).
-    pub(crate) unread: bool,
 }
 
 /// Derive a workspace's `displayStatus` (canonical precedence, spec
@@ -378,12 +375,11 @@ pub(crate) struct AttentionSignals {
 /// 8. Without a running agent, a task-stage rollup (`in_progress` /
 ///    `not_started` from steps 5/7) demotes to `idle`; the PR stages and
 ///    `complete` pass through unchanged.
-/// 9. `unread` promotes an idle/terminal base — `idle` (including the
-///    demoted task stages), `complete`, or `pr_merged` — to `unread`; it
-///    never masks the active PR stages (`pr_ready`/`pr_open`).
 ///
-/// A merged PR in history never masks an open PR (step 4 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 5 precedes the merged check).
+/// The dismissible `unread` workspace attention flag (§9.9) never feeds the
+/// derivation. A merged PR in history never masks an open PR (step 4 scans
+/// `pullRequests` for open/draft entries) or open tasks (step 5 precedes
+/// the merged check).
 fn compute_display_status(
     signals: AttentionSignals,
     agent_running: bool,
@@ -404,23 +400,12 @@ fn compute_display_status(
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
-    let base = match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
         WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
             WorkspaceDisplayStatus::Idle
         }
         other => other,
-    };
-    if signals.unread
-        && matches!(
-            base,
-            WorkspaceDisplayStatus::Idle
-                | WorkspaceDisplayStatus::Complete
-                | WorkspaceDisplayStatus::PrMerged
-        )
-    {
-        return WorkspaceDisplayStatus::Unread;
     }
-    base
 }
 
 /// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
@@ -510,8 +495,7 @@ fn display_status_changed_event(
 
 /// Unit tests for the pure `compute_display_status` derivation (canonical
 /// precedence): failed → blocked → needs_attention → running agent →
-/// (unread over idle/terminal bases) → active/latest open PR → open tasks →
-/// merged PR → complete/not_started.
+/// active/latest open PR → open tasks → merged PR → complete/not_started.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
@@ -538,13 +522,6 @@ mod display_status {
     fn blocked() -> AttentionSignals {
         AttentionSignals {
             blocked: true,
-            ..AttentionSignals::default()
-        }
-    }
-
-    fn unread() -> AttentionSignals {
-        AttentionSignals {
-            unread: true,
             ..AttentionSignals::default()
         }
     }
@@ -717,8 +694,8 @@ mod display_status {
 
     #[test]
     fn failed_and_blocked_win_over_everything_below() {
-        // failed/blocked outrank a running agent, every PR stage, every task
-        // rollup, and the unread flag.
+        // failed/blocked outrank a running agent, every PR stage, and every
+        // task rollup.
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         for (signals, expected) in [
@@ -737,98 +714,19 @@ mod display_status {
                 compute_display_status(signals, false, None, &[], None, Some(&stats(3, 3, 0))),
                 expected
             );
-            let with_unread = AttentionSignals {
-                unread: true,
-                ..signals
-            };
-            assert_eq!(
-                compute_display_status(with_unread, false, None, &[], None, None),
-                expected
-            );
         }
     }
 
     #[test]
-    fn needs_attention_outranks_running_agent_and_unread() {
-        // Precedence boundary: needs_attention > in_progress (running agent)
-        // and needs_attention > unread.
-        let both = AttentionSignals {
-            needs_attention: true,
-            unread: true,
-            ..AttentionSignals::default()
-        };
+    fn needs_attention_outranks_running_agent() {
+        // Precedence boundary: needs_attention > in_progress (running agent).
         assert_eq!(
-            compute_display_status(both, true, None, &[], None, None),
+            compute_display_status(sig(true), true, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
         );
         assert_eq!(
-            compute_display_status(both, false, None, &[], None, None),
+            compute_display_status(sig(true), false, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn running_agent_outranks_unread() {
-        // Precedence boundary: in_progress > unread — a live agent masks the
-        // unread flag (active work, nothing "unseen" to surface yet).
-        assert_eq!(
-            compute_display_status(unread(), true, None, &[], None, None),
-            WorkspaceDisplayStatus::InProgress
-        );
-        assert_eq!(
-            compute_display_status(unread(), true, None, &[], None, Some(&stats(3, 3, 0))),
-            WorkspaceDisplayStatus::InProgress
-        );
-    }
-
-    #[test]
-    fn unread_promotes_only_idle_and_terminal_bases() {
-        // unread promotes idle (no PR/tasks), the demoted task stages,
-        // complete, and pr_merged.
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, None),
-            WorkspaceDisplayStatus::Unread
-        );
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 1, 1))),
-            WorkspaceDisplayStatus::Unread
-        );
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 3, 0))),
-            WorkspaceDisplayStatus::Unread
-        );
-        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&merged), &[], None, None),
-            WorkspaceDisplayStatus::Unread
-        );
-    }
-
-    #[test]
-    fn unread_never_masks_active_pr_stages() {
-        // unread does NOT promote over pr_open / pr_ready — an active PR
-        // stage is actionable state that outranks the blue dot.
-        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&open), &[], None, None),
-            WorkspaceDisplayStatus::PrOpen
-        );
-        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
-        ready.mergeable = Some(true);
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&ready), &[], None, None),
-            WorkspaceDisplayStatus::PrReady
-        );
-        assert_eq!(
-            compute_display_status(
-                unread(),
-                false,
-                None,
-                &[],
-                Some(PullRequestStatus::Open),
-                None
-            ),
-            WorkspaceDisplayStatus::PrOpen
         );
     }
 
@@ -1159,8 +1057,8 @@ mod display_status {
 /// parent, not background, not deleted) carries a pending discussion request
 /// or pending structured questions (or the workspace flag is
 /// `review_required`); `blocked` iff one carries a pending blocker request;
-/// `failed` iff one is parked in `error`; `unread` mirrors the workspace
-/// flag. Child/background/deleted sessions never count.
+/// `failed` iff one is parked in `error`. The `unread` workspace flag never
+/// feeds the signals. Child/background/deleted sessions never count.
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
@@ -1297,19 +1195,18 @@ mod workspace_needs_attention {
 
     #[tokio::test]
     async fn workspace_attention_flag_maps_to_axes() {
-        // review_required → needs_attention; unread → unread. Both are
-        // flag-only signals: no sessions required.
+        // review_required → needs_attention (flag-only signal: no sessions
+        // required); unread feeds nothing — the flag is not a displayStatus
+        // axis.
         let (svc, ws, _tmp) = setup().await;
         let s = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
             .await;
         assert!(s.needs_attention);
-        assert!(!s.unread);
         let s = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
             .await;
-        assert!(s.unread);
-        assert!(!s.needs_attention);
+        assert_eq!(s, AttentionSignals::default());
     }
 
     #[tokio::test]
@@ -1413,9 +1310,12 @@ mod workspace_needs_attention {
             .expect("drop agent_session table");
         assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
         let s = svc
-            .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
+            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
             .await;
-        assert!(s.unread, "flag-derived axes survive a store read failure");
+        assert!(
+            s.needs_attention,
+            "flag-derived axes survive a store read failure"
+        );
     }
 }
 
@@ -2527,38 +2427,47 @@ mod display_status_events {
         );
     }
 
-    /// Unread flag triggers (§6.5 step 9): `raise_attention(Unread)` (the
-    /// turn-end blue dot) promotes an idle base to `unread` and emits;
-    /// `workspace.markSeen` retires the flag and emits the demotion.
+    /// Regression: the `unread` flag is not a displayStatus axis. A turn-end
+    /// `raise_attention(Unread)` on an idle workspace and the later
+    /// `workspace.markSeen` both leave the derived rollup at `idle` — no
+    /// `workspace:displayStatus-changed` — while the flag's own
+    /// `workspace:attention-changed` events still fire on raise and clear.
     #[tokio::test]
-    async fn unread_raise_and_mark_seen_transitions_emit() {
+    async fn unread_raise_and_mark_seen_never_move_display_status() {
         let h = harness().await;
         // Seed: idle baseline (no agents, no PR, no tasks).
         h.services.maybe_emit_display_status_changed(&h.ws).await;
 
         let mut sub = subscribe(&h);
+        let mut attn_sub = h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        });
         h.services
             .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
             .await
             .expect("raise unread");
-        let ev = recv_one(&mut sub).await;
-        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_silent(&mut sub).await;
+        let ev = recv_one(&mut attn_sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "unread" })
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
         );
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
-        let ev = recv_one(&mut sub).await;
+        assert_silent(&mut sub).await;
+        let ev = recv_one(&mut attn_sub).await;
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
         );
     }
 
-    /// Unread never masks a running agent: raising the flag while the
-    /// workspace is `in_progress` recomputes to the same `in_progress`
-    /// (no transition, no event).
+    /// Raising the unread flag while the workspace is `in_progress` also
+    /// stays silent — the flag feeds no displayStatus axis regardless of
+    /// the base state.
     #[tokio::test]
     async fn unread_raise_during_active_run_stays_silent() {
         let h = harness().await;
@@ -2574,11 +2483,39 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
+    /// Regression: a terminal `complete` base with the unread flag raised
+    /// serves `displayStatus: complete` — the turn-end blue dot never masks
+    /// the real terminal state (raise and markSeen both stay silent).
+    #[tokio::test]
+    async fn unread_flag_never_masks_complete() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert task");
+        // Seed: complete baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert_silent(&mut sub).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
+        h.services.enrich_display_status(&mut ws).await;
+        assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
+
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+    }
+
     /// Regression (intentd#945 review): the turn-end `raise_attention(Unread)`
     /// never downgrades a persistent `review_required` flag — the raise is a
-    /// guarded no-op (no `attention-changed`, no `needs_attention → unread`
-    /// demotion), and a later `workspace.markSeen` (guarded on `unread`)
-    /// leaves the review-required attention in place.
+    /// guarded no-op (no `attention-changed`), and a later
+    /// `workspace.markSeen` (guarded on `unread`) leaves the review-required
+    /// attention in place.
     #[tokio::test]
     async fn unread_raise_never_downgrades_review_required() {
         let h = harness().await;

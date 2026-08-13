@@ -3207,6 +3207,36 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "file.attachmentUpload.begin" => {
+            let ws = require_ws_note(params)?;
+            let file_name = require_str_param(params, "fileName")?;
+            let size_bytes = require_u64(params, "sizeBytes")?;
+            let sha256 = require_str_param(params, "sha256")?;
+            let mime_type = opt_str(params, "mimeType");
+            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.chunk" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.file_attachment_upload_chunk(upload_id, seq, data)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.commit" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_commit(upload_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.abort" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_abort(upload_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "primitive.addReference" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
