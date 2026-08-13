@@ -2872,9 +2872,11 @@ impl Services {
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
         // child-only sweep would leak (deleted_parent, child) entries for the
-        // daemon's lifetime.
+        // daemon's lifetime. The streaming path's terminal-error stash
+        // (monorepo#2050) is dropped on the same terms.
         self.clear_failure_streak(&agent_id);
         self.clear_failure_wake_dedup_all_roles(&agent_id);
+        self.discard_pending_terminal_error(&agent_id);
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;

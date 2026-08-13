@@ -3672,6 +3672,20 @@ impl Services {
             .remove(agent_id)
     }
 
+    /// Drop any stashed terminal-error context for `agent_id` WITHOUT
+    /// consuming it. Teardown paths that abort the turn worker (stop,
+    /// interrupt, retry, delete) can land between the streaming path's stash
+    /// and the terminal-failure handler's take; the orphaned entry would
+    /// otherwise survive and mis-describe a LATER failure (its streak /
+    /// stop_reason belong to the aborted turn), so every worker-abort path
+    /// discards the slot alongside its other per-turn flags.
+    pub(crate) fn discard_pending_terminal_error(&self, agent_id: &AgentId) {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
+            .remove(agent_id);
+    }
+
     /// The consecutive-identical-terminal-failure count for `agent_id` (0 when
     /// no streak is recorded).
     fn failure_streak_count(&self, agent_id: &AgentId) -> u32 {

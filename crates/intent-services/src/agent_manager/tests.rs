@@ -3661,6 +3661,77 @@ async fn terminal_failure_persists_error_before_publishing_events() {
     );
 }
 
+/// Teardown paths that abort the turn worker can land between the streaming
+/// path's terminal-error stash and the terminal-failure handler's take
+/// (monorepo#2050): the orphaned entry describes the aborted turn, so a LATER
+/// failure must not consume it (its streak / stop_reason would mis-describe
+/// the new failure). Every worker-abort path — stop/detach, interrupt, retry,
+/// delete — must discard the slot.
+#[tokio::test]
+async fn worker_abort_paths_discard_stale_pending_terminal_error() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-stale-stash"),
+        AgentId::from("a-stale-stash"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let stash = |services: &crate::Services| {
+        let (services, id, ws) = (services.clone(), id.clone(), ws.clone());
+        async move {
+            let persist = super::persist_terminal_error_status_via_services(
+                &services,
+                &id,
+                &ws,
+                "session/prompt failed: aborted turn",
+            )
+            .await;
+            services.stash_pending_terminal_error(&id, persist);
+        }
+    };
+
+    // stop() → detach: discards the stash.
+    stash(&mgr.services).await;
+    mgr.stop(&id).await;
+    assert!(
+        mgr.services.take_pending_terminal_error(&id).is_none(),
+        "stop discards a stale pending terminal error"
+    );
+
+    // interrupt() (keep-alive; no handle → falls back through the stop arm,
+    // and the live-handle path discards at the worker abort): discards.
+    stash(&mgr.services).await;
+    mgr.interrupt(&id).await;
+    assert!(
+        mgr.services.take_pending_terminal_error(&id).is_none(),
+        "interrupt discards a stale pending terminal error"
+    );
+
+    // agent.retry (the clean-slate escape hatch): discards alongside the
+    // failure streak. Park the session in Error first so retry proceeds.
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("session/prompt failed: aborted turn".into())),
+        )
+        .await
+        .expect("park in error");
+    stash(&mgr.services).await;
+    mgr.agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry");
+    assert!(
+        mgr.services.take_pending_terminal_error(&id).is_none(),
+        "retry discards a stale pending terminal error"
+    );
+}
+
 /// Wire surface (monorepo#1022): the drain loop's `agent:queue:processing`
 /// names the entry being flipped to in-flight, including its `turnId` — the
 /// drain-start signal that covers `persisted: true` redrives which skip the

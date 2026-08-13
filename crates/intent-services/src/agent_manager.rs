@@ -3225,6 +3225,12 @@ impl AgentManager {
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
+        // Same staleness terms for the streaming path's persisted terminal-
+        // error stash (monorepo#2050): the abort above may have landed between
+        // `run_prompt_turn`'s stash and the terminal-failure handler's take,
+        // and the orphaned context describes the aborted turn, not a future
+        // failure.
+        self.services.discard_pending_terminal_error(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -3334,6 +3340,11 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
+        // The abort may have landed between the streaming path's terminal-
+        // error stash and the handler's take (monorepo#2050); the orphaned
+        // context describes the aborted turn, so it must not survive into a
+        // later failure's settle.
+        self.services.discard_pending_terminal_error(agent_id);
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row, stamped with the interruption reason (+ sender
         // attribution on preemption). Runs AFTER the abort (a worker append
@@ -5616,10 +5627,14 @@ impl AgentManager {
         self.persist_retry_status(&agent_id, workspace_id, next_status)
             .await?;
 
-        // Abort any in-flight worker task and release the in-flight slot
+        // Abort any in-flight worker task and release the in-flight slot.
+        // Any terminal-error context the aborted worker's streaming path
+        // stashed (monorepo#2050) is stale on the same terms as the streak
+        // cleared above — retry is the clean-slate escape hatch.
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
             worker.abort();
         }
+        self.services.discard_pending_terminal_error(&agent_id);
         self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
