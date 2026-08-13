@@ -15,7 +15,7 @@
 use serde_json::{json, Map, Value};
 
 /// Reasoning effort levels used by codex model variants.
-const CODEX_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /// Codex base models known to support reasoning effort even when an adapter
 /// reports only the unsuffixed base row. Expanded catalogs are detected and
@@ -196,6 +196,7 @@ fn codex_effort(value: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|effort| value.eq_ignore_ascii_case(effort))
+        .or_else(|| value.eq_ignore_ascii_case("none").then_some("none"))
 }
 
 fn strip_parenthesized_effort(value: &str) -> (String, Option<&'static str>) {
@@ -221,6 +222,19 @@ fn strip_codex_id_effort(
     id: &str,
     name_effort: Option<&'static str>,
 ) -> (String, Option<&'static str>) {
+    if let Some(open) = id.rfind('[') {
+        if let Some(level) = id
+            .strip_suffix(']')
+            .and_then(|without_close| without_close.get(open + 1..))
+            .and_then(codex_effort)
+        {
+            let base = id[..open].trim_end();
+            if !base.is_empty() {
+                return (base.to_string(), Some(level));
+            }
+        }
+    }
+
     let (base, parenthesized) = strip_parenthesized_effort(id);
     if parenthesized.is_some() {
         return (base, parenthesized);
@@ -288,8 +302,8 @@ pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
 }
 
 /// Codex variant of [`parse_acp_models`]: adapter-expanded effort variants are
-/// grouped into one base row. Adapter-advertised levels take precedence over
-/// levels inferred from variant ids/names, followed by the known-model fallback.
+/// grouped into one base row. Adapter-advertised levels are merged with levels
+/// inferred from variant ids/names, followed by the known-model fallback.
 pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
@@ -337,18 +351,26 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
     groups
         .into_iter()
         .map(|group| {
-            let levels = if !group.adapter_levels.is_empty() {
-                Some(group.adapter_levels)
-            } else if !group.inferred_levels.is_empty() {
-                Some(
-                    CODEX_EFFORTS
-                        .iter()
-                        .filter(|effort| {
-                            group.inferred_levels.iter().any(|level| level == **effort)
-                        })
-                        .map(|effort| effort.to_string())
-                        .collect(),
-                )
+            let levels = if !group.adapter_levels.is_empty() || !group.inferred_levels.is_empty() {
+                let mut levels: Vec<String> = CODEX_EFFORTS
+                    .iter()
+                    .filter(|effort| {
+                        group
+                            .adapter_levels
+                            .iter()
+                            .chain(&group.inferred_levels)
+                            .any(|level| level.eq_ignore_ascii_case(effort))
+                    })
+                    .map(|effort| effort.to_string())
+                    .collect();
+                push_unique(
+                    &mut levels,
+                    group
+                        .adapter_levels
+                        .into_iter()
+                        .filter(|level| codex_effort(level).is_none()),
+                );
+                (!levels.is_empty()).then_some(levels)
             } else {
                 CODEX_EFFORT_VARIANT_MODELS
                     .contains(&group.id.as_str())
