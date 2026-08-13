@@ -6223,6 +6223,26 @@ pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     }
 }
 
+/// True when `repo_path` is a daemon-provisioned (workspace-owned) checkout
+/// that must stay OUT of the `known_repo` registry
+/// (intent-hq/monorepo#2227): either the workspace's `repository_path` IS its
+/// checkout (standalone clone / cache hydration, where
+/// `repository_path == worktree_path`), or the path lives under one of the
+/// daemon's workspace roots (covers `ws.path` fallbacks, worktree-less rows,
+/// and leftovers from deleted workspaces). Genuine user repos live outside
+/// the roots and are never their own checkout.
+fn is_workspace_owned_checkout(
+    repo_path: &str,
+    worktree_path: Option<&str>,
+    workspaces_roots: &[PathBuf],
+) -> bool {
+    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path) {
+        return true;
+    }
+    let path = Path::new(repo_path);
+    workspaces_roots.iter().any(|root| path.starts_with(root))
+}
+
 /// Derive a repository display name from a local `repositoryPath` basename,
 /// mirroring the `known_repo_name` fallback — but returning `None` instead of
 /// an `"Unknown"` placeholder when the path has no usable basename, so an
@@ -7051,21 +7071,47 @@ mod orphan_trash_sweep_tests {
 }
 
 /// Upsert into the registry every workspace that carries a `repository_path`
-/// (TS `repo.list` one-time sync). Best-effort: callers ignore the result so a
+/// (TS `repo.list` one-time sync), skipping workspace-owned checkouts
+/// ([`is_workspace_owned_checkout`]) — then sweep pre-existing registry rows
+/// that point at such checkouts so polluted registries self-heal
+/// (intent-hq/monorepo#2227). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
-async fn sync_repos_from_workspaces(store: &Store) -> Result<()> {
+async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf]) -> Result<()> {
     let workspaces = store.list_workspaces(true).await?;
-    for ws in workspaces {
+    for ws in &workspaces {
         let Some(repo_path) = ws.repository_path.as_deref() else {
             continue;
         };
         if repo_path.is_empty() {
             continue;
         }
+        if is_workspace_owned_checkout(repo_path, ws.worktree_path.as_deref(), workspaces_roots) {
+            continue;
+        }
         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
         store
             .upsert_known_repo(repo_path, &name, ws.repository_owner.as_deref())
             .await?;
+    }
+    // Self-heal: drop rows registered before the skip above existed. A row is
+    // workspace-owned when it sits under a workspaces root (also covers
+    // leftovers from deleted workspaces) or matches a live workspace's
+    // standalone checkout (`repository_path == worktree_path`) that lives
+    // outside the current roots (e.g. under a former worktrees location).
+    let standalone: std::collections::HashSet<&str> = workspaces
+        .iter()
+        .filter(|ws| {
+            ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
+                && ws.repository_path == ws.worktree_path
+        })
+        .filter_map(|ws| ws.repository_path.as_deref())
+        .collect();
+    for repo in store.list_known_repos().await? {
+        if standalone.contains(repo.path.as_str())
+            || is_workspace_owned_checkout(&repo.path, None, workspaces_roots)
+        {
+            store.remove_known_repo(&repo.path).await?;
+        }
     }
     Ok(())
 }
@@ -12740,14 +12786,25 @@ impl WorkspaceApi for Services {
                     }
                     // Register the repo in the persistent registry so it survives
                     // workspace deletion and appears in `repo.list` without a restart
-                    // (TS `workspace.service` `addRepo` hook). Best-effort: a registry
+                    // (TS `workspace.service` `addRepo` hook). Workspace-owned
+                    // checkouts (standalone clone / cache hydration, or any path
+                    // under the workspaces root — including the `ws.path`
+                    // fallback) are not user repos and stay out of the registry
+                    // (intent-hq/monorepo#2227). Best-effort: a registry
                     // failure must not fail workspace creation.
                     let repo_path = ws
                         .repository_path
                         .as_deref()
                         .filter(|p| !p.is_empty())
                         .or(ws.path.as_deref())
-                        .filter(|p| !p.is_empty());
+                        .filter(|p| !p.is_empty())
+                        .filter(|p| {
+                            !is_workspace_owned_checkout(
+                                p,
+                                ws.worktree_path.as_deref(),
+                                std::slice::from_ref(&workspaces_root_pathbuf),
+                            )
+                        });
                     if let Some(repo_path) = repo_path {
                         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
                         if let Err(e) = store
@@ -18691,13 +18748,17 @@ impl WorkspaceApi for Services {
 
     fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let boot_root = self.workspaces_root.clone();
+        let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
             // Return the known repos immediately — don't block on the sync.
             let repos = store.list_known_repos().await?;
             // One-time background sync: register repos from existing workspaces
             // so pre-existing workspaces (created before this feature) get
-            // picked up. Spawned so it never blocks/fails the response, and
-            // guarded to run at most once per process (TS `repoRegistrySynced`).
+            // picked up, and sweep out workspace-owned checkouts
+            // (intent-hq/monorepo#2227). Spawned so it never blocks/fails the
+            // response, and guarded to run at most once per process
+            // (TS `repoRegistrySynced`).
             if REPO_REGISTRY_SYNCED
                 .compare_exchange(
                     false,
@@ -18709,7 +18770,14 @@ impl WorkspaceApi for Services {
             {
                 let store = store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = sync_repos_from_workspaces(&store).await {
+                    // Same root set as the teardown sweeps: the boot root plus
+                    // the currently configured `workspace.worktreesLocation`
+                    // (workspaces provisioned there live there).
+                    let mut roots = vec![boot_root.unwrap_or_else(default_workspaces_root)];
+                    if let Some(location) = worktrees_location.filter(|l| !roots.contains(l)) {
+                        roots.push(location);
+                    }
+                    if let Err(e) = sync_repos_from_workspaces(&store, &roots).await {
                         tracing::warn!(error = %e, "failed to sync workspace repos to registry");
                     }
                 });

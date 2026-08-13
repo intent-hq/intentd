@@ -17052,6 +17052,7 @@ mod known_repo {
     async fn one_time_sync_upserts_repos_from_workspaces() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
         // Explicit name + owner.
         store
             .insert_workspace(&ws_with_repo(
@@ -17078,7 +17079,10 @@ mod known_repo {
             .await
             .expect("ws3");
 
-        sync_repos_from_workspaces(&store).await.expect("sync");
+        let roots = vec![ws_root.path().to_path_buf()];
+        sync_repos_from_workspaces(&store, &roots)
+            .await
+            .expect("sync");
 
         let repos = store.list_known_repos().await.expect("list");
         assert_eq!(repos.len(), 2, "only repos with a repository_path sync");
@@ -17090,8 +17094,130 @@ mod known_repo {
         assert_eq!(by_path["/home/me/other-repo"].owner, None);
 
         // Re-running the sync is idempotent on path (no duplicate rows).
-        sync_repos_from_workspaces(&store).await.expect("resync");
+        sync_repos_from_workspaces(&store, &roots)
+            .await
+            .expect("resync");
         assert_eq!(store.list_known_repos().await.expect("list").len(), 2);
+    }
+
+    /// Workspace-owned checkouts never enter the registry
+    /// (intent-hq/monorepo#2227): a standalone checkout
+    /// (`repository_path == worktree_path`) and any path under a workspaces
+    /// root are both skipped; genuine user repos still sync.
+    #[tokio::test]
+    async fn sync_skips_workspace_owned_checkouts() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        // Standalone checkout OUTSIDE the current roots (e.g. a former
+        // worktrees location): repository_path == worktree_path.
+        let standalone = "/old/worktrees/ws-a/monorepo";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(standalone.to_string()),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(standalone),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("standalone ws");
+        // Checkout under the workspaces root, no worktree_path (e.g. a
+        // materialized import).
+        let under_root = ws_root.path().join("ws-b").join("monorepo");
+        store
+            .insert_workspace(&ws_with_repo(
+                &WorkspaceId::new(),
+                Some(&under_root.to_string_lossy()),
+                Some("monorepo"),
+                None,
+            ))
+            .await
+            .expect("under-root ws");
+        // Genuine user repo with a daemon-provisioned worktree.
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(
+                    ws_root
+                        .path()
+                        .join("ws-c")
+                        .join("monorepo")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some("/home/me/Developer/monorepo"),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("user ws");
+
+        sync_repos_from_workspaces(&store, &[ws_root.path().to_path_buf()])
+            .await
+            .expect("sync");
+
+        let repos = store.list_known_repos().await.expect("list");
+        assert_eq!(
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/home/me/Developer/monorepo"],
+            "only the user repo syncs"
+        );
+    }
+
+    /// Pre-existing polluted registries self-heal on sync
+    /// (intent-hq/monorepo#2227): rows under a workspaces root (including
+    /// leftovers whose workspace was deleted) and rows matching a live
+    /// standalone checkout are removed; user repos survive.
+    #[tokio::test]
+    async fn sync_sweeps_workspace_owned_rows_from_registry() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        // Live standalone workspace outside the roots.
+        let standalone = "/old/worktrees/ws-a/monorepo";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(standalone.to_string()),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(standalone),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("standalone ws");
+        // Pollution: the standalone checkout, an under-root leftover with no
+        // surviving workspace row, and a genuine user repo.
+        let leftover = ws_root.path().join("ws-gone").join("monorepo");
+        store
+            .upsert_known_repo(standalone, "monorepo", None)
+            .await
+            .expect("seed standalone row");
+        store
+            .upsert_known_repo(&leftover.to_string_lossy(), "monorepo", None)
+            .await
+            .expect("seed leftover row");
+        store
+            .upsert_known_repo("/home/me/Developer/monorepo", "monorepo", Some("intent-hq"))
+            .await
+            .expect("seed user row");
+
+        sync_repos_from_workspaces(&store, &[ws_root.path().to_path_buf()])
+            .await
+            .expect("sync");
+
+        let repos = store.list_known_repos().await.expect("list");
+        assert_eq!(
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/home/me/Developer/monorepo"],
+            "workspace-owned rows swept, user repo untouched"
+        );
     }
 
     #[tokio::test]
@@ -17121,6 +17247,71 @@ mod known_repo {
         assert_eq!(repos[0]["owner"], "intent-hq");
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
+    }
+
+    /// The `workspace.create` registration hook never registers
+    /// daemon-provisioned paths (intent-hq/monorepo#2227): a `repositoryPath`
+    /// under the workspaces root, a standalone checkout
+    /// (`repository_path == worktree_path`), and the `ws.path` fallback
+    /// pointing under the root are all skipped.
+    #[tokio::test]
+    async fn create_workspace_skips_registry_for_workspace_owned_paths() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        // repositoryPath under the workspaces root (non-git → provisioning is
+        // skipped and the path reaches the hook unchanged).
+        let under_root = ws_root.path().join("ws-x").join("monorepo");
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(under_root.to_string_lossy().to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create under root");
+
+        // Standalone checkout outside the roots: repository_path IS the
+        // caller-supplied worktree_path.
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some("/old/worktrees/ws-y/monorepo".to_string()),
+                worktree_path: Some("/old/worktrees/ws-y/monorepo".to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create standalone");
+
+        // No repositoryPath; the `ws.path` fallback points under the root.
+        svc.create_workspace(
+            WorkspaceCreate {
+                path: Some(
+                    ws_root
+                        .path()
+                        .join("ws-z")
+                        .join("repo")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create path fallback");
+
+        assert_eq!(
+            store.list_known_repos().await.expect("list"),
+            vec![],
+            "no workspace-owned path is registered"
+        );
     }
 
     /// `workspace.create` derives `repository_name` from the local
