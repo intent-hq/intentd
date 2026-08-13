@@ -704,9 +704,16 @@ async fn agent_memory_knobs_over_wss() {
     assert_eq!(entry["type"], json!("number"));
     assert_eq!(entry["category"], json!("agents"));
     assert_eq!(entry["min"], json!(0.0), "{entry}");
-    // The default is the *absent* key (auto, monorepo#2063): the catalog
-    // carries no defaultValue and a fresh install reports a null value.
-    assert_eq!(entry["defaultValue"], Value::Null, "{entry}");
+    // The default is the *absent* key (auto, monorepo#2063): the wire entry
+    // omits `defaultValue` entirely (indexing would read an absent key as
+    // null too, so assert on the object) while `value` is always present and
+    // explicitly null on a fresh install.
+    let entry_obj = entry.as_object().expect("entry is an object");
+    assert!(
+        !entry_obj.contains_key("defaultValue"),
+        "defaultValue must be omitted, not null: {entry}"
+    );
+    assert!(entry_obj.contains_key("value"), "{entry}");
     assert_eq!(entry["value"], Value::Null, "{entry}");
     let max = entry["max"]
         .as_f64()
