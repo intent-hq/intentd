@@ -31,9 +31,9 @@ permissions: {}
 
 on:
   schedule:
-    # Every 30 minutes; each run is a seconds-long API check that either
+    # Hourly at :00; each run is a seconds-long API check that either
     # squash-merges a green Release PR or exits quietly.
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
