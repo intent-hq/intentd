@@ -54,6 +54,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod attachment_upload;
 mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
@@ -708,6 +709,14 @@ pub struct Services {
     /// restart drops pending imports (staging dirs are swept lazily by the
     /// next `begin`), and the FE simply restarts the upload.
     transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
+    /// In-flight staged attachment uploads (`file.attachmentUpload.*`, keyed
+    /// by `uploadId`): destination + declared size/sha + chunk cursor
+    /// between `begin` and `commit`/`abort`. Shared across clones so chunks
+    /// arriving over any connection stage into the same session. In-memory
+    /// only — a daemon restart drops pending uploads (staging dirs are swept
+    /// lazily by the next `begin`), and the client simply restarts the
+    /// upload.
+    attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -852,6 +861,7 @@ impl Services {
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
+            attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -11407,6 +11417,52 @@ impl WorkspaceApi for Services {
             }
             Ok(result)
         })
+    }
+
+    fn file_attachment_upload_begin(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+        mime_type: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_begin_op(
+                workspace_id,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+            )
+            .await
+        })
+    }
+
+    fn file_attachment_upload_chunk(
+        &self,
+        upload_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_chunk_op(upload_id, seq, data)
+                .await
+        })
+    }
+
+    fn file_attachment_upload_commit(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_commit_op(upload_id).await })
+    }
+
+    fn file_attachment_upload_abort(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_abort_op(upload_id).await })
     }
 
     fn file_get_attachment_info(

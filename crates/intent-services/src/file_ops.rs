@@ -172,7 +172,7 @@ pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
 /// Reduce a client-supplied attachment file name to a safe basename: keep
 /// only the final path component (either separator style), then drop any
 /// remaining `..`/`.`/empty outcome. `None` when nothing usable is left.
-fn sanitize_attachment_name(file_name: &str) -> Option<String> {
+pub(crate) fn sanitize_attachment_name(file_name: &str) -> Option<String> {
     let base = file_name
         .rsplit(['/', '\\'])
         .next()
