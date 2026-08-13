@@ -111,6 +111,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.status",
     "git.unstage",
     "git.unstageHunk",
+    "gitRoot.list",
     "github.authStatus",
     "github.branches.list",
     "github.branches.listCached",

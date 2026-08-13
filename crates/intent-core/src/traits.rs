@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -2767,12 +2767,53 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `git.status`: working-tree status for a workspace. Remote workspaces and
-    /// non-repositories return the empty status (PROTOCOL §5.6).
-    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
-        let _ = workspace_id;
+    /// non-repositories return the empty status (PROTOCOL §5.6). When
+    /// `git_root_id` is set, the scan runs against that registered git root's
+    /// path instead of the workspace worktree; an unknown id or one belonging
+    /// to another workspace is `InvalidParams` (`-32602`).
+    fn git_status(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        let _ = (workspace_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `gitRoot.list`: every registered git root for a workspace (agent-
+    /// registered and auto-detected), as the wire envelope
+    /// `{ gitRoots: [...] }` with each row carrying the persisted
+    /// `WorkspaceGitRoot` fields plus a live-read `branch`. A missing
+    /// workspace is `NotFound` (`-32602`); a workspace with no registered
+    /// roots returns an empty list (PROTOCOL §5.6 extensions,
+    /// intent-hq/monorepo#2053).
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Resolve a registered git root to its filesystem path after validating
+    /// it belongs to `workspace_id`. An unknown id — or an id registered to a
+    /// different workspace — is `InvalidParams` (`-32602`). Used by the
+    /// transport for path-based git reads (`git.branchStatus`) that accept a
+    /// `gitRootId` in place of a raw `repoPath`.
+    fn git_root_path(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (workspace_id, git_root_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_path not implemented".to_string(),
             ))
         })
     }
@@ -2955,9 +2996,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.changes`: the working-tree file list (`FileStatus[]`) for a
     /// workspace — the same `files` array as `git.status`. Remote workspaces and
-    /// non-repositories return an empty array (wire §7.7).
-    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+    /// non-repositories return an empty array (wire §7.7). When `git_root_id`
+    /// is set, the scan targets that registered root's path; an unknown or
+    /// foreign id is `InvalidParams` (`-32602`).
+    fn git_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_changes not implemented".to_string(),
@@ -2974,15 +3021,18 @@ pub trait WorkspaceApi: Send + Sync {
     /// the wire `path` param arrives folded into this set); `None` or an empty
     /// vec means the full tree. Returns `[{ path, hunks }]`; remote/non-repo
     /// workspaces and an unresolvable `commit_hash` return an empty array
-    /// (wire §7.7).
+    /// (wire §7.7). When `git_root_id` is set, the walk targets that
+    /// registered root's path; an unknown or foreign id is `InvalidParams`
+    /// (`-32602`).
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
         paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, paths, staged, commit_hash);
+        let _ = (workspace_id, paths, staged, commit_hash, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_diffs not implemented".to_string(),
@@ -3012,14 +3062,17 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.commits`: paginated reverse-chronological commit history as the
     /// canonical §5.5 page envelope `{ items: CommitInfo[], nextToken }`. Remote
-    /// workspaces and non-repositories return an empty page (wire §7.7).
+    /// workspaces and non-repositories return an empty page (wire §7.7). When
+    /// `git_root_id` is set, the walk targets that registered root's path; an
+    /// unknown or foreign id is `InvalidParams` (`-32602`).
     fn git_commits(
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, limit, page_token);
+        let _ = (workspace_id, limit, page_token, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commits not implemented".to_string(),
@@ -3031,14 +3084,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// semantics) as `{ content }`. `ref` accepts anything revparse-able plus
     /// the index ref `":0"`; a path missing at the ref and remote/non-repo
     /// workspaces return `{ content: "" }` (wire §7.7), while an unresolvable
-    /// `ref` is `-32603` (PROTOCOL §5.6 extensions).
+    /// `ref` is `-32603` (PROTOCOL §5.6 extensions). When `git_root_id` is
+    /// set, the read targets that registered root's path; an unknown or
+    /// foreign id is `InvalidParams` (`-32602`).
     fn git_show_file(
         &self,
         workspace_id: WorkspaceId,
         file_path: String,
         git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_path, git_ref);
+        let _ = (workspace_id, file_path, git_ref, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_show_file not implemented".to_string(),

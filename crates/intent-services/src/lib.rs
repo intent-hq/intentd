@@ -14,12 +14,13 @@ use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
-    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
-    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, LINE_ATTRIBUTION_UPDATED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE,
+    SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED,
+    TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_TOKEN_USAGE_CHANGED,
+    WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -41,8 +42,8 @@ use intent_core::{
     TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -1408,6 +1409,36 @@ impl Services {
         Arc::clone(&self.git_status_cache)
     }
 
+    /// Resolve the target path for a workspace-scoped `git.*` read
+    /// (monorepo#2053): with `git_root_id` set, look up the registered git
+    /// root and validate it belongs to `ws` — an unknown id or one registered
+    /// to another workspace is `InvalidParams` (`-32602`) so a caller cannot
+    /// read an arbitrary root through a foreign workspace. Without it, fall
+    /// back to the workspace worktree exactly as before (`None` when the
+    /// workspace has no local path).
+    async fn resolve_git_read_root(
+        &self,
+        ws: &Workspace,
+        git_root_id: Option<&WorkspaceGitRootId>,
+    ) -> Result<Option<PathBuf>> {
+        let Some(id) = git_root_id else {
+            return Ok(git_ops::worktree_path(ws));
+        };
+        let root = match self.store.get_workspace_git_root(id).await {
+            Ok(r) => r,
+            Err(Error::NotFound(_)) => {
+                return Err(Error::InvalidParams(format!("Unknown git root: {id}")))
+            }
+            Err(e) => return Err(e),
+        };
+        if root.workspace_id != ws.id {
+            // Same message as the unknown-id case so a foreign root is not
+            // distinguishable from a nonexistent one.
+            return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+        }
+        Ok(Some(PathBuf::from(root.path)))
+    }
+
     /// Hydrate the in-memory script registry from the persisted definitions
     /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
     /// composition root on boot so `script.*` survives daemon restarts; runtime
@@ -2541,6 +2572,45 @@ impl Services {
     /// Borrow the underlying store (composition-root / diagnostics use).
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Persist (insert-or-merge) a workspace git root and emit the matching
+    /// change event (monorepo#2053): `gitRoot:registered` when the path was
+    /// not yet tracked for the workspace, `gitRoot:updated` when an existing
+    /// row was merged (re-registration / attribution append). Returns the
+    /// stored row. Callers (the `ws.git.registerRoot` MCP binding, submodule
+    /// auto-detection) validate the path before reaching this.
+    pub async fn register_git_root(
+        &self,
+        root: &intent_core::WorkspaceGitRoot,
+    ) -> Result<intent_core::WorkspaceGitRoot> {
+        let existed = self
+            .store
+            .find_workspace_git_root_by_path(&root.workspace_id, &root.path)
+            .await?
+            .is_some();
+        let stored = self.store.upsert_workspace_git_root(root).await?;
+        let event_type = if existed {
+            GIT_ROOT_UPDATED
+        } else {
+            GIT_ROOT_REGISTERED
+        };
+        publish_event(&self.event_bus, git_root_changed_event(event_type, &stored)).await;
+        Ok(stored)
+    }
+
+    /// Delete a workspace git root and emit `gitRoot:unregistered`
+    /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
+    /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
+    pub async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
+        let root = self.store.get_workspace_git_root(git_root_id).await?;
+        self.store.delete_workspace_git_root(git_root_id).await?;
+        publish_event(
+            &self.event_bus,
+            git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
+        )
+        .await;
+        Ok(())
     }
 
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
@@ -7935,6 +8005,54 @@ fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> 
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "tokenUsage": usage,
+        }),
+    }
+}
+
+/// Build a `gitRoot:registered` / `gitRoot:updated` event (§6.5,
+/// monorepo#2053) carrying the full persisted row as `gitRoot` so clients
+/// re-render without a follow-up `gitRoot.list`. `event_type` must be
+/// [`GIT_ROOT_REGISTERED`] or [`GIT_ROOT_UPDATED`].
+pub(crate) fn git_root_changed_event(
+    event_type: &str,
+    root: &intent_core::WorkspaceGitRoot,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: root.workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": root.workspace_id.as_str(),
+            "gitRoot": root,
+        }),
+    }
+}
+
+/// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
+/// removed root's id and path so clients drop the row without a re-list.
+pub(crate) fn git_root_unregistered_event(
+    workspace_id: &WorkspaceId,
+    git_root_id: &WorkspaceGitRootId,
+    path: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_ROOT_UNREGISTERED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "gitRootId": git_root_id.as_str(),
+            "path": path,
         }),
     }
 }
@@ -18033,11 +18151,13 @@ impl WorkspaceApi for Services {
     fn git_status(
         &self,
         workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
         let svc = self.clone();
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
-            // (the TS `getStatus` fallbacks), never an error.
+            // (the TS `getStatus` fallbacks), never an error — but an unknown
+            // `gitRootId` is `-32602` (monorepo#2053).
             let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
@@ -18046,7 +18166,7 @@ impl WorkspaceApi for Services {
             if ws.is_remote {
                 return Ok(intent_git::status::empty_status());
             }
-            let Some(path) = git_ops::worktree_path(&ws) else {
+            let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(intent_git::status::empty_status());
             };
             if !path.join(".git").exists() {
@@ -18068,6 +18188,49 @@ impl WorkspaceApi for Services {
                 );
             }
             status.map(|s| (*s).clone())
+        })
+    }
+
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // A missing workspace is `NotFound` (router → -32602); a workspace
+            // with no registered roots is an empty list (monorepo#2053).
+            let _ = store.get_workspace(&workspace_id).await?;
+            let roots = store.list_workspace_git_roots(&workspace_id).await?;
+            // Serialize the persisted row and graft on the live-read `branch`
+            // (never persisted — HEAD moves outside the daemon's control, so
+            // it is read per call like the FE's own branch display).
+            let git_roots: Vec<serde_json::Value> = roots
+                .into_iter()
+                .map(|root| {
+                    let branch =
+                        intent_git::status::current_branch_at(std::path::Path::new(&root.path));
+                    let mut v = serde_json::to_value(&root).unwrap_or_default();
+                    if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
+                        obj.insert("branch".to_string(), serde_json::Value::String(branch));
+                    }
+                    v
+                })
+                .collect();
+            Ok(serde_json::json!({ "gitRoots": git_roots }))
+        })
+    }
+
+    fn git_root_path(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            // Unlike the workspace-scoped reads, a missing workspace is an
+            // error here (the caller explicitly named a root to resolve).
+            let ws = svc.store.get_workspace(&workspace_id).await?;
+            let path = svc.resolve_git_read_root(&ws, Some(&git_root_id)).await?;
+            // `resolve_git_read_root` with `Some(id)` always yields a path.
+            path.map(|p| p.to_string_lossy().into_owned())
+                .ok_or_else(|| Error::InvalidParams(format!("Unknown git root: {git_root_id}")))
         })
     }
 
@@ -19233,7 +19396,11 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn git_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
@@ -19247,7 +19414,7 @@ impl WorkspaceApi for Services {
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(path) = git_ops::worktree_path(&ws) else {
+            let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
             if !path.join(".git").exists() {
@@ -19267,7 +19434,9 @@ impl WorkspaceApi for Services {
         paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         let inflight = Arc::clone(&self.git_diffs_inflight);
         let slow_warns = Arc::clone(&self.git_diffs_slow_warns);
@@ -19282,7 +19451,7 @@ impl WorkspaceApi for Services {
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
             if !worktree.join(".git").exists() {
@@ -19313,6 +19482,7 @@ impl WorkspaceApi for Services {
                 paths.clone(),
                 staged,
                 commit_hash.clone(),
+                git_root_id.clone(),
             );
             loop {
                 match inflight.join(&key) {
@@ -19449,7 +19619,9 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             // §5.5 paginated read: clamp the page size to [1,200] (default 50)
@@ -19465,7 +19637,7 @@ impl WorkspaceApi for Services {
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
             if !worktree.join(".git").exists() {
@@ -19512,7 +19684,9 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         file_path: String,
         git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             // Same empty fallbacks as the other `git.*` reads (unknown/remote/
@@ -19527,7 +19701,7 @@ impl WorkspaceApi for Services {
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
             if !worktree.join(".git").exists() {

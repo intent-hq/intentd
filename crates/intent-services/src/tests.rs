@@ -12146,7 +12146,10 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         // Page size 1 → newest commit only, with a token for the older page.
-        let page1 = svc.git_commits(ws_id.clone(), Some(1), None).await.unwrap();
+        let page1 = svc
+            .git_commits(ws_id.clone(), Some(1), None, None)
+            .await
+            .unwrap();
         let items = page1["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         let head = &items[0];
@@ -12162,7 +12165,7 @@ mod file_tracking {
 
         // Following the token yields the older (seed) commit, then no more.
         let page2 = svc
-            .git_commits(ws_id, Some(1), Some(token.to_string()))
+            .git_commits(ws_id, Some(1), Some(token.to_string()), None)
             .await
             .unwrap();
         let items2 = page2["items"].as_array().unwrap();
@@ -12183,7 +12186,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let changes = svc.git_changes(ws_id).await.unwrap();
+        let changes = svc.git_changes(ws_id, None).await.unwrap();
         let arr = changes.as_array().unwrap();
         let seed = arr.iter().find(|c| c["path"] == "seed.txt").unwrap();
         assert_eq!(seed["status"], serde_json::json!("M"));
@@ -12201,7 +12204,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -12235,7 +12238,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -12266,7 +12269,7 @@ mod file_tracking {
         };
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, true, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, true, None, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "sub").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -12327,7 +12330,7 @@ mod file_tracking {
         let first = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The leader is inside the walk (flight registered, probe parked).
         wait_until("leader to enter the walk", || {
@@ -12338,10 +12341,10 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The identical call joined the in-flight walk as a follower.
-        let key = (ws_id.clone(), None, false, None);
+        let key = (ws_id.clone(), None, false, None, None);
         wait_until("second call to join as follower", || {
             svc.git_diffs_waiters(&key) == 1
         })
@@ -12388,13 +12391,13 @@ mod file_tracking {
         let unstaged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
         let staged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, true, None).await }
+            async move { svc.git_diffs(ws, None, true, None, None).await }
         });
         // The non-identical request must start its own walk while the first
         // is still parked.
@@ -12439,7 +12442,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         // The leader is inside the scan (flight registered, probe parked).
         wait_until("leader to enter the scan", || {
@@ -12451,7 +12454,7 @@ mod file_tracking {
             .map(|_| {
                 let svc = svc.clone();
                 let ws = ws_id.clone();
-                tokio::spawn(async move { svc.git_status(ws).await })
+                tokio::spawn(async move { svc.git_status(ws, None).await })
             })
             .collect();
         wait_until("followers to join the in-flight scan", || {
@@ -12500,7 +12503,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12620,12 +12623,12 @@ mod file_tracking {
 
         let first = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_a).await }
+            async move { svc.git_status(ws_a, None).await }
         });
         wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
         let second = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_b).await }
+            async move { svc.git_status(ws_b, None).await }
         });
         // The other worktree must start its own scan while the first is parked.
         wait_until("second independent scan", || {
@@ -12660,8 +12663,8 @@ mod file_tracking {
             })
         });
 
-        assert!(svc.git_status(ws_id.clone()).await.is_err());
-        assert!(svc.git_status(ws_id).await.is_err());
+        assert!(svc.git_status(ws_id.clone(), None).await.is_err());
+        assert!(svc.git_status(ws_id, None).await.is_err());
         assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
     }
 
@@ -12693,7 +12696,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12702,7 +12705,7 @@ mod file_tracking {
         let changes = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_changes(ws).await }
+            async move { svc.git_changes(ws, None).await }
         });
         wait_until("git.changes to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12750,7 +12753,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12759,7 +12762,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12810,7 +12813,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -12819,7 +12822,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -12858,17 +12861,17 @@ mod file_tracking {
             })
         });
 
-        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        let first = svc.git_status(ws_id.clone(), None).await.unwrap();
         for _ in 0..4 {
             assert_eq!(
-                svc.git_status(ws_id.clone()).await.unwrap(),
+                svc.git_status(ws_id.clone(), None).await.unwrap(),
                 first,
                 "cached reads return the same status"
             );
         }
         assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
         // The other scan-backed reads serve the same entry.
-        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.git_changes(ws_id.clone(), None).await.unwrap();
         svc.accept_changes_get_status(ws_id).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
@@ -12896,7 +12899,7 @@ mod file_tracking {
             })
         });
 
-        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        let before = svc.git_status(ws_id.clone(), None).await.unwrap();
         assert!(
             before.files.iter().any(|f| !f.staged),
             "the edit starts unstaged"
@@ -12904,7 +12907,7 @@ mod file_tracking {
         svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
             .await
             .unwrap();
-        let after = svc.git_status(ws_id).await.unwrap();
+        let after = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -12937,7 +12940,7 @@ mod file_tracking {
             });
 
         assert!(svc
-            .git_status(ws_id.clone())
+            .git_status(ws_id.clone(), None)
             .await
             .unwrap()
             .files
@@ -12945,7 +12948,7 @@ mod file_tracking {
         // Out-of-band edit: no `file:*` event, no daemon mutation.
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         assert!(
-            svc.git_status(ws_id.clone())
+            svc.git_status(ws_id.clone(), None)
                 .await
                 .unwrap()
                 .files
@@ -12955,7 +12958,7 @@ mod file_tracking {
         assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let expired = svc.git_status(ws_id).await.unwrap();
+        let expired = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -12994,7 +12997,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -13007,7 +13010,7 @@ mod file_tracking {
         release.store(true, Ordering::SeqCst);
         leader.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -13046,7 +13049,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -13061,7 +13064,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the flight", || {
             svc.git_status_waiters(&repo.dir) > 0
@@ -13072,7 +13075,7 @@ mod file_tracking {
         leader.await.unwrap().unwrap();
         follower.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -13090,14 +13093,16 @@ mod file_tracking {
     async fn git_reads_empty_for_non_repo_workspace() {
         let (_t, svc, ws) = ft_setup().await;
         assert_eq!(
-            svc.git_changes(ws.clone()).await.unwrap(),
+            svc.git_changes(ws.clone(), None).await.unwrap(),
             serde_json::json!([])
         );
         assert_eq!(
-            svc.git_diffs(ws.clone(), None, false, None).await.unwrap(),
+            svc.git_diffs(ws.clone(), None, false, None, None)
+                .await
+                .unwrap(),
             serde_json::json!([])
         );
-        let commits = svc.git_commits(ws.clone(), None, None).await.unwrap();
+        let commits = svc.git_commits(ws.clone(), None, None, None).await.unwrap();
         assert_eq!(commits["items"], serde_json::json!([]));
         assert_eq!(commits["nextToken"], serde_json::Value::Null);
         // git.commitDetails degrades to an empty envelope (graceful) — same as
@@ -13184,6 +13189,225 @@ mod file_tracking {
         assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
+    /// Build a `WorkspaceGitRoot` row for the given workspace + path
+    /// (monorepo#2053 read-surface tests).
+    fn git_root_row(ws_id: &WorkspaceId, path: &std::path::Path) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![AgentId("agent-1".into())],
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// `gitRoot.list` returns every registered root for the workspace with a
+    /// live-read `branch` grafted on, and an empty list when none are
+    /// registered (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_list_returns_registered_roots_with_branch() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let empty = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(empty["gitRoots"], serde_json::json!([]));
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        let roots = listed["gitRoots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["id"], root.id.as_str());
+        assert_eq!(roots[0]["path"], root.path);
+        assert_eq!(roots[0]["source"], "agent");
+        assert_eq!(
+            roots[0]["registeredByAgentIds"],
+            serde_json::json!(["agent-1"])
+        );
+        assert!(
+            roots[0]["branch"].is_string(),
+            "live-read branch grafted on: {:?}",
+            roots[0]
+        );
+    }
+
+    /// `gitRoot.list` on an unknown workspace is `NotFound` (router → -32602).
+    #[tokio::test]
+    async fn git_root_list_unknown_workspace_is_not_found() {
+        let repo = init_git_repo();
+        let (_t, svc, _ws) = svc_with_repo(&repo).await;
+        let err = svc.git_root_list(WorkspaceId::new()).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// A `gitRootId` on the workspace-scoped reads targets the registered
+    /// root's path instead of the workspace worktree (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_scoped_to_registered_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        std::fs::write(secondary.dir.join("root-only.txt"), "hi\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // git.status against the secondary root sees its untracked file...
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            status.files.iter().any(|f| f.path == "root-only.txt"),
+            "{status:?}"
+        );
+        // ...while the primary-worktree scan (no gitRootId) does not.
+        let primary_status = svc.git_status(ws_id.clone(), None).await.unwrap();
+        assert!(
+            !primary_status
+                .files
+                .iter()
+                .any(|f| f.path == "root-only.txt"),
+            "{primary_status:?}"
+        );
+
+        // git.changes projects the same root-scoped file list.
+        let changes = svc
+            .git_changes(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "root-only.txt"));
+
+        // git.commits walks the secondary root's history.
+        let commits = svc
+            .git_commits(ws_id.clone(), None, None, Some(root.id.clone()))
+            .await
+            .unwrap();
+        let items = commits["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("seed commit"));
+
+        // git.showFile reads blobs at the secondary root's HEAD.
+        let shown = svc
+            .git_show_file(
+                ws_id,
+                "seed.txt".to_string(),
+                "HEAD".to_string(),
+                Some(root.id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown["content"], "seed\n");
+    }
+
+    /// An unknown `gitRootId` — or one registered to a different workspace —
+    /// is `InvalidParams` (-32602), not an empty fallback (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_unknown_or_foreign_git_root_id_is_invalid_params() {
+        let repo = init_git_repo();
+        let other_repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        // Unknown id.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // A root registered to a *different* workspace.
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        let foreign = git_root_row(&other_ws, &other_repo.dir);
+        svc.store()
+            .upsert_workspace_git_root(&foreign)
+            .await
+            .unwrap();
+        let err = svc
+            .git_changes(ws_id, Some(foreign.id.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+    }
+
+    /// `register_git_root` emits `gitRoot:registered` on first registration
+    /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
+    /// `gitRoot:unregistered` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_unregister_emit_events() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(ws_id.0.clone()),
+            ..Default::default()
+        });
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        let stored = svc.register_git_root(&root).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("registered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:registered");
+        assert_eq!(batch[0].data["gitRoot"]["id"], stored.id.as_str());
+
+        // Re-registering the same path merges and emits `gitRoot:updated`.
+        let mut again = git_root_row(&ws_id, &secondary.dir);
+        again.registered_by_agent_ids = vec![AgentId("agent-2".into())];
+        let merged = svc.register_git_root(&again).await.unwrap();
+        assert_eq!(merged.id, stored.id, "merged into the existing row");
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("updated event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:updated");
+        assert_eq!(
+            batch[0].data["gitRoot"]["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+
+        svc.unregister_git_root(&stored.id).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("unregistered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:unregistered");
+        assert_eq!(batch[0].data["gitRootId"], stored.id.as_str());
+        assert_eq!(batch[0].data["path"], stored.path);
+
+        // Unregistering an unknown id is NotFound.
+        let err = svc.unregister_git_root(&stored.id).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
     /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
     /// its first parent (PROTOCOL §5.6 extension).
     #[tokio::test]
@@ -13217,7 +13441,13 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), false, Some(head))
+            .git_diffs(
+                ws_id,
+                Some(vec!["seed.txt".to_string()]),
+                false,
+                Some(head),
+                None,
+            )
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13303,7 +13533,7 @@ mod file_tracking {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
 
         // Legacy two-pass reference: one full scan for the file list, then
         // one scan per file for its hunks (binary → empty hunks).
@@ -13345,11 +13575,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
-            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = narrowed.as_array().unwrap();
@@ -13373,7 +13603,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
@@ -13381,6 +13611,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["b.txt".to_string(), "new.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13408,11 +13639,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let empty_paths = svc
-            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None)
+            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None, None)
             .await
             .unwrap();
         assert_eq!(empty_paths, full);
@@ -13422,6 +13653,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["no-such-file.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13453,6 +13685,7 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string(), "third.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -13474,7 +13707,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13501,7 +13734,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -13520,12 +13753,18 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let relative = svc
-            .git_diffs(ws_id.clone(), Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(
+                ws_id.clone(),
+                Some(vec!["b.txt".to_string()]),
+                false,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let abs = repo.dir.join("b.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None)
+            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative, "absolute form narrows like relative");
@@ -13540,12 +13779,13 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
         let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id, Some(vec![abs]), true, None)
+            .git_diffs(ws_id, Some(vec![abs]), true, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative);
@@ -13564,6 +13804,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["/no/such/root/b.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -13600,7 +13841,7 @@ mod file_tracking {
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
-                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None)
+                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None, None)
                     .await
             }
         });
@@ -13613,7 +13854,7 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, Some(vec![abs]), false, None).await }
+            async move { svc.git_diffs(ws, Some(vec![abs]), false, None, None).await }
         });
         // The absolute request normalized onto the relative request's key and
         // joined the in-flight walk as a follower.
@@ -13621,6 +13862,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("absolute request to join as follower", || {
@@ -13670,6 +13912,7 @@ mod file_tracking {
                     Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -13692,6 +13935,7 @@ mod file_tracking {
                     ]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -13702,6 +13946,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("reordered request to join as follower", || {
