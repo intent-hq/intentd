@@ -8044,7 +8044,7 @@ fn workspace_setup_started_event(workspace_id: &WorkspaceId) -> NewEvent {
 /// terminal actually spawned; `exit_code` is present only when the script ran
 /// to exit and its status was observable. `exitCode` is omitted (not null)
 /// when unavailable so the payload stays self-sufficient.
-fn workspace_setup_completed_event(
+pub(crate) fn workspace_setup_completed_event(
     workspace_id: &WorkspaceId,
     ran_script: bool,
     exit_code: Option<u32>,
@@ -8073,9 +8073,21 @@ fn workspace_setup_completed_event(
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
 /// like every change-event publish: failures are logged, never returned.
+///
+/// Import paths run no setup stage, so the matching
+/// `workspace:setup:completed { ranScript: false }` is published immediately
+/// after — otherwise the watcher registry would hold the workspace's watcher
+/// start pending for the full setup backstop (§6.5 pairs every logical create
+/// with exactly one completion).
 pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
     if let Err(e) = bus.publish(&workspace_created_event(ws)).await {
         tracing::warn!(error = %e, "failed to publish workspace:created event");
+    }
+    if let Err(e) = bus
+        .publish(&workspace_setup_completed_event(&ws.id, false, None))
+        .await
+    {
+        tracing::warn!(error = %e, "failed to publish workspace:setup:completed event");
     }
 }
 

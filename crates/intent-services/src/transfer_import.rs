@@ -31,7 +31,7 @@ use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
 use crate::transfer_git::TransferRefsManifest;
-use crate::{publish_event, workspace_created_event, Services};
+use crate::{publish_event, workspace_created_event, workspace_setup_completed_event, Services};
 
 /// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
 /// this by 4/3 on the wire (~21.4 MiB), keeping the full JSON-RPC frame
@@ -505,6 +505,14 @@ impl Services {
 
         let ws = self.store.get_workspace(&workspace_id).await?;
         publish_event(&self.event_bus, workspace_created_event(&ws)).await;
+        // Imports run no setup stage: publish the completion immediately so
+        // the watcher registry starts this workspace's watchers instead of
+        // holding the deferred start until the setup backstop expires.
+        publish_event(
+            &self.event_bus,
+            workspace_setup_completed_event(&workspace_id, false, None),
+        )
+        .await;
 
         Ok(serde_json::json!({
             "workspace": ws,

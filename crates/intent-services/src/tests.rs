@@ -20991,6 +20991,52 @@ mod setup_lifecycle_events {
 
         assert_quiet(&mut sub).await;
     }
+
+    /// `publish_workspace_created` (the out-of-`Services` insert path used by
+    /// the legacy importer) pairs its `workspace:created` with an immediate
+    /// `completed { ranScript: false }` — imports run no setup stage, so the
+    /// watcher registry must not hold their watcher start until the backstop.
+    #[tokio::test]
+    async fn publish_workspace_created_emits_immediate_completed() {
+        let root = unique_dir("intentd-setupev-legacy-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Imported".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // Subscribe after the create so only the re-publish is in scope.
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![
+                "workspace:created".to_string(),
+                "workspace:setup:*".to_string(),
+            ],
+            ..Default::default()
+        });
+        crate::publish_workspace_created(&bus, &ws).await;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:created");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
+    }
 }
 
 mod file_ops_service {
