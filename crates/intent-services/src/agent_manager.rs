@@ -1110,6 +1110,13 @@ impl ProcessRegistry {
     /// here would be a TOCTOU: earlier kills in the sweep await (SIGTERM
     /// grace + descendant sweep), so a turn could start between the check and
     /// the kill and have its child tree killed.
+    ///
+    /// NOT cancellation-safe: dropping this future at the `kill().await`
+    /// leaks the held claim — `release` never runs for it, so `try_begin`
+    /// permanently loses for that agent and its queue never drains until
+    /// daemon restart. The reap loop task is the only production caller and
+    /// is aborted only at shutdown; a future caller must not wrap this in a
+    /// timeout/select that can drop it mid-kill.
     pub async fn evict_idle_older_than<C, R>(
         &self,
         ttl: Duration,
@@ -6210,12 +6217,15 @@ impl AgentManager {
             move |id: &AgentId| {
                 // Lock order busy → reap_claims, matching `try_begin`, so
                 // "not busy → claimed" is atomic against a concurrent claim.
+                // The insert result IS the claim: `false` (already present)
+                // means an overlapping sweep holds this id — treating that as
+                // a win would let its release drop the shared claim while
+                // this sweep's kill is still in flight, reopening the window.
                 let busy = busy.lock().unwrap();
                 if busy.contains(id) {
                     return false;
                 }
-                claims.lock().unwrap().insert(id.clone());
-                true
+                claims.lock().unwrap().insert(id.clone())
             }
         };
         let release = {

@@ -1437,6 +1437,40 @@ async fn reap_revalidates_candidate_after_earlier_kills_await() {
     );
 }
 
+/// monorepo#2118 (PR review) — an overlapping sweep must not double-claim: a
+/// candidate whose id is ALREADY in `reap_claims` (another sweep holds it
+/// mid-kill) is skipped, not killed. With the old unconditional-`true` claim,
+/// the second sweep would kill it and its release would drop the first
+/// sweep's still-needed claim, reopening the window mid-kill.
+#[tokio::test]
+async fn overlapping_sweep_does_not_double_claim() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-reap-overlap");
+    let id = AgentId::from("a-reap-overlap");
+    seed_agent(&mgr, &ws, &id).await;
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    mgr.registry()
+        .register(id.clone(), recording_kill(id.clone(), log.clone()));
+    mgr.registry().set_last_active(&id, 1);
+
+    // Another sweep holds the claim (mid-kill).
+    mgr.reap_claims.lock().unwrap().insert(id.clone());
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 0);
+    assert!(log.lock().unwrap().is_empty(), "no kill under a held claim");
+    assert!(mgr.registry().is_registered(&id), "candidate kept");
+    assert!(
+        mgr.reap_claims.lock().unwrap().contains(&id),
+        "the holder's claim is untouched (a lost try_claim never releases)"
+    );
+
+    // Holder releases: the next sweep claims and reaps normally.
+    mgr.reap_claims.lock().unwrap().remove(&id);
+    assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
+    assert!(!mgr.registry().is_registered(&id));
+}
+
 /// Track a mock agent whose handle owns a REAL child process (a long sleep),
 /// the way `create_agent` installs one, and arm the child-exit watcher for it.
 /// Returns the child's pid and the watcher task.
