@@ -110,11 +110,13 @@ pub const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cance
 pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 
 // Agent process-registry lifecycle events (new in intentd; PROTOCOL §6.5). Emitted
-// by the daemon-internal `ProcessRegistry` when a spawn queues for a concurrency
-// slot (all slots active), when a queued spawn resumes (a slot freed), and when
-// the registry evicts the LRU idle process. Self-sufficient payloads carry
-// `{ agentId, used, cap }` so a client can render the cap-saturation state without
-// polling. Mirrors the TS reference `agent-process-registry.ts` logging.
+// by the daemon-internal `ProcessRegistry` when a spawn queues for admission
+// (all slots active, or the aggregate memory budget is exceeded — monorepo#2063),
+// when a queued spawn resumes, and when the registry evicts the LRU idle process.
+// Self-sufficient payloads carry `{ agentId, used, cap, reason }` — `reason` is
+// `"slots"` or `"memory-budget"`, naming the admission constraint that drove the
+// event — so a client can render the saturation state without polling. Mirrors
+// the TS reference `agent-process-registry.ts` logging.
 pub const AGENT_PROCESS_QUEUED: &str = "agent:process:queued";
 pub const AGENT_PROCESS_RESUMED: &str = "agent:process:resumed";
 pub const AGENT_PROCESS_EVICTED: &str = "agent:process:evicted";
