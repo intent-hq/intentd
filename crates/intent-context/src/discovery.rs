@@ -13,23 +13,9 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 use intent_core::path_utils;
-
-/// Extensions Windows can actually run (`CreateProcess` / `cmd.exe`-runnable),
-/// in resolution-preference order. Mirrors the canonical provider-discovery
-/// policy in `intent_providers::discover`.
-const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
-
-/// True when `path` carries a Windows-runnable executable extension
-/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
-fn has_windows_exec_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            WINDOWS_EXEC_EXTENSIONS
-                .iter()
-                .any(|e| ext.eq_ignore_ascii_case(e))
-        })
-}
+use intent_core::path_utils::{
+    has_windows_exec_extension, is_executable_file, is_executable_file_for, WINDOWS_EXEC_EXTENSIONS,
+};
 
 /// Candidate auggie file names for the current platform. POSIX uses the bare
 /// name; Windows probes only runnable entry points (`.exe`/`.cmd`/`.bat`) in
@@ -80,35 +66,6 @@ pub fn enhanced_path() -> OsString {
     std::env::join_paths(enhanced_path_dirs()).unwrap_or_default()
 }
 
-/// True when `p` is a file that is executable (unix checks the exec bit;
-/// Windows requires a runnable executable extension — `CreateProcess` cannot
-/// run a bare extensionless file, so its mere existence is not enough).
-fn is_executable_file(p: &Path) -> bool {
-    is_executable_file_for(p, cfg!(windows))
-}
-
-/// [`is_executable_file`] parametrized on the platform (test seam — Windows CI
-/// is disabled, so the Windows arm is unit-tested on POSIX).
-fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
-    if !p.is_file() {
-        return false;
-    }
-    if is_windows {
-        return has_windows_exec_extension(p);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 /// Find the first auggie executable across `dirs` (first dir, first candidate
 /// name wins).
 pub fn find_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -153,6 +110,13 @@ fn marker_file_path_with_home_for(home: Option<&Path>, is_windows: bool) -> Opti
 /// to its runnable sibling by probing `.exe`/`.cmd`/`.bat` in the same
 /// directory, so the authoritative marker still works when that directory is
 /// off the daemon's minimal PATH.
+///
+/// Deliberate asymmetry with provider PATH scanning: marker resolution
+/// REPLACES a non-runnable extension (`with_extension` — the marker records
+/// one concrete install path, so `…\auggie.ps1` probes `…\auggie.exe`),
+/// while provider PATH-scan candidates APPEND runnable suffixes to the
+/// command as given (`name_candidates_for` in `intent_providers::discover` —
+/// `foo.py` probes `foo.py.exe`), matching how `cmd.exe` resolves PATHEXT.
 fn resolve_runnable(recorded: &Path, is_windows: bool) -> Option<PathBuf> {
     if is_executable_file_for(recorded, is_windows) {
         return Some(recorded.to_path_buf());
