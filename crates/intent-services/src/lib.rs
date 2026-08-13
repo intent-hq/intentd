@@ -19,8 +19,8 @@ use intent_core::events::{
     SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED,
     TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_TOKEN_USAGE_CHANGED,
-    WORKSPACE_UPDATED,
+    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_SETUP_COMPLETED,
+    WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -8021,6 +8021,54 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
     }
 }
 
+/// Build a `workspace:setup:started` event (§6.5): an effective setup script
+/// was resolved for the create's setup stage and a spawn will be attempted.
+fn workspace_setup_started_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SETUP_STARTED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+        }),
+    }
+}
+
+/// Build a `workspace:setup:completed` event (§6.5): the create's setup stage
+/// reached a terminal state. `ran_script` is true only when the script's
+/// terminal actually spawned; `exit_code` is present only when the script ran
+/// to exit and its status was observable. `exitCode` is omitted (not null)
+/// when unavailable so the payload stays self-sufficient.
+fn workspace_setup_completed_event(
+    workspace_id: &WorkspaceId,
+    ran_script: bool,
+    exit_code: Option<u32>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "ranScript": ran_script,
+    });
+    if let Some(code) = exit_code {
+        data["exitCode"] = serde_json::json!(code);
+    }
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SETUP_COMPLETED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
 /// Publish a `workspace:created` event for a workspace row inserted outside
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
@@ -13496,12 +13544,19 @@ impl WorkspaceApi for Services {
                     // Skipped when skipWorktree or no worktree was provisioned.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
                     // returns immediately without re-executing the script.
+                    // Setup lifecycle (§6.5): `workspace:setup:started` fires iff an
+                    // effective script was resolved and a spawn will be attempted;
+                    // exactly one `workspace:setup:completed` fires per logical create
+                    // on every terminal path of the setup stage. Idempotent replays
+                    // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
-                    if !ws.skip_worktree {
-                    if let Some(worktree_path_buf) =
+                    let setup_worktree = if ws.skip_worktree {
+                        None
+                    } else {
                         crate::git_ops::worktree_path(&ws)
-                    {
+                    };
+                    if let Some(worktree_path_buf) = setup_worktree {
                         // Spawn background task to read + execute setup script (fire-and-forget).
                         // Move config IO into the task so workspace.create doesn't block on it.
                         let workspace_id = ws.id.clone();
@@ -13540,7 +13595,15 @@ impl WorkspaceApi for Services {
                             };
                             let script = match effective_script {
                                 Some(s) => s,
-                                None => return, // No script to execute
+                                None => {
+                                    // No script to execute: the setup stage is done.
+                                    publish_event(
+                                        &bus_for_setup,
+                                        workspace_setup_completed_event(&workspace_id, false, None),
+                                    )
+                                    .await;
+                                    return;
+                                }
                             };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
@@ -13548,6 +13611,15 @@ impl WorkspaceApi for Services {
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
+                            // A script was resolved and a spawn will be attempted.
+                            publish_event(
+                                &bus_for_setup,
+                                workspace_setup_started_event(&workspace_id),
+                            )
+                            .await;
+                            // Every terminal path below funnels into exactly one
+                            // `workspace:setup:completed` publish after this block.
+                            let (ran_script, exit_code): (bool, Option<u32>) = 'setup: {
                             // Write script to a private file under worktree .intent/ directory
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
@@ -13560,7 +13632,7 @@ impl WorkspaceApi for Services {
                                         workspace = %workspace_id.as_str(),
                                         "setup script execution skipped: .intent is not a real directory (symlink or file)"
                                     );
-                                    return;
+                                    break 'setup (false, None);
                                 }
                             } else {
                                 // .intent doesn't exist, create it with restrictive permissions
@@ -13570,7 +13642,7 @@ impl WorkspaceApi for Services {
                                         error = %e,
                                         "failed to create .intent directory for setup script"
                                     );
-                                    return;
+                                    break 'setup (false, None);
                                 }
                                 #[cfg(unix)]
                                 {
@@ -13615,7 +13687,7 @@ impl WorkspaceApi for Services {
                                     error = %e,
                                     "failed to write setup script to private file"
                                 );
-                                return;
+                                break 'setup (false, None);
                             }
                             // cmd.exe fallback only: the timing wrapper is a
                             // sibling .cmd file rather than an inline `-c`
@@ -13633,7 +13705,7 @@ impl WorkspaceApi for Services {
                                         "failed to write setup script cmd wrapper"
                                     );
                                     let _ = tokio::fs::remove_file(&script_path).await;
-                                    return;
+                                    break 'setup (false, None);
                                 }
                                 Some(p)
                             } else {
@@ -13670,18 +13742,19 @@ impl WorkspaceApi for Services {
                                     // Spawn output stream to fan setup script output to event bus
                                     crate::terminal_ops::spawn_output_stream(
                                         pty_for_setup.clone(),
-                                        bus_for_setup,
+                                        bus_for_setup.clone(),
                                         workspace_id.clone(),
                                         pty_id,
                                         terminal_id,
                                     );
                                     // Wait for the script to actually complete before cleanup
-                                    let _ = pty_for_setup.wait(pty_id).await;
+                                    let exit = pty_for_setup.wait(pty_id).await;
                                     // Best-effort cleanup of the script + wrapper files (after exit)
                                     let _ = tokio::fs::remove_file(&script_path).await;
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
+                                    (true, exit.ok().map(|e| e.exit_code))
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -13694,10 +13767,28 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
+                                    (false, None)
                                 }
                             }
+                            };
+                            publish_event(
+                                &bus_for_setup,
+                                workspace_setup_completed_event(
+                                    &workspace_id,
+                                    ran_script,
+                                    exit_code,
+                                ),
+                            )
+                            .await;
                         });
-                    }
+                    } else {
+                        // skipWorktree / no worktree provisioned: the setup stage
+                        // never runs, but the lifecycle still completes.
+                        publish_event(
+                            &bus_for_setup,
+                            workspace_setup_completed_event(&ws.id, false, None),
+                        )
+                        .await;
                     }
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
@@ -15244,6 +15335,10 @@ impl WorkspaceApi for Services {
                 );
             }
             publish_event(&bus, workspace_created_event(&ws)).await;
+            // `workspace.duplicate` never runs a setup script, but the setup
+            // lifecycle (§6.5) still completes so clients waiting on
+            // `workspace:setup:completed` converge on every create-shaped flow.
+            publish_event(&bus, workspace_setup_completed_event(&ws.id, false, None)).await;
             // Seed the default spec note for the new workspace (mirrors the
             // `workspace.create` flow so `note.list` returns the well-known
             // `spec` id immediately).

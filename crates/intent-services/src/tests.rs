@@ -7360,13 +7360,18 @@ mod change_event_parity {
             .await
             .expect("first create")
             .workspace;
-        // The first create publishes `workspace:created` and the spec seed's
-        // `note:created`; drain both before checking replay is silent.
+        // The first create publishes `workspace:created`, the spec seed's
+        // `note:created`, and the setup stage's `workspace:setup:completed`
+        // (no worktree → no script); drain all three before checking replay
+        // is silent.
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "workspace:created");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "workspace:setup:completed");
+        assert_eq!(ev["data"]["ranScript"], json!(false));
 
         // Replay with the same key but different input still returns the
         // original workspace (the body is never re-executed).
@@ -7624,6 +7629,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         let spec_before = h
             .store
@@ -7677,6 +7683,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (initial seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         // Drop the spec straight through the store to simulate a corrupt /
         // manually-cleared workspace.
@@ -8098,6 +8105,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         let stray_id = NoteId::new();
         let stray = Note {
@@ -20710,6 +20718,278 @@ mod worktree_provisioning {
             .workspace;
 
         assert_eq!(ws.title, "My Explicit Title");
+    }
+}
+
+/// Setup lifecycle events (§6.5): `workspace:setup:started` fires iff an
+/// effective setup script was resolved and a spawn will be attempted; exactly
+/// one `workspace:setup:completed` fires per logical create on every terminal
+/// path — script exit (`ranScript: true` + `exitCode`), no script, skipped
+/// isolation, no worktree — and `workspace.duplicate` (which never runs a
+/// setup script) completes immediately with `ranScript: false`.
+mod setup_lifecycle_events {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::TempDb;
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a git repo with one commit; returns (guard, head branch).
+    fn seed_repo(prefix: &str) -> (TempDir, String) {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        (dir, branch)
+    }
+
+    async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_event_bus(bus.clone());
+        (svc, bus, tmp)
+    }
+
+    /// Subscribe to only the setup lifecycle events (the setup terminal's
+    /// `terminal:*` stream and the create's other events stay out of scope).
+    fn subscribe_setup(bus: &EventBus) -> Subscription {
+        bus.subscribe(SubscriptionFilter {
+            event_types: vec!["workspace:setup:*".to_string()],
+            ..Default::default()
+        })
+    }
+
+    /// Receive one setup event (generous timeout: script paths cross a PTY
+    /// spawn + reap poll), serialized to wire JSON.
+    async fn recv_setup(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(20), sub.recv())
+            .await
+            .expect("setup event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event per delivery");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_quiet(sub: &mut Subscription) {
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
+    }
+
+    /// Script runs to a zero exit: `started` then `completed` with
+    /// `ranScript: true` and `exitCode: 0`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_success_emits_started_then_completed_exit_zero() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-ok-repo");
+        let root = unique_dir("intentd-setupev-ok-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 0".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:started");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"]["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"]["ranScript"], json!(true));
+        assert_eq!(ev["data"]["exitCode"], json!(0));
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// Script exits non-zero: `completed` still fires once, carrying the
+    /// script's real exit code — a failing setup script never fails the
+    /// create and never suppresses the lifecycle terminal event.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_failure_emits_completed_with_nonzero_exit_code() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-fail-repo");
+        let root = unique_dir("intentd-setupev-fail-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 7".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:started");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["data"]["ranScript"], json!(true));
+        assert_eq!(ev["data"]["exitCode"], json!(7));
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// Worktree provisioned but no effective script anywhere (no explicit
+    /// param, no repo config, no legacy row): no `started`, exactly one
+    /// `completed` with `ranScript: false` and no `exitCode` key.
+    #[tokio::test]
+    async fn no_script_emits_completed_only() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-noscript-repo");
+        let root = unique_dir("intentd-setupev-noscript-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false }),
+            "no exitCode key when no script ran"
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// `skipIsolation` opts out of the setup stage entirely — even with an
+    /// explicit `setupScript` in the request, no `started` fires and the
+    /// lifecycle completes immediately with `ranScript: false`.
+    #[tokio::test]
+    async fn skip_isolation_emits_completed_without_running_script() {
+        let root = unique_dir("intentd-setupev-skip-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Skip isolation".to_string()),
+                    skip_isolation: Some(true),
+                    setup_script: Some("exit 0".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// `workspace.duplicate` runs no setup script: exactly one immediate
+    /// `completed { ranScript: false }` under the duplicate's id, no `started`.
+    #[tokio::test]
+    async fn duplicate_emits_immediate_completed() {
+        let root = unique_dir("intentd-setupev-dup-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        // Subscribe after the create so its own `completed` is out of scope.
+        let mut sub = subscribe_setup(&bus);
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], dup.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": dup.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
     }
 }
 

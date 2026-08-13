@@ -281,6 +281,16 @@ pub const WORKSPACE_DELETE_SCHEDULED: &str = "workspace:delete-scheduled";
 pub const WORKSPACE_DELETE_CANCELLED: &str = "workspace:delete-cancelled";
 pub const WORKSPACE_OPENED: &str = "workspace:opened";
 pub const WORKSPACE_CLOSED: &str = "workspace:closed";
+// Setup-script lifecycle of the `workspace.create` setup stage (PROTOCOL
+// §6.5). `workspace:setup:started` `{ workspaceId }` fires when an effective
+// setup script was resolved and a spawn will be attempted;
+// `workspace:setup:completed` `{ workspaceId, ranScript, exitCode? }` fires
+// exactly once per logical create on every terminal path (no script, spawn
+// failure, script exit) — including create paths that never reach the setup
+// stage (`skipWorktree`, no worktree) and `workspace.duplicate`, which runs
+// no setup. Idempotent replays publish nothing (same as `workspace:created`).
+pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
+pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
 pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
 // payloads carry the new derived value so the FE flips the green/blue dot with no
