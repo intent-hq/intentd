@@ -1370,7 +1370,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1520,7 +1520,7 @@ async fn wss_agent_set_model_provider_id_param() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1702,7 +1702,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2418,7 +2418,7 @@ async fn wss_agent_delegate_persists_reasoning_effort() {
 async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_levels() {
     let dir = test_tempdir("intentd-wss-create-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2516,7 +2516,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
 async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let dir = test_tempdir("intentd-wss-settings-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -3509,7 +3509,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
             .unwrap_or(0)
     };
     let last_good = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
