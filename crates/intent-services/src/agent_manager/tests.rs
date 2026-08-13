@@ -477,6 +477,58 @@ async fn budget_driven_process_events_carry_memory_budget_reason() {
     );
 }
 
+/// When both constraints bind at once (all slots active AND over budget), the
+/// budget wins the reason label — a freed slot alone cannot clear it.
+#[tokio::test]
+async fn both_constraints_binding_labels_reason_memory_budget() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    // Cap of 1 with one ACTIVE process (no idle to evict) AND over budget:
+    // both constraints bind, so the queued reason must be memory-budget.
+    let reg = Arc::new(ProcessRegistry::new(1).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, spawning) = (AgentId::from("active"), AgentId::from("spawning"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle = tokio::spawn(async move { reg2.acquire(&spawning2).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    {
+        let events = events.lock().unwrap();
+        let queued = events
+            .iter()
+            .find(|(a, e, _)| e == "agent:process:queued" && a == &spawning)
+            .expect("queued event recorded");
+        assert_eq!(queued.2, "memory-budget", "budget wins when both bind");
+    }
+
+    // Release both constraints so the queued spawn resolves and the task ends.
+    probe.set(gb);
+    reg.deregister(&active);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("acquire resolves once both constraints clear")
+        .expect("task ok");
+}
+
 #[tokio::test]
 async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     let gb = super::GB;

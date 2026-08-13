@@ -869,7 +869,8 @@ impl ProcessRegistry {
 
     /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
     /// Chainable builder; returns `Self` so the manager can wire this after
-    /// construction. The callback signature is `(agent_id, event_type, used, cap)`.
+    /// construction. The callback signature is
+    /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
         self
