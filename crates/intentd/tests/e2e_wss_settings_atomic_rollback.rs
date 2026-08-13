@@ -704,7 +704,17 @@ async fn agent_memory_knobs_over_wss() {
     assert_eq!(entry["type"], json!("number"));
     assert_eq!(entry["category"], json!("agents"));
     assert_eq!(entry["min"], json!(0.0), "{entry}");
-    assert_eq!(entry["defaultValue"], json!(0.0), "{entry}");
+    // The default is the *absent* key (auto, monorepo#2063): the wire entry
+    // omits `defaultValue` entirely (indexing would read an absent key as
+    // null too, so assert on the object) while `value` is always present and
+    // explicitly null on a fresh install.
+    let entry_obj = entry.as_object().expect("entry is an object");
+    assert!(
+        !entry_obj.contains_key("defaultValue"),
+        "defaultValue must be omitted, not null: {entry}"
+    );
+    assert!(entry_obj.contains_key("value"), "{entry}");
+    assert_eq!(entry["value"], Value::Null, "{entry}");
     let max = entry["max"]
         .as_f64()
         .unwrap_or_else(|| panic!("{budget} must advertise a max: {entry}"));
@@ -766,6 +776,24 @@ async fn agent_memory_knobs_over_wss() {
     let resp = wss_rpc(&mut ws, 7, "settings.reset", json!({ "path": reap })).await;
     assert_success_envelope(&resp, 7);
     assert_eq!(resp["result"]["value"].as_f64(), Some(10.0), "{resp}");
+
+    // The explicit 0 written above is a *stored* off, distinct from auto: it
+    // reads back as 0 with origin `file`.
+    let resp = wss_rpc(&mut ws, 8, "settings.get", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 8);
+    assert_eq!(resp["result"]["value"].as_f64(), Some(0.0), "{resp}");
+    assert_eq!(resp["result"]["origin"], json!("file"), "{resp}");
+
+    // `settings.reset` is the only wire path back to auto (monorepo#2063):
+    // it must *remove* the key — value returns to null, origin to `default`
+    // — not rewrite a literal 0, which would pin the install to off.
+    let resp = wss_rpc(&mut ws, 9, "settings.reset", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 9);
+    assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
+    let resp = wss_rpc(&mut ws, 10, "settings.get", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 10);
+    assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
+    assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
 }
 
 /// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,
