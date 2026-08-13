@@ -2620,8 +2620,11 @@ impl Services {
     ///    roots — idempotent: already-tracked paths are left untouched, and a
     ///    root removed via `ws.git.unregisterRoot` is re-added by the scan
     ///    while the submodule exists on disk;
-    /// 2. auto-prune roots whose path no longer exists on disk (emitting
-    ///    `gitRoot:unregistered` via [`Services::unregister_git_root`]);
+    /// 2. auto-prune roots whose path no longer exists on disk — only a
+    ///    positive `NotFound`/`NotADirectory` stat prunes; any other stat
+    ///    error (transient `PermissionDenied`/EIO on a flaky mount) logs and
+    ///    skips (emitting `gitRoot:unregistered` via
+    ///    [`Services::unregister_git_root`] when pruning);
     /// 3. refresh each remaining root's PR linkage by its current branch
     ///    against its detected repo ([`Services::refresh_git_root_pr`]).
     ///
@@ -2715,14 +2718,32 @@ impl Services {
             }
         };
         for root in roots {
-            if tokio::fs::metadata(&root.path).await.is_err() {
-                if let Err(e) = self.unregister_git_root(&root.id).await {
-                    tracing::warn!(
-                        workspace = %ws.id.as_str(),
-                        git_root = %root.id.as_str(),
-                        error = %e,
-                        "git root sweep: auto-prune failed"
-                    );
+            // Auto-prune only on a genuine path-gone (`NotFound`, or a parent
+            // component that is no longer a directory). Roots may live
+            // anywhere on the host (network/FUSE mounts included), so a
+            // transient `PermissionDenied`/EIO must never delete an
+            // agent-registered root with its attribution and PR history —
+            // those kinds log and skip the root until the next sweep.
+            if let Err(e) = tokio::fs::metadata(&root.path).await {
+                match e.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                        if let Err(e) = self.unregister_git_root(&root.id).await {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root sweep: auto-prune failed"
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            git_root = %root.id.as_str(),
+                            error = %e,
+                            "git root sweep: root path unreadable, skipping (not pruned)"
+                        );
+                    }
                 }
                 continue;
             }

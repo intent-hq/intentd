@@ -11066,6 +11066,57 @@ mod pr {
         assert_eq!(roots.len(), 1);
     }
 
+    /// Auto-prune fires only on a genuine path-gone (`NotFound` /
+    /// `NotADirectory`): a transient stat failure of any other kind
+    /// (`PermissionDenied` here, standing in for EIO on a flaky mount) must
+    /// never delete an agent-registered root with its attribution and PR
+    /// history — the sweep logs and skips it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_does_not_prune_root_on_transient_stat_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Root at guard/repo where `guard` is later made unsearchable, so a
+        // stat of the root's path fails with PermissionDenied, not NotFound.
+        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let repo_dir = guard.join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let root = sweep_root(&ws.id, &repo_dir, None);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root.path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&guard);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "root must survive the transient error");
+        assert_eq!(roots[0].id, root.id);
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 0, "no prune event");
+    }
+
     /// An unlinked root with a detected repo discovers an open PR by its
     /// current branch (emitting `gitRoot:updated`); a re-sweep with identical
     /// forge state is a no-op.
