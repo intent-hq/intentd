@@ -218,6 +218,24 @@ fn set_form_writes_config_and_exits_without_daemon_or_network() {
         fs::read_to_string(&paths.config_path).unwrap(),
         "channel = \"beta\"\n"
     );
+
+    let alpha_output = run_sitter(dir.path(), &base_url, &[], &["sitter", "channel", "alpha"]);
+    assert_eq!(
+        alpha_output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&alpha_output)
+    );
+    assert_eq!(
+        fs::read_to_string(&paths.config_path).unwrap(),
+        "channel = \"alpha\"\n"
+    );
+    assert!(
+        stdout_of(&alpha_output).contains("channel alpha pinned"),
+        "stdout: {}",
+        stdout_of(&alpha_output)
+    );
+
     let stdout = stdout_of(&output);
     assert!(stdout.contains("channel beta pinned"), "stdout: {stdout}");
     assert!(stdout.contains("`intentd restart`"), "stdout: {stdout}");
@@ -258,6 +276,9 @@ fn get_form_prints_effective_channel_and_origin() {
     fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
     let output = run_sitter(dir.path(), &base_url, &[], get);
     assert_eq!(stdout_of(&output), "beta (from config)\n");
+    fs::write(&paths.config_path, "channel = \"alpha\"\n").unwrap();
+    let output = run_sitter(dir.path(), &base_url, &[], get);
+    assert_eq!(stdout_of(&output), "alpha (from config)\n");
 
     // Env overrides config; flag overrides env.
     let output = run_sitter(dir.path(), &base_url, &[(CHANNEL_ENV, "stable")], get);
@@ -269,6 +290,13 @@ fn get_form_prints_effective_channel_and_origin() {
         &["--sitter-channel=beta", "sitter", "channel"],
     );
     assert_eq!(stdout_of(&output), "beta (from flag)\n");
+    let output = run_sitter(
+        dir.path(),
+        &base_url,
+        &[(CHANNEL_ENV, "stable")],
+        &["--sitter-channel=alpha", "sitter", "channel"],
+    );
+    assert_eq!(stdout_of(&output), "alpha (from flag)\n");
 
     assert!(!daemon_log_path(dir.path()).exists());
 }
