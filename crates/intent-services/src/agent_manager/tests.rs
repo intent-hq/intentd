@@ -483,6 +483,51 @@ async fn deregister_credits_back_the_provisional_charge() {
         .expect("the credited charge frees the headroom immediately");
 }
 
+/// `budget_status` (monorepo#2063 A3): the `system.status` visibility read —
+/// `None` without a budget; with one, the installed bytes, the charged bytes
+/// admission compares (sample + pending correction; `None` before the first
+/// sample), and the live waiter count.
+#[tokio::test]
+async fn budget_status_reports_budget_charged_and_queued() {
+    let gb = super::GB;
+    // No budget installed → no visibility fields at all.
+    assert!(ProcessRegistry::new(8).budget_status().is_none());
+
+    // Installed but never sampled → the ceiling serves, charged is absent.
+    let reg = ProcessRegistry::new(8);
+    assert!(reg.set_memory_budget(4 * gb, Arc::new(NeverSampled)));
+    assert_eq!(reg.budget_status(), Some((4 * gb, None, 0)));
+
+    // Sampled, over budget, with a spawn queued behind the gate: charged
+    // reflects the sample and the waiter is counted.
+    let reg = Arc::new(ProcessRegistry::new(8));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let active = AgentId::from("active");
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+    let reg2 = reg.clone();
+    let handle = tokio::spawn(async move { reg2.acquire(&AgentId::from("spawning")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (budget, charged, queued) = reg.budget_status().expect("budget installed");
+    assert_eq!(budget, 4 * gb);
+    assert_eq!(charged, Some(10 * gb), "charged is what admission compares");
+    assert_eq!(queued, 1, "the queued spawn is visible");
+
+    // A fresh sample the correction has not been reset against is served
+    // uncorrected — and reading it never perturbs admission state.
+    probe.set(gb);
+    let (_, charged, _) = reg.budget_status().expect("budget installed");
+    assert_eq!(charged, Some(gb));
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the drained tree admits the queued spawn")
+        .expect("task ok");
+    let (_, _, queued) = reg.budget_status().expect("budget installed");
+    assert_eq!(queued, 0, "the admitted spawn left the queue");
+}
+
 #[tokio::test]
 async fn lifecycle_active_processes_are_not_reaped() {
     let reg = ProcessRegistry::new(8);

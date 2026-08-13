@@ -841,6 +841,35 @@ impl ProcessRegistry {
         (!budget_admits(charged, budget.budget_bytes, inner.entries.len())).then_some(charged)
     }
 
+    /// Read-only budget visibility for `system.status` (monorepo#2063):
+    /// `Some((budget_bytes, charged_bytes, queued_spawns))` when a budget is
+    /// installed, else `None`. `charged_bytes` is what admission actually
+    /// compares — the last tree sample plus the pending correction — and is
+    /// `None` until the first sample lands (the budget is inert until then,
+    /// see [`Self::budget_denies`]). A sample newer than the one the
+    /// correction was accumulated against is served uncorrected, mirroring
+    /// the reset `budget_denies` would perform — but without mutating, so a
+    /// status read never perturbs admission state. `queued_spawns` counts
+    /// live waiters (dropped receivers excluded), whether they queued on the
+    /// slot cap or the budget.
+    pub fn budget_status(&self) -> Option<(u64, Option<u64>, u64)> {
+        let budget = self.memory.get()?;
+        let inner = self.inner.lock().unwrap();
+        let charged = budget.probe.sample().map(|(sampled, seq)| {
+            if inner.budget_sample_seq == Some(seq) {
+                charged_bytes(sampled, inner.budget_pending_bytes)
+            } else {
+                sampled
+            }
+        });
+        let queued = inner
+            .wait_queue
+            .iter()
+            .filter(|(_, tx)| !tx.is_closed())
+            .count() as u64;
+        Some((budget.budget_bytes, charged, queued))
+    }
+
     /// Adjust the pending correction by one agent's provisional cost: `+1` on
     /// admission (the spawn is not in the last sample yet), `-1` on deregister
     /// (the dead process still is). No-op when no budget is installed.
