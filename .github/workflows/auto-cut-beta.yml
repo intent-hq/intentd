@@ -87,9 +87,14 @@ jobs:
           # Identify the open release-plz Release PR: head branch
           # `release-plz-*` and a release title in either pr_name form this
           # repo has produced (see release-plz.yml's concurrency comment).
+          # Branch name and title alone are attacker-controlled (a fork PR
+          # can use both), so the candidate is also required to come from a
+          # branch in THIS repository (no fork heads), and its author is
+          # verified below against the release-plz PAT identity.
           prs=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
-            --json number,title,headRefName,isDraft,labels \
-            --jq '[.[] | select((.headRefName | startswith("release-plz-"))
+            --json number,title,headRefName,isDraft,labels,isCrossRepository,author \
+            --jq '[.[] | select((.isCrossRepository == false)
+                  and (.headRefName | startswith("release-plz-"))
                   and ((.title | startswith("chore: release v"))
                     or (.title | startswith("chore(intentd): release v"))))]')
           count=$(jq 'length' <<<"$prs")
@@ -106,6 +111,20 @@ jobs:
           number=$(jq -r '.[0].number' <<<"$prs")
           title=$(jq -r '.[0].title' <<<"$prs")
           echo "Release PR: #$number ($title)"
+
+          # Bind the candidate to the release-plz identity: the Release PR
+          # is opened with the same RELEASE_PLZ_TOKEN PAT this workflow
+          # authenticates with, so its author must be the token's own login.
+          # Together with the same-repo check above, this pins the merge
+          # target to the repository-managed release-plz PR — a PR that
+          # merely imitates the branch-name/title shape never qualifies.
+          viewer=$(gh api graphql -f query='query { viewer { login } }' \
+            --jq '.data.viewer.login')
+          author=$(jq -r '.[0].author.login' <<<"$prs")
+          if [[ -z "$viewer" || "$author" != "$viewer" ]]; then
+            echo "::warning::Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
+            exit 0
+          fi
 
           # Pause guardrail: a human puts `hold-release` on the Release PR to
           # stop auto-cutting (e.g. to batch more changes or hold a bad
@@ -151,18 +170,25 @@ jobs:
             exit 0
           fi
 
-          unresolved=$(gh api graphql \
-            -f query='query($owner: String!, $repo: String!, $pr: Int!) {
+          # --paginate walks every reviewThreads page (an unresolved thread
+          # past the first page must still block the merge); --jq emits one
+          # per-page count, summed by awk.
+          unresolved=$(gh api graphql --paginate \
+            -f query='query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
               repository(owner: $owner, name: $repo) {
                 pullRequest(number: $pr) {
-                  reviewThreads(first: 100) { nodes { isResolved } }
+                  reviewThreads(first: 100, after: $endCursor) {
+                    nodes { isResolved }
+                    pageInfo { hasNextPage endCursor }
+                  }
                 }
               }
             }' \
             -f owner="${GITHUB_REPOSITORY%/*}" \
             -f repo="${GITHUB_REPOSITORY#*/}" \
             -F pr="$number" \
-            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length')
+            --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)] | length' \
+            | awk '{ sum += $1 } END { print sum + 0 }')
           if [[ "$unresolved" -ne 0 ]]; then
             echo "Release PR #$number has $unresolved unresolved review thread(s); skipping."
             exit 0
