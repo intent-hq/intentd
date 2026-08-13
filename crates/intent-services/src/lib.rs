@@ -288,6 +288,19 @@ pub struct Services {
     /// only — a daemon restart forgets the streak (the provider-block
     /// classifier still applies via the persisted `stop_reason`).
     agent_failure_streaks: Arc<Mutex<HashMap<AgentId, (String, u32)>>>,
+    /// Handoff slot for a terminal error the streaming path already persisted
+    /// (monorepo#2050): `agent_id → PersistedTerminalError`. When
+    /// `run_prompt_turn` (or the worker's idle-timeout-cap branch) persists
+    /// `status = error` + `stop_reason` BEFORE it emits the terminal
+    /// `agent:failed`/`agent:stream:end` pair — the durable-before-observable
+    /// guarantee — it stashes the persisted context here so the turn worker's
+    /// [`handle_terminal_turn_failure`](crate::agent_manager) reuses it instead
+    /// of recording the identical-failure streak and writing the Error status a
+    /// SECOND time (which would double-count the poison streak). Entries are
+    /// single-shot: the handler removes the slot as soon as it settles the
+    /// failure, so a stale entry never bleeds into a later turn. In-memory only.
+    pending_terminal_error:
+        Arc<Mutex<HashMap<AgentId, crate::agent_manager::PersistedTerminalError>>>,
     /// Last `agent:failed` wake delivered per `(parent, child)` pair
     /// (monorepo#840): the error text of the most recent failure wake. A
     /// repeated child failure with an UNCHANGED error is suppressed (the
@@ -782,6 +795,7 @@ impl Services {
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
+            pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
@@ -3629,6 +3643,33 @@ impl Services {
             .lock()
             .expect("agent failure streak registry poisoned")
             .remove(agent_id);
+    }
+
+    /// Stash the terminal-error context the streaming path already persisted
+    /// (monorepo#2050) so the turn worker's terminal-failure handler reuses it
+    /// instead of recording the failure streak and writing the Error status a
+    /// second time. Overwrites any prior slot for `agent_id` (single-shot).
+    pub(crate) fn stash_pending_terminal_error(
+        &self,
+        agent_id: &AgentId,
+        error: crate::agent_manager::PersistedTerminalError,
+    ) {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
+            .insert(agent_id.clone(), error);
+    }
+
+    /// Take (and remove) the stashed terminal-error context for `agent_id`, if
+    /// the streaming path persisted one for this failure (monorepo#2050).
+    pub(crate) fn take_pending_terminal_error(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<crate::agent_manager::PersistedTerminalError> {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
+            .remove(agent_id)
     }
 
     /// The consecutive-identical-terminal-failure count for `agent_id` (0 when

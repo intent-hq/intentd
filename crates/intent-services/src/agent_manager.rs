@@ -7532,6 +7532,22 @@ async fn run_message_worker(
                                 error = %e,
                                 "prompt idle timeout — consecutive-timeout cap spent, failing terminally"
                             );
+                            // Durable-before-observable (monorepo#2050): persist
+                            // Error + stop_reason and stash it BEFORE this branch
+                            // emits its own `agent:failed`, so a client reading
+                            // `agent.get`/`agent.getSession` on that event sees the
+                            // persisted Error. `handle_terminal_turn_failure` below
+                            // reuses the stash (streak recorded / status written
+                            // exactly once, monorepo#840).
+                            let persist = persist_terminal_error_status(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &e.to_string(),
+                            )
+                            .await;
+                            mgr.services
+                                .stash_pending_terminal_error(&agent_id, persist);
                             let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                             if let Some(tid) = options.turn_id.as_deref() {
                                 data["turnId"] = json!(tid);
@@ -8637,7 +8653,7 @@ async fn publish_terminal_failure_events(
 /// reads `agent.get`/`agent.getSession` upon observing either event is
 /// guaranteed the persisted Error. Returns the context the observable half
 /// ([`publish_error_status_and_requeue`]) needs to emit the matching events.
-struct PersistedTerminalError {
+pub(crate) struct PersistedTerminalError {
     /// The failure text persisted into `agent_session.stop_reason`.
     error_text: String,
     /// Identical-failure streak AFTER recording this failure (monorepo#840).
@@ -8652,8 +8668,15 @@ struct PersistedTerminalError {
     status_persisted: bool,
 }
 
-async fn persist_terminal_error_status(
-    mgr: &AgentManager,
+/// Durable slice of the terminal-failure path, over the bare [`Services`]
+/// handle (monorepo#2050): the streaming path ([`Services::run_prompt_turn`])
+/// has no [`AgentManager`], but the persist touches only the services surface,
+/// so it can run there too — ahead of the streaming path's own terminal
+/// emits — and the resulting [`PersistedTerminalError`] is handed to the worker
+/// via [`Services::stash_pending_terminal_error`]. The `&AgentManager` entry
+/// point [`persist_terminal_error_status`] delegates here.
+pub(crate) async fn persist_terminal_error_status_via_services(
+    services: &Services,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     error_text: &str,
@@ -8661,7 +8684,7 @@ async fn persist_terminal_error_status(
     // monorepo#840: record the identical-failure streak BEFORE persisting so
     // `session_poisoned` sees a consistent (status, streak) pair as soon as
     // the Error status lands.
-    let streak = mgr.services.record_terminal_failure(agent_id, error_text);
+    let streak = services.record_terminal_failure(agent_id, error_text);
     // monorepo#940: the same classification that quarantines the session
     // (`session_poisoned`) is surfaced on the wire as `sessionCorrupted` so
     // clients get a structured "retry will recreate" signal, not just the raw
@@ -8680,8 +8703,7 @@ async fn persist_terminal_error_status(
     // the bus, so subscribers see the canonical fields immediately via
     // agent.get/getSession.
     let ts = now_iso();
-    let status_persisted = match mgr
-        .services
+    let status_persisted = match services
         .store
         .set_agent_session_status(
             workspace_id,
@@ -8706,6 +8728,18 @@ async fn persist_terminal_error_status(
         ts,
         status_persisted,
     }
+}
+
+/// `&AgentManager` entry point for the durable terminal-error persist; thin
+/// delegate to [`persist_terminal_error_status_via_services`].
+async fn persist_terminal_error_status(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    error_text: &str,
+) -> PersistedTerminalError {
+    persist_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, error_text)
+        .await
 }
 
 /// Observable half of the terminal-failure path: emit `agent:status-changed`
@@ -8999,7 +9033,7 @@ const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// spec's only sanctioned cancel-error shape is code `-32800` (the message is
 /// free text there too). The "cancelled" substring heuristic remains for
 /// non-RPC renderings, which carry no data suffix.
-fn prompt_cancellation_error(err: &Error) -> bool {
+pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
     };
@@ -9184,11 +9218,19 @@ async fn handle_terminal_turn_failure(
     mgr.kill_child_only(agent_id).await;
 
     let error_text = error.to_string();
-    // Durable-before-observable (monorepo#2009): persist Error + stop_reason
-    // before the terminal pair (when this path still owes it) reaches the bus.
-    // When the streaming path already emitted the pair, the persist is the
-    // earliest this handler can make the status durable.
-    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
+    // Durable-before-observable (monorepo#2009/#2050): persist Error +
+    // stop_reason before the terminal pair (when this path still owes it)
+    // reaches the bus. The streaming path (`run_prompt_turn`) that already
+    // emitted the pair also already persisted (durable-before-observable there
+    // too) and stashed the context — reuse it so the identical-failure streak
+    // (monorepo#840) is recorded exactly once and the Error status is not
+    // written twice. Fall back to persisting here when no stash exists (the
+    // pre-#2050 path: a `?`-propagated store error, or the idle-timeout-cap
+    // branch before its own persist).
+    let persist = match mgr.services.take_pending_terminal_error(agent_id) {
+        Some(precomputed) => precomputed,
+        None => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
+    };
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(
             mgr,
