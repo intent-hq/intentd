@@ -5544,6 +5544,77 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.attachmentUpload.begin`: open a staged chunked attachment
+    /// upload session for payloads larger than one RPC frame (PROTOCOL
+    /// §5.9). Validates the header — the workspace must exist, `file_name`
+    /// non-empty, `size_bytes` positive and within the 1 GiB attachment cap,
+    /// `sha256` 64 hex chars — and returns `{ uploadId, maxChunkBytes }`.
+    fn file_attachment_upload_begin(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+        mime_type: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_name, size_bytes, sha256, mime_type);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_begin not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.chunk`: stage one seq-numbered base64 slice of
+    /// the payload; retrying a seq is idempotent and chunks may arrive in
+    /// any order (PROTOCOL §5.9). Returns `{ uploadId, seq, receivedBytes }`.
+    fn file_attachment_upload_chunk(
+        &self,
+        upload_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (upload_id, seq, data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.commit`: verify the assembled payload's
+    /// SHA-256 and place it through the same collision-safe placement +
+    /// attachment-registry path as `file.placeAttachment` (PROTOCOL §5.9).
+    /// The result is byte-shape-identical to a successful
+    /// `file.placeAttachment`: `{ ok, path, fileName, size, attachmentId,
+    /// mimeType?, uploadedAt }`.
+    fn file_attachment_upload_commit(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = upload_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.abort`: drop the staged upload session and
+    /// delete its staging directory (PROTOCOL §5.9). Idempotent — aborting
+    /// an unknown id succeeds quietly. Returns `{ uploadId, aborted }`.
+    fn file_attachment_upload_abort(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = upload_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_abort not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file.getAttachmentInfo`: attachment-registry metadata lookup
     /// (PROTOCOL §5.9) → `{ attachmentId, fileName, mimeType?, size,
     /// uploadedAt, path, exists }`. `path` is the stored workspace-relative

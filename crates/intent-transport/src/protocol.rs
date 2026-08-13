@@ -145,10 +145,20 @@
 //! daemon-owned root lifecycle (agent registration via the MCP-only
 //! `ws.git.registerRoot` / `ws.git.unregisterRoot` / `ws.git.listRoots`
 //! bindings, submodule auto-detection, auto-prune, per-root PR discovery) —
-//! 288 router methods, 327 total.
+//! 288 router methods, 327 total. Version 6.16 adds the staged chunked
+//! attachment upload surface `file.attachmentUpload.begin` / `.chunk` /
+//! `.commit` / `.abort` (§5.9): chunked, idempotent upload of an attachment
+//! payload larger than one RPC frame (16 MiB decoded per chunk, 1 GiB per
+//! attachment), with `commit` SHA-256-verifying the assembled payload and
+//! placing it through the same collision-safe placement + attachment
+//! registry path as `file.placeAttachment` — the commit result is
+//! byte-shape-identical to a successful `placeAttachment` result. Sessions
+//! are in-memory only: a daemon restart drops them and orphaned staging
+//! dirs are swept lazily by the next `begin` — 292 router methods, 331
+//! total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.15";
+pub const PROTOCOL_VERSION: &str = "6.16";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
