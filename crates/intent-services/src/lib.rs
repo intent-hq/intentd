@@ -2218,11 +2218,14 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // The attention flag feeds the derived displayStatus
-        // (`review_required` axis only, §6.5 — `unread` never moves it):
-        // recompute-and-compare after the flag change so the transition
-        // emits.
-        self.maybe_emit_display_status_changed(workspace_id).await;
+        // The `unread` flag is not a displayStatus axis (§6.5), so the
+        // turn-end unread raise (the sole caller) never moves the derived
+        // rollup — skip the recompute (it would be a guaranteed no-op). A
+        // non-`unread` raise can move the `review_required` axis, so
+        // recompute-and-compare for those so the transition emits.
+        if level != WorkspaceAttention::Unread {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         Ok(())
     }
 
