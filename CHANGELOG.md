@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.14] - 2026-08-13
+
+### 🚀 Features
+
+- Add machine-readable watchStillArmed flag to agent-watch wake metadata ([#1179](https://github.com/intent-hq/intentd/pull/1179))
+
+### 🐛 Bug Fixes
+
+- Exclude workspace-owned checkouts from the known-repo registry ([#1181](https://github.com/intent-hq/intentd/pull/1181))
+
+
 ## [0.6.13] - 2026-08-13
 
 ### 🔧 Refactor
