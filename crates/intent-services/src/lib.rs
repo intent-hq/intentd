@@ -4018,9 +4018,13 @@ impl Services {
                 if newly_recorded && event.event_type == AGENT_FAILED {
                     // The grouped watch stays armed (group settlement owns
                     // it), so this immediate wake must NOT carry the
-                    // retirement suffix.
+                    // retirement suffix — and its metadata says so
+                    // machine-readably (`watchStillArmed: true`,
+                    // monorepo#2060, mirroring the hook wakes'
+                    // `hookStillActive` flag).
                     let wake = format_completion_wake(child_id, event, None, false);
-                    let metadata = build_event_notification_metadata(&[event]);
+                    let mut metadata = build_event_notification_metadata(&[event]);
+                    metadata["watchStillArmed"] = serde_json::json!(true);
                     if let Err(e) = self
                         .deliver_parent_wake(
                             &parent_ws,
@@ -4122,9 +4126,13 @@ impl Services {
                 continue;
             }
             // `remove_watch` just retired the one-shot watch, so the wake
-            // carries the retirement + re-arm suffix (issue monorepo#2051).
+            // carries the retirement + re-arm suffix (issue monorepo#2051)
+            // and the machine-readable `watchStillArmed: false` metadata
+            // flag (monorepo#2060, mirroring the hook wakes'
+            // `hookStillActive`) so consumers don't parse the note text.
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
+            metadata["watchStillArmed"] = serde_json::json!(false);
             crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             if let Err(e) = self
                 .deliver_parent_wake(
@@ -8636,7 +8644,10 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// `ws.agent.watch` re-arm pointer (or, for `agent:deleted`, a "cannot be
 /// re-watched" note — a deleted agent is rejected by `agent.watch` and has
 /// no next completion); `false` on the immediate grouped-failure path,
-/// whose watch stays armed for group settlement.
+/// whose watch stays armed for group settlement. Both call sites pair the
+/// note with the machine-readable `watchStillArmed` flag on the wake's
+/// `event_notification` metadata (monorepo#2060, the `hookStillActive`
+/// twin): `!watch_retired` there.
 fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,

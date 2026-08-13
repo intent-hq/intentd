@@ -1092,6 +1092,9 @@ async fn completion_delivery_attaches_event_notification_metadata() {
     assert_eq!(metadata["type"], json!("event_notification"));
     assert_eq!(metadata["eventCount"], json!(1));
     assert_eq!(metadata["eventTypes"], json!([AGENT_IDLE]));
+    // monorepo#2060: the ungrouped delivery retires the one-shot watch, and
+    // the metadata says so machine-readably (`hookStillActive` parity).
+    assert_eq!(metadata["watchStillArmed"], json!(false));
     let events = metadata["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["id"], json!(event.id));
@@ -17818,6 +17821,25 @@ async fn grouped_child_failure_wakes_parent_immediately() {
         !msgs.contains("the watch is now retired"),
         "grouped-failure wake carries no retirement note: {msgs}"
     );
+    // monorepo#2060: the armed state is also machine-readable on the
+    // immediate wake's metadata (`watchStillArmed: true`).
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let failure_meta = parent_session
+        .messages
+        .last()
+        .expect("immediate failure wake message")
+        .metadata
+        .as_ref()
+        .expect("immediate failure wake metadata");
+    assert_eq!(
+        failure_meta["watchStillArmed"],
+        json!(true),
+        "grouped-failure wake carries watchStillArmed: true: {failure_meta}"
+    );
 
     // The group is still live (it still owns settlement) and both grouped
     // watches remain in place.
@@ -22585,6 +22607,19 @@ async fn agent_watch_delivers_once_and_is_retired() {
         text.contains(&format!("ws.agent.watch(\\\"{}\\\")", target.0)),
         "idle wake carries the re-arm instruction naming the target: {text}"
     );
+    // monorepo#2060: the retirement is also machine-readable on the wake
+    // metadata (`watchStillArmed: false`), mirroring `hookStillActive`.
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "retiring wake carries watchStillArmed: false: {metadata}"
+    );
 
     // A second idle with no re-arm delivers nothing.
     svc.handle_completion_event(&completion_event(
@@ -22637,6 +22672,18 @@ async fn agent_watch_removed_after_target_deleted() {
     assert!(
         !text.contains("ws.agent.watch("),
         "deleted wake carries no dead-end re-arm pointer: {text}"
+    );
+    // monorepo#2060: the deleted-kind retirement is machine-readable too.
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "deleted wake carries watchStillArmed: false: {metadata}"
     );
 }
 
@@ -22705,6 +22752,25 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     assert!(
         !text.contains("the watch is now retired"),
         "attention wake carries no retirement note: {text}"
+    );
+    // monorepo#2060: the armed state is also machine-readable on the
+    // fan-out wake metadata (`watchStillArmed: true`).
+    let watcher_session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let attention_meta = watcher_session
+        .messages
+        .last()
+        .expect("attention wake message")
+        .metadata
+        .as_ref()
+        .expect("attention wake metadata");
+    assert_eq!(
+        attention_meta["watchStillArmed"],
+        json!(true),
+        "attention fan-out wake carries watchStillArmed: true: {attention_meta}"
     );
     // Attention is not a completion: no watch is consumed by the fan-out.
     assert_eq!(
