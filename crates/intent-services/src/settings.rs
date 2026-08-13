@@ -25,7 +25,7 @@
 //! [`cleanup_retired_settings`] deletes their stale rows on boot.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use intent_core::settings_file::SettingsFile;
@@ -726,8 +726,16 @@ const MEMORY_BUDGET_MAX_MB_FALLBACK: f64 = 1_024_000.0;
 ///
 /// The divergence is **one-directional**: this bound is never looser than the
 /// parse bound. See [`memory_budget_max_mb_for`] for why that matters.
+///
+/// Detected **once** and cached: `definitions()` is rebuilt by every
+/// `settings.list` / `settings.get`, and the Linux detection reads
+/// `/proc/meminfo`, so computing it inline would put a synchronous file read on
+/// a client-facing read path. Installed physical RAM cannot change under a live
+/// process, so this is the degenerate case of the derived-field ladder — the
+/// value is invalidated by nothing, and one read off the first call is enough.
 fn memory_budget_max_mb() -> f64 {
-    memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes())
+    static DETECTED: OnceLock<f64> = OnceLock::new();
+    *DETECTED.get_or_init(|| memory_budget_max_mb_for(crate::agent_manager::total_memory_bytes()))
 }
 
 /// [`memory_budget_max_mb`] against an explicit detection result, so every
