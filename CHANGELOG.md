@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.15] - 2026-08-13
+
+### 🚀 Features
+
+- Multi git root tracking — persisted roots, gitRoot.list, scoped git reads (protocol v6.15) ([#1180](https://github.com/intent-hq/intentd/pull/1180))
+- Defer workspace watcher start until setup script completes ([#1183](https://github.com/intent-hq/intentd/pull/1183))
+- Remove unread from the displayStatus derivation ([#1186](https://github.com/intent-hq/intentd/pull/1186))
+- Chunked attachment upload session (file.attachmentUpload.*) ([#1187](https://github.com/intent-hq/intentd/pull/1187))
+
+### 🐛 Bug Fixes
+
+- Close the idle reaper TOCTOU with claim-before-kill ([#1184](https://github.com/intent-hq/intentd/pull/1184))
+
+
 ## [0.6.14] - 2026-08-13
 
 ### 🚀 Features
