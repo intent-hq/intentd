@@ -78,8 +78,11 @@ impl Services {
 
     /// `file.attachmentUpload.begin`: validate the header and open a staging
     /// session. Rejects (all `InvalidParams` / `NotFound`, each naming the
-    /// specifics, per monorepo#2144): an unknown workspace, an empty file
-    /// name, a zero or over-cap declared size, and a malformed sha. Returns
+    /// specifics, per monorepo#2144): an unknown workspace, a file name that
+    /// placement would reject (empty, or a basename reducing to `.`/`..`/
+    /// nothing — the same sanitization commit applies, so a doomed name
+    /// fails here instead of after staging up to a gigabyte), a zero or
+    /// over-cap declared size, and a malformed sha. Returns
     /// `{ uploadId, maxChunkBytes }`.
     pub(crate) async fn file_attachment_upload_begin_op(
         &self,
@@ -93,6 +96,11 @@ impl Services {
             return Err(Error::InvalidParams(
                 "fileName must not be empty".to_string(),
             ));
+        }
+        if crate::file_ops::sanitize_attachment_name(&file_name).is_none() {
+            return Err(Error::InvalidParams(format!(
+                "invalid attachment fileName: {file_name:?}"
+            )));
         }
         if size_bytes == 0 {
             return Err(Error::InvalidParams(
@@ -639,6 +647,41 @@ mod tests {
             .expect_err("empty name");
         assert!(err.to_string().contains("fileName"), "got {err}");
 
+        // Names that placement's sanitization would reject fail at begin —
+        // before any bytes are staged — not at commit.
+        for doomed in ["/", "..", "dir/", "a/.."] {
+            let err = svc
+                .file_attachment_upload_begin_op(
+                    ws.clone(),
+                    doomed.to_string(),
+                    10,
+                    sha.clone(),
+                    None,
+                )
+                .await
+                .expect_err("doomed name");
+            assert!(
+                err.to_string().contains("invalid attachment fileName"),
+                "{doomed:?} got {err}"
+            );
+        }
+        // A path-bearing name whose basename is usable still passes begin
+        // (placement keeps only the basename). Abort it so the trailing
+        // no-staging-left-behind assertion stays meaningful.
+        let r = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "dir/nested.bin".to_string(),
+                10,
+                sha.clone(),
+                None,
+            )
+            .await
+            .expect("basename-usable name");
+        svc.file_attachment_upload_abort_op(r["uploadId"].as_str().unwrap().to_string())
+            .await
+            .expect("abort");
+
         let err = svc
             .file_attachment_upload_begin_op(ws.clone(), "f.bin".to_string(), 0, sha.clone(), None)
             .await
@@ -668,8 +711,12 @@ mod tests {
             .await
             .expect_err("sha");
         assert!(err.to_string().contains("64 hex"), "got {err}");
-        // No early-return left a staging dir behind.
-        assert!(!ws_root.0.join(".attachment-upload-staging").exists());
+        // No early-return left a staging dir behind (the root itself may
+        // exist from the successful basename-usable begin above).
+        let leftovers: Vec<_> = std::fs::read_dir(ws_root.0.join(".attachment-upload-staging"))
+            .map(|d| d.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "got {leftovers:?}");
     }
 
     /// `chunk` rejections: unknown uploadId, bad base64, empty data, and
@@ -719,6 +766,49 @@ mod tests {
         svc.file_attachment_upload_commit_op(upload_id)
             .await
             .expect("commit");
+    }
+
+    /// A decoded chunk over the 16 MiB per-chunk cap is rejected before any
+    /// reservation or write, and the session survives for correctly sized
+    /// chunks.
+    #[tokio::test]
+    async fn chunk_over_per_chunk_cap_rejected() {
+        let ws = WorkspaceId("ws-up-cap".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let oversized = vec![0u8; super::ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES + 1];
+        let r = svc
+            .file_attachment_upload_begin_op(
+                ws,
+                "big.bin".to_string(),
+                oversized.len() as u64,
+                sha256_hex(&oversized),
+                None,
+            )
+            .await
+            .expect("begin");
+        let upload_id = r["uploadId"].as_str().unwrap().to_string();
+
+        let err = svc
+            .file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&oversized))
+            .await
+            .expect_err("over cap");
+        assert!(err.to_string().contains("byte cap"), "got {err}");
+        // Nothing was reserved and no chunk file landed.
+        {
+            let uploads = svc.attachment_uploads.lock().unwrap();
+            assert_eq!(uploads.get(&upload_id).unwrap().received_bytes(), 0);
+        }
+        // The session still accepts correctly sized chunks.
+        svc.file_attachment_upload_chunk_op(
+            upload_id,
+            0,
+            b64(&oversized[..super::ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES]),
+        )
+        .await
+        .expect("in-cap chunk");
     }
 
     /// `commit` rejects incomplete staging, seq gaps, and a checksum
