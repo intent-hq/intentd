@@ -7,20 +7,15 @@
 //! (claude-agent-acp ≥ 0.60 / codex-acp ≥ 0.16 report the catalog this way),
 //! and the payload may be wrapped under `update` / `sessionUpdate`
 //! (session-update notifications). Effort-capable models carry the PROTOCOL
-//! §5.30 `effortLevels` list on a single base row — codex from its known
-//! level set, other providers from the adapter-advertised
-//! `supportedEffortLevels`.
+//! §5.30 `effortLevels` list on a single base row — codex from adapter evidence
+//! and collapsed variants, other providers from adapter-advertised per-model
+//! `supportedEffortLevels` / `effortLevels`, falling back to the session's
+//! global `thought_level` select.
 
 use serde_json::{json, Map, Value};
 
-/// Reasoning effort levels codex effort-capable models advertise (parity with
-/// `supportedReasoningEfforts` in the FE static catalog).
-const CODEX_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-
-/// Codex base models that support reasoning effort (parity with
-/// `EFFORT_CAPABLE_MODELS` in the FE).
-const CODEX_EFFORT_VARIANT_MODELS: [&str; 3] =
-    ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max"];
+/// Reasoning effort levels used by codex model variants.
+const CODEX_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /// Extract the raw model-entry array from any ACP payload shape.
 ///
@@ -83,6 +78,41 @@ fn extract_config_options_models(update: &Value) -> Option<&Vec<Value>> {
     by_key("id").or_else(|| by_key("category"))
 }
 
+/// Reasoning-effort levels advertised for the whole ACP session by the first
+/// `thought_level` select. This mirrors live-session discovery and drops the
+/// provider-default sentinel, which is a clear-selection affordance rather
+/// than a real effort level.
+fn extract_thought_level_values(payload: &Value) -> Option<Vec<String>> {
+    let update = payload
+        .get("update")
+        .or_else(|| payload.get("sessionUpdate"))
+        .unwrap_or(payload);
+    let option = update
+        .get("configOptions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|option| {
+            option.get("category").and_then(Value::as_str) == Some("thought_level")
+                && option.get("type").and_then(Value::as_str) == Some("select")
+        })?;
+    let values: Vec<String> = option
+        .get("options")
+        .and_then(Value::as_array)?
+        .iter()
+        .flat_map(|entry| {
+            entry.get("options").and_then(Value::as_array).map_or_else(
+                || std::slice::from_ref(entry).iter(),
+                |options| options.iter(),
+            )
+        })
+        .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+        .map(String::from)
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
 /// Pull `(id, name, description)` out of one raw model entry, tolerating the
 /// field aliases the adapters use (`modelId`/`id`/`value`,
 /// `name`/`displayName`/`label`).
@@ -109,20 +139,25 @@ fn entry_fields(entry: &Value) -> Option<(String, String, Option<String>)> {
     Some((id, name, description))
 }
 
-/// Adapter-advertised reasoning-effort levels for one raw model entry
-/// (`supportedEffortLevels`, as reported by claude-agent-acp). Non-string and
-/// blank entries are dropped; an absent or empty list yields `None`.
+/// Adapter-advertised reasoning-effort levels for one raw model entry.
+/// `supportedEffortLevels` (as reported by claude-agent-acp) wins over the
+/// wire-shaped `effortLevels` alias when both are populated. Non-string and
+/// blank entries are dropped; absent or empty lists yield `None`.
 fn entry_effort_levels(entry: &Value) -> Option<Vec<String>> {
-    let levels: Vec<String> = entry
-        .get("supportedEffortLevels")
-        .and_then(Value::as_array)?
+    ["supportedEffortLevels", "effortLevels"]
         .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect();
-    (!levels.is_empty()).then_some(levels)
+        .find_map(|key| {
+            let levels: Vec<String> = entry
+                .get(*key)
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            (!levels.is_empty()).then_some(levels)
+        })
 }
 
 /// Build one wire row `{ id, name, provider, description? }`.
@@ -146,46 +181,198 @@ fn with_effort_levels(mut row: Value, levels: Option<Vec<String>>) -> Value {
     row
 }
 
+fn codex_effort(value: &str) -> Option<&'static str> {
+    CODEX_EFFORTS
+        .iter()
+        .copied()
+        .find(|effort| value.eq_ignore_ascii_case(effort))
+        .or_else(|| value.eq_ignore_ascii_case("none").then_some("none"))
+}
+
+fn strip_parenthesized_effort(value: &str) -> (String, Option<&'static str>) {
+    let trimmed = value.trim();
+    let Some(open) = trimmed.rfind('(') else {
+        return (trimmed.to_string(), None);
+    };
+    let Some(level) = trimmed
+        .strip_suffix(')')
+        .and_then(|without_close| without_close.get(open + 1..))
+        .and_then(codex_effort)
+    else {
+        return (trimmed.to_string(), None);
+    };
+    let base = trimmed[..open].trim_end();
+    if base.is_empty() {
+        return (trimmed.to_string(), None);
+    }
+    (base.to_string(), Some(level))
+}
+
+fn strip_codex_id_effort(
+    id: &str,
+    name_effort: Option<&'static str>,
+) -> (String, Option<&'static str>) {
+    if let Some(open) = id.rfind('[') {
+        if let Some(level) = id
+            .strip_suffix(']')
+            .and_then(|without_close| without_close.get(open + 1..))
+            .and_then(codex_effort)
+        {
+            let base = id[..open].trim_end();
+            if !base.is_empty() {
+                return (base.to_string(), Some(level));
+            }
+        }
+    }
+
+    let (base, parenthesized) = strip_parenthesized_effort(id);
+    if parenthesized.is_some() {
+        return (base, parenthesized);
+    }
+
+    let lower = id.to_ascii_lowercase();
+    for effort in CODEX_EFFORTS {
+        for separator in ['/', ':'] {
+            let suffix = format!("{separator}{effort}");
+            if lower.ends_with(&suffix) && id.len() > suffix.len() {
+                return (id[..id.len() - suffix.len()].to_string(), Some(effort));
+            }
+        }
+    }
+
+    // A hyphen/underscore suffix is ambiguous with real model names such as
+    // `gpt-5.1-codex-max`; only strip it when the display name confirms that
+    // the row is an effort variant.
+    if let Some(effort) = name_effort {
+        for separator in ['-', '_'] {
+            let suffix = format!("{separator}{effort}");
+            if lower.ends_with(&suffix) && id.len() > suffix.len() {
+                return (id[..id.len() - suffix.len()].to_string(), Some(effort));
+            }
+        }
+    }
+    (id.to_string(), None)
+}
+
+fn push_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = String>) {
+    for value in additions {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+}
+
+struct CodexModelGroup {
+    id: String,
+    name: String,
+    description: Option<String>,
+    adapter_levels: Vec<String>,
+    inferred_levels: Vec<String>,
+}
+
 /// Parse an ACP payload (session/new result or session-update notification)
 /// into wire rows for `provider`. Used by claude-code, pi, and droid. Models
-/// advertising `supportedEffortLevels` carry them as `effortLevels`.
+/// carry per-model effort metadata when present, else levels from the session's
+/// global `thought_level` select.
 pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
     };
+    let session_effort_levels = extract_thought_level_values(payload);
     candidates
         .iter()
         .filter_map(|entry| {
             let (id, name, desc) = entry_fields(entry)?;
             Some(with_effort_levels(
                 wire_row(&id, &name, provider, desc.as_deref()),
-                entry_effort_levels(entry),
+                entry_effort_levels(entry).or_else(|| session_effort_levels.clone()),
             ))
         })
         .collect()
 }
 
-/// Codex variant of [`parse_acp_models`]: one base row per model, with the
-/// models in [`CODEX_EFFORT_VARIANT_MODELS`] carrying [`CODEX_EFFORTS`] as
-/// `effortLevels` instead of expanding into `{model}/{effort}` rows —
-/// reasoning effort is a first-class session field (PROTOCOL §5.2/§5.30).
+/// Codex variant of [`parse_acp_models`]: adapter-expanded effort variants are
+/// grouped into one base row. Adapter-advertised levels are merged with levels
+/// inferred from variant ids/names.
 pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
     };
-    candidates
-        .iter()
-        .filter_map(|entry| {
-            let (id, name, desc) = entry_fields(entry)?;
-            let levels = entry_effort_levels(entry).or_else(|| {
-                CODEX_EFFORT_VARIANT_MODELS
-                    .contains(&id.as_str())
-                    .then(|| CODEX_EFFORTS.iter().map(|s| s.to_string()).collect())
+    let mut groups: Vec<CodexModelGroup> = Vec::new();
+    for entry in candidates {
+        let Some((raw_id, raw_name, description)) = entry_fields(entry) else {
+            continue;
+        };
+        let (name, name_effort) = strip_parenthesized_effort(&raw_name);
+        let (id, id_effort) = strip_codex_id_effort(&raw_id, name_effort);
+        let inferred_effort = id_effort.or(name_effort);
+        let name = if name == raw_name && raw_name == raw_id && id != raw_id {
+            id.clone()
+        } else {
+            name
+        };
+
+        let index = groups
+            .iter()
+            .position(|group| group.id.eq_ignore_ascii_case(&id));
+        let group = if let Some(index) = index {
+            &mut groups[index]
+        } else {
+            groups.push(CodexModelGroup {
+                id,
+                name,
+                description: None,
+                adapter_levels: Vec::new(),
+                inferred_levels: Vec::new(),
             });
-            Some(with_effort_levels(
-                wire_row(&id, &name, "codex", desc.as_deref()),
+            groups.last_mut().expect("just pushed")
+        };
+        if inferred_effort.is_none() && group.description.is_none() {
+            group.description = description;
+        }
+        if let Some(levels) = entry_effort_levels(entry) {
+            push_unique(&mut group.adapter_levels, levels);
+        }
+        if let Some(effort) = inferred_effort {
+            push_unique(&mut group.inferred_levels, [effort.to_string()]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            let levels = if !group.adapter_levels.is_empty() || !group.inferred_levels.is_empty() {
+                let mut levels: Vec<String> = CODEX_EFFORTS
+                    .iter()
+                    .filter(|effort| {
+                        group
+                            .adapter_levels
+                            .iter()
+                            .chain(&group.inferred_levels)
+                            .any(|level| level.eq_ignore_ascii_case(effort))
+                    })
+                    .map(|effort| effort.to_string())
+                    .collect();
+                push_unique(
+                    &mut levels,
+                    group
+                        .adapter_levels
+                        .into_iter()
+                        .filter(|level| codex_effort(level).is_none()),
+                );
+                (!levels.is_empty()).then_some(levels)
+            } else {
+                None
+            };
+            with_effort_levels(
+                wire_row(
+                    &group.id,
+                    &group.name,
+                    "codex",
+                    group.description.as_deref(),
+                ),
                 levels,
-            ))
+            )
         })
         .collect()
 }
