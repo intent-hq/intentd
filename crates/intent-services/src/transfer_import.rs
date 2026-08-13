@@ -463,31 +463,26 @@ impl Services {
             Err(e) => {
                 if let Some(out) = &materialized {
                     crate::transfer_materialize::rollback_materialized(
-                        &self.store,
                         out,
                         &target_root.join(&workspace_id.0),
-                    )
-                    .await;
+                    );
                 }
                 return Err(e);
             }
         };
 
         // If the row insert fails AFTER materialization succeeded, unwind
-        // the checkout/sandboxes and the known_repo registration so a
-        // retried commit does not hit "materialize target already exists"
-        // and no uncommitted import leaks into known_repo.
+        // the checkout/sandboxes so a retried commit does not hit
+        // "materialize target already exists".
         let imported_rows = match self.store.transfer_import_rows(&outcome.rows).await {
             Ok(n) => n,
             Err(e) => {
                 rollback_materialized_attachments(&attachment_paths).await;
                 if let Some(out) = &materialized {
                     crate::transfer_materialize::rollback_materialized(
-                        &self.store,
                         out,
                         &target_root.join(&workspace_id.0),
-                    )
-                    .await;
+                    );
                 }
                 return Err(e);
             }
@@ -554,8 +549,9 @@ impl Services {
     /// `git/refs.json` under `extracted_dir`) via
     /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
     /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, fetch the base
-    /// ref, re-provision sandboxes, unwind WIP snapshots, and register the
-    /// checkout in `known_repo`. Runs BEFORE the store insert with the
+    /// ref, re-provision sandboxes, and unwind WIP snapshots. The checkout
+    /// is workspace-owned storage and is NOT registered in `known_repo`
+    /// (intent-hq/monorepo#2227). Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
     /// rewrites (workspace `repository_path` → the new checkout,
     /// `worktree_path` cleared, `checkout_mode` → direct, `branch` → the
@@ -617,7 +613,6 @@ impl Services {
             .clone()
             .unwrap_or_else(crate::default_workspaces_root);
         let out = crate::transfer_materialize::materialize_workspace_git(
-            &self.store,
             bundle,
             refs,
             ws.clone(),
@@ -2046,8 +2041,9 @@ mod tests {
     /// checkout and sandbox on disk, rewrite the stored workspace row
     /// (repository_path → checkout, worktree_path cleared, checkout_mode
     /// direct, branch → the bundled branch, base_commit_sha backfilled),
-    /// rewrite the stored sandbox path, drop the bundle-less sandbox row,
-    /// and register the checkout in known_repo.
+    /// rewrite the stored sandbox path, and drop the bundle-less sandbox
+    /// row — WITHOUT registering the workspace-owned checkout in known_repo
+    /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn import_commit_materializes_git() {
         let ws = WorkspaceId("ws-git-imported".to_string());
@@ -2232,13 +2228,11 @@ mod tests {
             "sandbox work\n"
         );
 
-        // Checkout registered as a known repo.
-        let known = svc.store.list_known_repos().await.expect("known repos");
-        assert!(
-            known
-                .iter()
-                .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
-            "checkout registered in known_repo: {known:?}"
+        // The workspace-owned checkout stays out of known_repo.
+        assert_eq!(
+            svc.store.list_known_repos().await.expect("known repos"),
+            vec![],
+            "materialized checkout is not registered in known_repo"
         );
     }
 
@@ -2306,9 +2300,8 @@ mod tests {
 
     /// If the row insert fails AFTER git materialization succeeded, the
     /// commit unwinds the materialization: the checkout directory is
-    /// removed, the known_repo registration is dropped, and a retried
-    /// commit re-materializes cleanly instead of failing on "materialize
-    /// target already exists".
+    /// removed and a retried commit re-materializes cleanly instead of
+    /// failing on "materialize target already exists".
     #[tokio::test]
     async fn import_commit_rolls_back_materialization_on_row_failure() {
         let ws = WorkspaceId("ws-git-rollback".to_string());

@@ -8478,8 +8478,9 @@ async fn wss_workspace_export_lifecycle() {
 /// checkout under the daemon's workspaces root (WIP snapshot unwound — the
 /// dirty file restored, not committed), rewrites the stored workspace row
 /// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
-/// direct), and registers the checkout in `known_repo`. Skips when `git` is
-/// unavailable on PATH (the bundler shells out to it).
+/// direct) — WITHOUT registering the workspace-owned checkout in
+/// `known_repo` (intent-hq/monorepo#2227). Skips when `git` is unavailable
+/// on PATH (the bundler shells out to it).
 #[tokio::test]
 async fn wss_workspace_import_commit_materializes_git() {
     use base64::Engine as _;
@@ -8645,13 +8646,12 @@ async fn wss_workspace_import_commit_materializes_git() {
         "uncommitted\n"
     );
 
-    // The checkout is registered in known_repo.
-    let known = srv.store.list_known_repos().await.expect("known repos");
-    assert!(
-        known
-            .iter()
-            .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
-        "checkout registered in known_repo: {known:?}"
+    // The materialized checkout is workspace-owned storage under the
+    // workspaces root and stays out of known_repo (intent-hq/monorepo#2227).
+    assert_eq!(
+        srv.store.list_known_repos().await.expect("known repos"),
+        vec![],
+        "materialized checkout is not registered in known_repo"
     );
 
     srv.ws.stop().await;
