@@ -387,8 +387,7 @@ fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
     assert_eq!(
         rows[0],
         json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex",
-                "description": "Flagship coding model",
-                "effortLevels": ["low", "medium", "high", "xhigh"] })
+                "description": "Flagship coding model" })
     );
     assert_eq!(
         rows[1],
@@ -397,26 +396,29 @@ fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
 }
 
 #[test]
-fn parse_codex_models_effort_levels_without_description() {
+fn parse_codex_models_bare_id_without_description() {
     let payload = json!({ "models": { "availableModels": [ { "modelId": "gpt-5.2-codex" } ] } });
     let rows = parse_codex_acp_models(&payload);
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0],
-        json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex",
-                "effortLevels": ["low", "medium", "high", "xhigh"] })
+        json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex" })
     );
 }
 
 #[test]
-fn parse_codex_models_all_legacy_fallbacks_use_four_levels() {
-    for model_id in ["gpt-5.3-codex", "gpt-5.2-codex", "gpt-5.1-codex-max"] {
+fn parse_codex_models_bare_ids_do_not_invent_effort_levels() {
+    for model_id in [
+        "gpt-5.6-sol",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gpt-5.1-codex-max",
+    ] {
         let payload = json!({ "models": { "availableModels": [{ "modelId": model_id }] } });
         let rows = parse_codex_acp_models(&payload);
-        assert_eq!(
-            rows[0]["effortLevels"],
-            json!(["low", "medium", "high", "xhigh"]),
-            "unexpected fallback for {model_id}"
+        assert!(
+            !rows[0].as_object().unwrap().contains_key("effortLevels"),
+            "unexpected invented levels for {model_id}"
         );
     }
 }
@@ -505,16 +507,16 @@ fn parse_codex_models_collapse_live_bracket_effort_ids() {
 }
 
 #[test]
-fn parse_codex_models_none_only_variant_uses_known_fallback() {
+fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [
             { "modelId": "gpt-5.6-sol[none]", "name": "GPT-5.6-Sol" }
         ] }
     });
     let rows = parse_codex_acp_models(&payload);
-    assert_eq!(
-        rows[0]["effortLevels"],
-        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+    assert!(
+        !rows[0].as_object().unwrap().contains_key("effortLevels"),
+        "none is not usable effort evidence"
     );
 }
 
@@ -538,8 +540,8 @@ fn parse_codex_collapsed_variants_merge_adapter_levels() {
 #[test]
 fn parse_codex_models_from_config_options() {
     // Canned from a live codex-acp@0.16.0 session/new result (2026-07-21):
-    // same configOptions[id="model"].options shape as claude-code. GPT-5.6-Sol
-    // is known effort-capable; the remaining rows carry no `effortLevels`.
+    // same configOptions[id="model"].options shape as claude-code. Bare rows
+    // carry no `effortLevels` without adapter evidence.
     let payload = json!({
         "sessionId": "sess_2",
         "modes": { "currentModeId": "auto", "availableModes": [] },
@@ -576,9 +578,9 @@ fn parse_codex_models_from_config_options() {
             "gpt-5.3-codex-spark"
         ]
     );
-    assert_eq!(
-        rows[0]["effortLevels"],
-        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+    assert!(
+        !rows[0].as_object().unwrap().contains_key("effortLevels"),
+        "bare model rows must not invent effort levels"
     );
     assert_eq!(
         rows[1],
@@ -588,9 +590,7 @@ fn parse_codex_models_from_config_options() {
 }
 
 #[test]
-fn parse_codex_config_options_carry_effort_levels() {
-    // Effort-capable base models carry `effortLevels` when reported via
-    // configOptions too — still one row per model.
+fn parse_codex_config_options_bare_id_has_no_effort_levels() {
     let payload = json!({
         "configOptions": [
             { "id": "model",
@@ -599,10 +599,9 @@ fn parse_codex_config_options_carry_effort_levels() {
     });
     let rows = parse_codex_acp_models(&payload);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], "gpt-5.3-codex");
     assert_eq!(
-        rows[0]["effortLevels"],
-        json!(["low", "medium", "high", "xhigh"])
+        rows[0],
+        json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex" })
     );
 }
 

@@ -7,8 +7,8 @@
 //! (claude-agent-acp ≥ 0.60 / codex-acp ≥ 0.16 report the catalog this way),
 //! and the payload may be wrapped under `update` / `sessionUpdate`
 //! (session-update notifications). Effort-capable models carry the PROTOCOL
-//! §5.30 `effortLevels` list on a single base row — codex from its known
-//! level set, other providers from adapter-advertised per-model
+//! §5.30 `effortLevels` list on a single base row — codex from adapter evidence
+//! and collapsed variants, other providers from adapter-advertised per-model
 //! `supportedEffortLevels` / `effortLevels`, falling back to the session's
 //! global `thought_level` select.
 
@@ -16,17 +16,6 @@ use serde_json::{json, Map, Value};
 
 /// Reasoning effort levels used by codex model variants.
 const CODEX_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
-const LEGACY_CODEX_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-
-/// Codex base models known to support reasoning effort even when an adapter
-/// reports only the unsuffixed base row. Expanded catalogs are detected and
-/// collapsed generically, so new families do not need to appear here.
-const CODEX_EFFORT_VARIANT_MODELS: [(&str, &[&str]); 4] = [
-    ("gpt-5.6-sol", &CODEX_EFFORTS),
-    ("gpt-5.3-codex", &LEGACY_CODEX_EFFORTS),
-    ("gpt-5.2-codex", &LEGACY_CODEX_EFFORTS),
-    ("gpt-5.1-codex-max", &LEGACY_CODEX_EFFORTS),
-];
 
 /// Extract the raw model-entry array from any ACP payload shape.
 ///
@@ -273,13 +262,6 @@ fn push_unique(values: &mut Vec<String>, additions: impl IntoIterator<Item = Str
     }
 }
 
-fn known_codex_effort_levels(id: &str) -> Option<Vec<String>> {
-    CODEX_EFFORT_VARIANT_MODELS
-        .iter()
-        .find(|(model, _)| id.eq_ignore_ascii_case(model))
-        .map(|(_, efforts)| efforts.iter().map(|effort| effort.to_string()).collect())
-}
-
 struct CodexModelGroup {
     id: String,
     name: String,
@@ -311,7 +293,7 @@ pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
 
 /// Codex variant of [`parse_acp_models`]: adapter-expanded effort variants are
 /// grouped into one base row. Adapter-advertised levels are merged with levels
-/// inferred from variant ids/names, followed by the known-model fallback.
+/// inferred from variant ids/names.
 pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
@@ -378,13 +360,9 @@ pub(super) fn parse_codex_acp_models(payload: &Value) -> Vec<Value> {
                         .into_iter()
                         .filter(|level| codex_effort(level).is_none()),
                 );
-                if levels.is_empty() {
-                    known_codex_effort_levels(&group.id)
-                } else {
-                    Some(levels)
-                }
+                (!levels.is_empty()).then_some(levels)
             } else {
-                known_codex_effort_levels(&group.id)
+                None
             };
             with_effort_levels(
                 wire_row(
