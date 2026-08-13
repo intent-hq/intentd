@@ -1099,12 +1099,33 @@ impl ProcessRegistry {
     }
 
     /// TTL-based idle reaping (§5.6/§6.7): evict every idle process whose last
-    /// activity is older than `ttl`, skipping any the `eligible` predicate
-    /// rejects (e.g. an agent with an in-flight prompt). Active processes and
-    /// those within the TTL are always kept. Returns the number evicted.
-    pub async fn evict_idle_older_than<F>(&self, ttl: Duration, eligible: F) -> usize
+    /// activity is older than `ttl`. Active processes and those within the TTL
+    /// are always kept. Returns the number evicted.
+    ///
+    /// Claim-before-kill (monorepo#2118): `try_claim` must atomically claim
+    /// the candidate against whatever can start work on it (the manager wires
+    /// it to check-and-claim under the same lock `try_begin` uses), and
+    /// `release` drops that claim after the kill — or immediately when the
+    /// re-validation below rejects the candidate. A plain eligibility check
+    /// here would be a TOCTOU: earlier kills in the sweep await (SIGTERM
+    /// grace + descendant sweep), so a turn could start between the check and
+    /// the kill and have its child tree killed.
+    ///
+    /// NOT cancellation-safe: dropping this future at the `kill().await`
+    /// leaks the held claim — `release` never runs for it, so `try_begin`
+    /// permanently loses for that agent and its queue never drains until
+    /// daemon restart. The reap loop task is the only production caller and
+    /// is aborted only at shutdown; a future caller must not wrap this in a
+    /// timeout/select that can drop it mid-kill.
+    pub async fn evict_idle_older_than<C, R>(
+        &self,
+        ttl: Duration,
+        try_claim: C,
+        release: R,
+    ) -> usize
     where
-        F: Fn(&AgentId) -> bool,
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
         let candidates = {
@@ -1113,11 +1134,28 @@ impl ProcessRegistry {
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
-            if !eligible(&id) {
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock: the candidate snapshot is
+            // stale by the time earlier kills in this sweep have awaited, so
+            // the entry may have run a whole turn (fresh `last_active_ms`),
+            // be actively streaming again, or be gone. With the claim held
+            // nothing can start new work on it after this check.
+            let still_stale = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .entries
+                    .get(&id)
+                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+            };
+            if !still_stale {
+                release(&id);
                 continue;
             }
             kill().await;
             self.deregister(&id);
+            release(&id);
             evicted += 1;
         }
         evicted
@@ -1340,6 +1378,18 @@ impl Drop for TeardownFence {
     }
 }
 
+/// Why a [`AgentManager::try_begin_outcome`] claim did or did not start:
+/// `Started` claimed the slot; `Busy` lost to a turn already in flight (a
+/// prompt worker owns the slot and its receiver); `ReapClaimed` lost to the
+/// idle-reap sweep holding the agent mid-kill (monorepo#2118) — nobody owns
+/// the slot, the handle is being torn down, so no work may be handed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryBeginOutcome {
+    Started,
+    Busy,
+    ReapClaimed,
+}
+
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -1369,6 +1419,14 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents claimed by the idle-reap sweep for the duration of their kill
+    /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
+    /// busy → reap_claims, matching `try_begin`'s read), so "not busy →
+    /// claimed" is atomic against a concurrent `try_begin`: a send racing the
+    /// sweep queues instead of starting a turn whose child tree the sweep is
+    /// about to kill. Released (no `busy` lock needed) after the kill, when
+    /// the sweep kicks the queue drain for anything that parked meanwhile.
+    reap_claims: Arc<Mutex<HashSet<AgentId>>>,
     /// Workspace each in-flight agent belongs to, recorded when the agent claims
     /// its in-flight slot so the slot release can recompute the workspace's
     /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
@@ -1516,6 +1574,7 @@ impl AgentManager {
             agent_config_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
@@ -3666,13 +3725,38 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
+        self.try_begin_outcome(agent_id, workspace_id).await == TryBeginOutcome::Started
+    }
+
+    /// [`AgentManager::try_begin`] with the loss reason: callers that behave
+    /// differently on "a prompt worker owns the slot" (safe to hand work to)
+    /// versus "the idle-reap sweep holds the agent mid-kill" (nobody owns the
+    /// slot; the handle is being torn down) need the distinction decided under
+    /// the SAME `busy`-lock acquisition as the claim itself — re-probing after
+    /// a `bool` loss would race the claim's release (monorepo#2118 review).
+    async fn try_begin_outcome(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> TryBeginOutcome {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
-        let claimed = {
+        let outcome = {
             let mut busy = self.busy.lock().unwrap();
-            let claimed = !busy.contains(agent_id);
-            if claimed {
+            // An agent claimed by the idle-reap sweep (monorepo#2118) counts
+            // as busy: the sweep is about to (or is mid-way through) killing
+            // its child tree, so starting a turn now would hand that turn's
+            // fresh children to the kill. The caller's queue fallback parks
+            // the message; the sweep kicks the drain after releasing.
+            let outcome = if busy.contains(agent_id) {
+                TryBeginOutcome::Busy
+            } else if self.reap_claims.lock().unwrap().contains(agent_id) {
+                TryBeginOutcome::ReapClaimed
+            } else {
+                TryBeginOutcome::Started
+            };
+            if outcome == TryBeginOutcome::Started {
                 // Drop a live-turn slot that outlived its turn BEFORE the claim
                 // becomes visible (monorepo#2104). A slot can survive its turn:
                 // when `flush_partial_turn_on_interruption` hits a non-UNIQUE
@@ -3708,9 +3792,9 @@ impl AgentManager {
                     .unwrap()
                     .insert(agent_id.clone(), workspace_id.clone());
             }
-            claimed
+            outcome
         };
-        if claimed {
+        if outcome == TryBeginOutcome::Started {
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -3722,7 +3806,7 @@ impl AgentManager {
             )
             .await;
         }
-        claimed
+        outcome
     }
 
     /// Release the in-flight slot without persisting agent status (used when
@@ -5396,19 +5480,37 @@ impl AgentManager {
             _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
-        // instead of interleaving. On the rare loss (a send claimed the slot
-        // between the busy check and here), the first notification is already
-        // consumed, so still stream it as an implicit turn — but with a ZERO
-        // settle window, handing the receiver straight back to the blocked
-        // prompt worker — and leave every slot-owner duty (registry
-        // active/idle marks, slot release, idle emit, queue drain) to the
-        // prompt turn that won the slot: marking idle here would flag the
-        // process eviction-eligible (and pop a spawn waiter) mid-prompt-turn.
-        if !self.try_begin(agent_id, workspace_id).await {
-            self.services
-                .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, Duration::ZERO)
-                .await;
-            return true;
+        // instead of interleaving. On the rare loss to a PROMPT turn (a send
+        // claimed the slot between the busy check and here), the first
+        // notification is already consumed, so still stream it as an implicit
+        // turn — but with a ZERO settle window, handing the receiver straight
+        // back to the blocked prompt worker — and leave every slot-owner duty
+        // (registry active/idle marks, slot release, idle emit, queue drain)
+        // to the prompt turn that won the slot: marking idle here would flag
+        // the process eviction-eligible (and pop a spawn waiter)
+        // mid-prompt-turn.
+        match self.try_begin_outcome(agent_id, workspace_id).await {
+            TryBeginOutcome::Started => {}
+            TryBeginOutcome::Busy => {
+                self.services
+                    .run_harness_wake_turn(
+                        &mut guard,
+                        first,
+                        agent_id,
+                        workspace_id,
+                        Duration::ZERO,
+                    )
+                    .await;
+                return true;
+            }
+            // A loss to the idle-reap sweep is NOT a prompt worker owning the
+            // slot: the sweep holds the agent mid-kill (monorepo#2118), so
+            // driving a harness wake turn here would run unowned concurrent
+            // work against the handle being torn down. Drop the consumed
+            // notification instead — it is the tail of the dying child's
+            // output and would have died with the handle's buffer had the
+            // kill won the race to it.
+            TryBeginOutcome::ReapClaimed => return true,
         }
         self.registry.mark_active(agent_id);
         // Drive the turn in its own task registered in `workers`, so
@@ -6098,11 +6200,61 @@ impl AgentManager {
     /// activity is older than `ttl`, skipping any with an in-flight prompt (a
     /// live turn loop in `busy`). Active streaming agents are protected by the
     /// registry's `is_active` flag. Returns the number reaped.
-    pub async fn reap_idle_older_than(&self, ttl: Duration) -> usize {
-        let busy = self.busy.clone();
-        self.registry
-            .evict_idle_older_than(ttl, move |id| !busy.lock().unwrap().contains(id))
-            .await
+    ///
+    /// Claim-before-kill (monorepo#2118): instead of a bare busy check, each
+    /// candidate is CLAIMED into `reap_claims` under the `busy` lock (the
+    /// same lock `try_begin` claims under), so no turn can start between the
+    /// eligibility check and the `kill().await` — a send racing the sweep
+    /// loses `try_begin` and parks its message on the queue instead. After
+    /// the sweep, any released agent with a ready queue gets a drain kick so
+    /// a message that parked behind the claim starts a fresh turn (the agent
+    /// respawns on demand) rather than stranding until the next queue event.
+    pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+        let try_claim = {
+            let busy = self.busy.clone();
+            let claims = self.reap_claims.clone();
+            move |id: &AgentId| {
+                // Lock order busy → reap_claims, matching `try_begin`, so
+                // "not busy → claimed" is atomic against a concurrent claim.
+                // The insert result IS the claim: `false` (already present)
+                // means an overlapping sweep holds this id — treating that as
+                // a win would let its release drop the shared claim while
+                // this sweep's kill is still in flight, reopening the window.
+                let busy = busy.lock().unwrap();
+                if busy.contains(id) {
+                    return false;
+                }
+                claims.lock().unwrap().insert(id.clone())
+            }
+        };
+        let release = {
+            let claims = self.reap_claims.clone();
+            let released = released.clone();
+            move |id: &AgentId| {
+                claims.lock().unwrap().remove(id);
+                released.lock().unwrap().push(id.clone());
+            }
+        };
+        let reaped = self
+            .registry
+            .evict_idle_older_than(ttl, try_claim, release)
+            .await;
+        // Drain kick for messages that parked behind a claim: with the claim
+        // released, a ready queue would otherwise sit unworked until the next
+        // external queue event (PROTOCOL §5.5 "never sits unworked").
+        let released = std::mem::take(&mut *released.lock().unwrap());
+        for id in released {
+            if !self.services.has_ready_to_send(&id) {
+                continue;
+            }
+            if let Ok(session) = self.services.store.get_agent_session(&id).await {
+                Arc::clone(self)
+                    .try_drain_queue(id, session.workspace_id)
+                    .await;
+            }
+        }
+        reaped
     }
 
     /// Tear down only the agent's child process + handle, without touching the

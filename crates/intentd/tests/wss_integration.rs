@@ -8203,7 +8203,7 @@ async fn wss_workspace_import_lifecycle() {
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     sub_ws
         .send(Message::Text(
-            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created"]}}"#
+            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created","workspace:setup:completed"]}}"#
                 .to_string()
                 .into(),
         ))
@@ -8264,6 +8264,37 @@ async fn wss_workspace_import_lifecycle() {
     .await
     .expect("timed out waiting for workspace:created after import commit");
     assert_eq!(evt["workspaceId"], ws_id, "{evt}");
+
+    // Imports run no setup stage, so the commit pairs `workspace:created`
+    // with an immediate `workspace:setup:completed { ranScript: false }` —
+    // the watcher registry must not defer this workspace to the backstop.
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:setup:completed"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:setup:completed after import commit");
+    assert_eq!(
+        evt["data"],
+        serde_json::json!({ "workspaceId": ws_id, "ranScript": false }),
+        "{evt}"
+    );
 
     let list = wss_call(
         srv.port,
