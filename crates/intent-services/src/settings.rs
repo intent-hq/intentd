@@ -747,6 +747,9 @@ fn memory_budget_max_mb() -> f64 {
 /// the invariant every claim in these doc comments depends on.
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
+        // INVARIANT: this bound may be tighter than the `config.toml` parse
+        // bound, never looser. Dropping the `.min` advertises a max the write
+        // path rejects; see the doc comment above before changing it.
         Some(bytes) => ((bytes / (1024 * 1024)) as f64).min(MEMORY_BUDGET_MAX_MB_FALLBACK),
         None => MEMORY_BUDGET_MAX_MB_FALLBACK,
     }
