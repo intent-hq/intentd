@@ -13870,6 +13870,48 @@ mod file_tracking {
         assert_eq!(listed["gitRoots"].as_array().unwrap().len(), 1);
     }
 
+    /// A RELATIVE `ws.git.registerRoot` path resolves against the workspace
+    /// worktree — not the daemon's cwd — so an agent whose cwd is the
+    /// worktree can register `vendor/lib` directly; the same relative
+    /// spelling unregisters it (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_resolves_relative_path_against_worktree() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        // A nested repo inside the worktree, registered by relative path.
+        let nested = primary.dir.join("vendor").join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        Repository::init(&nested).unwrap();
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                "vendor/lib".into(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&nested)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "resolved against the worktree, not the daemon cwd"
+        );
+
+        // The same relative spelling unregisters the root.
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), "vendor/lib".into())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+    }
+
     /// `ws.git.registerRoot` validation: a missing path, a non-repo
     /// directory, and the workspace's own primary root are all
     /// `InvalidParams`; an unknown workspace is `NotFound` (monorepo#2053).

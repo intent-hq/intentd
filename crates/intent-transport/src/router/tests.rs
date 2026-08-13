@@ -3906,10 +3906,25 @@ async fn git_branch_status_unknown_git_root_id_is_minus_32602() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
+    // Identical message to the other five gitRootId-scoped reads (§5.6):
+    // the domain error maps through `domain_to_rpc`, which prefixes
+    // `invalid params:` exactly like the `git.status` arm above.
     assert_eq!(
         v["error"]["message"],
-        serde_json::json!("Unknown git root: nope")
+        serde_json::json!("invalid params: Unknown git root: nope")
     );
+}
+
+#[tokio::test]
+async fn git_status_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":""}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("main"));
 }
 
 #[tokio::test]

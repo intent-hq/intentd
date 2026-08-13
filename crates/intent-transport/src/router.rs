@@ -2110,11 +2110,11 @@ async fn dispatch(
                 None => match opt_git_root_id(params) {
                     Some(id) => {
                         let ws = require_ws_note(params)?;
-                        match api.git_root_path(ws, id).await {
-                            Ok(p) => p,
-                            Err(Error::InvalidParams(m)) => return Err(invalid_params(m)),
-                            Err(e) => return Err(domain_to_rpc(e)),
-                        }
+                        // An unknown/foreign id maps through `domain_to_rpc`
+                        // like the other five scoped reads, so all six carry
+                        // the identical `invalid params: Unknown git root: X`
+                        // message (§5.6).
+                        api.git_root_path(ws, id).await.map_err(domain_to_rpc)?
                     }
                     // Neither supplied: the pre-existing missing-param error.
                     None => return Err(require_str_param(params, "repoPath").unwrap_err()),

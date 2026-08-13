@@ -2694,12 +2694,19 @@ impl Services {
                     }
                 }
                 // Best-effort repo detection, mirroring `ws.git.registerRoot`;
-                // non-GitHub remotes leave owner/name unset.
-                let (repo_owner, repo_name) = intent_git::remote::origin_url(&canonical)
-                    .ok()
-                    .flatten()
-                    .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                // non-GitHub remotes leave owner/name unset. The remote read
+                // is git I/O (roots may live on network/FUSE mounts), so it
+                // runs on the blocking pool — never inline on the runtime.
+                let origin_dir = canonical.clone();
+                let (repo_owner, repo_name) = tokio::task::spawn_blocking(move || {
+                    intent_git::remote::origin_url(&origin_dir)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
                 let ts = now_iso();
                 let root = intent_core::WorkspaceGitRoot {
                     id: WorkspaceGitRootId::new(),
@@ -2814,8 +2821,17 @@ impl Services {
             return Ok(PrRefreshOutcome::Skipped);
         };
         let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
-        let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path))
-            .unwrap_or_default();
+        // The live HEAD read is git I/O (roots may live on network/FUSE
+        // mounts), so it runs on the blocking pool — never inline on the
+        // runtime.
+        let branch_path = std::path::PathBuf::from(&root.path);
+        let branch = tokio::task::spawn_blocking(move || {
+            intent_git::status::current_branch_at(&branch_path)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
         match root.pr_number {
             Some(number) => {
                 let pr = sc
@@ -18570,10 +18586,25 @@ impl WorkspaceApi for Services {
             if trimmed.is_empty() {
                 return Err(Error::InvalidParams("path is required".to_string()));
             }
-            // Canonicalize first — registration is idempotent by canonical
+            // A relative path resolves against the workspace worktree — the
+            // caller is an agent whose cwd is the worktree, and resolving
+            // against the daemon's own cwd would be surprising and
+            // daemon-launch-dependent. Absolute paths pass through untouched.
+            let requested = if std::path::Path::new(trimmed).is_absolute() {
+                PathBuf::from(trimmed)
+            } else {
+                let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "Relative path requires a workspace worktree to resolve against: \
+                         {trimmed}"
+                    ))
+                })?;
+                worktree.join(trimmed)
+            };
+            // Canonicalize next — registration is idempotent by canonical
             // path, and the path may live anywhere on the host (no worktree
             // containment, monorepo#2053).
-            let canonical = tokio::fs::canonicalize(trimmed)
+            let canonical = tokio::fs::canonicalize(&requested)
                 .await
                 .map_err(|_| Error::InvalidParams(format!("Path does not exist: {trimmed}")))?;
             // A repo root has a `.git` entry — a directory for a normal
@@ -18598,12 +18629,18 @@ impl WorkspaceApi for Services {
                 }
             }
             // Best-effort repo owner/name detection from the root's `origin`
-            // remote — nullable, non-github remotes are left unset.
-            let (repo_owner, repo_name) = intent_git::remote::origin_url(&canonical)
-                .ok()
-                .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+            // remote — nullable, non-github remotes are left unset. The
+            // remote read is git I/O (the root may live on a network/FUSE
+            // mount), so it runs on the blocking pool — never on the RPC task.
+            let origin_dir = canonical.clone();
+            let (repo_owner, repo_name) =
+                tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&origin_dir))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    .and_then(|url| Self::parse_github_owner_repo(&url))
+                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
             let ts = now_iso();
             let root = intent_core::WorkspaceGitRoot {
                 id: WorkspaceGitRootId::new(),
@@ -18640,15 +18677,24 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
-            let _ = svc.store.get_workspace(&workspace_id).await?;
+            let ws = svc.store.get_workspace(&workspace_id).await?;
             let trimmed = path.trim();
             if trimmed.is_empty() {
                 return Err(Error::InvalidParams("path is required".to_string()));
             }
+            // Mirror `git_root_register`: a relative path resolves against
+            // the workspace worktree so the spelling that registered a root
+            // also unregisters it. No worktree → the raw spelling stands.
+            let requested = match git_ops::worktree_path(&ws) {
+                Some(worktree) if !std::path::Path::new(trimmed).is_absolute() => {
+                    worktree.join(trimmed)
+                }
+                _ => PathBuf::from(trimmed),
+            };
             // Canonicalize when the directory still exists so the same
             // spelling that registered the root resolves; fall back to the
             // raw path for roots whose directory is already gone.
-            let lookup = match tokio::fs::canonicalize(trimmed).await {
+            let lookup = match tokio::fs::canonicalize(&requested).await {
                 Ok(p) => p.to_string_lossy().into_owned(),
                 Err(_) => trimmed.to_string(),
             };
