@@ -9241,10 +9241,13 @@ async fn handle_terminal_turn_failure(
     // (monorepo#840) is recorded exactly once and the Error status is not
     // written twice. Fall back to persisting here when no stash exists (the
     // pre-#2050 path: a `?`-propagated store error, or the idle-timeout-cap
-    // branch before its own persist).
+    // branch before its own persist). The stash is consumed only when its
+    // error text matches THIS failure — a self-validating guard on top of the
+    // teardown-path discards: a stale context (however it survived) must not
+    // skip the new failure's own persist or mis-describe it on the wire.
     let persist = match mgr.services.take_pending_terminal_error(agent_id) {
-        Some(precomputed) => precomputed,
-        None => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
+        Some(precomputed) if precomputed.error_text == error_text => precomputed,
+        _ => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
     };
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(

@@ -8702,6 +8702,82 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     let _ = std::fs::remove_file(&attempt_file);
 }
 
+/// The consuming half of the monorepo#2050 handoff: a full worker-driven
+/// ordinary mid-turn failure — `run_prompt_turn` persists + stashes, then the
+/// worker's `handle_terminal_turn_failure` CONSUMES the stash instead of
+/// persisting again — leaves the identical-failure streak (monorepo#840) at
+/// exactly 1, not 2. A regression that made both halves persist would double-
+/// count the streak and halve the poison threshold.
+#[tokio::test]
+async fn worker_driven_streaming_failure_records_streak_exactly_once() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "promptRpcError": { "code": -32603, "message": "backend exploded" },
+        "response": "unreached",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2050-once"),
+        AgentId::from("a-2050-once"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "fails mid-turn".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // The worker settles the terminal failure: Error persisted, worker gone.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = mgr.services.store.get_agent_session_status(&id).await;
+            if status.ok() == Some(AgentStatus::Error)
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker settles the terminal streaming failure");
+
+    // Exactly-once: the streaming persist recorded the streak; the handler
+    // consumed the stash instead of recording it again.
+    assert_eq!(
+        mgr.services.failure_streak_count(&id),
+        1,
+        "one terminal failure records the streak exactly once (monorepo#840/#2050)"
+    );
+    // The stash was consumed by the handler — nothing lingers.
+    assert!(
+        mgr.services.take_pending_terminal_error(&id).is_none(),
+        "the handler consumed the stashed terminal-error context"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(
+        session
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("backend exploded")),
+        "stop_reason carries the failure text: {:?}",
+        session.stop_reason
+    );
+}
+
 /// monorepo#764 one-retry bound: a SECOND consecutive pre-output transport
 /// failure on the same message takes the existing terminal path — persisted
 /// Error status, the terminal `agent:failed` + `agent:stream:end` pair
