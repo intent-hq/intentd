@@ -1,8 +1,10 @@
-//! Channel manifest (`stable.json` / `beta.json`) schema and URLs.
+//! Channel manifest (`stable.json` / `beta.json` / `alpha.json`) schema and
+//! URLs.
 //!
 //! Manifests are produced by `scripts/make-channel-manifest.sh` (schema v1)
-//! and published as assets on the fixed `channel-stable` / `channel-beta`
-//! GitHub releases. Parsing is lenient about extra fields (forward compat);
+//! and published as assets on the fixed `channel-stable` / `channel-beta` /
+//! `channel-alpha` GitHub releases. Parsing is lenient about extra fields
+//! (forward compat);
 //! an unknown `schema` is reported as [`ManifestError::UnsupportedSchema`] —
 //! a soft check failure, never a panic.
 
@@ -54,7 +56,8 @@ pub struct PlatformEntry {
 pub struct ChannelManifest {
     /// Schema version (see [`MANIFEST_SCHEMA_VERSION`]).
     pub schema: u64,
-    /// Channel the manifest was published for (`stable` | `beta`).
+    /// Channel the manifest was published for
+    /// (`stable` | `beta` | `alpha`).
     #[serde(default)]
     pub channel: Option<String>,
     /// Daemon version the manifest points at (no leading `v`).
@@ -109,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_urls_for_both_channels() {
+    fn manifest_urls_for_all_channels() {
         assert_eq!(
             manifest_url(DEFAULT_MANIFEST_BASE_URLS[0], Channel::Stable),
             "https://github.com/intent-hq/intentd-releases/releases/download/channel-stable/stable.json"
@@ -119,12 +122,20 @@ mod tests {
             "https://github.com/intent-hq/intentd-releases/releases/download/channel-beta/beta.json"
         );
         assert_eq!(
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[0], Channel::Alpha),
+            "https://github.com/intent-hq/intentd-releases/releases/download/channel-alpha/alpha.json"
+        );
+        assert_eq!(
             manifest_url(DEFAULT_MANIFEST_BASE_URLS[1], Channel::Stable),
             "https://github.com/intent-hq/intentd/releases/download/channel-stable/stable.json"
         );
         assert_eq!(
             manifest_url(DEFAULT_MANIFEST_BASE_URLS[1], Channel::Beta),
             "https://github.com/intent-hq/intentd/releases/download/channel-beta/beta.json"
+        );
+        assert_eq!(
+            manifest_url(DEFAULT_MANIFEST_BASE_URLS[1], Channel::Alpha),
+            "https://github.com/intent-hq/intentd/releases/download/channel-alpha/alpha.json"
         );
     }
 

@@ -99,8 +99,8 @@ fn run_sitter_command(
     }
 }
 
-/// `intentd sitter channel [stable|beta] [--redownload]` — never touches a
-/// running daemon.
+/// `intentd sitter channel [stable|beta|alpha] [--redownload]` — never
+/// touches a running daemon.
 fn run_channel_command(
     set: Option<cli::Channel>,
     redownload: bool,
