@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.16] - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- Persist error status before terminal events on the streaming path ([#1191](https://github.com/intent-hq/intentd/pull/1191))
+- Collapse Codex effort variants ([#1173](https://github.com/intent-hq/intentd/pull/1173))
+
+
 ## [0.6.15] - 2026-08-13
 
 ### 🚀 Features
