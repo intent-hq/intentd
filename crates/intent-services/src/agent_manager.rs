@@ -1371,6 +1371,18 @@ impl Drop for TeardownFence {
     }
 }
 
+/// Why a [`AgentManager::try_begin_outcome`] claim did or did not start:
+/// `Started` claimed the slot; `Busy` lost to a turn already in flight (a
+/// prompt worker owns the slot and its receiver); `ReapClaimed` lost to the
+/// idle-reap sweep holding the agent mid-kill (monorepo#2118) — nobody owns
+/// the slot, the handle is being torn down, so no work may be handed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryBeginOutcome {
+    Started,
+    Busy,
+    ReapClaimed,
+}
+
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -3706,19 +3718,38 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
+        self.try_begin_outcome(agent_id, workspace_id).await == TryBeginOutcome::Started
+    }
+
+    /// [`AgentManager::try_begin`] with the loss reason: callers that behave
+    /// differently on "a prompt worker owns the slot" (safe to hand work to)
+    /// versus "the idle-reap sweep holds the agent mid-kill" (nobody owns the
+    /// slot; the handle is being torn down) need the distinction decided under
+    /// the SAME `busy`-lock acquisition as the claim itself — re-probing after
+    /// a `bool` loss would race the claim's release (monorepo#2118 review).
+    async fn try_begin_outcome(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> TryBeginOutcome {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
-        let claimed = {
+        let outcome = {
             let mut busy = self.busy.lock().unwrap();
             // An agent claimed by the idle-reap sweep (monorepo#2118) counts
             // as busy: the sweep is about to (or is mid-way through) killing
             // its child tree, so starting a turn now would hand that turn's
             // fresh children to the kill. The caller's queue fallback parks
             // the message; the sweep kicks the drain after releasing.
-            let claimed =
-                !busy.contains(agent_id) && !self.reap_claims.lock().unwrap().contains(agent_id);
-            if claimed {
+            let outcome = if busy.contains(agent_id) {
+                TryBeginOutcome::Busy
+            } else if self.reap_claims.lock().unwrap().contains(agent_id) {
+                TryBeginOutcome::ReapClaimed
+            } else {
+                TryBeginOutcome::Started
+            };
+            if outcome == TryBeginOutcome::Started {
                 // Drop a live-turn slot that outlived its turn BEFORE the claim
                 // becomes visible (monorepo#2104). A slot can survive its turn:
                 // when `flush_partial_turn_on_interruption` hits a non-UNIQUE
@@ -3754,9 +3785,9 @@ impl AgentManager {
                     .unwrap()
                     .insert(agent_id.clone(), workspace_id.clone());
             }
-            claimed
+            outcome
         };
-        if claimed {
+        if outcome == TryBeginOutcome::Started {
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -3768,7 +3799,7 @@ impl AgentManager {
             )
             .await;
         }
-        claimed
+        outcome
     }
 
     /// Release the in-flight slot without persisting agent status (used when
@@ -5442,19 +5473,37 @@ impl AgentManager {
             _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
-        // instead of interleaving. On the rare loss (a send claimed the slot
-        // between the busy check and here), the first notification is already
-        // consumed, so still stream it as an implicit turn — but with a ZERO
-        // settle window, handing the receiver straight back to the blocked
-        // prompt worker — and leave every slot-owner duty (registry
-        // active/idle marks, slot release, idle emit, queue drain) to the
-        // prompt turn that won the slot: marking idle here would flag the
-        // process eviction-eligible (and pop a spawn waiter) mid-prompt-turn.
-        if !self.try_begin(agent_id, workspace_id).await {
-            self.services
-                .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, Duration::ZERO)
-                .await;
-            return true;
+        // instead of interleaving. On the rare loss to a PROMPT turn (a send
+        // claimed the slot between the busy check and here), the first
+        // notification is already consumed, so still stream it as an implicit
+        // turn — but with a ZERO settle window, handing the receiver straight
+        // back to the blocked prompt worker — and leave every slot-owner duty
+        // (registry active/idle marks, slot release, idle emit, queue drain)
+        // to the prompt turn that won the slot: marking idle here would flag
+        // the process eviction-eligible (and pop a spawn waiter)
+        // mid-prompt-turn.
+        match self.try_begin_outcome(agent_id, workspace_id).await {
+            TryBeginOutcome::Started => {}
+            TryBeginOutcome::Busy => {
+                self.services
+                    .run_harness_wake_turn(
+                        &mut guard,
+                        first,
+                        agent_id,
+                        workspace_id,
+                        Duration::ZERO,
+                    )
+                    .await;
+                return true;
+            }
+            // A loss to the idle-reap sweep is NOT a prompt worker owning the
+            // slot: the sweep holds the agent mid-kill (monorepo#2118), so
+            // driving a harness wake turn here would run unowned concurrent
+            // work against the handle being torn down. Drop the consumed
+            // notification instead — it is the tail of the dying child's
+            // output and would have died with the handle's buffer had the
+            // kill won the race to it.
+            TryBeginOutcome::ReapClaimed => return true,
         }
         self.registry.mark_active(agent_id);
         // Drive the turn in its own task registered in `workers`, so

@@ -11401,6 +11401,62 @@ mod harness_wake_tests {
         assert!(!mgr.is_busy(&id), "slot never claimed");
     }
 
+    /// monorepo#2118 (PR review) — a tick losing the slot to a held REAP
+    /// claim must NOT drive a harness wake turn: unlike a loss to a prompt
+    /// worker (which owns the slot and finishes the turn), nobody owns the
+    /// slot during a reap kill and the handle is being torn down, so driving
+    /// the consumed notification would run unowned concurrent work in the
+    /// kill window. The tick drops the notification: no events, no rows, no
+    /// slot claim — and once the claim is released, a later burst opens an
+    /// implicit turn normally.
+    #[tokio::test]
+    async fn tick_losing_to_reap_claim_drops_notification_without_wake_turn() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        mgr.reap_claims.lock().unwrap().insert(id.clone());
+        note_tx.send(chunk_note("dying child tail")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+
+        assert!(
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
+            "no wake turn driven against the handle being killed"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no assistant row persisted"
+        );
+        assert!(!mgr.is_busy(&id), "slot never claimed");
+
+        // Claim released (kill done): the listener works normally again.
+        mgr.reap_claims.lock().unwrap().remove(&id);
+        note_tx.send(chunk_note("fresh burst")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:end"),
+            "post-release burst opens an implicit turn normally"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "only the post-release burst persisted");
+        assert_eq!(messages[0].content[0]["text"], json!("fresh burst"));
+    }
+
     /// `interrupt` aborts an open wake turn like a prompt turn: the drive
     /// task registered in `workers` is aborted, the streamed-so-far content
     /// is flushed as an interrupted row, the slot is released, and the single
