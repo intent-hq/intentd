@@ -1756,6 +1756,27 @@ impl Services {
             return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
         }
 
+        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
+        if let Some(rest) = trimmed.strip_prefix("ssh://") {
+            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            let host = &rest[..host_end];
+            // Strip a numeric port; a non-numeric suffix stays part of the
+            // host and fails the strict check below.
+            let host = host.split_once(':').map_or(host, |(h, port)| {
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    h
+                } else {
+                    host
+                }
+            });
+            if host != "github.com" {
+                return None;
+            }
+            let path = &rest[host_end..];
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+        }
+
         // SSH scp-like: git@host:path form. Extract host before the colon.
         if let Some(at_idx) = trimmed.find('@') {
             let after_at = &trimmed[at_idx + 1..];
@@ -2575,25 +2596,24 @@ impl Services {
     }
 
     /// Persist (insert-or-merge) a workspace git root and emit the matching
-    /// change event (monorepo#2053): `gitRoot:registered` when the path was
-    /// not yet tracked for the workspace, `gitRoot:updated` when an existing
-    /// row was merged (re-registration / attribution append). Returns the
-    /// stored row. Callers (the `ws.git.registerRoot` MCP binding, submodule
-    /// auto-detection) validate the path before reaching this.
+    /// change event (monorepo#2053): `gitRoot:registered` when the upsert
+    /// inserted a new row, `gitRoot:updated` when an existing row was merged
+    /// (re-registration / attribution append). The inserted-vs-merged fact
+    /// comes from the store's serialized upsert itself, so two concurrent
+    /// registrations of the same path emit exactly one `gitRoot:registered`
+    /// (the loser of the insert race observes the merge and emits
+    /// `gitRoot:updated`). Returns the stored row. Callers (the
+    /// `ws.git.registerRoot` MCP binding, submodule auto-detection) validate
+    /// the path before reaching this.
     pub async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
     ) -> Result<intent_core::WorkspaceGitRoot> {
-        let existed = self
-            .store
-            .find_workspace_git_root_by_path(&root.workspace_id, &root.path)
-            .await?
-            .is_some();
-        let stored = self.store.upsert_workspace_git_root(root).await?;
-        let event_type = if existed {
-            GIT_ROOT_UPDATED
-        } else {
+        let (stored, inserted) = self.store.upsert_workspace_git_root(root).await?;
+        let event_type = if inserted {
             GIT_ROOT_REGISTERED
+        } else {
+            GIT_ROOT_UPDATED
         };
         publish_event(&self.event_bus, git_root_changed_event(event_type, &stored)).await;
         Ok(stored)
@@ -8335,18 +8355,28 @@ pub(crate) fn git_root_changed_event(
     }
 }
 
-/// Serialize a persisted [`intent_core::WorkspaceGitRoot`] into its wire row
-/// — the persisted fields plus a live-read `branch` (never persisted; HEAD
-/// moves outside the daemon's control, so it is read per call like the FE's
-/// own branch display). Shared by `gitRoot.list` and `ws.git.registerRoot`
-/// so the two surfaces cannot drift (monorepo#2053).
-pub(crate) fn git_root_wire_row(root: &intent_core::WorkspaceGitRoot) -> serde_json::Value {
-    let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path));
-    let mut v = serde_json::to_value(root).unwrap_or_default();
-    if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
-        obj.insert("branch".to_string(), serde_json::Value::String(branch));
-    }
-    v
+/// Serialize persisted [`intent_core::WorkspaceGitRoot`] rows into their wire
+/// rows — the persisted fields plus a live-read `branch` (never persisted;
+/// HEAD moves outside the daemon's control, so it is read per call like the
+/// FE's own branch display). The branch reads are per-root git I/O, so
+/// callers run this on the blocking pool — never on the RPC task (the
+/// "no per-item git operations" cost contract, AGENTS.md). Shared by
+/// `gitRoot.list` and `ws.git.registerRoot` so the two surfaces cannot drift
+/// (monorepo#2053).
+pub(crate) fn git_root_wire_rows(
+    roots: &[intent_core::WorkspaceGitRoot],
+) -> Vec<serde_json::Value> {
+    roots
+        .iter()
+        .map(|root| {
+            let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path));
+            let mut v = serde_json::to_value(root).unwrap_or_default();
+            if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
+                obj.insert("branch".to_string(), serde_json::Value::String(branch));
+            }
+            v
+        })
+        .collect()
 }
 
 /// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
@@ -18473,18 +18503,21 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
             // (the TS `getStatus` fallbacks), never an error — but an unknown
-            // `gitRootId` is `-32602` (monorepo#2053).
+            // `gitRootId` is `-32602` (monorepo#2053). The root resolves
+            // BEFORE the remote early-return so the id is validated even on a
+            // remote workspace; a valid id then degrades to the same empty
+            // result the primary gets.
             let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
                 Err(e) => return Err(e),
             };
-            if ws.is_remote {
-                return Ok(intent_git::status::empty_status());
-            }
             let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(intent_git::status::empty_status());
             };
+            if ws.is_remote {
+                return Ok(intent_git::status::empty_status());
+            }
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
@@ -18514,7 +18547,12 @@ impl WorkspaceApi for Services {
             // with no registered roots is an empty list (monorepo#2053).
             let _ = store.get_workspace(&workspace_id).await?;
             let roots = store.list_workspace_git_roots(&workspace_id).await?;
-            let git_roots: Vec<serde_json::Value> = roots.iter().map(git_root_wire_row).collect();
+            // The per-root live branch reads are git I/O — batched onto the
+            // blocking pool so this list endpoint never performs per-item
+            // git operations on the RPC task (AGENTS.md cost contract).
+            let git_roots = tokio::task::spawn_blocking(move || git_root_wire_rows(&roots))
+                .await
+                .map_err(|e| Error::Internal(format!("gitRoot.list task failed: {e}")))?;
             Ok(serde_json::json!({ "gitRoots": git_roots }))
         })
     }
@@ -18583,7 +18621,15 @@ impl WorkspaceApi for Services {
                 updated_at: ts,
             };
             let stored = svc.register_git_root(&root).await?;
-            Ok(git_root_wire_row(&stored))
+            // The wire row's live branch read is git I/O — off the RPC task.
+            let row = tokio::task::spawn_blocking(move || {
+                git_root_wire_rows(std::slice::from_ref(&stored))
+                    .pop()
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("ws.git.registerRoot task failed: {e}")))?;
+            Ok(row)
         })
     }
 
@@ -19816,12 +19862,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
-            if ws.is_remote {
-                return Ok(empty);
-            }
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
             let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
+            if ws.is_remote {
+                return Ok(empty);
+            }
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
@@ -19853,12 +19901,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
-            if ws.is_remote {
-                return Ok(empty);
-            }
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
             let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
+            if ws.is_remote {
+                return Ok(empty);
+            }
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -20039,12 +20089,14 @@ impl WorkspaceApi for Services {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
             };
-            if ws.is_remote {
-                return Ok(empty);
-            }
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
             let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
+            if ws.is_remote {
+                return Ok(empty);
+            }
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -20103,12 +20155,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
-            if ws.is_remote {
-                return Ok(empty);
-            }
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
             let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
                 return Ok(empty);
             };
+            if ws.is_remote {
+                return Ok(empty);
+            }
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }

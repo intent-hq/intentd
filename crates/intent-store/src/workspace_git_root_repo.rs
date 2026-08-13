@@ -87,10 +87,15 @@ impl Store {
     /// auto-detected row in place, monorepo#2053), and `updated_at` is taken
     /// from `root`. The existing row's `id`, PR fields, and `created_at` are
     /// retained.
+    ///
+    /// Returns the stored row plus `true` when it was newly inserted /
+    /// `false` when an existing row was merged. The flag is decided inside
+    /// the same serialized write transaction as the insert-or-merge itself,
+    /// so concurrent registrations of one path observe exactly one insert.
     pub async fn upsert_workspace_git_root(
         &self,
         root: &WorkspaceGitRoot,
-    ) -> Result<WorkspaceGitRoot> {
+    ) -> Result<(WorkspaceGitRoot, bool)> {
         let pool = self.write_pool();
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -105,7 +110,7 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("find workspace git root failed: {e}")))?;
-            let merged = match existing {
+            let (merged, inserted) = match existing {
                 Some(row) => {
                     let mut current = root_from_row(&row)?;
                     for id in &root.registered_by_agent_ids {
@@ -140,7 +145,7 @@ impl Store {
                     .map_err(|e| {
                         Error::Internal(format!("merge workspace git root failed: {e}"))
                     })?;
-                    current
+                    (current, false)
                 }
                 None => {
                     let mut fresh = root.clone();
@@ -176,13 +181,13 @@ impl Store {
                         .map_err(|e| {
                             Error::Internal(format!("insert workspace git root failed: {e}"))
                         })?;
-                    fresh
+                    (fresh, true)
                 }
             };
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("upsert workspace git root commit failed: {e}"))
             })?;
-            Ok(merged)
+            Ok((merged, inserted))
         })
         .await
     }
@@ -383,19 +388,21 @@ mod tests {
         }
     }
 
-    /// A first upsert inserts; a second upsert on the same `(workspace,
-    /// path)` merges into the existing row — the new agent is appended, the
-    /// already-registered agent is not duplicated, the row keeps its `id` /
-    /// `source` / `created_at`, and no second row appears.
+    /// A first upsert inserts (`inserted == true`); a second upsert on the
+    /// same `(workspace, path)` merges into the existing row (`inserted ==
+    /// false`) — the new agent is appended, the already-registered agent is
+    /// not duplicated, the row keeps its `id` / `source` / `created_at`, and
+    /// no second row appears.
     #[tokio::test]
     async fn upsert_appends_registering_agent_deduped() {
         let (_tmp, store, ws_id) = store_with_workspace().await;
         let ts = now_iso();
         let first = test_root(&ws_id, "/tmp/clone-a", &["agent-1"], &ts);
-        let inserted = store
+        let (inserted, was_inserted) = store
             .upsert_workspace_git_root(&first)
             .await
             .expect("insert");
+        assert!(was_inserted, "first upsert inserts");
         assert_eq!(inserted.id, first.id);
         assert_eq!(
             inserted.registered_by_agent_ids,
@@ -406,10 +413,11 @@ mod tests {
         let mut second = test_root(&ws_id, "/tmp/clone-a", &["agent-1", "agent-2"], &later);
         second.repo_owner = Some("intent-hq".to_string());
         second.repo_name = Some("intentd".to_string());
-        let merged = store
+        let (merged, was_inserted) = store
             .upsert_workspace_git_root(&second)
             .await
             .expect("merge");
+        assert!(!was_inserted, "second upsert merges");
         assert_eq!(merged.id, first.id, "existing row id retained");
         assert_eq!(merged.created_at, first.created_at, "created_at retained");
         assert_eq!(
@@ -434,7 +442,7 @@ mod tests {
         let mut first = test_root(&ws_id, "/tmp/clone-b", &["agent-1", "agent-1"], &ts);
         first.repo_owner = Some("intent-hq".to_string());
         first.repo_name = Some("intentd".to_string());
-        let inserted = store
+        let (inserted, _) = store
             .upsert_workspace_git_root(&first)
             .await
             .expect("insert");
@@ -444,7 +452,7 @@ mod tests {
             "candidate list deduped on insert"
         );
 
-        let merged = store
+        let (merged, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/clone-b", &[], &now_iso()))
             .await
             .expect("merge");
@@ -464,14 +472,14 @@ mod tests {
         let (_tmp, store, ws_id) = store_with_workspace().await;
         let mut auto_root = test_root(&ws_id, "/tmp/clone-c", &[], &now_iso());
         auto_root.source = WorkspaceGitRootSource::Auto;
-        let inserted = store
+        let (inserted, _) = store
             .upsert_workspace_git_root(&auto_root)
             .await
             .expect("insert");
         assert_eq!(inserted.source, WorkspaceGitRootSource::Auto);
 
         // An agent registration takes over the auto-detected row in place.
-        let upgraded = store
+        let (upgraded, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/clone-c", &["agent-1"], &now_iso()))
             .await
             .expect("upgrade");
@@ -481,7 +489,7 @@ mod tests {
         // A later auto-detection pass must not downgrade it back.
         let mut auto_again = test_root(&ws_id, "/tmp/clone-c", &[], &now_iso());
         auto_again.source = WorkspaceGitRootSource::Auto;
-        let kept = store
+        let (kept, _) = store
             .upsert_workspace_git_root(&auto_again)
             .await
             .expect("merge");
@@ -494,11 +502,11 @@ mod tests {
     #[tokio::test]
     async fn get_list_find_delete_round_trip() {
         let (_tmp, store, ws_id) = store_with_workspace().await;
-        let a = store
+        let (a, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/a", &["agent-1"], &now_iso()))
             .await
             .expect("insert a");
-        let b = store
+        let (b, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/b", &[], "2999-01-01T00:00:00Z"))
             .await
             .expect("insert b");
@@ -541,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn pr_fields_update_round_trip() {
         let (_tmp, store, ws_id) = store_with_workspace().await;
-        let mut root = store
+        let (mut root, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/pr", &["agent-1"], &now_iso()))
             .await
             .expect("insert");
@@ -587,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_delete_cascades_git_roots() {
         let (_tmp, store, ws_id) = store_with_workspace().await;
-        let root = store
+        let (root, _) = store
             .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/cascade", &[], &now_iso()))
             .await
             .expect("insert");

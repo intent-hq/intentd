@@ -13669,6 +13669,92 @@ mod file_tracking {
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
     }
 
+    /// On a remote workspace the git reads still validate `gitRootId` before
+    /// the remote early-return: an unknown id is `InvalidParams` (-32602),
+    /// while a valid id degrades to the same empty result the primary gets
+    /// (monorepo#2053 review).
+    #[tokio::test]
+    async fn git_reads_remote_workspace_still_validates_git_root_id() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        ws.is_remote = true;
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Unknown id → -32602 even though the workspace is remote.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        let err = svc
+            .git_changes(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Valid id → the remote empty fallback, not an error.
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(status.files.is_empty(), "{status:?}");
+        let changes = svc.git_changes(ws_id, Some(root.id.clone())).await.unwrap();
+        assert_eq!(changes, serde_json::json!([]));
+    }
+
+    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
+    /// optional user and numeric port) alongside https and scp-like remotes,
+    /// and keeps the strict `github.com` host check for all three
+    /// (monorepo#2053 review).
+    #[test]
+    fn parse_github_owner_repo_handles_ssh_url_form() {
+        let parse = Services::parse_github_owner_repo;
+        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
+
+        // ssh:// forms.
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
+        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
+
+        // Strict host check on ssh:// too.
+        assert_eq!(
+            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
+        // A non-numeric "port" stays part of the host and is rejected.
+        assert_eq!(
+            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(
+            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
+            None
+        );
+        // No owner/repo path.
+        assert_eq!(parse("ssh://git@github.com"), None);
+        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
+
+        // The existing https and scp-like forms still parse.
+        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
+        assert_eq!(
+            parse("https://github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
+    }
+
     /// `register_git_root` emits `gitRoot:registered` on first registration
     /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
     /// `gitRoot:unregistered` (monorepo#2053).
