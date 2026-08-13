@@ -17314,6 +17314,52 @@ mod known_repo {
         );
     }
 
+    /// With a configured `workspace.worktreesLocation` the hook checks BOTH
+    /// roots: a `repositoryPath` under the **boot root** (e.g. a stale
+    /// checkout created before the setting changed) is skipped too, not just
+    /// paths under the create-time resolved parent (intent-hq/monorepo#2227).
+    #[tokio::test]
+    async fn create_workspace_skips_registry_for_boot_root_paths_with_custom_location() {
+        use crate::SettingsRegistry;
+        use std::sync::Arc;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let custom = tempfile::tempdir().expect("custom location");
+        let cfg_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(custom.path().join("worktrees").to_string_lossy()),
+            )])
+            .expect("apply worktreesLocation");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(registry);
+
+        let under_boot = ws_root.path().join("ws-old").join("monorepo");
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(under_boot.to_string_lossy().to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create under boot root");
+
+        assert_eq!(
+            store.list_known_repos().await.expect("list"),
+            vec![],
+            "boot-root path skipped even when worktreesLocation is configured"
+        );
+    }
+
     /// `workspace.create` derives `repository_name` from the local
     /// `repositoryPath` basename when the caller omits it; an explicit name
     /// always wins, and a create without a path leaves the name NULL.

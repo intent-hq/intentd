@@ -11546,6 +11546,13 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    // Kept alongside the resolved parent below: the known-repo
+                    // registration hook checks BOTH roots (a configured
+                    // `worktreesLocation` may differ from the boot root, and a
+                    // path under either is daemon-managed storage).
+                    let boot_root = workspaces_root
+                        .clone()
+                        .unwrap_or_else(default_workspaces_root);
                     let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
@@ -12792,6 +12799,13 @@ impl WorkspaceApi for Services {
                     // fallback) are not user repos and stay out of the registry
                     // (intent-hq/monorepo#2227). Best-effort: a registry
                     // failure must not fail workspace creation.
+                    // Same two-root set as the `repo.list` sweep: the resolved
+                    // create-time parent plus the boot root, so a stale
+                    // checkout under the other root never registers either.
+                    let mut registry_roots = vec![workspaces_root_pathbuf.clone()];
+                    if !registry_roots.contains(&boot_root) {
+                        registry_roots.push(boot_root.clone());
+                    }
                     let repo_path = ws
                         .repository_path
                         .as_deref()
@@ -12802,7 +12816,7 @@ impl WorkspaceApi for Services {
                             !is_workspace_owned_checkout(
                                 p,
                                 ws.worktree_path.as_deref(),
-                                std::slice::from_ref(&workspaces_root_pathbuf),
+                                &registry_roots,
                             )
                         });
                     if let Some(repo_path) = repo_path {
