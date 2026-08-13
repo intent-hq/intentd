@@ -518,9 +518,14 @@ pub struct AgentsSettings {
     pub max_concurrent: u32,
     /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
     /// daemon's whole child-process tree, above which new agent spawns queue
-    /// behind idle-process eviction instead of starting immediately (0 = off,
-    /// the default; changes apply on daemon restart; max 1,024,000).
-    pub memory_budget_mb: u32,
+    /// behind idle-process eviction instead of starting immediately. Absent
+    /// (`None`, the default) = auto (budget derived from system RAM); explicit
+    /// `0` = off — preserved because config files written before the auto
+    /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
+    /// monorepo#2109 no-migration precedent their behaviour must not change;
+    /// positive = budget in MB (changes apply on daemon restart; max
+    /// 1,024,000).
+    pub memory_budget_mb: Option<u32>,
     /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
     /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
     /// model probes; changes apply on daemon restart; range 1–64). Unlike
@@ -544,7 +549,7 @@ impl Default for AgentsSettings {
     fn default() -> Self {
         Self {
             max_concurrent: 0,
-            memory_budget_mb: 0,
+            memory_budget_mb: None,
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
@@ -930,14 +935,13 @@ impl SettingsFile {
                 ),
             ));
         }
-        if self.agents.memory_budget_mb > 1_024_000 {
-            return Err(bad(
-                "agents.memoryBudgetMb",
-                format!(
-                    "must be 0 (off) or between 1 and 1024000, got {}",
-                    self.agents.memory_budget_mb
-                ),
-            ));
+        if let Some(mb) = self.agents.memory_budget_mb {
+            if mb > 1_024_000 {
+                return Err(bad(
+                    "agents.memoryBudgetMb",
+                    format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
+                ));
+            }
         }
         // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
         // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
@@ -1212,17 +1216,22 @@ level = "info"
 maxConcurrent = 0
 # Agent memory budget (MB) -- aggregate resident memory the daemon's whole
 # child-process tree may use before new agent spawns queue behind idle-process
-# eviction (0 = off; nothing running is ever killed; changes apply on daemon
-# restart). A soft admission gate rather than a ceiling: measured transient
-# overshoot of 65-105% and steady state ~16% over, so budget for roughly 2x
-# the configured value as the transient. The overshoot is a fixed offset, not
-# proportional to demand -- at 1500 MB a 20-agent burst peaked the same as an
-# 8-agent one (3.06 vs 3.09 GB) where the same 20-agent burst unbounded
-# reached 12.37 GB. That 2x rule sizes the admission transient for a burst of
-# comparable agents; the gate runs at spawn only, so an already-admitted agent
-# whose own workload grows (a test suite) is never re-checked and can carry
-# the tree past the budget by itself.
-memoryBudgetMb = 0
+# eviction (nothing running is ever killed; changes apply on daemon restart).
+# Absent (the default, as in this file) = auto: the daemon derives the budget
+# from system RAM ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off. Upgrade
+# note: config files written before this key defaulted to auto carry a
+# literal `memoryBudgetMb = 0`, which stays off -- delete the line to opt
+# into auto. A positive value is the budget in MB (max 1024000). A soft
+# admission gate rather than a ceiling: measured transient overshoot of
+# 65-105% and steady state ~16% over, so budget for roughly 2x the configured
+# value as the transient. The overshoot is a fixed offset, not proportional
+# to demand -- at 1500 MB a 20-agent burst peaked the same as an 8-agent one
+# (3.06 vs 3.09 GB) where the same 20-agent burst unbounded reached 12.37 GB.
+# That 2x rule sizes the admission transient for a burst of comparable
+# agents; the gate runs at spawn only, so an already-admitted agent whose own
+# workload grows (a test suite) is never re-checked and can carry the tree
+# past the budget by itself.
+# memoryBudgetMb = 8192
 # Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
 # adapters (one-shot completions and model probes). Each costs ~610 MB and
 # holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
@@ -1648,6 +1657,9 @@ mod tests {
         file.providers.active = Some("claude-code".to_string());
         file.server.ws_api.enabled = true;
         file.agents.idle_reap_minutes = 15;
+        // An explicit 0 (off) must survive the round trip as `Some(0)`, never
+        // collapsing into the absent-key auto default.
+        file.agents.memory_budget_mb = Some(0);
         let text = toml::to_string(&file).expect("serializes");
         let back = SettingsFile::parse_str(&text).expect("re-parses");
         assert_eq!(back, file);
@@ -1909,17 +1921,31 @@ mod tests {
         );
     }
 
-    /// `agents.memoryBudgetMb` defaults to 0 (off, so an untouched config
-    /// behaves exactly as before), parses an override, and enforces the same
-    /// upper bound the catalog does.
+    /// The `agents.memoryBudgetMb` parse matrix (monorepo#2063): an absent
+    /// key is auto (`None`), an explicit `0` is off (`Some(0)` — every config
+    /// file the old template wrote carries that literal, so its behaviour is
+    /// preserved), a positive value is an explicit MB budget, and the upper
+    /// bound matches what the catalog enforces.
     #[test]
-    fn memory_budget_mb_defaults_off_and_bounds_are_enforced() {
+    fn memory_budget_mb_absent_auto_zero_off_positive_explicit() {
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
-        assert_eq!(parsed.agents.memory_budget_mb, 0);
+        assert_eq!(parsed.agents.memory_budget_mb, None, "absent key = auto");
+        assert!(
+            !DEFAULT_CONFIG_TEMPLATE.contains("\nmemoryBudgetMb ="),
+            "the template for new installs must not write the key (auto)"
+        );
+
+        let off =
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 0\n").expect("explicit 0 parses");
+        assert_eq!(
+            off.agents.memory_budget_mb,
+            Some(0),
+            "explicit 0 = off, distinct from the absent-key auto"
+        );
 
         let overridden =
             SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 20480\n").expect("override parses");
-        assert_eq!(overridden.agents.memory_budget_mb, 20_480);
+        assert_eq!(overridden.agents.memory_budget_mb, Some(20_480));
 
         let err = SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 2000000\n")
             .expect_err("out-of-range value must be rejected");

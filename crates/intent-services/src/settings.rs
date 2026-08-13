@@ -1304,15 +1304,21 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(200.0), // Upper bound to prevent resource exhaustion
             0.0,
         ),
-        number(
-            "agents.memoryBudgetMb",
-            "Agent memory budget (MB)",
-            "Aggregate resident memory the daemon's whole child-process tree may use before new agent spawns queue behind idle-process eviction (0 = off; nothing running is ever killed; changes apply on daemon restart)",
-            "agents",
-            Some(0.0),
-            Some(memory_budget_max_mb()),
-            0.0,
-        ),
+        // No `default_value`: the default is the *absent* key (auto, derived
+        // from system RAM), which `number()` cannot express (monorepo#2063).
+        SettingDefinition {
+            path: "agents.memoryBudgetMb",
+            label: "Agent memory budget (MB)",
+            description: "Aggregate resident memory the daemon's whole child-process tree may use before new agent spawns queue behind idle-process eviction (absent = auto, derived from system RAM; 0 = off; nothing running is ever killed; changes apply on daemon restart)",
+            category: "agents",
+            ty: SettingType::Number {
+                min: Some(0.0),
+                max: Some(memory_budget_max_mb()),
+            },
+            default_value: None,
+            sensitive: false,
+            read_only: false,
+        },
         number(
             "agents.maxConcurrentAdapters",
             "Max concurrent one-shot adapters",
@@ -1483,13 +1489,16 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 }
 
 /// The effective `agents.memoryBudgetMb` setting in bytes: a positive value
-/// installs the aggregate child-tree memory budget (monorepo#2063); 0 (the
-/// default) leaves it off entirely. See
-/// [`intent_services::recommended_memory_budget_bytes`] for the value this
-/// would default to if it were enabled.
+/// installs the aggregate child-tree memory budget (monorepo#2063); an
+/// explicit `0` is off. An absent key (`None`, the default) means auto — the
+/// boot wiring that resolves auto to
+/// [`intent_services::recommended_memory_budget_bytes`] lands separately, so
+/// until then auto yields `None` here and behaves like off.
 pub fn agent_memory_budget_bytes(settings: &SettingsFile) -> Option<u64> {
-    let mb = settings.agents.memory_budget_mb;
-    (mb > 0).then(|| mb as u64 * 1024 * 1024)
+    match settings.agents.memory_budget_mb {
+        None | Some(0) => None,
+        Some(mb) => Some(mb as u64 * 1024 * 1024),
+    }
 }
 
 /// The effective `agents.maxConcurrentAdapters` setting: the daemon-wide cap
@@ -2362,12 +2371,15 @@ mod tests {
         assert_eq!(max_concurrent_agents(&settings), Some(12));
     }
 
-    /// `agents.memoryBudgetMb` is a TOML-backed bounded number defaulting to 0
-    /// (off), and `agent_memory_budget_bytes` converts MB to bytes only when it
-    /// is set — a 0 must stay `None` rather than becoming a 0-byte budget that
-    /// would refuse every spawn.
+    /// `agents.memoryBudgetMb` is a TOML-backed bounded number, and
+    /// `agent_memory_budget_bytes` resolves the absent/0/positive
+    /// matrix (monorepo#2063): absent = auto (no explicit budget — the boot
+    /// wiring resolves it), explicit 0 = off (a 0 must stay `None` rather than
+    /// becoming a 0-byte budget that would refuse every spawn), positive = MB
+    /// converted to bytes. The catalog carries no `default_value` because the
+    /// default is the absent key.
     #[test]
-    fn agent_memory_budget_is_off_by_default_and_converts_mb_to_bytes() {
+    fn agent_memory_budget_matrix_absent_auto_zero_off_positive_bytes() {
         let def = find_definition("agents.memoryBudgetMb")
             .expect("agents.memoryBudgetMb missing from catalog");
         assert!(!def.sensitive);
@@ -2381,14 +2393,17 @@ mod tests {
         // usable range rather than a degenerate 0..0.
         assert_eq!(max, Some(memory_budget_max_mb()));
         assert!(max.expect("bounded") > 0.0);
-        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert_eq!(def.default_value, None, "the default is the absent key");
         assert!(KNOWN_PATHS.contains(&"agents.memoryBudgetMb"));
 
         let mut settings = SettingsFile::default();
-        assert_eq!(settings.agents.memory_budget_mb, 0);
+        assert_eq!(settings.agents.memory_budget_mb, None);
         assert_eq!(agent_memory_budget_bytes(&settings), None);
 
-        settings.agents.memory_budget_mb = 20_480;
+        settings.agents.memory_budget_mb = Some(0);
+        assert_eq!(agent_memory_budget_bytes(&settings), None);
+
+        settings.agents.memory_budget_mb = Some(20_480);
         assert_eq!(
             agent_memory_budget_bytes(&settings),
             Some(20 * 1024 * 1024 * 1024),
@@ -2477,7 +2492,7 @@ mod tests {
                 over_ram as u64
             ))
             .expect("a config.toml from a larger seat must still parse, not refuse to boot");
-            assert_eq!(parsed.agents.memory_budget_mb, over_ram as u32);
+            assert_eq!(parsed.agents.memory_budget_mb, Some(over_ram as u32));
         }
     }
 

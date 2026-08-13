@@ -704,7 +704,10 @@ async fn agent_memory_knobs_over_wss() {
     assert_eq!(entry["type"], json!("number"));
     assert_eq!(entry["category"], json!("agents"));
     assert_eq!(entry["min"], json!(0.0), "{entry}");
-    assert_eq!(entry["defaultValue"], json!(0.0), "{entry}");
+    // The default is the *absent* key (auto, monorepo#2063): the catalog
+    // carries no defaultValue and a fresh install reports a null value.
+    assert_eq!(entry["defaultValue"], Value::Null, "{entry}");
+    assert_eq!(entry["value"], Value::Null, "{entry}");
     let max = entry["max"]
         .as_f64()
         .unwrap_or_else(|| panic!("{budget} must advertise a max: {entry}"));
