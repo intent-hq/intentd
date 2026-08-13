@@ -70,6 +70,9 @@ jobs:
       pull-requests: read
       checks: read
       statuses: read
+      # gh pr view --json statusCheckRollup also resolves each check run's
+      # workflowRun, which needs Actions read.
+      actions: read
     steps:
       - name: Check release token
         id: token
