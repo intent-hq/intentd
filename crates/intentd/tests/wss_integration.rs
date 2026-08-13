@@ -5234,6 +5234,169 @@ async fn wss_git_commit_details_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `gitRoot.list` + the `gitRootId` param on the git reads over WSS
+/// (monorepo#2053): a registered secondary git root (a nested repo inside the
+/// workspace worktree) appears in `gitRoot.list` with its live-read branch,
+/// `git.status`/`git.changes` scoped by `gitRootId` target the nested repo
+/// instead of the workspace worktree, and an unknown `gitRootId` is `-32602`.
+#[tokio::test]
+async fn wss_git_root_list_and_scoped_reads_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed the primary repo with one commit and a nested repo inside it.
+    let repo_dir = test_tempdir("intentd-wssgitroot-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+    // An untracked file only the nested repo can see.
+    std::fs::write(nested.join("root-only.txt"), "hi\n").unwrap();
+
+    // Create a workspace pointing at the primary repo.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitRoot WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // No roots registered yet → empty list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["gitRoots"], serde_json::json!([]));
+
+    // Register the nested repo as a git root directly through the store (the
+    // agent-facing `ws.git.registerRoot` MCP binding lands separately).
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    // gitRoot.list returns the root with its live-read branch + attribution.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let roots = resp["result"]["gitRoots"].as_array().expect("gitRoots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], root.id.as_str());
+    assert_eq!(roots[0]["path"], root.path);
+    assert_eq!(roots[0]["source"], "agent");
+    assert_eq!(
+        roots[0]["registeredByAgentIds"],
+        serde_json::json!(["agent-1"])
+    );
+    assert!(
+        roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()),
+        "live-read branch present: {:?}",
+        roots[0]
+    );
+
+    // git.status scoped by gitRootId sees the nested repo's untracked file.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|f| f["path"] == "root-only.txt"),
+        "nested repo scan: {files:?}"
+    );
+
+    // git.changes scoped by gitRootId projects the same nested file list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.changes","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(changes.iter().any(|c| c["path"] == "root-only.txt"));
+
+    // The unscoped reads still target the primary worktree.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(
+        !changes.iter().any(|c| c["path"] == "root-only.txt"),
+        "primary scan unaffected: {changes:?}"
+    );
+
+    // Unknown gitRootId → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
 /// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
 /// prunes the unstaged walk to exactly the requested workspace-relative files,
 /// the legacy single `path` unions with `paths`, an absolute path under the
@@ -8478,8 +8641,9 @@ async fn wss_workspace_export_lifecycle() {
 /// checkout under the daemon's workspaces root (WIP snapshot unwound — the
 /// dirty file restored, not committed), rewrites the stored workspace row
 /// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
-/// direct), and registers the checkout in `known_repo`. Skips when `git` is
-/// unavailable on PATH (the bundler shells out to it).
+/// direct) — WITHOUT registering the workspace-owned checkout in
+/// `known_repo` (intent-hq/monorepo#2227). Skips when `git` is unavailable
+/// on PATH (the bundler shells out to it).
 #[tokio::test]
 async fn wss_workspace_import_commit_materializes_git() {
     use base64::Engine as _;
@@ -8645,13 +8809,12 @@ async fn wss_workspace_import_commit_materializes_git() {
         "uncommitted\n"
     );
 
-    // The checkout is registered in known_repo.
-    let known = srv.store.list_known_repos().await.expect("known repos");
-    assert!(
-        known
-            .iter()
-            .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
-        "checkout registered in known_repo: {known:?}"
+    // The materialized checkout is workspace-owned storage under the
+    // workspaces root and stays out of known_repo (intent-hq/monorepo#2227).
+    assert_eq!(
+        srv.store.list_known_repos().await.expect("known repos"),
+        vec![],
+        "materialized checkout is not registered in known_repo"
     );
 
     srv.ws.stop().await;

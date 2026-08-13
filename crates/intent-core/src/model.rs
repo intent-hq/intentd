@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -3361,6 +3364,58 @@ pub struct PrMonitor {
     /// poll never kills the loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
+/// lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceGitRootSource {
+    /// Registered explicitly by an agent (`ws.git.registerRoot`).
+    Agent,
+    /// Auto-detected by the daemon (the workspace worktree's git submodules).
+    Auto,
+}
+
+/// A secondary local git repository tracked for a workspace (multi git root
+/// tracking, intent-hq/monorepo#2053) — an agent-created subtree checkout, a
+/// submodule, or a sibling clone anywhere on the host. Persisted to the
+/// `workspace_git_root` table (rows cascade with their workspace); the daemon
+/// runs the same background PR discovery on each root as on the primary
+/// workspace root, so the PR fields mirror the [`Workspace`] PR fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitRoot {
+    pub id: WorkspaceGitRootId,
+    pub workspace_id: WorkspaceId,
+    /// Canonicalized absolute path of the git repository root. Registration
+    /// is idempotent by `(workspaceId, path)`.
+    pub path: String,
+    pub source: WorkspaceGitRootSource,
+    /// Repository owner detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_owner: Option<String>,
+    /// Repository name detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Agents that registered this root, in registration order (deduped).
+    /// Empty for auto-detected roots with no explicit registrations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_by_agent_ids: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// Persisted PR lifecycle status for the root's linked PR (§7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_status: Option<PullRequestStatus>,
+    /// Persisted list of PR snapshots discovered for the root's current
+    /// branch (§7.6). `None` = never populated by the daemon; `Some(vec![])`
+    /// = explicitly no discovered PRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests: Option<Vec<PullRequestInfo>>,
     pub created_at: String,
     pub updated_at: String,
 }

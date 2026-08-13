@@ -131,9 +131,24 @@
 //! quick-action fan-out could spawn until `server.maxOutstandingRpcs`
 //! (monorepo#2062). Nothing was spawned when this error is returned, so a
 //! retry is always safe — no new methods, 287 router methods, 326 total.
+//! Version 6.15 adds multi git root tracking (additive; §5.6, monorepo#2053):
+//! the `gitRoot.list` router method serves the workspace's registered
+//! secondary git roots as `{ gitRoots: [...] }` (each wire row is the
+//! persisted `WorkspaceGitRoot` plus a live-read `branch?`), six git reads —
+//! `git.status`, `git.changes`, `git.diffs`, `git.commits`, `git.showFile`,
+//! and `git.branchStatus` (where `workspaceId` + `gitRootId` may stand in
+//! for `repoPath`; `repoPath` wins when both are supplied) — gain the
+//! optional `gitRootId` param scoping the read to a registered root (an
+//! unknown or foreign-workspace id is `-32602` with an identical message;
+//! empty/whitespace values read as absent), and the `gitRoot:registered` /
+//! `gitRoot:updated` / `gitRoot:unregistered` event family surfaces the
+//! daemon-owned root lifecycle (agent registration via the MCP-only
+//! `ws.git.registerRoot` / `ws.git.unregisterRoot` / `ws.git.listRoots`
+//! bindings, submodule auto-detection, auto-prune, per-root PR discovery) —
+//! 288 router methods, 327 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.14";
+pub const PROTOCOL_VERSION: &str = "6.15";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

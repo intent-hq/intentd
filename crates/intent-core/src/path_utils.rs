@@ -528,6 +528,55 @@ where
     dirs
 }
 
+/// Extensions Windows can actually run for a discovered entry point
+/// (`CreateProcess` / `cmd.exe`-runnable), in resolution-preference order.
+///
+/// This is the single Windows runnable-extension policy shared by every
+/// binary-discovery site: provider discovery in `intent-providers`, auggie
+/// discovery in `intent-context`, and `host.findBinary` in `intent-transport`.
+pub const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+/// True when `path` carries a Windows-runnable executable extension
+/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
+pub fn has_windows_exec_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            WINDOWS_EXEC_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+        })
+}
+
+/// True when `p` is a file that is executable (unix checks the exec bit;
+/// Windows requires a runnable executable extension — `CreateProcess` cannot
+/// run a bare extensionless file, so its mere existence is not enough).
+pub fn is_executable_file(p: &Path) -> bool {
+    is_executable_file_for(p, cfg!(windows))
+}
+
+/// [`is_executable_file`] parametrized on the platform (test seam — Windows
+/// CI is disabled, so the Windows arm is unit-tested on POSIX).
+pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    if is_windows {
+        return has_windows_exec_extension(p);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1183,81 @@ mod tests {
         assert!(
             capture.credential_env.is_empty(),
             "Missing env sentinels should degrade to an empty map"
+        );
+    }
+
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-core-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        dir
+    }
+
+    #[test]
+    fn has_windows_exec_extension_only_matches_runnable_exts() {
+        assert!(has_windows_exec_extension(Path::new("tool.exe")));
+        assert!(has_windows_exec_extension(Path::new("tool.cmd")));
+        assert!(has_windows_exec_extension(Path::new("tool.bat")));
+        // Case-insensitive, matching Windows filename semantics.
+        assert!(has_windows_exec_extension(Path::new("tool.EXE")));
+        assert!(has_windows_exec_extension(Path::new("tool.Cmd")));
+        assert!(!has_windows_exec_extension(Path::new("tool")));
+        assert!(!has_windows_exec_extension(Path::new("tool.ps1")));
+        assert!(!has_windows_exec_extension(Path::new("tool.txt")));
+    }
+
+    #[test]
+    fn is_executable_file_windows_requires_runnable_extension() {
+        let dir = unique_temp_dir("win-exec");
+        let bare = dir.path().join("tool");
+        let cmd = dir.path().join("tool.cmd");
+        let exe_upper = dir.path().join("tool.EXE");
+        std::fs::write(&bare, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&cmd, "@echo off\r\n").unwrap();
+        std::fs::write(&exe_upper, "MZ").unwrap();
+        assert!(
+            !is_executable_file_for(&bare, true),
+            "an extensionless file is not runnable on Windows"
+        );
+        assert!(is_executable_file_for(&cmd, true));
+        assert!(
+            is_executable_file_for(&exe_upper, true),
+            "extension matching must be case-insensitive"
+        );
+        assert!(!is_executable_file_for(
+            &dir.path().join("missing.exe"),
+            true
+        ));
+        assert!(
+            !is_executable_file_for(dir.path(), true),
+            "directories never resolve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_posix_requires_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("posix-exec");
+        let plain = dir.path().join("tool");
+        std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            !is_executable_file_for(&plain, false),
+            "a file without the exec bit is not executable on POSIX"
+        );
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file_for(&plain, false));
+        assert!(!is_executable_file_for(&dir.path().join("missing"), false));
+        assert!(
+            !is_executable_file_for(dir.path(), false),
+            "directories never resolve"
         );
     }
 }

@@ -169,6 +169,18 @@ pub const GIT_PULL: &str = "git:pull";
 pub const GIT_BRANCH: &str = "git:branch";
 pub const GIT_MERGE: &str = "git:merge";
 
+// Workspace-git-root events (multi git root tracking,
+// intent-hq/monorepo#2053). Emitted when a secondary git root is registered
+// for a workspace, when a registered root's row changes (re-registration
+// attribution merge, PR-field refresh), and when a root is unregistered or
+// auto-pruned. Self-sufficient payloads: `gitRoot:registered` /
+// `gitRoot:updated` carry `{ workspaceId, gitRoot }` (the full wire
+// `WorkspaceGitRoot` row); `gitRoot:unregistered` carries
+// `{ workspaceId, gitRootId, path }`.
+pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
+pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
+pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
@@ -466,6 +478,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_PULL,
     GIT_BRANCH,
     GIT_MERGE,
+    GIT_ROOT_REGISTERED,
+    GIT_ROOT_UPDATED,
+    GIT_ROOT_UNREGISTERED,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
