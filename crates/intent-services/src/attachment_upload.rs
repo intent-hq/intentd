@@ -11,10 +11,15 @@
 //! deletes the staging state. Sessions are in-memory only — a daemon restart
 //! drops them and orphaned staging dirs are swept lazily by the next
 //! `begin` — and nothing is visible (no file, no registry row) until
-//! `commit` succeeds.
+//! `commit` succeeds. Sessions are bounded (monorepo#2275): each workspace
+//! may hold at most [`ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE`] live
+//! sessions, and a session idle past [`ATTACHMENT_UPLOAD_IDLE_TTL`] (no
+//! begin/chunk/commit activity) is expired lazily — reclaimed by the next
+//! `begin` and reported as a clear caller error to its own late calls.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use intent_core::{Error, Result, WorkspaceApi as _, WorkspaceId};
@@ -30,6 +35,28 @@ pub(crate) const ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum declared attachment size accepted by `begin` (decoded bytes).
 pub(crate) const ATTACHMENT_UPLOAD_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum live staged-upload sessions per workspace (monorepo#2275): a
+/// `begin` beyond the cap is rejected until one settles (commit/abort) or
+/// expires. Bounds the staging disk a single workspace can pin.
+pub(crate) const ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE: usize = 4;
+
+/// How long a session may sit with no begin/chunk/commit activity before it
+/// is expired and its staging reclaimed (monorepo#2275). Generous next to
+/// the per-chunk cadence of a live upload — even a slow link lands a 16 MiB
+/// chunk well inside 15 minutes — while bounding how long an abandoned
+/// session (client crash, dropped connection) pins up to 1 GiB of staging.
+const ATTACHMENT_UPLOAD_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Resolve the idle TTL, honoring the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS`
+/// test seam (milliseconds) so regression coverage need not wait 15 minutes.
+fn attachment_upload_idle_ttl() -> Duration {
+    std::env::var("INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(ATTACHMENT_UPLOAD_IDLE_TTL)
+}
 
 /// One in-flight staged attachment upload: everything `chunk`/`commit`/
 /// `abort` need between calls. Lives in [`Services::attachment_uploads`];
@@ -52,9 +79,19 @@ pub(crate) struct AttachmentUploadSession {
     /// race the commit's cleanup. Cleared on a failed commit (the session
     /// survives for retry or abort).
     pub committing: bool,
+    /// Last begin/chunk/commit activity — the idle-TTL clock. A committing
+    /// session never expires (the flag guards it), and a failed commit
+    /// refreshes the clock so the retry window restarts.
+    pub last_activity: Instant,
 }
 
 impl AttachmentUploadSession {
+    /// Idle past the TTL and safe to reclaim. Never true while a commit is
+    /// in flight — expiring mid-commit would race the files being hashed.
+    fn expired(&self, ttl: Duration) -> bool {
+        !self.committing && self.last_activity.elapsed() >= ttl
+    }
+
     fn received_bytes(&self) -> u64 {
         self.chunk_sizes.values().sum()
     }
@@ -64,6 +101,26 @@ impl AttachmentUploadSession {
 /// directory listing sorts in seq order for humans; commit reads by index).
 fn chunk_file_name(seq: u64) -> String {
     format!("chunk-{seq:08}")
+}
+
+/// Remove every idle-expired session from the registry, returning their
+/// staging dirs for the caller to delete OUTSIDE the lock (filesystem I/O
+/// never happens under the registry mutex). Committing sessions are never
+/// drained.
+fn drain_expired_sessions(uploads: &mut HashMap<String, AttachmentUploadSession>) -> Vec<PathBuf> {
+    let ttl = attachment_upload_idle_ttl();
+    let expired: Vec<String> = uploads
+        .iter()
+        .filter(|(_, s)| s.expired(ttl))
+        .map(|(id, _)| id.clone())
+        .collect();
+    expired
+        .iter()
+        .filter_map(|id| {
+            tracing::info!(upload = %id, "expiring idle attachment upload session");
+            uploads.remove(id).map(|s| s.staging_dir)
+        })
+        .collect()
 }
 
 impl Services {
@@ -82,8 +139,10 @@ impl Services {
     /// placement would reject (empty, or a basename reducing to `.`/`..`/
     /// nothing — the same sanitization commit applies, so a doomed name
     /// fails here instead of after staging up to a gigabyte), a zero or
-    /// over-cap declared size, and a malformed sha. Returns
-    /// `{ uploadId, maxChunkBytes }`.
+    /// over-cap declared size, a malformed sha, and — after idle-expired
+    /// sessions are reclaimed — a workspace already holding
+    /// [`ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE`] live sessions
+    /// (monorepo#2275). Returns `{ uploadId, maxChunkBytes }`.
     pub(crate) async fn file_attachment_upload_begin_op(
         &self,
         workspace_id: WorkspaceId,
@@ -136,24 +195,50 @@ impl Services {
         // Register the session BEFORE any directory exists, so every early
         // return leaves nothing on disk — and so the orphan sweep (which
         // checks the registry at removal time) can never classify this
-        // upload's directory as an orphan.
-        {
+        // upload's directory as an orphan. Expiry, the cap check, and the
+        // insert happen under ONE lock hold, so concurrent begins cannot
+        // both pass the cap (monorepo#2275); expired sessions are drained
+        // first so they never hold cap slots.
+        let expired_dirs;
+        let admitted = {
             let mut uploads = self
                 .attachment_uploads
                 .lock()
                 .expect("attachment upload registry poisoned");
-            let session = AttachmentUploadSession {
-                workspace_id,
-                file_name,
-                mime_type,
-                staging_dir: staging_dir.clone(),
-                declared_size: size_bytes,
-                declared_sha256: sha,
-                chunk_sizes: HashMap::new(),
-                committing: false,
-            };
-            uploads.insert(upload_id.clone(), session);
+            expired_dirs = drain_expired_sessions(&mut uploads);
+            let live = uploads
+                .values()
+                .filter(|s| s.workspace_id == workspace_id)
+                .count();
+            if live >= ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE {
+                Err(Error::InvalidParams(format!(
+                    "workspace {} already has {live} attachment uploads in progress \
+                     (max {ATTACHMENT_UPLOAD_MAX_SESSIONS_PER_WORKSPACE}) — commit or \
+                     abort one before beginning another",
+                    workspace_id.0
+                )))
+            } else {
+                let session = AttachmentUploadSession {
+                    workspace_id,
+                    file_name,
+                    mime_type,
+                    staging_dir: staging_dir.clone(),
+                    declared_size: size_bytes,
+                    declared_sha256: sha,
+                    chunk_sizes: HashMap::new(),
+                    committing: false,
+                    last_activity: Instant::now(),
+                };
+                uploads.insert(upload_id.clone(), session);
+                Ok(())
+            }
+        };
+        // Expired staging is reclaimed even when this begin was rejected at
+        // the cap — the drain already dropped the sessions. Best-effort.
+        for dir in expired_dirs {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
         }
+        admitted?;
 
         // Lazy sweep: staging dirs with no live session are orphans (a
         // daemon restart drops the in-memory registry). Best-effort — a
@@ -205,12 +290,42 @@ impl Services {
         }
     }
 
+    /// If `upload_id` names an idle-expired session, drop it, delete its
+    /// staging dir, and return the clear "expired" caller error the late
+    /// call surfaces (monorepo#2275). A live, unknown, or committing
+    /// session returns `Ok(())` — the caller's own lookup handles those.
+    async fn reclaim_upload_if_expired(&self, upload_id: &str) -> Result<()> {
+        let staging_dir = {
+            let mut uploads = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned");
+            let ttl = attachment_upload_idle_ttl();
+            match uploads.get(upload_id) {
+                Some(session) if session.expired(ttl) => {
+                    tracing::info!(upload = %upload_id, "expiring idle attachment upload session");
+                    uploads.remove(upload_id).map(|s| s.staging_dir)
+                }
+                _ => return Ok(()),
+            }
+        };
+        if let Some(dir) = staging_dir {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+        Err(Error::InvalidParams(format!(
+            "attachment upload {upload_id} expired after {}s of inactivity — begin a new upload",
+            attachment_upload_idle_ttl().as_secs()
+        )))
+    }
+
     /// `file.attachmentUpload.chunk`: stage one seq-numbered slice of the
     /// payload. `data` is base64; the decoded slice is written to its own
     /// `chunk-<seq>` file, so retrying a seq is idempotent (same bytes land
     /// in the same file) and chunks may arrive in any order. Rejects decoded
-    /// slices over [`ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES`] and totals beyond
-    /// the declared size. Returns `{ uploadId, seq, receivedBytes }`.
+    /// slices over [`ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES`], totals beyond
+    /// the declared size, and idle-expired sessions (the expired session is
+    /// reclaimed on the spot — monorepo#2275). Returns
+    /// `{ uploadId, seq, receivedBytes }`.
     pub(crate) async fn file_attachment_upload_chunk_op(
         &self,
         upload_id: String,
@@ -230,6 +345,9 @@ impl Services {
                 ATTACHMENT_UPLOAD_MAX_CHUNK_BYTES
             )));
         }
+        // An idle-expired session is reclaimed on the spot and this call
+        // gets the clear caller error (monorepo#2275).
+        self.reclaim_upload_if_expired(&upload_id).await?;
         // Reserve this seq's bytes under ONE lock hold: the size check and
         // the `chunk_sizes` update are atomic, so concurrent chunks cannot
         // both pass the check and push the total past the declared size.
@@ -246,6 +364,7 @@ impl Services {
                     "upload {upload_id} is committing — chunks are no longer accepted"
                 )));
             }
+            session.last_activity = Instant::now();
             // A retried seq replaces its previous bytes; only NEW bytes
             // count against the declared total.
             let prior_this_seq = session.chunk_sizes.get(&seq).copied();
@@ -326,6 +445,9 @@ impl Services {
         &self,
         upload_id: String,
     ) -> Result<serde_json::Value> {
+        // An idle-expired session is reclaimed on the spot and this call
+        // gets the clear caller error (monorepo#2275).
+        self.reclaim_upload_if_expired(&upload_id).await?;
         // Phase 1 — validate and CLAIM the `committing` flag under one lock
         // hold. Errors here (unknown id, already committing, incomplete,
         // gaps) never touch a flag another commit owns.
@@ -342,6 +464,7 @@ impl Services {
                     "upload {upload_id} is already committing"
                 )));
             }
+            session.last_activity = Instant::now();
             let received = session.received_bytes();
             if received != session.declared_size {
                 return Err(Error::InvalidParams(format!(
@@ -375,16 +498,27 @@ impl Services {
             .file_attachment_upload_commit_body(&upload_id, claim)
             .await;
         if result.is_err() {
-            if let Some(session) = self
-                .attachment_uploads
-                .lock()
-                .expect("attachment upload registry poisoned")
-                .get_mut(&upload_id)
-            {
-                session.committing = false;
-            }
+            self.release_failed_commit_claim(&upload_id);
         }
         result
+    }
+
+    /// Release a failed commit's `committing` claim so the session survives
+    /// for retry or abort. Also refreshes the idle clock: the commit itself
+    /// may have outlived the TTL (claim time is the last refresh before the
+    /// body runs), and without this the next call — or a `begin` sweep —
+    /// would expire the session instantly instead of granting the
+    /// documented fresh retry window.
+    fn release_failed_commit_claim(&self, upload_id: &str) {
+        if let Some(session) = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get_mut(upload_id)
+        {
+            session.committing = false;
+            session.last_activity = Instant::now();
+        }
     }
 
     async fn file_attachment_upload_commit_body(
@@ -475,8 +609,21 @@ fn assemble_and_verify(
         .map_err(|e| Error::Internal(format!("create assembled attachment failed: {e}")))?;
     let mut total = 0u64;
     for seq in chunk_seqs {
-        let bytes = std::fs::read(staging_dir.join(chunk_file_name(*seq)))
-            .map_err(|e| Error::Internal(format!("read staged chunk {seq} failed: {e}")))?;
+        let bytes = std::fs::read(staging_dir.join(chunk_file_name(*seq))).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // A reserved-but-unwritten chunk: the commit was pipelined
+                // behind a chunk call whose reservation landed but whose
+                // disk write had not yet — a caller-side race, not a daemon
+                // fault (monorepo#2275). The session survives; retry once
+                // the chunk call has returned.
+                Error::InvalidParams(format!(
+                    "chunk {seq} is still being written — wait for the chunk call to return, \
+                     then retry the commit"
+                ))
+            } else {
+                Error::Internal(format!("read staged chunk {seq} failed: {e}"))
+            }
+        })?;
         hasher.update(&bytes);
         total += bytes.len() as u64;
         out.write_all(&bytes)
@@ -486,8 +633,14 @@ fn assemble_and_verify(
         .map_err(|e| Error::Internal(format!("assemble attachment flush failed: {e}")))?;
     drop(out);
     if total != declared_size {
+        // Phase 1 already proved the RESERVATIONS sum to declared_size, so a
+        // short assembly means a chunk file was read mid-write — the
+        // partial-write guise of the same pipelined race as the NotFound arm
+        // above (monorepo#2275). Same remedy: the session survives; retry
+        // once the chunk call has returned.
         return Err(Error::InvalidParams(format!(
-            "assembled attachment is {total} bytes, expected {declared_size}"
+            "assembled attachment is {total} bytes, expected {declared_size} — a chunk may \
+             still be being written; wait for the chunk call to return, then retry the commit"
         )));
     }
     let actual = format!("{:x}", hasher.finalize());
@@ -961,12 +1114,277 @@ mod tests {
                 declared_sha256: "a".repeat(64),
                 chunk_sizes: std::collections::HashMap::new(),
                 committing: false,
+                last_activity: std::time::Instant::now(),
             },
         );
 
         svc.sweep_orphaned_upload_staging_dirs().await;
         assert!(live_dir.exists(), "live session dir must survive the sweep");
         assert!(!orphan_dir.exists(), "orphan dir must be swept");
+    }
+
+    /// Regression (monorepo#2275): the 5th concurrent `begin` for one
+    /// workspace is rejected with a caller error naming the cap, sessions in
+    /// OTHER workspaces don't count against it, and settling a session
+    /// (abort) frees the slot.
+    #[tokio::test]
+    async fn begin_rejects_fifth_concurrent_session_per_workspace() {
+        // The TTL env seam is read process-wide, so pin a huge TTL here:
+        // this test's four deliberately idle sessions must never be drained
+        // by a tiny TTL leaking from a concurrently running expiry test —
+        // holding the guard also serializes us against them via ENV_LOCK.
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "3600000",
+        )]);
+        let ws = WorkspaceId("ws-up-cap4".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"cap-me".to_vec();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(begin(&svc, &ws, &payload).await);
+        }
+        let err = svc
+            .file_attachment_upload_begin_op(
+                ws.clone(),
+                "fifth.bin".to_string(),
+                payload.len() as u64,
+                sha256_hex(&payload),
+                None,
+            )
+            .await
+            .expect_err("fifth begin must hit the cap");
+        assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+        assert!(err.to_string().contains('4'), "cap named: {err}");
+
+        // Another workspace is unaffected by this one's full slots.
+        let ws2 = WorkspaceId("ws-up-cap4-other".to_string());
+        let mut row2 = crate::tests::workspace(&ws2);
+        row2.worktree_path = Some(checkout.0.to_string_lossy().into_owned());
+        svc.store
+            .insert_workspace(&row2)
+            .await
+            .expect("seed second workspace");
+        begin(&svc, &ws2, &payload).await;
+
+        // Settling one session frees the slot.
+        svc.file_attachment_upload_abort_op(ids.pop().unwrap())
+            .await
+            .expect("abort");
+        begin(&svc, &ws, &payload).await;
+    }
+
+    /// Regression (monorepo#2275): a session idle past the TTL is dropped —
+    /// its staging dir swept — and subsequent chunk/commit calls get a clear
+    /// caller error instead of operating on reclaimed state. The TTL is
+    /// pinned tiny via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS` seam.
+    #[tokio::test]
+    async fn idle_session_expires_and_subsequent_ops_fail_cleanly() {
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "50",
+        )]);
+        let ws = WorkspaceId("ws-up-ttl".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"expire-me".to_vec();
+        let upload_id = begin(&svc, &ws, &payload).await;
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+        let staging = ws_root
+            .0
+            .join(".attachment-upload-staging")
+            .join(&upload_id);
+        assert!(staging.exists());
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // The expired session fails cleanly and its staging dir is swept.
+        let err = svc
+            .file_attachment_upload_chunk_op(upload_id.clone(), 1, b64(b"x"))
+            .await
+            .expect_err("chunk after expiry");
+        assert!(
+            matches!(err, Error::InvalidParams(_)) && err.to_string().contains("expired"),
+            "got {err:?}"
+        );
+        assert!(!staging.exists(), "expired staging dir must be swept");
+        // The session is gone now — later calls get the unknown-id caller
+        // error (the expiry already reclaimed it).
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect_err("commit after expiry");
+        assert!(
+            matches!(err, Error::NotFound(_)) || err.to_string().contains("expired"),
+            "got {err:?}"
+        );
+    }
+
+    /// Regression (monorepo#2275): expired sessions don't hold cap slots or
+    /// staging dirs — the next `begin` reclaims them — while a session kept
+    /// live by ongoing chunk activity is never reclaimed.
+    #[tokio::test]
+    async fn begin_reclaims_expired_sessions_and_spares_active_ones() {
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "1000",
+        )]);
+        let ws = WorkspaceId("ws-up-reclaim".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        // Fill all 4 slots, then let them all go idle past the TTL.
+        let payload = b"reclaim-me".to_vec();
+        let mut stale_ids = Vec::new();
+        for _ in 0..4 {
+            stale_ids.push(begin(&svc, &ws, &payload).await);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // A 5th begin succeeds — the expired sessions no longer count — and
+        // their staging dirs are swept.
+        let live_id = begin(&svc, &ws, &payload).await;
+        let staging_root = ws_root.0.join(".attachment-upload-staging");
+        for stale in &stale_ids {
+            assert!(
+                !staging_root.join(stale).exists(),
+                "expired staging dir must be swept: {stale}"
+            );
+        }
+
+        // Ongoing chunk activity keeps a session alive well past one TTL of
+        // wall time (5 x 250ms > 1000ms), with a 4x cadence-to-TTL margin so
+        // a stalled CI scheduler doesn't expire the "live" session.
+        let mid = payload.len() / 2;
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            svc.file_attachment_upload_chunk_op(live_id.clone(), 0, b64(&payload[..mid]))
+                .await
+                .expect("keep-alive chunk");
+        }
+        svc.file_attachment_upload_chunk_op(live_id.clone(), 1, b64(&payload[mid..]))
+            .await
+            .expect("final chunk");
+        svc.file_attachment_upload_commit_op(live_id)
+            .await
+            .expect("active session commits after > TTL wall time");
+    }
+
+    /// Regression (monorepo#2275): a pipelined commit racing an in-flight
+    /// chunk write (seq reserved in `chunk_sizes`, file not yet on disk) is
+    /// an `InvalidParams` caller error advising a retry — not `Internal` —
+    /// and the retried commit succeeds once the chunk write lands.
+    #[tokio::test]
+    async fn commit_racing_unwritten_chunk_is_caller_error_and_retryable() {
+        let ws = WorkspaceId("ws-up-race".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"pipelined-final-chunk!".to_vec();
+        let mid = payload.len() / 2;
+        let upload_id = begin(&svc, &ws, &payload).await;
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload[..mid]))
+            .await
+            .expect("chunk 0");
+        // Simulate the final chunk mid-write: its bytes are reserved under
+        // the registry lock (as `chunk` does before its disk write) but the
+        // chunk file has not landed yet.
+        svc.attachment_uploads
+            .lock()
+            .unwrap()
+            .get_mut(&upload_id)
+            .unwrap()
+            .chunk_sizes
+            .insert(1, (payload.len() - mid) as u64);
+
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect_err("commit racing the unwritten chunk");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "must be a caller error, got {err:?}"
+        );
+        assert!(err.to_string().contains("retry"), "advises retry: {err}");
+
+        // Same race, second guise: the chunk file exists but was read
+        // mid-write (tokio::fs::write is not atomic), so assembly comes up
+        // short. Also a caller error advising a retry — not a message that
+        // pushes the client to abort a recoverable upload.
+        let staging = ws_root
+            .0
+            .join(".attachment-upload-staging")
+            .join(&upload_id);
+        std::fs::write(
+            staging.join(super::chunk_file_name(1)),
+            &payload[mid..mid + 1],
+        )
+        .unwrap();
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect_err("commit racing the partially written chunk");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "must be a caller error, got {err:?}"
+        );
+        assert!(err.to_string().contains("retry"), "advises retry: {err}");
+
+        // The in-flight write lands; the retried commit succeeds.
+        std::fs::write(staging.join(super::chunk_file_name(1)), &payload[mid..]).unwrap();
+        svc.file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("retried commit");
+    }
+
+    /// Regression (monorepo#2275 review): a commit that fails after running
+    /// LONGER than the idle TTL must still leave the session a fresh retry
+    /// window. The failure path refreshes `last_activity` when it releases
+    /// the `committing` claim — without that, the claim-time timestamp is
+    /// already past the TTL and the next op (or a `begin` sweep) expires
+    /// the session instead of allowing the documented retry.
+    #[tokio::test]
+    async fn failed_commit_outliving_ttl_still_gets_fresh_retry_window() {
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "100",
+        )]);
+        let ws = WorkspaceId("ws-up-slow-commit".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"slow-commit".to_vec();
+        let upload_id = begin(&svc, &ws, &payload).await;
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+        // Simulate a commit claimed well over one TTL ago and still in
+        // flight: `committing` held, claim-time `last_activity` long stale.
+        {
+            let mut uploads = svc.attachment_uploads.lock().unwrap();
+            let session = uploads.get_mut(&upload_id).unwrap();
+            session.committing = true;
+            session.last_activity = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .expect("backdate claim time");
+        }
+        // The slow commit fails; its failure path releases the claim.
+        svc.release_failed_commit_claim(&upload_id);
+        // The session must NOT be instantly expired: the retry window
+        // restarts at the failure, so an immediate retry succeeds.
+        svc.file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("retry inside the refreshed window");
     }
 
     /// Regression: a commit rejected with "already committing" must NOT
