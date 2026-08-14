@@ -2630,6 +2630,20 @@ impl Services {
         &self.store
     }
 
+    /// Best-effort read of a git root's current HEAD commit SHA, for
+    /// stamping `registered_commit_sha` at registration time (monorepo#2053
+    /// follow-up). Fail-soft: an unreadable HEAD (unborn branch, corrupt
+    /// repo, unreachable mount) yields `None` — never an error. The read is
+    /// git I/O (roots may live on network/FUSE mounts), so it runs on the
+    /// blocking pool — never on the RPC task.
+    async fn read_git_root_head_sha(path: &std::path::Path) -> Option<String> {
+        let dir = path.to_path_buf();
+        tokio::task::spawn_blocking(move || intent_git::refs::rev_parse(&dir, "HEAD"))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
     /// Persist (insert-or-merge) a workspace git root and emit the matching
     /// change event (monorepo#2053): `gitRoot:registered` when the upsert
     /// inserted a new row, `gitRoot:updated` when an existing row was merged
@@ -2637,9 +2651,11 @@ impl Services {
     /// comes from the store's serialized upsert itself, so two concurrent
     /// registrations of the same path emit exactly one `gitRoot:registered`
     /// (the loser of the insert race observes the merge and emits
-    /// `gitRoot:updated`). Returns the stored row. Callers (the
-    /// `ws.git.registerRoot` MCP binding, submodule auto-detection) validate
-    /// the path before reaching this.
+    /// `gitRoot:updated`). On insert the row's `registered_commit_sha` is
+    /// persisted as supplied; on merge the existing value is always retained
+    /// (the store upsert never touches the column). Returns the stored row.
+    /// Callers (the `ws.git.registerRoot` MCP binding, submodule
+    /// auto-detection) validate the path before reaching this.
     pub async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
@@ -2680,7 +2696,12 @@ impl Services {
     ///    error (transient `PermissionDenied`/EIO on a flaky mount) logs and
     ///    skips (emitting `gitRoot:unregistered` via
     ///    [`Services::unregister_git_root`] when pruning);
-    /// 3. refresh each remaining root's PR linkage by its current branch
+    /// 3. best-effort backfill: a surviving root with a NULL
+    ///    `registered_commit_sha` (predates the column, or HEAD was
+    ///    unreadable at registration) is stamped with its CURRENT HEAD via
+    ///    the `IS NULL`-guarded store write, so old roots gain a boundary
+    ///    going forward (a set value is never overwritten);
+    /// 4. refresh each remaining root's PR linkage by its current branch
     ///    against its detected repo ([`Services::refresh_git_root_pr`]).
     ///
     /// Fail-soft per root: every per-root error is logged and never aborts
@@ -2742,6 +2763,9 @@ impl Services {
                 .flatten()
                 .and_then(|url| Self::parse_github_owner_repo(&url))
                 .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                // Stamp the root's HEAD at registration time (fail-soft:
+                // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
+                let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
                 let ts = now_iso();
                 let root = intent_core::WorkspaceGitRoot {
                     id: WorkspaceGitRootId::new(),
@@ -2751,6 +2775,7 @@ impl Services {
                     repo_owner,
                     repo_name,
                     registered_by_agent_ids: vec![],
+                    registered_commit_sha,
                     pr_number: None,
                     pr_url: None,
                     pr_status: None,
@@ -2808,6 +2833,43 @@ impl Services {
                     }
                 }
                 continue;
+            }
+            let mut root = root;
+            // Best-effort backfill: stamp a NULL `registered_commit_sha` with
+            // the root's CURRENT HEAD (rows predating the column, or whose
+            // HEAD was unreadable at registration). The store write is
+            // `IS NULL`-guarded, so a set value is never overwritten; a still
+            // unreadable HEAD leaves the row NULL for the next pass.
+            if root.registered_commit_sha.is_none() {
+                if let Some(sha) =
+                    Self::read_git_root_head_sha(std::path::Path::new(&root.path)).await
+                {
+                    let ts = now_iso();
+                    match self
+                        .store
+                        .backfill_workspace_git_root_commit_sha(&root.id, &sha, &ts)
+                        .await
+                    {
+                        Ok(true) => {
+                            root.registered_commit_sha = Some(sha);
+                            root.updated_at = ts;
+                            publish_event(
+                                &self.event_bus,
+                                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                            )
+                            .await;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root sweep: commit-sha backfill failed"
+                            );
+                        }
+                    }
+                }
             }
             let root_id = root.id.clone();
             let refreshed = match tokio::time::timeout(
@@ -18827,6 +18889,10 @@ impl WorkspaceApi for Services {
                     .flatten()
                     .and_then(|url| Self::parse_github_owner_repo(&url))
                     .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+            // Stamp the root's HEAD at registration time (fail-soft:
+            // unreadable HEAD ⇒ NULL; the store merge never overwrites an
+            // existing value on re-registration).
+            let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
             let ts = now_iso();
             let root = intent_core::WorkspaceGitRoot {
                 id: WorkspaceGitRootId::new(),
@@ -18836,6 +18902,7 @@ impl WorkspaceApi for Services {
                 repo_owner,
                 repo_name,
                 registered_by_agent_ids: vec![agent_id],
+                registered_commit_sha,
                 pr_number: None,
                 pr_url: None,
                 pr_status: None,

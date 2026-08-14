@@ -5337,6 +5337,7 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
         repo_owner: None,
         repo_name: None,
         registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: Some("feedfacefeedfacefeedfacefeedfacefeedface".into()),
         pr_number: None,
         pr_url: None,
         pr_status: None,
@@ -5366,6 +5367,10 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
     assert_eq!(
         roots[0]["registeredByAgentIds"],
         serde_json::json!(["agent-1"])
+    );
+    assert_eq!(
+        roots[0]["registeredCommitSha"],
+        "feedfacefeedfacefeedfacefeedfacefeedface"
     );
     assert!(
         roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()),

@@ -11243,6 +11243,7 @@ mod pr {
             repo_owner: owner_repo.map(|(o, _)| o.to_string()),
             repo_name: owner_repo.map(|(_, n)| n.to_string()),
             registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
             pr_number: None,
             pr_url: None,
             pr_status: None,
@@ -11320,6 +11321,128 @@ mod pr {
         assert_eq!(updated.len(), 0);
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
+    }
+
+    /// Commit an empty tree in `dir` so its HEAD resolves to a SHA, returning
+    /// the commit SHA (SweepRepo repos have an unborn HEAD by default).
+    fn sweep_commit(dir: &std::path::Path) -> String {
+        let repo = git2::Repository::open(dir).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap()
+            .to_string()
+    }
+
+    /// The sweep best-effort-backfills a NULL `registered_commit_sha` with
+    /// the root's CURRENT HEAD (emitting `gitRoot:updated`), never
+    /// overwrites a set value, and leaves an unreadable-HEAD root NULL for
+    /// the next pass (no churn).
+    #[tokio::test]
+    async fn sweep_backfills_null_registered_commit_sha() {
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Root A: HEAD resolvable, NULL sha → stamped on the next pass.
+        let with_head = SweepRepo::init("main", None);
+        let head_sha = sweep_commit(&with_head.dir);
+        let root_a = sweep_root(&ws.id, &with_head.dir, None);
+        svc.store()
+            .upsert_workspace_git_root(&root_a)
+            .await
+            .unwrap();
+        // Root B: unborn HEAD, NULL sha → stays NULL (fail-soft, no event).
+        let unborn = SweepRepo::init("main", None);
+        let root_b = sweep_root(&ws.id, &unborn.dir, None);
+        svc.store()
+            .upsert_workspace_git_root(&root_b)
+            .await
+            .unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let a = svc
+            .store()
+            .get_workspace_git_root(&root_a.id)
+            .await
+            .unwrap();
+        assert_eq!(a.registered_commit_sha.as_deref(), Some(head_sha.as_str()));
+        let b = svc
+            .store()
+            .get_workspace_git_root(&root_b.id)
+            .await
+            .unwrap();
+        assert_eq!(b.registered_commit_sha, None, "unreadable HEAD stays NULL");
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "one backfill stamp event");
+        assert_eq!(updated[0].data["gitRoot"]["registeredCommitSha"], head_sha);
+
+        // HEAD moves; a re-sweep never overwrites the stamped value and
+        // emits no further backfill event.
+        std::fs::write(with_head.dir.join("x.txt"), "x\n").unwrap();
+        {
+            let repo = git2::Repository::open(&with_head.dir).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("x.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
+                .unwrap();
+        }
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        let a = svc
+            .store()
+            .get_workspace_git_root(&root_a.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.registered_commit_sha.as_deref(),
+            Some(head_sha.as_str()),
+            "stamped SHA immutable across sweeps"
+        );
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "no re-stamp churn");
+    }
+
+    /// The sweep's submodule auto-detect stamps the submodule's HEAD on the
+    /// freshly registered root.
+    #[tokio::test]
+    async fn sweep_auto_register_stamps_registered_commit_sha() {
+        let parent = SweepRepo::init("main", None);
+        let sub_dir = parent.dir.join("packages").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        git2::Repository::init(&sub_dir).unwrap();
+        let sub_head = sweep_commit(&sub_dir);
+        std::fs::write(
+            parent.dir.join(".gitmodules"),
+            "[submodule \"packages/sub\"]\n\tpath = packages/sub\n\turl = https://github.com/o/r.git\n",
+        )
+        .unwrap();
+
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, &sc).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert_eq!(
+            roots[0].registered_commit_sha.as_deref(),
+            Some(sub_head.as_str()),
+            "auto-detect stamps the submodule HEAD"
+        );
     }
 
     /// Auto-prune fires only on a genuine path-gone (`NotFound` /
@@ -13776,6 +13899,7 @@ mod file_tracking {
             repo_owner: None,
             repo_name: None,
             registered_by_agent_ids: vec![AgentId("agent-1".into())],
+            registered_commit_sha: None,
             pr_number: None,
             pr_url: None,
             pr_status: None,
@@ -13800,7 +13924,7 @@ mod file_tracking {
         let root = git_root_row(&ws_id, &secondary.dir);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
 
-        let listed = svc.git_root_list(ws_id).await.unwrap();
+        let listed = svc.git_root_list(ws_id.clone()).await.unwrap();
         let roots = listed["gitRoots"].as_array().unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0]["id"], root.id.as_str());
@@ -13815,6 +13939,25 @@ mod file_tracking {
             "live-read branch grafted on: {:?}",
             roots[0]
         );
+        // Presence-detected: a NULL registered_commit_sha is OMITTED from the
+        // wire row (never null).
+        assert!(
+            !roots[0]
+                .as_object()
+                .unwrap()
+                .contains_key("registeredCommitSha"),
+            "NULL sha omitted from the wire: {:?}",
+            roots[0]
+        );
+
+        // A stamped SHA is carried on the wire row.
+        let ts = now_iso();
+        svc.store()
+            .backfill_workspace_git_root_commit_sha(&root.id, "deadbeef", &ts)
+            .await
+            .unwrap();
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"][0]["registeredCommitSha"], "deadbeef");
     }
 
     /// `gitRoot.list` on an unknown workspace is `NotFound` (router → -32602).
@@ -14107,8 +14250,19 @@ mod file_tracking {
         assert_eq!(row["repoName"], "intentd");
         assert_eq!(row["registeredByAgentIds"], serde_json::json!(["agent-1"]));
         assert!(row["branch"].is_string(), "live-read branch: {row:?}");
+        // Registration stamps the root's HEAD at that moment.
+        let head = Repository::open(&secondary.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(row["registeredCommitSha"], head);
 
-        // Idempotent by canonical path — a second caller merges in.
+        // Idempotent by canonical path — a second caller merges in; the
+        // stamped SHA is preserved even though HEAD has moved since.
+        commit_file(&secondary.dir, "more.txt", "more\n", "second commit");
         let again = svc
             .git_root_register(
                 ws_id.clone(),
@@ -14121,6 +14275,10 @@ mod file_tracking {
         assert_eq!(
             again["registeredByAgentIds"],
             serde_json::json!(["agent-1", "agent-2"])
+        );
+        assert_eq!(
+            again["registeredCommitSha"], head,
+            "re-registration preserves the first-registered SHA"
         );
         let listed = svc.git_root_list(ws_id).await.unwrap();
         assert_eq!(listed["gitRoots"].as_array().unwrap().len(), 1);
