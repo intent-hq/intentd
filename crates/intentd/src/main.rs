@@ -1128,19 +1128,24 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         sys.total_memory()
     };
     let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
-    match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
-        Some(budget_bytes) => {
-            manager
-                .registry()
-                .set_memory_budget(budget_bytes, child_usage.clone());
-            tracing::info!(
-                budget_bytes,
-                recommended_bytes,
-                "aggregate agent memory budget enabled"
-            );
-        }
-        None => tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)"),
-    }
+    let budget_enabled =
+        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
+            Some(budget_bytes) => {
+                manager
+                    .registry()
+                    .set_memory_budget(budget_bytes, child_usage.clone());
+                tracing::info!(
+                    budget_bytes,
+                    recommended_bytes,
+                    "aggregate agent memory budget enabled"
+                );
+                true
+            }
+            None => {
+                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+                false
+            }
+        };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1309,9 +1314,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown.
     let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
-    // configured TTL, killing each one's whole process group. Disabled entirely
-    // when `agents.idleReapMinutes == 0`.
-    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
+    // configured TTL, killing each one's whole process group — and, when an
+    // aggregate memory budget is installed (monorepo#2063), drain idle agents
+    // largest-first while over budget without waiting for the TTL. Disabled
+    // entirely when `agents.idleReapMinutes == 0` AND no budget is installed.
+    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled);
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
@@ -2002,6 +2009,14 @@ impl TreeMemoryProbe for ChildTreeUsage {
         // One read of the whole sample: the bytes and the sequence number that
         // identifies them come from the same sweep by construction.
         self.load().map(|s| (s.memory_bytes, s.seq))
+    }
+
+    fn agent_samples(&self) -> HashMap<AgentId, u64> {
+        // The per-agent buckets from the same sweep as `sample` (monorepo#2063
+        // A2): cheap clone off the Arc'd map, empty before the first sweep.
+        self.load()
+            .map(|s| s.agent_bytes.as_ref().clone())
+            .unwrap_or_default()
     }
 }
 
@@ -3043,30 +3058,61 @@ fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
 
-/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when disabled
-/// (`idle_reap_minutes == 0`). The sweep interval is derived from the TTL
-/// (≈4×/TTL), clamped so long TTLs still sweep and short ones do not busy-loop.
+/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
+/// sweep (`idle_reap_minutes == 0` and no memory budget). The sweep interval
+/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep and
+/// short ones do not busy-loop.
+///
+/// With a memory budget installed (monorepo#2063 level 2), every tick also
+/// drains idle agents largest-attributed-first while charged > budget — no
+/// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
+/// keeps the budget drain alive on the interval-clamp floor cadence.
 fn spawn_idle_reap_loop(
     manager: Arc<AgentManager>,
     idle_reap_minutes: u32,
+    budget_enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some((ttl, interval)) = reap_timings(idle_reap_minutes) else {
+    let timings = reap_timings(idle_reap_minutes);
+    if timings.is_none() && !budget_enabled {
         tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
         return None;
+    }
+    // TTL off but budget on: sweep at the same floor cadence the TTL clamp
+    // uses, running only the budget drain.
+    let interval = match timings {
+        Some((ttl, interval)) => {
+            tracing::info!(
+                ttl_ms = ttl.as_millis() as u64,
+                interval_ms = interval.as_millis() as u64,
+                "idle agent reaping enabled"
+            );
+            interval
+        }
+        None => {
+            let interval = Duration::from_secs(30);
+            tracing::info!(
+                interval_ms = interval.as_millis() as u64,
+                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+            );
+            interval
+        }
     };
-    tracing::info!(
-        ttl_ms = ttl.as_millis() as u64,
-        interval_ms = interval.as_millis() as u64,
-        "idle agent reaping enabled"
-    );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let reaped = manager.reap_idle_older_than(ttl).await;
-            if reaped > 0 {
-                tracing::info!(reaped, "idle agent sweep evicted idle agents");
+            if let Some((ttl, _)) = timings {
+                let reaped = manager.reap_idle_older_than(ttl).await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "idle agent sweep evicted idle agents");
+                }
+            }
+            if budget_enabled {
+                let reaped = manager.reap_over_budget().await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "over-budget sweep evicted idle agents");
+                }
             }
         }
     }))
