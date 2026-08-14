@@ -132,9 +132,10 @@ impl Services {
         let staging_dir = self.import_staging_root().join(&import_id);
 
         // Register the session BEFORE any directory exists, so every early
-        // return leaves nothing on disk. `live_ids` snapshots the registry
-        // for the orphan sweep below.
-        let live_ids: Vec<String> = {
+        // return leaves nothing on disk — and so the orphan sweep (which
+        // checks the registry at removal time) can never classify this
+        // import's directory as an orphan.
+        {
             let mut imports = self
                 .transfer_imports
                 .lock()
@@ -158,13 +159,12 @@ impl Services {
                 committing: false,
             };
             imports.insert(import_id.clone(), session);
-            imports.keys().cloned().collect()
-        };
+        }
 
         // Lazy sweep: staging dirs with no live session are orphans (a
         // daemon restart drops the in-memory registry, and pre-fix daemons
         // could leak dirs). Best-effort — a failed sweep never fails begin.
-        self.sweep_orphaned_staging_dirs(&live_ids).await;
+        self.sweep_orphaned_staging_dirs().await;
 
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
             self.transfer_imports
@@ -184,7 +184,11 @@ impl Services {
 
     /// Delete `.import-staging/<id>` directories whose id has no live
     /// session (orphans from a daemon restart mid-upload). Best-effort.
-    async fn sweep_orphaned_staging_dirs(&self, live_ids: &[String]) {
+    /// Liveness is checked against the registry immediately before each
+    /// removal — not against a snapshot taken before the directory listing —
+    /// so a `begin` that registers concurrently with a sweep in flight can
+    /// never have its staging directory removed.
+    async fn sweep_orphaned_staging_dirs(&self) {
         let root = self.import_staging_root();
         let mut entries = match tokio::fs::read_dir(&root).await {
             Ok(entries) => entries,
@@ -192,7 +196,12 @@ impl Services {
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if live_ids.contains(&name) {
+            let live = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .contains_key(&name);
+            if live {
                 continue;
             }
             tracing::info!(staging = %name, "sweeping orphaned import staging dir");
@@ -334,30 +343,16 @@ impl Services {
         &self,
         import_id: String,
     ) -> Result<serde_json::Value> {
-        let result = self.workspace_import_commit_inner(&import_id).await;
-        if result.is_err() {
-            // The session survives a failed commit — clear the in-flight
-            // flag so a retry (or abort) is accepted.
-            if let Some(session) = self
-                .transfer_imports
-                .lock()
-                .expect("transfer import registry poisoned")
-                .get_mut(&import_id)
-            {
-                session.committing = false;
-            }
-        }
-        result
-    }
-
-    async fn workspace_import_commit_inner(&self, import_id: &str) -> Result<serde_json::Value> {
-        let (staging_dir, declared_size, declared_sha, manifest, workspace_id, chunk_seqs) = {
+        // Phase 1 — validate and CLAIM the `committing` flag under one lock
+        // hold. Errors here (unknown id, already committing, incomplete,
+        // gaps) never touch a flag another commit owns.
+        let claim = {
             let mut imports = self
                 .transfer_imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
-                .get_mut(import_id)
+                .get_mut(&import_id)
                 .ok_or_else(|| Error::NotFound(format!("no import in progress: {import_id}")))?;
             if session.committing {
                 return Err(Error::InvalidParams(format!(
@@ -388,6 +383,37 @@ impl Services {
                 seqs,
             )
         };
+
+        // Phase 2 — the fallible work. On failure, clear the flag THIS call
+        // set (phase 1 claimed it exclusively), so the session survives for
+        // retry or abort without racing a concurrent commit's flag.
+        let result = self.workspace_import_commit_body(&import_id, claim).await;
+        if result.is_err() {
+            if let Some(session) = self
+                .transfer_imports
+                .lock()
+                .expect("transfer import registry poisoned")
+                .get_mut(&import_id)
+            {
+                session.committing = false;
+            }
+        }
+        result
+    }
+
+    async fn workspace_import_commit_body(
+        &self,
+        import_id: &str,
+        claim: (
+            PathBuf,
+            u64,
+            String,
+            TransferManifest,
+            WorkspaceId,
+            Vec<u64>,
+        ),
+    ) -> Result<serde_json::Value> {
+        let (staging_dir, declared_size, declared_sha, manifest, workspace_id, chunk_seqs) = claim;
 
         // Reassemble + hash + unpack on the blocking pool (sync I/O + zip).
         let extracted_dir = staging_dir.join("extracted");
@@ -2787,5 +2813,116 @@ mod tests {
         svc.workspace_import_abort_op(import_id)
             .await
             .expect("abort");
+    }
+
+    /// Regression (monorepo#2274): a commit rejected with "already
+    /// committing" must NOT clear the `committing` flag owned by the
+    /// in-flight commit — chunks and aborts stay rejected while the first
+    /// commit runs.
+    #[tokio::test]
+    async fn rejected_concurrent_commit_leaves_committing_flag_intact() {
+        let ws = WorkspaceId("ws-commit-flag".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let m = manifest(&ws);
+        let archive = build_archive(&m, &fixture_rows(&ws));
+        let sha = sha256_hex(&archive);
+        let begin = svc
+            .workspace_import_begin_op(
+                serde_json::to_value(&m).expect("manifest json"),
+                archive.len() as u64,
+                sha,
+            )
+            .await
+            .expect("begin");
+        let import_id = begin["importId"].as_str().expect("importId").to_string();
+        svc.workspace_import_chunk_op(import_id.clone(), 0, b64(&archive))
+            .await
+            .expect("chunk");
+        // Simulate an in-flight first commit holding the claim.
+        svc.transfer_imports
+            .lock()
+            .unwrap()
+            .get_mut(&import_id)
+            .unwrap()
+            .committing = true;
+
+        let err = svc
+            .workspace_import_commit_op(import_id.clone())
+            .await
+            .expect_err("second commit rejected");
+        assert!(err.to_string().contains("already committing"), "got {err}");
+        // The rejection did not release the first commit's claim: the flag
+        // is still set, and chunk/abort remain rejected.
+        assert!(
+            svc.transfer_imports
+                .lock()
+                .unwrap()
+                .get(&import_id)
+                .unwrap()
+                .committing,
+            "committing flag must still be held"
+        );
+        let err = svc
+            .workspace_import_chunk_op(import_id.clone(), 1, b64(b"x"))
+            .await
+            .expect_err("chunk during commit");
+        assert!(err.to_string().contains("committing"), "got {err}");
+        let err = svc
+            .workspace_import_abort_op(import_id.clone())
+            .await
+            .expect_err("abort during commit");
+        assert!(err.to_string().contains("committing"), "got {err}");
+
+        // Release the claim (as the first commit's failure path would) and
+        // the retry path works end to end.
+        svc.transfer_imports
+            .lock()
+            .unwrap()
+            .get_mut(&import_id)
+            .unwrap()
+            .committing = false;
+        svc.workspace_import_commit_op(import_id)
+            .await
+            .expect("commit after release");
+    }
+
+    /// Regression (monorepo#2274): the sweep checks session liveness against
+    /// the registry at removal time, so a session registered while a sweep
+    /// is in flight (its id absent from any pre-listing snapshot) keeps its
+    /// staging dir; only truly session-less dirs are removed.
+    #[tokio::test]
+    async fn sweep_spares_live_sessions_registered_after_listing() {
+        let ws = WorkspaceId("ws-sweep-race".to_string());
+        let ws_root = TempDir::new("import-ws-root");
+        let assets_root = TempDir::new("import-assets-root");
+        let svc = fresh_services(&ws_root.0, &assets_root.0).await;
+
+        let staging_root = svc.import_staging_root();
+        let live_dir = staging_root.join("import-live");
+        let orphan_dir = staging_root.join("import-orphan");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        // Register `import-live` directly (as a begin racing the sweep
+        // would), so it is live in the registry but absent from any snapshot
+        // taken before its directory existed.
+        svc.transfer_imports.lock().unwrap().insert(
+            "import-live".to_string(),
+            super::ImportSession {
+                manifest: manifest(&ws),
+                workspace_id: ws.clone(),
+                staging_dir: live_dir.clone(),
+                declared_size: 1,
+                declared_sha256: "a".repeat(64),
+                chunk_sizes: std::collections::HashMap::new(),
+                committing: false,
+            },
+        );
+
+        svc.sweep_orphaned_staging_dirs().await;
+        assert!(live_dir.exists(), "live session dir must survive the sweep");
+        assert!(!orphan_dir.exists(), "orphan dir must be swept");
     }
 }
