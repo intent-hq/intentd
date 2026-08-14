@@ -49,7 +49,7 @@ these are different machines, so `navigate`/`openTab` URLs support reserved host
   aliases.
 
 Only the hostname is rewritten — scheme, port, path, query, and hash are preserved. Every
-rewritten action's result echoes `{ requestedUrl, finalUrl, rewritten: true, reason, warning? }`
+rewritten action's result echoes `{ requestedUrl, finalUrl, rewritten: true, reason, tunneled?, warning? }`
 so you can see what was opened. Prefer `daemon.localhost` for servers you started.
 
 Remote-daemon caveat: the client's browser reaches daemon-side servers over the network,
@@ -58,8 +58,8 @@ rewritten to a remote daemon host are reachability-probed before navigating. If 
 cannot be reached, the Electron desktop client automatically forwards the port over the
 daemon connection and opens the tunneled URL instead — the result carries `tunneled: true`
 and the `reason` describes the forward — so servers bound to `127.0.0.1` on the daemon
-still work. Web-browser clients cannot open a local tunnel listener, so there the action
-fails with an explanatory error (pointing at `127.0.0.1`-only binding or a firewall)
-instead of opening a broken page.
+still work. If the tunnel forward itself fails, or on web-browser clients (which cannot
+open a local tunnel listener), the action fails with an explanatory error (pointing at
+`127.0.0.1`-only binding or a firewall) instead of opening a broken page.
 
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.
