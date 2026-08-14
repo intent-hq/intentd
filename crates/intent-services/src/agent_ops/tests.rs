@@ -110,16 +110,31 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     (tmp, services, ws)
 }
 
-/// A TOML-backed registry with `agentFeatures.taskGraph = true`, for tests of
-/// surfaces gated behind the opt-in toggle (the delivery-time unblocked
-/// section). Returns the tempdir guard alongside so the config file outlives
-/// the test body.
-pub(super) fn task_graph_on_registry() -> (Arc<crate::SettingsRegistry>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("temp config dir");
-    let path = dir.path().join("config.toml");
-    std::fs::write(&path, "[agentFeatures]\ntaskGraph = true\n").expect("write config");
-    let registry = Arc::new(crate::SettingsRegistry::load(&path).expect("load registry"));
-    (registry, dir)
+async fn setup_with_task_graph(
+    enabled: bool,
+) -> (
+    TempDb,
+    Services,
+    WorkspaceId,
+    Arc<crate::SettingsRegistry>,
+    tempfile::TempDir,
+) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    if enabled {
+        registry
+            .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
+            .expect("enable taskGraph");
+    }
+    let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
+    (tmp, services, ws, registry, config_dir)
 }
 
 async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
@@ -23927,10 +23942,8 @@ use crate::agent_ops::ready_delta::{UNBLOCKED_SECTION_PREFIX, UNBLOCKED_TRIGGER_
 /// the persist) resolves the section fresh: the dependent task's row names it
 /// with an `intent://local/task/` link and the deps-satisfied reason.
 #[tokio::test]
-async fn completion_wake_carries_delivery_time_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
-    let (registry, _cfg) = task_graph_on_registry();
-    let svc = svc.with_settings_registry(registry);
+async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
+    let (_t, svc, ws, registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let done = link_task_note(&svc, &ws, &child, "Done task", "complete").await;
@@ -23948,6 +23961,9 @@ async fn completion_wake_carries_delivery_time_unblocked_section() {
         None,
     )
     .expect("register watch");
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(false))])
+        .expect("disable taskGraph after parent creation");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -23984,6 +24000,56 @@ async fn completion_wake_carries_delivery_time_unblocked_section() {
     assert!(
         !serde_json::to_string(metadata).unwrap().contains(&gated.0),
         "no unblocked enumeration persisted in metadata: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
+    let (_t, svc, ws, registry, _config) = setup_with_task_graph(false).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let done = link_task_note(&svc, &ws, &child, "Done task", "complete").await;
+    let gated = seed_task(&svc, &ws, "Gated task").await;
+    svc.task_set_relations(ws.clone(), gated, Some(vec![done.clone()]), None)
+        .await
+        .expect("gated dependsOn done");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
+        .expect("enable taskGraph after parent creation");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "did the work" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        !text.contains(UNBLOCKED_SECTION_PREFIX),
+        "taskGraph-off wake must not teach unblocked tasks: {text}"
+    );
+    assert!(
+        session.messages[0]
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_some()),
+        "enqueue-time trigger metadata remains intact"
     );
 }
 
@@ -24055,9 +24121,8 @@ async fn taskless_and_no_delta_wakes_are_unannotated() {
 /// function the drain paths call at flush time.
 #[tokio::test]
 async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
-    let (_t, svc, ws) = setup().await;
-    let (registry, _cfg) = task_graph_on_registry();
-    let svc = svc.with_settings_registry(registry);
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
     let a = seed_task(&svc, &ws, "Task A").await;
     let b = seed_task(&svc, &ws, "Task B").await;
     let gated = seed_task(&svc, &ws, "Gated").await;
@@ -24084,7 +24149,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     // No section yet: rendering now yields nothing attributable… to a stale
     // reader this wake would have said nothing forever.
     assert!(
-        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
         "b still incomplete → no delta"
@@ -24099,7 +24164,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     // now attributable to trigger A (its last unmet dep set includes A in the
     // counterfactual where A is still running).
     let section = svc
-        .unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        .unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
         .await
         .expect("delta non-empty at render time");
     assert!(
@@ -24113,7 +24178,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
         .await
         .expect("claim gated");
     assert!(
-        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
         "a claimed task is no longer surfaced at delivery"
@@ -24262,9 +24327,7 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
 /// `deliver_parent_wake` branch.
 #[tokio::test]
 async fn no_manager_send_now_resolves_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
-    let (registry, _cfg) = task_graph_on_registry();
-    let svc = svc.with_settings_registry(registry);
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let done = seed_task(&svc, &ws, "Done task").await;
     let gated = seed_task(&svc, &ws, "Gated task").await;
@@ -24321,10 +24384,12 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 /// `agentFeatures.taskGraph` gates the advisory section
 /// (intent-hq/monorepo#2445): with the toggle at its default (off), the same
 /// trigger stamp that would render a section yields `None` — the wake
-/// delivers unannotated. Read live: no registry wired behaves the same.
+/// delivers unannotated. The default-off value is captured when the session is
+/// created.
 #[tokio::test]
 async fn task_graph_off_suppresses_unblocked_section() {
     let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
     let done = seed_task(&svc, &ws, "Done task").await;
     let gated = seed_task(&svc, &ws, "Gated task").await;
     svc.task_set_relations(ws.clone(), gated.clone(), Some(vec![done.clone()]), None)
@@ -24339,7 +24404,7 @@ async fn task_graph_off_suppresses_unblocked_section() {
         &[(ws.0.clone(), done.0.clone())],
     );
     assert!(
-        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
         "taskGraph off (the default) must suppress the section"

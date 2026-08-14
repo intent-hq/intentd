@@ -701,11 +701,12 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.taskGraph` — teach agents the task-graph workflow:
     /// batch `ws.agent.delegate({ tasks })` guidance, `dependsOn` /
     /// `conflictsWith` relations, inline `@@@task` fence attributes, and the
-    /// delivery-time "Tasks now unblocked…" wake section. Docs/prompt only —
-    /// the underlying APIs are never dispatch-denied. Prompt/help gating
-    /// applies to new sessions; the wake section is computed at delivery
-    /// time, so that part follows the toggle live. Defaults **off**
-    /// (opt-in), unlike the other toggles (intent-hq/monorepo#2445).
+    /// "Tasks now unblocked…" wake section. Docs/prompt only — the underlying
+    /// APIs are never dispatch-denied. Prompt/help gating and unblocked-wake
+    /// teaching use the value captured when the parent session is created;
+    /// changing the live setting does not affect existing sessions' wakes.
+    /// Defaults **off** (opt-in), unlike the other toggles
+    /// (intent-hq/monorepo#2445).
     pub task_graph: bool,
 }
 
@@ -1327,8 +1328,9 @@ stateSnapshot = true
 prMonitor = true
 # Task graph -- teach agents the task-graph workflow (batch delegate,
 # dependsOn/conflictsWith relations, @@@task fence attributes, unblocked-wake
-# hints). Docs/prompt only; the APIs themselves always work. Opt-in: defaults
-# to off.
+# hints). Docs/prompt only; the APIs themselves always work. Prompt/help and
+# wake teaching use the value captured when the parent session is created.
+# Opt-in: defaults to off.
 taskGraph = false
 
 [wakeResume]

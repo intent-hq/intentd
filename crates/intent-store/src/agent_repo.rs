@@ -23,7 +23,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
-    stop_reason_timestamp, reasoning_effort, effort_levels";
+    stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled";
 
 /// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
 /// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
@@ -358,13 +358,14 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 36-column `agent_session` insert value list onto `query`, in
+/// Bind the full 37-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place.
 fn bind_session_insert<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     s: &'q AgentSession,
+    task_graph_enabled: bool,
 ) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
     Ok(query
         .bind(&s.id.0)
@@ -402,7 +403,8 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
-        .bind(effort_levels_to_db(&s.effort_levels)?))
+        .bind(effort_levels_to_db(&s.effort_levels)?)
+        .bind(task_graph_enabled as i64))
 }
 
 impl Store {
@@ -415,11 +417,21 @@ impl Store {
     /// duplicate-id behavior stays robust under concurrency instead of
     /// degrading to an opaque `-32603`.
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
+        self.insert_agent_session_with_task_graph(s, false).await
+    }
+
+    /// Insert a session with the daemon-owned task-graph feature snapshot that
+    /// governs delivery-time teaching for the lifetime of this session.
+    pub async fn insert_agent_session_with_task_graph(
+        &self,
+        s: &AgentSession,
+        task_graph_enabled: bool,
+    ) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        bind_session_insert(sqlx::query(&sql), s)?
+        bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
             .execute(self.write_pool())
             .await
             .map_err(|e| {
@@ -476,9 +488,9 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            bind_session_insert(sqlx::query(&session_sql), s)?
+            bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -567,6 +579,18 @@ impl Store {
             Some(r) => map_session_summary_row(&r),
             None => Err(Error::NotFound(format!("agent session {id}"))),
         }
+    }
+
+    /// Read the daemon-owned task-graph snapshot captured when this agent was
+    /// created. The value is deliberately outside the session wire model.
+    pub async fn get_agent_session_task_graph_enabled(&self, id: &AgentId) -> Result<bool> {
+        sqlx::query_scalar::<_, i64>("SELECT task_graph_enabled FROM agent_session WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent taskGraph snapshot failed: {e}")))?
+            .map(|value| value != 0)
+            .ok_or_else(|| Error::NotFound(format!("agent session {id}")))
     }
 
     /// Lightweight status-only lookup used by hot paths that just need the

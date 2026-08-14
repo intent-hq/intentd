@@ -5586,7 +5586,10 @@ impl Services {
                     message_metadata.as_ref(),
                 ) {
                     match self
-                        .unblocked_section_for_delivery(std::iter::once(message_metadata.as_ref()))
+                        .unblocked_section_for_delivery(
+                            &parent_agent_id,
+                            std::iter::once(message_metadata.as_ref()),
+                        )
                         .await
                     {
                         Some(section) => format!("{content}\n\n{section}"),
