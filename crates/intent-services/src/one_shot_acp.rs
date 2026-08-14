@@ -33,8 +33,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter,
-    AcpAdapterCommand, SpawnError,
+    adapter_slots, exited_detail, initialize_params, observe_exit_status, reap_child,
+    spawn_adapter_in, AcpAdapterCommand, AdapterSlots, SpawnError,
 };
 
 /// The one-shot launch description (shared with the model probe).
@@ -106,7 +106,30 @@ pub(crate) async fn run_one_shot_acp(
     config_option_model: Option<&str>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
-    let mut adapter = spawn_adapter(&cmd, prompt_timeout)
+    run_one_shot_acp_in(
+        adapter_slots(),
+        cmd,
+        prompt,
+        config_option_model,
+        prompt_timeout,
+    )
+    .await
+}
+
+/// [`run_one_shot_acp`] against a caller-supplied adapter bound instead of the
+/// process-global one. Production always goes through [`run_one_shot_acp`];
+/// this seam lets a test with a deliberately short prompt budget run against a
+/// private [`AdapterSlots`], so slot pressure from sibling tests sharing the
+/// global bound cannot turn its asserted failure into a queue timeout
+/// (monorepo#2379).
+pub(crate) async fn run_one_shot_acp_in(
+    slots: &AdapterSlots,
+    cmd: OneShotCommand,
+    prompt: &str,
+    config_option_model: Option<&str>,
+    prompt_timeout: Duration,
+) -> Result<String, OneShotError> {
+    let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
         .await
         .map_err(|e| match e {
             SpawnError::QueueTimeout { waited, limit } => OneShotError::QueueTimeout {

@@ -322,7 +322,19 @@ pub(crate) async fn spawn_adapter(
     cmd: &AcpAdapterCommand,
     queue_wait: Duration,
 ) -> Result<SpawnedAdapter, SpawnError> {
-    let slots = adapter_slots();
+    spawn_adapter_in(adapter_slots(), cmd, queue_wait).await
+}
+
+/// [`spawn_adapter`] against a caller-supplied bound instead of the
+/// process-global one. Production always goes through [`spawn_adapter`]; this
+/// seam exists so a test can run against a private [`AdapterSlots`] and stay
+/// insulated from slot pressure created by sibling tests sharing the global
+/// bound (monorepo#2379).
+pub(crate) async fn spawn_adapter_in(
+    slots: &AdapterSlots,
+    cmd: &AcpAdapterCommand,
+    queue_wait: Duration,
+) -> Result<SpawnedAdapter, SpawnError> {
     let started = std::time::Instant::now();
     let Some(slot) = slots.acquire(queue_wait).await else {
         let waited = started.elapsed();

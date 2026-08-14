@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{run_one_shot_acp, OneShotCommand, OneShotError};
+use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
+use crate::acp_adapter::AdapterSlots;
 
 /// Write `body` as an executable-by-node mock adapter script and return a
 /// launch command for it. The tempdir is returned so the caller keeps it
@@ -77,7 +78,12 @@ const onPrompt = () => {{}};
 ",
         pidfile = pidfile.to_string_lossy(),
     ));
-    let err = run_one_shot_acp(cmd, "hang", None, Duration::from_millis(500))
+    // A private single-slot bound keeps the deliberately short budget honest:
+    // under full-suite load the process-global bound can be saturated by
+    // sibling tests for longer than 500ms, which would turn the asserted
+    // PromptTimeout into a QueueTimeout (monorepo#2379).
+    let slots = AdapterSlots::new(1);
+    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, Duration::from_millis(500))
         .await
         .unwrap_err();
     assert!(
