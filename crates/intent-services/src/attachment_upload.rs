@@ -91,9 +91,7 @@ impl AttachmentUploadSession {
     fn expired(&self, ttl: Duration) -> bool {
         !self.committing && self.last_activity.elapsed() >= ttl
     }
-}
 
-impl AttachmentUploadSession {
     fn received_bytes(&self) -> u64 {
         self.chunk_sizes.values().sum()
     }
@@ -635,8 +633,14 @@ fn assemble_and_verify(
         .map_err(|e| Error::Internal(format!("assemble attachment flush failed: {e}")))?;
     drop(out);
     if total != declared_size {
+        // Phase 1 already proved the RESERVATIONS sum to declared_size, so a
+        // short assembly means a chunk file was read mid-write — the
+        // partial-write guise of the same pipelined race as the NotFound arm
+        // above (monorepo#2275). Same remedy: the session survives; retry
+        // once the chunk call has returned.
         return Err(Error::InvalidParams(format!(
-            "assembled attachment is {total} bytes, expected {declared_size}"
+            "assembled attachment is {total} bytes, expected {declared_size} — a chunk may \
+             still be being written; wait for the chunk call to return, then retry the commit"
         )));
     }
     let actual = format!("{:x}", hasher.finalize());
@@ -1125,6 +1129,14 @@ mod tests {
     /// (abort) frees the slot.
     #[tokio::test]
     async fn begin_rejects_fifth_concurrent_session_per_workspace() {
+        // The TTL env seam is read process-wide, so pin a huge TTL here:
+        // this test's four deliberately idle sessions must never be drained
+        // by a tiny TTL leaking from a concurrently running expiry test —
+        // holding the guard also serializes us against them via ENV_LOCK.
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "3600000",
+        )]);
         let ws = WorkspaceId("ws-up-cap4".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -1222,7 +1234,7 @@ mod tests {
     async fn begin_reclaims_expired_sessions_and_spares_active_ones() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "200",
+            "1000",
         )]);
         let ws = WorkspaceId("ws-up-reclaim".to_string());
         let ws_root = TempDir::new("attach-up-root");
@@ -1235,7 +1247,7 @@ mod tests {
         for _ in 0..4 {
             stale_ids.push(begin(&svc, &ws, &payload).await);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         // A 5th begin succeeds — the expired sessions no longer count — and
         // their staging dirs are swept.
@@ -1248,10 +1260,12 @@ mod tests {
             );
         }
 
-        // Ongoing chunk activity keeps a session alive well past one TTL.
+        // Ongoing chunk activity keeps a session alive well past one TTL of
+        // wall time (5 x 250ms > 1000ms), with a 4x cadence-to-TTL margin so
+        // a stalled CI scheduler doesn't expire the "live" session.
         let mid = payload.len() / 2;
-        for _ in 0..3 {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             svc.file_attachment_upload_chunk_op(live_id.clone(), 0, b64(&payload[..mid]))
                 .await
                 .expect("keep-alive chunk");
@@ -1302,11 +1316,30 @@ mod tests {
         );
         assert!(err.to_string().contains("retry"), "advises retry: {err}");
 
-        // The in-flight write lands; the retried commit succeeds.
+        // Same race, second guise: the chunk file exists but was read
+        // mid-write (tokio::fs::write is not atomic), so assembly comes up
+        // short. Also a caller error advising a retry — not a message that
+        // pushes the client to abort a recoverable upload.
         let staging = ws_root
             .0
             .join(".attachment-upload-staging")
             .join(&upload_id);
+        std::fs::write(
+            staging.join(super::chunk_file_name(1)),
+            &payload[mid..mid + 1],
+        )
+        .unwrap();
+        let err = svc
+            .file_attachment_upload_commit_op(upload_id.clone())
+            .await
+            .expect_err("commit racing the partially written chunk");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "must be a caller error, got {err:?}"
+        );
+        assert!(err.to_string().contains("retry"), "advises retry: {err}");
+
+        // The in-flight write lands; the retried commit succeeds.
         std::fs::write(staging.join(super::chunk_file_name(1)), &payload[mid..]).unwrap();
         svc.file_attachment_upload_commit_op(upload_id)
             .await
