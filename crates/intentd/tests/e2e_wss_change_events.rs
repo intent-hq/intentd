@@ -2941,9 +2941,9 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
     assert_eq!(mine["taskMetadata"]["conflictsWith"], json!([b]));
     assert_eq!(mine["unmetDependsOn"], json!([b]), "getMyTask: {mine}");
 
-    // task.list rows project the same fields. The notes above are children of
-    // `spec` but unlinked from its body, so the backward-compat fallback
-    // (no spec links → all direct task children) applies.
+    // task.list rows project the same fields. Membership is workspace-wide,
+    // so the notes above (children of `spec` but unlinked from its body) are
+    // returned with `specLinked: false`.
     let listed = wss_rpc(&mut rpc, 12, "task.list", json!({ "workspaceId": ws_id })).await;
     let row = listed["tasks"]
         .as_array()
@@ -2955,6 +2955,7 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
     assert_eq!(row["dependsOn"], json!([a, b]), "task.list row: {row}");
     assert_eq!(row["conflictsWith"], json!([b]));
     assert_eq!(row["unmetDependsOn"], json!([b]));
+    assert_eq!(row["specLinked"], false, "unlinked from spec body: {row}");
     // Relation-less rows omit the fields entirely (additive wire shape).
     let row_a = listed["tasks"]
         .as_array()

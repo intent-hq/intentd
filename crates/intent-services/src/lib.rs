@@ -6284,20 +6284,21 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
     stats
 }
 
-/// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
-/// `getWorkspaceTasks` (`workspace-summaries.ts`) over the `getSpecTaskNotes`
-/// (`task-stats.ts`) filter: spec-linked direct child task notes, **including
-/// cancelled** (renderer selectors derive counts/groupings). When the spec body
-/// has no task links, all direct children with task metadata count (TS
-/// backward-compat fallback). Order follows the stored note order; the title
-/// falls back to `Untitled task` to match the TS `note.title || 'Untitled task'`.
+/// Project a workspace's notes into the canonical `WorkspaceTask` list:
+/// EVERY task note in the workspace (any note with task metadata except the
+/// spec itself) — direct spec children, subtasks, and unlinked tasks alike,
+/// **including cancelled** (renderer selectors derive counts/groupings). Each
+/// row carries `specLinked`: true iff the task id appears in the spec body's
+/// `intent://local/task/{id}` links (false for every row when the spec has no
+/// links; not conditioned on `parent_id`). Order follows the stored note
+/// order (deduped by id); the title falls back to `Untitled task` to match
+/// the TS `note.title || 'Untitled task'`.
 fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
     let linked = notes
         .iter()
         .find(|n| n.id.as_str() == "spec")
         .map(|n| extract_spec_task_ids(&n.content))
         .unwrap_or_default();
-    let has_links = !linked.is_empty();
     let status_by_id = task_status_by_id(notes);
 
     let mut seen = HashSet::new();
@@ -6308,12 +6309,6 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
         };
         let id = note.id.as_str();
         if id == "spec" {
-            continue;
-        }
-        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
-            continue;
-        }
-        if has_links && !linked.contains(id) {
             continue;
         }
         if !seen.insert(id.to_string()) {
@@ -6328,6 +6323,7 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
             },
             status: task.status,
             updated_at: note.updated_at.clone(),
+            spec_linked: linked.contains(id),
             depends_on: task.depends_on.clone(),
             conflicts_with: task.conflicts_with.clone(),
             unmet_depends_on: unmet_depends_on_ids(&task.depends_on, &status_by_id),
@@ -6535,10 +6531,12 @@ fn ensure_no_tree_relative_dependency(
 /// `Untitled task` title fallback. Returns `Internal` when the note is not a
 /// task (mirrors `task.getMyTask`'s "Note is not a task" guard).
 /// `status_by_id` feeds the computed `unmetDependsOn` (callers may pass an
-/// empty map when the note has no `dependsOn` edges).
+/// empty map when the note has no `dependsOn` edges); `spec_linked` is
+/// whether the task id appears in the spec body's task links.
 fn note_to_workspace_task(
     note: &Note,
     status_by_id: &HashMap<String, TaskStatus>,
+    spec_linked: bool,
 ) -> Result<WorkspaceTask> {
     let task = match &note.metadata.task {
         Some(t) => t,
@@ -6553,6 +6551,7 @@ fn note_to_workspace_task(
         },
         status: task.status,
         updated_at: note.updated_at.clone(),
+        spec_linked,
         depends_on: task.depends_on.clone(),
         conflicts_with: task.conflicts_with.clone(),
         unmet_depends_on: unmet_depends_on_ids(&task.depends_on, status_by_id),
@@ -17258,9 +17257,10 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             let notes = store.list_notes(&workspace_id).await?;
-            // `stats` is the workspace-wide rollup over the full spec-linked
-            // set (mirrors the FE `computeTaskStats`); the optional `status`
-            // filter narrows `tasks` only.
+            // `tasks` membership is workspace-wide (every task note, flagged
+            // with `specLinked`); `stats` stays the rollup over the full
+            // spec-linked set (mirrors the FE `computeTaskStats`). The
+            // optional `status` filter narrows `tasks` only.
             let stats = compute_task_stats(&notes);
             let mut tasks = workspace_task_list(&notes);
             if let Some(f) = filter {
@@ -17284,15 +17284,31 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            // Only fetch the workspace note set when there are `dependsOn`
-            // edges to project into `unmetDependsOn`.
-            let status_by_id = match &note.metadata.task {
+            // `specLinked` needs the spec body; only fetch the full workspace
+            // note set when there are `dependsOn` edges to project into
+            // `unmetDependsOn` (the spec rides along in that read), otherwise
+            // a single spec-note read suffices.
+            let (status_by_id, linked) = match &note.metadata.task {
                 Some(t) if !t.depends_on.is_empty() => {
-                    task_status_by_id(&store.list_notes(&workspace_id).await?)
+                    let notes = store.list_notes(&workspace_id).await?;
+                    let linked = notes
+                        .iter()
+                        .find(|n| n.id.as_str() == "spec")
+                        .map(|n| extract_spec_task_ids(&n.content))
+                        .unwrap_or_default();
+                    (task_status_by_id(&notes), linked)
                 }
-                _ => HashMap::new(),
+                _ => {
+                    let linked = match store.get_note(&workspace_id, &NoteId::from("spec")).await {
+                        Ok(spec) => extract_spec_task_ids(&spec.content),
+                        Err(Error::NotFound(_)) => HashSet::new(),
+                        Err(e) => return Err(e),
+                    };
+                    (HashMap::new(), linked)
+                }
             };
-            note_to_workspace_task(&note, &status_by_id)
+            let spec_linked = linked.contains(note.id.as_str());
+            note_to_workspace_task(&note, &status_by_id, spec_linked)
         })
     }
 

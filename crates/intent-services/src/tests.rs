@@ -1404,12 +1404,15 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
     assert_eq!(mine.subtasks[0].status, "not_started");
 }
 
-/// `task.list` returns the workspace's spec-linked task notes projected into the
-/// `WorkspaceTask` shape (`{ id, title, status, updatedAt }`), including
-/// cancelled, and excluding the spec, non-task notes, non-children, and
-/// non-spec-linked task notes. `task.get` returns a single task note in the same
-/// shape; unknown / cross-workspace ids surface `NotFound` and non-task notes
-/// surface an `Internal` error.
+/// `task.list` returns ALL of the workspace's task notes (any note with task
+/// metadata except the spec itself — direct spec children, subtasks, and
+/// unlinked tasks alike, including cancelled) projected into the
+/// `WorkspaceTask` shape, each flagged with `specLinked` (true iff the id
+/// appears in the spec body's task links). The spec and non-task notes are
+/// excluded; `stats` stays the spec-linked direct-child rollup. `task.get`
+/// returns a single task note in the same shape (with `specLinked` computed
+/// from the spec body); unknown / cross-workspace ids surface `NotFound` and
+/// non-task notes surface an `Internal` error.
 #[tokio::test]
 async fn task_list_and_get_project_workspace_tasks() {
     use intent_core::{TaskMetadata, TaskStatus};
@@ -1419,7 +1422,8 @@ async fn task_list_and_get_project_workspace_tasks() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
 
-    // Spec links three task notes; a fourth task note is unlinked (excluded).
+    // Spec links three task notes; a fourth task note is unlinked (still
+    // returned, `specLinked: false`).
     let spec = note(
         &ws,
         "spec",
@@ -1450,11 +1454,15 @@ async fn task_list_and_get_project_workspace_tasks() {
         .insert_note(&mk_task("task-c", "Gamma", TaskStatus::Cancelled))
         .await
         .unwrap();
-    // Unlinked task note (spec has links, so excluded).
+    // Unlinked task note (returned with `specLinked: false`).
     store
         .insert_note(&mk_task("task-x", "Orphan", TaskStatus::NotStarted))
         .await
         .unwrap();
+    // Subtask (child of task-a, not the spec — returned, `specLinked: false`).
+    let mut sub = mk_task("task-sub", "Subtask", TaskStatus::NotStarted);
+    sub.parent_id = Some(NoteId::from("task-a"));
+    store.insert_note(&sub).await.unwrap();
     // Non-task child of spec (excluded — no task metadata).
     let mut plain = note(&ws, "plain", "body");
     plain.parent_id = Some(NoteId::from("spec"));
@@ -1462,14 +1470,20 @@ async fn task_list_and_get_project_workspace_tasks() {
 
     let svc = Services::new(store);
 
-    // task.list returns the three spec-linked task notes (cancelled included)
-    // plus the workspace-wide stats aggregate (full set, mirrors the FE
-    // `computeTaskStats`: total excludes cancelled, completed counts complete,
-    // inProgress counts in_progress + review_required).
+    // task.list returns every task note (cancelled, unlinked, and subtask
+    // included) with the `specLinked` flag, plus the stats aggregate — still
+    // the spec-linked direct-child rollup (mirrors the FE `computeTaskStats`:
+    // total excludes cancelled, completed counts complete, inProgress counts
+    // in_progress + review_required), untouched by the widened membership.
     let result = svc.task_list(ws.clone(), None).await.expect("task.list");
-    assert_eq!(result.tasks.len(), 3);
+    assert_eq!(result.tasks.len(), 5);
     let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, vec!["task-a", "task-b", "task-c"]);
+    assert_eq!(
+        ids,
+        vec!["task-a", "task-b", "task-c", "task-x", "task-sub"]
+    );
+    let linked: Vec<bool> = result.tasks.iter().map(|t| t.spec_linked).collect();
+    assert_eq!(linked, vec![true, true, true, false, false]);
     let alpha = &result.tasks[0];
     assert_eq!(alpha.title, "Alpha");
     assert_eq!(alpha.status, TaskStatus::InProgress);
@@ -1496,7 +1510,8 @@ async fn task_list_and_get_project_workspace_tasks() {
         .await
         .is_err());
 
-    // task.get returns a single task note in the WorkspaceTask shape.
+    // task.get returns a single task note in the WorkspaceTask shape, with
+    // `specLinked` computed from the spec body.
     let got = svc
         .task_get(ws.clone(), NoteId::from("task-a"))
         .await
@@ -1504,6 +1519,12 @@ async fn task_list_and_get_project_workspace_tasks() {
     assert_eq!(got.id.as_str(), "task-a");
     assert_eq!(got.title, "Alpha");
     assert_eq!(got.status, TaskStatus::InProgress);
+    assert!(got.spec_linked);
+    let got_x = svc
+        .task_get(ws.clone(), NoteId::from("task-x"))
+        .await
+        .expect("task.get unlinked");
+    assert!(!got_x.spec_linked);
 
     // Unknown id → NotFound; non-task note → Internal "Note is not a task".
     assert!(matches!(
@@ -1511,6 +1532,38 @@ async fn task_list_and_get_project_workspace_tasks() {
         Err(Error::NotFound(_))
     ));
     assert!(svc.task_get(ws, NoteId::from("plain")).await.is_err());
+}
+
+/// When the spec body has no task links, `task.list` still returns every task
+/// note in the workspace — all flagged `specLinked: false`.
+#[tokio::test]
+async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    store
+        .insert_note(&note(&ws, "spec", "No task links here."))
+        .await
+        .expect("spec");
+    for (id, parent) in [("task-a", "spec"), ("task-sub", "task-a")] {
+        let mut tn = note(&ws, id, "body");
+        tn.parent_id = Some(NoteId::from(parent));
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        store.insert_note(&tn).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+    let result = svc.task_list(ws, None).await.expect("task.list");
+    let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["task-a", "task-sub"]);
+    assert!(result.tasks.iter().all(|t| !t.spec_linked));
 }
 
 /// `task.setRelations` round-trips `dependsOn`/`conflictsWith` (deduped),

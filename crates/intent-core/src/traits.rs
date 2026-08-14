@@ -1129,12 +1129,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `task.list`: project a workspace's spec-linked task notes into the
+    /// `task.list`: project ALL of a workspace's task notes (every note with
+    /// task metadata except the spec itself — direct spec children, subtasks,
+    /// and unlinked tasks alike, each flagged with `specLinked`) into the
     /// canonical `WorkspaceTask` list **plus** the workspace-wide `taskStats`
     /// aggregate (PROTOCOL §5.4). `status` optionally filters the task list to
-    /// a single status; `stats` is always computed over the unfiltered
-    /// spec-linked set so the FE can render the progress rollup verbatim
-    /// (mirrors the canonical FE `computeTaskStats` in `task-stats.ts`).
+    /// a single status; `stats` stays the unfiltered spec-linked direct-child
+    /// rollup so the FE can render the progress rollup verbatim (mirrors the
+    /// canonical FE `computeTaskStats` in `task-stats.ts`).
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
