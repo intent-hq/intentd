@@ -32,7 +32,7 @@ use crate::{compute_task_stats, publish_event, system_actor, Services};
 /// behind [`Services::maybe_emit_display_status_changed`] (as
 /// [`DisplayStatusCache`], PROTOCOL §6.5) and
 /// [`Services::maybe_emit_waiting_changed`] (as [`WaitingStatusCache`],
-/// §9.1). A mutation that can move the derivation recomputes it and
+/// §5.1). A mutation that can move the derivation recomputes it and
 /// publishes the matching change event only on an actual transition, so
 /// no-op recomputes never spam the bus. Seeded lazily (first recompute after
 /// a mutation, or an emit-path enrichment) — a first observation records
@@ -56,7 +56,7 @@ pub(crate) struct LastObservedCache<T>(Mutex<CacheInner<T>>);
 /// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5).
 pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 
-/// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §9.1).
+/// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
 
 struct CacheInner<T> {
@@ -132,6 +132,15 @@ impl<T: Copy + PartialEq> LastObservedCache<T> {
         }
     }
 
+    /// Read the last-observed baseline for `workspace_id`, when one exists.
+    /// Best-effort — a poisoned lock reads as no baseline.
+    fn get(&self, workspace_id: &WorkspaceId) -> Option<T> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|inner| inner.map.get(workspace_id).copied())
+    }
+
     /// Test-only visibility into whether a baseline exists for `workspace_id`.
     #[cfg(test)]
     pub(crate) fn contains(&self, workspace_id: &WorkspaceId) -> bool {
@@ -156,15 +165,27 @@ impl Services {
     /// [`Services::maybe_emit_display_status_changed`]).
     pub(crate) async fn enrich_display_status(&self, ws: &mut Workspace) {
         // The orthogonal `waiting` flag rides the same emit path but is
-        // independent of the `taskStats` gate below: it derives purely from
-        // the live wait signals, so it is populated even when a transient
-        // notes-read failure leaves `displayStatus` absent. Pre-read
-        // generation snapshot first — a `workspace.delete` eviction racing
-        // the probe below must not have this seed resurrect the baseline.
-        let waiting_generation = self.last_waiting_statuses.generation();
-        ws.waiting = self.workspace_is_waiting(&ws.id).await;
-        self.last_waiting_statuses
-            .seed(&ws.id, ws.waiting, waiting_generation);
+        // independent of the `taskStats` gate below: it is populated even
+        // when a transient notes-read failure leaves `displayStatus` absent.
+        // Served from the last-observed cache (rung 1 of the derived-field
+        // ladder: the hook/monitor/watch mutation choke points keep it
+        // current via [`Services::maybe_emit_waiting_changed`], so hot
+        // list/get reads cost one in-memory lookup, no per-row store
+        // fan-out); only a cache miss — first touch after startup — probes
+        // the store and seeds the `workspace:waiting-changed` baseline.
+        ws.waiting = match self.last_waiting_statuses.get(&ws.id) {
+            Some(waiting) => waiting,
+            None => {
+                // Pre-read generation snapshot: a `workspace.delete`
+                // eviction racing the probe must not have this seed
+                // resurrect the baseline.
+                let waiting_generation = self.last_waiting_statuses.generation();
+                let waiting = self.workspace_is_waiting(&ws.id).await;
+                self.last_waiting_statuses
+                    .seed(&ws.id, waiting, waiting_generation);
+                waiting
+            }
+        };
         if ws.task_stats.is_none() {
             return;
         }
@@ -189,10 +210,14 @@ impl Services {
         ws.display_status = Some(display_status);
     }
 
-    /// The orthogonal wait probe behind `Workspace.waiting` (§9.1): true when
+    /// The orthogonal wait probe behind `Workspace.waiting` (§5.1): true when
     /// the workspace has any of ACTIVE background hooks, ACTIVE PR monitors,
-    /// or waiting agent subscriptions. Short-circuits on the first live
-    /// signal; best-effort/fail-open like the probes it reuses (a store read
+    /// or waiting agent subscriptions (undelivered child completion watches
+    /// held by top-level foreground agents — agent-owned `event.subscribe`
+    /// registrations deliberately do NOT count: they watch in-workspace
+    /// activity, not an external condition, matching the documented v6.17
+    /// signal set). Short-circuits on the first live signal;
+    /// best-effort/fail-open like the probes it reuses (a store read
     /// failure reads `false`, never wedges list/get emission).
     pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
         self.workspace_has_active_hooks(workspace_id).await
@@ -264,7 +289,7 @@ impl Services {
 
     /// Recompute a workspace's orthogonal `waiting` flag and publish
     /// `workspace:waiting-changed` iff it transitioned since the last
-    /// observation (PROTOCOL §9.1). Called after the lifecycle transitions
+    /// observation (PROTOCOL §5.1 / §6.5). Called after the lifecycle transitions
     /// that can move the derivation — hook create/dispatch/cancel/evict/
     /// expire, PR monitor register/complete/cancel, completion-watch
     /// register/retire/settlement/cancel — never from a polling loop. Same
@@ -276,6 +301,14 @@ impl Services {
     /// baseline absorbs: a transient flap emits at most one pair of
     /// transitions, and the next recompute converges on truth.
     pub(crate) async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
+        // Chief is a fixed virtual workspace synthesized on read
+        // (`workspace.get` returns `chief_workspace()` before enrichment and
+        // `workspace.list` excludes it), so its rows can never carry
+        // `waiting` — never emit a transition its re-read cannot confirm.
+        // Chief-anchored completion watches are deliberately invisible here.
+        if workspace_id.is_chief() {
+            return;
+        }
         // Pre-read generation snapshot: an eviction (workspace.delete)
         // landing between the reads below and the cache write must drop
         // this compute rather than re-insert a baseline for the deleted id
@@ -563,7 +596,7 @@ fn display_status_changed_event(
 }
 
 /// Build a `workspace:waiting-changed` change event with the self-sufficient
-/// payload `{ workspaceId, waiting }` (PROTOCOL §9.1 / §6.7). Private to
+/// payload `{ workspaceId, waiting }` (PROTOCOL §6.5 / §6.7). Private to
 /// this module: the only emitter is
 /// [`Services::maybe_emit_waiting_changed`].
 fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent {

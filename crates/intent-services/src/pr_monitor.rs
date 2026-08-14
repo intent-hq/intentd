@@ -779,7 +779,7 @@ impl Services {
             .await;
         // A newly persisted active monitor can promote the derived
         // displayStatus to `in_progress` (§6.5) and raise the orthogonal
-        // `waiting` flag (§9.1).
+        // `waiting` flag (§5.1).
         self.maybe_emit_display_status_changed(workspace_id).await;
         self.maybe_emit_waiting_changed(workspace_id).await;
         Ok((monitor, snapshot.requirements))
@@ -854,7 +854,7 @@ impl Services {
     }
 
     /// Whether the workspace owns any ACTIVE PR monitor — a
-    /// `Workspace.waiting` signal (§9.1, via
+    /// `Workspace.waiting` signal (§5.1, via
     /// [`Services::workspace_is_waiting`]): an idle agent still watching a
     /// PR via a monitor reads as waiting, without promoting the
     /// `displayStatus` rollup. SQL-filtered to active rows so the hot
@@ -984,7 +984,7 @@ impl Services {
             }
         }
         // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) and drop the `waiting` flag (§9.1) —
+        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
         // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&monitor.workspace_id)
             .await;
@@ -1565,7 +1565,7 @@ impl Services {
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
         // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) and drop the `waiting` flag (§9.1) —
+        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
         // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&completed.workspace_id)
             .await;
@@ -1672,7 +1672,7 @@ impl Services {
                 self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
                     .await;
                 // The last active monitor settling can demote the derived
-                // displayStatus (§6.5) and drop the `waiting` flag (§9.1).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&monitor.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&monitor.workspace_id).await;

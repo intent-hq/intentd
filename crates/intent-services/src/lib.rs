@@ -540,7 +540,7 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
-    /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §9.1):
+    /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1):
     /// the recompute-and-compare seam behind
     /// [`Services::maybe_emit_waiting_changed`]. See
     /// [`workspace_status::WaitingStatusCache`] — the map is private to the

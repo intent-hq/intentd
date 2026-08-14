@@ -1083,7 +1083,7 @@ async fn merged_pr_terminal_wake_refreshes_workspace_linkage_over_wss() {
     assert_eq!(ws["activePullRequest"]["status"], "Merged");
 }
 
-/// Active-monitor `waiting` flag over the wire (PROTOCOL §9.1, mirrors the
+/// Active-monitor `waiting` flag over the wire (PROTOCOL §5.1, mirrors the
 /// hook e2e in `e2e_wss_display_status_hooks.rs`): registering a monitor
 /// never moves the derived `displayStatus` — both `workspace.get` and
 /// `workspace.list` keep serving the base rollup (`idle`) with additive

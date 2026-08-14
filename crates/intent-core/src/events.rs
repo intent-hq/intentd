@@ -307,7 +307,8 @@ pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 // derivation; the self-sufficient payload `{ workspaceId, displayStatus }`
 // updates the workspace card badge with no follow-up fetch.
 pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-changed";
-// Orthogonal `Workspace.waiting` flag transition (PROTOCOL §9.1): recomputed
+// Orthogonal `Workspace.waiting` flag transition (PROTOCOL §5.1 / §6.5):
+// recomputed
 // and compared after the hook / PR-monitor / completion-watch lifecycle
 // transitions that can move the derivation; the self-sufficient payload
 // `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with

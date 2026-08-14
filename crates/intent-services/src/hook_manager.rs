@@ -598,7 +598,7 @@ impl Services {
                     self.spawn_hook_task(hook.clone());
                     // A newly persisted active hook can promote the derived
                     // displayStatus to `in_progress` (§6.5) and raise the
-                    // orthogonal `waiting` flag (§9.1).
+                    // orthogonal `waiting` flag (§5.1).
                     self.maybe_emit_display_status_changed(workspace_id).await;
                     self.maybe_emit_waiting_changed(workspace_id).await;
                     return Ok(json!({ "hook": hook, "dispatched": true }));
@@ -611,7 +611,7 @@ impl Services {
                 self.wake_hook_owner(&hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
                 // Hook settled terminal: recompute the derived displayStatus
-                // (§6.5) and the orthogonal `waiting` flag (§9.1) —
+                // (§6.5) and the orthogonal `waiting` flag (§5.1) —
                 // best-effort, transition-only emission.
                 self.maybe_emit_display_status_changed(workspace_id).await;
                 self.maybe_emit_waiting_changed(workspace_id).await;
@@ -643,7 +643,7 @@ impl Services {
                 self.spawn_hook_task(hook.clone());
                 // A newly persisted active hook can promote the derived
                 // displayStatus to `in_progress` (§6.5) and raise the
-                // orthogonal `waiting` flag (§9.1).
+                // orthogonal `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(workspace_id).await;
                 self.maybe_emit_waiting_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": false }))
@@ -730,18 +730,22 @@ impl Services {
     }
 
     /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
-    /// a `Workspace.waiting` signal (§9.1, via
+    /// a `Workspace.waiting` signal (§5.1, via
     /// [`Services::workspace_is_waiting`]): an idle agent still watching via
     /// a background hook reads as waiting, without promoting the
-    /// `displayStatus` rollup. Best-effort: a store read failure is logged
+    /// `displayStatus` rollup. SQL-side count-only aggregate — no row
+    /// hydration and no dependence on how many terminal rows the workspace
+    /// accumulated. Best-effort: a store read failure is logged
     /// and fails open to `false` (mirrors
     /// [`Services::workspace_attention_signals`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
-        match self.store.list_hooks_by_workspace(workspace_id).await {
-            Ok(hooks) => hooks
-                .iter()
-                .any(|h| matches!(h.state, HookState::Scheduled | HookState::Running)),
+        match self
+            .store
+            .count_active_hooks_by_workspace(workspace_id)
+            .await
+        {
+            Ok(n) => n > 0,
             Err(e) => {
                 tracing::warn!(
                     workspace = %workspace_id.0,
@@ -836,7 +840,7 @@ impl Services {
             None => self.resettle_owner_after_hook_terminal(&hook).await,
         }
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) and drop the orthogonal `waiting` flag (§9.1) —
+        // (§6.5) and drop the orthogonal `waiting` flag (§5.1) —
         // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
@@ -984,7 +988,7 @@ impl Services {
                 hook.next_run_at = None;
                 self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
                 // The pruned row may have been the workspace's last wait
-                // signal (§9.1).
+                // signal (§5.1).
                 self.maybe_emit_waiting_changed(&hook.workspace_id).await;
                 continue;
             }
@@ -1249,7 +1253,7 @@ impl Services {
                 self.wake_hook_owner(hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
                 // The last active hook settling can demote the derived
-                // displayStatus (§6.5) and drop the `waiting` flag (§9.1).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&hook.workspace_id).await;
@@ -1292,7 +1296,7 @@ impl Services {
                 };
                 self.wake_hook_owner(hook, &notice, "evicted").await;
                 // The last active hook settling can demote the derived
-                // displayStatus (§6.5) and drop the `waiting` flag (§9.1).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
                 self.maybe_emit_waiting_changed(&hook.workspace_id).await;
@@ -1353,7 +1357,7 @@ impl Services {
         );
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) and drop the `waiting` flag (§9.1) — best-effort like
+        // (§6.5) and drop the `waiting` flag (§5.1) — best-effort like
         // everything else on this path.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
@@ -1417,7 +1421,7 @@ impl Services {
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) and drop the `waiting` flag (§9.1) — best-effort,
+        // (§6.5) and drop the `waiting` flag (§5.1) — best-effort,
         // transition-only emission.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;

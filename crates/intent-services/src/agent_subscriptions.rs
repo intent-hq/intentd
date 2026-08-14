@@ -487,7 +487,7 @@ impl Services {
     /// Whether any TOP-LEVEL agent homed in `workspace_id` holds at least
     /// one active completion watch (ungrouped or grouped) — the third
     /// `Workspace.waiting` signal alongside active hooks and active PR
-    /// monitors (§9.1, via [`Services::workspace_is_waiting`]): an idle
+    /// monitors (§5.1, via [`Services::workspace_is_waiting`]): an idle
     /// parent still waiting on delegated children reads as waiting, without
     /// promoting the `displayStatus` rollup. `report_delivered` watches are
     /// excluded, matching the agent-waiting projection and settlement
@@ -2232,6 +2232,17 @@ mod tests {
         )
     }
 
+    /// Refresh the last-observed `waiting` baseline after a direct registry
+    /// mutation. Production watch mutations always route through
+    /// [`Services::publish_subscriptions_changed`], which runs this recompute;
+    /// tests that poke the registry directly must mirror it because the
+    /// list/get enrichment serves `waiting` from the last-observed cache
+    /// (rung 1 of the derived-field ladder), probing the store only on a
+    /// cache miss.
+    async fn recompute_waiting(svc: &Services, ws: &WorkspaceId) {
+        svc.maybe_emit_waiting_changed(ws).await;
+    }
+
     /// An armed completion watch held by an idle top-level parent sets the
     /// orthogonal `waiting` flag on the list/get enrichment path without
     /// promoting the derived `displayStatus` — for ungrouped and grouped
@@ -2254,6 +2265,7 @@ mod tests {
                 None,
             )
             .expect("register");
+        recompute_waiting(&svc, &ws).await;
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
             enriched(&svc, &ws).await,
@@ -2271,6 +2283,7 @@ mod tests {
         )
         .expect("register grouped");
         assert!(svc.remove_watch(&ungrouped));
+        recompute_waiting(&svc, &ws).await;
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
             enriched(&svc, &ws).await,
@@ -2299,6 +2312,7 @@ mod tests {
             (WorkspaceDisplayStatus::Idle, true)
         );
         assert!(svc.remove_watch(&id));
+        recompute_waiting(&svc, &ws).await;
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
             enriched(&svc, &ws).await,
@@ -2326,6 +2340,7 @@ mod tests {
             .expect("register");
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert!(svc.mark_watch_report_delivered(&id));
+        recompute_waiting(&svc, &ws).await;
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
             enriched(&svc, &ws).await,

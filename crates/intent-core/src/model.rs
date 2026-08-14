@@ -225,14 +225,19 @@ pub struct Workspace {
     /// elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_status: Option<WorkspaceDisplayStatus>,
-    /// Daemon-owned orthogonal wait flag (§9.1): `true` when the workspace
+    /// Daemon-owned orthogonal wait flag (PROTOCOL §5.1): `true` when the workspace
     /// has any of ACTIVE background hooks, ACTIVE PR monitors, or waiting
-    /// agent subscriptions — the workspace is watching an external condition
-    /// without a running agent turn. Orthogonal to `displayStatus` (a
-    /// workspace can be `complete` or `pr_ready` and still waiting). Derived
-    /// on the same `workspace.list` / `workspace.get` / subscription emit
-    /// path as `displayStatus` (never persisted); omitted (not `false`) when
-    /// no wait signal is live.
+    /// agent subscriptions (undelivered child completion watches held by
+    /// top-level foreground agents, anchored in the parent's home
+    /// workspace; `event.subscribe` registrations deliberately do not
+    /// count) — the workspace is watching an external condition without a
+    /// running agent turn. Orthogonal to `displayStatus` (a workspace can
+    /// be `complete` or `pr_ready` and still waiting). Served from the
+    /// last-observed cache on the same `workspace.list` / `workspace.get` /
+    /// subscription emit path as `displayStatus` (never persisted; the
+    /// hook/monitor/watch mutation choke points keep the cache current, and
+    /// only a first-touch miss probes the store); omitted (not `false`)
+    /// when no wait signal is live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
