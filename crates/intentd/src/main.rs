@@ -1114,32 +1114,32 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
-    // Aggregate child-tree memory budget (monorepo#2063), installed only when
-    // `agents.memoryBudgetMb` is an explicit positive value — an absent key
-    // means auto but its resolution to the recommended budget is not wired
-    // yet, and an explicit 0 means off. `process_cap` bounds agent *slots*, which
-    // is not a memory bound: a single agent's subtree was measured from 436 MB
-    // idle to 9.6 GB running a test suite. When installed, the budget reads the
-    // same descendant-tree sampler `system.status` reports (intentd#1139) and
-    // gates new spawns only — see [`ProcessRegistry::acquire`].
-    match agent_memory_budget_bytes(&boot_settings.effective) {
+    // Aggregate child-tree memory budget (monorepo#2063): an absent key means
+    // auto (resolves to the recommended budget derived from system RAM), an
+    // explicit 0 means off, and a positive value is an explicit MB budget.
+    // `process_cap` bounds agent *slots*, which is not a memory bound: a single
+    // agent's subtree was measured from 436 MB idle to 9.6 GB running a test
+    // suite. When installed, the budget reads the same descendant-tree sampler
+    // `system.status` reports (intentd#1139) and gates new spawns only — see
+    // [`ProcessRegistry::acquire`].
+    let total_memory_bytes = {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    };
+    let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
+    match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
         Some(budget_bytes) => {
             manager
                 .registry()
                 .set_memory_budget(budget_bytes, child_usage.clone());
             tracing::info!(
                 budget_bytes,
-                recommended_bytes = {
-                    let mut sys = sysinfo::System::new();
-                    sys.refresh_memory();
-                    recommended_memory_budget_bytes(sys.total_memory())
-                },
+                recommended_bytes,
                 "aggregate agent memory budget enabled"
             );
         }
-        None => tracing::debug!(
-            "aggregate agent memory budget not installed (agents.memoryBudgetMb absent or 0)"
-        ),
+        None => tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)"),
     }
     tracing::info!(
         process_cap = manager.registry().cap(),

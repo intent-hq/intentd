@@ -688,21 +688,33 @@ async fn wss_system_status_includes_capacity_version_uptime() {
             .is_empty(),
         "hostname non-empty: {r}"
     );
-    // Aggregate-budget fields (monorepo#2063): the budget is off by default
-    // (`agents.memoryBudgetMb = 0`), so all three are ABSENT — the
-    // presence-detection convention, unlike the always-present-but-nullable
-    // child-tree fields.
+    // Aggregate-budget fields (monorepo#2063): the budget is ON by default
+    // (auto resolves to recommended), so agentMemoryBudgetBytes and queuedSpawns
+    // are present. agentMemoryChargedBytes is absent until the descendant-tree
+    // sampler lands its first sample.
     let obj = r.as_object().expect("result is object");
-    for field in [
-        "agentMemoryBudgetBytes",
-        "agentMemoryChargedBytes",
-        "queuedSpawns",
-    ] {
-        assert!(
-            !obj.contains_key(field),
-            "{field} must be absent while the budget is off: {r}"
-        );
-    }
+    assert!(
+        obj.contains_key("agentMemoryBudgetBytes"),
+        "agentMemoryBudgetBytes must be present (auto is on by default): {r}"
+    );
+    assert!(
+        obj["agentMemoryBudgetBytes"].as_u64().is_some(),
+        "agentMemoryBudgetBytes must be a positive u64: {r}"
+    );
+    assert!(
+        obj.contains_key("queuedSpawns"),
+        "queuedSpawns must be present when budget is active: {r}"
+    );
+    assert_eq!(
+        obj["queuedSpawns"].as_u64(),
+        Some(0),
+        "no spawn is queued in a fresh daemon: {r}"
+    );
+    // agentMemoryChargedBytes is absent until the first sample
+    assert!(
+        !obj.contains_key("agentMemoryChargedBytes"),
+        "agentMemoryChargedBytes must be absent before first sample: {r}"
+    );
 }
 
 #[tokio::test]
