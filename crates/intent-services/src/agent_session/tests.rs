@@ -945,6 +945,86 @@ async fn prompt_turn_streams_events_and_accumulates() {
         json!("Hello world"),
         "terminal stream:end carries the final preview from the full turn text"
     );
+    // Normal `end_turn` endings stay metadata-free: no `finishReason` on the
+    // terminal stream:end and no metadata on the persisted assistant row.
+    assert!(
+        end.data.get("finishReason").is_none(),
+        "finishReason omitted on a normal end_turn ending"
+    );
+    assert!(
+        messages[0].metadata.is_none(),
+        "no row metadata on a normal end_turn ending"
+    );
+}
+
+/// Abnormal turn endings (PROTOCOL §7): a turn resolving with a non-`end_turn`
+/// stop reason (here `refusal`) persists `metadata.finishReason` on the turn's
+/// assistant row — durable across reload — and the terminal `agent:stream:end`
+/// carries the same `finishReason` so live clients render it without a
+/// transcript re-fetch. The turn still completes normally (`agent:idle`, no
+/// `agent:failed`).
+#[tokio::test]
+async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(prompt_updates(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The assistant row carries the durable finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the same finishReason live.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+
+    // The turn is a completion, not a failure: `agent:idle` fires (its
+    // `finishReason` is the existing lifecycle field) and `agent:failed`
+    // never does.
+    let idle = events
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .expect("agent:idle");
+    assert_eq!(idle.data["finishReason"], json!("refusal"));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
+    );
 }
 
 /// Mid-turn `agent:stream:activity` clips the preview at the last newline:
