@@ -27,8 +27,9 @@ which is not the client's machine in a remote-daemon setup. Use the `daemon.loca
 alias to target it explicitly — and bind `0.0.0.0` so a remote client can reach the port:
 
 ```json
-// 1. Start a server on the daemon machine, e.g. via ws.host.exec:
-//    python3 -m http.server 8000 --bind 0.0.0.0
+// 1. Start a server on the daemon machine. Use a service-mode script (ws.script.*) or a
+//    terminal for long-running processes — ws.host.exec is one-shot and would block:
+//    ws.script.create("http-server", "python3 -m http.server 8000 --bind 0.0.0.0", "service")
 
 // 2. Open it using the daemon.localhost alias
 {
@@ -37,7 +38,7 @@ alias to target it explicitly — and bind `0.0.0.0` so a remote client can reac
   ]
 }
 // The result echoes the rewrite, e.g.:
-// { requestedUrl: "http://daemon.localhost:8000/", finalUrl: "http://10.0.0.5:8000/", rewritten: true, reason: "..." }
+// { requestedUrl: "http://daemon.localhost:8000", finalUrl: "http://10.0.0.5:8000/", rewritten: true, reason: "..." }
 
 // To target an app on the user's machine instead, use client.localhost
 {
