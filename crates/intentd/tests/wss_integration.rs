@@ -8118,8 +8118,9 @@ async fn wss_file_place_attachment_round_trip() {
 /// transport. A two-chunk payload is staged and committed; the commit result
 /// is byte-shape-identical to a successful `file.placeAttachment` result
 /// (registry fields included) and the reassembled bytes land under
-/// `.intent/attachments/`. An unknown uploadId is the documented -32602, and
-/// `abort` retires a pending session idempotently.
+/// `.intent/attachments/`. An unknown uploadId is the documented -32602, the
+/// 5th concurrent per-workspace begin is the documented -32602 naming the
+/// cap (monorepo#2275), and `abort` retires a pending session idempotently.
 #[tokio::test]
 async fn wss_file_attachment_upload_round_trip() {
     use base64::Engine as _;
@@ -8229,6 +8230,47 @@ async fn wss_file_attachment_upload_round_trip() {
             .is_some_and(|m| m.contains("no attachment upload in progress")),
         "{resp}"
     );
+
+    // Per-workspace session cap (monorepo#2275): the 5th live begin is the
+    // documented -32602 naming the cap, and settling a session (abort)
+    // frees the slot.
+    let mut cap_ids = Vec::new();
+    for i in 0..4 {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"cap-{i}.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+            ws.0
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        cap_ids.push(
+            resp["result"]["uploadId"]
+                .as_str()
+                .expect("uploadId")
+                .to_string(),
+        );
+    }
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":41,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"fifth.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("attachment uploads in progress") && m.contains("max 4")),
+        "{resp}"
+    );
+    for (i, cap_id) in cap_ids.iter().enumerate() {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{cap_id}"}}}}"#
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(
+            resp["result"]["aborted"],
+            serde_json::json!(true),
+            "abort {i}: {resp}"
+        );
+    }
 
     // abort retires a pending session; a second abort is the idempotent
     // non-error (`aborted: false`).
