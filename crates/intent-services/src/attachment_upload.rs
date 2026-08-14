@@ -500,16 +500,27 @@ impl Services {
             .file_attachment_upload_commit_body(&upload_id, claim)
             .await;
         if result.is_err() {
-            if let Some(session) = self
-                .attachment_uploads
-                .lock()
-                .expect("attachment upload registry poisoned")
-                .get_mut(&upload_id)
-            {
-                session.committing = false;
-            }
+            self.release_failed_commit_claim(&upload_id);
         }
         result
+    }
+
+    /// Release a failed commit's `committing` claim so the session survives
+    /// for retry or abort. Also refreshes the idle clock: the commit itself
+    /// may have outlived the TTL (claim time is the last refresh before the
+    /// body runs), and without this the next call — or a `begin` sweep —
+    /// would expire the session instantly instead of granting the
+    /// documented fresh retry window.
+    fn release_failed_commit_claim(&self, upload_id: &str) {
+        if let Some(session) = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get_mut(upload_id)
+        {
+            session.committing = false;
+            session.last_activity = Instant::now();
+        }
     }
 
     async fn file_attachment_upload_commit_body(
@@ -1300,6 +1311,47 @@ mod tests {
         svc.file_attachment_upload_commit_op(upload_id)
             .await
             .expect("retried commit");
+    }
+
+    /// Regression (monorepo#2275 review): a commit that fails after running
+    /// LONGER than the idle TTL must still leave the session a fresh retry
+    /// window. The failure path refreshes `last_activity` when it releases
+    /// the `committing` claim — without that, the claim-time timestamp is
+    /// already past the TTL and the next op (or a `begin` sweep) expires
+    /// the session instead of allowing the documented retry.
+    #[tokio::test]
+    async fn failed_commit_outliving_ttl_still_gets_fresh_retry_window() {
+        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
+            "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
+            "100",
+        )]);
+        let ws = WorkspaceId("ws-up-slow-commit".to_string());
+        let ws_root = TempDir::new("attach-up-root");
+        let checkout = TempDir::new("attach-up-co");
+        let svc = seeded_services(&ws, &ws_root.0, &checkout.0).await;
+
+        let payload = b"slow-commit".to_vec();
+        let upload_id = begin(&svc, &ws, &payload).await;
+        svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
+            .await
+            .expect("chunk");
+        // Simulate a commit claimed well over one TTL ago and still in
+        // flight: `committing` held, claim-time `last_activity` long stale.
+        {
+            let mut uploads = svc.attachment_uploads.lock().unwrap();
+            let session = uploads.get_mut(&upload_id).unwrap();
+            session.committing = true;
+            session.last_activity = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(2))
+                .expect("backdate claim time");
+        }
+        // The slow commit fails; its failure path releases the claim.
+        svc.release_failed_commit_claim(&upload_id);
+        // The session must NOT be instantly expired: the retry window
+        // restarts at the failure, so an immediate retry succeeds.
+        svc.file_attachment_upload_commit_op(upload_id)
+            .await
+            .expect("retry inside the refreshed window");
     }
 
     /// Regression: a commit rejected with "already committing" must NOT
