@@ -3175,6 +3175,66 @@ async fn task_subscribe_snapshot_and_deltas_carry_spec_linked_over_wss() {
         linked_row["specLinked"], true,
         "linked delta row: {linked_row}"
     );
+
+    // A spec-body edit that flips linkage both ways — dropping the linked
+    // task's link and adding the unlinked one — emits ONE delta with
+    // `updated` rows for exactly the flipped tasks (monorepo#2407): the
+    // subscriber no longer holds stale `specLinked` flags until the tasks'
+    // own next events.
+    wss_rpc(
+        &mut rpc,
+        8,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": "spec",
+            "content": format!("- [ ] [Unlinked](intent://local/task/{unlinked_id})"),
+            "confirmReplacement": true,
+        }),
+    )
+    .await;
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("delta"), "push: {push}");
+    let rows = push["delta"]["updated"].as_array().expect("updated rows");
+    assert_eq!(rows.len(), 2, "exactly the flipped tasks: {push}");
+    let by_id = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == json!(id))
+            .unwrap_or_else(|| panic!("row for {id}: {push}"))
+    };
+    assert_eq!(by_id(&linked_id)["specLinked"], false, "push: {push}");
+    assert_eq!(by_id(&unlinked_id)["specLinked"], true, "push: {push}");
+
+    // A spec edit that leaves the link set unchanged emits no task delta at
+    // all: the next push is the status update driven afterwards, not a
+    // spec-edit artifact.
+    wss_rpc(
+        &mut rpc,
+        9,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": "spec",
+            "content": format!("edited body\n- [ ] [Unlinked](intent://local/task/{unlinked_id})"),
+            "confirmReplacement": true,
+        }),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        10,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": unlinked_id, "status": "in_progress" }),
+    )
+    .await;
+    let push = next_subscription_push(&mut sub, 10).await;
+    let rows = push["delta"]["updated"].as_array().expect("updated rows");
+    assert_eq!(rows.len(), 1, "no spec-edit artifact push: {push}");
+    assert_eq!(rows[0]["id"], json!(unlinked_id), "push: {push}");
+    assert_eq!(
+        rows[0]["metadata"]["task"]["status"], "in_progress",
+        "push: {push}"
+    );
 }
 
 /// End-to-end readiness-over-dependsOn (PROTOCOL.md §5.4/§6.5; spec §2.2,
