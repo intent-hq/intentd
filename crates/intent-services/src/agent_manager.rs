@@ -437,9 +437,8 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 /// agent's worth of slack still inside the 40 GB the slot cap already considers
 /// spendable — and the 21.5 GB tree measured in #2063 would have crossed it.
 ///
-/// Only a recommendation today: `agents.memoryBudgetMb` defaults to auto (the
-/// absent key; explicit 0 = off), and nothing calls this at runtime until the
-/// boot wiring resolves auto to this value.
+/// The recommended default: `agents.memoryBudgetMb` defaults to auto (the
+/// absent key; explicit 0 = off), and boot wiring resolves auto to this value.
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
 }
@@ -792,9 +791,10 @@ pub struct ProcessRegistry {
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
     /// Optional aggregate memory budget, installed once by the composition root
-    /// when `agents.memoryBudgetMb` resolves to a positive budget. Not installed
-    /// (explicit 0 = off, or auto pending its boot wiring) leaves every path
-    /// below byte-for-byte identical to the slot-cap-only behaviour.
+    /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
+    /// absent key, resolves to the recommended value; explicit 0 = off). Not
+    /// installed leaves every path below byte-for-byte identical to the
+    /// slot-cap-only behaviour.
     memory: std::sync::OnceLock<MemoryBudget>,
 }
 

@@ -1218,8 +1218,7 @@ maxConcurrent = 0
 # child-process tree may use before new agent spawns queue behind idle-process
 # eviction (nothing running is ever killed; changes apply on daemon restart).
 # Absent (the default, as in this file) = auto: the daemon picks the budget
-# (today auto installs none, i.e. behaves like off; a RAM-derived default
-# lands separately, monorepo#2063). Explicit 0 = off, always. Upgrade note:
+# ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal
 # `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
 # auto. A positive value is the budget in MB (max 1024000). A soft
