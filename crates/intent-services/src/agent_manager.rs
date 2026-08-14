@@ -882,7 +882,7 @@ impl ProcessRegistry {
         let queued = inner
             .wait_queue
             .iter()
-            .filter(|(_, tx)| !tx.is_closed())
+            .filter(|(_, tx, _)| !tx.is_closed())
             .count() as u64;
         Some((budget.budget_bytes, charged, queued))
     }
