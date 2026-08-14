@@ -592,6 +592,34 @@ fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillF
         .collect()
 }
 
+/// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
+/// attributed subtree first (Phase A attribution), ties and unattributed
+/// entries (charged 0 by the sort) falling back to least-recently-used first —
+/// so with no attribution at all the order degrades to plain LRU.
+fn idle_largest_first(
+    inner: &RegistryInner,
+    samples: &HashMap<AgentId, u64>,
+) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, u64, u64, KillFn)> = inner
+        .entries
+        .iter()
+        .filter(|(_, e)| !e.is_active)
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                samples.get(id).copied().unwrap_or(0),
+                e.last_active_ms,
+                e.kill.clone(),
+            )
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    candidates
+        .into_iter()
+        .map(|(id, _, _, kill)| (id, kill))
+        .collect()
+}
+
 /// The concrete service-layer [`EventSink`]: the bridge `intent-acp`'s
 /// client-served request handler publishes its `file:changed` /
 /// `agent:permission:*` events through, appended + broadcast over the M2
@@ -904,6 +932,23 @@ impl ProcessRegistry {
                 .budget_pending_bytes
                 .saturating_add(agents.saturating_mul(PROVISIONAL_AGENT_BYTES as i64));
         }
+    }
+
+    /// Credit raw `bytes` back against the pending correction, beyond what
+    /// [`Self::budget_adjust`] already credited. Used by the budget drain: a
+    /// victim's *attributed* size can dwarf the fixed provisional credit, and
+    /// without this the drain keeps killing smaller idle agents for up to a
+    /// full sample period after the real overshoot cleared. An over-credit
+    /// from stale attribution self-heals the moment a fresh sample lands
+    /// ([`Self::budget_denies`] resets the pending correction on a new seq).
+    fn budget_credit_extra_bytes(&self, bytes: u64) {
+        if bytes == 0 || self.memory.get().is_none() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.budget_pending_bytes = inner
+            .budget_pending_bytes
+            .saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
@@ -1224,6 +1269,113 @@ impl ProcessRegistry {
             }
             kill().await;
             self.deregister(&id);
+            release(&id);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Budget-triggered idle drain (monorepo#2063 level 2): while the
+    /// aggregate charge is over the installed budget, evict idle processes
+    /// largest-attributed-subtree-first (Phase A attribution; LRU fallback
+    /// when attribution is unavailable), re-checking the budget before every
+    /// kill so the drain stops the moment the overshoot clears. Each
+    /// eviction credits the victim's attributed bytes (at least the
+    /// provisional cost) against the charge, so the stop condition holds
+    /// within a single sample period — not only after the next sample lands.
+    /// Unlike the
+    /// [`Self::acquire`] path this fires without a spawn attempt, and unlike
+    /// [`Self::evict_idle_older_than`] it ignores the TTL — memory pressure
+    /// is now, not in `idleReapMinutes`. No budget installed, no sample yet,
+    /// or under budget → 0 evictions, byte-for-byte the old behaviour.
+    /// Active processes are never candidates, mirroring both other paths.
+    ///
+    /// Each eviction logs + emits `agent:process:evicted` with reason
+    /// [`REASON_MEMORY_BUDGET`], matching the acquire path's budget eviction.
+    ///
+    /// Claim-before-kill (monorepo#2118): same `try_claim` / `release`
+    /// contract as [`Self::evict_idle_older_than`], including the
+    /// re-validation before each kill and the NOT-cancellation-safe caveat —
+    /// dropping this future at the `kill().await` leaks the held claim.
+    pub async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
+    where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
+        // The common case (under budget / no budget / no sample) must stay one
+        // lock + one probe read. The candidate order is snapshotted here; the
+        // per-kill re-check below only decides *whether* to keep draining.
+        let (candidates, samples) = {
+            let mut inner = self.inner.lock().unwrap();
+            if self.budget_denies(&mut inner).is_none() {
+                return 0;
+            }
+            let samples = self
+                .memory
+                .get()
+                .map(|b| b.probe.agent_samples())
+                .unwrap_or_default();
+            (idle_largest_first(&inner, &samples), samples)
+        };
+        let mut evicted = 0;
+        for (id, kill) in candidates {
+            // Stop the moment the budget clears: each eviction credits the
+            // victim's full known cost back (below), and a fresh sample may
+            // land mid-drain.
+            let still_over = {
+                let mut inner = self.inner.lock().unwrap();
+                self.budget_denies(&mut inner).is_some()
+            };
+            if !still_over {
+                break;
+            }
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock (the monorepo#2118 TOCTOU):
+            // earlier kills in this drain awaited, so the entry may be
+            // actively streaming again or gone. With the claim held nothing
+            // can start new work on it after this check.
+            let still_idle = {
+                let inner = self.inner.lock().unwrap();
+                inner.entries.get(&id).is_some_and(|e| !e.is_active)
+            };
+            if !still_idle {
+                release(&id);
+                continue;
+            }
+            let used = self.size();
+            tracing::info!(
+                evicted = %id,
+                used = used,
+                cap = self.cap,
+                reason = REASON_MEMORY_BUDGET,
+                "process registry: over-budget idle process evicted"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(
+                    &id,
+                    "agent:process:evicted",
+                    used,
+                    self.cap,
+                    REASON_MEMORY_BUDGET,
+                );
+                tokio::spawn(fut);
+            }
+            kill().await;
+            self.deregister(&id);
+            // `deregister` credited the fixed provisional cost; top it up to
+            // the victim's attributed bytes when attribution knows more, so
+            // the per-kill re-check above sees the real reclaim within this
+            // sample period instead of over-draining every idle candidate
+            // (the next sample resets the correction either way).
+            self.budget_credit_extra_bytes(
+                samples
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(PROVISIONAL_AGENT_BYTES),
+            );
             release(&id);
             evicted += 1;
         }
@@ -6356,6 +6508,44 @@ impl AgentManager {
     /// a message that parked behind the claim starts a fresh turn (the agent
     /// respawns on demand) rather than stranding until the next queue event.
     pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let (try_claim, release, released) = self.reap_claim_fns();
+        let reaped = self
+            .registry
+            .evict_idle_older_than(ttl, try_claim, release)
+            .await;
+        self.kick_released(released).await;
+        reaped
+    }
+
+    /// Budget-triggered idle reap (monorepo#2063 level 2): while the aggregate
+    /// charge is over the installed budget, evict idle agents
+    /// largest-attributed-subtree-first (Phase A attribution; LRU fallback
+    /// when attribution is unavailable) — without waiting for the TTL or for
+    /// a spawn attempt. No budget / no sample / under budget → no-op. Same
+    /// claim-before-kill semantics (monorepo#2118) and post-sweep drain kick
+    /// as [`Self::reap_idle_older_than`]. Returns the number reaped.
+    pub async fn reap_over_budget(self: &Arc<Self>) -> usize {
+        let (try_claim, release, released) = self.reap_claim_fns();
+        let reaped = self
+            .registry
+            .evict_while_over_budget(try_claim, release)
+            .await;
+        self.kick_released(released).await;
+        reaped
+    }
+
+    /// The claim-before-kill wiring (monorepo#2118) shared by every reap
+    /// sweep: `try_claim` check-and-claims into `reap_claims` under the
+    /// `busy` lock, `release` drops the claim and records the id for the
+    /// post-sweep drain kick ([`Self::kick_released`]).
+    #[allow(clippy::type_complexity)]
+    fn reap_claim_fns(
+        &self,
+    ) -> (
+        impl Fn(&AgentId) -> bool,
+        impl Fn(&AgentId),
+        Arc<Mutex<Vec<AgentId>>>,
+    ) {
         let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
         let try_claim = {
             let busy = self.busy.clone();
@@ -6382,13 +6572,13 @@ impl AgentManager {
                 released.lock().unwrap().push(id.clone());
             }
         };
-        let reaped = self
-            .registry
-            .evict_idle_older_than(ttl, try_claim, release)
-            .await;
-        // Drain kick for messages that parked behind a claim: with the claim
-        // released, a ready queue would otherwise sit unworked until the next
-        // external queue event (PROTOCOL §5.5 "never sits unworked").
+        (try_claim, release, released)
+    }
+
+    /// Drain kick for messages that parked behind a claim: with the claim
+    /// released, a ready queue would otherwise sit unworked until the next
+    /// external queue event (PROTOCOL §5.5 "never sits unworked").
+    async fn kick_released(self: &Arc<Self>, released: Arc<Mutex<Vec<AgentId>>>) {
         let released = std::mem::take(&mut *released.lock().unwrap());
         for id in released {
             if !self.services.has_ready_to_send(&id) {
@@ -6400,7 +6590,6 @@ impl AgentManager {
                     .await;
             }
         }
-        reaped
     }
 
     /// Tear down only the agent's child process + handle, without touching the

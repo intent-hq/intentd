@@ -265,11 +265,17 @@ async fn acquire_queues_until_a_process_goes_idle() {
 
 /// Tree-memory probe whose reading tests set by hand. Every `set` bumps the
 /// sample id, which is exactly what the real 5 s sampler does.
-struct FakeProbe(Mutex<(u64, u64)>);
+struct FakeProbe(
+    Mutex<(u64, u64)>,
+    Mutex<std::collections::HashMap<AgentId, u64>>,
+);
 
 impl FakeProbe {
     fn new(bytes: u64) -> Arc<Self> {
-        Arc::new(Self(Mutex::new((bytes, 1))))
+        Arc::new(Self(
+            Mutex::new((bytes, 1)),
+            Mutex::new(std::collections::HashMap::new()),
+        ))
     }
 
     /// Publish a freshly measured reading (new sample id → the registry drops
@@ -279,11 +285,21 @@ impl FakeProbe {
         guard.0 = bytes;
         guard.1 += 1;
     }
+
+    /// Publish per-agent attribution buckets (monorepo#2063 Phase A) alongside
+    /// the aggregate reading.
+    fn set_agents(&self, pairs: &[(&AgentId, u64)]) {
+        *self.1.lock().unwrap() = pairs.iter().map(|(id, b)| ((*id).clone(), *b)).collect();
+    }
 }
 
 impl TreeMemoryProbe for FakeProbe {
     fn sample(&self) -> Option<(u64, u64)> {
         Some(*self.0.lock().unwrap())
+    }
+
+    fn agent_samples(&self) -> std::collections::HashMap<AgentId, u64> {
+        self.1.lock().unwrap().clone()
     }
 }
 
@@ -689,6 +705,153 @@ async fn budget_status_reports_budget_charged_and_queued() {
         .expect("task ok");
     let (_, _, queued) = reg.budget_status().expect("budget installed");
     assert_eq!(queued, 0, "the admitted spawn left the queue");
+}
+
+/// Budget-triggered idle drain (monorepo#2063 level 2): an over-budget state
+/// drains idle processes with NO spawn attempt, largest-attributed-subtree
+/// first, and stops the moment the charge clears the budget — the smaller
+/// idle survivor is kept. The probe never publishes a fresh sample here: the
+/// stop relies on the drain crediting the victim's ATTRIBUTED bytes (7 GB),
+/// not just the fixed provisional cost, so it holds within a single sample
+/// period.
+#[tokio::test]
+async fn over_budget_drain_evicts_largest_attributed_idle_first() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (small, big) = (AgentId::from("small"), AgentId::from("big"));
+    reg.register(small.clone(), recording_kill(small.clone(), log.clone()));
+    reg.register(big.clone(), recording_kill(big.clone(), log.clone()));
+    // LRU alone would pick `small` (older); attribution must pick `big`.
+    reg.set_last_active(&small, 100);
+    reg.set_last_active(&big, 200);
+    probe.set_agents(&[(&small, gb), (&big, 7 * gb)]);
+
+    let evicted = reg.evict_while_over_budget(|_| true, |_| {}).await;
+
+    assert_eq!(evicted, 1, "the drain stops once the charge clears");
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![big.clone()],
+        "largest attributed idle subtree goes first"
+    );
+    assert!(reg.is_registered(&small), "under budget again → small kept");
+}
+
+/// With no attribution at all (probe predates Phase A buckets / first sweep
+/// not landed), the over-budget drain degrades to plain LRU order.
+#[tokio::test]
+async fn over_budget_drain_falls_back_to_lru_without_attribution() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (older, newer) = (AgentId::from("older"), AgentId::from("newer"));
+    reg.register(older.clone(), recording_kill(older.clone(), log.clone()));
+    reg.register(newer.clone(), recording_kill(newer.clone(), log.clone()));
+    reg.set_last_active(&older, 100);
+    reg.set_last_active(&newer, 200);
+
+    let evicted = {
+        let probe = probe.clone();
+        reg.evict_while_over_budget(|_| true, move |_| probe.set(2 * gb))
+            .await
+    };
+
+    assert_eq!(evicted, 1);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![older.clone()],
+        "no attribution → least-recently-used first"
+    );
+    assert!(reg.is_registered(&newer));
+}
+
+/// The over-budget drain never touches active processes: with every process
+/// active it evicts nothing, however far over budget the tree is — admission
+/// (and level 4, opt-in) own that case, not the reap sweep.
+#[tokio::test]
+async fn over_budget_drain_never_touches_active_processes() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (a, b) = (AgentId::from("a"), AgentId::from("b"));
+    for id in [&a, &b] {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+        reg.mark_active(id);
+    }
+    probe.set_agents(&[(&a, 7 * gb), (&b, 2 * gb)]);
+
+    assert_eq!(reg.evict_while_over_budget(|_| true, |_| {}).await, 0);
+    assert!(log.lock().unwrap().is_empty(), "no kill ran");
+    assert!(reg.is_registered(&a) && reg.is_registered(&b));
+}
+
+/// Under budget (or no budget installed, or no sample yet) the drain is a
+/// no-op — the sweep must not evict a single idle process without pressure.
+#[tokio::test]
+async fn over_budget_drain_is_inert_without_pressure() {
+    let gb = super::GB;
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    // No budget installed.
+    let reg = ProcessRegistry::new(8);
+    let id = AgentId::from("a");
+    reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    assert_eq!(reg.evict_while_over_budget(|_| true, |_| {}).await, 0);
+
+    // Installed but never sampled.
+    let reg = ProcessRegistry::new(8);
+    assert!(reg.set_memory_budget(4 * gb, Arc::new(NeverSampled)));
+    reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    assert_eq!(reg.evict_while_over_budget(|_| true, |_| {}).await, 0);
+
+    // Sampled under budget.
+    let reg = ProcessRegistry::new(8);
+    assert!(reg.set_memory_budget(4 * gb, FakeProbe::new(gb)));
+    reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    assert_eq!(reg.evict_while_over_budget(|_| true, |_| {}).await, 0);
+
+    assert!(log.lock().unwrap().is_empty(), "no kill ever ran");
+}
+
+/// A candidate whose `try_claim` loses (busy, or another sweep holds it) is
+/// skipped, and the drain moves on to the next-largest candidate.
+#[tokio::test]
+async fn over_budget_drain_skips_candidates_whose_claim_loses() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (held, next) = (AgentId::from("held"), AgentId::from("next"));
+    reg.register(held.clone(), recording_kill(held.clone(), log.clone()));
+    reg.register(next.clone(), recording_kill(next.clone(), log.clone()));
+    probe.set_agents(&[(&held, 7 * gb), (&next, 2 * gb)]);
+
+    let evicted = {
+        let held = held.clone();
+        let probe = probe.clone();
+        reg.evict_while_over_budget(move |id| *id != held, move |_| probe.set(2 * gb))
+            .await
+    };
+
+    assert_eq!(evicted, 1);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![next.clone()],
+        "the lost claim is skipped, not killed"
+    );
+    assert!(reg.is_registered(&held), "claim holder's candidate kept");
 }
 
 #[tokio::test]
@@ -1680,6 +1843,74 @@ async fn overlapping_sweep_does_not_double_claim() {
     mgr.reap_claims.lock().unwrap().remove(&id);
     assert_eq!(mgr.reap_idle_older_than(Duration::from_secs(60)).await, 1);
     assert!(!mgr.registry().is_registered(&id));
+}
+
+/// monorepo#2063 B7 — the manager's over-budget reap drains idle agents with
+/// fresh timestamps (no TTL involved), skips agents with an in-flight prompt
+/// via the same claim wiring as the TTL sweep, and honors a claim another
+/// sweep already holds.
+#[tokio::test]
+async fn reap_over_budget_drains_idle_and_respects_claims() {
+    let gb = super::GB;
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-budget-reap");
+    let (busy, idle) = (AgentId::from("busy"), AgentId::from("idle"));
+    seed_agent(&mgr, &ws, &busy).await;
+    track(&mgr, &busy);
+    track(&mgr, &idle);
+    // Both freshly active — the TTL sweep would touch neither.
+    assert!(mgr.try_begin(&busy, &ws).await, "busy claims its turn");
+
+    let probe = FakeProbe::new(10 * gb);
+    probe.set_agents(&[(&busy, 7 * gb), (&idle, 2 * gb)]);
+    assert!(mgr.registry().set_memory_budget(4 * gb, probe.clone()));
+
+    // Still over budget after the eviction: the drain must stop anyway once
+    // only the busy agent (claim-protected) remains.
+    assert_eq!(Arc::clone(&mgr).reap_over_budget().await, 1);
+    assert!(!mgr.contains(&idle), "idle agent drained without a TTL");
+    assert!(mgr.contains(&busy), "in-flight agent survives the drain");
+
+    // A claim held by another sweep protects its agent too.
+    track(&mgr, &idle);
+    mgr.end_turn(&busy).await;
+    mgr.registry().mark_idle(&busy);
+    mgr.reap_claims.lock().unwrap().insert(busy.clone());
+    probe.set(10 * gb);
+    let evicted = {
+        let probe = probe.clone();
+        let mgr = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            let n = mgr.reap_over_budget().await;
+            probe.set(gb);
+            n
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(evicted, 1, "only the unclaimed idle agent is drained");
+    assert!(mgr.contains(&busy), "held claim protects the agent");
+    assert!(
+        mgr.reap_claims.lock().unwrap().contains(&busy),
+        "the holder's claim is untouched"
+    );
+}
+
+/// monorepo#2063 B7 — under budget the manager's over-budget reap is a no-op:
+/// no agent is touched however stale its timestamp.
+#[tokio::test]
+async fn reap_over_budget_is_inert_under_budget() {
+    let gb = super::GB;
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let id = AgentId::from("a-under-budget");
+    track(&mgr, &id);
+    mgr.registry().set_last_active(&id, 1);
+    assert!(mgr.registry().set_memory_budget(4 * gb, FakeProbe::new(gb)));
+
+    assert_eq!(Arc::clone(&mgr).reap_over_budget().await, 0);
+    assert!(mgr.contains(&id), "no pressure → nothing drained");
 }
 
 /// Track a mock agent whose handle owns a REAL child process (a long sleep),
