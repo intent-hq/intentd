@@ -214,7 +214,11 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// requeues are never rewritten, and a content that already carries the
 /// section (terminal-failure requeue) is not annotated twice. Best-effort and
 /// advisory only — an empty delta or a snapshot error appends nothing.
-async fn annotate_unblocked_hints(services: &Services, entries: &mut [QueuedMessage]) {
+async fn annotate_unblocked_hints(
+    services: &Services,
+    agent_id: &AgentId,
+    entries: &mut [QueuedMessage],
+) {
     use crate::agent_ops::ready_delta;
     let candidates: Vec<usize> = entries
         .iter()
@@ -231,6 +235,7 @@ async fn annotate_unblocked_hints(services: &Services, entries: &mut [QueuedMess
     };
     let section = services
         .unblocked_section_for_delivery(
+            agent_id,
             candidates
                 .iter()
                 .map(|&i| entries[i].message_metadata.as_ref()),
@@ -4794,7 +4799,10 @@ impl AgentManager {
         {
             match self
                 .services
-                .unblocked_section_for_delivery(std::iter::once(options.message_metadata.as_ref()))
+                .unblocked_section_for_delivery(
+                    &agent_id,
+                    std::iter::once(options.message_metadata.as_ref()),
+                )
                 .await
             {
                 Some(section) => format!("{content}\n\n{section}"),
@@ -5114,7 +5122,7 @@ impl AgentManager {
         annotate_dequeue_wait(&mut next);
         // Delivery-time unblocked hints (monorepo#2044): resolved NOW, at
         // render time, from the trigger ids the wake stamped at enqueue.
-        annotate_unblocked_hints(&self.services, std::slice::from_mut(&mut next)).await;
+        annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut next)).await;
         // Drain-start signal (monorepo#1022): the entry just flipped to
         // in-flight; its `turnId` covers redrives that skip the user-row
         // append below. Emitted AFTER the stale-redrive annotation so the
@@ -5260,7 +5268,7 @@ impl AgentManager {
         annotate_dequeue_wait(&mut entry);
         // Delivery-time unblocked hints (monorepo#2044): parity with the
         // drain paths — resolved at render time.
-        annotate_unblocked_hints(&self.services, std::slice::from_mut(&mut entry)).await;
+        annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut entry)).await;
         // Publish the shrunk snapshot (write-through persist inside) so
         // clients see the entry leave the queue before the turn starts.
         self.services
@@ -8270,7 +8278,8 @@ async fn run_message_worker(
             annotate_dequeue_wait(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): resolved at
             // render time, same placement as the single-entry drain arm.
-            annotate_unblocked_hints(&mgr.services, std::slice::from_mut(&mut next)).await;
+            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
+                .await;
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
@@ -8477,7 +8486,8 @@ async fn run_message_worker(
             annotate_dequeue_wait(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): same contract
             // as the pre-release drain arm.
-            annotate_unblocked_hints(&mgr.services, std::slice::from_mut(&mut next)).await;
+            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
+                .await;
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
@@ -8660,7 +8670,7 @@ async fn prepare_flush_turn(
     // this batch coalesce into ONE fresh delta, appended to the last
     // trigger-carrying entry. Runs before the row persists (same placement
     // contract as the annotations above).
-    annotate_unblocked_hints(&mgr.services, &mut entries).await;
+    annotate_unblocked_hints(&mgr.services, agent_id, &mut entries).await;
     // Drain-start signal (monorepo#1022): one event for the combined turn,
     // keyed on the head entry (its `turn_id` IS the turn's id below).
     mgr.services

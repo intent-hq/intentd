@@ -2633,7 +2633,11 @@ impl Services {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        self.store.insert_agent_session(&session).await?;
+        let settings = self.effective_settings();
+        let task_graph_enabled = settings.agent_features.task_graph;
+        self.store
+            .insert_agent_session_with_task_graph(&session, task_graph_enabled)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
@@ -4100,7 +4104,10 @@ impl Services {
             && ready_delta::metadata_has_triggers(entry.message_metadata.as_ref())
         {
             if let Some(section) = self
-                .unblocked_section_for_delivery(std::iter::once(entry.message_metadata.as_ref()))
+                .unblocked_section_for_delivery(
+                    &agent_id,
+                    std::iter::once(entry.message_metadata.as_ref()),
+                )
                 .await
             {
                 entry.content = format!("{}\n\n{}", entry.content, section);
@@ -6017,19 +6024,28 @@ impl Services {
     /// (`None`) and the wake delivers unannotated.
     pub(crate) async fn unblocked_section_for_delivery<'a>(
         &self,
+        agent_id: &AgentId,
         metadatas: impl Iterator<Item = Option<&'a Value>>,
     ) -> Option<String> {
-        // `agentFeatures.taskGraph` gates the advisory section (docs/prompt
-        // teaching, intent-hq/monorepo#2445). Read LIVE like `stateSnapshot`
-        // — the section is computed at delivery time, so the toggle applies
-        // to the very next wake of every session; the wake itself still
-        // delivers, just unannotated.
-        if !self.effective_settings().agent_features.task_graph {
-            return None;
-        }
         let triggers = ready_delta::collect_trigger_tasks(metadatas);
         if triggers.is_empty() {
             return None;
+        }
+        match self
+            .store
+            .get_agent_session_task_graph_enabled(agent_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    %error,
+                    "taskGraph session snapshot unavailable; delivering wake without the section"
+                );
+                return None;
+            }
         }
         // Group trigger task ids per workspace (cross-workspace parents can
         // in principle coalesce wakes from several workspaces) and compute

@@ -3028,6 +3028,15 @@ fn test_provider() -> intent_providers::ProviderConfig {
 }
 
 async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    seed_agent_with_task_graph(mgr, ws, id, false).await;
+}
+
+async fn seed_agent_with_task_graph(
+    mgr: &AgentManager,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    task_graph_enabled: bool,
+) {
     let ts = now_iso();
     let workspace = Workspace {
         id: ws.clone(),
@@ -3121,7 +3130,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         .expect("insert ws");
     mgr.services
         .store
-        .insert_agent_session(&session)
+        .insert_agent_session_with_task_graph(&session, task_graph_enabled)
         .await
         .expect("insert session");
 }
@@ -11987,7 +11996,8 @@ mod unblocked_hints_tests {
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         let mgr = AgentManager::new(services, sink, 8);
         let ws = WorkspaceId::from("ws-unblocked");
-        seed_agent(&mgr, &ws, &AgentId::from("seed-unblocked")).await;
+        let parent = AgentId::from("seed-unblocked");
+        seed_agent_with_task_graph(&mgr, &ws, &parent, true).await;
         let services = &mgr.services;
         let a = seed_task(services, &ws, "Task A", "complete").await;
         let b = seed_task(services, &ws, "Task B", "complete").await;
@@ -12013,7 +12023,7 @@ mod unblocked_hints_tests {
         let plain = queued_msg("unrelated user message", &now_iso(), false);
 
         let mut entries = vec![wake_a, plain, wake_b];
-        super::super::annotate_unblocked_hints(services, &mut entries).await;
+        super::super::annotate_unblocked_hints(services, &parent, &mut entries).await;
 
         assert!(
             !entries[0].content.contains(UNBLOCKED_SECTION_PREFIX),
@@ -12048,7 +12058,8 @@ mod unblocked_hints_tests {
     async fn requeued_and_persisted_entries_are_not_reannotated() {
         let (_tmp, mgr) = manager().await;
         let ws = WorkspaceId::from("ws-unblocked-idem");
-        seed_agent(&mgr, &ws, &AgentId::from("seed-unblocked-idem")).await;
+        let parent = AgentId::from("seed-unblocked-idem");
+        seed_agent(&mgr, &ws, &parent).await;
         let services = &mgr.services;
         let a = seed_task(services, &ws, "Task A", "complete").await;
         let gated = seed_task(services, &ws, "Gated", "not_started").await;
@@ -12068,14 +12079,14 @@ mod unblocked_hints_tests {
         annotated.message_metadata = Some(md.clone());
         let before = annotated.content.clone();
         let mut entries = vec![annotated];
-        super::super::annotate_unblocked_hints(services, &mut entries).await;
+        super::super::annotate_unblocked_hints(services, &parent, &mut entries).await;
         assert_eq!(entries[0].content, before, "no double annotation");
 
         // Persisted rows stay byte-identical to the transcript.
         let mut persisted = queued_msg("wake", &now_iso(), true);
         persisted.message_metadata = Some(md);
         let mut entries = vec![persisted];
-        super::super::annotate_unblocked_hints(services, &mut entries).await;
+        super::super::annotate_unblocked_hints(services, &parent, &mut entries).await;
         assert_eq!(entries[0].content, "wake", "persisted rows never rewritten");
     }
 }
