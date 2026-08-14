@@ -4240,6 +4240,17 @@ impl AgentManager {
             outcome
         };
         if outcome == TryBeginOutcome::Started {
+            // A real turn is starting: if the workspace is Archived, flip it
+            // back to Active and emit the stamped §6.5 delta (auto-unarchive
+            // on agent activity). Runs BEFORE the activity/status emits so
+            // subscribers see the workspace Active by the time the turn's
+            // own events arrive. Best-effort: never blocks the turn. The
+            // enqueue paths (archived gates in `try_drain_queue` /
+            // `deliver_wake_message`) are untouched — only a claimed slot
+            // triggers this.
+            self.services
+                .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                .await;
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(

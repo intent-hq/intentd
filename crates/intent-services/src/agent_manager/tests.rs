@@ -1799,6 +1799,82 @@ async fn losing_try_begin_leaves_the_running_turns_slot_intact() {
     assert_eq!(live.message_id, "msg-running");
 }
 
+/// A winning `try_begin` in an ARCHIVED workspace auto-unarchives it: the
+/// row flips to Active and the §6.5 `workspace:updated` delta carries the
+/// additive `autoUnarchive` stamp naming the triggering agent. The claim
+/// itself still succeeds — the unarchive is a side effect of the turn
+/// start, never a gate on it.
+#[tokio::test]
+async fn winning_try_begin_auto_unarchives_the_workspace() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-auto-unarchive");
+    let id = AgentId::from("a-auto-unarchive");
+    seed_agent(&mgr, &ws, &id).await;
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.status = WorkspaceStatus::Archived;
+    row.archived = true;
+    row.archived_at = Some(now_iso());
+    mgr.services
+        .store
+        .update_workspace(&row)
+        .await
+        .expect("archive row");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "the claim wins despite the archived workspace"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert!(!after.archived, "turn start flipped the row to Active");
+    assert_eq!(after.status, WorkspaceStatus::Active);
+    assert!(after.archived_at.is_none());
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let delta = events
+        .iter()
+        .find(|e| e.event_type == "workspace:updated")
+        .expect("auto-unarchive published workspace:updated");
+    assert_eq!(
+        delta.data["changes"],
+        json!({
+            "archived": false,
+            "status": "Active",
+            "archivedAt": null,
+            "autoUnarchive": {
+                "reason": "agent_activity",
+                "agentId": id.0,
+                "agentName": "Builder",
+            },
+        }),
+        "stamped §6.5 delta"
+    );
+
+    mgr.end_turn(&id).await;
+}
+
+/// A winning `try_begin` whose workspace row is MISSING (unarchivable) must
+/// still start the turn — the auto-unarchive is best-effort and never
+/// blocks or fails the claim.
+#[tokio::test]
+async fn winning_try_begin_survives_auto_unarchive_failure() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-missing-row");
+    let id = AgentId::from("a-orphan-turn");
+    // No workspace/session rows seeded: the workspace read inside the
+    // auto-unarchive fails, and the claim must still succeed.
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "a failed auto-unarchive must not block the turn"
+    );
+    assert!(mgr.is_busy(&id), "the slot is held");
+    mgr.end_turn(&id).await;
+}
+
 #[tokio::test]
 async fn reap_idle_older_than_skips_in_flight_agents() {
     let (_tmp, mgr) = manager().await;
