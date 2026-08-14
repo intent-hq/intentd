@@ -5953,9 +5953,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // First turn is slow to open a deterministic window where the second send
     // (carrying messageMetadata) lands on a busy agent and queues.
     let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the queueInfo assertions
+        // exercise the stamp without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -6101,6 +6105,147 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     assert_eq!(
         tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
         "drained user block must fold the same messageMetadata: {tagged}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production-default threshold gate (monorepo#2353): with NO env override, a
+// queued entry that waited only ~2s (below the 5s threshold) drains WITHOUT
+// the dequeue-wait [SYSTEM NOTE] and WITHOUT the queueInfo metadata stamp —
+// the sub-threshold hop reads exactly like an immediate delivery (PROTOCOL
+// §5.5), while caller-supplied messageMetadata still persists verbatim.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
+    let Some(script) = gate("WSS sub-threshold dequeue-wait E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // 2s busy window < 5s threshold; INTENTD_DEQUEUE_WAIT_MIN_MS deliberately
+    // NOT set — this test exercises the production default.
+    let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // First send — the agent goes busy for 2000ms.
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first message" }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+    sleep(Duration::from_millis(200)).await;
+
+    // Second send while busy — queues, waits ~2s, drains sub-threshold.
+    let metadata = json!({ "type": "event_notification" });
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "sub-threshold queued message",
+            "messageMetadata": metadata,
+        }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+
+    // Wait for both turns to finish (first send + drained queued send).
+    let mut stream_end_count = 0;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            stream_end_count += 1;
+            if stream_end_count >= 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(stream_end_count, 2, "both turns must complete");
+
+    let convo = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let drained = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("sub-threshold queued message"))
+        })
+        .expect("drained user message row present");
+    // No dequeue-wait system note on the persisted content.
+    let text = drained["contentBlocks"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("This message was queued at"),
+        "sub-threshold drain must not carry the dequeue-wait note: {drained}"
+    );
+    // No queueInfo stamp — neither on the row metadata nor the in-block fold.
+    assert!(
+        drained["metadata"]["queueInfo"].is_null(),
+        "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
+    );
+    assert!(
+        drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
+        "sub-threshold drain must not fold queueInfo into the block: {drained}"
+    );
+    // Caller-supplied messageMetadata still persists verbatim.
+    assert_eq!(
+        drained["metadata"]["type"], "event_notification",
+        "caller messageMetadata must persist unchanged: {drained}"
     );
 }
 
@@ -8766,9 +8911,13 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the wait-note assertions
+        // exercise the annotation without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
