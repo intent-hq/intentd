@@ -616,6 +616,144 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(mc >= 1, "assistant message persisted (messageCount={mc})");
 }
 
+/// Abnormal finish reason (PROTOCOL §7): a turn resolving with a
+/// non-`end_turn` stop reason (`refusal` here) durably tags the assistant row
+/// with `metadata.finishReason` — visible on the `agent.getConversation`
+/// transcript after the turn — and the terminal `agent:stream:end` carries
+/// the same `finishReason` live. The turn stays a completion: `agent:idle`
+/// fires (carrying its existing `finishReason` lifecycle field) and
+/// `agent:failed` never does.
+#[tokio::test]
+async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
+    let Some(script) = gate("WSS abnormal finishReason E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "refusing to continue",
+        "stopReason": "refusal",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "do something" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Terminal surface: stream:end carries finishReason, agent:idle follows,
+    // agent:failed never fires — an abnormal stop reason is a completion.
+    let mut end_frame: Option<Value> = None;
+    let mut idle_frame: Option<Value> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:stream:end") => {
+                end_frame = Some(event.clone());
+            }
+            Some("agent:idle") => {
+                idle_frame = Some(event.clone());
+                break;
+            }
+            Some("agent:failed") => {
+                panic!("agent:failed emitted for an abnormal (refusal) completion: {frame}");
+            }
+            _ => {}
+        }
+    }
+    let end = end_frame.expect("terminal agent:stream:end observed");
+    assert_eq!(
+        end["data"]["finishReason"].as_str(),
+        Some("refusal"),
+        "terminal stream:end carries the abnormal finishReason: {end}"
+    );
+    let message_id = end["data"]["messageId"]
+        .as_str()
+        .expect("stream:end carries the persisted messageId")
+        .to_string();
+    let idle = idle_frame.expect("agent:idle observed");
+    assert_eq!(
+        idle["data"]["finishReason"].as_str(),
+        Some("refusal"),
+        "agent:idle lifecycle finishReason: {idle}"
+    );
+
+    // Durable half: the transcript row carries metadata.finishReason so a
+    // reloading client can render the ending without having seen the event.
+    let convo = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let assistant = messages
+        .iter()
+        .find(|m| m["id"] == json!(message_id))
+        .expect("assistant row from the turn present in the transcript");
+    assert_eq!(assistant["role"], json!("assistant"));
+    assert_eq!(
+        assistant["metadata"]["finishReason"].as_str(),
+        Some("refusal"),
+        "assistant row durably tagged with the abnormal finishReason: {assistant}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
