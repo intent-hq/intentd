@@ -11279,7 +11279,7 @@ mod pr {
         std::fs::remove_dir_all(&gone_dir).unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -11306,7 +11306,7 @@ mod pr {
 
         // Re-sweeping is idempotent: the tracked submodule is not re-upserted
         // (no `gitRoot:registered`/`gitRoot:updated` churn).
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
         let registered = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:registered", 10)
@@ -11361,7 +11361,7 @@ mod pr {
             .unwrap();
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
 
         let a = svc
             .store()
@@ -11398,7 +11398,7 @@ mod pr {
             repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
                 .unwrap();
         }
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
         let a = svc
             .store()
             .get_workspace_git_root(&root_a.id)
@@ -11415,6 +11415,35 @@ mod pr {
             .await
             .unwrap();
         assert_eq!(updated.len(), 1, "no re-stamp churn");
+    }
+
+    /// The sweep's local steps run without a SourceControl provider: the
+    /// commit-sha backfill still stamps a NULL row when `sc` is `None`
+    /// (unconfigured credentials must not strand pre-migration rows).
+    #[tokio::test]
+    async fn sweep_backfill_runs_without_source_control() {
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        let with_head = SweepRepo::init("main", None);
+        let head_sha = sweep_commit(&with_head.dir);
+        let root = sweep_root(&ws.id, &with_head.dir, None);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        svc.sweep_workspace_git_roots(&ws, None).await;
+
+        let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
+        assert_eq!(
+            stamped.registered_commit_sha.as_deref(),
+            Some(head_sha.as_str()),
+            "backfill must not require a forge provider"
+        );
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "one backfill stamp event");
     }
 
     /// The sweep's submodule auto-detect stamps the submodule's HEAD on the
@@ -11434,7 +11463,7 @@ mod pr {
 
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "{roots:?}");
@@ -11479,7 +11508,7 @@ mod pr {
         );
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -11511,7 +11540,7 @@ mod pr {
             discover: true,
             ..Default::default()
         });
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1);
@@ -11535,7 +11564,7 @@ mod pr {
         assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
 
         // Identical forge state on the next sweep: no new event.
-        svc.sweep_workspace_git_roots(&ws, &sc).await;
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
         let updated = svc
             .store()
             .events_by_type(&ws.id, "gitRoot:updated", 10)

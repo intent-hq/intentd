@@ -2708,10 +2708,15 @@ impl Services {
     /// the sweep, so a bad root never fails the workspace refresh. Each
     /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// like the workspace refresh itself.
+    ///
+    /// `sc` is `None` when no SourceControl provider is configured: steps
+    /// 1–3 are pure git/store work and still run (so submodule detection,
+    /// pruning, and the commit-sha backfill don't require forge
+    /// credentials); only the per-root PR refresh (step 4) is skipped.
     async fn sweep_workspace_git_roots(
         &self,
         ws: &Workspace,
-        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+        sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
     ) {
         if ws.is_remote || ws.archived {
             return;
@@ -2871,6 +2876,11 @@ impl Services {
                     }
                 }
             }
+            // Step 4 (PR refresh) needs a forge; without one the sweep's
+            // local steps above have already done their work.
+            let Some(sc) = sc else {
+                continue;
+            };
             let root_id = root.id.clone();
             let refreshed = match tokio::time::timeout(
                 self.pr_refresh_fetch_timeout,
@@ -3279,11 +3289,14 @@ impl Services {
         if workspaces.is_empty() {
             return;
         }
+        // An unavailable provider (no credentials / gh setup) skips only the
+        // forge-touching work; the git-root sweep's local steps (submodule
+        // auto-detect, prune, commit-sha backfill) still run below.
         let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
-            Ok(sc) => sc,
+            Ok(sc) => Some(sc),
             Err(e) => {
-                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping sweep");
-                return;
+                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping PR refresh");
+                None
             }
         };
         for ws in workspaces {
@@ -3295,29 +3308,31 @@ impl Services {
             // timeouts: a refresh that pends indefinitely maps to the same
             // log-and-continue path as any other per-workspace error instead
             // of wedging the sweep for every other workspace.
-            let refreshed = match tokio::time::timeout(
-                self.pr_refresh_fetch_timeout,
-                self.refresh_workspace_pr_with_sc(ws.clone(), &sc),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Error::Internal(format!(
-                    "PR refresh timed out after {:?}",
-                    self.pr_refresh_fetch_timeout
-                ))),
-            };
-            if let Err(e) = refreshed {
-                tracing::warn!(
-                    workspace = %ws_id.as_str(),
-                    error = %e,
-                    "pr refresh: workspace refresh failed"
-                );
+            if let Some(sc) = &sc {
+                let refreshed = match tokio::time::timeout(
+                    self.pr_refresh_fetch_timeout,
+                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Internal(format!(
+                        "PR refresh timed out after {:?}",
+                        self.pr_refresh_fetch_timeout
+                    ))),
+                };
+                if let Err(e) = refreshed {
+                    tracing::warn!(
+                        workspace = %ws_id.as_str(),
+                        error = %e,
+                        "pr refresh: workspace refresh failed"
+                    );
+                }
             }
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(&ws, &sc).await;
+            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
