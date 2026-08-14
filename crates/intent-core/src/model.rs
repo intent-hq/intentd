@@ -1678,6 +1678,18 @@ pub struct WorkspaceTask {
     pub title: String,
     pub status: TaskStatus,
     pub updated_at: String,
+    /// True iff this task's id appears in the spec note body as an
+    /// `intent://local/task/{id}` link. Additive field, always serialized
+    /// (`false` for every row when the spec has no links); not conditioned
+    /// on `parent_id`.
+    #[serde(default)]
+    pub spec_linked: bool,
+    /// Backing note's parent pointer, so clients can distinguish subtasks
+    /// (parent is another task) from top-level tasks (parent is the spec or
+    /// absent) and reconstruct the hierarchy from `task.list` alone.
+    /// Additive; omitted when the note has no parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NoteId>,
     /// Task relations (empty and omitted for tasks without them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<NoteId>,
@@ -1690,9 +1702,11 @@ pub struct WorkspaceTask {
 
 /// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
 /// the optional `status` filter) **and** the workspace-wide `taskStats`
-/// aggregate (always computed over the unfiltered spec-linked set, mirroring
-/// the canonical FE `computeTaskStats` in `task-stats.ts`). Lets the FE render
-/// the progress rollup verbatim instead of re-deriving it from `note.list`.
+/// aggregate. `tasks` membership is workspace-wide — every task note except
+/// the spec itself, each flagged with `specLinked` — while `stats` stays the
+/// spec-linked direct-child rollup (mirrors the canonical FE
+/// `computeTaskStats` in `task-stats.ts`). Lets the FE render the progress
+/// rollup verbatim instead of re-deriving it from `note.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskListResult {
