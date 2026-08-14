@@ -1158,8 +1158,12 @@ fn task_note_value(note: Note, linked: &HashSet<String>) -> Option<Value> {
 
 /// Read the spec note's `intent://local/task/{id}` link set for `specLinked`
 /// stamping — ONE bounded `get_note("spec")` per delta (the snapshot reuses
-/// its own `list_notes` read instead). A missing/unreadable spec degrades to
-/// the empty set (every row `specLinked: false`), matching `task.list`.
+/// its own `list_notes` read instead). A missing spec degrades to the empty
+/// set (every row `specLinked: false`), matching `task.list`. Unlike
+/// `task_get` (which propagates non-NotFound store errors), a TRANSIENT read
+/// error also degrades to the empty set here: dropping the delta would lose
+/// the row change itself, which is worse than a conservatively-false flag
+/// that self-corrects on the task's next event.
 async fn spec_linked_ids(api: &dyn WorkspaceApi, workspace_id: &WorkspaceId) -> HashSet<String> {
     match api
         .get_note(workspace_id.clone(), NoteId::from("spec"))
