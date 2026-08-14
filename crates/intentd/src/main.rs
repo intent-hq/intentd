@@ -2230,12 +2230,20 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
             // Snapshot of registered agent root pids, taken alongside the
             // process-table refresh so the buckets describe the same instant
-            // as the tree they partition.
-            let agent_roots: HashMap<sysinfo::Pid, AgentId> = manager
-                .agent_root_pids()
-                .into_iter()
-                .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
-                .collect();
+            // as the tree they partition. Burst (peak-only) sweeps skip it:
+            // `observe_burst` consumes only the aggregate bytes, so paying
+            // the handles lock + per-descendant bucketing at sub-second
+            // cadence would buy nothing — an empty map keeps the walk on
+            // its aggregate-only fast path.
+            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
+                manager
+                    .agent_root_pids()
+                    .into_iter()
+                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
             let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
             if publish {
                 task_usage.store(count, bytes, agent_bytes);
