@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.18] - 2026-08-14
+
+### 🚀 Features
+
+- *(agents)* Persist abnormal finishReason on the turn's assistant row ([#1211](https://github.com/intent-hq/intentd/pull/1211))
+- Widen task.list to all workspace task notes, add specLinked to WorkspaceTask ([#1214](https://github.com/intent-hq/intentd/pull/1214))
+- Auto-unarchive workspace on agent turn start ([#1216](https://github.com/intent-hq/intentd/pull/1216))
+
+### 🐛 Bug Fixes
+
+- Threshold-gate dequeue-wait annotation at 5s ([#1212](https://github.com/intent-hq/intentd/pull/1212))
+
+### 🧪 Testing
+
+- Regression coverage for nested repos/worktrees under untracked parent dirs in transfer WIP snapshot ([#1210](https://github.com/intent-hq/intentd/pull/1210))
+
+
 ## [0.6.17] - 2026-08-14
 
 ### 🚀 Features
