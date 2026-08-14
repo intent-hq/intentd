@@ -14861,74 +14861,11 @@ impl WorkspaceApi for Services {
     }
 
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         let this = self.clone();
-        let manager = self.agent_manager();
-        Box::pin(async move {
-            if id.is_chief() {
-                return Ok(chief_workspace());
-            }
-            let mut ws = store.get_workspace(&id).await?;
-            ws.status = WorkspaceStatus::Active;
-            ws.archived = false;
-            ws.archived_at = None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
-            // Re-engage queues parked by the archived gates
-            // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
-            // background agent's drain organically, so without this a queue
-            // parked during archive — including the hook-cancel wake notices
-            // — would stay stranded until someone happened to message the
-            // agent. Kick the drain for every workspace agent with
-            // ready-to-send work (cheap summary read, no message hydration);
-            // `try_drain_queue` re-checks its own gates (busy, question
-            // hold, Error park). Best-effort: a listing failure is logged
-            // and unarchive still succeeds — parked queues then drain on the
-            // next explicit kick.
-            if let Some(manager) = manager {
-                match store.list_agent_session_summaries(&id).await {
-                    Ok(sessions) => {
-                        for session in sessions {
-                            if this.has_ready_to_send(&session.id) {
-                                manager
-                                    .clone()
-                                    .try_drain_queue(session.id, id.clone())
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        workspace = %id.as_str(),
-                        error = %e,
-                        "unarchive: agent session listing failed; parked queues drain on next kick"
-                    ),
-                }
-            }
-            // Derive `lastActivity` (§9.1) and persist it through the scoped
-            // monotonic write (monorepo#1585).
-            this.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
-                .await;
-            // Derive `activity` from live agent state (§9.9) so the mutation
-            // response carries `agent_running` when agents are in-flight,
-            // not the stale default `idle` from the persisted row.
-            ws.activity = this.workspace_activity(&ws.id);
-            // Full applied delta with an explicit JSON `null` for `archivedAt`
-            // so clients clear the field instead of keeping the stale value.
-            publish_event(
-                &bus,
-                workspace_updated_event(
-                    &ws.id,
-                    serde_json::json!({
-                        "archived": false,
-                        "status": ws.status,
-                        "archivedAt": serde_json::Value::Null,
-                    }),
-                ),
-            )
-            .await;
-            Ok(ws)
-        })
+        // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
+        // no `autoUnarchive` stamp on the emitted delta (absent ≠
+        // present-false, PROTOCOL §6.5).
+        Box::pin(async move { this.unarchive_workspace_inner(id, None).await })
     }
 
     fn duplicate_workspace(
@@ -23722,6 +23659,161 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
                 .await
+        })
+    }
+}
+
+/// Workspace unarchive plumbing shared by the manual RPCs
+/// (`workspace.unarchive` / `workspace.restore`) and the turn-start
+/// auto-unarchive (monorepo — auto-unarchive on agent activity).
+impl Services {
+    /// Flip an archived workspace back to Active: persist the row, kick the
+    /// drains parked by the archived gates, derive `lastActivity`/`activity`,
+    /// and publish ONE `workspace:updated` delta. `auto_unarchive` — set only
+    /// on the turn-start trigger — is embedded additively in the delta's
+    /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
+    /// callers pass `None` and the field is absent (PROTOCOL §6.5).
+    async fn unarchive_workspace_inner(
+        &self,
+        id: WorkspaceId,
+        auto_unarchive: Option<serde_json::Value>,
+    ) -> Result<Workspace> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let manager = self.agent_manager();
+        if id.is_chief() {
+            return Ok(chief_workspace());
+        }
+        let mut ws = store.get_workspace(&id).await?;
+        ws.status = WorkspaceStatus::Active;
+        ws.archived = false;
+        ws.archived_at = None;
+        ws.updated_at = now_iso();
+        store.update_workspace(&ws).await?;
+        // Re-engage queues parked by the archived gates
+        // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
+        // background agent's drain organically, so without this a queue
+        // parked during archive — including the hook-cancel wake notices
+        // — would stay stranded until someone happened to message the
+        // agent. Kick the drain for every workspace agent with
+        // ready-to-send work (cheap summary read, no message hydration);
+        // `try_drain_queue` re-checks its own gates (busy, question
+        // hold, Error park). Best-effort: a listing failure is logged
+        // and unarchive still succeeds — parked queues then drain on the
+        // next explicit kick.
+        if let Some(manager) = manager {
+            match store.list_agent_session_summaries(&id).await {
+                Ok(sessions) => {
+                    for session in sessions {
+                        if self.has_ready_to_send(&session.id) {
+                            manager
+                                .clone()
+                                .try_drain_queue(session.id, id.clone())
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "unarchive: agent session listing failed; parked queues drain on next kick"
+                ),
+            }
+        }
+        // Derive `lastActivity` (§9.1) and persist it through the scoped
+        // monotonic write (monorepo#1585).
+        self.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
+            .await;
+        // Derive `activity` from live agent state (§9.9) so the mutation
+        // response carries `agent_running` when agents are in-flight,
+        // not the stale default `idle` from the persisted row.
+        ws.activity = self.workspace_activity(&ws.id);
+        // Full applied delta with an explicit JSON `null` for `archivedAt`
+        // so clients clear the field instead of keeping the stale value.
+        let mut changes = serde_json::json!({
+            "archived": false,
+            "status": ws.status,
+            "archivedAt": serde_json::Value::Null,
+        });
+        if let Some(stamp) = auto_unarchive {
+            changes["autoUnarchive"] = stamp;
+        }
+        publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+        Ok(ws)
+    }
+
+    /// Best-effort auto-unarchive at the turn-start choke point
+    /// ([`crate::agent_manager::AgentManager::try_begin`]'s `Started`
+    /// branch): when a real turn begins in an Archived workspace, flip it
+    /// back to Active and emit the §6.5 `workspace:updated` delta stamped
+    /// `autoUnarchive: { reason: "agent_activity", agentId, agentName }`.
+    ///
+    /// Non-archived workspaces cost one point read (`archived` is part of
+    /// the workspace row already fetched by callers of the send path, but
+    /// this helper re-reads to stay self-contained at the choke point) and
+    /// nothing else. Chief is virtual and never archived, so it is skipped
+    /// without a read. NEVER fails the turn: every error is logged as a
+    /// warning and swallowed — a workspace stuck Archived is strictly
+    /// better than a lost turn, and the archived drain gates keep parking
+    /// follow-on wakes until a later trigger succeeds.
+    ///
+    /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
+    /// type cycle: this helper is awaited inside `try_begin`, and the
+    /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
+    /// the row is Active by then, so the re-entrant read short-circuits —
+    /// but the inferred future type would be infinite).
+    pub(crate) fn auto_unarchive_on_turn_start<'a>(
+        &'a self,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if workspace_id.is_chief() {
+                return;
+            }
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => {}
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
+                    );
+                    return;
+                }
+            }
+            // Name lookup is display-only: a lookup failure (or a session
+            // with no row yet) degrades to `null`, never blocks the
+            // unarchive.
+            let agent_name = self
+                .store
+                .get_agent_session_name(agent_id)
+                .await
+                .ok()
+                .flatten();
+            let stamp = serde_json::json!({
+                "reason": "agent_activity",
+                "agentId": agent_id,
+                "agentName": agent_name,
+            });
+            match self
+                .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %agent_id,
+                    "auto-unarchived workspace on agent turn start"
+                ),
+                Err(e) => tracing::warn!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %agent_id,
+                    error = %e,
+                    "auto-unarchive failed; turn proceeds in archived workspace"
+                ),
+            }
         })
     }
 }

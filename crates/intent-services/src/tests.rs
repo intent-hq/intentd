@@ -6515,6 +6515,175 @@ mod change_event_parity {
         );
     }
 
+    /// Minimal agent session row for the auto-unarchive stamp tests.
+    fn auto_unarchive_session(agent_id: &AgentId, ws: &WorkspaceId, name: &str) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: name.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        }
+    }
+
+    /// A turn starting in an Archived workspace auto-unarchives it: the row
+    /// flips to Active and ONE `workspace:updated` delta fires carrying the
+    /// additive `autoUnarchive: { reason: "agent_activity", agentId,
+    /// agentName }` stamp alongside the standard unarchive delta fields
+    /// (§6.5). Manual unarchive coverage (no stamp) is the exact-equality
+    /// assertion in `unarchive_workspace_emits_workspace_updated_once`.
+    #[tokio::test]
+    async fn auto_unarchive_on_turn_start_emits_stamped_delta() {
+        use intent_core::WorkspaceStatus;
+        let h = harness().await;
+        let mut ws = workspace(&h.ws);
+        ws.status = WorkspaceStatus::Archived;
+        ws.archived = true;
+        ws.archived_at = Some(intent_core::now_iso());
+        h.store.update_workspace(&ws).await.expect("archive row");
+        let agent_id = AgentId::from("agent-auto-unarchive");
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("insert session");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": false,
+                    "status": "Active",
+                    "archivedAt": null,
+                    "autoUnarchive": {
+                        "reason": "agent_activity",
+                        "agentId": agent_id.0,
+                        "agentName": "Builder",
+                    },
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "auto-unarchive must publish exactly one event, got extra: {quiet:?}"
+        );
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(!row.archived, "row flipped to Active");
+        assert_eq!(row.status, WorkspaceStatus::Active);
+        assert!(row.archived_at.is_none(), "archivedAt cleared");
+    }
+
+    /// A turn starting in a NON-archived workspace is a no-op: no event, no
+    /// row write — the turn-start hot path costs one point read only.
+    #[tokio::test]
+    async fn auto_unarchive_noop_when_workspace_active() {
+        let h = harness().await;
+        let agent_id = AgentId::from("agent-noop");
+        let before = h.store.get_workspace(&h.ws).await.expect("row");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "active workspace must emit nothing, got: {quiet:?}"
+        );
+        let after = h.store.get_workspace(&h.ws).await.expect("row");
+        assert_eq!(
+            before.updated_at, after.updated_at,
+            "no row write on the active-workspace path"
+        );
+    }
+
+    /// Best-effort contract: a workspace read failure (missing row) must
+    /// return cleanly — no panic, no event — so the turn proceeds.
+    #[tokio::test]
+    async fn auto_unarchive_swallows_workspace_read_failure() {
+        let h = harness().await;
+        let agent_id = AgentId::from("agent-fail");
+        let missing = WorkspaceId::from("ws-does-not-exist");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&missing, &agent_id)
+            .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "failed read must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The agent-name lookup is display-only: an archived workspace whose
+    /// triggering agent has no session row still unarchives, with
+    /// `agentName: null` in the stamp.
+    #[tokio::test]
+    async fn auto_unarchive_stamps_null_name_when_session_missing() {
+        use intent_core::WorkspaceStatus;
+        let h = harness().await;
+        let mut ws = workspace(&h.ws);
+        ws.status = WorkspaceStatus::Archived;
+        ws.archived = true;
+        ws.archived_at = Some(intent_core::now_iso());
+        h.store.update_workspace(&ws).await.expect("archive row");
+        let agent_id = AgentId::from("agent-no-row");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"]["autoUnarchive"],
+            json!({
+                "reason": "agent_activity",
+                "agentId": agent_id.0,
+                "agentName": null,
+            })
+        );
+    }
+
     /// `update_workspace` normalises the delta snapshot published as
     /// `workspace:updated { changes }` (§6.5) so subscribers can mirror the
     /// applied delta without a follow-up read: a raw `baseRef: "origin/main"`
