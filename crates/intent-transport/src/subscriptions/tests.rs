@@ -1211,19 +1211,33 @@ mod task_delta_re_read {
         TaskMetadata, WorkspaceApi, WorkspaceId,
     };
 
-    /// Minimal `WorkspaceApi` that returns a pre-canned [`Note`] from `get_note`
-    /// (or `NotFound` when the fixture is `None`). Everything else falls
+    /// Minimal `WorkspaceApi` that serves pre-canned [`Note`]s from `get_note`
+    /// by id — `spec` for the spec fixture, anything else for the task-note
+    /// fixture (`NotFound` when the fixture is `None`). Everything else falls
     /// through to the trait defaults, which is fine because `task_delta` only
     /// touches `get_note`.
-    struct StaticNoteApi(Option<Note>);
+    struct StaticNoteApi {
+        note: Option<Note>,
+        spec: Option<Note>,
+    }
+
+    impl StaticNoteApi {
+        fn new(note: Option<Note>) -> Self {
+            Self { note, spec: None }
+        }
+    }
 
     impl WorkspaceApi for StaticNoteApi {
         fn get_note(
             &self,
             _workspace_id: WorkspaceId,
-            _note_id: NoteId,
+            note_id: NoteId,
         ) -> BoxFuture<'_, Result<Note>> {
-            let note = self.0.clone();
+            let note = if note_id.as_str() == "spec" {
+                self.spec.clone()
+            } else {
+                self.note.clone()
+            };
             Box::pin(async move { note.ok_or_else(|| Error::NotFound("note".to_string())) })
         }
     }
@@ -1252,6 +1266,14 @@ mod task_delta_re_read {
         }
     }
 
+    fn spec_note(content: &str) -> Note {
+        Note {
+            id: NoteId::from("spec"),
+            content: content.to_string(),
+            ..note_with(None)
+        }
+    }
+
     fn note_event(event_type: &str, note_id: &str) -> Event {
         Event {
             id: "evt-1".into(),
@@ -1274,7 +1296,7 @@ mod task_delta_re_read {
     async fn note_updated_emits_removed_ids_when_task_was_demoted() {
         // The re-read note no longer projects a task → the delta must remove it
         // from every subscribed task list.
-        let api = StaticNoteApi(Some(note_with(None)));
+        let api = StaticNoteApi::new(Some(note_with(None)));
         let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"))
             .await
             .expect("delta must be emitted for demotion");
@@ -1288,7 +1310,7 @@ mod task_delta_re_read {
         // The `task:status-changed` arm shares the re-read path with
         // `note:updated`; a demotion that races a status event must still be
         // reported as a removal, not silently dropped.
-        let api = StaticNoteApi(Some(note_with(None)));
+        let api = StaticNoteApi::new(Some(note_with(None)));
         let d = task_delta(&api, &ws(), &note_event(TASK_STATUS_CHANGED, "n-1"))
             .await
             .expect("delta must be emitted");
@@ -1298,13 +1320,39 @@ mod task_delta_re_read {
     #[tokio::test]
     async fn note_updated_still_emits_updated_when_task_present() {
         // Regression guard: the removal path must not swallow legitimate
-        // `updated` deltas when the note is still a task.
-        let api = StaticNoteApi(Some(note_with(Some(TaskMetadata::default()))));
+        // `updated` deltas when the note is still a task. With no spec note
+        // readable, `specLinked` degrades to false (matching `task.list`).
+        let api = StaticNoteApi::new(Some(note_with(Some(TaskMetadata::default()))));
         let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"))
             .await
             .expect("delta must be emitted");
         assert_eq!(d["updated"][0]["id"], "n-1");
+        assert_eq!(d["updated"][0]["specLinked"], false);
         assert!(d.get("removedIds").is_none());
+    }
+
+    #[tokio::test]
+    async fn updated_row_carries_spec_linked_true_when_spec_links_the_task() {
+        // `specLinked` semantics match `task.list` (§5.4): true iff the task
+        // id appears in the spec body's `intent://local/task/{id}` links.
+        let mut api = StaticNoteApi::new(Some(note_with(Some(TaskMetadata::default()))));
+        api.spec = Some(spec_note("- [ ] [T](intent://local/task/n-1)"));
+        let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"))
+            .await
+            .expect("delta must be emitted");
+        assert_eq!(d["updated"][0]["specLinked"], true, "delta: {d}");
+    }
+
+    #[tokio::test]
+    async fn added_row_carries_spec_linked_flag() {
+        // The `note:created` arm stamps the flag too — false when the spec
+        // links a different task.
+        let mut api = StaticNoteApi::new(Some(note_with(Some(TaskMetadata::default()))));
+        api.spec = Some(spec_note("- [ ] [Other](intent://local/task/n-2)"));
+        let d = task_delta(&api, &ws(), &note_event(NOTE_CREATED, "n-1"))
+            .await
+            .expect("delta must be emitted");
+        assert_eq!(d["added"][0]["specLinked"], false, "delta: {d}");
     }
 }
 

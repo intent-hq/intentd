@@ -3039,6 +3039,144 @@ async fn task_set_relations_round_trip_and_cycle_rejection_over_wss() {
     );
 }
 
+/// End-to-end `task.subscribe` `specLinked` enrichment over WSS: the seq-0
+/// snapshot rows and the delta `added`/`updated` rows carry the additive
+/// `specLinked` flag with the same semantics as `task.list` (§5.4) — true iff
+/// the task id appears in the spec body's `intent://local/task/{id}` links —
+/// so a live task update no longer drops the flag until the next `task.list`
+/// refetch. Cost contract: the snapshot derives the flag from its own
+/// `note.list` read; each delta adds exactly ONE bounded spec-note read.
+#[tokio::test]
+async fn task_subscribe_snapshot_and_deltas_carry_spec_linked_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "SpecLinked", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // One linked task, authored before subscribing: create + markAsTask, then
+    // link it from the spec body.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Linked", "content": "body" }),
+    )
+    .await;
+    let linked_id = created["note"]["id"].as_str().expect("note id").to_string();
+    wss_rpc(
+        &mut rpc,
+        3,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": linked_id, "status": "not_started" }),
+    )
+    .await;
+    wss_rpc(
+        &mut rpc,
+        4,
+        "note.setContent",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": "spec",
+            "content": format!("- [ ] [Linked](intent://local/task/{linked_id})"),
+            "confirmReplacement": true,
+        }),
+    )
+    .await;
+
+    // Snapshot (seq 0): the linked task's row carries `specLinked: true`.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "task.subscribe",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    let row = snap
+        .iter()
+        .find(|t| t["id"] == json!(linked_id))
+        .expect("linked task in snapshot");
+    assert_eq!(row["specLinked"], true, "snapshot row: {row}");
+
+    // A second task, unlinked from the spec body: its markAsTask promotion
+    // lands as an `updated` delta carrying `specLinked: false`.
+    let created = wss_rpc(
+        &mut rpc,
+        5,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Unlinked", "content": "body" }),
+    )
+    .await;
+    let unlinked_id = created["note"]["id"].as_str().expect("note id").to_string();
+    wss_rpc(
+        &mut rpc,
+        6,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": unlinked_id, "status": "not_started" }),
+    )
+    .await;
+    let unlinked_row = 'outer: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        assert_eq!(push["kind"], json!("delta"), "push: {push}");
+        for key in ["added", "updated"] {
+            if let Some(rows) = push["delta"][key].as_array() {
+                for entry in rows {
+                    if entry["id"] == json!(unlinked_id) {
+                        break 'outer entry.clone();
+                    }
+                }
+            }
+        }
+    };
+    assert_eq!(
+        unlinked_row["specLinked"], false,
+        "unlinked delta row: {unlinked_row}"
+    );
+
+    // A status update on the linked task keeps the flag live on the `updated`
+    // delta — the gap this enrichment closes.
+    wss_rpc(
+        &mut rpc,
+        7,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": linked_id, "status": "in_progress" }),
+    )
+    .await;
+    let linked_row = 'outer: loop {
+        let push = next_subscription_push(&mut sub, 10).await;
+        if let Some(rows) = push["delta"]["updated"].as_array() {
+            for entry in rows {
+                if entry["id"] == json!(linked_id) {
+                    break 'outer entry.clone();
+                }
+            }
+        }
+    };
+    assert_eq!(
+        linked_row["metadata"]["task"]["status"], "in_progress",
+        "row: {linked_row}"
+    );
+    assert_eq!(
+        linked_row["specLinked"], true,
+        "linked delta row: {linked_row}"
+    );
+}
+
 /// End-to-end readiness-over-dependsOn (PROTOCOL.md §5.4/§6.5; spec §2.2,
 /// monorepo#1974) over WSS: a task with `dependsOn` edges onto two
 /// sibling-subtree tasks stays out of `task:ready-tasks-changed`'s

@@ -18,7 +18,9 @@ use intent_core::events::{
     WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
-use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    extract_spec_task_ids, now_iso, AgentId, Event, Note, NoteId, WorkspaceApi, WorkspaceId,
+};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -380,13 +382,24 @@ pub(crate) async fn channel_snapshot(
             Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| empty()),
             Err(_) => empty(),
         },
+        // Task snapshot rows are note-shaped entities enriched with the
+        // additive `specLinked` flag (same semantics as `task.list`, §5.4):
+        // true iff the task id appears in the spec body's
+        // `intent://local/task/{id}` links. The spec content comes from the
+        // SAME `list_notes` read — no extra query (O(rows) cost contract).
         Channel::Task => match api.list_notes(workspace_id).await {
             Ok(notes) => {
-                let tasks: Vec<_> = notes
+                let linked = notes
+                    .iter()
+                    .find(|n| n.id.as_str() == "spec")
+                    .map(|n| extract_spec_task_ids(&n.content))
+                    .unwrap_or_default();
+                let tasks: Vec<Value> = notes
                     .into_iter()
                     .filter(|n| n.metadata.task.is_some())
+                    .filter_map(|n| task_note_value(n, &linked))
                     .collect();
-                serde_json::to_value(tasks).unwrap_or_else(|_| empty())
+                Value::Array(tasks)
             }
             Err(_) => empty(),
         },
@@ -1129,12 +1142,45 @@ pub(crate) async fn channel_delta(
     }
 }
 
+/// Serialize a task note for the `task` channel wire, stamping the additive
+/// `specLinked` flag: true iff the note id appears in `linked` (the spec
+/// body's `intent://local/task/{id}` link set — same semantics as `task.list`,
+/// §5.4). Serialization keeps the note shape untouched otherwise; a non-object
+/// serialization is dropped (never happens for [`Note`]).
+fn task_note_value(note: Note, linked: &HashSet<String>) -> Option<Value> {
+    let spec_linked = linked.contains(note.id.as_str());
+    let mut value = serde_json::to_value(note).ok()?;
+    value
+        .as_object_mut()?
+        .insert("specLinked".to_string(), Value::Bool(spec_linked));
+    Some(value)
+}
+
+/// Read the spec note's `intent://local/task/{id}` link set for `specLinked`
+/// stamping — ONE bounded `get_note("spec")` per delta (the snapshot reuses
+/// its own `list_notes` read instead). A missing spec degrades to the empty
+/// set (every row `specLinked: false`), matching `task.list`. Unlike
+/// `task_get` (which propagates non-NotFound store errors), a TRANSIENT read
+/// error also degrades to the empty set here: dropping the delta would lose
+/// the row change itself, which is worse than a conservatively-false flag
+/// that self-corrects on the task's next event.
+async fn spec_linked_ids(api: &dyn WorkspaceApi, workspace_id: &WorkspaceId) -> HashSet<String> {
+    match api
+        .get_note(workspace_id.clone(), NoteId::from("spec"))
+        .await
+    {
+        Ok(spec) => extract_spec_task_ids(&spec.content),
+        Err(_) => HashSet::new(),
+    }
+}
+
 /// Map a `task` channel event by re-reading the note and keeping only task
 /// notes. `note:created` → `added`, `note:updated`/`task:status-changed` →
 /// `updated` when the note still projects a task or `removedIds` when the note
 /// has been demoted (task block removed), `note:deleted` → `removedIds` (the
 /// delete is idempotent on the client even when the removed note was not a
-/// task).
+/// task). `added`/`updated` rows carry the additive `specLinked` flag (one
+/// extra spec-note read per delta, still O(rows) — see [`task_note_value`]).
 pub(crate) async fn task_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
@@ -1149,7 +1195,8 @@ pub(crate) async fn task_delta(
                 .await
                 .ok()?;
             note.metadata.task.as_ref()?;
-            Some(json!({ "added": [serde_json::to_value(note).ok()?] }))
+            let linked = spec_linked_ids(api, workspace_id).await;
+            Some(json!({ "added": [task_note_value(note, &linked)?] }))
         }
         NOTE_UPDATED | TASK_STATUS_CHANGED => {
             let note = api
@@ -1159,7 +1206,8 @@ pub(crate) async fn task_delta(
             if note.metadata.task.is_none() {
                 return Some(json!({ "removedIds": [note_id] }));
             }
-            Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
+            let linked = spec_linked_ids(api, workspace_id).await;
+            Some(json!({ "updated": [task_note_value(note, &linked)?] }))
         }
         _ => None,
     }
