@@ -4796,6 +4796,15 @@ async fn wss_task_list_emits_stats_aggregate() {
     for id in ["task-x", "task-sub"] {
         assert_eq!(by_id[id]["specLinked"], false, "{id} is not spec-linked");
     }
+    // `parentId` rides along (omitted when the note has no parent), so the
+    // subtask is distinguishable from the unlinked top-level task.
+    assert_eq!(by_id["task-a"]["parentId"], "spec");
+    assert_eq!(by_id["task-sub"]["parentId"], "task-a");
+    assert!(
+        by_id["task-x"].get("parentId").is_none(),
+        "parentId omitted for parentless notes: {}",
+        by_id["task-x"]
+    );
 
     let stats = &result["stats"];
     assert_eq!(stats["total"], 3, "total excludes cancelled: {stats}");

@@ -1684,6 +1684,12 @@ pub struct WorkspaceTask {
     /// on `parent_id`.
     #[serde(default)]
     pub spec_linked: bool,
+    /// Backing note's parent pointer, so clients can distinguish subtasks
+    /// (parent is another task) from top-level tasks (parent is the spec or
+    /// absent) and reconstruct the hierarchy from `task.list` alone.
+    /// Additive; omitted when the note has no parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NoteId>,
     /// Task relations (empty and omitted for tasks without them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<NoteId>,

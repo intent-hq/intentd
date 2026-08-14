@@ -1484,6 +1484,23 @@ async fn task_list_and_get_project_workspace_tasks() {
     );
     let linked: Vec<bool> = result.tasks.iter().map(|t| t.spec_linked).collect();
     assert_eq!(linked, vec![true, true, true, false, false]);
+    // `parentId` rides along so subtasks are distinguishable from top-level
+    // tasks without a note.list read.
+    let parents: Vec<Option<&str>> = result
+        .tasks
+        .iter()
+        .map(|t| t.parent_id.as_ref().map(|p| p.as_str()))
+        .collect();
+    assert_eq!(
+        parents,
+        vec![
+            Some("spec"),
+            Some("spec"),
+            Some("spec"),
+            Some("spec"),
+            Some("task-a")
+        ]
+    );
     let alpha = &result.tasks[0];
     assert_eq!(alpha.title, "Alpha");
     assert_eq!(alpha.status, TaskStatus::InProgress);
@@ -1564,6 +1581,12 @@ async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
     let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(ids, vec!["task-a", "task-sub"]);
     assert!(result.tasks.iter().all(|t| !t.spec_linked));
+    // Deliberate asymmetry: the stats fallback still counts direct spec
+    // children when the spec has no task links (task-a; task-sub is a
+    // subtask), even though every row above reports specLinked: false.
+    assert_eq!(result.stats.total, 1);
+    assert_eq!(result.stats.completed, 0);
+    assert_eq!(result.stats.in_progress, 0);
 }
 
 /// `task.setRelations` round-trips `dependsOn`/`conflictsWith` (deduped),
@@ -1657,13 +1680,15 @@ async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
     let unmet: Vec<&str> = c.unmet_depends_on.iter().map(|d| d.as_str()).collect();
     assert_eq!(unmet, vec!["task-b"]);
 
-    // task.get projects them too.
+    // task.get projects them too; task-c has dependsOn edges, so this
+    // exercises the deps-path specLinked branch (spec read via list_notes).
     let got = svc
         .task_get(ws.clone(), NoteId::from("task-c"))
         .await
         .expect("task.get");
     let unmet: Vec<&str> = got.unmet_depends_on.iter().map(|d| d.as_str()).collect();
     assert_eq!(unmet, vec!["task-b"]);
+    assert!(got.spec_linked);
 
     // Omitted field is kept; `[]` clears.
     let r = svc

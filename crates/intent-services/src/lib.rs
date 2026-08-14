@@ -6290,9 +6290,10 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
 /// **including cancelled** (renderer selectors derive counts/groupings). Each
 /// row carries `specLinked`: true iff the task id appears in the spec body's
 /// `intent://local/task/{id}` links (false for every row when the spec has no
-/// links; not conditioned on `parent_id`). Order follows the stored note
-/// order (deduped by id); the title falls back to `Untitled task` to match
-/// the TS `note.title || 'Untitled task'`.
+/// links; not conditioned on `parent_id`), plus the backing note's
+/// `parentId` so clients can tell subtasks from top-level tasks. Order
+/// follows the stored note order (deduped by id); the title falls back to
+/// `Untitled task` to match the TS `note.title || 'Untitled task'`.
 fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
     let linked = notes
         .iter()
@@ -6324,6 +6325,7 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
             status: task.status,
             updated_at: note.updated_at.clone(),
             spec_linked: linked.contains(id),
+            parent_id: note.parent_id.clone(),
             depends_on: task.depends_on.clone(),
             conflicts_with: task.conflicts_with.clone(),
             unmet_depends_on: unmet_depends_on_ids(&task.depends_on, &status_by_id),
@@ -6552,6 +6554,7 @@ fn note_to_workspace_task(
         status: task.status,
         updated_at: note.updated_at.clone(),
         spec_linked,
+        parent_id: note.parent_id.clone(),
         depends_on: task.depends_on.clone(),
         conflicts_with: task.conflicts_with.clone(),
         unmet_depends_on: unmet_depends_on_ids(&task.depends_on, status_by_id),
