@@ -2145,6 +2145,13 @@ fn walk_descendants(
 
 /// Walk `root`'s descendants in the refreshed process table, returning
 /// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+///
+/// Thread rows are excluded from both the adjacency and the sums: on Linux,
+/// sysinfo lists threads (`/proc/<pid>/task` entries) as `Process` rows whose
+/// `memory()` is the WHOLE process's RSS and whose `parent()` is the owning
+/// process, so counting them charged an N-threaded child N+1 times — up to
+/// 219x inflation of `childMemoryBytes` (monorepo#2342). macOS never lists
+/// thread rows, so `thread_kind()` is `None` there and nothing changes.
 fn descendant_tree_usage(
     sys: &sysinfo::System,
     root: sysinfo::Pid,
@@ -2152,13 +2159,20 @@ fn descendant_tree_usage(
 ) -> (usize, u64, HashMap<AgentId, u64>) {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
+        if proc.thread_kind().is_some() {
+            continue;
+        }
         if let Some(parent) = proc.parent() {
             children.entry(parent).or_default().push(*pid);
         }
     }
     walk_descendants(
         &children,
-        &|pid| sys.process(pid).map(|p| p.memory()),
+        &|pid| {
+            sys.process(pid)
+                .filter(|p| p.thread_kind().is_none())
+                .map(|p| p.memory())
+        },
         root,
         agent_roots,
     )
@@ -2228,7 +2242,11 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
-        let refresh_kind = ProcessRefreshKind::nothing().with_memory();
+        // `without_tasks()`: on Linux, `nothing()` still enumerates every
+        // `/proc/<pid>/task` directory and lists each thread as a process
+        // row (monorepo#2342). The walk filters thread rows defensively,
+        // but not fetching them at all keeps the sweep cheap.
+        let refresh_kind = ProcessRefreshKind::nothing().with_memory().without_tasks();
         let mut sys = System::new();
         let mut warned = false;
         let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
@@ -5142,6 +5160,88 @@ mod tests {
         assert_eq!(
             walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
             (0, 0, HashMap::new())
+        );
+    }
+
+    /// Helper child for the thread-row regression test below: parks 16
+    /// sleeping threads so its `/proc/<pid>/task` directory is populated,
+    /// prints READY, and waits to be killed. Env-gated so a stray
+    /// `--include-ignored` run returns immediately instead of sleeping.
+    #[test]
+    #[ignore = "helper child process; spawned by descendant_tree_usage_excludes_linux_thread_rows"]
+    fn thread_heavy_child_helper() {
+        if std::env::var("INTENTD_TEST_THREAD_HEAVY_CHILD").is_err() {
+            return;
+        }
+        let park = || std::thread::sleep(Duration::from_secs(60));
+        let _threads: Vec<_> = (0..16).map(|_| std::thread::spawn(park)).collect();
+        println!("READY");
+        park();
+    }
+
+    /// The monorepo#2342 regression: on Linux, sysinfo's process table lists
+    /// threads (`/proc/<pid>/task` entries) as `Process` rows, each reporting
+    /// the WHOLE process's RSS and chaining into the tree via `parent()` ==
+    /// the owning process. The old walk counted an N-threaded child N+1
+    /// times — observed up to 219x inflation of `childMemoryBytes`. A walk
+    /// rooted at a multi-threaded process must charge its thread rows as
+    /// neither descendants nor bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_tree_usage_excludes_linux_thread_rows() {
+        use std::io::BufRead as _;
+
+        // Re-exec this test binary filtered to the thread-heavy helper above
+        // — the only guaranteed-available multi-threaded child.
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--include-ignored",
+                "--exact",
+                "tests::thread_heavy_child_helper",
+                "--nocapture",
+            ])
+            .env("INTENTD_TEST_THREAD_HEAVY_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn thread-heavy child");
+        let mut lines = std::io::BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+        loop {
+            match lines.next() {
+                Some(Ok(line)) if line.contains("READY") => break,
+                Some(_) => continue,
+                None => panic!("child exited before READY"),
+            }
+        }
+
+        // Refresh WITH tasks — the table shape the sampler saw before the
+        // fix — so the walk itself must be what excludes the thread rows.
+        let child_pid = sysinfo::Pid::from_u32(child.id());
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_tasks(),
+        );
+        let thread_rows = sys
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_some() && p.parent() == Some(child_pid))
+            .count();
+        let usage = descendant_tree_usage(&sys, child_pid, &HashMap::new());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            thread_rows >= 16,
+            "precondition: the refreshed table must list the child's thread rows (got {thread_rows})"
+        );
+        assert_eq!(
+            usage,
+            (0, 0, HashMap::new()),
+            "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }
 }
