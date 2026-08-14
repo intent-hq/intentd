@@ -13,7 +13,7 @@ use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
 use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -1144,8 +1144,11 @@ fn parse_channel_params(
 /// Per-subscription forwarder for the TB-5 channels. Mirrors
 /// [`forward_note_subscription`] but dispatches snapshot + delta through the
 /// channel-generic [`subscriptions::channel_snapshot`] /
-/// [`subscriptions::channel_delta`]. Owns `seq` for strict monotonicity; aborted
-/// by [`ConnSub`] on unsubscribe / disconnect.
+/// [`subscriptions::channel_delta`] — except the task channel, which routes
+/// through the stateful [`subscriptions::task_snapshot`] /
+/// [`subscriptions::task_delta`] pair so spec-body edits refresh flipped
+/// `specLinked` flags (monorepo#2407). Owns `seq` for strict monotonicity;
+/// aborted by [`ConnSub`] on unsubscribe / disconnect.
 async fn forward_channel_subscription(
     api: Arc<dyn WorkspaceApi>,
     channel: Channel,
@@ -1155,9 +1158,19 @@ async fn forward_channel_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
 ) {
-    let snapshot =
+    // The task channel's delta mapper is stateful: it tracks the spec's
+    // task-link set so a spec-body edit can re-emit the rows whose
+    // `specLinked` flag flipped (monorepo#2407). Seeded from the snapshot's
+    // own `list_notes` read — no extra query.
+    let mut spec_links = HashSet::new();
+    let snapshot = if channel == Channel::Task {
+        let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
+        spec_links = links;
+        snapshot
+    } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
-            .await;
+            .await
+    };
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send_bulk(frame).await.is_err() {
         return;
@@ -1165,15 +1178,20 @@ async fn forward_channel_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = subscription.recv().await {
         for event in batch {
-            if let Some(delta) = subscriptions::channel_delta(
-                api.as_ref(),
-                channel,
-                &workspace_id,
-                note_id.as_ref(),
-                &event,
-            )
-            .await
-            {
+            let delta = if channel == Channel::Task {
+                subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
+                    .await
+            } else {
+                subscriptions::channel_delta(
+                    api.as_ref(),
+                    channel,
+                    &workspace_id,
+                    note_id.as_ref(),
+                    &event,
+                )
+                .await
+            };
+            if let Some(delta) = delta {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
                     return;
