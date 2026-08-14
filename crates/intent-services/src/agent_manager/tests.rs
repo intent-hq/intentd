@@ -11972,7 +11972,20 @@ mod unblocked_hints_tests {
     /// once, not per-wake).
     #[tokio::test]
     async fn batch_coalesces_triggers_into_one_section_on_last_entry() {
-        let (_tmp, mgr) = manager().await;
+        // The section is gated behind the opt-in `agentFeatures.taskGraph`
+        // (intent-hq/monorepo#2445), so wire a registry with it on.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let cfg = tempfile::tempdir().expect("temp config dir");
+        let cfg_path = cfg.path().join("config.toml");
+        std::fs::write(&cfg_path, "[agentFeatures]\ntaskGraph = true\n").expect("write config");
+        let registry = Arc::new(crate::SettingsRegistry::load(&cfg_path).expect("load registry"));
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        let mgr = AgentManager::new(services, sink, 8);
         let ws = WorkspaceId::from("ws-unblocked");
         seed_agent(&mgr, &ws, &AgentId::from("seed-unblocked")).await;
         let services = &mgr.services;

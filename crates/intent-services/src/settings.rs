@@ -1442,6 +1442,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agentFeatures",
             true,
         ),
+        boolean(
+            "agentFeatures.taskGraph",
+            "Task graph teaching",
+            "Teach agents the task-graph workflow (batch delegate, dependsOn/conflictsWith, @@@task fence attributes, unblocked-wake hints); docs/prompt only, APIs always work; applies to new sessions only",
+            "agentFeatures",
+            false,
+        ),
         number(
             "prMonitor.debounceSeconds",
             "PR monitor debounce seconds",
@@ -2820,31 +2827,37 @@ mod tests {
         }
     }
 
-    /// The nine `agentFeatures.*` toggles are TOML-backed booleans, all
-    /// defaulting to `true`: each has a catalog entry in the `agentFeatures`
-    /// category and a `KNOWN_PATHS` entry, and each round-trips through the
-    /// registry-wired service (default origin → file override → reset).
+    /// The `agentFeatures.*` toggles are TOML-backed booleans — all default
+    /// `true` except `taskGraph` (opt-in, defaults `false`): each has a
+    /// catalog entry in the `agentFeatures` category and a `KNOWN_PATHS`
+    /// entry, and each round-trips through the registry-wired service
+    /// (default origin → file override → reset).
     #[tokio::test]
     async fn agent_features_toggles_round_trip_via_registry() {
         let paths = [
-            "agentFeatures.backgroundHooks",
-            "agentFeatures.hostExec",
-            "agentFeatures.scripts",
-            "agentFeatures.terminalAccess",
-            "agentFeatures.browserAutomation",
-            "agentFeatures.richChatBlocks",
-            "agentFeatures.structuredQuestions",
-            "agentFeatures.attentionRequests",
-            "agentFeatures.stateSnapshot",
-            "agentFeatures.prMonitor",
+            ("agentFeatures.backgroundHooks", true),
+            ("agentFeatures.hostExec", true),
+            ("agentFeatures.scripts", true),
+            ("agentFeatures.terminalAccess", true),
+            ("agentFeatures.browserAutomation", true),
+            ("agentFeatures.richChatBlocks", true),
+            ("agentFeatures.structuredQuestions", true),
+            ("agentFeatures.attentionRequests", true),
+            ("agentFeatures.stateSnapshot", true),
+            ("agentFeatures.prMonitor", true),
+            ("agentFeatures.taskGraph", false),
         ];
-        for path in paths {
+        for (path, default) in paths {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
             assert!(!def.read_only, "{path} must not be read-only");
             assert_eq!(def.category, "agentFeatures");
             assert!(matches!(def.ty, SettingType::Boolean), "{path} boolean");
-            assert_eq!(def.default_value, Some(json!(true)), "{path} defaults on");
+            assert_eq!(
+                def.default_value,
+                Some(json!(default)),
+                "{path} default mismatch"
+            );
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
 
@@ -2859,18 +2872,18 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        for path in paths {
+        for (path, default) in paths {
             // Default with `default` origin.
             let got = svc.get(path).await.expect("get");
-            assert_eq!(got["value"], json!(true), "{path} default");
+            assert_eq!(got["value"], json!(default), "{path} default");
             assert_eq!(got["origin"], json!("default"), "{path} origin");
 
             // Update persists to config.toml with `file` origin, never SQLite.
-            svc.update(&json!([{ "path": path, "value": false }]))
+            svc.update(&json!([{ "path": path, "value": !default }]))
                 .await
                 .expect("update");
             let got = svc.get(path).await.expect("get");
-            assert_eq!(got["value"], json!(false), "{path} updated");
+            assert_eq!(got["value"], json!(!default), "{path} updated");
             assert_eq!(got["origin"], json!("file"), "{path} origin");
             assert_eq!(
                 store.get_setting(path).await.expect("read settings table"),
@@ -2880,7 +2893,7 @@ mod tests {
 
             // Reset restores the default.
             let reset = svc.reset(path).await.expect("reset");
-            assert_eq!(reset["value"], json!(true), "{path} reset");
+            assert_eq!(reset["value"], json!(default), "{path} reset");
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["origin"], json!("default"), "{path} origin after reset");
         }

@@ -111,6 +111,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.attentionRequests",
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
+    "agentFeatures.taskGraph",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
 ];

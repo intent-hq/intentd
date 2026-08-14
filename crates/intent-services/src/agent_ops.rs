@@ -6019,6 +6019,14 @@ impl Services {
         &self,
         metadatas: impl Iterator<Item = Option<&'a Value>>,
     ) -> Option<String> {
+        // `agentFeatures.taskGraph` gates the advisory section (docs/prompt
+        // teaching, intent-hq/monorepo#2445). Read LIVE like `stateSnapshot`
+        // — the section is computed at delivery time, so the toggle applies
+        // to the very next wake of every session; the wake itself still
+        // delivers, just unannotated.
+        if !self.effective_settings().agent_features.task_graph {
+            return None;
+        }
         let triggers = ready_delta::collect_trigger_tasks(metadatas);
         if triggers.is_empty() {
             return None;
