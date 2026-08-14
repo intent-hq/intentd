@@ -22,6 +22,13 @@
 # referenced by commits/PRs in (previous tag, released tag] also get a
 # fail-soft "Fixed in intentd vX.Y.Z (alpha)" comment
 # (scripts/notify-fixed-issues.sh).
+#
+# When the FE_DISPATCH_TOKEN secret is configured, a repository_dispatch of
+# type `intentd-alpha-published` (client_payload.version = the released
+# version, no leading v) is sent to intent-hq/cloudlands-fe after the alpha
+# manifest is published (source + mirror), so its auto-pin-intentd workflow
+# can bump the sidecar pin immediately. Fail-soft: a missing secret or a
+# failed dispatch logs a warning and never fails the job.
 name: Publish channel manifest
 
 on:
@@ -180,3 +187,22 @@ jobs:
           GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
         run: |
           ./scripts/publish-channel-manifest.sh alpha mirror/alpha.json intent-hq/intentd-releases
+      # --- FE notification: alpha published ---
+      # Fail-soft by design (mirrors notify-monorepo.yml): a missing
+      # FE_DISPATCH_TOKEN secret or a failed dispatch logs a warning and
+      # never fails the job — the FE's cron backstop picks up the bump.
+      - name: Notify cloudlands-fe of alpha publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FE_DISPATCH_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::FE_DISPATCH_TOKEN secret is not set; skipping cloudlands-fe notification"
+            exit 0
+          fi
+          if ! gh api repos/intent-hq/cloudlands-fe/dispatches \
+            -f event_type=intentd-alpha-published \
+            -f "client_payload[version]=${TAG#v}"; then
+            echo "::warning::repository_dispatch to intent-hq/cloudlands-fe failed; its cron run will pick up the bump"
+          fi
