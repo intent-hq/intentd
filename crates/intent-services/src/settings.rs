@@ -1490,13 +1490,15 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 
 /// The effective `agents.memoryBudgetMb` setting in bytes: a positive value
 /// installs the aggregate child-tree memory budget (monorepo#2063); an
-/// explicit `0` is off. An absent key (`None`, the default) means auto — the
-/// boot wiring that resolves auto to
-/// [`intent_services::recommended_memory_budget_bytes`] lands separately, so
-/// until then auto yields `None` here and behaves like off.
-pub fn agent_memory_budget_bytes(settings: &SettingsFile) -> Option<u64> {
+/// explicit `0` is off; an absent key (`None`, the default) resolves to the
+/// recommended budget derived from `total_memory_bytes`
+/// ([`intent_services::recommended_memory_budget_bytes`]).
+pub fn agent_memory_budget_bytes(settings: &SettingsFile, total_memory_bytes: u64) -> Option<u64> {
     match settings.agents.memory_budget_mb {
-        None | Some(0) => None,
+        None => Some(crate::agent_manager::recommended_memory_budget_bytes(
+            total_memory_bytes,
+        )),
+        Some(0) => None,
         Some(mb) => Some(mb as u64 * 1024 * 1024),
     }
 }
@@ -2373,13 +2375,14 @@ mod tests {
 
     /// `agents.memoryBudgetMb` is a TOML-backed bounded number, and
     /// `agent_memory_budget_bytes` resolves the absent/0/positive
-    /// matrix (monorepo#2063): absent = auto (no explicit budget — the boot
-    /// wiring resolves it), explicit 0 = off (a 0 must stay `None` rather than
-    /// becoming a 0-byte budget that would refuse every spawn), positive = MB
-    /// converted to bytes. The catalog carries no `default_value` because the
+    /// matrix (monorepo#2063): absent = auto (resolves to the recommended budget
+    /// derived from system RAM), explicit 0 = off (a 0 must stay `None` rather
+    /// than becoming a 0-byte budget that would refuse every spawn), positive =
+    /// MB converted to bytes. The catalog carries no `default_value` because the
     /// default is the absent key.
     #[test]
     fn agent_memory_budget_matrix_absent_auto_zero_off_positive_bytes() {
+        use crate::agent_manager::recommended_memory_budget_bytes;
         let def = find_definition("agents.memoryBudgetMb")
             .expect("agents.memoryBudgetMb missing from catalog");
         assert!(!def.sensitive);
@@ -2398,14 +2401,19 @@ mod tests {
 
         let mut settings = SettingsFile::default();
         assert_eq!(settings.agents.memory_budget_mb, None);
-        assert_eq!(agent_memory_budget_bytes(&settings), None);
+        // Absent key resolves to recommended budget. Test with 48 GB RAM.
+        let total_ram = 48 * 1024 * 1024 * 1024;
+        assert_eq!(
+            agent_memory_budget_bytes(&settings, total_ram),
+            Some(recommended_memory_budget_bytes(total_ram)),
+        );
 
         settings.agents.memory_budget_mb = Some(0);
-        assert_eq!(agent_memory_budget_bytes(&settings), None);
+        assert_eq!(agent_memory_budget_bytes(&settings, total_ram), None);
 
         settings.agents.memory_budget_mb = Some(20_480);
         assert_eq!(
-            agent_memory_budget_bytes(&settings),
+            agent_memory_budget_bytes(&settings, total_ram),
             Some(20 * 1024 * 1024 * 1024),
         );
     }
