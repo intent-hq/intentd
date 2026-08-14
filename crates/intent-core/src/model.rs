@@ -3433,6 +3433,13 @@ pub struct WorkspaceGitRoot {
     /// Empty for auto-detected roots with no explicit registrations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registered_by_agent_ids: Vec<AgentId>,
+    /// The root's HEAD commit SHA captured when the root was first registered
+    /// (agent registration or sweep auto-detect); immutable once set — merges
+    /// never touch it. `None` when HEAD was unreadable at registration or the
+    /// row predates the field; the background sweep best-effort-backfills
+    /// such rows with the root's current HEAD (a going-forward boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_commit_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

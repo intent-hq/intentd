@@ -14,7 +14,8 @@ use sqlx::Row;
 use crate::{enum_from_db, enum_to_db, Store};
 
 const COLUMNS: &str = "id, workspace_id, path, source, repo_owner, repo_name, \
-    registered_by_agent_ids, pr_number, pr_url, pr_status, pull_requests, created_at, updated_at";
+    registered_by_agent_ids, registered_commit_sha, pr_number, pr_url, pr_status, pull_requests, \
+    created_at, updated_at";
 
 /// Encode the `registered_by_agent_ids` list to its JSON-array TEXT column.
 fn agent_ids_to_db(ids: &[AgentId]) -> Result<String> {
@@ -62,6 +63,7 @@ fn root_from_row(r: &SqliteRow) -> Result<WorkspaceGitRoot> {
         repo_owner: get_opt("repo_owner")?,
         repo_name: get_opt("repo_name")?,
         registered_by_agent_ids: agent_ids_from_db(&get("registered_by_agent_ids")?)?,
+        registered_commit_sha: get_opt("registered_commit_sha")?,
         pr_number: r
             .try_get::<Option<i64>, _>("pr_number")
             .map_err(err)?
@@ -85,8 +87,11 @@ impl Store {
     /// `source` is upgraded `auto` → `agent` when `root` is agent-registered
     /// (never downgraded — an explicit registration takes over an
     /// auto-detected row in place, monorepo#2053), and `updated_at` is taken
-    /// from `root`. The existing row's `id`, PR fields, and `created_at` are
-    /// retained.
+    /// from `root`. The existing row's `id`, PR fields,
+    /// `registered_commit_sha` (the merge NEVER touches it — the field means
+    /// "HEAD when first registered"; a NULL row is backfilled only via
+    /// [`Store::backfill_workspace_git_root_commit_sha`]), and `created_at`
+    /// are retained.
     ///
     /// Returns the stored row plus `true` when it was newly inserted /
     /// `false` when an existing row was merged. The flag is decided inside
@@ -160,7 +165,7 @@ impl Store {
                     });
                     let sql = format!(
                         "INSERT INTO workspace_git_root ({COLUMNS}) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     );
                     sqlx::query(&sql)
                         .bind(&fresh.id.0)
@@ -170,6 +175,7 @@ impl Store {
                         .bind(&fresh.repo_owner)
                         .bind(&fresh.repo_name)
                         .bind(agent_ids_to_db(&fresh.registered_by_agent_ids)?)
+                        .bind(&fresh.registered_commit_sha)
                         .bind(fresh.pr_number.map(|n| n as i64))
                         .bind(&fresh.pr_url)
                         .bind(fresh.pr_status.map(|s| enum_to_db(&s)).transpose()?)
@@ -279,6 +285,43 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Stamp a git root's `registered_commit_sha` ONLY when it is currently
+    /// NULL — the best-effort backfill the background sweep runs on rows that
+    /// predate the column (or whose HEAD was unreadable at registration). The
+    /// `IS NULL` guard enforces the never-overwrite contract at the SQL
+    /// level; a row that already carries a value returns `false` untouched.
+    /// `NotFound` when the row is absent.
+    pub async fn backfill_workspace_git_root_commit_sha(
+        &self,
+        id: &WorkspaceGitRootId,
+        sha: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE workspace_git_root SET registered_commit_sha = ?, updated_at = ? \
+             WHERE id = ? AND registered_commit_sha IS NULL",
+        )
+        .bind(sha)
+        .bind(updated_at)
+        .bind(&id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("backfill git root commit sha failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Distinguish "already stamped" from "no such row".
+        let exists = sqlx::query("SELECT 1 FROM workspace_git_root WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("backfill git root lookup failed: {e}")))?;
+        if exists.is_none() {
+            return Err(Error::NotFound(format!("workspace git root {id}")));
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +423,7 @@ mod tests {
             repo_owner: None,
             repo_name: None,
             registered_by_agent_ids: agents.iter().map(|a| AgentId(a.to_string())).collect(),
+            registered_commit_sha: None,
             pr_number: None,
             pr_url: None,
             pr_status: None,
@@ -463,6 +507,109 @@ mod tests {
             merged.registered_by_agent_ids,
             vec![AgentId("agent-1".into())]
         );
+    }
+
+    /// `registered_commit_sha` round-trips on insert and is NEVER touched by
+    /// a merge — neither overwritten by a differing candidate value nor
+    /// filled from one when the row is NULL (the field means "HEAD when
+    /// first registered"; NULL rows are backfilled only via the scoped
+    /// `IS NULL`-guarded write).
+    #[tokio::test]
+    async fn registered_commit_sha_insert_stamps_merge_preserves() {
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+
+        // Insert with a SHA → round-trips.
+        let mut stamped = test_root(&ws_id, "/tmp/sha-a", &["agent-1"], &now_iso());
+        stamped.registered_commit_sha = Some("a".repeat(40));
+        let (inserted, _) = store
+            .upsert_workspace_git_root(&stamped)
+            .await
+            .expect("insert");
+        assert_eq!(
+            inserted.registered_commit_sha.as_deref(),
+            Some(&*"a".repeat(40))
+        );
+
+        // A merge candidate with a DIFFERENT SHA never overwrites.
+        let mut differing = test_root(&ws_id, "/tmp/sha-a", &["agent-2"], &now_iso());
+        differing.registered_commit_sha = Some("b".repeat(40));
+        let (merged, was_inserted) = store
+            .upsert_workspace_git_root(&differing)
+            .await
+            .expect("merge");
+        assert!(!was_inserted);
+        assert_eq!(
+            merged.registered_commit_sha.as_deref(),
+            Some(&*"a".repeat(40)),
+            "merge preserves the first-registered SHA"
+        );
+
+        // Insert without a SHA → NULL; a merge candidate carrying one does
+        // NOT fill it (merges never touch the column).
+        let bare = test_root(&ws_id, "/tmp/sha-b", &[], &now_iso());
+        let (inserted, _) = store
+            .upsert_workspace_git_root(&bare)
+            .await
+            .expect("insert bare");
+        assert_eq!(inserted.registered_commit_sha, None);
+        let mut candidate = test_root(&ws_id, "/tmp/sha-b", &["agent-1"], &now_iso());
+        candidate.registered_commit_sha = Some("c".repeat(40));
+        let (merged, _) = store
+            .upsert_workspace_git_root(&candidate)
+            .await
+            .expect("merge bare");
+        assert_eq!(merged.registered_commit_sha, None, "merge never fills NULL");
+        let read = store.get_workspace_git_root(&merged.id).await.expect("get");
+        assert_eq!(read.registered_commit_sha, None);
+    }
+
+    /// `backfill_workspace_git_root_commit_sha` stamps ONLY a NULL row
+    /// (returning `true`), leaves a stamped row untouched (returning
+    /// `false`), and is `NotFound` for an absent row.
+    #[tokio::test]
+    async fn backfill_commit_sha_only_fills_null() {
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        let (root, _) = store
+            .upsert_workspace_git_root(&test_root(&ws_id, "/tmp/sha-c", &[], &now_iso()))
+            .await
+            .expect("insert");
+        assert_eq!(root.registered_commit_sha, None);
+
+        let ts = now_iso();
+        let stamped = store
+            .backfill_workspace_git_root_commit_sha(&root.id, &"d".repeat(40), &ts)
+            .await
+            .expect("backfill");
+        assert!(stamped, "NULL row is stamped");
+        let read = store.get_workspace_git_root(&root.id).await.expect("get");
+        assert_eq!(
+            read.registered_commit_sha.as_deref(),
+            Some(&*"d".repeat(40))
+        );
+        assert_eq!(read.updated_at, ts);
+
+        // A second backfill with a different SHA never overwrites.
+        let stamped = store
+            .backfill_workspace_git_root_commit_sha(&root.id, &"e".repeat(40), &now_iso())
+            .await
+            .expect("backfill again");
+        assert!(!stamped, "stamped row untouched");
+        let read = store.get_workspace_git_root(&root.id).await.expect("get");
+        assert_eq!(
+            read.registered_commit_sha.as_deref(),
+            Some(&*"d".repeat(40))
+        );
+
+        assert!(matches!(
+            store
+                .backfill_workspace_git_root_commit_sha(
+                    &WorkspaceGitRootId::new(),
+                    &"f".repeat(40),
+                    &now_iso()
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     /// A merge upsert upgrades `source` `auto` → `agent` when the candidate
