@@ -402,6 +402,133 @@ async fn budget_reclaims_idle_processes_before_queueing_a_spawn() {
     );
 }
 
+/// Budget-driven queue/evict/resume events must carry `reason: "memory-budget"`
+/// (monorepo#2063) — the slot-cap variant (`"slots"`) is asserted end-to-end in
+/// [`process_cap_events_queued_resumed_evicted`].
+#[tokio::test]
+async fn budget_driven_process_events_carry_memory_budget_reason() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    // Slots free; only memory binds — every event below is budget-driven.
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (idle, active, spawning) = (
+        AgentId::from("idle"),
+        AgentId::from("active"),
+        AgentId::from("spawning"),
+    );
+    reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+
+    // Over budget with a slot free: evicts the idle process, then queues.
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle = tokio::spawn(async move { reg2.acquire(&spawning2).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Under budget again + a deregister → wakes the queued spawn (resumed).
+    probe.set(gb);
+    reg.deregister(&active);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("acquire resolves once woken under budget")
+        .expect("task ok");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = events.lock().unwrap().clone();
+    let find = |event_type: &str, agent: &AgentId| {
+        events
+            .iter()
+            .find(|(a, e, _)| e == event_type && a == agent)
+            .unwrap_or_else(|| panic!("{event_type} event for {agent} recorded"))
+            .2
+            .clone()
+    };
+    assert_eq!(
+        find("agent:process:evicted", &idle),
+        "memory-budget",
+        "budget-driven eviction reason"
+    );
+    assert_eq!(
+        find("agent:process:queued", &spawning),
+        "memory-budget",
+        "budget-driven queue reason"
+    );
+    assert_eq!(
+        find("agent:process:resumed", &spawning),
+        "memory-budget",
+        "budget-driven resume reason"
+    );
+}
+
+/// When both constraints bind at once (all slots active AND over budget), the
+/// budget wins the reason label — a freed slot alone cannot clear it.
+#[tokio::test]
+async fn both_constraints_binding_labels_reason_memory_budget() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    // Cap of 1 with one ACTIVE process (no idle to evict) AND over budget:
+    // both constraints bind, so the queued reason must be memory-budget.
+    let reg = Arc::new(ProcessRegistry::new(1).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (active, spawning) = (AgentId::from("active"), AgentId::from("spawning"));
+    reg.register(active.clone(), recording_kill(active.clone(), log.clone()));
+    reg.mark_active(&active);
+
+    let reg2 = reg.clone();
+    let spawning2 = spawning.clone();
+    let handle = tokio::spawn(async move { reg2.acquire(&spawning2).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    {
+        let events = events.lock().unwrap();
+        let queued = events
+            .iter()
+            .find(|(a, e, _)| e == "agent:process:queued" && a == &spawning)
+            .expect("queued event recorded");
+        assert_eq!(queued.2, "memory-budget", "budget wins when both bind");
+    }
+
+    // Release both constraints so the queued spawn resolves and the task ends.
+    probe.set(gb);
+    reg.deregister(&active);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("acquire resolves once both constraints clear")
+        .expect("task ok");
+}
+
 #[tokio::test]
 async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     let gb = super::GB;
@@ -805,6 +932,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     );
     assert_eq!(ev.data["used"], 2, "used count at eviction");
     assert_eq!(ev.data["cap"], 2, "cap value");
+    assert_eq!(ev.data["reason"], "slots", "slot-cap eviction reason");
 
     // Scenario: cap=2, B and C now registered, make both active, acquire for D → should queue.
     mgr.registry.mark_active(&b);
@@ -897,6 +1025,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     );
     assert_eq!(ev.data["used"], 2, "used count at queue");
     assert_eq!(ev.data["cap"], 2, "cap value");
+    assert_eq!(ev.data["reason"], "slots", "slot-cap queue reason");
 
     // Mark B idle → should resume D.
     mgr.registry.mark_idle(&b);
@@ -932,6 +1061,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     );
     assert_eq!(ev.data["used"], 2, "used count after resume");
     assert_eq!(ev.data["cap"], 2, "cap value");
+    assert_eq!(ev.data["reason"], "slots", "slot-cap resume reason");
 }
 
 async fn manager() -> (TempDb, AgentManager) {
