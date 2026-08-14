@@ -7916,6 +7916,73 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// monorepo#2063 A2: `agent.diagnostics` agent rows carry `subtreeMemoryBytes`
+/// from the runtime manager's tree probe — present only for agents the probe
+/// attributed bytes to, omitted otherwise (no bucket, no probe, or no manager
+/// attached). Diagnostics-only: the field never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_subtree_memory_bytes() {
+    use crate::agent_manager::TreeMemoryProbe;
+    use std::collections::HashMap;
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let sampled = create_agent(&svc, &ws, "Sampled").await;
+    let unsampled = create_agent(&svc, &ws, "Unsampled").await;
+
+    // No manager attached: the field is absent everywhere.
+    let before = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics without manager");
+    for row in before["diagnostics"]["agents"].as_array().expect("agents") {
+        assert!(
+            row.get("subtreeMemoryBytes").is_none(),
+            "no probe, no field: {row}"
+        );
+    }
+
+    struct FixedProbe(HashMap<AgentId, u64>);
+    impl TreeMemoryProbe for FixedProbe {
+        fn sample(&self) -> Option<(u64, u64)> {
+            Some((self.0.values().sum(), 1))
+        }
+        fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.0.clone()
+        }
+    }
+
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        sink,
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    manager.set_tree_probe(Arc::new(FixedProbe(HashMap::from([(
+        sampled.clone(),
+        123_456_789,
+    )]))));
+
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(
+        row_for(&sampled)["subtreeMemoryBytes"],
+        json!(123_456_789u64)
+    );
+    assert!(
+        row_for(&unsampled).get("subtreeMemoryBytes").is_none(),
+        "no bucket for this agent, field omitted"
+    );
+}
+
 /// intent-hq/monorepo#1897: a ready-to-send queue entry older than
 /// `STALE_QUEUE_ENTRY_AFTER_MS` on an agent that is not actively responding
 /// raises a `stale-queue-entry` stuck risk naming the agent and the oldest

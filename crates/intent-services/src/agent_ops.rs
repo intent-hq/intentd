@@ -7563,6 +7563,16 @@ impl Services {
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        // Per-agent subtree memory attribution (monorepo#2063 A2): resident
+        // bytes of each agent's descendant process tree from the runtime
+        // manager's tree probe, stamped as `subtreeMemoryBytes` (omitted when
+        // the agent has no bucket — not spawned, no sample yet, or no runtime
+        // manager attached). Diagnostics-only by design: this deliberately
+        // stays off the hot `agent.list`/`agent.get` payloads.
+        let agent_memory: HashMap<AgentId, u64> = self
+            .agent_manager()
+            .map(|m| m.agent_memory_samples())
+            .unwrap_or_default();
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -7636,6 +7646,9 @@ impl Services {
                 if !monitors.is_empty() {
                     row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
+            }
+            if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
+                row.insert("subtreeMemoryBytes".into(), json!(bytes));
             }
             agent_rows.push(Value::Object(row));
         }
