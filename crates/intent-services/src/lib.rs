@@ -23722,8 +23722,12 @@ impl Services {
         }
         // Derive `lastActivity` (§9.1) and persist it through the scoped
         // monotonic write (monorepo#1585).
-        self.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
-            .await;
+        let ctx = if auto_unarchive.is_some() {
+            "auto-unarchive"
+        } else {
+            "workspace.unarchive"
+        };
+        self.derive_and_persist_last_activity(&mut ws, ctx).await;
         // Derive `activity` from live agent state (§9.9) so the mutation
         // response carries `agent_running` when agents are in-flight,
         // not the stale default `idle` from the persisted row.
@@ -23743,10 +23747,17 @@ impl Services {
     }
 
     /// Best-effort auto-unarchive at the turn-start choke point
-    /// ([`crate::agent_manager::AgentManager::try_begin`]'s `Started`
-    /// branch): when a real turn begins in an Archived workspace, flip it
-    /// back to Active and emit the §6.5 `workspace:updated` delta stamped
-    /// `autoUnarchive: { reason: "agent_activity", agentId, agentName }`.
+    /// ([`crate::agent_manager::AgentManager::try_begin_outcome`]'s
+    /// `Started` branch): when a real turn begins in an Archived workspace,
+    /// flip it back to Active and emit the §6.5 `workspace:updated` delta
+    /// stamped `autoUnarchive: { reason: "agent_activity", agentId,
+    /// agentName }`.
+    ///
+    /// Not serialized across concurrent turn starts: two agents winning
+    /// `try_begin` near-simultaneously in the same archived workspace can
+    /// each observe `archived: true` and both emit a stamped delta. The
+    /// row writes are idempotent; consumers keying UI (e.g. a toast) on
+    /// the stamp should dedup per workspace.
     ///
     /// Non-archived workspaces cost one point read (`archived` is part of
     /// the workspace row already fetched by callers of the send path, but
