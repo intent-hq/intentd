@@ -2077,13 +2077,16 @@ impl Services {
         // `max_turn_requests`, …) is durably tagged on the assistant row so
         // clients can render the ending after a reload. Normal endings
         // (`end_turn` / `stream_complete`) stay metadata-free — no noise on
-        // the common path.
+        // the common path. A zero-output abnormal turn still persists an
+        // empty marker row (mirroring the §7.2 pre-first-token interrupt
+        // marker): `agent:idle` / `agent:stream:end` are ephemeral, so the
+        // row is the only durable record of the ending.
         let abnormal_finish_reason = result
             .as_ref()
             .ok()
             .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
             .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
-        if !blocks.is_empty() {
+        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));

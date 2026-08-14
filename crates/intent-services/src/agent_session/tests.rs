@@ -1027,6 +1027,69 @@ async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
     );
 }
 
+/// A ZERO-OUTPUT abnormal ending (PROTOCOL §7.3): the prompt resolves with an
+/// abnormal stop reason before emitting a single `session/update`. Because
+/// `agent:idle` / `agent:stream:end` are ephemeral, the turn must still
+/// persist an empty marker row (`contentBlocks: []`) tagged with
+/// `metadata.finishReason` so the ending survives a reload — mirroring the
+/// §7.2 pre-first-token interrupt marker row.
+#[tokio::test]
+async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(Vec::new(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The empty marker row is persisted: no content blocks, but the durable
+    // finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, json!([]));
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the finishReason and the marker row's id.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
+    );
+}
+
 /// Mid-turn `agent:stream:activity` clips the preview at the last newline:
 /// the first chunk carries a completed line plus the start of the next one,
 /// so the activity serves only the completed line; a partial
