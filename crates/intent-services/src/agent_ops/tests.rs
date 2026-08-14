@@ -94,6 +94,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -14010,26 +14011,17 @@ fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscrip
     })
 }
 
-async fn recv_display_status(sub: &mut crate::Subscription) -> serde_json::Value {
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("displayStatus event delivered")
-        .expect("subscription open");
-    assert_eq!(batch.len(), 1, "expected exactly one displayStatus event");
-    serde_json::to_value(&batch[0]).expect("serialize event")
-}
-
 async fn assert_display_status_silent(sub: &mut crate::Subscription) {
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(res.is_err(), "expected no displayStatus event: {res:?}");
 }
 
-/// Registering the first watch for an otherwise-idle workspace promotes its
-/// derived `displayStatus` to `in_progress` (exactly one
-/// `workspace:displayStatus-changed`); a second registration while already
-/// promoted is a no-op recompute and stays silent.
+/// Registering a watch for an otherwise-idle workspace sets the orthogonal
+/// `waiting` flag without moving the derived `displayStatus` — no
+/// `workspace:displayStatus-changed` fires for either the first or a second
+/// registration.
 #[tokio::test]
-async fn watch_registration_emits_display_status_promotion() {
+async fn watch_registration_sets_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Seed the last-observed cache (first observation never emits).
@@ -14037,35 +14029,30 @@ async fn watch_registration_emits_display_status_promotion() {
 
     let mut sub = subscribe_display_status(&bus, &ws);
     delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
-    );
+    assert!(svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut sub).await;
 
-    // A second watch while already promoted: transition-only, so silent.
     delegate_after_all(&svc, &ws, &parent).await;
+    assert!(svc.workspace_is_waiting(&ws).await);
     assert_display_status_silent(&mut sub).await;
 }
 
 /// The coordinator flow end to end: the parent delegates (watch registered →
-/// promotion), goes idle while the child is still out (workspace STAYS
-/// `in_progress` — no event), and the child settling retires the group's
-/// watches, demoting the workspace back to its base rollup (exactly one
-/// demotion event).
+/// waiting), goes idle while the child is still out (still waiting), and the
+/// child settling retires the group's watches, dropping the flag — with no
+/// `workspace:displayStatus-changed` at any point.
 #[tokio::test]
-async fn watch_settlement_emits_display_status_demotion() {
+async fn watch_settlement_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     svc.maybe_emit_display_status_changed(&ws).await;
 
     let mut sub = subscribe_display_status(&bus, &ws);
     let c1 = delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+    assert!(svc.workspace_is_waiting(&ws).await);
 
     // Parent idles first (seals the group; child still expected): the
-    // workspace keeps waiting on the child, so no demotion yet.
+    // workspace keeps waiting on the child.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -14073,10 +14060,10 @@ async fn watch_settlement_emits_display_status_demotion() {
         json!({ "agentId": parent.0 }),
     ))
     .await;
-    assert_display_status_silent(&mut sub).await;
+    assert!(svc.workspace_is_waiting(&ws).await);
 
-    // Child settles: the group fires, its watches retire, and the workspace
-    // demotes back to the base rollup.
+    // Child settles: the group fires, its watches retire, and the waiting
+    // flag drops — silently.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -14085,36 +14072,29 @@ async fn watch_settlement_emits_display_status_demotion() {
     ))
     .await;
     assert!(svc.list_watches_for_parent(&parent).is_empty());
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
-    );
+    assert!(!svc.workspace_is_waiting(&ws).await);
     assert_display_status_silent(&mut sub).await;
 }
 
 /// The unscoped `agent.cancelSubscriptions` sweep drops the caller's last
-/// watch, demoting the anchor workspace's derived `displayStatus`.
+/// watch — and with it the anchor workspace's `waiting` flag — without any
+/// `workspace:displayStatus-changed`.
 #[tokio::test]
-async fn cancel_subscriptions_emits_display_status_demotion() {
+async fn cancel_subscriptions_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     svc.maybe_emit_display_status_changed(&ws).await;
 
     let mut sub = subscribe_display_status(&bus, &ws);
     delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+    assert!(svc.workspace_is_waiting(&ws).await);
 
     svc.agent_cancel_subscriptions_op(ws.clone(), parent.clone(), None, None)
         .await
         .expect("cancel subscriptions");
     assert!(svc.list_watches_for_parent(&parent).is_empty());
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
-    );
+    assert!(!svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut sub).await;
 }
 
 /// `reportToParent` from a child enrolled in an undelivered after_all group is
@@ -18770,9 +18750,9 @@ fn subscribe_subscriptions_changed(bus: &EventBus) -> crate::Subscription {
 /// Regression (monorepo#1449): `resume_interrupted_agent` re-arms the
 /// parent's completion watch after a daemon restart, and the re-registration
 /// must publish exactly one `agent:subscriptions-changed` for the parent's
-/// home workspace (like every other watch-lifecycle site), whose recompute
-/// also promotes a previously-idle workspace's `displayStatus` to
-/// `in_progress`.
+/// home workspace (like every other watch-lifecycle site). The re-armed
+/// watch reads as the orthogonal `waiting` flag — never a `displayStatus`
+/// transition.
 #[tokio::test]
 async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -18785,8 +18765,7 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
         .unwrap()
         .subscriptions
         .clear();
-    // Re-baseline the displayStatus cache post-"restart" so the resume-time
-    // recompute observes the idle → in_progress transition.
+    // Re-baseline the displayStatus cache post-"restart".
     svc.maybe_emit_display_status_changed(&ws).await;
 
     svc.store
@@ -18818,13 +18797,10 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
         "resume must publish subscriptions-changed exactly once"
     );
 
-    // The re-armed watch is the promotion trigger: the previously-idle
-    // workspace transitions to in_progress via the publish's recompute.
-    let ev = recv_display_status(&mut status_sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
-    );
+    // The re-armed watch reads as waiting on the read path; the workspace's
+    // displayStatus never transitions.
+    assert!(svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut status_sub).await;
 }
 
 /// monorepo#1449 (grouped branch): a resumed child still expected by an

@@ -540,6 +540,13 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
+    /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1):
+    /// the recompute-and-compare seam behind
+    /// [`Services::maybe_emit_waiting_changed`]. See
+    /// [`workspace_status::WaitingStatusCache`] — the map is private to the
+    /// `workspace_status` module. Shared across clones so every service
+    /// handle compares against the same last-emitted value.
+    last_waiting_statuses: Arc<workspace_status::WaitingStatusCache>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -845,6 +852,7 @@ impl Services {
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
+            last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -12816,6 +12824,7 @@ impl WorkspaceApi for Services {
                         token_usage: None,
                         cow_supported: None,
                         display_status: None,
+                        waiting: false,
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
@@ -15040,6 +15049,7 @@ impl WorkspaceApi for Services {
                 token_usage: None,
                 cow_supported: None,
                 display_status: None,
+                waiting: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,

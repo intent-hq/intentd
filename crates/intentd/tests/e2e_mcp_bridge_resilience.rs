@@ -81,6 +81,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         disk_usage: None,
         pending_delete_at: None,
         display_status: None,
+        waiting: false,
     }
 }
 

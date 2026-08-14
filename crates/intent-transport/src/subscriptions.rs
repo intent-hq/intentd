@@ -16,7 +16,7 @@ use intent_core::events::{
     AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
     WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Map, Value};
@@ -341,6 +341,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             WORKSPACE_ACTIVITY_CHANGED,
             WORKSPACE_ATTENTION_CHANGED,
             WORKSPACE_DISPLAY_STATUS_CHANGED,
+            WORKSPACE_WAITING_CHANGED,
             PR_LINKED,
             PR_UPDATED,
             PR_UNLINKED,
@@ -1213,6 +1214,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | WORKSPACE_ACTIVITY_CHANGED
         | WORKSPACE_ATTENTION_CHANGED
         | WORKSPACE_DISPLAY_STATUS_CHANGED
+        | WORKSPACE_WAITING_CHANGED
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {
