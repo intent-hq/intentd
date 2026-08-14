@@ -2307,6 +2307,9 @@ impl SystemControl for DaemonControl {
         // matching the port/fingerprint/clients fallback, and self-correcting
         // on the next call.
         let tcp = port.is_some();
+        // Aggregate-budget visibility (monorepo#2063): absent when the budget
+        // is off, so the wire fields stay presence-detected.
+        let budget = self.manager.registry().budget_status();
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -2328,6 +2331,9 @@ impl SystemControl for DaemonControl {
             child_processes: child_tree.map(|s| s.count),
             child_memory_bytes: child_tree.map(|s| s.memory_bytes),
             child_memory_peak_bytes: child_tree.map(|s| s.peak_memory_bytes),
+            agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
+            agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
+            queued_spawns: budget.map(|(_, _, queued)| queued),
         }
     }
 

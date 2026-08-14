@@ -89,6 +89,21 @@ pub struct SystemStatus {
     /// enough that the baseline alone missed them almost entirely — measured,
     /// a 16-chain burst peaking at 6.97 GB reported 0.01 GB.
     pub child_memory_peak_bytes: Option<u64>,
+    /// The installed aggregate agent memory budget in bytes
+    /// (`agents.memoryBudgetMb`, monorepo#2063). `None` when the budget is
+    /// off. The three budget fields are presence-detected on the wire —
+    /// omitted when `None`, never null — unlike the child-tree sample fields
+    /// above, which are null until the first sample.
+    pub agent_memory_budget_bytes: Option<u64>,
+    /// The bytes admission actually compares against the budget: the last
+    /// descendant-tree sample plus the provisional correction for spawns
+    /// admitted / processes released since it was taken. `None` when the
+    /// budget is off, and also while the budget is on but no sample has
+    /// landed yet (the budget is inert until then).
+    pub agent_memory_charged_bytes: Option<u64>,
+    /// Spawns currently queued behind the admission gate (slot cap or memory
+    /// budget). `None` when the budget is off.
+    pub queued_spawns: Option<u64>,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -201,6 +216,11 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
 
 /// Render a [`SystemStatus`] to the `system.status` result JSON. `is_local`
 /// reflects the serving transport (UDS ⇒ `local`, WSS ⇒ `remote`, §12.3).
+///
+/// The aggregate-budget fields (`agentMemoryBudgetBytes`,
+/// `agentMemoryChargedBytes`, `queuedSpawns`; monorepo#2063) are
+/// presence-detected: omitted when the budget is off, never null — unlike the
+/// child-tree sample fields, which are always present and null until sampled.
 pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     let mut transports = Vec::new();
     if status.uds {
@@ -209,7 +229,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     if status.tcp {
         transports.push("tcp");
     }
-    json!({
+    let mut v = json!({
         "running": true,
         "listenMode": status.listen_mode,
         "transports": transports,
@@ -234,7 +254,18 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             "hasDisplay": status.has_display,
             "locality": if is_local { "local" } else { "remote" },
         },
-    })
+    });
+    let obj = v.as_object_mut().expect("status_json literal is an object");
+    if let Some(budget) = status.agent_memory_budget_bytes {
+        obj.insert("agentMemoryBudgetBytes".into(), budget.into());
+    }
+    if let Some(charged) = status.agent_memory_charged_bytes {
+        obj.insert("agentMemoryChargedBytes".into(), charged.into());
+    }
+    if let Some(queued) = status.queued_spawns {
+        obj.insert("queuedSpawns".into(), queued.into());
+    }
+    v
 }
 
 /// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only
