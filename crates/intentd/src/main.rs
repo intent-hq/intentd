@@ -12,7 +12,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
-use intent_core::{Config, ServerControl, WorkspaceApi};
+use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
     agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
     max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
@@ -1911,11 +1911,19 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
 /// exists to serve: by the time anyone captures a debug bundle the overshoot
 /// is minutes in the past and the tree has drained back to baseline. The peak
 /// survives it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChildTreeSample {
     count: usize,
     memory_bytes: u64,
     peak_memory_bytes: u64,
+    /// Resident bytes bucketed by registered agent root (monorepo#2063 Phase
+    /// A): each descendant's RSS credited to its nearest registered agent root,
+    /// from the same sweep as `memory_bytes` so the buckets and the aggregate
+    /// describe one tree. Descendants under no registered root (one-shot
+    /// adapter chains, `host.exec` children) appear only in the aggregate.
+    /// Measurement only today — nothing enforces per-agent limits with it.
+    /// Behind an `Arc` so `load()` stays a cheap clone.
+    agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
     /// Sweep counter, incremented on every store. Carried inside the sample for
     /// the same reason the other three fields are published together: the spawn
     /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
@@ -1938,16 +1946,17 @@ struct ChildTreeUsage {
 }
 
 impl ChildTreeUsage {
-    fn store(&self, count: usize, memory_bytes: u64) {
+    fn store(&self, count: usize, memory_bytes: u64, agent_bytes: HashMap<AgentId, u64>) {
         let mut guard = self.inner.write().expect("child tree usage lock poisoned");
-        let peak_memory_bytes = guard.map_or(memory_bytes, |prev| {
+        let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
         });
-        let seq = guard.map_or(1, |prev| prev.seq.wrapping_add(1));
+        let seq = guard.as_ref().map_or(1, |prev| prev.seq.wrapping_add(1));
         *guard = Some(ChildTreeSample {
             count,
             memory_bytes,
             peak_memory_bytes,
+            agent_bytes: std::sync::Arc::new(agent_bytes),
             seq,
         });
     }
@@ -1981,7 +1990,10 @@ impl ChildTreeUsage {
     }
 
     fn load(&self) -> Option<ChildTreeSample> {
-        *self.inner.read().expect("child tree usage lock poisoned")
+        self.inner
+            .read()
+            .expect("child tree usage lock poisoned")
+            .clone()
     }
 }
 
@@ -2058,10 +2070,19 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Aggregate `(process count, resident bytes)` of every pid reachable from
-/// `root` through the `pid -> children` adjacency, excluding `root` itself —
-/// the root is already reported as `memoryBytes`, and counting it twice would
-/// inflate every bundle's tree total.
+/// Aggregate `(process count, resident bytes, per-agent resident bytes)` of
+/// every pid reachable from `root` through the `pid -> children` adjacency,
+/// excluding `root` itself — the root is already reported as `memoryBytes`,
+/// and counting it twice would inflate every bundle's tree total.
+///
+/// `agent_roots` maps each registered agent's spawned child pid to its agent
+/// id. During the walk, every descendant is additionally credited to the
+/// nearest such root at or above it (an agent root is credited to its own
+/// bucket, a nested agent root starts a new bucket for its own subtree), so
+/// the buckets are a partition of the subset of the tree that sits under a
+/// registered agent. Descendants under no registered root count only toward
+/// the aggregate. One pass, O(processes) — attribution rides the existing
+/// traversal instead of re-walking per agent.
 ///
 /// Split from [`descendant_tree_usage`] so the traversal is testable without a
 /// live process table. The walk is iterative and visited-guarded: a pid table
@@ -2071,36 +2092,57 @@ fn walk_descendants(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
     root: sysinfo::Pid,
-) -> (usize, u64) {
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
     let mut count = 0usize;
     let mut bytes = 0u64;
+    let mut agent_bytes: HashMap<AgentId, u64> = HashMap::new();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
-    let mut stack = vec![root];
-    while let Some(pid) = stack.pop() {
+    // Each frame carries the bucket its subtree inherits: the nearest
+    // registered agent root at or above it (`None` outside any agent subtree).
+    let mut stack: Vec<(sysinfo::Pid, Option<&AgentId>)> = vec![(root, None)];
+    while let Some((pid, bucket)) = stack.pop() {
         for child in children.get(&pid).into_iter().flatten() {
             if !seen.insert(*child) {
                 continue;
             }
+            // A registered agent root opens its own bucket — including when
+            // nested under another agent's subtree, so a sub-agent's usage is
+            // credited to the sub-agent, not its ancestor.
+            let child_bucket = agent_roots.get(child).or(bucket);
             if let Some(memory) = memory_of(*child) {
                 count += 1;
                 bytes = bytes.saturating_add(memory);
+                if let Some(agent) = child_bucket {
+                    let slot = agent_bytes.entry(agent.clone()).or_insert(0);
+                    *slot = slot.saturating_add(memory);
+                }
             }
-            stack.push(*child);
+            stack.push((*child, child_bucket));
         }
     }
-    (count, bytes)
+    (count, bytes, agent_bytes)
 }
 
 /// Walk `root`'s descendants in the refreshed process table, returning
-/// `(process count, aggregate resident bytes)`.
-fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u64) {
+/// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+fn descendant_tree_usage(
+    sys: &sysinfo::System,
+    root: sysinfo::Pid,
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
         if let Some(parent) = proc.parent() {
             children.entry(parent).or_default().push(*pid);
         }
     }
-    walk_descendants(&children, &|pid| sys.process(pid).map(|p| p.memory()), root)
+    walk_descendants(
+        &children,
+        &|pid| sys.process(pid).map(|p| p.memory()),
+        root,
+        agent_roots,
+    )
 }
 
 /// What one poll of the descendant-tree sampler should do.
@@ -2186,9 +2228,25 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
                 ChildTreeSweep::Peak => false,
             };
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
-            let (count, bytes) = descendant_tree_usage(&sys, pid);
+            // Snapshot of registered agent root pids, taken alongside the
+            // process-table refresh so the buckets describe the same instant
+            // as the tree they partition. Burst (peak-only) sweeps skip it:
+            // `observe_burst` consumes only the aggregate bytes, so paying
+            // the handles lock + per-descendant bucketing at sub-second
+            // cadence would buy nothing — an empty map keeps the walk on
+            // its aggregate-only fast path.
+            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
+                manager
+                    .agent_root_pids()
+                    .into_iter()
+                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
             if publish {
-                task_usage.store(count, bytes);
+                task_usage.store(count, bytes, agent_bytes);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -2328,9 +2386,9 @@ impl SystemControl for DaemonControl {
             hostname,
             cpu_percent,
             memory_bytes,
-            child_processes: child_tree.map(|s| s.count),
-            child_memory_bytes: child_tree.map(|s| s.memory_bytes),
-            child_memory_peak_bytes: child_tree.map(|s| s.peak_memory_bytes),
+            child_processes: child_tree.as_ref().map(|s| s.count),
+            child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
+            child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
@@ -4695,11 +4753,42 @@ mod tests {
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
-        usage.store(6, 4_294_967_296);
+        usage.store(6, 4_294_967_296, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.count, 6);
         assert_eq!(sample.memory_bytes, 4_294_967_296);
         assert_eq!(sample.peak_memory_bytes, 4_294_967_296);
+    }
+
+    /// The per-agent buckets are published with, and replaced by, each full
+    /// sample — they describe the same sweep as `memory_bytes`, so a stale
+    /// bucket surviving a later sweep would pair buckets from one tree with
+    /// an aggregate from another.
+    #[test]
+    fn child_tree_usage_agent_buckets_follow_the_sample() {
+        let usage = ChildTreeUsage::default();
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            4,
+            1_000,
+            HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+        );
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.agent_bytes.get(&a), Some(&700));
+        assert_eq!(sample.agent_bytes.get(&b), Some(&200));
+
+        // A burst reading moves only the peak — the buckets stay put.
+        usage.observe_burst(9_000);
+        let after_burst = usage.load().expect("sampled");
+        assert_eq!(after_burst.agent_bytes, sample.agent_bytes);
+
+        // The next full sample replaces the buckets wholesale: an agent that
+        // exited between sweeps must not linger.
+        usage.store(1, 300, HashMap::from([(b.clone(), 300)]));
+        let next = usage.load().expect("sampled");
+        assert_eq!(next.agent_bytes.get(&a), None);
+        assert_eq!(next.agent_bytes.get(&b), Some(&300));
     }
 
     /// The peak must survive the tree draining back to baseline — that is the
@@ -4709,9 +4798,9 @@ mod tests {
     #[test]
     fn child_tree_usage_peak_is_a_high_water_mark() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000);
-        usage.store(24, 5_000_000_000);
-        usage.store(0, 0);
+        usage.store(4, 1_000_000_000, HashMap::new());
+        usage.store(24, 5_000_000_000, HashMap::new());
+        usage.store(0, 0, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
@@ -4728,9 +4817,9 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_reaches_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(0, 10_000_000);
+        usage.store(0, 10_000_000, HashMap::new());
         usage.observe_burst(6_970_000_000);
-        usage.store(0, 10_000_000);
+        usage.store(0, 10_000_000, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(
             sample.peak_memory_bytes, 6_970_000_000,
@@ -4747,7 +4836,7 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_moves_only_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000);
+        usage.store(4, 1_000_000_000, HashMap::new());
         let before = usage.load().expect("sampled");
         usage.observe_burst(7_000_000_000);
         let after = usage.load().expect("sampled");
@@ -4800,14 +4889,14 @@ mod tests {
         const A: (usize, u64) = (4, 1_000_000_000);
         const B: (usize, u64) = (24, 5_000_000_000);
         let usage = Arc::new(ChildTreeUsage::default());
-        usage.store(A.0, A.1);
+        usage.store(A.0, A.1, HashMap::new());
 
         let writer = {
             let usage = usage.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
                     let (count, bytes) = if i % 2 == 0 { A } else { B };
-                    usage.store(count, bytes);
+                    usage.store(count, bytes, HashMap::new());
                 }
             })
         };
@@ -4858,10 +4947,90 @@ mod tests {
         // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
         let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
         let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
         assert_eq!(bytes, 1400);
+        assert!(agent_bytes.is_empty(), "no registered roots, no buckets");
+    }
+
+    /// Attribution buckets each descendant under its nearest registered agent
+    /// root: the root's own RSS and its whole chain (npm exec → adapter → CLI)
+    /// are credited to the agent, siblings land in separate buckets, and a
+    /// descendant under no registered root counts only toward the aggregate.
+    #[test]
+    fn walk_descendants_buckets_rss_by_nearest_agent_root() {
+        // 1 (daemon) → 2 (agent A root) → 3 → 4, a sibling agent 1 → 5 (agent
+        // B root), and an unregistered chain 1 → 6 → 7 (host.exec-style).
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (1, 6), (6, 7)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(5), b.clone()),
+        ]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(count, 6);
+        assert_eq!(bytes, 200 + 300 + 400 + 500 + 600 + 700);
+        // Agent A: its root 2 plus descendants 3 and 4.
+        assert_eq!(agent_bytes.get(&a), Some(&(200 + 300 + 400)));
+        // Agent B: just its root 5.
+        assert_eq!(agent_bytes.get(&b), Some(&500));
+        // 6 → 7 is under no registered root: aggregate-only.
+        assert_eq!(agent_bytes.values().sum::<u64>(), 1400);
+    }
+
+    /// A registered root nested under another agent's subtree opens its own
+    /// bucket — a sub-agent's usage is credited to the sub-agent, not folded
+    /// into its ancestor's bucket (the buckets partition the tree).
+    #[test]
+    fn walk_descendants_nested_agent_root_starts_its_own_bucket() {
+        // 1 → 2 (agent A root) → 3 (agent B root, nested) → 4.
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(3), b.clone()),
+        ]);
+        let (_, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(bytes, 200 + 300 + 400);
+        assert_eq!(agent_bytes.get(&a), Some(&200), "only its own pid");
+        assert_eq!(agent_bytes.get(&b), Some(&(300 + 400)));
+    }
+
+    /// A registered root whose pid is not in the walked tree (already exited,
+    /// or its subtree reparented to init) simply contributes no bucket — the
+    /// aggregate is unaffected and no phantom zero-byte entry appears.
+    #[test]
+    fn walk_descendants_ignores_agent_roots_outside_the_tree() {
+        let children = adjacency(&[(1, 2)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        let roots = HashMap::from([(sysinfo::Pid::from(42), AgentId::from("agent-gone"))]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 10));
+        assert!(agent_bytes.is_empty());
+    }
+
+    /// An agent root that vanished mid-walk (its memory read fails) still
+    /// buckets the live descendants underneath it — the chain below a dead
+    /// `npm exec` is exactly the RSS the agent is responsible for.
+    #[test]
+    fn walk_descendants_buckets_survive_a_dead_agent_root() {
+        let children = adjacency(&[(1, 2), (2, 3)]);
+        let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
+        let a = AgentId::from("agent-a");
+        let roots = HashMap::from([(sysinfo::Pid::from(2), a.clone())]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 700));
+        assert_eq!(agent_bytes.get(&a), Some(&700));
     }
 
     /// A pid table sampled while processes exit and get reparented can contain
@@ -4871,7 +5040,8 @@ mod tests {
     fn walk_descendants_terminates_on_a_cycle() {
         let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 2, "each pid is counted exactly once");
         assert_eq!(bytes, 20);
     }
@@ -4883,7 +5053,8 @@ mod tests {
     fn walk_descendants_skips_pids_that_exited_mid_walk() {
         let children = adjacency(&[(1, 2), (2, 3)]);
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 1);
         assert_eq!(bytes, 700);
     }
@@ -4894,8 +5065,8 @@ mod tests {
         let children = adjacency(&[(9, 10)]);
         let memory = |_: sysinfo::Pid| Some(10);
         assert_eq!(
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1)),
-            (0, 0)
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
+            (0, 0, HashMap::new())
         );
     }
 }
