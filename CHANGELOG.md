@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.21] - 2026-08-14
+
+### 🚀 Features
+
+- Opt-in agentFeatures.taskGraph flag gating task-graph teaching ([#1226](https://github.com/intent-hq/intentd/pull/1226))
+
+### 🐛 Bug Fixes
+
+- Capture taskGraph for unblocked wakes per session
+
+
 ## [0.6.20] - 2026-08-14
 
 ### 🐛 Bug Fixes
