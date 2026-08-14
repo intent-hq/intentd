@@ -1213,19 +1213,25 @@ mod task_delta_re_read {
     use std::collections::HashSet;
 
     /// Minimal `WorkspaceApi` that serves pre-canned [`Note`]s from `get_note`
-    /// by id — `spec` for the spec fixture, anything else for the task-note
-    /// fixture (`NotFound` when the fixture is `None`) — and both fixtures
-    /// from `list_notes` (the spec-flip path's one bounded read). Everything
-    /// else falls through to the trait defaults, which is fine because
+    /// by id — `spec` for the spec fixture, `other`'s own id for the second
+    /// task-note fixture, anything else for the primary task-note fixture
+    /// (`NotFound` when the fixture is `None`) — and all fixtures from
+    /// `list_notes` (the spec-flip path's one bounded read). Everything else
+    /// falls through to the trait defaults, which is fine because
     /// `task_delta` only touches these two.
     struct StaticNoteApi {
         note: Option<Note>,
         spec: Option<Note>,
+        other: Option<Note>,
     }
 
     impl StaticNoteApi {
         fn new(note: Option<Note>) -> Self {
-            Self { note, spec: None }
+            Self {
+                note,
+                spec: None,
+                other: None,
+            }
         }
     }
 
@@ -1237,6 +1243,8 @@ mod task_delta_re_read {
         ) -> BoxFuture<'_, Result<Note>> {
             let note = if note_id.as_str() == "spec" {
                 self.spec.clone()
+            } else if self.other.as_ref().is_some_and(|n| n.id == note_id) {
+                self.other.clone()
             } else {
                 self.note.clone()
             };
@@ -1247,7 +1255,13 @@ mod task_delta_re_read {
             &'a self,
             _workspace_id: &'a WorkspaceId,
         ) -> BoxFuture<'a, Result<Vec<Note>>> {
-            let notes: Vec<Note> = self.spec.iter().chain(self.note.iter()).cloned().collect();
+            let notes: Vec<Note> = self
+                .spec
+                .iter()
+                .chain(self.note.iter())
+                .chain(self.other.iter())
+                .cloned()
+                .collect();
             Box::pin(async move { Ok(notes) })
         }
     }
@@ -1458,6 +1472,56 @@ mod task_delta_re_read {
         let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "spec"), &mut linked).await;
         assert!(d.is_none(), "no delta expected: {d:?}");
         assert!(linked.contains("ghost"), "the tracked set still advances");
+    }
+
+    #[tokio::test]
+    async fn per_task_stamp_must_not_adopt_other_tasks_link_changes() {
+        // Interleaving race (PR #1224 review, r3784216992): a spec write that
+        // links n-2 commits, then n-1's own event is processed BEFORE the
+        // spec's `note:updated` reaches the forwarder. The per-task arm's
+        // fresh spec read already sees n-2's link, but must update only n-1
+        // in the tracked set — adopting n-2's membership without re-emitting
+        // its row would make the later flip diff see no difference, leaving
+        // the subscriber's n-2 flag permanently stale.
+        let mut api = StaticNoteApi::new(Some(note_with(Some(TaskMetadata::default()))));
+        api.other = Some(Note {
+            id: NoteId::from("n-2"),
+            ..note_with(Some(TaskMetadata::default()))
+        });
+        api.spec = Some(spec_note("- [ ] [Other](intent://local/task/n-2)"));
+        let mut linked = HashSet::new();
+        let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), &mut linked)
+            .await
+            .expect("delta must be emitted");
+        assert_eq!(d["updated"][0]["specLinked"], false, "delta: {d}");
+        assert!(
+            !linked.contains("n-2"),
+            "per-task stamp must not adopt n-2's membership: {linked:?}"
+        );
+        // The spec event arrives next: its flip diff still sees n-2 as new
+        // and re-emits the row the subscriber has never seen linked.
+        let d = task_delta(&api, &ws(), &note_event(NOTE_UPDATED, "spec"), &mut linked)
+            .await
+            .expect("flip delta must be emitted");
+        assert_eq!(d["updated"][0]["id"], "n-2", "delta: {d}");
+        assert_eq!(d["updated"][0]["specLinked"], true, "delta: {d}");
+    }
+
+    #[tokio::test]
+    async fn spec_deletion_emits_updated_rows_unlinking_tracked_tasks() {
+        // Spec `note:deleted` routes through the same flip diff against the
+        // now-empty link set (PR #1224 review, r3784217143): every tracked
+        // task is re-emitted `specLinked: false` instead of the subscriber
+        // holding stale flags forever.
+        let api = StaticNoteApi::new(Some(note_with(Some(TaskMetadata::default()))));
+        let mut linked = HashSet::from(["n-1".to_string()]);
+        let d = task_delta(&api, &ws(), &note_event(NOTE_DELETED, "spec"), &mut linked)
+            .await
+            .expect("flip delta must be emitted");
+        assert_eq!(d["updated"][0]["id"], "n-1");
+        assert_eq!(d["updated"][0]["specLinked"], false, "delta: {d}");
+        assert!(d.get("removedIds").is_none(), "delta: {d}");
+        assert!(linked.is_empty(), "tracked set must drain: {linked:?}");
     }
 }
 

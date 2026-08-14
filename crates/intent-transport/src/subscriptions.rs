@@ -1175,38 +1175,50 @@ fn task_note_value(note: Note, linked: &HashSet<String>) -> Option<Value> {
     Some(value)
 }
 
-/// Refresh the tracked spec link set from ONE bounded `get_note("spec")`
-/// read (the snapshot reuses its own `list_notes` read instead). A missing
-/// spec degrades to the empty set (every row `specLinked: false`), matching
-/// `task.list`. Unlike `task_get` (which propagates non-NotFound store
-/// errors), a TRANSIENT read error also degrades to the empty set here:
-/// dropping the delta would lose the row change itself, which is worse than a
-/// conservatively-false flag that self-corrects on the task's next event (or
-/// on the next spec-body edit, whose flip diff re-emits the affected rows —
-/// see [`spec_link_flip_delta`]).
-async fn refresh_spec_linked_ids(
+/// Resolve `note_id`'s CURRENT spec linkage from ONE bounded
+/// `get_note("spec")` read and record it in the tracked set — touching ONLY
+/// that id. The set must keep reflecting what was last STAMPED onto emitted
+/// rows, per id: a fresh spec read here may already contain link changes for
+/// OTHER tasks whose spec `note:updated` has not reached this forwarder yet,
+/// and adopting those memberships without re-emitting their rows would make
+/// the later flip diff see no difference — a permanently stale subscriber
+/// flag, the very bug class of monorepo#2407. A missing spec degrades to
+/// unlinked (`specLinked: false`), matching `task.list`. Unlike `task_get`
+/// (which propagates non-NotFound store errors), a TRANSIENT read error also
+/// degrades to unlinked here: dropping the delta would lose the row change
+/// itself, which is worse than a conservatively-false flag that self-corrects
+/// on the task's next event (or on the next spec-body edit, whose flip diff
+/// re-emits the affected rows — see [`spec_link_flip_delta`]).
+async fn stamp_spec_linked(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
+    note_id: &str,
     linked: &mut HashSet<String>,
 ) {
-    *linked = match api
+    let is_linked = match api
         .get_note(workspace_id.clone(), NoteId::from("spec"))
         .await
     {
-        Ok(spec) => extract_spec_task_ids(&spec.content),
-        Err(_) => HashSet::new(),
+        Ok(spec) => extract_spec_task_ids(&spec.content).contains(note_id),
+        Err(_) => false,
     };
+    if is_linked {
+        linked.insert(note_id.to_string());
+    } else {
+        linked.remove(note_id);
+    }
 }
 
-/// Map a spec-body `note:updated` to `updated` rows for the tasks whose
-/// `specLinked` flag flipped (monorepo#2407): ONE `list_notes` read yields
-/// both the new link set (from the spec's own content) and the task rows to
-/// re-emit, keeping the O(rows) cost contract — no per-task scans. Ids in the
-/// symmetric difference against the tracked set that are not task notes
-/// (dangling links) flip silently; an edit that leaves the link set unchanged
-/// emits nothing. The tracked set is replaced so every stamp the subscriber
-/// has seen agrees with it; on a read error the delta is dropped and the set
-/// kept (the next spec read reconverges).
+/// Map a spec `note:updated` / `note:deleted` to `updated` rows for the
+/// tasks whose `specLinked` flag flipped (monorepo#2407): ONE `list_notes`
+/// read yields both the new link set (from the spec's own content; empty
+/// when the spec is gone, so a deletion unlinks every tracked task) and the
+/// task rows to re-emit, keeping the O(rows) cost contract — no per-task
+/// scans. Ids in the symmetric difference against the tracked set that are
+/// not task notes (dangling links) flip silently; an edit that leaves the
+/// link set unchanged emits nothing. The tracked set is replaced so every
+/// stamp the subscriber has seen agrees with it; on a read error the delta
+/// is dropped and the set kept (the next spec read reconverges).
 async fn spec_link_flip_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
@@ -1241,12 +1253,15 @@ async fn spec_link_flip_delta(
 /// extra spec-note read per delta, still O(rows) — see [`task_note_value`]).
 ///
 /// The mapper is stateful: `linked` tracks the spec's task-link set as last
-/// stamped onto emitted rows (seeded from [`task_snapshot`]'s read). A
-/// `note:updated` for the SPEC itself routes to [`spec_link_flip_delta`],
-/// which diffs the new link set against `linked` and re-emits exactly the
-/// flipped task rows (monorepo#2407) instead of the old junk
-/// `removedIds: ["spec"]` demotion; every other spec read refreshes `linked`
-/// in passing so the diff base stays honest.
+/// stamped onto emitted rows (seeded from [`task_snapshot`]'s read).
+/// `note:updated` AND `note:deleted` for the SPEC itself route to
+/// [`spec_link_flip_delta`], which diffs the new link set against `linked`
+/// (empty after a deletion) and re-emits exactly the flipped task rows
+/// (monorepo#2407) instead of the old junk `removedIds: ["spec"]` demotion.
+/// Per-task arms stamp the event's own row via [`stamp_spec_linked`], which
+/// updates ONLY that id in `linked` — never the whole set, so link changes
+/// for other tasks stay visible to the flip diff of the spec event that
+/// carries them.
 pub(crate) async fn task_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
@@ -1255,7 +1270,9 @@ pub(crate) async fn task_delta(
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
-        NOTE_UPDATED if note_id == "spec" => spec_link_flip_delta(api, workspace_id, linked).await,
+        NOTE_UPDATED | NOTE_DELETED if note_id == "spec" => {
+            spec_link_flip_delta(api, workspace_id, linked).await
+        }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         NOTE_CREATED => {
             let note = api
@@ -1263,7 +1280,7 @@ pub(crate) async fn task_delta(
                 .await
                 .ok()?;
             note.metadata.task.as_ref()?;
-            refresh_spec_linked_ids(api, workspace_id, linked).await;
+            stamp_spec_linked(api, workspace_id, note_id, linked).await;
             Some(json!({ "added": [task_note_value(note, linked)?] }))
         }
         NOTE_UPDATED | TASK_STATUS_CHANGED => {
@@ -1274,7 +1291,7 @@ pub(crate) async fn task_delta(
             if note.metadata.task.is_none() {
                 return Some(json!({ "removedIds": [note_id] }));
             }
-            refresh_spec_linked_ids(api, workspace_id, linked).await;
+            stamp_spec_linked(api, workspace_id, note_id, linked).await;
             Some(json!({ "updated": [task_note_value(note, linked)?] }))
         }
         _ => None,
