@@ -1674,12 +1674,29 @@ impl AgentManager {
     /// root; it is a point-in-time snapshot, so a pid may already be dead by
     /// the time the caller walks the process table — the walk simply finds no
     /// process for it.
+    ///
+    /// Handles whose child has already been reaped are omitted too: a dead
+    /// child's handle stays installed until the exit watcher removes it, and
+    /// in that window the OS can recycle the pid for an unrelated process —
+    /// mapping it would credit that stranger's subtree to the old agent.
+    /// `try_wait` is cheap and idempotent (tokio caches the exit status), so
+    /// this costs one non-blocking syscall per live handle. An indeterminate
+    /// `try_wait` error is treated as reaped: the pid cannot be trusted, and
+    /// its subtree falls back to the aggregate rather than a wrong bucket.
     pub fn agent_root_pids(&self) -> HashMap<u32, AgentId> {
         self.handles
             .lock()
             .unwrap()
-            .iter()
-            .filter_map(|(agent_id, handle)| handle.child_pid.map(|pid| (pid, agent_id.clone())))
+            .iter_mut()
+            .filter_map(|(agent_id, handle)| {
+                let pid = handle.child_pid?;
+                if let Some(child) = handle._child.as_mut() {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        return None;
+                    }
+                }
+                Some((pid, agent_id.clone()))
+            })
             .collect()
     }
 
@@ -10275,6 +10292,41 @@ mod dead_child_respawn_tests {
 
         mgr.stop(&with_pid).await;
         mgr.stop(&pidless).await;
+    }
+
+    /// A handle whose child has already exited must drop out of the map even
+    /// while the handle itself is still installed (the exit watcher removes
+    /// it only on its next poll): in that window the OS can recycle the pid
+    /// for an unrelated process, and mapping it would credit that stranger's
+    /// subtree to the dead agent.
+    #[tokio::test]
+    async fn agent_root_pids_omits_handles_whose_child_was_reaped() {
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+
+        let agent_id = AgentId::from("agent-reaped-root");
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        assert!(child.id().is_some(), "unreaped child still reports a pid");
+        let _ends = install_fake_handle(&mgr, &agent_id, Some(child));
+
+        // The child exits on its own; once `try_wait` observes that, the
+        // mapping must be gone. Poll up to a deadline — the exit is quick
+        // but not synchronous with the spawn returning.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mgr.agent_root_pids().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reaped child stayed in agent_root_pids"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "only the mapping drops out; the handle awaits the exit watcher"
+        );
+        mgr.stop(&agent_id).await;
     }
 }
 
