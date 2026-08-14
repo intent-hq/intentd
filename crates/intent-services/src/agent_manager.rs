@@ -578,7 +578,12 @@ fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
 
 /// LRU idle entry excluding `exclude` — the turn-start budget gate's eviction
 /// candidate list (monorepo#2063 B8): the gated agent's own process is never
-/// its own victim (evicting it would only trade this gate for the spawn gate).
+/// its own gate's victim (evicting it would only trade this gate for the spawn
+/// gate). Other admission paths — a concurrent spawn `acquire`, or another
+/// turn-start gate — select via their own candidate lists and may still evict
+/// a process parked here; its waiter then wakes via `deregister`, re-classifies
+/// as unregistered, admits, and respawns through the spawn gate (queued, never
+/// refused, message intact — the warm session is lost, not the turn).
 fn lru_idle_excluding(inner: &RegistryInner, exclude: &AgentId) -> Option<(AgentId, KillFn)> {
     inner
         .entries
@@ -1192,8 +1197,11 @@ impl ProcessRegistry {
     /// - The slot cap is not consulted: the process already holds its slot.
     /// - Admission charges no provisional cost: the warm process is already
     ///   inside the tree sample, so charging would double-count it.
-    /// - Its own idle process is never the eviction victim: that would only
-    ///   trade this gate for the spawn gate and lose the warm session.
+    /// - Its own idle process is never *this gate's* eviction victim: that
+    ///   would only trade this gate for the spawn gate and lose the warm
+    ///   session. Other admission paths may still reclaim it while it waits
+    ///   (see [`lru_idle_excluding`]); the turn then degrades to the spawn
+    ///   gate — still queued, never refused.
     /// - A process marked ACTIVE admits immediately: busy agents are never
     ///   gated mid-turn (regression-pinned).
     ///
@@ -1209,37 +1217,45 @@ impl ProcessRegistry {
             let action = {
                 let mut inner = self.inner.lock().unwrap();
                 let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
-                if !idle_here || self.budget_denies(&mut inner).is_none() {
-                    Action::Admit
-                } else if let Some((id, kill)) = lru_idle_excluding(&inner, agent_id) {
-                    Action::Evict(id, kill)
+                let over_budget = if idle_here {
+                    self.budget_denies(&mut inner)
                 } else {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    // Same waiter hygiene as `acquire`: drop dead receivers
-                    // before re-queueing on the timed budget re-check.
-                    inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
-                    inner
-                        .wait_queue
-                        .push((agent_id.clone(), tx, REASON_MEMORY_BUDGET));
-                    let used = inner.entries.len();
-                    tracing::info!(
-                        agent = %agent_id,
-                        used = used,
-                        cap = self.cap,
-                        budget_bytes = self.memory.get().map(|b| b.budget_bytes),
-                        "process registry: turn start queued (aggregate memory budget)"
-                    );
-                    if let Some(ref f) = self.event_fn {
-                        let fut = f(
-                            agent_id,
-                            "agent:process:queued",
-                            used,
-                            self.cap,
-                            REASON_MEMORY_BUDGET,
+                    None
+                };
+                if let Some(charged) = over_budget {
+                    if let Some((id, kill)) = lru_idle_excluding(&inner, agent_id) {
+                        Action::Evict(id, kill)
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        // Same waiter hygiene as `acquire`: drop dead receivers
+                        // before re-queueing on the timed budget re-check.
+                        inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
+                        inner
+                            .wait_queue
+                            .push((agent_id.clone(), tx, REASON_MEMORY_BUDGET));
+                        let used = inner.entries.len();
+                        tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            charged_memory_bytes = charged,
+                            budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            "process registry: turn start queued (aggregate memory budget)"
                         );
-                        tokio::spawn(fut);
+                        if let Some(ref f) = self.event_fn {
+                            let fut = f(
+                                agent_id,
+                                "agent:process:queued",
+                                used,
+                                self.cap,
+                                REASON_MEMORY_BUDGET,
+                            );
+                            tokio::spawn(fut);
+                        }
+                        Action::Wait(rx)
                     }
-                    Action::Wait(rx)
+                } else {
+                    Action::Admit
                 }
             };
             match action {
