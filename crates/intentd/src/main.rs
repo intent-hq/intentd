@@ -1114,8 +1114,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
-    // Aggregate child-tree memory budget (monorepo#2063), off unless
-    // `agents.memoryBudgetMb` is set. `process_cap` bounds agent *slots*, which
+    // Aggregate child-tree memory budget (monorepo#2063), installed only when
+    // `agents.memoryBudgetMb` is an explicit positive value — an absent key
+    // means auto but its resolution to the recommended budget is not wired
+    // yet, and an explicit 0 means off. `process_cap` bounds agent *slots*, which
     // is not a memory bound: a single agent's subtree was measured from 436 MB
     // idle to 9.6 GB running a test suite. When installed, the budget reads the
     // same descendant-tree sampler `system.status` reports (intentd#1139) and
@@ -1135,7 +1137,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                 "aggregate agent memory budget enabled"
             );
         }
-        None => tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)"),
+        None => tracing::debug!(
+            "aggregate agent memory budget not installed (agents.memoryBudgetMb absent or 0)"
+        ),
     }
     tracing::info!(
         process_cap = manager.registry().cap(),

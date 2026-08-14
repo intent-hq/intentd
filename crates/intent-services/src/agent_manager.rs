@@ -437,8 +437,9 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 /// agent's worth of slack still inside the 40 GB the slot cap already considers
 /// spendable — and the 21.5 GB tree measured in #2063 would have crossed it.
 ///
-/// Only a recommendation today: `agents.memoryBudgetMb` defaults to 0 (off), so
-/// nothing calls this at runtime until the default is flipped.
+/// Only a recommendation today: `agents.memoryBudgetMb` defaults to auto (the
+/// absent key; explicit 0 = off), and nothing calls this at runtime until the
+/// boot wiring resolves auto to this value.
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
 }
@@ -515,9 +516,20 @@ pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
 /// Invoked by the registry when a spawn queues, resumes, or an idle process is
-/// evicted; the manager wires this to log + publish workspace events.
+/// evicted; the manager wires this to log + publish workspace events. The final
+/// parameter is the machine-readable `reason` — [`REASON_SLOTS`] or
+/// [`REASON_MEMORY_BUDGET`] — naming which admission constraint drove the event
+/// (monorepo#2063).
 pub type ProcessEventFn =
-    Arc<dyn Fn(&AgentId, &str, usize, usize) -> BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(&AgentId, &str, usize, usize, &str) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// `reason` value for `agent:process:*` events driven by the concurrency slot
+/// cap (all slots active / a slot freed).
+pub const REASON_SLOTS: &str = "slots";
+
+/// `reason` value for `agent:process:*` events driven by the aggregate memory
+/// budget (monorepo#2063).
+pub const REASON_MEMORY_BUDGET: &str = "memory-budget";
 
 struct ProcessEntry {
     last_active_ms: u64,
@@ -528,8 +540,10 @@ struct ProcessEntry {
 #[derive(Default)]
 struct RegistryInner {
     entries: HashMap<AgentId, ProcessEntry>,
-    /// Queue of waiting spawns, each carrying the agent id + oneshot channel.
-    wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>)>,
+    /// Queue of waiting spawns, each carrying the agent id + oneshot channel +
+    /// the reason it queued ([`REASON_SLOTS`] / [`REASON_MEMORY_BUDGET`]), so
+    /// the matching `agent:process:resumed` can echo it back.
+    wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)>,
     /// Sample id [`ProcessRegistry::budget_denies`] last corrected against.
     /// `None` until the first sample is consulted.
     budget_sample_seq: Option<u64>,
@@ -538,7 +552,9 @@ struct RegistryInner {
     budget_pending_bytes: i64,
 }
 
-fn pop_waiter(inner: &mut RegistryInner) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>)> {
+fn pop_waiter(
+    inner: &mut RegistryInner,
+) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)> {
     // Skip senders whose receiver is gone. A memory-budget waiter re-queues
     // after each [`BUDGET_RECHECK`] and an abandoned `acquire` future drops its
     // receiver outright, so handing the wakeup to a dead entry would consume it
@@ -776,8 +792,9 @@ pub struct ProcessRegistry {
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
     /// Optional aggregate memory budget, installed once by the composition root
-    /// when `agents.memoryBudgetMb` is non-zero. Absent (the default) leaves
-    /// every path below byte-for-byte identical to the slot-cap-only behaviour.
+    /// when `agents.memoryBudgetMb` resolves to a positive budget. Not installed
+    /// (explicit 0 = off, or auto pending its boot wiring) leaves every path
+    /// below byte-for-byte identical to the slot-cap-only behaviour.
     memory: std::sync::OnceLock<MemoryBudget>,
 }
 
@@ -854,7 +871,8 @@ impl ProcessRegistry {
 
     /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
     /// Chainable builder; returns `Self` so the manager can wire this after
-    /// construction. The callback signature is `(agent_id, event_type, used, cap)`.
+    /// construction. The callback signature is
+    /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
         self
@@ -903,17 +921,18 @@ impl ProcessRegistry {
             self.budget_adjust(&mut inner, -1);
             pop_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx)) = resumed_agent {
+        if let Some((resumed_id, tx, reason)) = resumed_agent {
             let _ = tx.send(());
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
                 used = used,
                 cap = self.cap,
+                reason = reason,
                 "process registry: queued spawn resumed"
             );
             if let Some(ref f) = self.event_fn {
-                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
                 tokio::spawn(fut);
             }
         }
@@ -948,17 +967,18 @@ impl ProcessRegistry {
             }
             pop_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx)) = resumed_agent {
+        if let Some((resumed_id, tx, reason)) = resumed_agent {
             let _ = tx.send(());
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
                 used = used,
                 cap = self.cap,
+                reason = reason,
                 "process registry: queued spawn resumed"
             );
             if let Some(ref f) = self.event_fn {
-                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
                 tokio::spawn(fut);
             }
         }
@@ -982,7 +1002,9 @@ impl ProcessRegistry {
         loop {
             enum Action {
                 Slot,
-                Evict(AgentId, KillFn),
+                /// The `&'static str` is the reason the eviction was needed
+                /// ([`REASON_SLOTS`] / [`REASON_MEMORY_BUDGET`]).
+                Evict(AgentId, KillFn, &'static str),
                 /// The `bool` is true when the wait is on memory rather than a
                 /// slot, which needs a timed re-check rather than only a wakeup.
                 Wait(tokio::sync::oneshot::Receiver<()>, bool),
@@ -990,6 +1012,15 @@ impl ProcessRegistry {
             let action = {
                 let mut inner = self.inner.lock().unwrap();
                 let over_budget = self.budget_denies(&mut inner);
+                // Which admission constraint is binding right now. When both
+                // bind at once, the budget wins the label — matching the log
+                // discrimination below, and the budget is the constraint a
+                // freed slot alone cannot clear.
+                let reason = if over_budget.is_some() {
+                    REASON_MEMORY_BUDGET
+                } else {
+                    REASON_SLOTS
+                };
                 if inner.entries.len() < self.cap && over_budget.is_none() {
                     // Charge the spawn now: it will not appear in a tree sample
                     // for up to a sampling period, and a burst of spawns must not
@@ -997,13 +1028,13 @@ impl ProcessRegistry {
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
                 } else if let Some((id, kill)) = lru_idle(&inner) {
-                    Action::Evict(id, kill)
+                    Action::Evict(id, kill, reason)
                 } else {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     // Drop waiters whose receiver is gone before adding ours, so
                     // re-queueing on the budget re-check cannot grow the queue.
-                    inner.wait_queue.retain(|(_, tx)| !tx.is_closed());
-                    inner.wait_queue.push((agent_id.clone(), tx));
+                    inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
+                    inner.wait_queue.push((agent_id.clone(), tx, reason));
                     let used = inner.entries.len();
                     match over_budget {
                         Some(charged) => tracing::info!(
@@ -1022,7 +1053,7 @@ impl ProcessRegistry {
                         ),
                     }
                     if let Some(ref f) = self.event_fn {
-                        let fut = f(agent_id, "agent:process:queued", used, self.cap);
+                        let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
                         tokio::spawn(fut);
                     }
                     Action::Wait(rx, over_budget.is_some())
@@ -1030,16 +1061,17 @@ impl ProcessRegistry {
             };
             match action {
                 Action::Slot => return,
-                Action::Evict(id, kill) => {
+                Action::Evict(id, kill, reason) => {
                     let used = self.size();
                     tracing::info!(
                         evicted = %id,
                         used = used,
                         cap = self.cap,
+                        reason = reason,
                         "process registry: LRU idle process evicted"
                     );
                     if let Some(ref f) = self.event_fn {
-                        let fut = f(&id, "agent:process:evicted", used, self.cap);
+                        let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
                         tokio::spawn(fut);
                     }
                     kill().await;
@@ -1525,10 +1557,11 @@ impl AgentManager {
     pub fn new(services: Services, sink: Arc<dyn EventSink>, cap: usize) -> Self {
         // Wire the registry event function to publish process-cap lifecycle events.
         let services_clone = services.clone();
-        let event_fn: ProcessEventFn = Arc::new(move |agent_id, event_type, used, cap| {
+        let event_fn: ProcessEventFn = Arc::new(move |agent_id, event_type, used, cap, reason| {
             let services = services_clone.clone();
             let agent_id = agent_id.clone();
             let event_type = event_type.to_string();
+            let reason = reason.to_string();
             Box::pin(async move {
                 // Best-effort workspace lookup: process-cap events are global across
                 // workspaces, so when the session row is missing (mid-create or already
@@ -1547,6 +1580,7 @@ impl AgentManager {
                             "agentId": agent_id.0,
                             "used": used,
                             "cap": cap,
+                            "reason": reason,
                         }),
                     )
                     .await;
