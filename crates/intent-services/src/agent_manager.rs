@@ -82,11 +82,13 @@ fn stale_redrive_note(report_timestamp: &str) -> String {
 const STALE_REDRIVE_NOTE_PREFIX: &str =
     "[SYSTEM NOTE] This message was queued before you completed";
 
-/// Deterministic system note appended to every drained queue entry so the
+/// Deterministic system note appended to a drained queue entry so the
 /// target agent knows when the message entered the queue and how long it
 /// waited before delivery. Messages delivered immediately (never queued)
-/// are NOT annotated — the note is applied only on the queue-drain paths.
-/// Coexists with the #576 stale-redrive note (both may appear).
+/// are NOT annotated — the note is applied only on the queue-drain paths,
+/// and only when the wait reached [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`]
+/// (monorepo#2353). Coexists with the #576 stale-redrive note (both may
+/// appear).
 fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
     format!(
         "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
@@ -100,6 +102,28 @@ fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
 /// ("…queued before you completed"), so the two checks never shadow each
 /// other.
 const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+
+/// Minimum wait (milliseconds) before a drained entry earns the dequeue-wait
+/// annotation (monorepo#2353). Incidental queue hops — e.g. a question-wizard
+/// answer converted into an enqueue + immediate drain by the #1791
+/// FIFO-restore branch — deliver within moments, and a "waited 0s" note/chip
+/// is pure noise; a sub-threshold wait is treated like an immediate delivery
+/// (no [SYSTEM NOTE], no `queueInfo` stamp). Waits at/above the threshold are
+/// annotated unchanged (PROTOCOL §5.5).
+const DEQUEUE_WAIT_ANNOTATION_MIN_MS: i128 = 5_000;
+
+/// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
+/// env override (whole milliseconds). Primarily for tests/CI — the e2e
+/// suites park entries behind short (~2s) mock busy turns and assert the
+/// annotation, so they lower the threshold instead of slowing every turn
+/// past 5s. Mirrors the `INTENTD_*_RETRY_BACKOFF_MS` override pattern.
+fn dequeue_wait_annotation_min_ms() -> i128 {
+    std::env::var("INTENTD_DEQUEUE_WAIT_MIN_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(i128::from)
+        .unwrap_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS)
+}
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
 /// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
@@ -123,7 +147,10 @@ fn format_wait_duration(secs: i64) -> String {
 /// constraint — so those redrives skip the note entirely: the delivered
 /// prompt stays byte-identical to the persisted row, at the cost of no wait
 /// note for that entry. Fail open: an unparseable `queued_at` leaves the
-/// content untouched.
+/// content untouched. Threshold-gated (monorepo#2353): a wait below
+/// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] — including a negative wait from clock
+/// skew — skips both the note and the stamp, treating the sub-threshold hop
+/// like an immediate delivery.
 ///
 /// Alongside the content note, the entry's `messageMetadata` is stamped with
 /// structured queue info — `queueInfo: { queuedAt, waitedMs }` (PROTOCOL
@@ -131,7 +158,8 @@ fn format_wait_duration(secs: i64) -> String {
 /// wait for clients, riding the same metadata plumbing as the A2A sender
 /// attribution. Same guards as the note: an existing `queueInfo` is never
 /// overwritten (first-delivery numbers stay across requeues), and the
-/// persisted-entry / unparseable-`queued_at` skips above cover the stamp too.
+/// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
+/// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
@@ -144,6 +172,9 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
         return;
     };
     let elapsed = time::OffsetDateTime::now_utc() - queued;
+    if elapsed.whole_milliseconds() < dequeue_wait_annotation_min_ms() {
+        return;
+    }
     msg.content = format!(
         "{}\n\n{}",
         msg.content,
@@ -152,7 +183,8 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
             &format_wait_duration(elapsed.whole_seconds())
         )
     );
-    // Negative waits (clock skew) clamp to 0, matching the note's formatting.
+    // The threshold gate above guarantees a positive wait; the clamp stays as
+    // a belt-and-braces guard for the u64 conversion.
     let waited_ms = u64::try_from(elapsed.whole_milliseconds().max(0)).unwrap_or(u64::MAX);
     let queue_info = json!({ "queuedAt": msg.queued_at, "waitedMs": waited_ms });
     match msg.message_metadata.as_mut() {

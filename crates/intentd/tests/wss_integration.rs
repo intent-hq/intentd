@@ -4687,18 +4687,22 @@ fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-/// `task.list` over the real WSS wire returns `{ tasks, stats }` and the
-/// `stats` aggregate mirrors the FE `computeTaskStats` (`task-stats.ts`)
-/// classification: `total` excludes `cancelled`, `completed` counts `complete`,
-/// and `inProgress` counts `in_progress` + `review_required`. The optional
-/// `status` filter narrows `tasks` only — `stats` stays the unfiltered rollup
-/// so the FE renders the progress bar verbatim regardless of the active filter
-/// (PROTOCOL §5.4).
+/// `task.list` over the real WSS wire returns `{ tasks, stats }`: `tasks`
+/// membership is workspace-wide (every task note except the spec — direct
+/// spec children, subtasks, and unlinked tasks alike), each row carrying the
+/// `specLinked` flag (true iff the id appears in the spec body's
+/// `intent://local/task/{id}` links), while the `stats` aggregate stays the
+/// spec-linked direct-child rollup mirroring the FE `computeTaskStats`
+/// (`task-stats.ts`) classification: `total` excludes `cancelled`,
+/// `completed` counts `complete`, and `inProgress` counts `in_progress` +
+/// `review_required`. The optional `status` filter narrows `tasks` only —
+/// `stats` stays the unfiltered rollup so the FE renders the progress bar
+/// verbatim regardless of the active filter (PROTOCOL §5.4).
 #[tokio::test]
 async fn wss_task_list_emits_stats_aggregate() {
     let srv = start(WsOptions::default()).await;
 
-    // Seed a workspace + spec note + four task notes directly through the
+    // Seed a workspace + spec note + task notes directly through the
     // shared store — `note.create` mints a fresh `NoteId`, so the spec note
     // (which must have id == "spec") can only be created out-of-band.
     let ws = WorkspaceId::new();
@@ -4727,18 +4731,27 @@ async fn wss_task_list_emits_stats_aggregate() {
         });
         n
     };
+    // An unlinked task and a subtask (child of task-a) — both returned with
+    // `specLinked: false`, both excluded from the spec-linked `stats` rollup.
+    let mut orphan = mk_task("task-x", "Orphan", TaskStatus::NotStarted);
+    orphan.parent_id = None;
+    let mut sub = mk_task("task-sub", "Subtask", TaskStatus::InProgress);
+    sub.parent_id = Some(NoteId::from("task-a"));
     for n in [
         mk_task("task-a", "Alpha", TaskStatus::InProgress),
         mk_task("task-b", "Beta", TaskStatus::Complete),
         mk_task("task-c", "Gamma", TaskStatus::ReviewRequired),
         mk_task("task-d", "Delta", TaskStatus::Cancelled),
+        orphan,
+        sub,
     ] {
         srv.store.insert_note(&n).await.expect("insert task note");
     }
 
-    // Unfiltered: returns the four spec-linked tasks (cancelled included) and
-    // a `stats` rollup where `total` excludes the cancelled task and
-    // `inProgress` counts both in_progress + review_required.
+    // Unfiltered: returns all six task notes (cancelled, unlinked, and
+    // subtask included) and a `stats` rollup over the spec-linked set only,
+    // where `total` excludes the cancelled task and `inProgress` counts both
+    // in_progress + review_required.
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"task.list","params":{{"workspaceId":"{}"}}}}"#,
         ws.0
@@ -4761,7 +4774,10 @@ async fn wss_task_list_emits_stats_aggregate() {
         .map(|t| t["id"].as_str().expect("task id"))
         .collect();
     task_ids.sort_unstable();
-    assert_eq!(task_ids, vec!["task-a", "task-b", "task-c", "task-d"]);
+    assert_eq!(
+        task_ids,
+        vec!["task-a", "task-b", "task-c", "task-d", "task-sub", "task-x"]
+    );
     let by_id: std::collections::HashMap<&str, &Value> = tasks
         .iter()
         .map(|t| (t["id"].as_str().unwrap(), t))
@@ -4772,13 +4788,30 @@ async fn wss_task_list_emits_stats_aggregate() {
     assert_eq!(by_id["task-c"]["status"], "review_required");
     assert_eq!(by_id["task-d"]["status"], "cancelled");
     assert!(by_id["task-a"]["updatedAt"].is_string());
+    // `specLinked` is always serialized: true for spec-linked ids, false for
+    // the unlinked task and the subtask.
+    for id in ["task-a", "task-b", "task-c", "task-d"] {
+        assert_eq!(by_id[id]["specLinked"], true, "{id} is spec-linked");
+    }
+    for id in ["task-x", "task-sub"] {
+        assert_eq!(by_id[id]["specLinked"], false, "{id} is not spec-linked");
+    }
+    // `parentId` rides along (omitted when the note has no parent), so the
+    // subtask is distinguishable from the unlinked top-level task.
+    assert_eq!(by_id["task-a"]["parentId"], "spec");
+    assert_eq!(by_id["task-sub"]["parentId"], "task-a");
+    assert!(
+        by_id["task-x"].get("parentId").is_none(),
+        "parentId omitted for parentless notes: {}",
+        by_id["task-x"]
+    );
 
     let stats = &result["stats"];
     assert_eq!(stats["total"], 3, "total excludes cancelled: {stats}");
     assert_eq!(stats["completed"], 1, "completed = 1 complete: {stats}");
     assert_eq!(
         stats["inProgress"], 2,
-        "inProgress = in_progress + review_required: {stats}"
+        "inProgress = spec-linked in_progress + review_required: {stats}"
     );
     // Only the documented fields cross the wire (camelCase, no `tasks` array).
     let stats_keys: Vec<&str> = stats
