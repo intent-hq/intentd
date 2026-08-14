@@ -934,6 +934,23 @@ impl ProcessRegistry {
         }
     }
 
+    /// Credit raw `bytes` back against the pending correction, beyond what
+    /// [`Self::budget_adjust`] already credited. Used by the budget drain: a
+    /// victim's *attributed* size can dwarf the fixed provisional credit, and
+    /// without this the drain keeps killing smaller idle agents for up to a
+    /// full sample period after the real overshoot cleared. An over-credit
+    /// from stale attribution self-heals the moment a fresh sample lands
+    /// ([`Self::budget_denies`] resets the pending correction on a new seq).
+    fn budget_credit_extra_bytes(&self, bytes: u64) {
+        if bytes == 0 || self.memory.get().is_none() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.budget_pending_bytes = inner
+            .budget_pending_bytes
+            .saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
     /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
     /// Chainable builder; returns `Self` so the manager can wire this after
     /// construction. The callback signature is
@@ -1262,7 +1279,11 @@ impl ProcessRegistry {
     /// aggregate charge is over the installed budget, evict idle processes
     /// largest-attributed-subtree-first (Phase A attribution; LRU fallback
     /// when attribution is unavailable), re-checking the budget before every
-    /// kill so the drain stops the moment the overshoot clears. Unlike the
+    /// kill so the drain stops the moment the overshoot clears. Each
+    /// eviction credits the victim's attributed bytes (at least the
+    /// provisional cost) against the charge, so the stop condition holds
+    /// within a single sample period — not only after the next sample lands.
+    /// Unlike the
     /// [`Self::acquire`] path this fires without a spawn attempt, and unlike
     /// [`Self::evict_idle_older_than`] it ignores the TTL — memory pressure
     /// is now, not in `idleReapMinutes`. No budget installed, no sample yet,
@@ -1284,7 +1305,7 @@ impl ProcessRegistry {
         // The common case (under budget / no budget / no sample) must stay one
         // lock + one probe read. The candidate order is snapshotted here; the
         // per-kill re-check below only decides *whether* to keep draining.
-        let candidates = {
+        let (candidates, samples) = {
             let mut inner = self.inner.lock().unwrap();
             if self.budget_denies(&mut inner).is_none() {
                 return 0;
@@ -1294,12 +1315,13 @@ impl ProcessRegistry {
                 .get()
                 .map(|b| b.probe.agent_samples())
                 .unwrap_or_default();
-            idle_largest_first(&inner, &samples)
+            (idle_largest_first(&inner, &samples), samples)
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
-            // Stop the moment the budget clears: each deregister credits the
-            // provisional cost back, and a fresh sample may land mid-drain.
+            // Stop the moment the budget clears: each eviction credits the
+            // victim's full known cost back (below), and a fresh sample may
+            // land mid-drain.
             let still_over = {
                 let mut inner = self.inner.lock().unwrap();
                 self.budget_denies(&mut inner).is_some()
@@ -1342,6 +1364,18 @@ impl ProcessRegistry {
             }
             kill().await;
             self.deregister(&id);
+            // `deregister` credited the fixed provisional cost; top it up to
+            // the victim's attributed bytes when attribution knows more, so
+            // the per-kill re-check above sees the real reclaim within this
+            // sample period instead of over-draining every idle candidate
+            // (the next sample resets the correction either way).
+            self.budget_credit_extra_bytes(
+                samples
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(PROVISIONAL_AGENT_BYTES),
+            );
             release(&id);
             evicted += 1;
         }

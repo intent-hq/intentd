@@ -3066,7 +3066,9 @@ fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
 /// With a memory budget installed (monorepo#2063 level 2), every tick also
 /// drains idle agents largest-attributed-first while charged > budget — no
 /// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
-/// keeps the budget drain alive on the interval-clamp floor cadence.
+/// keeps the budget drain alive on the interval-clamp floor cadence, and TTL
+/// reaping on caps the shared interval at that same floor so a long TTL
+/// cannot slow the budget drain's reaction time.
 fn spawn_idle_reap_loop(
     manager: Arc<AgentManager>,
     idle_reap_minutes: u32,
@@ -3078,9 +3080,19 @@ fn spawn_idle_reap_loop(
         return None;
     }
     // TTL off but budget on: sweep at the same floor cadence the TTL clamp
-    // uses, running only the budget drain.
+    // uses, running only the budget drain. With BOTH on, cap the shared
+    // interval at that floor — a long TTL may stretch its interval to 300s,
+    // and turning TTL reaping on must not slow the budget drain's reaction
+    // time below the budget-only cadence (an early TTL sweep is harmless: it
+    // just finds nothing old enough).
+    let budget_floor = Duration::from_secs(30);
     let interval = match timings {
         Some((ttl, interval)) => {
+            let interval = if budget_enabled {
+                interval.min(budget_floor)
+            } else {
+                interval
+            };
             tracing::info!(
                 ttl_ms = ttl.as_millis() as u64,
                 interval_ms = interval.as_millis() as u64,
@@ -3089,12 +3101,11 @@ fn spawn_idle_reap_loop(
             interval
         }
         None => {
-            let interval = Duration::from_secs(30);
             tracing::info!(
-                interval_ms = interval.as_millis() as u64,
+                interval_ms = budget_floor.as_millis() as u64,
                 "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
             );
-            interval
+            budget_floor
         }
     };
     Some(tokio::spawn(async move {

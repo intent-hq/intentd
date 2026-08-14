@@ -518,7 +518,9 @@ pub struct AgentsSettings {
     pub max_concurrent: u32,
     /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
     /// daemon's whole child-process tree, above which new agent spawns queue
-    /// behind idle-process eviction instead of starting immediately. Absent
+    /// behind idle-process eviction instead of starting immediately and the
+    /// periodic reap sweep drains idle agents largest-first without waiting
+    /// for a spawn or the idle TTL (monorepo#2063 level 2). Absent
     /// (`None`, the default) = auto (budget derived from system RAM); explicit
     /// `0` = off — preserved because config files written before the auto
     /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
@@ -1215,8 +1217,10 @@ level = "info"
 # memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
 # Agent memory budget (MB) -- aggregate resident memory the daemon's whole
-# child-process tree may use before new agent spawns queue behind idle-process
-# eviction (nothing running is ever killed; changes apply on daemon restart).
+# child-process tree may use before it reclaims: new agent spawns queue behind
+# idle-process eviction, and a background sweep drains idle agents
+# largest-first while over budget (nothing running is ever killed; changes
+# apply on daemon restart).
 # Absent (the default, as in this file) = auto: the daemon picks the budget
 # ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
 # config files written before this key defaulted to auto carry a literal

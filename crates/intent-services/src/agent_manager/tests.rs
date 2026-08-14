@@ -710,7 +710,10 @@ async fn budget_status_reports_budget_charged_and_queued() {
 /// Budget-triggered idle drain (monorepo#2063 level 2): an over-budget state
 /// drains idle processes with NO spawn attempt, largest-attributed-subtree
 /// first, and stops the moment the charge clears the budget — the smaller
-/// idle survivor is kept.
+/// idle survivor is kept. The probe never publishes a fresh sample here: the
+/// stop relies on the drain crediting the victim's ATTRIBUTED bytes (7 GB),
+/// not just the fixed provisional cost, so it holds within a single sample
+/// period.
 #[tokio::test]
 async fn over_budget_drain_evicts_largest_attributed_idle_first() {
     let gb = super::GB;
@@ -727,11 +730,7 @@ async fn over_budget_drain_evicts_largest_attributed_idle_first() {
     reg.set_last_active(&big, 200);
     probe.set_agents(&[(&small, gb), (&big, 7 * gb)]);
 
-    let evicted = {
-        let probe = probe.clone();
-        reg.evict_while_over_budget(|_| true, move |_| probe.set(2 * gb))
-            .await
-    };
+    let evicted = reg.evict_while_over_budget(|_| true, |_| {}).await;
 
     assert_eq!(evicted, 1, "the drain stops once the charge clears");
     assert_eq!(
