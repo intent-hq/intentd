@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED;
+use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
 use intent_core::{
     now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
     WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
@@ -28,13 +28,14 @@ use intent_store::NewEvent;
 
 use crate::{compute_task_stats, publish_event, system_actor, Services};
 
-/// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5): the
-/// recompute-and-compare seam behind
-/// [`Services::maybe_emit_display_status_changed`]. A mutation that can move
-/// the derivation recomputes it and publishes
-/// `workspace:displayStatus-changed` only on an actual transition, so no-op
-/// recomputes never spam the bus. Seeded lazily (first recompute after a
-/// mutation, or an emit-path enrichment) — a first observation records
+/// Last-observed derived value per workspace: the recompute-and-compare seam
+/// behind [`Services::maybe_emit_display_status_changed`] (as
+/// [`DisplayStatusCache`], PROTOCOL §6.5) and
+/// [`Services::maybe_emit_waiting_changed`] (as [`WaitingStatusCache`],
+/// §9.1). A mutation that can move the derivation recomputes it and
+/// publishes the matching change event only on an actual transition, so
+/// no-op recomputes never spam the bus. Seeded lazily (first recompute after
+/// a mutation, or an emit-path enrichment) — a first observation records
 /// without emitting. In-memory only; a daemon restart re-seeds on first
 /// touch. Shared across clones (behind `Arc`) so every service handle
 /// compares against the same last-emitted value. The map is private to this
@@ -45,22 +46,35 @@ use crate::{compute_task_stats, publish_event, system_actor, Services};
 /// between, and the late write would resurrect a baseline for the deleted id
 /// (a leaked entry, and a stale comparison for an importer re-insert of the
 /// same id). Guard: `evictions` counts evictions under the same lock; writers
-/// snapshot it via [`DisplayStatusCache::generation`] *before* their store
+/// snapshot it via [`LastObservedCache::generation`] *before* their store
 /// reads and their write is dropped when the counter moved and no entry
 /// survived for the id (an entry that still exists was not evicted — or was
 /// legitimately re-seeded — so the write proceeds). A dropped write is always
 /// safe: the next transition recomputes from fresh state.
-#[derive(Default)]
-pub(crate) struct DisplayStatusCache(Mutex<CacheInner>);
+pub(crate) struct LastObservedCache<T>(Mutex<CacheInner<T>>);
 
-#[derive(Default)]
-struct CacheInner {
-    map: HashMap<WorkspaceId, WorkspaceDisplayStatus>,
+/// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5).
+pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
+
+/// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §9.1).
+pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
+
+struct CacheInner<T> {
+    map: HashMap<WorkspaceId, T>,
     /// Total evictions since startup; see the eviction-race guard above.
     evictions: u64,
 }
 
-impl DisplayStatusCache {
+impl<T> Default for LastObservedCache<T> {
+    fn default() -> Self {
+        Self(Mutex::new(CacheInner {
+            map: HashMap::new(),
+            evictions: 0,
+        }))
+    }
+}
+
+impl<T: Copy + PartialEq> LastObservedCache<T> {
     /// Snapshot the eviction generation. Writers capture this *before* their
     /// store reads and pass it back to [`seed`](Self::seed) /
     /// [`record`](Self::record), which drop the write when an eviction
@@ -75,34 +89,29 @@ impl DisplayStatusCache {
     /// mutation compares against it. `generation` is the pre-read snapshot;
     /// a stale seed for an id with no surviving entry is dropped (eviction
     /// race, see the type docs). Best-effort — a poisoned lock is ignored.
-    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus, generation: u64) {
+    fn seed(&self, workspace_id: &WorkspaceId, value: T, generation: u64) {
         if let Ok(mut inner) = self.0.lock() {
             if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
                 return;
             }
-            inner.map.entry(workspace_id.clone()).or_insert(status);
+            inner.map.entry(workspace_id.clone()).or_insert(value);
         }
     }
 
-    /// Record `status` and report whether it transitioned since the last
+    /// Record `value` and report whether it transitioned since the last
     /// observation: `Some(false)` on a first observation (a seed has no
     /// baseline to transition from), `None` on a poisoned lock or when the
     /// write was dropped by the eviction-race guard (the caller skips
     /// emission). `generation` is the pre-read snapshot from
     /// [`generation`](Self::generation).
-    fn record(
-        &self,
-        workspace_id: &WorkspaceId,
-        status: WorkspaceDisplayStatus,
-        generation: u64,
-    ) -> Option<bool> {
+    fn record(&self, workspace_id: &WorkspaceId, value: T, generation: u64) -> Option<bool> {
         match self.0.lock() {
             Ok(mut inner) => {
                 if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
                     return None;
                 }
-                Some(match inner.map.insert(workspace_id.clone(), status) {
-                    Some(previous) => previous != status,
+                Some(match inner.map.insert(workspace_id.clone(), value) {
+                    Some(previous) => previous != value,
                     None => false,
                 })
             }
@@ -146,6 +155,16 @@ impl Services {
     /// this baseline (a seed never emits; see
     /// [`Services::maybe_emit_display_status_changed`]).
     pub(crate) async fn enrich_display_status(&self, ws: &mut Workspace) {
+        // The orthogonal `waiting` flag rides the same emit path but is
+        // independent of the `taskStats` gate below: it derives purely from
+        // the live wait signals, so it is populated even when a transient
+        // notes-read failure leaves `displayStatus` absent. Pre-read
+        // generation snapshot first — a `workspace.delete` eviction racing
+        // the probe below must not have this seed resurrect the baseline.
+        let waiting_generation = self.last_waiting_statuses.generation();
+        ws.waiting = self.workspace_is_waiting(&ws.id).await;
+        self.last_waiting_statuses
+            .seed(&ws.id, ws.waiting, waiting_generation);
         if ws.task_stats.is_none() {
             return;
         }
@@ -154,16 +173,12 @@ impl Services {
         let generation = self.last_display_statuses.generation();
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
-        // `activity: "agent_running"` with `displayStatus: "idle"`.
-        // Active background hooks and PR monitors fold into the promotion
-        // (§6.5): an idle agent still watching via a hook or a PR monitor
-        // reads as active work.
+        // `activity: "agent_running"` with `displayStatus: "idle"`. Wait
+        // signals (hooks/monitors/subscriptions) no longer fold into the
+        // promotion — they surface as the orthogonal `waiting` flag above.
         let display_status = compute_display_status(
             self.workspace_attention_signals(&ws.id, ws.attention).await,
-            ws.activity == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(&ws.id).await
-                || self.workspace_has_active_pr_monitors(&ws.id).await
-                || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
+            ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -172,6 +187,19 @@ impl Services {
         self.last_display_statuses
             .seed(&ws.id, display_status, generation);
         ws.display_status = Some(display_status);
+    }
+
+    /// The orthogonal wait probe behind `Workspace.waiting` (§9.1): true when
+    /// the workspace has any of ACTIVE background hooks, ACTIVE PR monitors,
+    /// or waiting agent subscriptions. Short-circuits on the first live
+    /// signal; best-effort/fail-open like the probes it reuses (a store read
+    /// failure reads `false`, never wedges list/get emission).
+    pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
+        self.workspace_has_active_hooks(workspace_id).await
+            || self.workspace_has_active_pr_monitors(workspace_id).await
+            || self
+                .workspace_has_waiting_agent_subscriptions(workspace_id)
+                .await
     }
 
     /// Recompute a workspace's derived `displayStatus` and publish
@@ -207,14 +235,13 @@ impl Services {
         let signals = self
             .workspace_attention_signals(workspace_id, ws.attention)
             .await;
+        // Wait signals (hooks/monitors/subscriptions) do not fold into the
+        // promotion — they surface as the orthogonal `waiting` flag on the
+        // read paths ([`Services::workspace_is_waiting`]); only a live agent
+        // turn promotes here.
         let status = compute_display_status(
             signals,
-            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(workspace_id).await
-                || self.workspace_has_active_pr_monitors(workspace_id).await
-                || self
-                    .workspace_has_waiting_agent_subscriptions(workspace_id)
-                    .await,
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -235,9 +262,50 @@ impl Services {
         }
     }
 
-    /// Evict a deleted workspace's last-observed baseline (G7): called from
-    /// `workspace.delete` after the store cascade so the in-memory map does
-    /// not leak entries for the daemon's lifetime. Bumps the cache's eviction
+    /// Recompute a workspace's orthogonal `waiting` flag and publish
+    /// `workspace:waiting-changed` iff it transitioned since the last
+    /// observation (PROTOCOL §9.1). Called after the lifecycle transitions
+    /// that can move the derivation — hook create/dispatch/cancel/evict/
+    /// expire, PR monitor register/complete/cancel, completion-watch
+    /// register/retire/settlement/cancel — never from a polling loop. Same
+    /// contract as [`Services::maybe_emit_display_status_changed`]: the
+    /// first observation seeds without emitting, a workspace-read failure
+    /// (deleted workspace) skips the recompute entirely, and the whole path
+    /// is best-effort — the mutation's own result is the contract. The wait
+    /// probe itself fails open to `false` on store errors, which the dedup
+    /// baseline absorbs: a transient flap emits at most one pair of
+    /// transitions, and the next recompute converges on truth.
+    pub(crate) async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
+        // Pre-read generation snapshot: an eviction (workspace.delete)
+        // landing between the reads below and the cache write must drop
+        // this compute rather than re-insert a baseline for the deleted id
+        // (see the `LastObservedCache` docs).
+        let generation = self.last_waiting_statuses.generation();
+        // Deleted-workspace guard: the wait probes read hook/monitor rows
+        // directly, so without this read a post-delete recompute could
+        // fabricate a baseline for a gone workspace.
+        if self.store.get_workspace(workspace_id).await.is_err() {
+            return;
+        }
+        let waiting = self.workspace_is_waiting(workspace_id).await;
+        let Some(transitioned) =
+            self.last_waiting_statuses
+                .record(workspace_id, waiting, generation)
+        else {
+            return;
+        };
+        if transitioned {
+            publish_event(
+                &self.event_bus,
+                waiting_changed_event(workspace_id, waiting),
+            )
+            .await;
+        }
+    }
+
+    /// Evict a deleted workspace's last-observed baselines (G7): called from
+    /// `workspace.delete` after the store cascade so the in-memory maps do
+    /// not leak entries for the daemon's lifetime. Bumps each cache's eviction
     /// generation, so a recompute that read the workspace before the cascade
     /// drops its late write instead of resurrecting the baseline. Workspace
     /// ids are never recycled by `workspace.create` (tombstoned via
@@ -245,6 +313,7 @@ impl Services {
     /// come from such a late write — which the generation guard prevents.
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
+        self.last_waiting_statuses.evict(workspace_id);
     }
 
     /// Recompute after a spec-body write. The spec's markdown gates
@@ -355,11 +424,11 @@ pub(crate) struct AttentionSignals {
 ///    the user (discussion request or pending structured questions) or the
 ///    `review_required` workspace attention flag — outranks a running agent.
 /// 3. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says. Callers fold active-hook and
-///    active-PR-monitor state into this flag
-///    ([`Services::workspace_has_active_hooks`] /
-///    [`Services::workspace_has_active_pr_monitors`]) so an idle agent
-///    still watching via a background hook or a PR monitor reads the same.
+///    work, whatever the PR/task rollup says. Wait signals (active hooks,
+///    active PR monitors, waiting agent subscriptions) do NOT fold in — an
+///    idle workspace watching an external condition keeps its base rollup
+///    and surfaces the orthogonal `Workspace.waiting` flag instead
+///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
@@ -489,6 +558,27 @@ fn display_status_changed_event(
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "displayStatus": display_status,
+        }),
+    }
+}
+
+/// Build a `workspace:waiting-changed` change event with the self-sufficient
+/// payload `{ workspaceId, waiting }` (PROTOCOL §9.1 / §6.7). Private to
+/// this module: the only emitter is
+/// [`Services::maybe_emit_waiting_changed`].
+fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_WAITING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "waiting": waiting,
         }),
     }
 }

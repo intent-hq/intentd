@@ -2233,13 +2233,14 @@ impl Services {
     /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
     ///
-    /// The watch set is also a `displayStatus` in-progress promotion input
-    /// (an idle parent still waiting on delegated children reads as active
-    /// work), so every publish recomputes the anchor workspace's derived
-    /// status — transition-only and best-effort
-    /// ([`Services::maybe_emit_display_status_changed`] dedupes against the
-    /// last observation and swallows errors), so a no-op recompute stays
-    /// silent and can never break the watch lifecycle.
+    /// The watch set also feeds the anchor workspace's derived
+    /// `displayStatus` and its orthogonal `waiting` flag (an idle parent
+    /// still waiting on delegated children reads as pending work), so every
+    /// publish recomputes both — transition-only and best-effort
+    /// ([`Services::maybe_emit_display_status_changed`] /
+    /// [`Services::maybe_emit_waiting_changed`] dedupe against the last
+    /// observation and swallow errors), so a no-op recompute stays silent
+    /// and can never break the watch lifecycle.
     pub(crate) async fn publish_subscriptions_changed(
         &self,
         workspace_id: &WorkspaceId,
@@ -2264,6 +2265,7 @@ impl Services {
         )
         .await;
         self.maybe_emit_display_status_changed(workspace_id).await;
+        self.maybe_emit_waiting_changed(workspace_id).await;
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
@@ -7104,6 +7106,7 @@ impl Services {
             self.remove_event_subscriptions_for_agent(&agent_id).await;
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
+                self.maybe_emit_waiting_changed(anchor).await;
             }
             // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
             // dropping every outgoing watch may remove the caller's last
