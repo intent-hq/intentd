@@ -576,6 +576,23 @@ fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
         .map(|(id, e)| (id.clone(), e.kill.clone()))
 }
 
+/// LRU idle entry excluding `exclude` — the turn-start budget gate's eviction
+/// candidate list (monorepo#2063 B8): the gated agent's own process is never
+/// its own gate's victim (evicting it would only trade this gate for the spawn
+/// gate). Other admission paths — a concurrent spawn `acquire`, or another
+/// turn-start gate — select via their own candidate lists and may still evict
+/// a process parked here; its waiter then wakes via `deregister`, re-classifies
+/// as unregistered, admits, and respawns through the spawn gate (queued, never
+/// refused, message intact — the warm session is lost, not the turn).
+fn lru_idle_excluding(inner: &RegistryInner, exclude: &AgentId) -> Option<(AgentId, KillFn)> {
+    inner
+        .entries
+        .iter()
+        .filter(|(id, e)| !e.is_active && *id != exclude)
+        .min_by_key(|(_, e)| e.last_active_ms)
+        .map(|(id, e)| (id.clone(), e.kill.clone()))
+}
+
 /// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
 /// least-recently-used first (the TTL idle-reap candidate list).
 fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillFn)> {
@@ -1167,6 +1184,108 @@ impl ProcessRegistry {
                 }
                 Action::Wait(rx, false) => {
                     let _ = rx.await;
+                }
+            }
+        }
+    }
+
+    /// Turn-start budget re-check for an agent whose process is already
+    /// registered (monorepo#2063 B8): an idle agent's next turn gates on the
+    /// aggregate memory budget on the same terms as a spawn — reclaim by
+    /// evicting the LRU idle process, else queue until the budget clears —
+    /// never refused. Differences from [`Self::acquire`], all deliberate:
+    /// - The slot cap is not consulted: the process already holds its slot.
+    /// - Admission charges no provisional cost: the warm process is already
+    ///   inside the tree sample, so charging would double-count it.
+    /// - Its own idle process is never *this gate's* eviction victim: that
+    ///   would only trade this gate for the spawn gate and lose the warm
+    ///   session. Other admission paths may still reclaim it while it waits
+    ///   (see [`lru_idle_excluding`]); the turn then degrades to the spawn
+    ///   gate — still queued, never refused.
+    /// - A process marked ACTIVE admits immediately: busy agents are never
+    ///   gated mid-turn (regression-pinned).
+    ///
+    /// An unregistered agent admits immediately too — its child must spawn,
+    /// and `create_agent`'s [`Self::acquire`] is that path's gate.
+    pub async fn acquire_turn_start(&self, agent_id: &AgentId) {
+        loop {
+            enum Action {
+                Admit,
+                Evict(AgentId, KillFn),
+                Wait(tokio::sync::oneshot::Receiver<()>),
+            }
+            let action = {
+                let mut inner = self.inner.lock().unwrap();
+                let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
+                let over_budget = if idle_here {
+                    self.budget_denies(&mut inner)
+                } else {
+                    None
+                };
+                if let Some(charged) = over_budget {
+                    if let Some((id, kill)) = lru_idle_excluding(&inner, agent_id) {
+                        Action::Evict(id, kill)
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        // Same waiter hygiene as `acquire`: drop dead receivers
+                        // before re-queueing on the timed budget re-check.
+                        inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
+                        inner
+                            .wait_queue
+                            .push((agent_id.clone(), tx, REASON_MEMORY_BUDGET));
+                        let used = inner.entries.len();
+                        tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            charged_memory_bytes = charged,
+                            budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            "process registry: turn start queued (aggregate memory budget)"
+                        );
+                        if let Some(ref f) = self.event_fn {
+                            let fut = f(
+                                agent_id,
+                                "agent:process:queued",
+                                used,
+                                self.cap,
+                                REASON_MEMORY_BUDGET,
+                            );
+                            tokio::spawn(fut);
+                        }
+                        Action::Wait(rx)
+                    }
+                } else {
+                    Action::Admit
+                }
+            };
+            match action {
+                Action::Admit => return,
+                Action::Evict(id, kill) => {
+                    let used = self.size();
+                    tracing::info!(
+                        evicted = %id,
+                        used = used,
+                        cap = self.cap,
+                        reason = REASON_MEMORY_BUDGET,
+                        "process registry: LRU idle process evicted"
+                    );
+                    if let Some(ref f) = self.event_fn {
+                        let fut = f(
+                            &id,
+                            "agent:process:evicted",
+                            used,
+                            self.cap,
+                            REASON_MEMORY_BUDGET,
+                        );
+                        tokio::spawn(fut);
+                    }
+                    kill().await;
+                    self.deregister(&id);
+                }
+                Action::Wait(rx) => {
+                    // Memory can fall with no registry event to wake us (same
+                    // as the `acquire` budget wait), so re-evaluate on a timer.
+                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
                 }
             }
         }
@@ -7631,6 +7750,16 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
+        // about to go active re-checks the aggregate budget like a spawn
+        // would — queued behind eviction, never refused. Sits at the top of
+        // the loop, BEFORE `run_turn` marks the process active, so every
+        // turn (initial send and each queue-drain handoff) gates while the
+        // agent is still idle — and never mid-turn, where the process is
+        // marked active and `acquire_turn_start` admits immediately. An
+        // unregistered agent also admits immediately: its spawn below goes
+        // through `create_agent`'s `acquire`, the existing gate.
+        mgr.registry.acquire_turn_start(&agent_id).await;
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
                 // Clear any persisted completion report at the start of this turn

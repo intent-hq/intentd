@@ -854,6 +854,132 @@ async fn over_budget_drain_skips_candidates_whose_claim_loses() {
     assert!(reg.is_registered(&held), "claim holder's candidate kept");
 }
 
+/// Turn-start budget re-check (monorepo#2063 B8): an idle registered agent's
+/// next turn gates on the budget like a spawn — reclaim by evicting another
+/// idle process (never its own), else queue until the tree drains. Never
+/// refused.
+#[tokio::test]
+async fn turn_start_gates_idle_agent_and_reclaims_other_idle_first() {
+    let gb = super::GB;
+    let reg = Arc::new(ProcessRegistry::new(8));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (warm, other) = (AgentId::from("warm"), AgentId::from("other"));
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
+    reg.register(other.clone(), recording_kill(other.clone(), log.clone()));
+    // `other` is the LRU idle process — but even if `warm` were older, its
+    // own process must never be the victim (asserted below).
+    reg.set_last_active(&warm, 100);
+    reg.set_last_active(&other, 200);
+
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move { reg2.acquire_turn_start(&warm2).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![other.clone()],
+        "reclaims the OTHER idle process, never the gated agent's own"
+    );
+    assert!(
+        reg.is_registered(&warm),
+        "the gated agent's process survives"
+    );
+    assert!(
+        !handle.is_finished(),
+        "still over budget after the one eviction available → the turn waits"
+    );
+
+    // Once the tree drains, the queued turn proceeds on its own timed
+    // re-check — no registry event fires here.
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the turn-start waiter must re-check on its own timer")
+        .expect("task ok");
+}
+
+/// Busy agents are never gated mid-turn (monorepo#2063 B8 regression): a
+/// process marked ACTIVE admits immediately however far over budget the tree
+/// is, and so does an agent with no registered process at all (its spawn is
+/// gated by `acquire` instead).
+#[tokio::test]
+async fn turn_start_never_gates_active_or_unregistered_agents() {
+    let gb = super::GB;
+    let reg = ProcessRegistry::new(8);
+    let probe = FakeProbe::new(100 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let busy = AgentId::from("busy");
+    reg.register(busy.clone(), recording_kill(busy.clone(), log.clone()));
+    reg.mark_active(&busy);
+
+    timeout(Duration::from_millis(200), reg.acquire_turn_start(&busy))
+        .await
+        .expect("an active process is never gated mid-turn");
+
+    timeout(
+        Duration::from_millis(200),
+        reg.acquire_turn_start(&AgentId::from("unregistered")),
+    )
+    .await
+    .expect("an unregistered agent admits immediately (spawn path gates it)");
+    assert!(log.lock().unwrap().is_empty(), "nothing was evicted");
+}
+
+/// The turn-start gate's queue/evict events carry `reason: "memory-budget"`,
+/// and admission charges NO provisional cost — the warm process is already in
+/// the tree sample, so a charge would double-count it.
+#[tokio::test]
+async fn turn_start_gate_events_carry_memory_budget_reason_without_charge() {
+    let gb = super::GB;
+    let events: Arc<Mutex<Vec<(AgentId, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    let event_fn: super::ProcessEventFn =
+        Arc::new(move |agent_id, event_type, _used, _cap, reason| {
+            let events = events_clone.clone();
+            let agent_id = agent_id.clone();
+            let event_type = event_type.to_string();
+            let reason = reason.to_string();
+            Box::pin(async move {
+                events.lock().unwrap().push((agent_id, event_type, reason));
+            })
+        });
+
+    let reg = Arc::new(ProcessRegistry::new(8).with_event_fn(event_fn));
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let warm = AgentId::from("warm");
+    reg.register(warm.clone(), recording_kill(warm.clone(), log.clone())); // No other idle to evict.
+
+    let reg2 = reg.clone();
+    let warm2 = warm.clone();
+    let handle = tokio::spawn(async move { reg2.acquire_turn_start(&warm2).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let events = events.lock().unwrap();
+        let queued = events
+            .iter()
+            .find(|(a, e, _)| e == "agent:process:queued" && a == &warm)
+            .expect("queued event recorded");
+        assert_eq!(queued.2, "memory-budget", "turn-start gate reason");
+    }
+
+    probe.set(gb);
+    timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the drained tree admits the queued turn")
+        .expect("task ok");
+    // Admission left the charge exactly at the sample — no provisional cost.
+    let (_, charged, _) = reg.budget_status().expect("budget installed");
+    assert_eq!(charged, Some(gb), "turn-start admission charges nothing");
+}
+
 #[tokio::test]
 async fn lifecycle_active_processes_are_not_reaped() {
     let reg = ProcessRegistry::new(8);
