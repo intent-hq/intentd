@@ -1114,6 +1114,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
+    // Read-only tree probe for `agent.diagnostics` per-agent subtree memory
+    // attribution (monorepo#2063 A2): installed unconditionally, unlike the
+    // budget below, which only exists when the budget resolves positive.
+    manager.set_tree_probe(child_usage.clone());
     // Aggregate child-tree memory budget (monorepo#2063): an absent key means
     // auto (resolves to the recommended budget derived from system RAM), an
     // explicit 0 means off, and a positive value is an explicit MB budget.
@@ -4846,6 +4850,20 @@ mod tests {
         let next = usage.load().expect("sampled");
         assert_eq!(next.agent_bytes.get(&a), None);
         assert_eq!(next.agent_bytes.get(&b), Some(&300));
+    }
+
+    /// The probe's `agent_samples` (monorepo#2063 A2) serves the buckets from
+    /// the latest sweep — empty before the first sample, matching `sample`'s
+    /// `None` — so `agent.diagnostics` can stamp `subtreeMemoryBytes` from
+    /// the same sweep the aggregate came from.
+    #[test]
+    fn child_tree_usage_probe_serves_agent_samples() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert!(probe.agent_samples().is_empty());
+        let a = AgentId::from("agent-a");
+        usage.store(2, 900, HashMap::from([(a.clone(), 700)]));
+        assert_eq!(probe.agent_samples().get(&a), Some(&700));
     }
 
     /// The peak must survive the tree draining back to baseline — that is the

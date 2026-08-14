@@ -2279,6 +2279,170 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 }
 
+/// monorepo#2063 A2 over the real WSS wire: `agent.diagnostics` rows carry
+/// `subtreeMemoryBytes` for an agent whose spawned subtree the live sampler
+/// has attributed, and omit it for an agent that was never spawned — proving
+/// the composition-root `set_tree_probe` wiring in `cmd_serve`, the sampler's
+/// per-agent bucketing, and the wire shape end to end (not just the
+/// service-level fake). Also asserts the field stays off the hot `agent.get` /
+/// `agent.list` payloads (diagnostics-only by design).
+///
+/// Timing: the sampler publishes a full attribution sweep at boot and then on
+/// its ~5s baseline cadence, so the parked agent's bucket lands within one
+/// baseline period of the spawn — the poll loop below bounds that wait.
+#[tokio::test]
+async fn agent_diagnostics_reports_subtree_memory_over_wss() {
+    let Some(script) = gate("WSS diagnostics subtreeMemoryBytes E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Park the prompted agent mid-turn so its node child stays alive across
+    // sampler sweeps and keeps a registered agent-root pid.
+    let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Never prompted — no worker child, so no bucket and no field.
+    let idle = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "mock:default" }),
+    )
+    .await;
+    let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
+
+    // Prompted and parked — a live node subtree for the sampler to attribute.
+    let busy = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "mock:default" }),
+    )
+    .await;
+    let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": busy_id, "content": "go" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait until the turn has streamed its pre-cancel chunk — the worker child
+    // is now live and registered as an agent root.
+    let mut parked = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "chat:stream:delta" {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "busy agent streamed a chunk and parked mid-turn");
+
+    // Poll diagnostics until the live sampler's next full sweep (≤ ~5s away)
+    // attributes the parked subtree; the budget leaves slack for slow CI.
+    let deadline = std::time::Instant::now() + common::test_timeout(Duration::from_secs(30));
+    let mut req_id = 20i64;
+    let mut busy_bytes: Option<u64> = None;
+    let mut last_diag = Value::Null;
+    while std::time::Instant::now() < deadline {
+        req_id += 1;
+        let diag = wss_rpc(
+            &mut rpc,
+            req_id,
+            "agent.diagnostics",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let agents = diag["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents array")
+            .clone();
+        last_diag = diag;
+        let busy_row = agents
+            .iter()
+            .find(|a| a["id"] == json!(busy_id))
+            .expect("busy row in diagnostics");
+        if let Some(bytes) = busy_row["subtreeMemoryBytes"].as_u64() {
+            busy_bytes = Some(bytes);
+            // The never-spawned agent's row omits the field entirely (absent,
+            // never 0/null) — asserted on the same snapshot that proved the
+            // sweep has attribution data.
+            let idle_row = agents
+                .iter()
+                .find(|a| a["id"] == json!(idle_id))
+                .expect("idle row in diagnostics");
+            assert!(
+                idle_row.get("subtreeMemoryBytes").is_none(),
+                "unspawned agent row omits subtreeMemoryBytes: {idle_row}"
+            );
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    let busy_bytes = busy_bytes.unwrap_or_else(|| {
+        panic!("sampler never attributed the parked subtree: {last_diag}");
+    });
+    assert!(busy_bytes > 0, "a live node subtree has resident bytes");
+
+    // Diagnostics-only by design: the hot list payloads never carry the field.
+    let got = wss_rpc(&mut rpc, 90, "agent.get", json!({ "agentId": busy_id })).await;
+    assert!(
+        got["agent"].get("subtreeMemoryBytes").is_none(),
+        "agent.get omits subtreeMemoryBytes: {}",
+        got["agent"]
+    );
+    let list = wss_rpc(&mut rpc, 91, "agent.list", json!({ "workspaceId": ws_id })).await;
+    for row in list["agents"].as_array().expect("agents array") {
+        assert!(
+            row.get("subtreeMemoryBytes").is_none(),
+            "agent.list omits subtreeMemoryBytes: {row}"
+        );
+    }
+
+    // Release the parked worker so the daemon tears down cleanly.
+    let stopped = wss_rpc(&mut rpc, 92, "agent.stop", json!({ "agentId": busy_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+}
+
 /// AUDIT-P2-1b: when an agent has a real pending completion watch (its
 /// MCP-delegated child is still running), the daemon emits the specific
 /// `waitingForAgentIds: [childId]` alongside `isWaitingForOtherAgents: true`

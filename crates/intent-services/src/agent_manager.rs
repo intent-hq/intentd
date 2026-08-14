@@ -1738,6 +1738,13 @@ pub struct AgentManager {
     /// spawns, reused while the served model matches, restarted on model
     /// switch, and killed on daemon [`AgentManager::shutdown`].
     unsloth: Arc<crate::unsloth_server::UnslothServerManager>,
+    /// Descendant-tree memory probe for read-only visibility (monorepo#2063
+    /// A2): installed unconditionally by the composition root (unlike the
+    /// budget probe on the registry, which only exists when
+    /// `agents.memoryBudgetMb` resolves to a positive value) so
+    /// `agent.diagnostics` can serve per-agent subtree attribution whether or
+    /// not a budget is configured. Absent in tests / bare wiring.
+    tree_probe: std::sync::OnceLock<Arc<dyn TreeMemoryProbe>>,
 }
 
 impl AgentManager {
@@ -1807,6 +1814,7 @@ impl AgentManager {
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
+            tree_probe: std::sync::OnceLock::new(),
         }
     }
 
@@ -1888,6 +1896,25 @@ impl AgentManager {
     /// Borrow the process registry (lifecycle / diagnostics).
     pub fn registry(&self) -> &ProcessRegistry {
         &self.registry
+    }
+
+    /// Install the descendant-tree memory probe for read-only visibility
+    /// (monorepo#2063 A2). Called once by the composition root after the
+    /// sampler exists; a second call is a no-op. Deliberately separate from
+    /// [`ProcessRegistry::set_memory_budget`]: diagnostics attribution wants
+    /// the probe even when no budget is configured.
+    pub fn set_tree_probe(&self, probe: Arc<dyn TreeMemoryProbe>) {
+        let _ = self.tree_probe.set(probe);
+    }
+
+    /// Per-agent subtree memory attribution from the installed probe
+    /// (monorepo#2063 A2), or an empty map when no probe is wired (tests /
+    /// bare wiring) or no sample has landed yet.
+    pub fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
+        self.tree_probe
+            .get()
+            .map(|p| p.agent_samples())
+            .unwrap_or_default()
     }
 
     /// Snapshot of `spawned child pid -> agent id` for every live handle that
