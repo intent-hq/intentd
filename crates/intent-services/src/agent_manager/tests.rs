@@ -11468,10 +11468,26 @@ mod stale_redrive_tests {
         seed_agent(&mgr, &ws, &id).await;
         set_session_provider(&mgr, &ws, &id, "mock").await;
 
-        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        mgr.services
-            .enqueue_message(&id, "fresh work".to_string(), None, None, None, None, false);
+        // Report lands 60s ago; the queued entry is backdated to 10s ago —
+        // still AFTER the report (fresh, not a stale redrive) but past the
+        // dequeue-wait annotation threshold (monorepo#2353) so the drained
+        // row still carries the wait note.
+        set_delegated_report(&mgr, &ws, &id, &super::dequeue_wait_tests::iso_secs_ago(60)).await;
+        let (enqueued, _) = mgr.services.enqueue_message(
+            &id,
+            "fresh work".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let mut entry = mgr
+            .services
+            .take_queued_message(&id, &enqueued.id)
+            .expect("entry queued");
+        entry.queued_at = super::dequeue_wait_tests::iso_secs_ago(10);
+        mgr.services.requeue_front(&id, entry);
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(10), async {
@@ -11517,19 +11533,28 @@ mod stale_redrive_tests {
         );
         assert!(
             text.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
-            "every drained row carries the dequeue-wait note: {text}"
+            "an above-threshold drained row carries the dequeue-wait note: {text}"
         );
     }
 }
 
-/// Dequeue-wait annotation: every drained queue entry tells the target when
-/// it entered the queue and how long it waited before delivery —
+/// Dequeue-wait annotation: a drained queue entry tells the target when it
+/// entered the queue and how long it waited before delivery —
 /// [`super::annotate_dequeue_wait`] must annotate exactly once, never rewrite
-/// a persisted requeue, and never touch messages that were delivered
-/// immediately (the direct-send path never constructs a queue entry).
+/// a persisted requeue, never touch messages that were delivered immediately
+/// (the direct-send path never constructs a queue entry), and skip waits
+/// below [`super::DEQUEUE_WAIT_ANNOTATION_MIN_MS`] entirely (monorepo#2353).
 mod dequeue_wait_tests {
     use super::*;
     use crate::agent_ops::QueuedMessage;
+
+    /// RFC-3339 UTC timestamp `secs` seconds in the past — backdates
+    /// `queued_at` so a test drain lands above the annotation threshold.
+    pub(super) fn iso_secs_ago(secs: i64) -> String {
+        (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format backdated timestamp")
+    }
 
     pub(super) fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
@@ -11630,14 +11655,54 @@ mod dequeue_wait_tests {
     }
 
     #[test]
-    fn negative_wait_clamps_to_zero() {
-        // Clock skew: an entry "queued in the future" clamps to 0, matching
-        // the content note's `0s`.
+    fn sub_threshold_wait_is_not_annotated() {
+        // An incidental queue hop (monorepo#2353): an entry that waited less
+        // than the threshold is treated like an immediate delivery — no
+        // [SYSTEM NOTE], no queueInfo stamp.
+        let mut msg = queued_msg("instant hop", &intent_core::now_iso(), false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(
+            msg.content, "instant hop",
+            "sub-threshold wait → no dequeue-wait note"
+        );
+        assert_eq!(
+            msg.message_metadata, None,
+            "sub-threshold wait → no queueInfo stamp"
+        );
+    }
+
+    #[test]
+    fn wait_at_or_above_threshold_is_annotated() {
+        // Just past the threshold: the note and stamp apply unchanged.
+        let queued_at = iso_secs_ago(6);
+        let mut msg = queued_msg("parked a while", &queued_at, false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert!(
+            msg.content.contains(super::super::DEQUEUE_WAIT_NOTE_PREFIX),
+            "above-threshold wait carries the note: {}",
+            msg.content
+        );
+        let md = msg.message_metadata.as_ref().expect("queueInfo stamped");
+        assert_eq!(md["queueInfo"]["queuedAt"], queued_at);
+        assert!(
+            md["queueInfo"]["waitedMs"].as_u64().is_some_and(
+                |ms| ms >= u64::try_from(super::super::DEQUEUE_WAIT_ANNOTATION_MIN_MS).unwrap()
+            ),
+            "waitedMs reflects the above-threshold wait: {md}"
+        );
+    }
+
+    #[test]
+    fn negative_wait_is_sub_threshold_and_skipped() {
+        // Clock skew: an entry "queued in the future" reads as a negative
+        // wait, which sits below the threshold and skips the annotation.
         let mut msg = queued_msg("skewed", "2999-01-01T00:00:00Z", false);
         super::super::annotate_dequeue_wait(&mut msg);
-        assert!(msg.content.contains("waited 0s"), "{}", msg.content);
-        let md = msg.message_metadata.as_ref().unwrap();
-        assert_eq!(md["queueInfo"]["waitedMs"], 0);
+        assert_eq!(msg.content, "skewed", "negative wait → no note");
+        assert_eq!(
+            msg.message_metadata, None,
+            "negative wait → no queueInfo stamp"
+        );
     }
 
     #[test]
@@ -11680,7 +11745,9 @@ mod dequeue_wait_tests {
     }
 
     /// `agent.sendQueuedMessageNow` runtime path: the delivered (and
-    /// persisted) content carries the dequeue-wait note.
+    /// persisted) content carries the dequeue-wait note. The entry's
+    /// `queued_at` is backdated past the threshold — a fresh enqueue would
+    /// drain sub-threshold and skip the annotation (monorepo#2353).
     #[tokio::test]
     async fn send_queued_message_now_annotates_dequeue_wait() {
         let (_tmp, mgr) = manager().await;
@@ -11694,6 +11761,13 @@ mod dequeue_wait_tests {
             .await
             .expect("queue");
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+        // Backdate the enqueue so the drain-time wait clears the threshold.
+        let mut entry = mgr
+            .services
+            .take_queued_message(&id, &entry_id)
+            .expect("entry queued");
+        entry.queued_at = iso_secs_ago(10);
+        mgr.services.requeue_front(&id, entry);
 
         let result = mgr
             .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())

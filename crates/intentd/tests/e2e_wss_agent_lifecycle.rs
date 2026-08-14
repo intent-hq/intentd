@@ -5953,9 +5953,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // First turn is slow to open a deterministic window where the second send
     // (carrying messageMetadata) lands on a busy agent and queues.
     let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the queueInfo assertions
+        // exercise the stamp without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -8766,9 +8770,13 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the wait-note assertions
+        // exercise the annotation without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
