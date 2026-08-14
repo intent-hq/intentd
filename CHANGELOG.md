@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.19] - 2026-08-14
+
+### 🚀 Features
+
+- Carry specLinked on task.subscribe snapshot and delta payloads ([#1218](https://github.com/intent-hq/intentd/pull/1218))
+- Persist registered-commit SHA on workspace git roots ([#1220](https://github.com/intent-hq/intentd/pull/1220))
+
+### 🐛 Bug Fixes
+
+- Two-phase commit claim + just-in-time sweep recheck in workspace import ([#1219](https://github.com/intent-hq/intentd/pull/1219))
+- Bound attachment upload sessions with a per-workspace cap and idle TTL ([#1217](https://github.com/intent-hq/intentd/pull/1217))
+
+### 🧪 Testing
+
+- Deflake one_shot prompt-timeout test with a private adapter bound ([#1222](https://github.com/intent-hq/intentd/pull/1222))
+
+
 ## [0.6.18] - 2026-08-14
 
 ### 🚀 Features
