@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.20] - 2026-08-14
+
+### 🐛 Bug Fixes
+
+- Refresh flipped specLinked flags on spec-body edits in task.subscribe ([#1224](https://github.com/intent-hq/intentd/pull/1224))
+
+
 ## [0.6.19] - 2026-08-14
 
 ### 🚀 Features
