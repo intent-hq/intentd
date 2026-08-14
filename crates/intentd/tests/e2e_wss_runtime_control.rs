@@ -688,6 +688,83 @@ async fn wss_system_status_includes_capacity_version_uptime() {
             .is_empty(),
         "hostname non-empty: {r}"
     );
+    // Aggregate-budget fields (monorepo#2063): the budget is off by default
+    // (`agents.memoryBudgetMb = 0`), so all three are ABSENT — the
+    // presence-detection convention, unlike the always-present-but-nullable
+    // child-tree fields.
+    let obj = r.as_object().expect("result is object");
+    for field in [
+        "agentMemoryBudgetBytes",
+        "agentMemoryChargedBytes",
+        "queuedSpawns",
+    ] {
+        assert!(
+            !obj.contains_key(field),
+            "{field} must be absent while the budget is off: {r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wss_system_status_reports_budget_fields_when_installed() {
+    // With `agents.memoryBudgetMb` set, system.status carries the aggregate
+    // budget visibility fields (monorepo#2063): agentMemoryBudgetBytes always,
+    // agentMemoryChargedBytes once the descendant-tree sampler has landed a
+    // sample (absent before — the budget is inert until then), and
+    // queuedSpawns (0 with nothing queued).
+    let data_dir = temp_data_dir();
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[agents]\nmemoryBudgetMb = 20480\n",
+    )
+    .expect("seed config.toml with agents.memoryBudgetMb");
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+    let resp = wss_rpc(&mut ws, 8, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 8);
+    assert_eq!(
+        r["agentMemoryBudgetBytes"].as_u64(),
+        Some(20_480u64 * 1024 * 1024),
+        "installed budget rides the wire: {r}"
+    );
+    assert_eq!(
+        r["queuedSpawns"].as_u64(),
+        Some(0),
+        "no spawn is queued in a fresh daemon: {r}"
+    );
+    // Charged bytes appear only once the sampler has landed its first tree
+    // sample (~5s cadence; a fast test can beat it). When present it must be
+    // a u64, never null — presence-detected like the other two.
+    match r
+        .as_object()
+        .expect("result is object")
+        .get("agentMemoryChargedBytes")
+    {
+        None => {}
+        Some(v) => {
+            assert!(
+                v.is_u64(),
+                "agentMemoryChargedBytes is u64 when present, never null: {r}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
