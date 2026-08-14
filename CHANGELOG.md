@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.17] - 2026-08-14
+
+### 🚀 Features
+
+- *(agents)* Turn-start memory budget re-check for idle-to-active transitions ([#1203](https://github.com/intent-hq/intentd/pull/1203))
+- *(agents)* Stamp reason (slots | memory-budget) on agent:process:* events ([#1196](https://github.com/intent-hq/intentd/pull/1196))
+- *(settings)* Auto/off semantics for agents.memoryBudgetMb ([#1195](https://github.com/intent-hq/intentd/pull/1195))
+- Expose aggregate memory budget visibility on system.status ([#1198](https://github.com/intent-hq/intentd/pull/1198))
+- Bucket descendant-tree RSS by nearest registered agent root ([#1197](https://github.com/intent-hq/intentd/pull/1197))
+- *(agents)* Wire boot to resolve auto memory budget to recommended value
+- *(services)* Expose subtreeMemoryBytes on agent.diagnostics rows ([#1201](https://github.com/intent-hq/intentd/pull/1201))
+- *(agents)* Budget-triggered idle reap drains without a spawn ([#1202](https://github.com/intent-hq/intentd/pull/1202))
+- *(transport)* /tunnel WS endpoint with stream mux + loopback relay ([#1205](https://github.com/intent-hq/intentd/pull/1205))
+- Derive orthogonal workspace waiting flag and emit workspace:waiting-changed ([#1207](https://github.com/intent-hq/intentd/pull/1207))
+
+### 🐛 Bug Fixes
+
+- *(intentd)* Exclude Linux thread rows from the child-tree memory sampler ([#1209](https://github.com/intent-hq/intentd/pull/1209))
+
+### 📚 Documentation
+
+- *(acp)* Document daemon.localhost/client.localhost convention in browser docs ([#1206](https://github.com/intent-hq/intentd/pull/1206))
+- *(acp)* Note automatic tunnel fallback for unreachable remote loopback URLs ([#1208](https://github.com/intent-hq/intentd/pull/1208))
+
+
 ## [0.6.16] - 2026-08-13
 
 ### 🐛 Bug Fixes

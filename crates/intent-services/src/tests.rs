@@ -166,6 +166,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -17151,6 +17152,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -17291,6 +17293,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -17422,6 +17425,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -17548,6 +17552,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -17673,6 +17678,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -17803,6 +17809,7 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -18619,6 +18626,7 @@ mod known_repo {
             diff_summary: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

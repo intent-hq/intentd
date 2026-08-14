@@ -321,13 +321,14 @@ fn channel_event_types_full_matrix() {
         "workspace:activity-changed",
         "workspace:attention-changed",
         "workspace:displayStatus-changed",
+        "workspace:waiting-changed",
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 9);
+    assert_eq!(ws.len(), 10);
     // Comment channel — single type.
     assert_eq!(
         channel_event_types(Channel::Comment),

@@ -307,6 +307,13 @@ pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 // derivation; the self-sufficient payload `{ workspaceId, displayStatus }`
 // updates the workspace card badge with no follow-up fetch.
 pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-changed";
+// Orthogonal `Workspace.waiting` flag transition (PROTOCOL §5.1 / §6.5):
+// recomputed
+// and compared after the hook / PR-monitor / completion-watch lifecycle
+// transitions that can move the derivation; the self-sufficient payload
+// `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
+// no follow-up fetch.
+pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -538,6 +545,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
+    WORKSPACE_WAITING_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
     WORKSPACE_TRANSFER_PROGRESS,
