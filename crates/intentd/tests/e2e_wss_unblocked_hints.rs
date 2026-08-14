@@ -384,6 +384,16 @@ async fn unblocked_section_reaches_parent_wake_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_and_task_notes(&data_dir).await;
 
+    // The unblocked-wake section is gated behind the opt-in
+    // `agentFeatures.taskGraph` (intent-hq/monorepo#2445): seed the toggle on
+    // in the daemon's config before it boots.
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[agentFeatures]\ntaskGraph = true\n",
+    )
+    .expect("seed config.toml with agentFeatures.taskGraph");
+
     const CHILD_MARK: &str = "UNBLK_E2E_CHILD_TURN";
     const PARENT_GO: &str = "UNBLK_E2E_PARENT_GO";
     let delegate_js = format!(

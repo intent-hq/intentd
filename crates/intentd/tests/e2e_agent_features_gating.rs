@@ -2,7 +2,8 @@
 //
 // Drives the full toggle flow over the real WSS transport:
 //   1. `settings.get` / `settings.update` / `settings.reset` round-trip for all
-//      ten `agentFeatures.*` paths (defaults on).
+//      eleven `agentFeatures.*` paths (defaults on, except the opt-in
+//      `taskGraph`).
 //   2. Full session (defaults on): assembled system prompt CONTAINS the gated
 //      sections, the per-agent MCP bridge advertises the full `workspace_api`
 //      surface, and the gated `host({...})` methods dispatch successfully.
@@ -44,18 +45,20 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 type Ws = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
-/// The ten `agentFeatures.*` settings paths (all default on).
-const FEATURE_PATHS: [&str; 10] = [
-    "agentFeatures.backgroundHooks",
-    "agentFeatures.hostExec",
-    "agentFeatures.scripts",
-    "agentFeatures.terminalAccess",
-    "agentFeatures.browserAutomation",
-    "agentFeatures.richChatBlocks",
-    "agentFeatures.structuredQuestions",
-    "agentFeatures.attentionRequests",
-    "agentFeatures.stateSnapshot",
-    "agentFeatures.prMonitor",
+/// The eleven `agentFeatures.*` settings paths with their defaults — all on
+/// except the opt-in `taskGraph` (intent-hq/monorepo#2445).
+const FEATURE_PATHS: [(&str, bool); 11] = [
+    ("agentFeatures.backgroundHooks", true),
+    ("agentFeatures.hostExec", true),
+    ("agentFeatures.scripts", true),
+    ("agentFeatures.terminalAccess", true),
+    ("agentFeatures.browserAutomation", true),
+    ("agentFeatures.richChatBlocks", true),
+    ("agentFeatures.structuredQuestions", true),
+    ("agentFeatures.attentionRequests", true),
+    ("agentFeatures.stateSnapshot", true),
+    ("agentFeatures.prMonitor", true),
+    ("agentFeatures.taskGraph", false),
 ];
 
 struct Daemon {
@@ -410,34 +413,35 @@ async fn agent_features_settings_round_trip() {
     let mut ws = wss_connect(port, client_config(fp)).await;
 
     let mut id = 100;
-    for path in FEATURE_PATHS {
-        // Default on.
+    for (path, default) in FEATURE_PATHS {
+        // Default value.
         let got = wss_rpc(&mut ws, id, "settings.get", json!({ "path": path })).await;
         assert_eq!(
             got["result"]["value"],
-            json!(true),
-            "{path} should default to true: {got}"
+            json!(default),
+            "{path} should default to {default}: {got}"
         );
         id += 1;
 
-        // Flip off.
+        // Flip.
         let upd = wss_rpc(
             &mut ws,
             id,
             "settings.update",
-            json!({ "changes": [{ "path": path, "value": false }] }),
+            json!({ "changes": [{ "path": path, "value": !default }] }),
         )
         .await;
         assert_eq!(upd["result"]["applied"][0]["path"], path, "applied: {upd}");
-        assert_eq!(upd["result"]["applied"][0]["value"], json!(false));
+        assert_eq!(upd["result"]["applied"][0]["value"], json!(!default));
         id += 1;
 
         // Persisted.
         let got2 = wss_rpc(&mut ws, id, "settings.get", json!({ "path": path })).await;
         assert_eq!(
             got2["result"]["value"],
-            json!(false),
-            "{path} should now be false"
+            json!(!default),
+            "{path} should now be {}",
+            !default
         );
         id += 1;
 
@@ -445,8 +449,8 @@ async fn agent_features_settings_round_trip() {
         let reset = wss_rpc(&mut ws, id, "settings.reset", json!({ "path": path })).await;
         assert_eq!(
             reset["result"]["value"],
-            json!(true),
-            "{path} reset should restore default true"
+            json!(default),
+            "{path} reset should restore default {default}"
         );
         id += 1;
     }
@@ -567,6 +571,16 @@ async fn agent_features_gate_new_sessions_only() {
     assert!(
         prompt_a.contains("## Raising Attention"),
         "full prompt must contain the attentionRequests section"
+    );
+    // `taskGraph` is the opt-in exception: with defaults, the batch-delegation
+    // teaching is absent from the prompt (intent-hq/monorepo#2445).
+    assert!(
+        !prompt_a.contains("### Batch delegation"),
+        "default prompt must not teach batch delegation (taskGraph opt-in)"
+    );
+    assert!(
+        prompt_a.contains("## Delegating Tasks"),
+        "single-task delegation guidance must survive taskGraph off"
     );
 
     // A's bridge (from the generated per-agent MCP config) advertises the

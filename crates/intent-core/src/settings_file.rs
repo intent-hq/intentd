@@ -659,8 +659,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on**; changes apply to new agent
-/// sessions only.
+/// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
+/// changes apply to new agent sessions only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -698,6 +698,15 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.prMonitor` — expose centralized PR monitoring
     /// (`ws.pr.monitor` / `ws.pr.unmonitor`) to agents.
     pub pr_monitor: bool,
+    /// `agentFeatures.taskGraph` — teach agents the task-graph workflow:
+    /// batch `ws.agent.delegate({ tasks })` guidance, `dependsOn` /
+    /// `conflictsWith` relations, inline `@@@task` fence attributes, and the
+    /// delivery-time "Tasks now unblocked…" wake section. Docs/prompt only —
+    /// the underlying APIs are never dispatch-denied. Prompt/help gating
+    /// applies to new sessions; the wake section is computed at delivery
+    /// time, so that part follows the toggle live. Defaults **off**
+    /// (opt-in), unlike the other toggles (intent-hq/monorepo#2445).
+    pub task_graph: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -713,6 +722,7 @@ impl Default for AgentFeaturesSettings {
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
+            task_graph: false,
         }
     }
 }
@@ -1286,7 +1296,8 @@ toonOutput = true
 maxPerAgent = 5
 
 [agentFeatures]
-# All toggles default to on; changes apply to new agent sessions only.
+# All toggles default to on (except taskGraph, which is opt-in); changes
+# apply to new agent sessions only.
 # Background hooks -- expose background hooks (ws.hook.*) to agents.
 backgroundHooks = true
 # Host exec -- expose one-shot host command execution (ws.host.exec) to
@@ -1314,6 +1325,11 @@ stateSnapshot = true
 # PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
 # ws.pr.unmonitor) to agents.
 prMonitor = true
+# Task graph -- teach agents the task-graph workflow (batch delegate,
+# dependsOn/conflictsWith relations, @@@task fence attributes, unblocked-wake
+# hints). Docs/prompt only; the APIs themselves always work. Opt-in: defaults
+# to off.
+taskGraph = false
 
 [wakeResume]
 # Wake resume enabled -- detect host sleep/wake and resume work on wake.
@@ -1465,6 +1481,8 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
+        // `taskGraph` is the one opt-in toggle: absent → off.
+        assert!(!parsed.agent_features.task_graph);
     }
 
     #[test]
@@ -1473,6 +1491,20 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("agentFeatures"), "names the table: {msg}");
         assert!(msg.contains("hostExek"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn task_graph_defaults_off_and_opts_in() {
+        // Opt-in (intent-hq/monorepo#2445): empty file and the shipped
+        // template both resolve to off; an explicit `taskGraph = true` opts in.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(!parsed.agent_features.task_graph);
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("taskGraph = false"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(!templated.agent_features.task_graph);
+        let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = true\n")
+            .expect("override parses");
+        assert!(parsed.agent_features.task_graph);
     }
 
     #[test]
