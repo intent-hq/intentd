@@ -6778,9 +6778,15 @@ impl Services {
             .await;
         // Close the registration-time race: a target that already settled
         // delivers its synthetic completion immediately (same reconciliation
-        // path as `app.agents.waitFor` / startup rehydration).
-        self.reconcile_watch_child_on_rehydration(&target_agent_id, &target_ws)
-            .await;
+        // path as `app.agents.waitFor` / startup rehydration). Registration
+        // call site (monorepo#2532): a reported idle target still owning
+        // active hooks/PR monitors defers instead of firing instantly.
+        self.reconcile_watch_child_on_rehydration(
+            &target_agent_id,
+            &target_ws,
+            crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+        )
+        .await;
         Ok(json!({
             "ok": true,
             "subscriptionId": id,
@@ -7041,9 +7047,15 @@ impl Services {
         // Reconcile already-settled targets NOW (immediate: fires the fresh
         // watch right away; after_all: records the completion in the
         // still-open group, which fires once it seals on the caller's idle).
+        // Registration call site (monorepo#2532): a reported idle target
+        // still owning active hooks/PR monitors defers instead.
         for (target, target_ws) in reconcile_targets {
-            self.reconcile_watch_child_on_rehydration(&target, &target_ws)
-                .await;
+            self.reconcile_watch_child_on_rehydration(
+                &target,
+                &target_ws,
+                crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+            )
+            .await;
         }
         Ok(json!({ "ok": true, "waitMode": wait_mode, "results": results }))
     }

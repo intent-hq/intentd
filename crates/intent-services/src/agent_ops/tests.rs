@@ -14141,6 +14141,195 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     );
 }
 
+/// monorepo#2532 Gap A: re-arming via `agent.watch` after a reportToParent
+/// wake ADOPTS the parent's existing watch and must reset `report_delivered`
+/// (fresh interest, mirroring the failure-wake dedup clear), persist the
+/// reset, and fire on the child's next genuine `agent:idle`.
+#[tokio::test]
+async fn rearm_after_report_resets_report_delivered_and_fires_next_idle() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("shipped it"), Some(child.clone()))
+        .await
+        .expect("report");
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1);
+    assert!(watches[0].report_delivered, "report disarmed the watch");
+
+    // Re-arm: adoption must reset the report-time disarm, in memory AND in
+    // the persisted row (the durable registration wrappers upsert the
+    // adopted watch's refreshed state).
+    svc.agent_watch_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect("re-arm");
+    let watches = svc.find_watches_for_child(&child);
+    assert_eq!(watches.len(), 1, "adopted, not duplicated");
+    assert!(
+        !watches[0].report_delivered,
+        "adoption resets report_delivered"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list persisted watches");
+        if rows.len() == 1 && !rows[0].report_delivered {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persisted watch never showed report_delivered=false: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The child's next genuine idle fires the re-armed watch (pre-fix it was
+    // skipped by the stale flag and the watch silently retired).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "report": "shipped it" }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline + 2,
+        "re-armed watch fires on the next idle"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "fired watch retired"
+    );
+}
+
+/// monorepo#2532 Gap B (`agent.watch` call site): a registration-time
+/// reconcile against a reported, RuntimeIdle child that still owns an ACTIVE
+/// hook must DEFER — no instant synthetic wake with the stale report; the
+/// watch stays armed with the interim-skip marker recorded, and the hook's
+/// terminal-transition backstop settles it.
+#[tokio::test]
+async fn registration_reconcile_defers_on_reported_idle_child_with_active_hook() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("PR ready; hook armed".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake off the stale report"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed through the deferral"
+    );
+
+    // The hook's terminal transition routes through the redelivery backstop:
+    // the deferred watch now settles with the child's real completion.
+    svc.store()
+        .update_hook_state(&hook.hook_id, intent_core::HookState::Dispatched)
+        .await
+        .expect("dispatch hook");
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "hook-terminal backstop settles the deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "settled watch retired"
+    );
+}
+
+/// monorepo#2532 Gap B (`app.agents.waitFor` call site): same registration-time
+/// deferral for a reported idle child owning an ACTIVE PR monitor; the
+/// monitor's terminal transition backstop settles the deferred watch.
+#[tokio::test]
+async fn wait_for_reconcile_defers_on_reported_idle_child_with_active_monitor() {
+    let (_t, svc, ws) = setup().await;
+    let watcher = create_agent(&svc, &ws, "Watcher").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 88).await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::RuntimeIdle;
+    s.completion_report = Some("PR ready; monitor armed".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+
+    svc.app_agents_wait_op(ws.clone(), watcher.clone(), vec![child.0.clone()], None)
+        .await
+        .expect("waitFor");
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        0,
+        "no instant synthetic wake off the stale report"
+    );
+    assert_eq!(
+        svc.find_watches_for_child(&child).len(),
+        1,
+        "watch stays armed through the deferral"
+    );
+
+    svc.store()
+        .update_pr_monitor_state(
+            &monitor.monitor_id,
+            intent_core::PrMonitorState::Completed,
+            &now_iso(),
+        )
+        .await
+        .expect("complete monitor");
+    svc.redeliver_completion_after_queue_mutation(&child).await;
+    assert_eq!(
+        parent_message_count(&svc, &watcher).await,
+        1,
+        "monitor-terminal backstop settles the deferred watch"
+    );
+    assert!(
+        svc.find_watches_for_child(&child).is_empty(),
+        "settled watch retired"
+    );
+}
+
 /// Watch-set changes emit `agent:subscriptions-changed` carrying the parent's
 /// refreshed waiting flags: `true` + the child id on registration (delegate),
 /// `false` + empty after the aggregated wake clears the group watches.

@@ -1583,3 +1583,489 @@ async fn agent_watch_rearm_on_idle_but_waiting_target_defers_over_wss() {
     .await;
     assert_eq!(wakes, 1, "exactly one completion wake for middle");
 }
+
+/// Poll `agent.list` until an agent named `name` appears; returns its id.
+/// Needed for agents spawned by another agent's turn (`ws.agent.create`),
+/// whose id the test does not learn from its own RPC call.
+async fn await_agent_id_by_name(
+    rpc: &mut TlsWs,
+    req_id: &mut i64,
+    ws_id: &str,
+    name: &str,
+    deadline: tokio::time::Instant,
+) -> String {
+    loop {
+        let list = wss_rpc(rpc, *req_id, "agent.list", json!({ "workspaceId": ws_id })).await;
+        *req_id += 1;
+        if let Some(agent) = list["agents"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .find(|a| a["name"] == json!(name))
+        {
+            return agent["id"].as_str().expect("agent id").to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agent named {name} never appeared: {list}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// monorepo#2532 Gap A: re-arming after the reportToParent wake ADOPTS the
+/// parent's surviving watch and must reset `report_delivered` so the child's
+/// next genuine completion delivers. The child idles agent-waiting (own live
+/// watch on a leaf, the #1468 deferral the report does NOT bypass), keeping
+/// the reported-on watch alive for the adoption; pre-fix the adopted watch
+/// kept the stale flag and the final idle was suppressed + silently retired
+/// (no wake, ever).
+#[tokio::test]
+async fn agent_watch_rearm_adoption_after_report_fires_next_completion_over_wss() {
+    let Some(script) = gate("WSS re-arm adoption after report E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    const SPAWN_GO: &str = "WATCH5_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH5_CHILD_GO";
+    const REARM_GO: &str = "WATCH5_REARM_GO";
+    const LEAF_GO: &str = "WATCH5_LEAF_GO";
+    const REPORT: &str = "WATCH5_REPORT leaf watch armed; waiting on it";
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('AdoptChild', '{CHILD_GO} do your work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    let child_watch_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'AdoptLeaf');
+        const r = await ws.agent.watch(t.id);
+        return 'leafWatched=' + r.ok;
+    "#;
+    let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let rearm_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'AdoptChild');
+        const r = await ws.agent.watch(t.id);
+        return 'rearmed=' + r.ok;
+    "#;
+    // Wake-ack rules FIRST: every wake turn (report wake, hook/completion
+    // wakes) must ack, never re-run a marker rule off replayed history.
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the reporting child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": child_watch_js, "summary": "child watches leaf" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": child_report_js, "summary": "child reports" }
+                    },
+                ],
+                "emitToolBlocks": true,
+                "response": "child parked on leaf",
+            },
+            {
+                "ifPromptContains": REARM_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": rearm_js, "summary": "re-arm the reported-on child" }
+                },
+                "emitToolBlocks": true,
+                "response": "rearm done",
+            },
+            { "ifPromptContains": LEAF_GO, "response": "leaf turn done" },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
+    let ws_id = setup.ws_id.clone();
+
+    // Leaf FIRST (the child's ws.agent.list lookup must find it), then the
+    // parent, who spawns the child through the bridge (parent linkage is what
+    // makes reportToParent legal and arms the auto parent→child watch).
+    let _leaf = create_agent(&mut setup.rpc, 10, &ws_id, "AdoptLeaf").await;
+    let parent = create_agent(&mut setup.rpc, 11, &ws_id, "AdoptParent").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "AdoptChild",
+        budget.step(60),
+    )
+    .await;
+
+    // Child's kickoff turn: watches the leaf, reports (immediate parent wake
+    // flips the auto watch to report_delivered), then idles agent-waiting —
+    // the reported-on watch SURVIVES this interim idle.
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert_eq!(
+        child_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "child interim idle is stamped agent-waiting: {child_idle}"
+    );
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "reported. Report:",
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        text.contains("consumed your one-shot watch"),
+        "report wake disclosed the disarm: {text}"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "reported-on watch survives the agent-waiting idle");
+
+    // Re-arm: adoption of the surviving pair must reset report_delivered
+    // (Gap A) and the registration-time reconcile defers (#1468) — no
+    // instant synthetic wake.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": REARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "rearm send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "rearmed=true",
+        budget.step(60),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("completed."),
+        "re-arm must not fire a synthetic completion: {text}"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "adopted watch stays armed (no duplicate)");
+
+    // Leaf completes → the child's own watch fires its wake turn → the child
+    // idles GENUINELY → the re-armed watch must deliver (pre-fix: the stale
+    // report_delivered flag suppressed this idle and retired the watch with
+    // no wake).
+    let leaf = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "AdoptLeaf",
+        budget.step(30),
+    )
+    .await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        50,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": leaf, "content": LEAF_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "leaf send ok: {sent}");
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        "completed.",
+        budget.step(90),
+    )
+    .await;
+    assert!(
+        text.contains(&format!("Child agent AdoptChild ({child})")),
+        "completion wake names the child: {text}"
+    );
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    let wakes = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "completed.").await;
+    assert_eq!(wakes, 1, "exactly one completion wake after the re-arm");
+}
+
+/// monorepo#2532 Gap B: arming a watch on a child that REPORTED and idled
+/// while holding an ACTIVE background hook must not fire instantly with the
+/// stale report — the registration-time reconcile defers, the watch stays
+/// armed, and the hook's dispatch (child's next real completion) delivers
+/// exactly once, without the stale report.
+#[tokio::test]
+async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
+    let Some(script) = gate("WSS hook-waiting registration deferral E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    const SPAWN_GO: &str = "WATCH6_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH6_CHILD_GO";
+    const ARM_GO: &str = "WATCH6_ARM_GO";
+    const REPORT: &str = "WATCH6_REPORT PR ready; hook stays armed for late comments";
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('HookChild', '{CHILD_GO} do your work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    // Armed-timer hook: the immediate validation run holds (state marker),
+    // every later run (driven by hook.runNow below) dispatches — the
+    // one-shot dispatch is the hook's terminal transition.
+    let child_hook_js = format!(
+        "const r = await ws.hook.schedule({{ name: 'late-watch', code: {}, delayMs: 60000 }}); \
+         return 'hooked=' + r.hook.state;",
+        json!(
+            "if (hookState === null) { return { dispatch: false, state: { armed: true } }; } \
+             return { dispatch: true, message: 'late change detected' };"
+        )
+    );
+    let child_report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let arm_js = r#"
+        const agents = await ws.agent.list();
+        const t = agents.find(a => a.name === 'HookChild');
+        const r = await ws.agent.watch(t.id);
+        return 'armed=' + r.ok;
+    "#;
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[Background hook", "response": "hook wake handled" },
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the hooked child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": child_hook_js, "summary": "child schedules hook" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": child_report_js, "summary": "child reports" }
+                    },
+                ],
+                "emitToolBlocks": true,
+                "response": "child settled behind its hook",
+            },
+            {
+                "ifPromptContains": ARM_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": arm_js, "summary": "watch the reported hooked child" }
+                },
+                "emitToolBlocks": true,
+                "response": "arm done",
+            },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
+    let ws_id = setup.ws_id.clone();
+
+    // The spawner is the child's parent (reportToParent target); the WATCHER
+    // is a separate fresh agent whose NEW registration is the gap under test.
+    let spawner = create_agent(&mut setup.rpc, 10, &ws_id, "HookSpawner").await;
+    let watcher = create_agent(&mut setup.rpc, 11, &ws_id, "HookWatcher").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": spawner, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "HookChild",
+        budget.step(60),
+    )
+    .await;
+
+    // Child schedules its hook, reports, and idles: the report SETTLES it
+    // despite the active hook (#1945) — the spawner's auto watch retires on
+    // the suppressed idle, leaving the child RuntimeIdle with a persisted
+    // report and an active hook.
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert!(
+        child_idle["data"]["waitingOnHooks"].is_array(),
+        "child idle is stamped hook-waiting: {child_idle}"
+    );
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &spawner,
+        "reported. Report:",
+        budget.step(60),
+    )
+    .await;
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &spawner,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+
+    // The watcher arms a FRESH watch on the reported, hook-holding idle
+    // child. Pre-fix the registration-time reconcile synthesized an instant
+    // idle whose report bypassed the hook deferral — an immediate wake with
+    // the STALE report.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        30,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": watcher, "content": ARM_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "arm send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        "armed=true",
+        budget.step(60),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("Child agent"),
+        "watch on a reported hook-waiting child must not fire instantly: {text}"
+    );
+    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &watcher, &child).await;
+    req_id += 1;
+    assert_eq!(n, 1, "deferred watch stays armed");
+
+    // Fire the hook (its terminal one-shot dispatch): the child's wake turn
+    // ends in its REAL completion — the deferred watch delivers exactly
+    // once, without the stale report (cleared at the wake turn's start).
+    let listed = wss_rpc(
+        &mut setup.rpc,
+        40,
+        "hook.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let hook_id = listed["hooks"]
+        .as_array()
+        .expect("hooks array")
+        .iter()
+        .find(|h| h["name"] == "late-watch" && h["state"] == "scheduled")
+        .unwrap_or_else(|| panic!("scheduled late-watch hook in hook.list: {listed}"))["hookId"]
+        .as_str()
+        .expect("hookId")
+        .to_string();
+    let ran = wss_rpc(
+        &mut setup.rpc,
+        41,
+        "hook.runNow",
+        json!({ "workspaceId": ws_id, "hookId": hook_id }),
+    )
+    .await;
+    assert_eq!(ran["ok"], true, "hook.runNow ok: {ran}");
+    let text = await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        &format!("Child agent HookChild ({child})"),
+        budget.step(90),
+    )
+    .await;
+    assert!(
+        text.contains("completed."),
+        "settlement wake reports the child completed: {text}"
+    );
+    assert!(
+        !text.contains("WATCH6_REPORT"),
+        "the deferred wake must not carry the stale report: {text}"
+    );
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+    await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &watcher,
+        budget.step(60),
+    )
+    .await;
+    let wakes = wake_row_count(
+        &mut setup.rpc,
+        req_id,
+        &ws_id,
+        &watcher,
+        &format!("Child agent HookChild ({child})"),
+    )
+    .await;
+    assert_eq!(wakes, 1, "exactly one completion wake for the hooked child");
+}

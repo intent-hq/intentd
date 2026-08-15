@@ -121,6 +121,19 @@ pub(crate) struct SubscriptionRegistry {
     pub delegation_groups: Vec<DelegationGroup>,
 }
 
+/// Which call site is running
+/// [`Services::reconcile_watch_child_on_rehydration`] (monorepo#2532): a NEW
+/// explicit registration (`agent.watch` / `app.agents.waitFor`) asks for the
+/// child's NEXT completion — a reported idle child still owning active hooks
+/// or PR monitors defers instead of firing instantly with the stale report —
+/// while boot REHYDRATION keeps report-equals-settlement semantics (a missed
+/// wake must deliver at boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchReconcileCallSite {
+    Registration,
+    Rehydration,
+}
+
 /// The shared registration safety gate: a non-chief parent may only watch
 /// children inside its own workspace; a chief-workspace parent may watch any
 /// agent. Enforced in [`Services::register_completion_watch`] (the single
@@ -286,6 +299,12 @@ impl Services {
                     existing.group_id = Some(gid);
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
+                // monorepo#2532: adoption expresses fresh interest in the
+                // child's NEXT completion — clear the report-time disarm so
+                // a re-armed watch fires on the next `agent:idle` (mirrors
+                // the failure-wake dedup clear below). Persisted by the
+                // callers' write-through upsert of the returned watch.
+                existing.report_delivered = false;
                 // Refresh the parent display name and home-workspace anchor
                 // from the current registration (mirroring
                 // `find_and_refresh_ungrouped_watch`): a watch created with
@@ -1321,8 +1340,12 @@ impl Services {
         to_reconcile.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
         to_reconcile.dedup_by(|a, b| a.0 == b.0);
         for (child_id, child_ws) in to_reconcile {
-            self.reconcile_watch_child_on_rehydration(&child_id, &child_ws)
-                .await;
+            self.reconcile_watch_child_on_rehydration(
+                &child_id,
+                &child_ws,
+                WatchReconcileCallSite::Rehydration,
+            )
+            .await;
         }
         Ok(loaded)
     }
@@ -1350,12 +1373,15 @@ impl Services {
     /// route it through [`Services::deliver_completion_to_watches`] so the
     /// parent wakes now instead of waiting for an event that already fired.
     /// Used both at startup rehydration (child settled while the daemon was
-    /// down) and at `app.agents.waitFor` registration time (target settled
-    /// before — or concurrently with — the registration).
+    /// down) and at `agent.watch` / `app.agents.waitFor` registration time
+    /// (target settled before — or concurrently with — the registration);
+    /// `call_site` distinguishes the two (monorepo#2532, see
+    /// [`WatchReconcileCallSite`]).
     pub(crate) async fn reconcile_watch_child_on_rehydration(
         &self,
         child_id: &AgentId,
         fallback_ws: &WorkspaceId,
+        call_site: WatchReconcileCallSite,
     ) {
         use intent_core::AgentStatus;
         let (event_type, event_ws, status_value, completion_report) =
@@ -1390,6 +1416,31 @@ impl Services {
                         // completion if the last outgoing watch disappears
                         // without a wake, then leave the watch armed.
                         if settled && self.agent_is_waiting_on_agents(child_id) {
+                            self.mark_interim_skipped_idle(child_id);
+                            return;
+                        }
+                        // Registration-time hook/PR-monitor deferral
+                        // (monorepo#2532 Gap B): a NEW explicit watch on a
+                        // reported idle child that still owns active hooks or
+                        // PR monitors asks for the child's NEXT completion —
+                        // the caller already has the report, so an instant
+                        // synthetic idle (whose #1945 report bypass would
+                        // skip the live path's deferrals) fires the fresh
+                        // watch with the STALE report. Defer like the
+                        // agent-waiting branch above: record the interim-skip
+                        // marker and leave the watch armed — the hook/monitor
+                        // terminal-transition backstops
+                        // (`redeliver_completion_after_queue_mutation`)
+                        // synthesize the real completion later. Boot
+                        // REHYDRATION keeps current semantics (report =
+                        // settlement; a missed wake must deliver at boot —
+                        // e.g. SUB-1 sender-watches that get no report-time
+                        // wake).
+                        if settled
+                            && matches!(call_site, WatchReconcileCallSite::Registration)
+                            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
+                        {
                             self.mark_interim_skipped_idle(child_id);
                             return;
                         }
