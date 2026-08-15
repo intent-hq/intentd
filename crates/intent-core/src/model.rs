@@ -2955,19 +2955,72 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
-    /// Batch form (PROTOCOL §5.5): a list of task-note ids to classify and
-    /// start together. Mutually exclusive with `taskNoteId`/`noteId`/
-    /// `taskText`, and the single-task-only `agentInstructions`/`force` are
-    /// rejected alongside it; when present the result enumerates every listed
-    /// task with its disposition (`started` / `held:*` / `skipped`) plus the
-    /// unlock plan. Single-task calls (this field absent) behave exactly as
-    /// before.
-    pub tasks: Option<Vec<NoteId>>,
-    /// Batch-only conflict policy (default false): `false` holds a task whose
-    /// `conflictsWith` intersects the running/starting set, admitting
-    /// startable tasks in effort-weighted critical-path priority order;
-    /// `true` starts it anyway and names the conflict pairs in the result.
-    pub greedy: Option<bool>,
+    /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
+    /// together — each entry either a bare task-note id or a
+    /// [`BatchTaskEntry::Options`] object carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
+    /// `agentInstructions`/`force` are rejected alongside it; when present
+    /// the result enumerates every listed task with its disposition
+    /// (`started` / `held:*` / `skipped`) plus the unlock plan. Single-task
+    /// calls (this field absent) behave exactly as before.
+    pub tasks: Option<Vec<BatchTaskEntry>>,
+    /// REMOVED batch conflict override (PROTOCOL §5.5): kept as a field only
+    /// so a request still passing `greedy` gets a clear rejection instead of
+    /// being silently ignored — delegate a held task individually to force
+    /// it past a conflict hold. `Option<Option<bool>>` via
+    /// [`deserialize_optional_field`] so an explicit `null` (`Some(None)`)
+    /// is detected as present and rejected too; only a missing field
+    /// (`None`) passes.
+    #[serde(deserialize_with = "deserialize_optional_field")]
+    pub greedy: Option<Option<bool>>,
+}
+
+/// One entry of the batch `agent.delegate` `tasks` array (PROTOCOL §5.5):
+/// either a bare task-note id string (the original shape, unchanged) or an
+/// object carrying the id plus per-task option overrides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BatchTaskEntry {
+    /// Bare task-note id — inherits the call's top-level
+    /// `specialist`/`model`/`reasoningEffort` defaults.
+    Id(NoteId),
+    /// Object entry with per-task overrides.
+    Options(BatchTaskOptions),
+}
+
+impl BatchTaskEntry {
+    /// The task-note id this entry addresses, regardless of shape.
+    pub fn task_note_id(&self) -> &NoteId {
+        match self {
+            BatchTaskEntry::Id(id) => id,
+            BatchTaskEntry::Options(opts) => &opts.task_note_id,
+        }
+    }
+}
+
+/// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
+/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// defaults for that task only. `agentInstructions` is carried solely so the
+/// delegate op can reject it with a clear error — it is never honored (each
+/// started task's first message resolves from its own task note).
+/// `deny_unknown_fields` so a typo'd or unsupported per-entry key (e.g.
+/// `behaviorPrompt`, `waitMode`, `greedy`) fails deserialization instead of
+/// being silently dropped — the same silent-ignore failure mode the modeled
+/// rejection fields exist to prevent (works with `untagged`: serde buffers
+/// the content).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchTaskOptions {
+    pub task_note_id: NoteId,
+    #[serde(default)]
+    pub specialist: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub agent_instructions: Option<String>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -3548,6 +3601,71 @@ mod tests {
         // Round-trips back to an equal value.
         let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn agent_delegate_input_tasks_accepts_mixed_string_and_object_entries() {
+        // PROTOCOL §5.5 batch form: a bare taskNoteId string and an object
+        // entry with per-task overrides deserialize side by side.
+        let input: AgentDelegateInput = serde_json::from_value(json!({
+            "tasks": [
+                "bare-id",
+                { "taskNoteId": "obj-id", "specialist": "verifier",
+                  "model": "mock:m", "reasoningEffort": "high" },
+                { "taskNoteId": "min-id" },
+            ],
+            "specialist": "implementor",
+        }))
+        .unwrap();
+        let tasks = input.tasks.expect("tasks");
+        assert_eq!(tasks.len(), 3);
+        assert!(matches!(&tasks[0], BatchTaskEntry::Id(id) if id.0 == "bare-id"));
+        assert_eq!(tasks[0].task_note_id().0, "bare-id");
+        match &tasks[1] {
+            BatchTaskEntry::Options(o) => {
+                assert_eq!(o.task_note_id.0, "obj-id");
+                assert_eq!(o.specialist.as_deref(), Some("verifier"));
+                assert_eq!(o.model.as_deref(), Some("mock:m"));
+                assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
+                assert!(o.agent_instructions.is_none());
+            }
+            other => panic!("expected Options, got {other:?}"),
+        }
+        assert_eq!(tasks[2].task_note_id().0, "min-id");
+
+        // An object entry without a taskNoteId fails to deserialize.
+        assert!(serde_json::from_value::<AgentDelegateInput>(
+            json!({ "tasks": [{ "specialist": "verifier" }] })
+        )
+        .is_err());
+
+        // deny_unknown_fields: a typo'd or unsupported per-entry key fails
+        // deserialization instead of being silently dropped.
+        for bad in [
+            json!({ "taskNoteId": "x", "speciallist": "verifier" }),
+            json!({ "taskNoteId": "x", "behaviorPrompt": "be terse" }),
+            json!({ "taskNoteId": "x", "waitMode": "after_all" }),
+            json!({ "taskNoteId": "x", "greedy": true }),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentDelegateInput>(json!({ "tasks": [bad] })).is_err(),
+                "unknown per-entry key must fail deserialization: {bad}"
+            );
+        }
+
+        // The removed `greedy` param is presence-aware: a missing field is
+        // `None`, while `true`/`false`/an explicit `null` all deserialize as
+        // present (`Some(..)`) so the service layer can reject any of them.
+        assert!(input.greedy.is_none());
+        for (val, expect) in [
+            (json!(true), Some(Some(true))),
+            (json!(false), Some(Some(false))),
+            (json!(null), Some(None)),
+        ] {
+            let with_greedy: AgentDelegateInput =
+                serde_json::from_value(json!({ "tasks": ["x"], "greedy": val })).unwrap();
+            assert_eq!(with_greedy.greedy, expect);
+        }
     }
 
     #[test]

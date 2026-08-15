@@ -5450,6 +5450,16 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // `greedy` was a batch-level conflict override; it is REMOVED. Any
+        // supplied value — `true`, `false`, or an explicit `null` — rejects
+        // on BOTH forms (the check sits before the batch routing so a
+        // single-task call cannot silently carry it either); only a missing
+        // field passes.
+        if input.greedy.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
+            ));
+        }
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
@@ -6087,13 +6097,15 @@ impl Services {
     /// state (task statuses, `dependsOn`/`conflictsWith` edges, live assigned
     /// agents; see [`batch::classify_batch_tasks`]) — then delegate exactly
     /// the start subset through the unchanged single-task path (per-task
-    /// agent creation, group enrollment honoring `waitMode`). No scheduler
-    /// state is written: held tasks are simply not started, and re-calling
-    /// with the same list is idempotent (running/terminal tasks classify as
-    /// `skipped`). The result enumerates EVERY supplied task with its
-    /// disposition + reason and projects the unlock plan; the existing group
-    /// settlement wake is the resume signal — the caller re-calls delegate
-    /// then, which recomputes everything.
+    /// agent creation, group enrollment honoring `waitMode`). Entries may be
+    /// bare task-note ids or objects carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides of the top-level
+    /// defaults. No scheduler state is written: held tasks are simply not
+    /// started, and re-calling with the same list is idempotent
+    /// (running/terminal tasks classify as `skipped`). The result enumerates
+    /// EVERY supplied task with its disposition + reason and projects the
+    /// unlock plan; the existing group settlement wake is the resume signal —
+    /// the caller re-calls delegate then, which recomputes everything.
     async fn agent_delegate_batch_op(
         &self,
         workspace_id: WorkspaceId,
@@ -6101,13 +6113,28 @@ impl Services {
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
         use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition};
+        use intent_core::BatchTaskEntry;
 
-        let requested: Vec<String> = input
-            .tasks
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| id.0)
+        let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
+        // Per-task option overrides, keyed by task-note id. Only OBJECT
+        // entries populate the map, so for a duplicated id the last object
+        // entry wins and a trailing bare-string duplicate does NOT reset an
+        // earlier object's overrides (classification dedups to one row
+        // anyway).
+        let mut overrides: HashMap<String, intent_core::BatchTaskOptions> = HashMap::new();
+        for entry in &entries {
+            if let BatchTaskEntry::Options(opts) = entry {
+                if opts.agent_instructions.is_some() {
+                    return Err(Error::InvalidParams(
+                        "agent.delegate: agentInstructions is not supported on a tasks entry — each started task's first message resolves from its own task note".to_string(),
+                    ));
+                }
+                overrides.insert(opts.task_note_id.0.clone(), opts.clone());
+            }
+        }
+        let requested: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.task_note_id().0.clone())
             .collect();
         if requested.is_empty() {
             return Err(Error::InvalidParams(
@@ -6182,8 +6209,7 @@ impl Services {
             )));
         }
 
-        let greedy = input.greedy.unwrap_or(false);
-        let classified = classify_batch_tasks(&requested, &snaps, greedy);
+        let classified = classify_batch_tasks(&requested, &snaps);
 
         // Delegate the start subset through the unchanged single-task path.
         // A per-task failure becomes an `error` disposition rather than
@@ -6195,12 +6221,21 @@ impl Services {
             let mut row = json!({ "taskNoteId": id, "title": title });
             let obj = row.as_object_mut().unwrap();
             match disposition {
-                BatchDisposition::Start { conflicts_with } => {
+                BatchDisposition::Start => {
+                    // Per-entry overrides beat the top-level defaults, field
+                    // by field.
+                    let opts = overrides.get(id);
                     let single = intent_core::AgentDelegateInput {
                         task_note_id: Some(NoteId::from(id.as_str())),
-                        specialist: input.specialist.clone(),
-                        model: input.model.clone(),
-                        reasoning_effort: input.reasoning_effort.clone(),
+                        specialist: opts
+                            .and_then(|o| o.specialist.clone())
+                            .or_else(|| input.specialist.clone()),
+                        model: opts
+                            .and_then(|o| o.model.clone())
+                            .or_else(|| input.model.clone()),
+                        reasoning_effort: opts
+                            .and_then(|o| o.reasoning_effort.clone())
+                            .or_else(|| input.reasoning_effort.clone()),
                         behavior_prompt: input.behavior_prompt.clone(),
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
@@ -6218,16 +6253,6 @@ impl Services {
                             obj.insert("disposition".into(), json!("started"));
                             obj.insert("agentId".into(), res["agentId"].clone());
                             obj.insert("agentName".into(), res["name"].clone());
-                            if !conflicts_with.is_empty() {
-                                obj.insert("conflictsWith".into(), json!(conflicts_with));
-                                obj.insert(
-                                    "reason".into(),
-                                    json!(format!(
-                                        "started despite conflictsWith overlap with {} (greedy) — expect rebases",
-                                        conflicts_with.join(", ")
-                                    )),
-                                );
-                            }
                             started_ids.push(id.clone());
                         }
                         Err(e) => {
@@ -6259,7 +6284,7 @@ impl Services {
                     obj.insert(
                         "reason".into(),
                         json!(format!(
-                            "conflictsWith intersects the running/starting set ({}); pass greedy: true to start anyway",
+                            "conflictsWith intersects the running/starting set ({}); delegate it individually to force it",
                             conflicts_with.join(", ")
                         )),
                     );
@@ -6339,7 +6364,6 @@ impl Services {
         }
         Ok(json!({
             "ok": true,
-            "greedy": greedy,
             "tasks": rows,
             "startedTaskIds": started_ids,
             "unlockPlan": unlock_plan,
