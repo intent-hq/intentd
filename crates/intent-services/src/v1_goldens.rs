@@ -1520,6 +1520,55 @@ fn golden_user_rules_wrapper() {
     );
 }
 
+/// RTK instruction line: exact bytes for the subcommand-joined variant
+/// (mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`).
+#[test]
+fn golden_rtk_instruction_line() {
+    assert_eq!(
+        crate::rules::rtk_instruction_line(&["git".to_string(), "cargo".to_string()]),
+        "Prefix these commands with rtk for compressed, LLM-friendly output: git, cargo"
+    );
+}
+
+/// Skills catalog wrapper: exact bytes of the prompt-injection layer,
+/// including XML escaping of metadata fields and the empty-catalog fast path.
+#[test]
+fn golden_skills_catalog_wrapper() {
+    let skill = |name: &str, description: &str, location: &str| crate::skills::SkillMetadata {
+        name: name.to_string(),
+        description: description.to_string(),
+        location: location.to_string(),
+        scope: "project".to_string(),
+        allowed_tools: None,
+        compatibility: None,
+    };
+    assert_eq!(crate::skills::build_skills_catalog(&[]), "");
+    assert_eq!(
+        crate::skills::build_skills_catalog(&[
+            skill("deploy", "Deploy the app", "/repo/.skills/deploy/SKILL.md"),
+            skill("a<b", "uses & \"quotes\"", "/repo/x/SKILL.md"),
+        ]),
+        "The following skills provide specialized instructions for specific tasks.\n\
+         When a task matches a skill's description, use your file-read tool to load\n\
+         the SKILL.md at the listed location before proceeding.\n\
+         When a skill references relative paths, resolve them against the skill's\n\
+         directory (the parent of SKILL.md) and use absolute paths in tool calls.\n\
+         \n\
+         <available_skills>\n\
+         \x20 <skill>\n\
+         \x20   <name>deploy</name>\n\
+         \x20   <description>Deploy the app</description>\n\
+         \x20   <location>/repo/.skills/deploy/SKILL.md</location>\n\
+         \x20 </skill>\n\
+         \x20 <skill>\n\
+         \x20   <name>a&lt;b</name>\n\
+         \x20   <description>uses &amp; &quot;quotes&quot;</description>\n\
+         \x20   <location>/repo/x/SKILL.md</location>\n\
+         \x20 </skill>\n\
+         </available_skills>"
+    );
+}
+
 /// Isolation hints: the sandboxed-implementor and CoW-coordinator layers.
 #[test]
 fn golden_isolation_hints() {
