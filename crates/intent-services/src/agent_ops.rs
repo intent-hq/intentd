@@ -6116,8 +6116,11 @@ impl Services {
         use intent_core::BatchTaskEntry;
 
         let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
-        // Per-task option overrides, keyed by task-note id (last entry wins
-        // for a duplicated id — classification dedups to one row anyway).
+        // Per-task option overrides, keyed by task-note id. Only OBJECT
+        // entries populate the map, so for a duplicated id the last object
+        // entry wins and a trailing bare-string duplicate does NOT reset an
+        // earlier object's overrides (classification dedups to one row
+        // anyway).
         let mut overrides: HashMap<String, intent_core::BatchTaskOptions> = HashMap::new();
         for entry in &entries {
             if let BatchTaskEntry::Options(opts) = entry {

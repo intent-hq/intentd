@@ -3004,8 +3004,13 @@ impl BatchTaskEntry {
 /// defaults for that task only. `agentInstructions` is carried solely so the
 /// delegate op can reject it with a clear error — it is never honored (each
 /// started task's first message resolves from its own task note).
+/// `deny_unknown_fields` so a typo'd or unsupported per-entry key (e.g.
+/// `behaviorPrompt`, `waitMode`, `greedy`) fails deserialization instead of
+/// being silently dropped — the same silent-ignore failure mode the modeled
+/// rejection fields exist to prevent (works with `untagged`: serde buffers
+/// the content).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BatchTaskOptions {
     pub task_note_id: NoteId,
     #[serde(default)]
@@ -3633,6 +3638,20 @@ mod tests {
             json!({ "tasks": [{ "specialist": "verifier" }] })
         )
         .is_err());
+
+        // deny_unknown_fields: a typo'd or unsupported per-entry key fails
+        // deserialization instead of being silently dropped.
+        for bad in [
+            json!({ "taskNoteId": "x", "speciallist": "verifier" }),
+            json!({ "taskNoteId": "x", "behaviorPrompt": "be terse" }),
+            json!({ "taskNoteId": "x", "waitMode": "after_all" }),
+            json!({ "taskNoteId": "x", "greedy": true }),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentDelegateInput>(json!({ "tasks": [bad] })).is_err(),
+                "unknown per-entry key must fail deserialization: {bad}"
+            );
+        }
 
         // The removed `greedy` param is presence-aware: a missing field is
         // `None`, while `true`/`false`/an explicit `null` all deserialize as
