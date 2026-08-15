@@ -23791,9 +23791,11 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         other => panic!("expected InvalidParams, got {other:?}"),
     }
 
-    // `greedy` was removed: any value (true or false) is rejected with the
-    // pointer at individual delegation.
-    for greedy in [true, false] {
+    // `greedy` was removed: any supplied value — `true`, `false`, or an
+    // explicit `null` (`Some(None)` after presence-aware deserialization) —
+    // is rejected with the pointer at individual delegation, in BOTH forms.
+    for greedy in [Some(true), Some(false), None] {
+        // Batch form.
         let err = svc
             .agent_delegate_op(
                 ws.clone(),
@@ -23805,6 +23807,30 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
             )
             .await
             .expect_err("greedy rejected in batch mode");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(
+                    "greedy was removed; delegate a held task individually to force it past the conflict hold"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Single-task form: the check sits before batch routing, so a
+        // single-task call cannot silently carry the removed param either.
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    task_note_id: Some(note_id.clone()),
+                    greedy: Some(greedy),
+                    model: Some("mock:default".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("greedy rejected in single-task mode");
         match &err {
             Error::InvalidParams(msg) => assert!(
                 msg.contains(

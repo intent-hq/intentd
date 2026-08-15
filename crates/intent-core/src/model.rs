@@ -2968,8 +2968,12 @@ pub struct AgentDelegateInput {
     /// REMOVED batch conflict override (PROTOCOL §5.5): kept as a field only
     /// so a request still passing `greedy` gets a clear rejection instead of
     /// being silently ignored — delegate a held task individually to force
-    /// it past a conflict hold.
-    pub greedy: Option<bool>,
+    /// it past a conflict hold. `Option<Option<bool>>` via
+    /// [`deserialize_optional_field`] so an explicit `null` (`Some(None)`)
+    /// is detected as present and rejected too; only a missing field
+    /// (`None`) passes.
+    #[serde(deserialize_with = "deserialize_optional_field")]
+    pub greedy: Option<Option<bool>>,
 }
 
 /// One entry of the batch `agent.delegate` `tasks` array (PROTOCOL §5.5):
@@ -3629,6 +3633,20 @@ mod tests {
             json!({ "tasks": [{ "specialist": "verifier" }] })
         )
         .is_err());
+
+        // The removed `greedy` param is presence-aware: a missing field is
+        // `None`, while `true`/`false`/an explicit `null` all deserialize as
+        // present (`Some(..)`) so the service layer can reject any of them.
+        assert!(input.greedy.is_none());
+        for (val, expect) in [
+            (json!(true), Some(Some(true))),
+            (json!(false), Some(Some(false))),
+            (json!(null), Some(None)),
+        ] {
+            let with_greedy: AgentDelegateInput =
+                serde_json::from_value(json!({ "tasks": ["x"], "greedy": val })).unwrap();
+            assert_eq!(with_greedy.greedy, expect);
+        }
     }
 
     #[test]

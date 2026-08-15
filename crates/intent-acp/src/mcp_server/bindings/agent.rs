@@ -298,7 +298,9 @@ async fn delegate(
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
         tasks,
-        greedy: opt_bool(args, "greedy"),
+        // Presence-sensitive: `greedy` is REMOVED and any supplied value
+        // (even `null`) must reach the service layer for its rejection.
+        greedy: args.get("greedy").map(Value::as_bool),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())

@@ -5450,6 +5450,16 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // `greedy` was a batch-level conflict override; it is REMOVED. Any
+        // supplied value — `true`, `false`, or an explicit `null` — rejects
+        // on BOTH forms (the check sits before the batch routing so a
+        // single-task call cannot silently carry it either); only a missing
+        // field passes.
+        if input.greedy.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
+            ));
+        }
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
@@ -6126,13 +6136,6 @@ impl Services {
         if requested.is_empty() {
             return Err(Error::InvalidParams(
                 "agent.delegate: tasks must be a non-empty array of task note ids".to_string(),
-            ));
-        }
-        // `greedy` was a batch-level conflict override; it is gone (the
-        // single-task form already bypasses classification entirely).
-        if input.greedy.is_some() {
-            return Err(Error::InvalidParams(
-                "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
         // The batch form is an alternative addressing mode: mixing it with
