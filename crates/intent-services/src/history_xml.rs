@@ -25,7 +25,9 @@ const SUPERVISOR_CLOSING: &str =
     "Continue the conversation from this point. Do not mention session recovery or interruption.\n</supervisor>";
 
 /// Escape XML special characters (TS `escapeXml`): `&` first, then `<`, `>`, `"`.
-fn escape_xml(text: &str) -> String {
+/// Also used by the restart-resume tail recap (monorepo#2539) so replayed
+/// user/partial text cannot escape its quoting tags.
+pub(crate) fn escape_xml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
