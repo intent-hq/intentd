@@ -82,6 +82,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
+# No-echo terminal input for `intentd settings <sensitive>` prompts
+# (termios); already in the workspace dependency tree via intent-core.
+libc = "0.2"
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).
