@@ -25,14 +25,15 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled";
 
-/// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
-/// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
-/// and loading it made `agent.list` scale with the stored prompt bytes.
+/// Session metadata needed by the `AgentLite` summary projection.
+/// `system_prompt` and `image_blocks` are intentionally omitted:
+/// `AgentLite::from_session` strips them from the wire, and loading them made
+/// `agent.list` scale with the stored prompt/base64-image bytes.
 const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    initial_message, context_references, image_blocks, file_blocks, is_background, metadata, sandbox_id, \
+    initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// One agent session's usage inputs for the workspace token-usage tally
@@ -1857,16 +1858,21 @@ impl Store {
 }
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_system_prompt(row, col(row, "system_prompt")?)
+    map_session_row_with_heavy_cols(
+        row,
+        col(row, "system_prompt")?,
+        json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+    )
 }
 
 fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_system_prompt(row, None)
+    map_session_row_with_heavy_cols(row, None, None)
 }
 
-fn map_session_row_with_system_prompt(
+fn map_session_row_with_heavy_cols(
     row: &SqliteRow,
     system_prompt: Option<String>,
+    image_blocks: Option<serde_json::Value>,
 ) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
@@ -1912,7 +1918,7 @@ fn map_session_row_with_system_prompt(
             col(row, "context_references")?,
             "context_references",
         )?,
-        image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        image_blocks,
         file_blocks: json_col_from_db(col(row, "file_blocks")?, "file_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
@@ -4597,6 +4603,9 @@ mod tests {
         // Insert agent session
         let agent_id = AgentId("agent-summary-test".to_string());
         let system_prompt = "large system prompt".repeat(4096);
+        let image_blocks = serde_json::json!([
+            {"type": "image", "data": "A".repeat(4096), "mimeType": "image/png"}
+        ]);
         let session = AgentSession {
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
@@ -4627,7 +4636,7 @@ mod tests {
             delegation_depth: None,
             initial_message: None,
             context_references: None,
-            image_blocks: None,
+            image_blocks: Some(image_blocks.clone()),
             file_blocks: None,
             is_background: false,
             metadata: None,
@@ -4667,6 +4676,11 @@ mod tests {
             "full session reads should retain system_prompt"
         );
         assert_eq!(
+            full[0].image_blocks.as_ref(),
+            Some(&image_blocks),
+            "full session reads should retain image_blocks"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -4689,9 +4703,17 @@ mod tests {
             summaries[0].system_prompt, None,
             "summary reads should not load system_prompt"
         );
+        assert_eq!(
+            summaries[0].image_blocks, None,
+            "summary reads should not load image_blocks"
+        );
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
             "the summary SELECT must not mention system_prompt"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("image_blocks"),
+            "the summary SELECT must not mention image_blocks"
         );
     }
 
