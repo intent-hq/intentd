@@ -34,7 +34,9 @@ fn escape_xml(text: &str) -> String {
 
 /// Middle-truncate `text` to `max_chars`, keeping the head and tail (TS
 /// `truncateMiddleContent`). Operates on chars to stay on UTF-8 boundaries.
-fn truncate_middle_content(text: &str, max_chars: usize) -> String {
+/// Also used by the restart-resume tail recap (monorepo#2539) to bound the
+/// replayed user/partial-response text.
+pub(crate) fn truncate_middle_content(text: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     if len <= max_chars {

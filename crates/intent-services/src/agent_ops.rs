@@ -10017,6 +10017,99 @@ fn validate_message_role(role: &str) -> Result<()> {
     }
 }
 
+/// Per-segment char cap for the restart-resume tail recap (middle-truncated):
+/// generous enough to replay a real request/partial response verbatim, small
+/// enough that a pathological message cannot blow up the continuation prompt.
+const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
+
+/// Build the mid-turn tail recap for a restart resume (monorepo#2539).
+///
+/// A `session/load` resume replays the PROVIDER's session checkpoint, which
+/// only contains completed turns — the turn that was in flight at the
+/// interruption (its user message, and any partial assistant output the
+/// shutdown flush persisted) never resolved provider-side, so the resumed
+/// context silently ends one exchange early even though the daemon transcript
+/// has the full tail. This recap replays that daemon-side tail (prompt-only,
+/// via `TurnOptions::prepend_content`) ahead of the continuation message, with
+/// an explicit cut-off disclosure.
+///
+/// Returns `Some(recap)` when the transcript tail shows an interrupted turn:
+/// walking backward, system rows (e.g. the interruption marker) are skipped
+/// and assistant rows tagged `metadata.interrupted` are collected as partial
+/// output, until a user row (the interrupted turn's message) is reached.
+/// Returns `None` when the last non-system row is a completed assistant turn
+/// (the provider checkpoint already covers it), when there is no user row, or
+/// when an unexpected row shape makes the tail unreadable.
+fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<String> {
+    let mut partials: Vec<String> = Vec::new();
+    let mut user_text: Option<String> = None;
+    for m in messages.iter().rev() {
+        match m.role.as_str() {
+            "system" => continue,
+            "assistant" => {
+                let interrupted = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !interrupted {
+                    // Last turn completed normally — the provider's own
+                    // session state covers it; nothing was lost.
+                    return None;
+                }
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("");
+                if !text.is_empty() {
+                    partials.push(text);
+                }
+            }
+            "user" => {
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("\n");
+                if !text.is_empty() {
+                    user_text = Some(text);
+                }
+                break;
+            }
+            // Any other tail shape (e.g. a bare `tool` row) is not the
+            // interrupted-turn pattern this recap understands — fail safe.
+            _ => return None,
+        }
+    }
+    let user_text = user_text?;
+    partials.reverse();
+    let user_text =
+        crate::history_xml::truncate_middle_content(&user_text, RESUME_RECAP_SEGMENT_MAX_CHARS);
+    let mut recap = String::from(
+        "<supervisor>\nRestart recovery: the harness restarted while you were \
+         responding, and your restored session may predate that turn — the lost \
+         exchange is repeated below (parts of it may or may not already be in \
+         your context).\n\nThe user's last message, delivered before the \
+         interruption:\n<interrupted_user_message>\n",
+    );
+    recap.push_str(&user_text);
+    recap.push_str("\n</interrupted_user_message>\n\n");
+    let partial_text = partials.join("");
+    if partial_text.is_empty() {
+        recap.push_str(
+            "Your response to it was cut off before any output was produced — \
+             treat that request as not yet acted on.\n</supervisor>",
+        );
+    } else {
+        recap.push_str(
+            "Your partial response before the cut-off (it did NOT complete; \
+             anything after this point was lost):\n<interrupted_partial_response>\n",
+        );
+        recap.push_str(&crate::history_xml::truncate_middle_content(
+            &partial_text,
+            RESUME_RECAP_SEGMENT_MAX_CHARS,
+        ));
+        recap.push_str("\n</interrupted_partial_response>\n</supervisor>");
+    }
+    Some(recap)
+}
+
 impl Services {
     /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
     /// daemon's resume orchestrator calls this to resume every turn Task C
@@ -10314,28 +10407,68 @@ impl Services {
         // Deliver continuation message
         let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 
-        // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load).
+        // Mid-turn tail recap (monorepo#2539): a `session/load` resume replays
+        // the PROVIDER's session checkpoint, which contains only completed
+        // turns — the interrupted `session/prompt` never resolved
+        // provider-side, so the interrupting user message and the partial
+        // assistant output (both durable in the daemon transcript; the UI
+        // renders them) would silently vanish from the model-visible context
+        // and the agent would resume from a stale point. Rebuild that tail
+        // from the transcript and deliver it prompt-only
+        // (`TurnOptions::prepend_content`) ahead of the continuation.
+        // `build_turn_prompt` drops the prepend TEXT when the session is
+        // recreated instead of resumed (`history_covers_prepend`: the
+        // `<supervisor>` history replay already carries the whole
+        // transcript), so the tail reaches the agent exactly once on either
+        // branch. The recap is built from the pre-marker `session` snapshot,
+        // so the just-appended interruption marker never leaks into it.
+        let recap = build_resume_tail_recap(&session.messages);
+
+        // Use the send-message machinery to deliver the continuation (lazily
+        // respawns the provider and resumes via ACP `session/load`).
         // Automatic origin: a resume continuation must not bury a Q&A the
         // agent had pending when the harness shut down (question hold — the
-        // marker is persisted, so the hold survives the restart).
-        if let Err(e) = self
-            .agent_send_message(
-                workspace_id.clone(),
-                agent_id.clone(),
-                continuation.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                intent_core::MessageOrigin::Automatic,
-            )
-            .await
-        {
+        // marker is persisted, so the hold survives the restart). The manager
+        // path is called directly so the recap can ride
+        // `TurnOptions::prepend_content`; the store-only fallback (no manager
+        // attached) keeps the plain trait call — it drives no outbound
+        // prompt, so there is no context to repair.
+        let send_result = match self.agent_manager() {
+            Some(manager) => {
+                let options = crate::agent_manager::TurnOptions {
+                    prepend_content: recap,
+                    origin: intent_core::MessageOrigin::Automatic,
+                    ..crate::agent_manager::TurnOptions::default()
+                };
+                manager
+                    .send_message(
+                        agent_id.clone(),
+                        workspace_id.clone(),
+                        continuation.to_string(),
+                        None,
+                        options,
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message(
+                    workspace_id.clone(),
+                    agent_id.clone(),
+                    continuation.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    intent_core::MessageOrigin::Automatic,
+                )
+                .await
+            }
+        };
+        if let Err(e) = send_result {
             reset_to_pending().await;
             return Err(e);
         }
