@@ -878,4 +878,20 @@ async fn settings_sensitive_stdin_paths_never_echo_plaintext() {
         "conflict error expected: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    // Empty stdin input is rejected — a failed upstream producer (e.g.
+    // `op read` exiting with empty stdout) must never blank a stored secret.
+    for input in ["", "\n"] {
+        let output = run_settings(&data_dir, &["linear.token", "--stdin"], Some(input));
+        assert!(
+            !output.status.success(),
+            "empty stdin input ({input:?}) must fail: {}",
+            combined(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no value provided on stdin"),
+            "empty-stdin error expected for {input:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

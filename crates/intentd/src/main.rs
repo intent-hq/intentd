@@ -3655,14 +3655,21 @@ fn settings_value_source(
 
 /// Read a `--stdin` / `-` value: the whole of stdin to EOF, minus exactly
 /// one trailing newline (`pipe`-friendly: `op read … | intentd settings
-/// linear.token --stdin`). Never logs or echoes the value.
+/// linear.token --stdin`). Never logs or echoes the value. Empty input is
+/// rejected — same as the hidden prompt — so a failed upstream producer
+/// (e.g. `op read` exiting with empty stdout) never silently blanks a
+/// stored secret.
 fn read_value_from_stdin() -> anyhow::Result<String> {
     use std::io::Read;
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
         .map_err(|e| anyhow::anyhow!("failed to read value from stdin: {e}"))?;
-    Ok(trim_one_trailing_newline(buf))
+    let value = trim_one_trailing_newline(buf);
+    if value.is_empty() {
+        anyhow::bail!("no value provided on stdin; nothing changed");
+    }
+    Ok(value)
 }
 
 /// Trim exactly one trailing newline (`\n` or `\r\n`); anything else —
@@ -3890,8 +3897,23 @@ async fn cmd_settings_set(
     definition: &Value,
     raw: &str,
 ) -> anyhow::Result<()> {
-    let value =
-        coerce_setting_value(definition, raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    // Defense-in-depth: every sensitive definition is a string today, so
+    // coercion cannot fail on one — but if a sensitive setting were ever
+    // boolean/number-typed, the coercion error's `got \`{raw}\`` detail
+    // would print the prompt/stdin-supplied plaintext to stderr. Strip the
+    // raw value from the message for sensitive definitions.
+    let sensitive = definition
+        .get("sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let value = coerce_setting_value(definition, raw).map_err(|e| {
+        if sensitive {
+            let redacted = e.to_string().replace(raw, "********");
+            anyhow::anyhow!("{name}: {redacted}")
+        } else {
+            anyhow::anyhow!("{name}: {e}")
+        }
+    })?;
     let params = json!({ "changes": [{ "path": name, "value": value }] });
     let response = settings_rpc(config, "settings.update", params).await?;
     if let Some(error) = response.get("error") {
@@ -3907,11 +3929,7 @@ async fn cmd_settings_set(
             // entry), but if the response shape ever drifts, never fall back
             // to the caller's plaintext for a sensitive setting — print the
             // daemon's redaction placeholder instead.
-            if definition
-                .get("sensitive")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if sensitive {
                 json!("********")
             } else {
                 value

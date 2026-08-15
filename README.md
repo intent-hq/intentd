@@ -359,11 +359,15 @@ non-zero exit; sensitive values are printed pre-redacted by the daemon.
 > **Secrets never need to touch argv.** For a `sensitive` setting, omit the value
 > to be prompted for it interactively with echo disabled (`read -s` style), or pipe
 > it via `--stdin` (equivalently, pass `-` as the value) for scripted use — stdin
-> input is read to EOF with exactly one trailing newline trimmed. On a non-TTY with
-> no value, the command errors with guidance instead of hanging. Passing the
-> plaintext as an argument still works but prints a warning, since argv lands in
-> shell history and is visible in process listings (`ps`) while the command runs.
-> `--stdin` / `-` are accepted for non-sensitive settings too.
+> input is read to EOF with exactly one trailing newline trimmed, and empty input
+> is rejected (so a failed upstream producer never blanks a stored secret). On a
+> non-TTY with no value, the command errors with guidance instead of hanging.
+> Passing the plaintext as an argument still works but prints a warning, since
+> argv lands in shell history and is visible in process listings (`ps`) while the
+> command runs. `--stdin` / `-` are accepted for non-sensitive settings too.
+> Because a bare `intentd settings <name>` prompts for sensitive settings instead
+> of printing them, view a sensitive setting's redacted value/origin via the list
+> (`intentd settings`) or `intentd call settings.get '{"path":"<name>"}'`.
 
 ### Pairing a remote client (WSS)
 
