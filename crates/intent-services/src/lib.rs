@@ -13672,6 +13672,16 @@ impl WorkspaceApi for Services {
                         } else {
                             metadata.remove("initialMessage");
                         }
+                        // The effective session-level image blocks, mirroring
+                        // the `agent_create_op` harvest (top-level param wins
+                        // over the `metadata.imageBlocks` fallback). Captured
+                        // here because the created `AgentLite` no longer
+                        // serves `imageBlocks` (list-projection cost contract)
+                        // and the first-turn threading below still needs them.
+                        let image_blocks = agent
+                            .image_blocks
+                            .or_else(|| metadata.get("imageBlocks").cloned())
+                            .filter(|v| !v.is_null());
                         let extra = intent_core::AgentCreateExtra {
                             provider: nonempty_owned(agent.provider),
                             agent_type: nonempty_owned(agent.agent_type),
@@ -13679,7 +13689,7 @@ impl WorkspaceApi for Services {
                             context_references: agent
                                 .context_references
                                 .filter(|v| !v.is_null()),
-                            image_blocks: agent.image_blocks.filter(|v| !v.is_null()),
+                            image_blocks: image_blocks.clone(),
                             file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
                             // The initial agent is the workspace's
                             // foreground agent (top-level wins over any
@@ -13708,14 +13718,12 @@ impl WorkspaceApi for Services {
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
-                        // Extract image_blocks and context_references from the created
-                        // agent (STAB-69: thread them into the first turn so imageBlocks
-                        // attached to the initial prompt reach the ACP).
-                        let created_image_blocks = created
-                            .get("agent")
-                            .and_then(|a| a.get("imageBlocks"))
-                            .filter(|v| !v.is_null())
-                            .cloned();
+                        // Extract file_blocks and context_references from the created
+                        // agent (STAB-69: thread them into the first turn so attachments
+                        // on the initial prompt reach the ACP). Image blocks come from
+                        // the harvested input above — the `AgentLite` create result no
+                        // longer carries `imageBlocks`.
+                        let created_image_blocks = image_blocks;
                         let created_file_blocks = created
                             .get("agent")
                             .and_then(|a| a.get("fileBlocks"))
