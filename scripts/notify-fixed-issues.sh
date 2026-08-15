@@ -183,6 +183,7 @@ linked_prs_query='query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
       closedByPullRequestsReferences(first: 100, includeClosedPrs: true) {
+        pageInfo { hasNextPage }
         nodes { repository { nameWithOwner } number state mergeCommit { oid } }
       }
     }
@@ -215,16 +216,28 @@ while IFS= read -r n; do
   # contained in TO_REF; an empty set falls back to the range-scan evidence
   # that put the issue on the list. Enumeration failure (API error, issue
   # number actually a PR, ...) is indeterminate => skip with a warning.
+  # The jq filter emits pageInfo.hasNextPage as the first line, then one
+  # "<number> <state> <oid>" line per SOURCE_REPO-linked PR.
   if ! linked=$(gh_issues api graphql \
     -f query="$linked_prs_query" \
     -f owner="${ISSUES_REPO%/*}" -f repo="${ISSUES_REPO#*/}" -F number="$n" \
-    --jq ".data.repository.issue.closedByPullRequestsReferences.nodes[]
-      | select(.repository.nameWithOwner == \"${SOURCE_REPO}\")
-      | \"\(.number) \(.state) \(.mergeCommit.oid // \"\")\"" 2>/dev/null); then
+    --jq ".data.repository.issue.closedByPullRequestsReferences
+      | (.pageInfo.hasNextPage | tostring),
+        (.nodes[]
+          | select(.repository.nameWithOwner == \"${SOURCE_REPO}\")
+          | \"\(.number) \(.state) \(.mergeCommit.oid // \"\")\")" 2>/dev/null); then
     echo "warning: issue #$n: could not enumerate linked ${SOURCE_REPO} fix PRs; completeness indeterminate, skipping" >&2
     failed=1
     continue
   fi
+  # A truncated connection (>100 linked PRs) could hide an open or
+  # unreleased SOURCE_REPO PR beyond the first page: indeterminate => skip.
+  if [[ "$(head -n1 <<<"$linked")" != "false" ]]; then
+    echo "warning: issue #$n: more than 100 linked PRs (result truncated); completeness indeterminate, skipping" >&2
+    failed=1
+    continue
+  fi
+  linked=$(tail -n +2 <<<"$linked")
   incomplete=""
   while read -r pr state oid; do
     [[ -n "$pr" ]] || continue
