@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin,
-    NoteId, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    model::{AgentDelegateInput, BatchTaskEntry},
+    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin, NoteId, WorkspaceApi,
+    WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -268,16 +269,18 @@ async fn delegate(
 ) -> Result<Value, String> {
     let tasks = match args.get("tasks").and_then(Value::as_array) {
         Some(a) => {
-            if let Some(bad) = a.iter().find(|v| !v.is_string()) {
-                return Err(format!(
-                    "tasks must be an array of task note id strings, got: {bad}"
-                ));
+            let mut entries: Vec<BatchTaskEntry> = Vec::with_capacity(a.len());
+            for v in a {
+                match serde_json::from_value::<BatchTaskEntry>(v.clone()) {
+                    Ok(entry) => entries.push(entry),
+                    Err(_) => {
+                        return Err(format!(
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, reasoningEffort? }} objects, got: {v}"
+                        ));
+                    }
+                }
             }
-            Some(
-                a.iter()
-                    .filter_map(|v| v.as_str().map(NoteId::from_string))
-                    .collect(),
-            )
+            Some(entries)
         }
         None => None,
     };

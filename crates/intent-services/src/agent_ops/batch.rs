@@ -1,15 +1,15 @@
 //! Batch `agent.delegate` classification (PROTOCOL §5.5).
 //!
-//! Pure, stateless helpers behind the `tasks: [taskNoteId]` + `greedy` batch
-//! form: given a snapshot of the workspace's task notes (status, `dependsOn`,
+//! Pure, stateless helpers behind the `tasks: [entry]` batch form: given a
+//! snapshot of the workspace's task notes (status, `dependsOn`,
 //! `conflictsWith`, live assigned agent) they classify every requested task as
 //! start / held / skipped and project the unlock plan. The functions write no
 //! scheduler state — the delegate op re-runs them on every call, which is what
 //! makes re-supplying the same list idempotent.
 //!
-//! Greedy-off admission is a HEURISTIC, deliberately not an exact solver:
-//! makespan minimization under `dependsOn` + `conflictsWith` is NP-complete,
-//! and the spec records the decision to use deterministic effort-weighted
+//! Admission is a HEURISTIC, deliberately not an exact solver: makespan
+//! minimization under `dependsOn` + `conflictsWith` is NP-complete, and the
+//! spec records the decision to use deterministic effort-weighted
 //! critical-path list scheduling instead of an external solver crate.
 //! Priority = the longest effort-weighted chain of dependents downstream of
 //! the task (one topological pass — cheap and exact since `dependsOn` is
@@ -18,7 +18,9 @@
 //! admitted/running set. Ties break by more-dependents-unlocked, then
 //! shortest-processing-time, then task id — fully deterministic. Classic list
 //! scheduling: O(V+E), no search or backtracking, within 2x of optimal for
-//! this constraint family.
+//! this constraint family. There is no batch-level conflict override (the
+//! former `greedy` param was removed): forcing past a conflict hold is the
+//! single-task form's job — delegate the held task individually.
 
 use std::collections::{HashMap, HashSet};
 
@@ -184,11 +186,8 @@ pub(crate) fn serial_remaining_minutes(
 /// Classified disposition for one requested task.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BatchDisposition {
-    /// Eligible to start now. `conflicts_with` is non-empty only under
-    /// `greedy: true`, naming the running/starting tasks it overlaps with.
-    Start {
-        conflicts_with: Vec<String>,
-    },
+    /// Eligible to start now.
+    Start,
     /// Unmet `dependsOn` edges. `decision_needed` is the subset that can
     /// never complete on its own (cancelled or missing task notes).
     HeldOnDeps {
@@ -196,7 +195,7 @@ pub(crate) enum BatchDisposition {
         decision_needed: Vec<String>,
     },
     /// `conflictsWith` (symmetric closure) intersects the running/starting
-    /// set and `greedy` is false.
+    /// set.
     HeldOnConflict {
         conflicts_with: Vec<String>,
     },
@@ -215,13 +214,12 @@ pub(crate) enum BatchDisposition {
 /// `conflictsWith` edges, and which tasks have live assigned agents. The
 /// conflict relation is treated as symmetric (undirected closure over the
 /// whole snapshot), and tasks started earlier in this same batch count toward
-/// the running set for later entries. Under `greedy: false`, startable tasks
-/// are admitted in critical-path-priority order (see the module docs), not
-/// request order — the output order still follows the request.
+/// the running set for later entries. Startable tasks are admitted in
+/// critical-path-priority order (see the module docs), not request order —
+/// the output order still follows the request.
 pub(crate) fn classify_batch_tasks(
     requested: &[String],
     snaps: &HashMap<String, BatchTaskSnap>,
-    greedy: bool,
 ) -> Vec<(String, BatchDisposition)> {
     // Symmetric conflict adjacency over the full snapshot: A conflictsWith B
     // holds in both directions regardless of which note declares the edge.
@@ -296,12 +294,10 @@ pub(crate) fn classify_batch_tasks(
         out.push((id.clone(), disposition));
     }
 
-    // Admission. Greedy admits everything in request order (conflicts named
-    // against the active-so-far set); greedy-off is the deterministic
-    // critical-path list scheduling documented on the module: descending
-    // priority, ties by more-dependents-unlocked, then shortest effort, then
-    // task id.
-    if !greedy {
+    // Admission: the deterministic critical-path list scheduling documented
+    // on the module — descending priority, ties by more-dependents-unlocked,
+    // then shortest effort, then task id.
+    {
         let priorities = critical_path_priorities(snaps);
         let dependents = dependent_edges(snaps);
         startable.sort_by(|a, b| {
@@ -314,25 +310,15 @@ pub(crate) fn classify_batch_tasks(
                 .then(a.cmp(b))
         });
     }
-    let mut admitted_overlaps: HashMap<&str, Vec<String>> = HashMap::new();
     let mut held_on_conflict: HashSet<&str> = HashSet::new();
     for id in startable {
-        let mut overlapping: Vec<String> = conflicts
+        let overlaps = conflicts
             .get(id)
-            .map(|neighbors| {
-                neighbors
-                    .iter()
-                    .filter(|n| active.contains(**n))
-                    .map(|n| n.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        overlapping.sort();
-        if overlapping.is_empty() || greedy {
-            active.insert(id);
-            admitted_overlaps.insert(id, overlapping);
-        } else {
+            .is_some_and(|neighbors| neighbors.iter().any(|n| active.contains(*n)));
+        if overlaps {
             held_on_conflict.insert(id);
+        } else {
+            active.insert(id);
         }
     }
 
@@ -357,12 +343,7 @@ pub(crate) fn classify_batch_tasks(
                         conflicts_with: overlapping,
                     }
                 } else {
-                    BatchDisposition::Start {
-                        conflicts_with: admitted_overlaps
-                            .get(id.as_str())
-                            .cloned()
-                            .unwrap_or_default(),
-                    }
+                    BatchDisposition::Start
                 }
             });
             (id, disposition)
@@ -407,9 +388,9 @@ pub(crate) fn project_unlock_plan(
         })
         .map(|(id, _)| id.clone())
         .collect();
-    classify_batch_tasks(&held, &simulated, false)
+    classify_batch_tasks(&held, &simulated)
         .into_iter()
-        .filter(|(_, d)| matches!(d, BatchDisposition::Start { .. }))
+        .filter(|(_, d)| matches!(d, BatchDisposition::Start))
         .map(|(id, _)| id)
         .collect()
 }
@@ -444,7 +425,7 @@ mod tests {
 
     fn started_ids(out: &[(String, BatchDisposition)]) -> Vec<&str> {
         out.iter()
-            .filter(|(_, d)| matches!(d, BatchDisposition::Start { .. }))
+            .filter(|(_, d)| matches!(d, BatchDisposition::Start))
             .map(|(id, _)| id.as_str())
             .collect()
     }
@@ -454,13 +435,8 @@ mod tests {
         let mut snaps = HashMap::new();
         snaps.insert("t1".into(), snap(TaskStatus::NotStarted, &[], &[]));
         snaps.insert("t2".into(), snap(TaskStatus::NotStarted, &["t1"], &[]));
-        let out = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps, false);
-        assert_eq!(
-            out[0].1,
-            BatchDisposition::Start {
-                conflicts_with: vec![]
-            }
-        );
+        let out = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps);
+        assert_eq!(out[0].1, BatchDisposition::Start);
         assert_eq!(
             out[1].1,
             BatchDisposition::HeldOnDeps {
@@ -479,7 +455,7 @@ mod tests {
             "t".into(),
             snap(TaskStatus::NotStarted, &["done", "gone", "missing"], &[]),
         );
-        let out = classify_batch_tasks(&ids(&["t"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["t"]), &snaps);
         assert_eq!(
             out[0].1,
             BatchDisposition::HeldOnDeps {
@@ -490,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_with_running_task_holds_unless_greedy() {
+    fn conflict_with_running_task_holds() {
         let mut snaps = HashMap::new();
         // The RUNNING task declares the edge; the requested task does not —
         // symmetric closure must still hold it.
@@ -499,17 +475,10 @@ mod tests {
             running(snap(TaskStatus::InProgress, &[], &["t"])),
         );
         snaps.insert("t".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let held = classify_batch_tasks(&ids(&["t"]), &snaps, false);
+        let held = classify_batch_tasks(&ids(&["t"]), &snaps);
         assert_eq!(
             held[0].1,
             BatchDisposition::HeldOnConflict {
-                conflicts_with: vec!["busy".into()]
-            }
-        );
-        let greedy = classify_batch_tasks(&ids(&["t"]), &snaps, true);
-        assert_eq!(
-            greedy[0].1,
-            BatchDisposition::Start {
                 conflicts_with: vec!["busy".into()]
             }
         );
@@ -520,13 +489,8 @@ mod tests {
         let mut snaps = HashMap::new();
         snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &["b"]));
         snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let out = classify_batch_tasks(&ids(&["a", "b"]), &snaps, false);
-        assert_eq!(
-            out[0].1,
-            BatchDisposition::Start {
-                conflicts_with: vec![]
-            }
-        );
+        let out = classify_batch_tasks(&ids(&["a", "b"]), &snaps);
+        assert_eq!(out[0].1, BatchDisposition::Start);
         assert_eq!(
             out[1].1,
             BatchDisposition::HeldOnConflict {
@@ -544,7 +508,7 @@ mod tests {
         );
         snaps.insert("done".into(), snap(TaskStatus::Complete, &[], &[]));
         snaps.insert("gone".into(), snap(TaskStatus::Cancelled, &[], &[]));
-        let out = classify_batch_tasks(&ids(&["busy", "done", "gone"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["busy", "done", "gone"]), &snaps);
         assert_eq!(
             out[0].1,
             BatchDisposition::SkippedAlreadyRunning {
@@ -560,7 +524,7 @@ mod tests {
     fn duplicate_requested_ids_classify_once() {
         let mut snaps = HashMap::new();
         snaps.insert("t".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let out = classify_batch_tasks(&ids(&["t", "t"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["t", "t"]), &snaps);
         assert_eq!(out.len(), 1);
     }
 
@@ -573,7 +537,7 @@ mod tests {
         // t4 depends on a cancelled task: never unlocked by settlement.
         snaps.insert("dead".into(), snap(TaskStatus::Cancelled, &[], &[]));
         snaps.insert("t4".into(), snap(TaskStatus::NotStarted, &["dead"], &[]));
-        let classified = classify_batch_tasks(&ids(&["t1", "t2", "t3", "t4"]), &snaps, false);
+        let classified = classify_batch_tasks(&ids(&["t1", "t2", "t3", "t4"]), &snaps);
         let unlocked = project_unlock_plan(&classified, &snaps, &ids(&["t1"]));
         assert_eq!(unlocked, vec!["t2".to_string(), "t3".to_string()]);
     }
@@ -586,7 +550,7 @@ mod tests {
             running(snap(TaskStatus::InProgress, &[], &[])),
         );
         snaps.insert("t".into(), snap(TaskStatus::NotStarted, &["busy"], &[]));
-        let classified = classify_batch_tasks(&ids(&["busy", "t"]), &snaps, false);
+        let classified = classify_batch_tasks(&ids(&["busy", "t"]), &snaps);
         let unlocked = project_unlock_plan(&classified, &snaps, &[]);
         assert_eq!(unlocked, vec!["t".to_string()]);
     }
@@ -602,7 +566,7 @@ mod tests {
             running(snap(TaskStatus::InProgress, &[], &["t"])),
         );
         snaps.insert("t".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let classified = classify_batch_tasks(&ids(&["t"]), &snaps, false);
+        let classified = classify_batch_tasks(&ids(&["t"]), &snaps);
         assert_eq!(
             classified[0].1,
             BatchDisposition::HeldOnConflict {
@@ -620,22 +584,22 @@ mod tests {
         let mut snaps = HashMap::new();
         snaps.insert("t1".into(), snap(TaskStatus::NotStarted, &[], &[]));
         snaps.insert("t2".into(), snap(TaskStatus::NotStarted, &["t1"], &[]));
-        let classified = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps, false);
+        let classified = classify_batch_tasks(&ids(&["t1", "t2"]), &snaps);
         let unlocked = project_unlock_plan(&classified, &snaps, &[]);
         assert_eq!(unlocked, Vec::<String>::new());
     }
 
     #[test]
-    fn no_two_conflicting_tasks_ever_co_admitted_greedy_off() {
+    fn no_two_conflicting_tasks_ever_co_admitted() {
         // Conflict edges a—b, b—c, c—d (declared on one side each; the
-        // symmetric closure covers both directions). No greedy-off start set
-        // may contain both endpoints of any edge.
+        // symmetric closure covers both directions). No start set may
+        // contain both endpoints of any edge.
         let mut snaps = HashMap::new();
         snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &["b"]));
         snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &["c"]));
         snaps.insert("c".into(), snap(TaskStatus::NotStarted, &[], &[]));
         snaps.insert("d".into(), snap(TaskStatus::NotStarted, &[], &["c"]));
-        let out = classify_batch_tasks(&ids(&["a", "b", "c", "d"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["a", "b", "c", "d"]), &snaps);
         let started = started_ids(&out);
         for (id, s) in snaps.iter() {
             for other in &s.conflicts_with {
@@ -652,14 +616,14 @@ mod tests {
     fn longer_dependency_chain_admitted_before_equal_conflict_shorter_one() {
         // `short` and `long` conflict; `long` heads a 3-task dependsOn chain
         // while `short` heads a 1-task chain. Request order puts `short`
-        // first — greedy-off must still admit `long` (higher critical-path
+        // first — admission must still admit `long` (higher critical-path
         // priority) and hold `short`.
         let mut snaps = HashMap::new();
         snaps.insert("long".into(), snap(TaskStatus::NotStarted, &[], &["short"]));
         snaps.insert("mid".into(), snap(TaskStatus::NotStarted, &["long"], &[]));
         snaps.insert("leaf".into(), snap(TaskStatus::NotStarted, &["mid"], &[]));
         snaps.insert("short".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let out = classify_batch_tasks(&ids(&["short", "long"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["short", "long"]), &snaps);
         // Output order still follows the request.
         assert_eq!(out[0].0, "short");
         assert_eq!(
@@ -668,12 +632,7 @@ mod tests {
                 conflicts_with: vec!["long".into()]
             }
         );
-        assert_eq!(
-            out[1].1,
-            BatchDisposition::Start {
-                conflicts_with: vec![]
-            }
-        );
+        assert_eq!(out[1].1, BatchDisposition::Start);
     }
 
     #[test]
@@ -702,7 +661,7 @@ mod tests {
             "c3".into(),
             with_effort(snap(TaskStatus::NotStarted, &["c2"], &[]), 10),
         );
-        let out = classify_batch_tasks(&ids(&["chatty", "heavy"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["chatty", "heavy"]), &snaps);
         assert_eq!(started_ids(&out), vec!["heavy"]);
     }
 
@@ -731,7 +690,7 @@ mod tests {
             "vd1".into(),
             with_effort(snap(TaskStatus::NotStarted, &["v"], &[]), 30),
         );
-        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps);
         assert_eq!(started_ids(&out), vec!["u"]);
 
         // Equal priority (50) and unlock count (1); own effort 10 vs 20 —
@@ -754,14 +713,14 @@ mod tests {
             "sd".into(),
             with_effort(snap(TaskStatus::NotStarted, &["slow"], &[]), 30),
         );
-        let out = classify_batch_tasks(&ids(&["slow", "zquick"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["slow", "zquick"]), &snaps);
         assert_eq!(started_ids(&out), vec!["zquick"]);
 
         // Everything ties → lexicographically smaller id wins.
         let mut snaps = HashMap::new();
         snaps.insert("x".into(), snap(TaskStatus::NotStarted, &[], &["y"]));
         snaps.insert("y".into(), snap(TaskStatus::NotStarted, &[], &[]));
-        let out = classify_batch_tasks(&ids(&["y", "x"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["y", "x"]), &snaps);
         assert_eq!(started_ids(&out), vec!["x"]);
     }
 
@@ -868,7 +827,7 @@ mod tests {
             "vd".into(),
             with_effort(snap(TaskStatus::NotStarted, &["v", "v"], &[]), 30),
         );
-        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps, false);
+        let out = classify_batch_tasks(&ids(&["v", "u"]), &snaps);
         assert_eq!(started_ids(&out), vec!["u"]);
     }
 }

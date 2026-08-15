@@ -1,6 +1,6 @@
 //! WSS e2e for the batch `agent.delegate` form (PROTOCOL §5.5): drives the
 //! real pinned-TLS WebSocket against a live `intentd serve` and asserts the
-//! `tasks: [taskNoteId]` + `greedy` request/response contract:
+//! `tasks: [entry]` request/response contract:
 //!
 //! - ready tasks start (per-task agent creation + assignment), dep-blocked
 //!   tasks are `held:blocked-on-deps` naming the unmet ids, conflicting tasks
@@ -8,7 +8,9 @@
 //!   settlement unlocks;
 //! - re-calling with the same list is idempotent (`skipped` with the running
 //!   agent id, nothing new starts);
-//! - `greedy: true` starts a conflicting task anyway and names the pair;
+//! - object entries (`{ taskNoteId, specialist?, model?, reasoningEffort? }`)
+//!   deserialize alongside bare-string ids;
+//! - the removed `greedy` param is rejected with `-32602`;
 //! - mixing `tasks` with `taskNoteId` is rejected with `-32602`.
 //!
 //! Gated on `node` + the mock ACP agent fixture (same gate as the other
@@ -290,8 +292,8 @@ fn row_for<'a>(resp: &'a Value, id: &str) -> &'a Value {
 
 /// The full batch request/response shape over the wire: start + hold + skip
 /// dispositions, unlock plan (including the mixed-estimate shadowing shape
-/// for `criticalPathMinutes`, monorepo#2128), idempotent re-call, greedy
-/// override, and the mixed-addressing rejection.
+/// for `criticalPathMinutes`, monorepo#2128), idempotent re-call, object
+/// entries, the greedy-removal rejection, and the mixed-addressing rejection.
 #[tokio::test]
 async fn batch_delegate_request_response_shape_over_wss() {
     let Some(script) = gate() else {
@@ -353,7 +355,10 @@ async fn batch_delegate_request_response_shape_over_wss() {
     )
     .await;
     assert_eq!(resp["ok"], json!(true), "batch ok: {resp}");
-    assert_eq!(resp["greedy"], json!(false), "greedy defaults false");
+    assert!(
+        resp.as_object().unwrap().get("greedy").is_none(),
+        "greedy echo removed from the result: {resp}"
+    );
     assert_eq!(resp["tasks"].as_array().unwrap().len(), 3);
 
     let r1 = row_for(&resp, &t1);
@@ -370,6 +375,13 @@ async fn batch_delegate_request_response_shape_over_wss() {
     let r3 = row_for(&resp, &t3);
     assert_eq!(r3["disposition"], json!("held:conflict"));
     assert_eq!(r3["conflictsWith"], json!([t1]));
+    assert!(
+        r3["reason"]
+            .as_str()
+            .unwrap()
+            .contains("delegate it individually to force it"),
+        "{r3}"
+    );
 
     // Unlock plan: t2 and t3 both become startable when t1 settles.
     let unlocked = resp["unlockPlan"]["unlockedBySettlement"]
@@ -431,8 +443,9 @@ async fn batch_delegate_request_response_shape_over_wss() {
     assert_eq!(row_for(&again, &t3)["disposition"], json!("held:conflict"));
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
 
-    // greedy: true starts the conflicting t3 anyway, naming the pair.
-    let greedy = wss_rpc(
+    // The removed greedy param is rejected with -32602 pointing at
+    // individual delegation.
+    let err = wss_rpc_raw(
         &mut ws,
         50,
         "agent.delegate",
@@ -444,11 +457,29 @@ async fn batch_delegate_request_response_shape_over_wss() {
         }),
     )
     .await;
-    assert_eq!(greedy["greedy"], json!(true));
-    let r3 = row_for(&greedy, &t3);
-    assert_eq!(r3["disposition"], json!("started"), "{greedy}");
+    assert_eq!(err["error"]["code"], json!(-32602), "{err}");
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains(
+            "greedy was removed; delegate a held task individually to force it past the conflict hold"
+        ),
+        "{err}"
+    );
+
+    // Object entries deserialize alongside bare strings: t3 is still held
+    // (conflict with running t1), and the row shape is unchanged.
+    let mixed = wss_rpc(
+        &mut ws,
+        55,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "tasks": [{ "taskNoteId": t3, "model": "mock:default", "reasoningEffort": "low" }],
+        }),
+    )
+    .await;
+    let r3 = row_for(&mixed, &t3);
+    assert_eq!(r3["disposition"], json!("held:conflict"), "{mixed}");
     assert_eq!(r3["conflictsWith"], json!([t1]));
-    assert!(r3["reason"].as_str().unwrap().contains("expect rebases"));
 
     // Mixed addressing is rejected with -32602.
     let err = wss_rpc_raw(

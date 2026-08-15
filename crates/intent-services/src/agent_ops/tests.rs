@@ -23685,16 +23685,21 @@ async fn agent_snapshot_counts_pending_questions() {
 }
 
 // ---------------------------------------------------------------------------
-// Batch `agent.delegate` (tasks[] + greedy): full request→response shape over
-// the service op — classification is unit-tested in `batch.rs`; these lock
-// the wiring (validation, per-task delegation, response rows, unlock plan,
-// idempotent re-call).
+// Batch `agent.delegate` (tasks[]): full request→response shape over the
+// service op — classification is unit-tested in `batch.rs`; these lock the
+// wiring (validation, per-task delegation, per-task option overrides,
+// response rows, unlock plan, idempotent re-call).
 // ---------------------------------------------------------------------------
 
-fn batch_input(ids: &[&NoteId], greedy: Option<bool>) -> AgentDelegateInput {
+use intent_core::{BatchTaskEntry, BatchTaskOptions};
+
+fn batch_input(ids: &[&NoteId]) -> AgentDelegateInput {
     AgentDelegateInput {
-        tasks: Some(ids.iter().map(|id| (*id).clone()).collect()),
-        greedy,
+        tasks: Some(
+            ids.iter()
+                .map(|id| BatchTaskEntry::Id((*id).clone()))
+                .collect(),
+        ),
         ..Default::default()
     }
 }
@@ -23731,7 +23736,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
-                tasks: Some(vec![note_id.clone()]),
+                tasks: Some(vec![BatchTaskEntry::Id(note_id.clone())]),
                 task_note_id: Some(note_id.clone()),
                 ..Default::default()
             },
@@ -23746,7 +23751,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
 
     let ghost = NoteId::new();
     let err = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&ghost], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&ghost]), None)
         .await
         .expect_err("unknown task id rejected");
     match &err {
@@ -23760,7 +23765,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
             ws.clone(),
             AgentDelegateInput {
                 agent_instructions: Some("do it my way".into()),
-                ..batch_input(&[&note_id], None)
+                ..batch_input(&[&note_id])
             },
             None,
         )
@@ -23775,7 +23780,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
             ws.clone(),
             AgentDelegateInput {
                 force: Some(true),
-                ..batch_input(&[&note_id], None)
+                ..batch_input(&[&note_id])
             },
             None,
         )
@@ -23783,6 +23788,57 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .expect_err("force rejected in batch mode");
     match &err {
         Error::InvalidParams(msg) => assert!(msg.contains("force"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    // `greedy` was removed: any value (true or false) is rejected with the
+    // pointer at individual delegation.
+    for greedy in [true, false] {
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    greedy: Some(greedy),
+                    ..batch_input(&[&note_id])
+                },
+                None,
+            )
+            .await
+            .expect_err("greedy rejected in batch mode");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(
+                    "greedy was removed; delegate a held task individually to force it past the conflict hold"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    // Per-entry `agentInstructions` is rejected with a clear error.
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![BatchTaskEntry::Options(BatchTaskOptions {
+                    task_note_id: note_id.clone(),
+                    specialist: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agent_instructions: Some("do it my way".into()),
+                })]),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("per-entry agentInstructions rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("agentInstructions is not supported on a tasks entry"),
+            "{msg}"
+        ),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
 }
@@ -23799,11 +23855,14 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
         .expect("t2 dependsOn t1");
 
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
         .await
         .expect("batch delegate");
     assert_eq!(resp["ok"], true);
-    assert_eq!(resp["greedy"], false);
+    assert!(
+        !resp.as_object().unwrap().contains_key("greedy"),
+        "greedy echo removed from the result: {resp}"
+    );
     assert_eq!(resp["tasks"].as_array().unwrap().len(), 2);
 
     let r1 = row_for(&resp, &t1);
@@ -23835,7 +23894,7 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     // Idempotent re-call: same list → started task now skips (already
     // running, naming its agent), held task still holds; nothing new starts.
     let again = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
         .await
         .expect("re-call");
     let r1 = row_for(&again, &t1);
@@ -23849,10 +23908,10 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
 }
 
-/// Conflicts: greedy=false holds the later task of a conflicting pair;
-/// greedy=true starts it anyway and names the pair.
+/// Conflicts: the later task of a conflicting pair holds, naming the pair,
+/// and the reason points at individual delegation (no more greedy override).
 #[tokio::test]
-async fn batch_delegate_conflicts_hold_unless_greedy() {
+async fn batch_delegate_conflicts_hold_and_point_at_individual_delegation() {
     let (_t, svc, ws) = setup().await;
     let a = seed_task(&svc, &ws, "A").await;
     let b = seed_task(&svc, &ws, "B").await;
@@ -23861,7 +23920,7 @@ async fn batch_delegate_conflicts_hold_unless_greedy() {
         .expect("a conflictsWith b");
 
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b]), None)
         .await
         .expect("batch");
     // Neither has estimates or dependents, so the critical-path tie breaks
@@ -23876,26 +23935,77 @@ async fn batch_delegate_conflicts_hold_unless_greedy() {
     let rh = row_for(&resp, held);
     assert_eq!(rh["disposition"], "held:conflict", "{resp}");
     assert_eq!(rh["conflictsWith"], json!([started.0]));
-    assert!(rh["reason"].as_str().unwrap().contains("greedy"), "{rh}");
+    assert!(
+        rh["reason"]
+            .as_str()
+            .unwrap()
+            .contains("delegate it individually to force it"),
+        "{rh}"
+    );
     assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([held.0]));
+}
 
-    // Fresh pair under greedy=true: both start; the overlapping one names
-    // the pair and warns about rebases.
-    let c = seed_task(&svc, &ws, "C").await;
-    let d = seed_task(&svc, &ws, "D").await;
-    svc.task_set_relations(ws.clone(), c.clone(), None, Some(vec![d.clone()]))
-        .await
-        .expect("c conflictsWith d");
+/// Per-task option entries: an object entry's `specialist`/`model`/
+/// `reasoningEffort` override the top-level defaults for that task only,
+/// while bare-string entries inherit the defaults; row shape is unchanged.
+#[tokio::test]
+async fn batch_delegate_per_task_options_override_top_level_defaults() {
+    let (_t, svc, ws) = setup().await;
+    let plain = seed_task(&svc, &ws, "Plain").await;
+    let custom = seed_task(&svc, &ws, "Custom").await;
+
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&c, &d], Some(true)), None)
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Id(plain.clone()),
+                    BatchTaskEntry::Options(BatchTaskOptions {
+                        task_note_id: custom.clone(),
+                        specialist: Some("verifier".into()),
+                        model: Some("mock:override".into()),
+                        reasoning_effort: Some("high".into()),
+                        agent_instructions: None,
+                    }),
+                ]),
+                specialist: Some("implementor".into()),
+                model: Some("mock:default".into()),
+                ..Default::default()
+            },
+            None,
+        )
         .await
-        .expect("greedy batch");
-    assert_eq!(resp["greedy"], true);
-    assert_eq!(row_for(&resp, &c)["disposition"], "started");
-    let rd = row_for(&resp, &d);
-    assert_eq!(rd["disposition"], "started");
-    assert_eq!(rd["conflictsWith"], json!([c.0]));
-    assert!(rd["reason"].as_str().unwrap().contains("expect rebases"));
+        .expect("batch with per-task options");
+
+    let rp = row_for(&resp, &plain);
+    assert_eq!(rp["disposition"], "started", "{resp}");
+    let rc = row_for(&resp, &custom);
+    assert_eq!(rc["disposition"], "started", "{resp}");
+    // Row shape unchanged: started rows carry agentId/agentName only.
+    for row in [rp, rc] {
+        assert!(row.get("specialist").is_none(), "{row}");
+        assert!(row.get("model").is_none(), "{row}");
+    }
+
+    // The bare entry inherited the top-level defaults…
+    let plain_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(rp["agentId"].as_str().unwrap()))
+        .await
+        .expect("plain session");
+    assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(plain_session.model.as_deref(), Some("mock:default"));
+    assert!(plain_session.reasoning_effort.is_none());
+
+    // …and the object entry's overrides won, field by field.
+    let custom_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(rc["agentId"].as_str().unwrap()))
+        .await
+        .expect("custom session");
+    assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
+    assert_eq!(custom_session.model.as_deref(), Some("mock:override"));
+    assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));
 }
 
 /// Terminal statuses skip; a cancelled dependency surfaces as
@@ -23917,11 +24027,7 @@ async fn batch_delegate_skips_terminal_and_flags_cancelled_deps() {
         .expect("blocked dependsOn dead");
 
     let resp = svc
-        .agent_delegate_op(
-            ws.clone(),
-            batch_input(&[&done, &dead, &blocked], None),
-            None,
-        )
+        .agent_delegate_op(ws.clone(), batch_input(&[&done, &dead, &blocked]), None)
         .await
         .expect("batch");
     assert_eq!(row_for(&resp, &done)["disposition"], "skipped");
