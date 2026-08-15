@@ -1563,27 +1563,39 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         }
     };
 
-    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
+    // Auto-resume interrupted agents at startup. `--resume-all` forces the
+    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
+    // (`auto` = headless hosts only, `on` = always, `off` = never).
     // Spawn in the background so it doesn't block startup; log failures per-agent.
-    if resume_all {
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    if resume_on_start {
         let services_clone = services.clone();
         tokio::spawn(async move {
-            tracing::info!("--resume-all: enumerating interrupted agents");
+            tracing::info!("resume-on-start: enumerating interrupted agents");
             // List all pending interrupted agents
             let rows = match services_clone.store().list_interrupted_agents().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
+                    tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
                     return;
                 }
             };
             if rows.is_empty() {
-                tracing::info!("--resume-all: no interrupted agents to resume");
+                tracing::info!("resume-on-start: no interrupted agents to resume");
                 return;
             }
             tracing::info!(
                 count = rows.len(),
-                "--resume-all: resuming interrupted agents"
+                "resume-on-start: resuming interrupted agents"
             );
             let mut resumed = Vec::new();
             let mut failed = Vec::new();
@@ -1595,7 +1607,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::info!(
                             agent_id = %agent_id,
                             workspace = %interrupted.workspace_id,
-                            "--resume-all: resumed agent"
+                            "resume-on-start: resumed agent"
                         );
                         resumed.push(agent_id.0);
                     }
@@ -1603,7 +1615,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::warn!(
                             agent_id = %agent_id,
                             error = %e,
-                            "--resume-all: failed to resume agent"
+                            "resume-on-start: failed to resume agent"
                         );
                         failed.push((agent_id.0, e.to_string()));
                     }
@@ -1612,7 +1624,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             tracing::info!(
                 resumed = resumed.len(),
                 failed = failed.len(),
-                "--resume-all: auto-resume sweep complete"
+                "resume-on-start: auto-resume sweep complete"
             );
         });
     }
@@ -3924,6 +3936,27 @@ async fn report_context_engine() {
     }
 }
 
+/// Whether the startup interrupted-agent resume sweep should run. The
+/// `--resume-all` flag forces the sweep; otherwise the
+/// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
+/// `off` never resumes, and `auto` (the default) resumes only on headless
+/// hosts (no display detected).
+fn should_resume_on_start(
+    resume_all: bool,
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    has_display: bool,
+) -> bool {
+    use intent_core::settings_file::ResumeInterruptedOnStart;
+    if resume_all {
+        return true;
+    }
+    match setting {
+        ResumeInterruptedOnStart::On => true,
+        ResumeInterruptedOnStart::Off => false,
+        ResumeInterruptedOnStart::Auto => !has_display,
+    }
+}
+
 /// §5.7 / §12.3 host capabilities: display availability + derived locality. The
 /// local UDS control path is `local`; remote WSS clients are `remote` (the live
 /// value is reported per-connection by `intentd status`).
@@ -4383,6 +4416,33 @@ mod tests {
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[test]
+    fn resume_on_start_flag_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // --resume-all wins regardless of setting or display.
+        for setting in [R::Auto, R::On, R::Off] {
+            for has_display in [true, false] {
+                assert!(should_resume_on_start(true, setting, has_display));
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_setting_on_and_off_ignore_display() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        for has_display in [true, false] {
+            assert!(should_resume_on_start(false, R::On, has_display));
+            assert!(!should_resume_on_start(false, R::Off, has_display));
+        }
+    }
+
+    #[test]
+    fn resume_on_start_auto_resumes_only_headless() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        assert!(should_resume_on_start(false, R::Auto, false));
+        assert!(!should_resume_on_start(false, R::Auto, true));
     }
 
     #[test]

@@ -381,6 +381,31 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
 }
 
+/// Seed `config.toml` with `[agents] resumeInterruptedOnStart = "off"` so a
+/// restarted daemon does NOT auto-resume pending interrupted agents. Restart
+/// suites that assert rows stay pending in `agent.listInterrupted` need this
+/// pin: the setting defaults to `auto`, which resumes on headless hosts (no
+/// display) — exactly what CI runners are. Appends to an existing seeded
+/// config; no-op if an `[agents]` table is already present.
+#[allow(dead_code)]
+pub fn disable_resume_on_start(data_dir: &std::path::Path) {
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    let path = data_dir.join("config.toml");
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read {}: {e}", path.display()),
+    };
+    if text.lines().any(|l| l.trim_start().starts_with("[agents]")) {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("\n[agents]\nresumeInterruptedOnStart = \"off\"\n");
+    std::fs::write(&path, text).expect("seed config.toml with agents.resumeInterruptedOnStart");
+}
+
 /// The pinned-TLS WebSocket client stream type shared by the WSS e2e suites.
 pub type TlsWs =
     tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
