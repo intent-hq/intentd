@@ -443,7 +443,7 @@ fn normalize_batch_window_ms(batch_window: Option<i64>) -> i64 {
 
 /// Human-readable wake text summarizing one delivered batch (the FE-visible
 /// `event_notification` metadata carries the structured per-event payload).
-fn format_event_subscription_wake(events: &[&Event]) -> String {
+pub(crate) fn format_event_subscription_wake(events: &[&Event]) -> String {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut types: Vec<&str> = Vec::new();
     for e in events {
