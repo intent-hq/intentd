@@ -2,9 +2,14 @@
 Description=Intent backend daemon (intentd)
 After=network.target
 
+# A systemd user unit does not inherit the graphical session's DISPLAY /
+# WAYLAND_DISPLAY, so the daemon sees this service as headless: the default
+# agents.resumeInterruptedOnStart=auto resumes interrupted agents at startup
+# even on a desktop. Opt out with:
+#   intentd settings agents.resumeInterruptedOnStart off
 [Service]
 Type=simple
-ExecStart=/usr/bin/intentd serve --resume-all
+ExecStart=/usr/bin/intentd serve
 ExecStop=/usr/bin/intentd stop
 Restart=on-failure
 

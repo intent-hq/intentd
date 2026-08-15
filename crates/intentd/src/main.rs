@@ -92,6 +92,24 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
+    /// Read or change daemon settings (§5.12) on a running daemon. With no
+    /// arguments, lists every setting with its type and current value
+    /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
+    /// with `<name> <value>`, validates the value against the setting's
+    /// definition and applies it (`settings.update`). Values are coerced to
+    /// the definition's type: booleans take `true`/`false`, numbers a numeric
+    /// literal, enums one of the allowed strings, object/array settings a
+    /// JSON document. Sensitive values arrive pre-redacted from the daemon.
+    Settings {
+        /// Dotted setting path, e.g. `agents.resumeInterruptedOnStart`.
+        name: Option<String>,
+        /// New value, parsed per the setting's type (booleans: `true`/`false`;
+        /// numbers: a numeric literal; object/array settings: JSON).
+        /// `allow_hyphen_values`: a negative number (`-3`) must reach the
+        /// coercion layer instead of being rejected as an unknown flag.
+        #[arg(allow_hyphen_values = true)]
+        value: Option<String>,
+    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -214,6 +232,9 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
+        Command::Settings { name, value } => {
+            to_exit(cmd_settings(name.as_deref(), value.as_deref()).await)
+        }
         Command::McpBridge { connect } => {
             // The bridge reads stdin via `tokio::io::stdin()`, whose pending
             // blocking-pool read outlives `run_stdio_bridge`; returning
@@ -1563,27 +1584,39 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         }
     };
 
-    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
+    // Auto-resume interrupted agents at startup. `--resume-all` forces the
+    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
+    // (`auto` = headless hosts only, `on` = always, `off` = never).
     // Spawn in the background so it doesn't block startup; log failures per-agent.
-    if resume_all {
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    if resume_on_start {
         let services_clone = services.clone();
         tokio::spawn(async move {
-            tracing::info!("--resume-all: enumerating interrupted agents");
+            tracing::info!("resume-on-start: enumerating interrupted agents");
             // List all pending interrupted agents
             let rows = match services_clone.store().list_interrupted_agents().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
+                    tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
                     return;
                 }
             };
             if rows.is_empty() {
-                tracing::info!("--resume-all: no interrupted agents to resume");
+                tracing::info!("resume-on-start: no interrupted agents to resume");
                 return;
             }
             tracing::info!(
                 count = rows.len(),
-                "--resume-all: resuming interrupted agents"
+                "resume-on-start: resuming interrupted agents"
             );
             let mut resumed = Vec::new();
             let mut failed = Vec::new();
@@ -1595,7 +1628,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::info!(
                             agent_id = %agent_id,
                             workspace = %interrupted.workspace_id,
-                            "--resume-all: resumed agent"
+                            "resume-on-start: resumed agent"
                         );
                         resumed.push(agent_id.0);
                     }
@@ -1603,7 +1636,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::warn!(
                             agent_id = %agent_id,
                             error = %e,
-                            "--resume-all: failed to resume agent"
+                            "resume-on-start: failed to resume agent"
                         );
                         failed.push((agent_id.0, e.to_string()));
                     }
@@ -1612,7 +1645,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             tracing::info!(
                 resumed = resumed.len(),
                 failed = failed.len(),
-                "--resume-all: auto-resume sweep complete"
+                "resume-on-start: auto-resume sweep complete"
             );
         });
     }
@@ -3526,6 +3559,236 @@ async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `intentd settings` dispatcher: list (no args) / get (`<name>`) / set
+/// (`<name> <value>`), all against a running daemon over the local socket.
+async fn cmd_settings(name: Option<&str>, value: Option<&str>) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    match (name, value) {
+        (None, _) => cmd_settings_list(&config).await,
+        (Some(name), None) => cmd_settings_get(&config, name).await,
+        (Some(name), Some(value)) => cmd_settings_set(&config, name, value).await,
+    }
+}
+
+/// `rpc_call` wrapper for the `settings` subcommand: a connection failure
+/// gains guidance to start the daemon instead of a bare socket error.
+async fn settings_rpc(config: &Config, method: &str, params: Value) -> anyhow::Result<Value> {
+    rpc_call(&config.socket_path, method, params)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("cannot connect to daemon") {
+                anyhow::anyhow!(
+                    "{msg}\nintentd does not appear to be running — start it with \
+                     `intentd serve` or via the installed service"
+                )
+            } else {
+                e
+            }
+        })
+}
+
+async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
+    let response = settings_rpc(config, "settings.list", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let settings = response
+        .pointer("/result/settings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rows: Vec<(String, String, String)> = settings
+        .iter()
+        .map(|s| {
+            (
+                s.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                s.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                display_setting_value(s.get("value").unwrap_or(&Value::Null)),
+            )
+        })
+        .collect();
+    let path_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
+    let type_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
+    println!("{:<path_w$}  {:<type_w$}  VALUE", "PATH", "TYPE");
+    for (path, ty, value) in rows {
+        println!("{path:<path_w$}  {ty:<type_w$}  {value}");
+    }
+    Ok(())
+}
+
+async fn cmd_settings_get(config: &Config, name: &str) -> anyhow::Result<()> {
+    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
+    println!("{name} = {value}");
+    let definition = result.get("definition").cloned().unwrap_or(Value::Null);
+    println!("  type: {}", display_setting_type(&definition));
+    if let Some(default) = definition.get("defaultValue") {
+        println!("  default: {}", display_setting_value(default));
+    }
+    if let Some(origin) = result.get("origin").and_then(Value::as_str) {
+        println!("  origin: {origin}");
+    }
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+async fn cmd_settings_set(config: &Config, name: &str, raw: &str) -> anyhow::Result<()> {
+    // Fetch the definition first: an unknown name fails here with the
+    // daemon's own message, and the definition's type drives the coercion.
+    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let definition = response
+        .pointer("/result/definition")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let value =
+        coerce_setting_value(&definition, raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let params = json!({ "changes": [{ "path": name, "value": value }] });
+    let response = settings_rpc(config, "settings.update", params).await?;
+    if let Some(error) = response.get("error") {
+        // Daemon-side validation (bad enum value, out-of-range number,
+        // read-only) surfaces its message verbatim.
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let applied = response
+        .pointer("/result/applied/0/value")
+        .cloned()
+        .unwrap_or_else(|| {
+            // Unreachable today (`settings.update` always echoes the applied
+            // entry), but if the response shape ever drifts, never fall back
+            // to the caller's plaintext for a sensitive setting — print the
+            // daemon's redaction placeholder instead.
+            if definition
+                .get("sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                json!("********")
+            } else {
+                value
+            }
+        });
+    println!("{name} = {}", display_setting_value(&applied));
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+/// Coerce a raw CLI string into a JSON value matching the setting
+/// definition's wire `type` (§5.12): boolean → `true`/`false`, number →
+/// numeric parse (integer shape preserved), enum/string → the string as-is,
+/// object → parsed JSON (object or array). Enum membership and number
+/// range stay with the daemon, whose `-32602` message is authoritative.
+fn coerce_setting_value(definition: &Value, raw: &str) -> anyhow::Result<Value> {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    match ty {
+        "boolean" => match raw {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => anyhow::bail!("expected a boolean: true or false (got `{raw}`)"),
+        },
+        "number" => {
+            if let Ok(n) = raw.parse::<i64>() {
+                return Ok(json!(n));
+            }
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("expected a number (got `{raw}`)"))?;
+            if !n.is_finite() {
+                anyhow::bail!("expected a finite number (got `{raw}`)");
+            }
+            Ok(json!(n))
+        }
+        "object" => {
+            let v: Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow::anyhow!("expected a JSON object or array: {e}"))?;
+            if !(v.is_object() || v.is_array()) {
+                anyhow::bail!("expected a JSON object or array (got `{raw}`)");
+            }
+            Ok(v)
+        }
+        // Enums are strings on the wire; strings pass through as-is.
+        _ => Ok(json!(raw)),
+    }
+}
+
+/// Render a setting value for terminal output: unset → `(unset)`, strings
+/// bare, everything else compact JSON. Sensitive values arrive pre-redacted
+/// from the daemon and are printed as-is.
+fn display_setting_value(value: &Value) -> String {
+    match value {
+        Value::Null => "(unset)".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Render a definition's type for terminal output, folding in the enum
+/// values / number bounds when present.
+fn display_setting_type(definition: &Value) -> String {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    match ty {
+        "enum" => {
+            let values = definition
+                .get("enumValues")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("enum [{values}]")
+        }
+        "number" => {
+            let mut bounds = Vec::new();
+            if let Some(min) = definition.get("min").and_then(Value::as_f64) {
+                bounds.push(format!("min {min}"));
+            }
+            if let Some(max) = definition.get("max").and_then(Value::as_f64) {
+                bounds.push(format!("max {max}"));
+            }
+            if bounds.is_empty() {
+                "number".to_string()
+            } else {
+                format!("number ({})", bounds.join(", "))
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 async fn cmd_status() -> ExitCode {
     let config = match resolve_config() {
         Ok(c) => c,
@@ -3921,6 +4184,27 @@ async fn report_context_engine() {
         EngineAvailability::Unavailable { reason } => {
             println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
         }
+    }
+}
+
+/// Whether the startup interrupted-agent resume sweep should run. The
+/// `--resume-all` flag forces the sweep; otherwise the
+/// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
+/// `off` never resumes, and `auto` (the default) resumes only on headless
+/// hosts (no display detected).
+fn should_resume_on_start(
+    resume_all: bool,
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    has_display: bool,
+) -> bool {
+    use intent_core::settings_file::ResumeInterruptedOnStart;
+    if resume_all {
+        return true;
+    }
+    match setting {
+        ResumeInterruptedOnStart::On => true,
+        ResumeInterruptedOnStart::Off => false,
+        ResumeInterruptedOnStart::Auto => !has_display,
     }
 }
 
@@ -4353,6 +4637,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coerce_boolean_accepts_true_false_only() {
+        let def = json!({ "type": "boolean" });
+        assert_eq!(coerce_setting_value(&def, "true").unwrap(), json!(true));
+        assert_eq!(coerce_setting_value(&def, "false").unwrap(), json!(false));
+        let err = coerce_setting_value(&def, "on").unwrap_err().to_string();
+        assert!(err.contains("true or false"), "{err}");
+    }
+
+    #[test]
+    fn coerce_number_parses_integers_and_floats() {
+        let def = json!({ "type": "number", "min": 1.0, "max": 65535.0 });
+        assert_eq!(coerce_setting_value(&def, "5181").unwrap(), json!(5181));
+        assert_eq!(coerce_setting_value(&def, "0.5").unwrap(), json!(0.5));
+        assert_eq!(coerce_setting_value(&def, "-3").unwrap(), json!(-3));
+        let err = coerce_setting_value(&def, "abc").unwrap_err().to_string();
+        assert!(err.contains("expected a number"), "{err}");
+        // Range enforcement stays with the daemon: out-of-range parses fine.
+        assert_eq!(coerce_setting_value(&def, "99999").unwrap(), json!(99999));
+    }
+
+    #[test]
+    fn settings_value_accepts_hyphen_leading_values() {
+        // `allow_hyphen_values` on the positional: without it clap rejects
+        // `-3` as an unknown flag before the coercion layer ever runs.
+        let cli = Cli::try_parse_from(["intentd", "settings", "some.number", "-3"])
+            .expect("hyphen-leading value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value } => {
+                assert_eq!(name.as_deref(), Some("some.number"));
+                assert_eq!(value.as_deref(), Some("-3"));
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_number_rejects_non_finite() {
+        let def = json!({ "type": "number" });
+        for raw in ["inf", "-inf", "NaN"] {
+            let err = coerce_setting_value(&def, raw).unwrap_err().to_string();
+            assert!(err.contains("finite"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn coerce_enum_and_string_pass_through_as_strings() {
+        // Enum membership is validated by the daemon; the CLI only shapes
+        // the value as a string.
+        let enum_def = json!({ "type": "enum", "enumValues": ["on", "off", "auto"] });
+        assert_eq!(
+            coerce_setting_value(&enum_def, "auto").unwrap(),
+            json!("auto")
+        );
+        assert_eq!(
+            coerce_setting_value(&enum_def, "bogus").unwrap(),
+            json!("bogus")
+        );
+        let string_def = json!({ "type": "string" });
+        assert_eq!(
+            coerce_setting_value(&string_def, "true").unwrap(),
+            json!("true")
+        );
+        // A missing/unknown type falls back to string pass-through.
+        assert_eq!(coerce_setting_value(&Value::Null, "x").unwrap(), json!("x"));
+    }
+
+    #[test]
+    fn coerce_object_parses_json_objects_and_arrays() {
+        let def = json!({ "type": "object" });
+        assert_eq!(
+            coerce_setting_value(&def, r#"{"a":1}"#).unwrap(),
+            json!({ "a": 1 })
+        );
+        assert_eq!(
+            coerce_setting_value(&def, r#"["x","y"]"#).unwrap(),
+            json!(["x", "y"])
+        );
+        let err = coerce_setting_value(&def, "not json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+        // Valid JSON scalars are still rejected — the type wants a structure.
+        let err = coerce_setting_value(&def, "42").unwrap_err().to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+    }
+
+    #[test]
     fn listener_down_error_is_detected_from_data_code() {
         // Preferred detection: the machine-readable discriminator
         // (monorepo#1822) — message prose is irrelevant when it is present.
@@ -4383,6 +4754,33 @@ mod tests {
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[test]
+    fn resume_on_start_flag_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // --resume-all wins regardless of setting or display.
+        for setting in [R::Auto, R::On, R::Off] {
+            for has_display in [true, false] {
+                assert!(should_resume_on_start(true, setting, has_display));
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_setting_on_and_off_ignore_display() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        for has_display in [true, false] {
+            assert!(should_resume_on_start(false, R::On, has_display));
+            assert!(!should_resume_on_start(false, R::Off, has_display));
+        }
+    }
+
+    #[test]
+    fn resume_on_start_auto_resumes_only_headless() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        assert!(should_resume_on_start(false, R::Auto, false));
+        assert!(!should_resume_on_start(false, R::Auto, true));
     }
 
     #[test]

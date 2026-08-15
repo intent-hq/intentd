@@ -641,6 +641,92 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
     assert_eq!(resp["result"]["origin"], json!("default"));
 }
 
+/// `agents.resumeInterruptedOnStart` over WSS (per AGENTS.md testing gate):
+/// the TOML-backed enum appears in `settings.list` with its definition and
+/// `auto` default, round-trips through `settings.update` / `settings.get` /
+/// `settings.reset` with `file` origin, and rejects unknown enum values with
+/// `-32602` (PROTOCOL §9).
+#[tokio::test]
+async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let path = "agents.resumeInterruptedOnStart";
+
+    // settings.list — advertised as an enum with the `auto` default.
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == path)
+        .unwrap_or_else(|| panic!("{path} missing from settings.list"));
+    assert_eq!(entry["type"], json!("enum"));
+    assert_eq!(entry["enumValues"], json!(["auto", "on", "off"]));
+    assert_eq!(entry["category"], json!("agents"));
+    assert_eq!(entry["defaultValue"], json!("auto"));
+    assert_eq!(entry["value"], json!("auto"));
+    assert_eq!(entry["origin"], json!("default"));
+
+    // Update → applied, reads back with `file` origin.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "on" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 2);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 1, "{resp}");
+    assert_eq!(applied[0]["path"], json!(path));
+    assert_eq!(applied[0]["value"], json!("on"));
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 3);
+    assert_eq!(resp["result"]["path"], json!(path));
+    assert_eq!(resp["result"]["value"], json!("on"));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // Unknown enum values reject with -32602 (PROTOCOL §9).
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "maybe" }] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 4, -32602);
+
+    // Reset restores the `auto` default.
+    let resp = wss_rpc(&mut ws, 5, "settings.reset", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 5);
+    assert_eq!(resp["result"]["value"], json!("auto"));
+    let resp = wss_rpc(&mut ws, 6, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 6);
+    assert_eq!(resp["result"]["value"], json!("auto"));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+}
+
 /// Assert the JSON-RPC 2.0 success envelope (PROTOCOL §1): `jsonrpc: "2.0"`,
 /// the echoed `id`, a `result` object and no `error` member.
 fn assert_success_envelope(resp: &Value, id: i64) {

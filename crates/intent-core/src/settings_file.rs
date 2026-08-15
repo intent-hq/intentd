@@ -545,6 +545,12 @@ pub struct AgentsSettings {
     /// entries (user-origin entries stay FIFO), `off` is one turn per queued
     /// message.
     pub flush_queued_messages: FlushQueuedMessagesMode,
+    /// `agents.resumeInterruptedOnStart` — whether the daemon resumes
+    /// interrupted agents at startup when `--resume-all` is absent: `auto`
+    /// resumes only on headless hosts (no display detected), `on` always
+    /// resumes, `off` never resumes. The `--resume-all` flag forces the
+    /// sweep regardless of this setting.
+    pub resume_interrupted_on_start: ResumeInterruptedOnStart,
 }
 
 impl Default for AgentsSettings {
@@ -555,6 +561,32 @@ impl Default for AgentsSettings {
             max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
+            resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
+        }
+    }
+}
+
+/// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
+/// (`"auto"`, `"on"`, `"off"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeInterruptedOnStart {
+    /// Resume interrupted agents at startup only on headless hosts.
+    #[default]
+    Auto,
+    /// Always resume interrupted agents at startup.
+    On,
+    /// Never resume interrupted agents at startup.
+    Off,
+}
+
+impl ResumeInterruptedOnStart {
+    /// The wire/TOML string for this value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResumeInterruptedOnStart::Auto => "auto",
+            ResumeInterruptedOnStart::On => "on",
+            ResumeInterruptedOnStart::Off => "off",
         }
     }
 }
@@ -1276,6 +1308,11 @@ idleReapMinutes = 10
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
+# Resume interrupted on start -- whether the daemon resumes interrupted
+# agents at startup when --resume-all is absent: "auto" resumes only on
+# headless hosts (no display detected), "on" always resumes, "off" never
+# resumes. --resume-all forces the sweep regardless of this setting.
+resumeInterruptedOnStart = "auto"
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
@@ -1582,6 +1619,39 @@ mod tests {
         let err =
             SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
         assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_accepts_variants() {
+        for (raw, expected) in [
+            ("\"auto\"", ResumeInterruptedOnStart::Auto),
+            ("\"on\"", ResumeInterruptedOnStart::On),
+            ("\"off\"", ResumeInterruptedOnStart::Off),
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nresumeInterruptedOnStart = {raw}\n"))
+                    .expect("parses");
+            assert_eq!(parsed.agents.resume_interrupted_on_start, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_defaults_to_auto() {
+        let parsed = SettingsFile::parse_str("").expect("empty parses");
+        assert_eq!(
+            parsed.agents.resume_interrupted_on_start,
+            ResumeInterruptedOnStart::Auto
+        );
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_rejects_unknown_string() {
+        let err = SettingsFile::parse_str("[agents]\nresumeInterruptedOnStart = \"maybe\"\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resumeInterruptedOnStart"),
+            "{err}"
+        );
     }
 
     #[test]
