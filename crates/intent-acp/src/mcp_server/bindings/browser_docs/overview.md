@@ -62,4 +62,35 @@ still work. If the tunnel forward itself fails, or on web-browser clients (which
 open a local tunnel listener), the action fails with an explanatory error (pointing at
 `127.0.0.1`-only binding or a firewall) instead of opening a broken page.
 
+## Port Tunnels
+
+Explicit port forwards from the client machine to daemon-loopback ports — the tab-free
+counterpart to the implicit `openTab`/`navigate` auto-tunnel above. Use them when you
+need the forwarded port itself rather than a browser tab. The same three actions work
+uniformly on every transport: remote daemons forward over the daemon connection
+(`backend: "tunnel"`), local daemons use a loopback relay (`backend: "direct"`). Never
+branch on the backend — it is diagnostic only.
+
+- `{ action: "openTunnel", remotePort }` → `{ remotePort, localPort, backend: "tunnel"|"direct", reused }`
+  — forward daemon-side `remotePort`; reach it at `127.0.0.1:<localPort>` on the client.
+  Reuses a live forward for the same `remotePort` (`reused: true`) or creates one.
+- `{ action: "listTunnels" }` → `{ tunnels: [{ remotePort, localPort, backend }] }`
+- `{ action: "closeTunnel", remotePort }` → `{ remotePort, closed: true }` — errors when
+  no active forward exists for that port.
+
+### Lifecycle & recovery
+
+Forwards live in the client process, not the daemon: they all drop when the client
+restarts, a new client takes over, or the daemon connection/transport changes.
+
+- `localPort` is ephemeral — always use the value returned by the latest `openTunnel`;
+  never cache it across calls.
+- Connection refused on a previously returned `localPort`, or the forward missing from
+  `listTunnels`? Just call `openTunnel { remotePort }` again — it reuses a live forward
+  (`reused: true`) or transparently recreates a dead one, and returns the current
+  `localPort`. `openTunnel` is cheap and idempotent per `remotePort`; re-establishing is
+  the standard move, not an error condition to diagnose.
+- A definitively refused connect to the daemon-side port (server gone) drops the whole
+  forward immediately; forwards idle for ~10 minutes are swept as the backstop.
+
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.
