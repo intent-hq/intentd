@@ -3091,13 +3091,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// files: string[], fileDetails: [{ path, additions, deletions }] }`.
     /// Remote/non-repo workspaces and an unresolvable hash return an empty
     /// envelope (`{ commitHash, fileDetails: [], files: [] }`) so the FE renders
-    /// a friendly empty state instead of crashing (wire §7.7).
+    /// a friendly empty state instead of crashing (wire §7.7). When
+    /// `git_root_id` is set, the read runs against that registered git root's
+    /// path instead of the workspace worktree; an unknown id or one belonging
+    /// to another workspace is `InvalidParams` (`-32602`).
     fn git_commit_details(
         &self,
         workspace_id: WorkspaceId,
         commit_hash: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, commit_hash);
+        let _ = (workspace_id, commit_hash, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commit_details not implemented".to_string(),
