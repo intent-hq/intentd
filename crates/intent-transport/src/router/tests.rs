@@ -892,6 +892,33 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    fn git_commit_details(
+        &self,
+        _workspace_id: WorkspaceId,
+        commit_hash: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if let Some(id) = &git_root_id {
+                if id.as_str() != "root-1" {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                return Ok(serde_json::json!({
+                    "commitHash": commit_hash,
+                    "message": "root-commit",
+                    "files": ["root-only.txt"],
+                    "fileDetails": [{ "path": "root-only.txt", "additions": 1, "deletions": 0 }],
+                }));
+            }
+            Ok(serde_json::json!({
+                "commitHash": commit_hash,
+                "message": "primary-commit",
+                "files": ["src/a.ts"],
+                "fileDetails": [{ "path": "src/a.ts", "additions": 1, "deletions": 0 }],
+            }))
+        })
+    }
+
     fn git_stage(
         &self,
         _workspace_id: WorkspaceId,
@@ -3945,6 +3972,54 @@ async fn git_status_empty_git_root_id_is_treated_as_absent() {
     .await
     .unwrap();
     assert_eq!(v["result"]["branch"], serde_json::json!("main"));
+}
+
+#[tokio::test]
+async fn git_commit_details_with_git_root_id_scopes_to_root() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commitHash"], serde_json::json!("abc123"));
+    assert_eq!(v["result"]["message"], serde_json::json!("root-commit"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["root-only.txt"]));
+}
+
+#[tokio::test]
+async fn git_commit_details_without_git_root_id_targets_primary() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
+}
+
+#[tokio::test]
+async fn git_commit_details_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_commit_details_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
 }
 
 #[tokio::test]
