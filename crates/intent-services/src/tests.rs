@@ -14148,13 +14148,11 @@ mod file_tracking {
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
-        // git.commitDetails follows the same policy (never an empty fallback).
+        // git.commitDetails follows the same policy (never an empty fallback);
+        // the foreign id exercises the foreign-root half here (the remote
+        // test below covers the unknown-id half for commitDetails).
         let err = svc
-            .git_commit_details(
-                ws_id,
-                "deadbeef".to_string(),
-                Some(intent_core::WorkspaceGitRootId::new()),
-            )
+            .git_commit_details(ws_id, "deadbeef".to_string(), Some(foreign.id.clone()))
             .await
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
