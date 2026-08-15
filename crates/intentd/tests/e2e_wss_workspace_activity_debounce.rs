@@ -381,12 +381,12 @@ async fn workspace_activity_changed_debounce() {
 
     // Drain events until we see the idle workspace activity change plus the
     // displayStatus demotion that rides the same debounced flip. The demoted
-    // status is `unread`, not `idle`: the completed turn raised the
-    // server-owned unread flag (§9.9), which promotes the idle base (§6.5).
+    // status is `idle`: the completed turn raises the server-owned unread
+    // flag (§9.9), but the flag is not a displayStatus axis (§6.5).
     let mut saw_idle = false;
-    let mut saw_status_unread = false;
+    let mut saw_status_idle = false;
     for _ in 0..40 {
-        if saw_idle && saw_status_unread {
+        if saw_idle && saw_status_idle {
             break;
         }
         if let Some(ev) = wss_event_opt(&mut sub, 2).await {
@@ -395,9 +395,9 @@ async fn workspace_activity_changed_debounce() {
                 saw_idle = true;
             }
             if ev["type"] == "workspace:displayStatus-changed"
-                && ev["data"]["displayStatus"] == "unread"
+                && ev["data"]["displayStatus"] == "idle"
             {
-                saw_status_unread = true;
+                saw_status_idle = true;
             }
         }
     }
@@ -406,14 +406,19 @@ async fn workspace_activity_changed_debounce() {
         "expected workspace:activity-changed idle after debounce"
     );
     assert!(
-        saw_status_unread,
-        "expected workspace:displayStatus-changed unread after debounce"
+        saw_status_idle,
+        "expected workspace:displayStatus-changed idle after debounce"
     );
 
-    // The post-run read path agrees with the event stream.
+    // The post-run read path agrees with the event stream; the turn-end
+    // unread flag persists on `attention` without moving the rollup.
     let got = uds_rpc(&socket, 4, "workspace.get", json!({ "workspaceId": ws_id })).await;
     assert_eq!(
-        got["result"]["workspace"]["displayStatus"], "unread",
-        "post-run displayStatus is unread: {got}"
+        got["result"]["workspace"]["displayStatus"], "idle",
+        "post-run displayStatus is idle: {got}"
+    );
+    assert_eq!(
+        got["result"]["workspace"]["attention"], "unread",
+        "turn-end unread flag persists: {got}"
     );
 }

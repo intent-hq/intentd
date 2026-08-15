@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the PascalCase variant names (`Active`/`Inactive`/`Archived`/
@@ -110,18 +113,18 @@ pub enum NoteVisibility {
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
-/// `taskStats`, live agent activity, the per-workspace attention axes, and
-/// the dismissible workspace attention flag. Wire values are the snake_case
-/// variant names, matching the FE union exactly. Canonical precedence
-/// (§6.5): `Failed` (a top-level agent parked in `error`) > `Blocked` (a
-/// top-level pending `blocker` attention request) > `NeedsAttention`
-/// (discussion requests, pending structured questions, or the
-/// `review_required` attention flag) > `InProgress` (running agent) >
-/// `Unread` (the `unread` attention flag, promoting only over the
-/// idle/terminal bases `Idle`/`Complete`/`PrMerged`) > the PR/task rollup.
-/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
-/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
-/// never reach the wire on their own.
+/// `taskStats`, live agent activity, and the per-workspace attention axes.
+/// Wire values are the snake_case variant names, matching the FE union
+/// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
+/// in `error`) > `Blocked` (a top-level pending `blocker` attention
+/// request) > `NeedsAttention` (discussion requests, pending structured
+/// questions, or the `review_required` attention flag) > `InProgress`
+/// (running agent) > the PR/task rollup. The dismissible `unread` attention
+/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
+/// is the flag's own contract, not a display status. Without a running
+/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
+/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
+/// on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -130,7 +133,6 @@ pub enum WorkspaceDisplayStatus {
     NeedsAttention,
     Failed,
     Blocked,
-    Unread,
     Idle,
     Complete,
     PrReady,
@@ -223,6 +225,21 @@ pub struct Workspace {
     /// elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_status: Option<WorkspaceDisplayStatus>,
+    /// Daemon-owned orthogonal wait flag (PROTOCOL §5.1): `true` when the workspace
+    /// has any of ACTIVE background hooks, ACTIVE PR monitors, or waiting
+    /// agent subscriptions (undelivered child completion watches held by
+    /// top-level foreground agents, anchored in the parent's home
+    /// workspace; `event.subscribe` registrations deliberately do not
+    /// count) — the workspace is watching an external condition without a
+    /// running agent turn. Orthogonal to `displayStatus` (a workspace can
+    /// be `complete` or `pr_ready` and still waiting). Served from the
+    /// last-observed cache on the same `workspace.list` / `workspace.get` /
+    /// subscription emit path as `displayStatus` (never persisted; the
+    /// hook/monitor/watch mutation choke points keep the cache current, and
+    /// only a first-touch miss probes the store); omitted (not `false`)
+    /// when no wait signal is live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -356,6 +373,7 @@ pub fn chief_workspace() -> Workspace {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        waiting: false,
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
@@ -1660,6 +1678,18 @@ pub struct WorkspaceTask {
     pub title: String,
     pub status: TaskStatus,
     pub updated_at: String,
+    /// True iff this task's id appears in the spec note body as an
+    /// `intent://local/task/{id}` link. Additive field, always serialized
+    /// (`false` for every row when the spec has no links); not conditioned
+    /// on `parent_id`.
+    #[serde(default)]
+    pub spec_linked: bool,
+    /// Backing note's parent pointer, so clients can distinguish subtasks
+    /// (parent is another task) from top-level tasks (parent is the spec or
+    /// absent) and reconstruct the hierarchy from `task.list` alone.
+    /// Additive; omitted when the note has no parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NoteId>,
     /// Task relations (empty and omitted for tasks without them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<NoteId>,
@@ -1672,9 +1702,11 @@ pub struct WorkspaceTask {
 
 /// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
 /// the optional `status` filter) **and** the workspace-wide `taskStats`
-/// aggregate (always computed over the unfiltered spec-linked set, mirroring
-/// the canonical FE `computeTaskStats` in `task-stats.ts`). Lets the FE render
-/// the progress rollup verbatim instead of re-deriving it from `note.list`.
+/// aggregate. `tasks` membership is workspace-wide — every task note except
+/// the spec itself, each flagged with `specLinked` — while `stats` stays the
+/// spec-linked direct-child rollup (mirrors the canonical FE
+/// `computeTaskStats` in `task-stats.ts`). Lets the FE render the progress
+/// rollup verbatim instead of re-deriving it from `note.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskListResult {
@@ -2607,9 +2639,11 @@ pub struct AgentMetadata {
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
-/// the TS `AgentLite`: the full [`AgentSession`] with `messages` and
-/// `systemPrompt` stripped (clients fetch the transcript via
-/// `agent.getConversation`), plus a derived `messageCount`, the
+/// the TS `AgentLite`: the full [`AgentSession`] with `messages`,
+/// `systemPrompt`, and the session-level `imageBlocks` stripped (clients fetch
+/// the transcript via `agent.getConversation`; the spawn-time image blocks —
+/// potentially large base64 blobs — are detail-only and served by
+/// `agent.getSession`), plus a derived `messageCount`, the
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
@@ -2741,10 +2775,6 @@ pub struct AgentLite {
     /// when absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_references: Option<serde_json::Value>,
-    /// Session-level image blocks persisted at spawn (P3-1.2b); omitted when
-    /// absent so pre-gap wire shapes are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_blocks: Option<serde_json::Value>,
     /// Session-level file blocks persisted at spawn (PROTOCOL §5.5); omitted
     /// when absent so pre-existing wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2845,7 +2875,6 @@ impl AgentLite {
             last_message_id,
             digest,
             context_references: session.context_references,
-            image_blocks: session.image_blocks,
             file_blocks: session.file_blocks,
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,
@@ -2926,19 +2955,72 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
-    /// Batch form (PROTOCOL §5.5): a list of task-note ids to classify and
-    /// start together. Mutually exclusive with `taskNoteId`/`noteId`/
-    /// `taskText`, and the single-task-only `agentInstructions`/`force` are
-    /// rejected alongside it; when present the result enumerates every listed
-    /// task with its disposition (`started` / `held:*` / `skipped`) plus the
-    /// unlock plan. Single-task calls (this field absent) behave exactly as
-    /// before.
-    pub tasks: Option<Vec<NoteId>>,
-    /// Batch-only conflict policy (default false): `false` holds a task whose
-    /// `conflictsWith` intersects the running/starting set, admitting
-    /// startable tasks in effort-weighted critical-path priority order;
-    /// `true` starts it anyway and names the conflict pairs in the result.
-    pub greedy: Option<bool>,
+    /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
+    /// together — each entry either a bare task-note id or a
+    /// [`BatchTaskEntry::Options`] object carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
+    /// `agentInstructions`/`force` are rejected alongside it; when present
+    /// the result enumerates every listed task with its disposition
+    /// (`started` / `held:*` / `skipped`) plus the unlock plan. Single-task
+    /// calls (this field absent) behave exactly as before.
+    pub tasks: Option<Vec<BatchTaskEntry>>,
+    /// REMOVED batch conflict override (PROTOCOL §5.5): kept as a field only
+    /// so a request still passing `greedy` gets a clear rejection instead of
+    /// being silently ignored — delegate a held task individually to force
+    /// it past a conflict hold. `Option<Option<bool>>` via
+    /// [`deserialize_optional_field`] so an explicit `null` (`Some(None)`)
+    /// is detected as present and rejected too; only a missing field
+    /// (`None`) passes.
+    #[serde(deserialize_with = "deserialize_optional_field")]
+    pub greedy: Option<Option<bool>>,
+}
+
+/// One entry of the batch `agent.delegate` `tasks` array (PROTOCOL §5.5):
+/// either a bare task-note id string (the original shape, unchanged) or an
+/// object carrying the id plus per-task option overrides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BatchTaskEntry {
+    /// Bare task-note id — inherits the call's top-level
+    /// `specialist`/`model`/`reasoningEffort` defaults.
+    Id(NoteId),
+    /// Object entry with per-task overrides.
+    Options(BatchTaskOptions),
+}
+
+impl BatchTaskEntry {
+    /// The task-note id this entry addresses, regardless of shape.
+    pub fn task_note_id(&self) -> &NoteId {
+        match self {
+            BatchTaskEntry::Id(id) => id,
+            BatchTaskEntry::Options(opts) => &opts.task_note_id,
+        }
+    }
+}
+
+/// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
+/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// defaults for that task only. `agentInstructions` is carried solely so the
+/// delegate op can reject it with a clear error — it is never honored (each
+/// started task's first message resolves from its own task note).
+/// `deny_unknown_fields` so a typo'd or unsupported per-entry key (e.g.
+/// `behaviorPrompt`, `waitMode`, `greedy`) fails deserialization instead of
+/// being silently dropped — the same silent-ignore failure mode the modeled
+/// rejection fields exist to prevent (works with `untagged`: serde buffers
+/// the content).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchTaskOptions {
+    pub task_note_id: NoteId,
+    #[serde(default)]
+    pub specialist: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub agent_instructions: Option<String>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the
@@ -3365,6 +3447,65 @@ pub struct PrMonitor {
     pub updated_at: String,
 }
 
+/// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
+/// lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceGitRootSource {
+    /// Registered explicitly by an agent (`ws.git.registerRoot`).
+    Agent,
+    /// Auto-detected by the daemon (the workspace worktree's git submodules).
+    Auto,
+}
+
+/// A secondary local git repository tracked for a workspace (multi git root
+/// tracking, intent-hq/monorepo#2053) — an agent-created subtree checkout, a
+/// submodule, or a sibling clone anywhere on the host. Persisted to the
+/// `workspace_git_root` table (rows cascade with their workspace); the daemon
+/// runs the same background PR discovery on each root as on the primary
+/// workspace root, so the PR fields mirror the [`Workspace`] PR fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitRoot {
+    pub id: WorkspaceGitRootId,
+    pub workspace_id: WorkspaceId,
+    /// Canonicalized absolute path of the git repository root. Registration
+    /// is idempotent by `(workspaceId, path)`.
+    pub path: String,
+    pub source: WorkspaceGitRootSource,
+    /// Repository owner detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_owner: Option<String>,
+    /// Repository name detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Agents that registered this root, in registration order (deduped).
+    /// Empty for auto-detected roots with no explicit registrations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_by_agent_ids: Vec<AgentId>,
+    /// The root's HEAD commit SHA captured when the root was first registered
+    /// (agent registration or sweep auto-detect); immutable once set — merges
+    /// never touch it. `None` when HEAD was unreadable at registration or the
+    /// row predates the field; the background sweep best-effort-backfills
+    /// such rows with the root's current HEAD (a going-forward boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// Persisted PR lifecycle status for the root's linked PR (§7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_status: Option<PullRequestStatus>,
+    /// Persisted list of PR snapshots discovered for the root's current
+    /// branch (§7.6). `None` = never populated by the daemon; `Some(vec![])`
+    /// = explicitly no discovered PRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests: Option<Vec<PullRequestInfo>>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
 /// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
@@ -3460,6 +3601,71 @@ mod tests {
         // Round-trips back to an equal value.
         let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn agent_delegate_input_tasks_accepts_mixed_string_and_object_entries() {
+        // PROTOCOL §5.5 batch form: a bare taskNoteId string and an object
+        // entry with per-task overrides deserialize side by side.
+        let input: AgentDelegateInput = serde_json::from_value(json!({
+            "tasks": [
+                "bare-id",
+                { "taskNoteId": "obj-id", "specialist": "verifier",
+                  "model": "mock:m", "reasoningEffort": "high" },
+                { "taskNoteId": "min-id" },
+            ],
+            "specialist": "implementor",
+        }))
+        .unwrap();
+        let tasks = input.tasks.expect("tasks");
+        assert_eq!(tasks.len(), 3);
+        assert!(matches!(&tasks[0], BatchTaskEntry::Id(id) if id.0 == "bare-id"));
+        assert_eq!(tasks[0].task_note_id().0, "bare-id");
+        match &tasks[1] {
+            BatchTaskEntry::Options(o) => {
+                assert_eq!(o.task_note_id.0, "obj-id");
+                assert_eq!(o.specialist.as_deref(), Some("verifier"));
+                assert_eq!(o.model.as_deref(), Some("mock:m"));
+                assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
+                assert!(o.agent_instructions.is_none());
+            }
+            other => panic!("expected Options, got {other:?}"),
+        }
+        assert_eq!(tasks[2].task_note_id().0, "min-id");
+
+        // An object entry without a taskNoteId fails to deserialize.
+        assert!(serde_json::from_value::<AgentDelegateInput>(
+            json!({ "tasks": [{ "specialist": "verifier" }] })
+        )
+        .is_err());
+
+        // deny_unknown_fields: a typo'd or unsupported per-entry key fails
+        // deserialization instead of being silently dropped.
+        for bad in [
+            json!({ "taskNoteId": "x", "speciallist": "verifier" }),
+            json!({ "taskNoteId": "x", "behaviorPrompt": "be terse" }),
+            json!({ "taskNoteId": "x", "waitMode": "after_all" }),
+            json!({ "taskNoteId": "x", "greedy": true }),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentDelegateInput>(json!({ "tasks": [bad] })).is_err(),
+                "unknown per-entry key must fail deserialization: {bad}"
+            );
+        }
+
+        // The removed `greedy` param is presence-aware: a missing field is
+        // `None`, while `true`/`false`/an explicit `null` all deserialize as
+        // present (`Some(..)`) so the service layer can reject any of them.
+        assert!(input.greedy.is_none());
+        for (val, expect) in [
+            (json!(true), Some(Some(true))),
+            (json!(false), Some(Some(false))),
+            (json!(null), Some(None)),
+        ] {
+            let with_greedy: AgentDelegateInput =
+                serde_json::from_value(json!({ "tasks": ["x"], "greedy": val })).unwrap();
+            assert_eq!(with_greedy.greedy, expect);
+        }
     }
 
     #[test]
@@ -3812,6 +4018,7 @@ mod tests {
             agent_summary: None,
             diff_summary: None,
             display_status: None,
+            waiting: false,
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
@@ -3835,9 +4042,18 @@ mod tests {
         ] {
             assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
         }
+        // Presence-detected `waiting`: omitted when false, emitted when true.
+        assert!(v.get("waiting").is_none(), "waiting omitted when false");
         // Round-trips back with optionals defaulted to None.
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, ws);
+
+        let mut waiting_ws = ws.clone();
+        waiting_ws.waiting = true;
+        let v = serde_json::to_value(&waiting_ws).unwrap();
+        assert_eq!(v["waiting"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, waiting_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

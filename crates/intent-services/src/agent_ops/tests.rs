@@ -94,6 +94,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -107,6 +108,33 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let services = Services::new(store);
     (tmp, services, ws)
+}
+
+async fn setup_with_task_graph(
+    enabled: bool,
+) -> (
+    TempDb,
+    Services,
+    WorkspaceId,
+    Arc<crate::SettingsRegistry>,
+    tempfile::TempDir,
+) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    if enabled {
+        registry
+            .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
+            .expect("enable taskGraph");
+    }
+    let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
+    (tmp, services, ws, registry, config_dir)
 }
 
 async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
@@ -1092,6 +1120,9 @@ async fn completion_delivery_attaches_event_notification_metadata() {
     assert_eq!(metadata["type"], json!("event_notification"));
     assert_eq!(metadata["eventCount"], json!(1));
     assert_eq!(metadata["eventTypes"], json!([AGENT_IDLE]));
+    // monorepo#2060: the ungrouped delivery retires the one-shot watch, and
+    // the metadata says so machine-readably (`hookStillActive` parity).
+    assert_eq!(metadata["watchStillArmed"], json!(false));
     let events = metadata["events"].as_array().expect("events array");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["id"], json!(event.id));
@@ -4523,8 +4554,10 @@ async fn create_with_name_explicitly_set_false_stays_renameable() {
 /// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
 /// `metadata` spawn hint / top-level params and re-serves them via
 /// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
-/// session-level `contextReferences` / `imageBlocks`, and
-/// `metadata.isBackground` (G-A1/P3-1.2c).
+/// session-level `contextReferences`, and `metadata.isBackground`
+/// (G-A1/P3-1.2c). Session-level `imageBlocks` persist but stay OFF the lite
+/// projection (list-payload cost contract) — they are served by
+/// `agent.getSession` only.
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -4562,11 +4595,21 @@ async fn create_persists_and_reserves_gap_fields() {
         v["contextReferences"],
         json!([{ "type": "file", "path": "src/a.rs" }])
     );
-    assert_eq!(
-        v["imageBlocks"],
-        json!([{ "type": "image", "data": "abc" }])
+    assert!(
+        v.get("imageBlocks").is_none(),
+        "session-level imageBlocks must stay off the lite projection"
     );
     assert_eq!(v["metadata"]["isBackground"], json!(true));
+
+    // The persisted blocks are still served by the detail read.
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(
+        session.image_blocks,
+        Some(json!([{ "type": "image", "data": "abc" }]))
+    );
 
     // And on `agent.list`.
     let agents = svc.agent_list_op(ws).await.expect("list");
@@ -7911,6 +7954,73 @@ async fn diagnostics_reports_queue_snapshots() {
     let text = drained["text"].as_str().expect("text");
     assert!(text.contains("Queued agents: 0"), "text: {text}");
     assert!(!text.contains("Pending message queues:"), "text: {text}");
+}
+
+/// monorepo#2063 A2: `agent.diagnostics` agent rows carry `subtreeMemoryBytes`
+/// from the runtime manager's tree probe — present only for agents the probe
+/// attributed bytes to, omitted otherwise (no bucket, no probe, or no manager
+/// attached). Diagnostics-only: the field never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_subtree_memory_bytes() {
+    use crate::agent_manager::TreeMemoryProbe;
+    use std::collections::HashMap;
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let sampled = create_agent(&svc, &ws, "Sampled").await;
+    let unsampled = create_agent(&svc, &ws, "Unsampled").await;
+
+    // No manager attached: the field is absent everywhere.
+    let before = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics without manager");
+    for row in before["diagnostics"]["agents"].as_array().expect("agents") {
+        assert!(
+            row.get("subtreeMemoryBytes").is_none(),
+            "no probe, no field: {row}"
+        );
+    }
+
+    struct FixedProbe(HashMap<AgentId, u64>);
+    impl TreeMemoryProbe for FixedProbe {
+        fn sample(&self) -> Option<(u64, u64)> {
+            Some((self.0.values().sum(), 1))
+        }
+        fn agent_samples(&self) -> HashMap<AgentId, u64> {
+            self.0.clone()
+        }
+    }
+
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        sink,
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    manager.set_tree_probe(Arc::new(FixedProbe(HashMap::from([(
+        sampled.clone(),
+        123_456_789,
+    )]))));
+
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(
+        row_for(&sampled)["subtreeMemoryBytes"],
+        json!(123_456_789u64)
+    );
+    assert!(
+        row_for(&unsampled).get("subtreeMemoryBytes").is_none(),
+        "no bucket for this agent, field omitted"
+    );
 }
 
 /// intent-hq/monorepo#1897: a ready-to-send queue entry older than
@@ -13940,26 +14050,17 @@ fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscrip
     })
 }
 
-async fn recv_display_status(sub: &mut crate::Subscription) -> serde_json::Value {
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("displayStatus event delivered")
-        .expect("subscription open");
-    assert_eq!(batch.len(), 1, "expected exactly one displayStatus event");
-    serde_json::to_value(&batch[0]).expect("serialize event")
-}
-
 async fn assert_display_status_silent(sub: &mut crate::Subscription) {
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(res.is_err(), "expected no displayStatus event: {res:?}");
 }
 
-/// Registering the first watch for an otherwise-idle workspace promotes its
-/// derived `displayStatus` to `in_progress` (exactly one
-/// `workspace:displayStatus-changed`); a second registration while already
-/// promoted is a no-op recompute and stays silent.
+/// Registering a watch for an otherwise-idle workspace sets the orthogonal
+/// `waiting` flag without moving the derived `displayStatus` — no
+/// `workspace:displayStatus-changed` fires for either the first or a second
+/// registration.
 #[tokio::test]
-async fn watch_registration_emits_display_status_promotion() {
+async fn watch_registration_sets_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Seed the last-observed cache (first observation never emits).
@@ -13967,35 +14068,30 @@ async fn watch_registration_emits_display_status_promotion() {
 
     let mut sub = subscribe_display_status(&bus, &ws);
     delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
-    );
+    assert!(svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut sub).await;
 
-    // A second watch while already promoted: transition-only, so silent.
     delegate_after_all(&svc, &ws, &parent).await;
+    assert!(svc.workspace_is_waiting(&ws).await);
     assert_display_status_silent(&mut sub).await;
 }
 
 /// The coordinator flow end to end: the parent delegates (watch registered →
-/// promotion), goes idle while the child is still out (workspace STAYS
-/// `in_progress` — no event), and the child settling retires the group's
-/// watches, demoting the workspace back to its base rollup (exactly one
-/// demotion event).
+/// waiting), goes idle while the child is still out (still waiting), and the
+/// child settling retires the group's watches, dropping the flag — with no
+/// `workspace:displayStatus-changed` at any point.
 #[tokio::test]
-async fn watch_settlement_emits_display_status_demotion() {
+async fn watch_settlement_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     svc.maybe_emit_display_status_changed(&ws).await;
 
     let mut sub = subscribe_display_status(&bus, &ws);
     let c1 = delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+    assert!(svc.workspace_is_waiting(&ws).await);
 
     // Parent idles first (seals the group; child still expected): the
-    // workspace keeps waiting on the child, so no demotion yet.
+    // workspace keeps waiting on the child.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -14003,10 +14099,10 @@ async fn watch_settlement_emits_display_status_demotion() {
         json!({ "agentId": parent.0 }),
     ))
     .await;
-    assert_display_status_silent(&mut sub).await;
+    assert!(svc.workspace_is_waiting(&ws).await);
 
-    // Child settles: the group fires, its watches retire, and the workspace
-    // demotes back to the base rollup.
+    // Child settles: the group fires, its watches retire, and the waiting
+    // flag drops — silently.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -14015,36 +14111,29 @@ async fn watch_settlement_emits_display_status_demotion() {
     ))
     .await;
     assert!(svc.list_watches_for_parent(&parent).is_empty());
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
-    );
+    assert!(!svc.workspace_is_waiting(&ws).await);
     assert_display_status_silent(&mut sub).await;
 }
 
 /// The unscoped `agent.cancelSubscriptions` sweep drops the caller's last
-/// watch, demoting the anchor workspace's derived `displayStatus`.
+/// watch — and with it the anchor workspace's `waiting` flag — without any
+/// `workspace:displayStatus-changed`.
 #[tokio::test]
-async fn cancel_subscriptions_emits_display_status_demotion() {
+async fn cancel_subscriptions_drops_waiting_without_display_status_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     svc.maybe_emit_display_status_changed(&ws).await;
 
     let mut sub = subscribe_display_status(&bus, &ws);
     delegate_after_all(&svc, &ws, &parent).await;
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(ev["data"]["displayStatus"], json!("in_progress"));
+    assert!(svc.workspace_is_waiting(&ws).await);
 
     svc.agent_cancel_subscriptions_op(ws.clone(), parent.clone(), None, None)
         .await
         .expect("cancel subscriptions");
     assert!(svc.list_watches_for_parent(&parent).is_empty());
-    let ev = recv_display_status(&mut sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "idle" })
-    );
+    assert!(!svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut sub).await;
 }
 
 /// `reportToParent` from a child enrolled in an undelivered after_all group is
@@ -17818,6 +17907,25 @@ async fn grouped_child_failure_wakes_parent_immediately() {
         !msgs.contains("the watch is now retired"),
         "grouped-failure wake carries no retirement note: {msgs}"
     );
+    // monorepo#2060: the armed state is also machine-readable on the
+    // immediate wake's metadata (`watchStillArmed: true`).
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let failure_meta = parent_session
+        .messages
+        .last()
+        .expect("immediate failure wake message")
+        .metadata
+        .as_ref()
+        .expect("immediate failure wake metadata");
+    assert_eq!(
+        failure_meta["watchStillArmed"],
+        json!(true),
+        "grouped-failure wake carries watchStillArmed: true: {failure_meta}"
+    );
 
     // The group is still live (it still owns settlement) and both grouped
     // watches remain in place.
@@ -18681,9 +18789,9 @@ fn subscribe_subscriptions_changed(bus: &EventBus) -> crate::Subscription {
 /// Regression (monorepo#1449): `resume_interrupted_agent` re-arms the
 /// parent's completion watch after a daemon restart, and the re-registration
 /// must publish exactly one `agent:subscriptions-changed` for the parent's
-/// home workspace (like every other watch-lifecycle site), whose recompute
-/// also promotes a previously-idle workspace's `displayStatus` to
-/// `in_progress`.
+/// home workspace (like every other watch-lifecycle site). The re-armed
+/// watch reads as the orthogonal `waiting` flag — never a `displayStatus`
+/// transition.
 #[tokio::test]
 async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
@@ -18696,8 +18804,7 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
         .unwrap()
         .subscriptions
         .clear();
-    // Re-baseline the displayStatus cache post-"restart" so the resume-time
-    // recompute observes the idle → in_progress transition.
+    // Re-baseline the displayStatus cache post-"restart".
     svc.maybe_emit_display_status_changed(&ws).await;
 
     svc.store
@@ -18729,13 +18836,10 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
         "resume must publish subscriptions-changed exactly once"
     );
 
-    // The re-armed watch is the promotion trigger: the previously-idle
-    // workspace transitions to in_progress via the publish's recompute.
-    let ev = recv_display_status(&mut status_sub).await;
-    assert_eq!(
-        ev["data"],
-        json!({ "workspaceId": ws.0, "displayStatus": "in_progress" })
-    );
+    // The re-armed watch reads as waiting on the read path; the workspace's
+    // displayStatus never transitions.
+    assert!(svc.workspace_is_waiting(&ws).await);
+    assert_display_status_silent(&mut status_sub).await;
 }
 
 /// monorepo#1449 (grouped branch): a resumed child still expected by an
@@ -22585,6 +22689,19 @@ async fn agent_watch_delivers_once_and_is_retired() {
         text.contains(&format!("ws.agent.watch(\\\"{}\\\")", target.0)),
         "idle wake carries the re-arm instruction naming the target: {text}"
     );
+    // monorepo#2060: the retirement is also machine-readable on the wake
+    // metadata (`watchStillArmed: false`), mirroring `hookStillActive`.
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "retiring wake carries watchStillArmed: false: {metadata}"
+    );
 
     // A second idle with no re-arm delivers nothing.
     svc.handle_completion_event(&completion_event(
@@ -22637,6 +22754,18 @@ async fn agent_watch_removed_after_target_deleted() {
     assert!(
         !text.contains("ws.agent.watch("),
         "deleted wake carries no dead-end re-arm pointer: {text}"
+    );
+    // monorepo#2060: the deleted-kind retirement is machine-readable too.
+    let session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "deleted wake carries watchStillArmed: false: {metadata}"
     );
 }
 
@@ -22705,6 +22834,25 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     assert!(
         !text.contains("the watch is now retired"),
         "attention wake carries no retirement note: {text}"
+    );
+    // monorepo#2060: the armed state is also machine-readable on the
+    // fan-out wake metadata (`watchStillArmed: true`).
+    let watcher_session = svc
+        .store()
+        .get_agent_session(&watcher)
+        .await
+        .expect("watcher session");
+    let attention_meta = watcher_session
+        .messages
+        .last()
+        .expect("attention wake message")
+        .metadata
+        .as_ref()
+        .expect("attention wake metadata");
+    assert_eq!(
+        attention_meta["watchStillArmed"],
+        json!(true),
+        "attention fan-out wake carries watchStillArmed: true: {attention_meta}"
     );
     // Attention is not a completion: no watch is consumed by the fan-out.
     assert_eq!(
@@ -23537,16 +23685,21 @@ async fn agent_snapshot_counts_pending_questions() {
 }
 
 // ---------------------------------------------------------------------------
-// Batch `agent.delegate` (tasks[] + greedy): full request→response shape over
-// the service op — classification is unit-tested in `batch.rs`; these lock
-// the wiring (validation, per-task delegation, response rows, unlock plan,
-// idempotent re-call).
+// Batch `agent.delegate` (tasks[]): full request→response shape over the
+// service op — classification is unit-tested in `batch.rs`; these lock the
+// wiring (validation, per-task delegation, per-task option overrides,
+// response rows, unlock plan, idempotent re-call).
 // ---------------------------------------------------------------------------
 
-fn batch_input(ids: &[&NoteId], greedy: Option<bool>) -> AgentDelegateInput {
+use intent_core::{BatchTaskEntry, BatchTaskOptions};
+
+fn batch_input(ids: &[&NoteId]) -> AgentDelegateInput {
     AgentDelegateInput {
-        tasks: Some(ids.iter().map(|id| (*id).clone()).collect()),
-        greedy,
+        tasks: Some(
+            ids.iter()
+                .map(|id| BatchTaskEntry::Id((*id).clone()))
+                .collect(),
+        ),
         ..Default::default()
     }
 }
@@ -23583,7 +23736,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
-                tasks: Some(vec![note_id.clone()]),
+                tasks: Some(vec![BatchTaskEntry::Id(note_id.clone())]),
                 task_note_id: Some(note_id.clone()),
                 ..Default::default()
             },
@@ -23598,7 +23751,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
 
     let ghost = NoteId::new();
     let err = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&ghost], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&ghost]), None)
         .await
         .expect_err("unknown task id rejected");
     match &err {
@@ -23612,7 +23765,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
             ws.clone(),
             AgentDelegateInput {
                 agent_instructions: Some("do it my way".into()),
-                ..batch_input(&[&note_id], None)
+                ..batch_input(&[&note_id])
             },
             None,
         )
@@ -23627,7 +23780,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
             ws.clone(),
             AgentDelegateInput {
                 force: Some(true),
-                ..batch_input(&[&note_id], None)
+                ..batch_input(&[&note_id])
             },
             None,
         )
@@ -23635,6 +23788,83 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
         .expect_err("force rejected in batch mode");
     match &err {
         Error::InvalidParams(msg) => assert!(msg.contains("force"), "{msg}"),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+
+    // `greedy` was removed: any supplied value — `true`, `false`, or an
+    // explicit `null` (`Some(None)` after presence-aware deserialization) —
+    // is rejected with the pointer at individual delegation, in BOTH forms.
+    for greedy in [Some(true), Some(false), None] {
+        // Batch form.
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    greedy: Some(greedy),
+                    ..batch_input(&[&note_id])
+                },
+                None,
+            )
+            .await
+            .expect_err("greedy rejected in batch mode");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(
+                    "greedy was removed; delegate a held task individually to force it past the conflict hold"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Single-task form: the check sits before batch routing, so a
+        // single-task call cannot silently carry the removed param either.
+        let err = svc
+            .agent_delegate_op(
+                ws.clone(),
+                AgentDelegateInput {
+                    task_note_id: Some(note_id.clone()),
+                    greedy: Some(greedy),
+                    model: Some("mock:default".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("greedy rejected in single-task mode");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(
+                    "greedy was removed; delegate a held task individually to force it past the conflict hold"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    // Per-entry `agentInstructions` is rejected with a clear error.
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![BatchTaskEntry::Options(BatchTaskOptions {
+                    task_note_id: note_id.clone(),
+                    specialist: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agent_instructions: Some("do it my way".into()),
+                })]),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("per-entry agentInstructions rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains("agentInstructions is not supported on a tasks entry"),
+            "{msg}"
+        ),
         other => panic!("expected InvalidParams, got {other:?}"),
     }
 }
@@ -23651,11 +23881,14 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
         .expect("t2 dependsOn t1");
 
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
         .await
         .expect("batch delegate");
     assert_eq!(resp["ok"], true);
-    assert_eq!(resp["greedy"], false);
+    assert!(
+        !resp.as_object().unwrap().contains_key("greedy"),
+        "greedy echo removed from the result: {resp}"
+    );
     assert_eq!(resp["tasks"].as_array().unwrap().len(), 2);
 
     let r1 = row_for(&resp, &t1);
@@ -23687,7 +23920,7 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     // Idempotent re-call: same list → started task now skips (already
     // running, naming its agent), held task still holds; nothing new starts.
     let again = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2]), None)
         .await
         .expect("re-call");
     let r1 = row_for(&again, &t1);
@@ -23701,10 +23934,131 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
 }
 
-/// Conflicts: greedy=false holds the later task of a conflicting pair;
-/// greedy=true starts it anyway and names the pair.
+/// Relation-less annotation (monorepo#2457 part 3): a mixed request — a
+/// relation-bearing pair plus a task the graph does not cover. The uncovered
+/// task still starts exactly as before, but its row carries
+/// `relationsUnknown: true`, the relation-bearing rows carry no flag, and the
+/// unlock message counts the started uncovered tasks.
 #[tokio::test]
-async fn batch_delegate_conflicts_hold_unless_greedy() {
+async fn batch_delegate_annotates_relation_less_tasks_and_counts_them() {
+    let (_t, svc, ws) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    svc.task_set_relations(ws.clone(), t2.clone(), Some(vec![t1.clone()]), None)
+        .await
+        .expect("t2 dependsOn t1");
+    let lone = seed_task(&svc, &ws, "Lone").await;
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2, &lone]), None)
+        .await
+        .expect("batch");
+    let r1 = row_for(&resp, &t1);
+    assert_eq!(r1["disposition"], "started");
+    assert!(r1.get("relationsUnknown").is_none(), "{r1}");
+    let r2 = row_for(&resp, &t2);
+    assert_eq!(r2["disposition"], "held:blocked-on-deps");
+    assert!(r2.get("relationsUnknown").is_none(), "{r2}");
+    let rl = row_for(&resp, &lone);
+    assert_eq!(
+        rl["disposition"], "started",
+        "annotation never holds: {resp}"
+    );
+    assert_eq!(rl["relationsUnknown"], json!(true), "{resp}");
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 2 started tasks carry no relations — the graph does not cover them."),
+        "{resp}"
+    );
+}
+
+/// All-relation-less request: every row flags and the summary counts them
+/// all. A task referenced by another requested task's `dependsOn` while
+/// declaring none itself is covered by the graph — no flag, no count.
+#[tokio::test]
+async fn batch_delegate_flags_all_uncovered_and_spares_referenced_tasks() {
+    let (_t, svc, ws) = setup().await;
+    let a = seed_task(&svc, &ws, "A").await;
+    let b = seed_task(&svc, &ws, "B").await;
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b]), None)
+        .await
+        .expect("all relation-less");
+    for id in [&a, &b] {
+        let row = row_for(&resp, id);
+        assert_eq!(row["disposition"], "started", "{resp}");
+        assert_eq!(row["relationsUnknown"], json!(true), "{resp}");
+    }
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 of 2 started tasks carry no relations — the graph does not cover them."),
+        "{resp}"
+    );
+
+    // `dep` declares no relations but `t` (also requested) depends on it:
+    // the graph covers dep, so neither row flags and no count is appended.
+    let dep = seed_task(&svc, &ws, "Dep").await;
+    let t = seed_task(&svc, &ws, "T").await;
+    svc.task_set_relations(ws.clone(), t.clone(), Some(vec![dep.clone()]), None)
+        .await
+        .expect("t dependsOn dep");
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&dep, &t]), None)
+        .await
+        .expect("referenced pair");
+    let rd = row_for(&resp, &dep);
+    assert_eq!(rd["disposition"], "started", "{resp}");
+    assert!(rd.get("relationsUnknown").is_none(), "{rd}");
+    assert!(
+        row_for(&resp, &t).get("relationsUnknown").is_none(),
+        "{resp}"
+    );
+    assert!(
+        !resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("carry no relations"),
+        "{resp}"
+    );
+}
+
+/// The flag is stamped regardless of disposition: an uncovered task that
+/// skips (already complete) still carries `relationsUnknown: true`, and the
+/// count sentence stays absent when flagged tasks exist but none started.
+#[tokio::test]
+async fn batch_delegate_flags_non_started_rows_and_counts_started_only() {
+    let (_t, svc, ws) = setup().await;
+    let done = seed_task(&svc, &ws, "Done").await;
+    svc.task_update_note_status(ws.clone(), done.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete");
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&done]), None)
+        .await
+        .expect("batch");
+    let rd = row_for(&resp, &done);
+    assert_eq!(rd["disposition"], "skipped", "{resp}");
+    assert_eq!(rd["relationsUnknown"], json!(true), "{resp}");
+    assert_eq!(resp["startedTaskIds"], json!([] as [String; 0]), "{resp}");
+    assert!(
+        !resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("carry no relations"),
+        "{resp}"
+    );
+}
+
+/// Conflicts: the later task of a conflicting pair holds, naming the pair,
+/// and the reason points at individual delegation (no more greedy override).
+#[tokio::test]
+async fn batch_delegate_conflicts_hold_and_point_at_individual_delegation() {
     let (_t, svc, ws) = setup().await;
     let a = seed_task(&svc, &ws, "A").await;
     let b = seed_task(&svc, &ws, "B").await;
@@ -23713,7 +24067,7 @@ async fn batch_delegate_conflicts_hold_unless_greedy() {
         .expect("a conflictsWith b");
 
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b], None), None)
+        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b]), None)
         .await
         .expect("batch");
     // Neither has estimates or dependents, so the critical-path tie breaks
@@ -23728,26 +24082,77 @@ async fn batch_delegate_conflicts_hold_unless_greedy() {
     let rh = row_for(&resp, held);
     assert_eq!(rh["disposition"], "held:conflict", "{resp}");
     assert_eq!(rh["conflictsWith"], json!([started.0]));
-    assert!(rh["reason"].as_str().unwrap().contains("greedy"), "{rh}");
+    assert!(
+        rh["reason"]
+            .as_str()
+            .unwrap()
+            .contains("delegate it individually to force it"),
+        "{rh}"
+    );
     assert_eq!(resp["unlockPlan"]["unlockedBySettlement"], json!([held.0]));
+}
 
-    // Fresh pair under greedy=true: both start; the overlapping one names
-    // the pair and warns about rebases.
-    let c = seed_task(&svc, &ws, "C").await;
-    let d = seed_task(&svc, &ws, "D").await;
-    svc.task_set_relations(ws.clone(), c.clone(), None, Some(vec![d.clone()]))
-        .await
-        .expect("c conflictsWith d");
+/// Per-task option entries: an object entry's `specialist`/`model`/
+/// `reasoningEffort` override the top-level defaults for that task only,
+/// while bare-string entries inherit the defaults; row shape is unchanged.
+#[tokio::test]
+async fn batch_delegate_per_task_options_override_top_level_defaults() {
+    let (_t, svc, ws) = setup().await;
+    let plain = seed_task(&svc, &ws, "Plain").await;
+    let custom = seed_task(&svc, &ws, "Custom").await;
+
     let resp = svc
-        .agent_delegate_op(ws.clone(), batch_input(&[&c, &d], Some(true)), None)
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    BatchTaskEntry::Id(plain.clone()),
+                    BatchTaskEntry::Options(BatchTaskOptions {
+                        task_note_id: custom.clone(),
+                        specialist: Some("verifier".into()),
+                        model: Some("mock:override".into()),
+                        reasoning_effort: Some("high".into()),
+                        agent_instructions: None,
+                    }),
+                ]),
+                specialist: Some("implementor".into()),
+                model: Some("mock:default".into()),
+                ..Default::default()
+            },
+            None,
+        )
         .await
-        .expect("greedy batch");
-    assert_eq!(resp["greedy"], true);
-    assert_eq!(row_for(&resp, &c)["disposition"], "started");
-    let rd = row_for(&resp, &d);
-    assert_eq!(rd["disposition"], "started");
-    assert_eq!(rd["conflictsWith"], json!([c.0]));
-    assert!(rd["reason"].as_str().unwrap().contains("expect rebases"));
+        .expect("batch with per-task options");
+
+    let rp = row_for(&resp, &plain);
+    assert_eq!(rp["disposition"], "started", "{resp}");
+    let rc = row_for(&resp, &custom);
+    assert_eq!(rc["disposition"], "started", "{resp}");
+    // Row shape unchanged: started rows carry agentId/agentName only.
+    for row in [rp, rc] {
+        assert!(row.get("specialist").is_none(), "{row}");
+        assert!(row.get("model").is_none(), "{row}");
+    }
+
+    // The bare entry inherited the top-level defaults…
+    let plain_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(rp["agentId"].as_str().unwrap()))
+        .await
+        .expect("plain session");
+    assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(plain_session.model.as_deref(), Some("mock:default"));
+    assert!(plain_session.reasoning_effort.is_none());
+
+    // …and the object entry's overrides won, field by field.
+    let custom_session = svc
+        .store()
+        .get_agent_session(&AgentId::from(rc["agentId"].as_str().unwrap()))
+        .await
+        .expect("custom session");
+    assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
+    assert_eq!(custom_session.model.as_deref(), Some("mock:override"));
+    assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));
 }
 
 /// Terminal statuses skip; a cancelled dependency surfaces as
@@ -23769,11 +24174,7 @@ async fn batch_delegate_skips_terminal_and_flags_cancelled_deps() {
         .expect("blocked dependsOn dead");
 
     let resp = svc
-        .agent_delegate_op(
-            ws.clone(),
-            batch_input(&[&done, &dead, &blocked], None),
-            None,
-        )
+        .agent_delegate_op(ws.clone(), batch_input(&[&done, &dead, &blocked]), None)
         .await
         .expect("batch");
     assert_eq!(row_for(&resp, &done)["disposition"], "skipped");
@@ -23806,8 +24207,8 @@ use crate::agent_ops::ready_delta::{UNBLOCKED_SECTION_PREFIX, UNBLOCKED_TRIGGER_
 /// the persist) resolves the section fresh: the dependent task's row names it
 /// with an `intent://local/task/` link and the deps-satisfied reason.
 #[tokio::test]
-async fn completion_wake_carries_delivery_time_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
+async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
+    let (_t, svc, ws, registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let done = link_task_note(&svc, &ws, &child, "Done task", "complete").await;
@@ -23825,6 +24226,9 @@ async fn completion_wake_carries_delivery_time_unblocked_section() {
         None,
     )
     .expect("register watch");
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(false))])
+        .expect("disable taskGraph after parent creation");
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -23861,6 +24265,56 @@ async fn completion_wake_carries_delivery_time_unblocked_section() {
     assert!(
         !serde_json::to_string(metadata).unwrap().contains(&gated.0),
         "no unblocked enumeration persisted in metadata: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
+    let (_t, svc, ws, registry, _config) = setup_with_task_graph(false).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let done = link_task_note(&svc, &ws, &child, "Done task", "complete").await;
+    let gated = seed_task(&svc, &ws, "Gated task").await;
+    svc.task_set_relations(ws.clone(), gated, Some(vec![done.clone()]), None)
+        .await
+        .expect("gated dependsOn done");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .expect("register watch");
+    registry
+        .apply(&[("agentFeatures.taskGraph".into(), json!(true))])
+        .expect("enable taskGraph after parent creation");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "did the work" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        !text.contains(UNBLOCKED_SECTION_PREFIX),
+        "taskGraph-off wake must not teach unblocked tasks: {text}"
+    );
+    assert!(
+        session.messages[0]
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.get(UNBLOCKED_TRIGGER_TASKS_KEY).is_some()),
+        "enqueue-time trigger metadata remains intact"
     );
 }
 
@@ -23932,7 +24386,8 @@ async fn taskless_and_no_delta_wakes_are_unannotated() {
 /// function the drain paths call at flush time.
 #[tokio::test]
 async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
     let a = seed_task(&svc, &ws, "Task A").await;
     let b = seed_task(&svc, &ws, "Task B").await;
     let gated = seed_task(&svc, &ws, "Gated").await;
@@ -23959,7 +24414,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     // No section yet: rendering now yields nothing attributable… to a stale
     // reader this wake would have said nothing forever.
     assert!(
-        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
         "b still incomplete → no delta"
@@ -23974,7 +24429,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
     // now attributable to trigger A (its last unmet dep set includes A in the
     // counterfactual where A is still running).
     let section = svc
-        .unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        .unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
         .await
         .expect("delta non-empty at render time");
     assert!(
@@ -23988,7 +24443,7 @@ async fn unblocked_section_reflects_state_at_render_time_not_enqueue() {
         .await
         .expect("claim gated");
     assert!(
-        svc.unblocked_section_for_delivery(std::iter::once(Some(&metadata)))
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
             .await
             .is_none(),
         "a claimed task is no longer surfaced at delivery"
@@ -24137,7 +24592,7 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
 /// `deliver_parent_wake` branch.
 #[tokio::test]
 async fn no_manager_send_now_resolves_unblocked_section() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _registry, _config) = setup_with_task_graph(true).await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let done = seed_task(&svc, &ws, "Done task").await;
     let gated = seed_task(&svc, &ws, "Gated task").await;
@@ -24188,5 +24643,35 @@ async fn no_manager_send_now_resolves_unblocked_section() {
             gated.0
         )),
         "section names the dependent task: {text}"
+    );
+}
+
+/// `agentFeatures.taskGraph` gates the advisory section
+/// (intent-hq/monorepo#2445): with the toggle at its default (off), the same
+/// trigger stamp that would render a section yields `None` — the wake
+/// delivers unannotated. The default-off value is captured when the session is
+/// created.
+#[tokio::test]
+async fn task_graph_off_suppresses_unblocked_section() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let done = seed_task(&svc, &ws, "Done task").await;
+    let gated = seed_task(&svc, &ws, "Gated task").await;
+    svc.task_set_relations(ws.clone(), gated.clone(), Some(vec![done.clone()]), None)
+        .await
+        .expect("gated dependsOn done");
+    svc.task_update_note_status(ws.clone(), done.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete done");
+    let mut metadata = json!({ "type": "event_notification" });
+    crate::agent_ops::ready_delta::stamp_trigger_tasks(
+        &mut metadata,
+        &[(ws.0.clone(), done.0.clone())],
+    );
+    assert!(
+        svc.unblocked_section_for_delivery(&parent, std::iter::once(Some(&metadata)))
+            .await
+            .is_none(),
+        "taskGraph off (the default) must suppress the section"
     );
 }

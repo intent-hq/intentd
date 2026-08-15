@@ -778,8 +778,10 @@ impl Services {
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, None)
             .await;
         // A newly persisted active monitor can promote the derived
-        // displayStatus to `in_progress` (§6.5).
+        // displayStatus to `in_progress` (§6.5) and raise the orthogonal
+        // `waiting` flag (§5.1).
         self.maybe_emit_display_status_changed(workspace_id).await;
+        self.maybe_emit_waiting_changed(workspace_id).await;
         Ok((monitor, snapshot.requirements))
     }
 
@@ -851,9 +853,11 @@ impl Services {
             .collect())
     }
 
-    /// Whether the workspace owns any ACTIVE PR monitor — the `displayStatus`
-    /// promotion signal (§6.5): an idle agent still watching a PR via a
-    /// monitor reads as active work. SQL-filtered to active rows so the hot
+    /// Whether the workspace owns any ACTIVE PR monitor — a
+    /// `Workspace.waiting` signal (§5.1, via
+    /// [`Services::workspace_is_waiting`]): an idle agent still watching a
+    /// PR via a monitor reads as waiting, without promoting the
+    /// `displayStatus` rollup. SQL-filtered to active rows so the hot
     /// list/get enrichment cost is O(active monitors), never O(all monitor
     /// history in the workspace). Best-effort: a store read failure is
     /// logged and fails open to `false` (mirrors
@@ -980,9 +984,11 @@ impl Services {
             }
         }
         // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) — best-effort, transition-only emission.
+        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
+        // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&monitor.workspace_id)
             .await;
+        self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
         Ok(Some(monitor))
     }
 
@@ -1559,8 +1565,11 @@ impl Services {
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
         // The last active monitor settling can demote the derived
-        // displayStatus (§6.5) — best-effort, transition-only emission.
+        // displayStatus (§6.5) and drop the `waiting` flag (§5.1) —
+        // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&completed.workspace_id)
+            .await;
+        self.maybe_emit_waiting_changed(&completed.workspace_id)
             .await;
         Ok(true)
     }
@@ -1663,9 +1672,10 @@ impl Services {
                 self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
                     .await;
                 // The last active monitor settling can demote the derived
-                // displayStatus (§6.5).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&monitor.workspace_id)
                     .await;
+                self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
                 continue;
             }
             // Upgrade path: deliver a pending set the recompute would lose.
@@ -2433,6 +2443,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -4287,13 +4298,15 @@ mod tests {
         }
     }
 
-    /// Regression for intent-hq/monorepo#1814: an ACTIVE PR monitor promotes
-    /// the derived `displayStatus` to `in_progress` on the list/get
-    /// enrichment path even with the owner idle and every task complete —
-    /// mirroring `active_hook_promotes_display_status_to_in_progress` in
-    /// `hook_manager.rs`. The promotion lapses once the monitor settles.
+    /// An ACTIVE PR monitor sets the orthogonal `waiting` flag on the
+    /// list/get enrichment path without promoting the derived
+    /// `displayStatus` — the base rollup (`complete` here: every task done)
+    /// is served as-is, proving the flag coexists with `complete`; the flag
+    /// drops once the monitor settles. Mirrors
+    /// `active_hook_sets_waiting_without_promoting_display_status` in
+    /// `hook_manager.rs`.
     #[tokio::test]
-    async fn active_pr_monitor_promotes_display_status_to_in_progress() {
+    async fn active_pr_monitor_sets_waiting_without_promoting_display_status() {
         let (_db, _root, svc, _forge, ws, owner) = setup().await;
         svc.store()
             .insert_note(&task_note(&ws, "t1", intent_core::TaskStatus::Complete))
@@ -4303,26 +4316,65 @@ mod tests {
 
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
+        assert!(
+            row.waiting,
+            "idle owner with an active PR monitor must read waiting"
+        );
         assert_eq!(
             row.display_status,
-            Some(intent_core::WorkspaceDisplayStatus::InProgress),
-            "idle owner with an active PR monitor must read in_progress"
+            Some(intent_core::WorkspaceDisplayStatus::Complete),
+            "an active monitor never promotes the displayStatus rollup"
         );
 
-        // Settle the monitor: the promotion lapses and the base rollup runs.
+        // Settle the monitor: the waiting flag lapses; the rollup is
+        // unchanged.
         svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
             .await
             .expect("cancel");
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
+        assert!(!row.waiting, "terminal monitors never read waiting");
         assert_eq!(
             row.display_status,
             Some(intent_core::WorkspaceDisplayStatus::Complete),
-            "terminal monitors never promote"
         );
     }
 
-    /// `workspace_has_active_pr_monitors` is the promotion signal: true only
+    /// Orthogonality with the PR stages: a workspace whose linked PR reads
+    /// `pr_ready` keeps that rollup while an active monitor sets `waiting`.
+    #[tokio::test]
+    async fn waiting_coexists_with_pr_ready_display_status() {
+        let (_db, _root, svc, _forge, ws, owner) = setup().await;
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.active_pull_request = Some(intent_core::PullRequestInfo {
+            id: "pr-42".into(),
+            number: 42,
+            url: "https://github.com/o/r/pull/42".into(),
+            title: "Ready PR".into(),
+            status: intent_core::PullRequestStatus::Open,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: Some(true),
+            mergeable_state: None,
+            is_draft: Some(false),
+        });
+        svc.store().update_workspace(&row).await.expect("update");
+        register(&svc, &ws, &owner).await;
+
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        svc.enrich_workspace_aggregates(&mut row).await;
+        assert!(row.waiting, "the wait flag coexists with pr_ready");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::PrReady),
+        );
+    }
+
+    /// `workspace_has_active_pr_monitors` is the waiting signal: true only
     /// while a monitor is ACTIVE, false with no monitors and false again once
     /// every monitor is terminal (cancelled/completed).
     #[tokio::test]
@@ -4372,78 +4424,123 @@ mod tests {
             .collect()
     }
 
-    /// Monitor lifecycle transitions emit `workspace:displayStatus-changed`
-    /// exactly once per transition: register promotes (idle → in_progress),
-    /// cancel demotes (in_progress → idle) — mirroring
-    /// `hook_transitions_emit_display_status_changed_once` in
+    /// Monitor lifecycle transitions no longer move the derived
+    /// `displayStatus` (the wait signal is the orthogonal `waiting` flag):
+    /// neither register nor cancel emits `workspace:displayStatus-changed` —
+    /// mirroring `hook_transitions_never_emit_display_status_changed` in
     /// `hook_manager.rs`.
     #[tokio::test]
-    async fn monitor_transitions_emit_display_status_changed_once() {
+    async fn monitor_transitions_never_emit_display_status_changed() {
         let (_db, _root, svc, _forge, ws, owner) = setup().await;
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
         assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
         let monitor = register(&svc, &ws, &owner).await;
-        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+        assert!(svc.workspace_is_waiting(&ws).await);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
         // Re-running the recompute without a transition emits nothing.
         svc.maybe_emit_display_status_changed(&ws).await;
-        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
         svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
             .await
             .expect("cancel");
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle"]
-        );
+        assert!(!svc.workspace_is_waiting(&ws).await);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
     }
 
-    /// The poll loop's terminal completion (merged PR) demotes and emits,
-    /// and so does a rehydration cancel of an owner-gone monitor.
+    /// The poll loop's terminal completion (merged PR) and a rehydration
+    /// cancel of an owner-gone monitor both drop the waiting flag without
+    /// any displayStatus transition.
     #[tokio::test]
-    async fn completion_and_rehydration_cancel_emit_the_demotion() {
+    async fn completion_and_rehydration_cancel_drop_the_waiting_flag() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         svc.maybe_emit_display_status_changed(&ws).await;
 
         register(&svc, &ws, &owner).await;
-        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+        assert!(svc.workspace_is_waiting(&ws).await);
 
         forge.edit(|s| s.pr_state = PrState::Merged);
         svc.poll_pr_monitors().await;
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle"]
-        );
+        assert!(!svc.workspace_is_waiting(&ws).await);
 
-        // Rehydration cancel (owner gone) demotes too.
+        // Rehydration cancel (owner gone) drops the flag too.
         svc.pr_monitor_register(&ws, &owner, "o", "r", 7)
             .await
             .expect("register");
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle", "in_progress"]
-        );
+        assert!(svc.workspace_is_waiting(&ws).await);
         svc.store()
             .set_agent_session_status(&ws, &owner, AgentStatus::Deleted, false, &now_iso(), None)
             .await
             .expect("delete owner");
         assert_eq!(svc.rehydrate_pr_monitors().await.unwrap(), 0);
+        assert!(!svc.workspace_is_waiting(&ws).await);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+    }
+
+    /// Persisted `workspace:waiting-changed` payload flags for a workspace,
+    /// oldest-first.
+    async fn waiting_events(svc: &Services, ws: &WorkspaceId) -> Vec<bool> {
+        let mut evs = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![intent_core::events::WORKSPACE_WAITING_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query waiting events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data["waiting"].as_bool().unwrap())
+            .collect()
+    }
+
+    /// Monitor lifecycle transitions emit `workspace:waiting-changed`
+    /// exactly once per actual transition: register raises the flag, a
+    /// no-op recompute stays silent, cancel drops it, and the poll loop's
+    /// terminal completion (merged PR) drops it too.
+    #[tokio::test]
+    async fn monitor_transitions_emit_waiting_changed_on_transition_only() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_waiting_changed(&ws).await;
+        assert_eq!(waiting_events(&svc, &ws).await, Vec::<bool>::new());
+
+        let monitor = register(&svc, &ws, &owner).await;
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true]);
+
+        // Re-running the recompute without a transition emits nothing.
+        svc.maybe_emit_waiting_changed(&ws).await;
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true]);
+
+        svc.pr_monitor_cancel(&ws, &monitor.monitor_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true, false]);
+
+        // The poll loop's terminal completion emits the drop transition too.
+        forge.edit(|s| s.pr_state = PrState::Open);
+        register(&svc, &ws, &owner).await;
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true, false, true]);
+        forge.edit(|s| s.pr_state = PrState::Merged);
+        svc.poll_pr_monitors().await;
+        assert!(!svc.workspace_is_waiting(&ws).await);
         assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle", "in_progress", "idle"]
+            waiting_events(&svc, &ws).await,
+            vec![true, false, true, false]
         );
     }
 
     /// Regression for intent-hq/monorepo#1828: `workspace.archive` cancels
     /// every ACTIVE PR monitor in the workspace — state persisted to
     /// `cancelled`, `prMonitor:cancelled` emitted, owner told why — while
-    /// terminal monitors are untouched, and the displayStatus recompute
-    /// demotes the rollup so an archived workspace never reads
-    /// `in_progress` off a stale monitor signal indefinitely.
+    /// terminal monitors are untouched, so an archived workspace never
+    /// reads `waiting` off a stale monitor signal indefinitely.
     #[tokio::test]
-    async fn archive_cancels_active_pr_monitors_and_demotes_display_status() {
+    async fn archive_cancels_active_pr_monitors_and_drops_waiting() {
         use intent_core::WorkspaceApi;
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         // Seed the last-observed baseline (a seed never emits).
@@ -4526,13 +4623,11 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // The demotion emitted: the first register/cancel pair transitioned
-        // in_progress → idle, the second register promoted again, and the
-        // archive sweep's recompute demoted.
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle", "in_progress", "idle"]
-        );
+        // Monitor lifecycle never moves the displayStatus rollup: no
+        // transition emitted across register/complete/register/archive; the
+        // wait flag simply dropped with the sweep.
+        assert!(!svc.workspace_is_waiting(&ws).await);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
     }
 
     #[tokio::test]

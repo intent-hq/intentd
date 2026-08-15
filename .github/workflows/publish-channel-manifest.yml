@@ -1,10 +1,12 @@
 # Post-announce hook for the dist Release pipeline (see dist-workspace.toml
 # `post-announce-jobs`). After a tagged release is published (any tag the dist
 # pipeline accepts, including prerelease-suffixed ones), this builds a channel
-# manifest from the release's artifacts and uploads it as beta.json on
-# the fixed `channel-beta` release. Every release lands on the beta channel;
-# stable is a manual promotion of an existing release via the "Promote stable"
-# workflow (promote-stable.yml), which updates stable.json on `channel-stable`.
+# manifest from the release's artifacts and uploads it as alpha.json on
+# the fixed `channel-alpha` release. Every release lands on the alpha channel;
+# beta and stable are manual promotions of an existing release via the
+# "Promote beta" (promote-beta.yml) and "Promote stable" (promote-stable.yml)
+# workflows, which update beta.json on `channel-beta` and stable.json on
+# `channel-stable` — beta.json is no longer auto-published on every tag.
 #
 # The manifests give consumers (e.g. cloudlands-fe pin-bump automation,
 # installer scripts) a stable URL to discover the latest release per channel.
@@ -12,14 +14,26 @@
 #
 # When the INTENTD_RELEASES_TOKEN secret is configured, the release's platform
 # archives + .sha256 sidecars are also mirrored to the public
-# intent-hq/intentd-releases repo, together with a beta.json whose platform
-# URLs point at the mirrored assets. The beta.json published on this repo is
+# intent-hq/intentd-releases repo, together with an alpha.json whose platform
+# URLs point at the mirrored assets. The alpha.json published on this repo is
 # unchanged (sitter fallback path + future open-source path).
 #
 # When the MONOREPO_ISSUES_TOKEN secret is configured, monorepo issues
 # referenced by commits/PRs in (previous tag, released tag] also get a
-# fail-soft "Fixed in intentd vX.Y.Z (beta)" comment
-# (scripts/notify-fixed-issues.sh).
+# fail-soft, channel-free "This fix is included in intentd vX.Y.Z." comment
+# (scripts/notify-fixed-issues.sh). Posting is gated on completeness: an
+# issue whose linked intentd fix PRs are not all merged and contained in the
+# released tag stays silent until a later release delivers them. The gate
+# needs the token to read PRs on this repo too (pull-requests:read), and
+# this is the only workflow that comments — beta/stable promotions post
+# nothing.
+#
+# When the FE_DISPATCH_TOKEN secret is configured, a repository_dispatch of
+# type `intentd-alpha-published` (client_payload.version = the released
+# version, no leading v) is sent to intent-hq/cloudlands-fe after the alpha
+# manifest is published (source + mirror), so its auto-pin-intentd workflow
+# can bump the sidecar pin immediately. Fail-soft: a missing secret or a
+# failed dispatch logs a warning and never fails the job.
 name: Publish channel manifest
 
 on:
@@ -38,10 +52,10 @@ jobs:
       # The notifier script reads squash-merged PR bodies on this repo via
       # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
       pull-requests: read
-    # Serialize beta.json updates so two tags pushed close together cannot
+    # Serialize alpha.json updates so two tags pushed close together cannot
     # interleave and leave the manifest pointing at the older release.
     concurrency:
-      group: intentd-beta-manifest-publish
+      group: intentd-alpha-manifest-publish
       cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,11 +79,11 @@ jobs:
         env:
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          ./scripts/make-channel-manifest.sh "$TAG" beta beta.json
+          ./scripts/make-channel-manifest.sh "$TAG" alpha alpha.json
       - name: Publish manifest to channel release
         shell: bash
         run: |
-          ./scripts/publish-channel-manifest.sh beta beta.json
+          ./scripts/publish-channel-manifest.sh alpha alpha.json
       # --- Issue notifier: comment on fixed monorepo issues ---
       # Fail-soft: skipped with a warning when the MONOREPO_ISSUES_TOKEN
       # secret is not configured, and continue-on-error so a notification
@@ -86,7 +100,7 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::MONOREPO_ISSUES_TOKEN secret is not configured; skipping fixed-issue notifications"
           fi
-      - name: Notify fixed monorepo issues (beta)
+      - name: Notify fixed monorepo issues
         if: steps.notify-token.outputs.enabled == 'true'
         continue-on-error: true
         shell: bash
@@ -134,7 +148,7 @@ jobs:
             echo "::warning::No semver tag before $TAG (first release?); skipping fixed-issue notifications"
             exit 0
           fi
-          ./scripts/notify-fixed-issues.sh intentd "${TAG#v}" beta "$prev" "$TAG"
+          ./scripts/notify-fixed-issues.sh intentd "${TAG#v}" "$prev" "$TAG"
       # --- Public mirror: intent-hq/intentd-releases ---
       # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
       # configured, so a missing secret never blocks the release itself.
@@ -170,11 +184,30 @@ jobs:
           ASSET_REPO: intent-hq/intentd-releases
         run: |
           mkdir -p mirror
-          ./scripts/make-channel-manifest.sh "$TAG" beta mirror/beta.json
+          ./scripts/make-channel-manifest.sh "$TAG" alpha mirror/alpha.json
       - name: Publish manifest to intentd-releases channel release
         if: steps.mirror.outputs.enabled == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
         run: |
-          ./scripts/publish-channel-manifest.sh beta mirror/beta.json intent-hq/intentd-releases
+          ./scripts/publish-channel-manifest.sh alpha mirror/alpha.json intent-hq/intentd-releases
+      # --- FE notification: alpha published ---
+      # Fail-soft by design (mirrors notify-monorepo.yml): a missing
+      # FE_DISPATCH_TOKEN secret or a failed dispatch logs a warning and
+      # never fails the job — the FE's cron backstop picks up the bump.
+      - name: Notify cloudlands-fe of alpha publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FE_DISPATCH_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::FE_DISPATCH_TOKEN secret is not set; skipping cloudlands-fe notification"
+            exit 0
+          fi
+          if ! gh api repos/intent-hq/cloudlands-fe/dispatches \
+            -f event_type=intentd-alpha-published \
+            -f "client_payload[version]=${TAG#v}"; then
+            echo "::warning::repository_dispatch to intent-hq/cloudlands-fe failed; its cron run will pick up the bump"
+          fi

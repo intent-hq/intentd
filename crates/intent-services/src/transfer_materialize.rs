@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use intent_core::{CheckoutMode, Error, Result, Workspace};
 use intent_git::{cow_clone, cow_probe, CowSupport};
-use intent_store::{Sandbox, Store};
+use intent_store::Sandbox;
 
 use crate::transfer_git::{run_git, unwind_wip, TransferRefsManifest};
 
@@ -37,7 +37,7 @@ pub struct MaterializedGit {
     /// bundle was the only source and its staging path must not leak into
     /// the repo config.
     pub checkout_dir: PathBuf,
-    /// Display name registered in `known_repo`.
+    /// Display name used for the checkout's `<repo-slug>` folder naming.
     pub repo_name: String,
     /// Branch the checkout is on — the bundled `workspace_branch`, which is
     /// whatever HEAD pointed at when the bundle was built and may differ
@@ -87,38 +87,25 @@ impl MaterializedGit {
     }
 }
 
-/// Materialize and register: run [`materialize_workspace_git_blocking`] on
-/// the blocking pool, then upsert the checkout into the `known_repo`
-/// registry so the repository survives workspace deletion (spec §1: known
-/// repos are registered on target, not transferred). A registry failure
-/// rolls the created directories back — the import must stay all-or-nothing.
+/// Async entry: run [`materialize_workspace_git_blocking`] on the blocking
+/// pool. The materialized checkout is deliberately NOT registered in
+/// `known_repo` — it lives under the workspaces root, i.e. daemon-managed
+/// storage, and workspace-owned checkouts stay out of the registry
+/// (intent-hq/monorepo#2227; supersedes the earlier transfer-spec decision
+/// to register on target — the `repo.list` sync would sweep such a row
+/// right back out).
 pub async fn materialize_workspace_git(
-    store: &Store,
     bundle_path: PathBuf,
     refs: TransferRefsManifest,
     ws: Workspace,
     sandboxes: Vec<Sandbox>,
     workspaces_root: PathBuf,
 ) -> Result<MaterializedGit> {
-    let owner = ws.repository_owner.clone();
-    let ws_dir = workspaces_root.join(&ws.id.0);
-    let out = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &sandboxes, &workspaces_root)
     })
     .await
-    .map_err(|e| Error::Internal(format!("materialize task failed: {e}")))??;
-    if let Err(e) = store
-        .upsert_known_repo(
-            &out.checkout_dir.to_string_lossy(),
-            &out.repo_name,
-            owner.as_deref(),
-        )
-        .await
-    {
-        rollback_created(&created_paths(&out), &ws_dir);
-        return Err(e);
-    }
-    Ok(out)
+    .map_err(|e| Error::Internal(format!("materialize task failed: {e}")))?
 }
 
 /// Every directory a successful materialization created, in
@@ -136,28 +123,17 @@ fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
 }
 
 /// Undo a SUCCESSFUL materialization after a later commit step fails (e.g.
-/// the row insert): remove the created checkout/sandbox directories and the
-/// `known_repo` registration, restoring the target exactly as found so the
-/// staged import can be retried or aborted. Best-effort — failures are
-/// logged, the commit error being unwound takes precedence.
-pub async fn rollback_materialized(store: &Store, out: &MaterializedGit, ws_dir: &Path) {
+/// the row insert): remove the created checkout/sandbox directories,
+/// restoring the target exactly as found so the staged import can be
+/// retried or aborted. Best-effort — the commit error being unwound takes
+/// precedence.
+pub fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
     rollback_created(&created_paths(out), ws_dir);
-    if let Err(e) = store
-        .remove_known_repo(&out.checkout_dir.to_string_lossy())
-        .await
-    {
-        tracing::warn!(
-            path = %out.checkout_dir.display(),
-            error = %e,
-            "materialize rollback: failed to remove known_repo registration"
-        );
-    }
 }
 
 /// Materialize the workspace's git state from the transfer bundle. Blocking
 /// work (git2 I/O plus `git` child processes); async callers must run it via
-/// `spawn_blocking` — [`materialize_workspace_git`] does, and adds the
-/// registry upsert.
+/// `spawn_blocking` — [`materialize_workspace_git`] does.
 ///
 /// Sequence: clone the bundle at the workspace branch into
 /// `<workspaces_root>/<wsId>/<repo-slug>` (origin removed — the staging
@@ -626,6 +602,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
         }
@@ -1013,10 +990,16 @@ mod tests {
         );
     }
 
+    /// The async entry materializes the checkout without registering it in
+    /// `known_repo` — the checkout is workspace-owned storage under the
+    /// workspaces root and stays out of the registry
+    /// (intent-hq/monorepo#2227).
     #[tokio::test]
-    async fn async_entry_registers_known_repo() {
+    async fn async_entry_does_not_register_known_repo() {
         let tmp = crate::tests::TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
+        let store = intent_store::Store::open(&tmp.path)
+            .await
+            .expect("open store");
 
         let src = tempfile::TempDir::new().unwrap();
         let repo = src.path().join("source-repo");
@@ -1027,7 +1010,6 @@ mod tests {
 
         let target = tempfile::TempDir::new().unwrap();
         let out = materialize_workspace_git(
-            &store,
             bundle_path,
             refs,
             ws.clone(),
@@ -1037,9 +1019,11 @@ mod tests {
         .await
         .unwrap();
 
-        let repos = store.list_known_repos().await.unwrap();
-        assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].path, out.checkout_dir.to_string_lossy());
-        assert_eq!(repos[0].name, "test-repo");
+        assert!(out.checkout_dir.join(".git").exists(), "checkout created");
+        assert_eq!(
+            store.list_known_repos().await.unwrap(),
+            vec![],
+            "materialized checkout is not registered"
+        );
     }
 }

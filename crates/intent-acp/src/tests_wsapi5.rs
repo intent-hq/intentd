@@ -51,6 +51,11 @@ struct FakeApi {
     status_message_state: Mutex<Option<Option<String>>>,
     /// Recorded `save_asset` calls: (data, mime_type, original_name).
     save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
+    /// Recorded `git_root_register` calls: (path, agent_id).
+    git_root_register_calls: Mutex<Vec<(String, String)>>,
+    /// Recorded `git_root_unregister` calls: path.
+    git_root_unregister_calls: Mutex<Vec<String>>,
+    git_root_list_calls: Mutex<u32>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -105,6 +110,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -276,6 +282,43 @@ impl WorkspaceApi for FakeApi {
                 files: vec!["a.txt".to_string(), "b.txt".to_string()],
                 file_count: 2,
             })
+        })
+    }
+
+    fn git_root_register(
+        &self,
+        _id: WorkspaceId,
+        path: String,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.git_root_register_calls
+            .lock()
+            .unwrap()
+            .push((path.clone(), agent_id.as_str().to_string()));
+        Box::pin(async move {
+            Ok(json!({
+                "id": "gitroot-1",
+                "workspaceId": "ws-1",
+                "path": path,
+                "source": "agent",
+                "branch": "main",
+            }))
+        })
+    }
+
+    fn git_root_unregister(&self, _id: WorkspaceId, path: String) -> BoxFuture<'_, Result<Value>> {
+        self.git_root_unregister_calls.lock().unwrap().push(path);
+        Box::pin(async { Ok(json!({ "ok": true, "gitRootId": "gitroot-1", "path": "/tmp/sub" })) })
+    }
+
+    fn git_root_list(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        *self.git_root_list_calls.lock().unwrap() += 1;
+        // Mirror the production envelope — the binding unwraps `gitRoots`
+        // into the bare array the reference docs promise.
+        Box::pin(async {
+            Ok(
+                json!({ "gitRoots": [{ "id": "gitroot-1", "path": "/tmp/sub", "source": "agent" }] }),
+            )
         })
     }
 
@@ -758,7 +801,6 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         last_message_id: None,
         digest: None,
         context_references: None,
-        image_blocks: None,
         file_blocks: None,
         stop_reason: None,
         stop_reason_timestamp: None,
@@ -948,6 +990,63 @@ async fn git_removed_methods_error_as_unknown() {
         );
     }
     assert!(api.agent_commit_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn git_register_root_requires_caller_context() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.registerRoot('/tmp/sub');").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("No agent context available"));
+    assert!(api.git_root_register_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn git_register_root_passes_path_and_caller() {
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(&srv, "return await ws.git.registerRoot('/tmp/sub');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(v["id"], json!("gitroot-1"));
+    assert_eq!(v["path"], json!("/tmp/sub"));
+    assert_eq!(v["source"], json!("agent"));
+    let calls = api.git_root_register_calls.lock().unwrap();
+    assert_eq!(calls[0], ("/tmp/sub".to_string(), "agent-9".to_string()));
+}
+
+#[tokio::test]
+async fn git_register_root_requires_path() {
+    let (srv, api) = server_with_caller("agent-9");
+    let resp = call(&srv, "return await ws.git.registerRoot();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("path is required"));
+    assert!(api.git_root_register_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn git_unregister_root_passes_path() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.unregisterRoot('/tmp/sub');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["gitRootId"], json!("gitroot-1"));
+    assert_eq!(
+        *api.git_root_unregister_calls.lock().unwrap(),
+        vec!["/tmp/sub".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn git_list_roots_unwraps_envelope() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.git.listRoots();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    let roots = v.as_array().expect("bare array, envelope unwrapped");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], json!("gitroot-1"));
+    assert_eq!(*api.git_root_list_calls.lock().unwrap(), 1);
 }
 
 // ============================================================================

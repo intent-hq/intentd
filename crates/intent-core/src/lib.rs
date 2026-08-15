@@ -51,7 +51,10 @@ pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
@@ -65,17 +68,17 @@ pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    AnchorContext, AuthorType, CheckoutMode, Client, Comment, CommentAddResult, CommentAnchor,
-    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
-    CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
-    ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor,
-    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
-    GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitPullResult, GitStatus, Hook, HookState, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
+    AnchorContext, AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
+    CommentType, CommentWire, ContentType, ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry,
+    Draft, Event, EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
+    GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, Hook, HookState, KnownRepo,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
@@ -89,7 +92,8 @@ pub use model::{
     WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
     WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
     WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};

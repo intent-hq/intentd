@@ -70,6 +70,9 @@ pub struct WsOptions {
     /// and hands the same clone to every listener, so the cap spans UDS + WSS;
     /// the default is unlimited for standalone / test wiring.
     pub rpc_limiter: RpcLimiter,
+    /// `/tunnel` caps and timeouts; defaults are production values, tests
+    /// shrink them to exercise idle/connect/forward timeout behavior.
+    pub tunnel_limits: crate::tunnel::TunnelLimits,
 }
 
 impl Default for WsOptions {
@@ -83,6 +86,7 @@ impl Default for WsOptions {
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
+            tunnel_limits: crate::tunnel::TunnelLimits::default(),
         }
     }
 }
@@ -151,6 +155,8 @@ pub(crate) struct WsInner {
     /// (`server.maxOutstandingRpcs`); unlimited unless the composition root
     /// wires one through [`WsOptions::rpc_limiter`].
     pub rpc_limiter: RpcLimiter,
+    /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
+    pub tunnel_limits: crate::tunnel::TunnelLimits,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -196,6 +202,7 @@ impl WsApiServer {
             server_pairing_info: None,
             control,
             rpc_limiter: options.rpc_limiter,
+            tunnel_limits: options.tunnel_limits,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -233,6 +240,7 @@ impl WsApiServer {
             server_pairing_info: None,
             control,
             rpc_limiter: options.rpc_limiter,
+            tunnel_limits: options.tunnel_limits,
         };
         Self {
             inner: Arc::new(inner),
@@ -443,10 +451,11 @@ impl WsInner {
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
-        if path != "/ws" {
+        if path != "/ws" && path != "/tunnel" {
             return reject(&mut stream, 404, "Not Found").await;
         }
-        // §5.3 upgrade gate: enable flag, origin allow-list, then bearer token.
+        // §5.3 upgrade gate (shared by `/ws` and `/tunnel`): enable flag,
+        // origin allow-list, then bearer token.
         if !self.enabled {
             return reject(&mut stream, 403, "Forbidden").await;
         }
@@ -494,9 +503,17 @@ impl WsInner {
         // default 16 MiB) to the same value so a legitimate large payload sent
         // as a single unfragmented frame is still accepted. Over-limit frames
         // fail fast on the frame header, without buffering the payload.
+        // `/tunnel` gets a much smaller cap: the 40 MiB limit is sized for
+        // JSON-RPC envelopes, while tunnel frames are bounded per-`DATA` so
+        // the frame-count relay queues cannot buffer GiBs of payload.
+        let max_message = if path == "/tunnel" {
+            crate::tunnel::MAX_TUNNEL_MESSAGE_BYTES
+        } else {
+            crate::MAX_INBOUND_MESSAGE_BYTES
+        };
         let config = WebSocketConfig::default()
-            .max_message_size(Some(crate::MAX_INBOUND_MESSAGE_BYTES))
-            .max_frame_size(Some(crate::MAX_INBOUND_MESSAGE_BYTES));
+            .max_message_size(Some(max_message))
+            .max_frame_size(Some(max_message));
         let ws = if extensions_header.is_some() {
             WebSocketStream::from_raw_socket_with_extensions(
                 stream,
@@ -508,7 +525,11 @@ impl WsInner {
         } else {
             WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await
         };
-        self.spawn_connection(ws);
+        if path == "/tunnel" {
+            self.spawn_tunnel_connection(ws);
+        } else {
+            self.spawn_connection(ws);
+        }
         Ok(())
     }
 
@@ -541,6 +562,37 @@ impl WsInner {
             self.clone()
                 .connection_loop(id, ws, cmd_rx, last_pong.clone()),
         );
+        let abort = handle.abort_handle();
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                cmd_tx,
+                last_pong,
+                abort,
+            },
+        );
+    }
+
+    /// Register a new `/tunnel` client and spawn its mux loop. Tunnel
+    /// connections live in the same registry as `/ws` clients, so the
+    /// heartbeat reaper, `stop()` shutdown close, and the `/health` count all
+    /// cover them identically.
+    fn spawn_tunnel_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
+        let last_pong = Arc::new(AtomicI64::new(now_ms()));
+        let this = self.clone();
+        let limits = self.tunnel_limits;
+        let handle = tokio::spawn({
+            let last_pong = last_pong.clone();
+            async move {
+                crate::tunnel::run_tunnel_connection(ws, cmd_rx, last_pong, limits).await;
+                this.deregister(id);
+            }
+        });
         let abort = handle.abort_handle();
         self.clients.lock().expect("ws clients poisoned").insert(
             id,
@@ -790,7 +842,7 @@ fn header_str(value: &[u8]) -> Option<String> {
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

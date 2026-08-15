@@ -131,9 +131,55 @@
 //! quick-action fan-out could spawn until `server.maxOutstandingRpcs`
 //! (monorepo#2062). Nothing was spawned when this error is returned, so a
 //! retry is always safe — no new methods, 287 router methods, 326 total.
+//! Version 6.15 adds multi git root tracking (additive; §5.6, monorepo#2053):
+//! the `gitRoot.list` router method serves the workspace's registered
+//! secondary git roots as `{ gitRoots: [...] }` (each wire row is the
+//! persisted `WorkspaceGitRoot` plus a live-read `branch?`), six git reads —
+//! `git.status`, `git.changes`, `git.diffs`, `git.commits`, `git.showFile`,
+//! and `git.branchStatus` (where `workspaceId` + `gitRootId` may stand in
+//! for `repoPath`; `repoPath` wins when both are supplied) — gain the
+//! optional `gitRootId` param scoping the read to a registered root (an
+//! unknown or foreign-workspace id is `-32602` with an identical message;
+//! empty/whitespace values read as absent), and the `gitRoot:registered` /
+//! `gitRoot:updated` / `gitRoot:unregistered` event family surfaces the
+//! daemon-owned root lifecycle (agent registration via the MCP-only
+//! `ws.git.registerRoot` / `ws.git.unregisterRoot` / `ws.git.listRoots`
+//! bindings, submodule auto-detection, auto-prune, per-root PR discovery) —
+//! 288 router methods, 327 total. Version 6.16 adds the staged chunked
+//! attachment upload surface `file.attachmentUpload.begin` / `.chunk` /
+//! `.commit` / `.abort` (§5.9): chunked, idempotent upload of an attachment
+//! payload larger than one RPC frame (16 MiB decoded per chunk, 1 GiB per
+//! attachment), with `commit` SHA-256-verifying the assembled payload and
+//! placing it through the same collision-safe placement + attachment
+//! registry path as `file.placeAttachment` — the commit result is
+//! byte-shape-identical to a successful `placeAttachment` result. Sessions
+//! are in-memory only: a daemon restart drops them and orphaned staging
+//! dirs are swept lazily by the next `begin` — 292 router methods, 331
+//! total. Version 6.17 adds the daemon-owned orthogonal `waiting` flag on
+//! `Workspace` projections plus the `workspace:waiting-changed` event
+//! (additive; §5.1, §6.5), and unwinds the hook/PR-monitor/completion-watch
+//! folds from the `displayStatus` `in_progress` promotion — no
+//! method-catalog change, 292 router methods, 331 total. Version 6.18 adds
+//! the `file.readChunk` router method (additive; §5.9, monorepo#2458): one
+//! offset-windowed slice of a workspace file's raw bytes served FE-ward as
+//! `{ content (base64), bytesRead, size }` — the binary counterpart of the
+//! UTF-8-only `file.read`, with the same within-workspace containment
+//! guard, a 16 MiB decoded per-call cap (over-cap → -32602), directory
+//! rejection (-32602), and empty-chunk reads at/past EOF — 293 router
+//! methods, 332 total. Version 7.0 reworks the batch `agent.delegate`
+//! form (breaking; §5.5, part 2 of monorepo#2457): each `tasks` entry now
+//! accepts a bare taskNoteId string OR an object
+//! `{ taskNoteId, specialist?, model?, reasoningEffort? }` whose per-task
+//! options override the call's top-level defaults (additive half), while
+//! the `greedy` batch param is REMOVED — a request passing it is rejected
+//! with `-32602` ("greedy was removed; delegate a held task individually
+//! to force it past the conflict hold"), the batch result no longer echoes
+//! `greedy`, `started` rows never carry conflict overlap, and the
+//! `held:conflict` reason now points at individual delegation — no
+//! method-catalog change, 293 router methods, 332 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.14";
+pub const PROTOCOL_VERSION: &str = "7.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

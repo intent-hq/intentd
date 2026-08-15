@@ -98,6 +98,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agents.memoryBudgetMb",
     "agents.idleReapMinutes",
     "agents.flushQueuedMessages",
+    "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
     "workspaceApi.maxOutputChars",
     "workspaceApi.toonOutput",
@@ -111,6 +112,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.attentionRequests",
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
+    "agentFeatures.taskGraph",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
 ];

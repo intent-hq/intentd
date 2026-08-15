@@ -2,6 +2,164 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-08-15
+
+### 🚀 Features
+
+- Make startup auto-resume a setting with installer prompts ([#1238](https://github.com/intent-hq/intentd/pull/1238))
+- *(delegate)* Annotate relation-less tasks in batch classification ([#1237](https://github.com/intent-hq/intentd/pull/1237))
+
+
+## [0.7.0] - 2026-08-15
+
+### 🚀 Features
+
+- Add chunked binary file read method (file.readChunk) ([#1231](https://github.com/intent-hq/intentd/pull/1231))
+- *(prompts)* Rework flag-ON task-graph teaching from doctrine to advisory ([#1229](https://github.com/intent-hq/intentd/pull/1229))
+- *(git)* Add optional gitRootId param to git.commitDetails ([#1235](https://github.com/intent-hq/intentd/pull/1235))
+- *(delegate)* [**breaking**] Per-task options in batch delegate; remove greedy param ([#1236](https://github.com/intent-hq/intentd/pull/1236))
+
+### 🐛 Bug Fixes
+
+- Keep session-level base64 imageBlocks out of the AgentLite projection ([#1230](https://github.com/intent-hq/intentd/pull/1230))
+
+
+## [0.6.21] - 2026-08-14
+
+### 🚀 Features
+
+- Opt-in agentFeatures.taskGraph flag gating task-graph teaching ([#1226](https://github.com/intent-hq/intentd/pull/1226))
+
+### 🐛 Bug Fixes
+
+- Capture taskGraph for unblocked wakes per session
+
+
+## [0.6.20] - 2026-08-14
+
+### 🐛 Bug Fixes
+
+- Refresh flipped specLinked flags on spec-body edits in task.subscribe ([#1224](https://github.com/intent-hq/intentd/pull/1224))
+
+
+## [0.6.19] - 2026-08-14
+
+### 🚀 Features
+
+- Carry specLinked on task.subscribe snapshot and delta payloads ([#1218](https://github.com/intent-hq/intentd/pull/1218))
+- Persist registered-commit SHA on workspace git roots ([#1220](https://github.com/intent-hq/intentd/pull/1220))
+
+### 🐛 Bug Fixes
+
+- Two-phase commit claim + just-in-time sweep recheck in workspace import ([#1219](https://github.com/intent-hq/intentd/pull/1219))
+- Bound attachment upload sessions with a per-workspace cap and idle TTL ([#1217](https://github.com/intent-hq/intentd/pull/1217))
+
+### 🧪 Testing
+
+- Deflake one_shot prompt-timeout test with a private adapter bound ([#1222](https://github.com/intent-hq/intentd/pull/1222))
+
+
+## [0.6.18] - 2026-08-14
+
+### 🚀 Features
+
+- *(agents)* Persist abnormal finishReason on the turn's assistant row ([#1211](https://github.com/intent-hq/intentd/pull/1211))
+- Widen task.list to all workspace task notes, add specLinked to WorkspaceTask ([#1214](https://github.com/intent-hq/intentd/pull/1214))
+- Auto-unarchive workspace on agent turn start ([#1216](https://github.com/intent-hq/intentd/pull/1216))
+
+### 🐛 Bug Fixes
+
+- Threshold-gate dequeue-wait annotation at 5s ([#1212](https://github.com/intent-hq/intentd/pull/1212))
+
+### 🧪 Testing
+
+- Regression coverage for nested repos/worktrees under untracked parent dirs in transfer WIP snapshot ([#1210](https://github.com/intent-hq/intentd/pull/1210))
+
+
+## [0.6.17] - 2026-08-14
+
+### 🚀 Features
+
+- *(agents)* Turn-start memory budget re-check for idle-to-active transitions ([#1203](https://github.com/intent-hq/intentd/pull/1203))
+- *(agents)* Stamp reason (slots | memory-budget) on agent:process:* events ([#1196](https://github.com/intent-hq/intentd/pull/1196))
+- *(settings)* Auto/off semantics for agents.memoryBudgetMb ([#1195](https://github.com/intent-hq/intentd/pull/1195))
+- Expose aggregate memory budget visibility on system.status ([#1198](https://github.com/intent-hq/intentd/pull/1198))
+- Bucket descendant-tree RSS by nearest registered agent root ([#1197](https://github.com/intent-hq/intentd/pull/1197))
+- *(agents)* Wire boot to resolve auto memory budget to recommended value
+- *(services)* Expose subtreeMemoryBytes on agent.diagnostics rows ([#1201](https://github.com/intent-hq/intentd/pull/1201))
+- *(agents)* Budget-triggered idle reap drains without a spawn ([#1202](https://github.com/intent-hq/intentd/pull/1202))
+- *(transport)* /tunnel WS endpoint with stream mux + loopback relay ([#1205](https://github.com/intent-hq/intentd/pull/1205))
+- Derive orthogonal workspace waiting flag and emit workspace:waiting-changed ([#1207](https://github.com/intent-hq/intentd/pull/1207))
+
+### 🐛 Bug Fixes
+
+- *(intentd)* Exclude Linux thread rows from the child-tree memory sampler ([#1209](https://github.com/intent-hq/intentd/pull/1209))
+
+### 📚 Documentation
+
+- *(acp)* Document daemon.localhost/client.localhost convention in browser docs ([#1206](https://github.com/intent-hq/intentd/pull/1206))
+- *(acp)* Note automatic tunnel fallback for unreachable remote loopback URLs ([#1208](https://github.com/intent-hq/intentd/pull/1208))
+
+
+## [0.6.16] - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- Persist error status before terminal events on the streaming path ([#1191](https://github.com/intent-hq/intentd/pull/1191))
+- Collapse Codex effort variants ([#1173](https://github.com/intent-hq/intentd/pull/1173))
+
+
+## [0.6.15] - 2026-08-13
+
+### 🚀 Features
+
+- Multi git root tracking — persisted roots, gitRoot.list, scoped git reads (protocol v6.15) ([#1180](https://github.com/intent-hq/intentd/pull/1180))
+- Defer workspace watcher start until setup script completes ([#1183](https://github.com/intent-hq/intentd/pull/1183))
+- Remove unread from the displayStatus derivation ([#1186](https://github.com/intent-hq/intentd/pull/1186))
+- Chunked attachment upload session (file.attachmentUpload.*) ([#1187](https://github.com/intent-hq/intentd/pull/1187))
+
+### 🐛 Bug Fixes
+
+- Close the idle reaper TOCTOU with claim-before-kill ([#1184](https://github.com/intent-hq/intentd/pull/1184))
+
+
+## [0.6.14] - 2026-08-13
+
+### 🚀 Features
+
+- Add machine-readable watchStillArmed flag to agent-watch wake metadata ([#1179](https://github.com/intent-hq/intentd/pull/1179))
+
+### 🐛 Bug Fixes
+
+- Exclude workspace-owned checkouts from the known-repo registry ([#1181](https://github.com/intent-hq/intentd/pull/1181))
+
+
+## [0.6.13] - 2026-08-13
+
+### 🔧 Refactor
+
+- *(core)* Unify Windows runnable-extension policy in path_utils ([#1176](https://github.com/intent-hq/intentd/pull/1176))
+
+
+## [0.6.12] - 2026-08-13
+
+### 🚀 Features
+
+- Surface conversion createdTasks + warnings on note.create ([#1162](https://github.com/intent-hq/intentd/pull/1162))
+- *(settings)* Bound memoryBudgetMb by real RAM and reap idle agents at 10min ([#1166](https://github.com/intent-hq/intentd/pull/1166))
+
+### 🐛 Bug Fixes
+
+- *(chat)* Flush the live-turn slot as of flush time, not the pre-abort clone ([#1157](https://github.com/intent-hq/intentd/pull/1157))
+- Skip nested git repos in sandbox staging (add_all) ([#1168](https://github.com/intent-hq/intentd/pull/1168))
+- Prefer newest nvm Node during discovery ([#1169](https://github.com/intent-hq/intentd/pull/1169))
+- *(intent-context)* Require runnable extension in auggie discovery on Windows ([#1171](https://github.com/intent-hq/intentd/pull/1171))
+- Skip nested git repos/worktrees when snapshotting WIP for transfer ([#1159](https://github.com/intent-hq/intentd/pull/1159))
+- *(system.status)* Catch sub-5s bursts in childMemoryPeakBytes ([#1167](https://github.com/intent-hq/intentd/pull/1167))
+- *(chat)* Serve orphaned live-turn content instead of hiding it ([#1161](https://github.com/intent-hq/intentd/pull/1161))
+- Classify placeAttachment copy failures and log them at WARN ([#1165](https://github.com/intent-hq/intentd/pull/1165))
+
+
 ## [0.6.11] - 2026-08-12
 
 ### 🐛 Bug Fixes

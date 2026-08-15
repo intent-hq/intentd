@@ -2233,13 +2233,14 @@ impl Services {
     /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
     ///
-    /// The watch set is also a `displayStatus` in-progress promotion input
-    /// (an idle parent still waiting on delegated children reads as active
-    /// work), so every publish recomputes the anchor workspace's derived
-    /// status — transition-only and best-effort
-    /// ([`Services::maybe_emit_display_status_changed`] dedupes against the
-    /// last observation and swallows errors), so a no-op recompute stays
-    /// silent and can never break the watch lifecycle.
+    /// The watch set also feeds the anchor workspace's derived
+    /// `displayStatus` and its orthogonal `waiting` flag (an idle parent
+    /// still waiting on delegated children reads as pending work), so every
+    /// publish recomputes both — transition-only and best-effort
+    /// ([`Services::maybe_emit_display_status_changed`] /
+    /// [`Services::maybe_emit_waiting_changed`] dedupe against the last
+    /// observation and swallow errors), so a no-op recompute stays silent
+    /// and can never break the watch lifecycle.
     pub(crate) async fn publish_subscriptions_changed(
         &self,
         workspace_id: &WorkspaceId,
@@ -2264,6 +2265,7 @@ impl Services {
         )
         .await;
         self.maybe_emit_display_status_changed(workspace_id).await;
+        self.maybe_emit_waiting_changed(workspace_id).await;
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
@@ -2631,7 +2633,11 @@ impl Services {
             sandbox_path: None,
             sandbox_branch: None,
         };
-        self.store.insert_agent_session(&session).await?;
+        let settings = self.effective_settings();
+        let task_graph_enabled = settings.agent_features.task_graph;
+        self.store
+            .insert_agent_session_with_task_graph(&session, task_graph_enabled)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
@@ -2872,9 +2878,11 @@ impl Services {
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
         // child-only sweep would leak (deleted_parent, child) entries for the
-        // daemon's lifetime.
+        // daemon's lifetime. The streaming path's terminal-error stash
+        // (monorepo#2050) is dropped on the same terms.
         self.clear_failure_streak(&agent_id);
         self.clear_failure_wake_dedup_all_roles(&agent_id);
+        self.discard_pending_terminal_error(&agent_id);
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
@@ -4096,7 +4104,10 @@ impl Services {
             && ready_delta::metadata_has_triggers(entry.message_metadata.as_ref())
         {
             if let Some(section) = self
-                .unblocked_section_for_delivery(std::iter::once(entry.message_metadata.as_ref()))
+                .unblocked_section_for_delivery(
+                    &agent_id,
+                    std::iter::once(entry.message_metadata.as_ref()),
+                )
                 .await
             {
                 entry.content = format!("{}\n\n{}", entry.content, section);
@@ -5383,10 +5394,14 @@ impl Services {
                  remains armed; {completion_promise}.)",
                 session.name, caller.0, wake_verb, reason
             );
+            // `watchStillArmed: true` (monorepo#2060) is the machine-readable
+            // twin of the "remains armed" note above, mirroring the hook
+            // wakes' `hookStillActive` flag.
             let metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
                 "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "watchStillArmed": true,
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
                     "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
@@ -5435,6 +5450,16 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // `greedy` was a batch-level conflict override; it is REMOVED. Any
+        // supplied value — `true`, `false`, or an explicit `null` — rejects
+        // on BOTH forms (the check sits before the batch routing so a
+        // single-task call cannot silently carry it either); only a missing
+        // field passes.
+        if input.greedy.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
+            ));
+        }
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
@@ -6009,11 +6034,28 @@ impl Services {
     /// (`None`) and the wake delivers unannotated.
     pub(crate) async fn unblocked_section_for_delivery<'a>(
         &self,
+        agent_id: &AgentId,
         metadatas: impl Iterator<Item = Option<&'a Value>>,
     ) -> Option<String> {
         let triggers = ready_delta::collect_trigger_tasks(metadatas);
         if triggers.is_empty() {
             return None;
+        }
+        match self
+            .store
+            .get_agent_session_task_graph_enabled(agent_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    %error,
+                    "taskGraph session snapshot unavailable; delivering wake without the section"
+                );
+                return None;
+            }
         }
         // Group trigger task ids per workspace (cross-workspace parents can
         // in principle coalesce wakes from several workspaces) and compute
@@ -6055,27 +6097,46 @@ impl Services {
     /// state (task statuses, `dependsOn`/`conflictsWith` edges, live assigned
     /// agents; see [`batch::classify_batch_tasks`]) — then delegate exactly
     /// the start subset through the unchanged single-task path (per-task
-    /// agent creation, group enrollment honoring `waitMode`). No scheduler
-    /// state is written: held tasks are simply not started, and re-calling
-    /// with the same list is idempotent (running/terminal tasks classify as
-    /// `skipped`). The result enumerates EVERY supplied task with its
-    /// disposition + reason and projects the unlock plan; the existing group
-    /// settlement wake is the resume signal — the caller re-calls delegate
-    /// then, which recomputes everything.
+    /// agent creation, group enrollment honoring `waitMode`). Entries may be
+    /// bare task-note ids or objects carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides of the top-level
+    /// defaults. No scheduler state is written: held tasks are simply not
+    /// started, and re-calling with the same list is idempotent
+    /// (running/terminal tasks classify as `skipped`). The result enumerates
+    /// EVERY supplied task with its disposition + reason and projects the
+    /// unlock plan; the existing group settlement wake is the resume signal —
+    /// the caller re-calls delegate then, which recomputes everything.
     async fn agent_delegate_batch_op(
         &self,
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
-        use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition};
+        use batch::{
+            classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
+        };
+        use intent_core::BatchTaskEntry;
 
-        let requested: Vec<String> = input
-            .tasks
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| id.0)
+        let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
+        // Per-task option overrides, keyed by task-note id. Only OBJECT
+        // entries populate the map, so for a duplicated id the last object
+        // entry wins and a trailing bare-string duplicate does NOT reset an
+        // earlier object's overrides (classification dedups to one row
+        // anyway).
+        let mut overrides: HashMap<String, intent_core::BatchTaskOptions> = HashMap::new();
+        for entry in &entries {
+            if let BatchTaskEntry::Options(opts) = entry {
+                if opts.agent_instructions.is_some() {
+                    return Err(Error::InvalidParams(
+                        "agent.delegate: agentInstructions is not supported on a tasks entry — each started task's first message resolves from its own task note".to_string(),
+                    ));
+                }
+                overrides.insert(opts.task_note_id.0.clone(), opts.clone());
+            }
+        }
+        let requested: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.task_note_id().0.clone())
             .collect();
         if requested.is_empty() {
             return Err(Error::InvalidParams(
@@ -6150,8 +6211,13 @@ impl Services {
             )));
         }
 
-        let greedy = input.greedy.unwrap_or(false);
-        let classified = classify_batch_tasks(&requested, &snaps, greedy);
+        let classified = classify_batch_tasks(&requested, &snaps);
+        // Relation-less annotation (monorepo#2457 part 3): requested tasks
+        // the graph does not cover (no relations of their own, not
+        // referenced by any other requested task) classify exactly as
+        // before, but their rows carry `relationsUnknown: true` and the
+        // summary counts the started ones.
+        let relations_unknown = relations_unknown_ids(&requested, &snaps);
 
         // Delegate the start subset through the unchanged single-task path.
         // A per-task failure becomes an `error` disposition rather than
@@ -6162,13 +6228,25 @@ impl Services {
             let title = titles.get(id).cloned().unwrap_or_default();
             let mut row = json!({ "taskNoteId": id, "title": title });
             let obj = row.as_object_mut().unwrap();
+            if relations_unknown.contains(id) {
+                obj.insert("relationsUnknown".into(), json!(true));
+            }
             match disposition {
-                BatchDisposition::Start { conflicts_with } => {
+                BatchDisposition::Start => {
+                    // Per-entry overrides beat the top-level defaults, field
+                    // by field.
+                    let opts = overrides.get(id);
                     let single = intent_core::AgentDelegateInput {
                         task_note_id: Some(NoteId::from(id.as_str())),
-                        specialist: input.specialist.clone(),
-                        model: input.model.clone(),
-                        reasoning_effort: input.reasoning_effort.clone(),
+                        specialist: opts
+                            .and_then(|o| o.specialist.clone())
+                            .or_else(|| input.specialist.clone()),
+                        model: opts
+                            .and_then(|o| o.model.clone())
+                            .or_else(|| input.model.clone()),
+                        reasoning_effort: opts
+                            .and_then(|o| o.reasoning_effort.clone())
+                            .or_else(|| input.reasoning_effort.clone()),
                         behavior_prompt: input.behavior_prompt.clone(),
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
@@ -6186,16 +6264,6 @@ impl Services {
                             obj.insert("disposition".into(), json!("started"));
                             obj.insert("agentId".into(), res["agentId"].clone());
                             obj.insert("agentName".into(), res["name"].clone());
-                            if !conflicts_with.is_empty() {
-                                obj.insert("conflictsWith".into(), json!(conflicts_with));
-                                obj.insert(
-                                    "reason".into(),
-                                    json!(format!(
-                                        "started despite conflictsWith overlap with {} (greedy) — expect rebases",
-                                        conflicts_with.join(", ")
-                                    )),
-                                );
-                            }
                             started_ids.push(id.clone());
                         }
                         Err(e) => {
@@ -6227,7 +6295,7 @@ impl Services {
                     obj.insert(
                         "reason".into(),
                         json!(format!(
-                            "conflictsWith intersects the running/starting set ({}); pass greedy: true to start anyway",
+                            "conflictsWith intersects the running/starting set ({}); delegate it individually to force it",
                             conflicts_with.join(", ")
                         )),
                     );
@@ -6294,6 +6362,18 @@ impl Services {
                 " ~{minutes} min of serial work remains on the critical path."
             ));
         }
+        // Count started relation-less tasks in the human-readable summary
+        // (annotation only — nothing about the start decision changed).
+        let started_unknown = started_ids
+            .iter()
+            .filter(|id| relations_unknown.contains(*id))
+            .count();
+        if started_unknown > 0 {
+            unlock_message.push_str(&format!(
+                " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
+                started_ids.len()
+            ));
+        }
 
         let mut unlock_plan = json!({
             "unlockedBySettlement": unlocked,
@@ -6307,7 +6387,6 @@ impl Services {
         }
         Ok(json!({
             "ok": true,
-            "greedy": greedy,
             "tasks": rows,
             "startedTaskIds": started_ids,
             "unlockPlan": unlock_plan,
@@ -7098,6 +7177,7 @@ impl Services {
             self.remove_event_subscriptions_for_agent(&agent_id).await;
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
+                self.maybe_emit_waiting_changed(anchor).await;
             }
             // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
             // dropping every outgoing watch may remove the caller's last
@@ -7557,6 +7637,16 @@ impl Services {
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        // Per-agent subtree memory attribution (monorepo#2063 A2): resident
+        // bytes of each agent's descendant process tree from the runtime
+        // manager's tree probe, stamped as `subtreeMemoryBytes` (omitted when
+        // the agent has no bucket — not spawned, no sample yet, or no runtime
+        // manager attached). Diagnostics-only by design: this deliberately
+        // stays off the hot `agent.list`/`agent.get` payloads.
+        let agent_memory: HashMap<AgentId, u64> = self
+            .agent_manager()
+            .map(|m| m.agent_memory_samples())
+            .unwrap_or_default();
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -7630,6 +7720,9 @@ impl Services {
                 if !monitors.is_empty() {
                     row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
+            }
+            if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
+                row.insert("subtreeMemoryBytes".into(), json!(bytes));
             }
             agent_rows.push(Value::Object(row));
         }

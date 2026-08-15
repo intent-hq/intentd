@@ -150,6 +150,63 @@ pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Worktree-relative submodule `path` entries parsed from `.gitmodules`
+/// content (multi git root tracking, monorepo#2053). A tolerant INI-ish
+/// parse: only `path = <value>` lines inside `[submodule "..."]` sections
+/// count, order is preserved, duplicates are dropped, and unsafe values
+/// (empty, absolute on ANY platform, containing `..`) are skipped — the
+/// background sweep joins these against the worktree root, and `Path::join`
+/// REPLACES the base when handed an absolute path, so a hostile
+/// `.gitmodules` must never smuggle one in. `/`-rooted, Windows
+/// drive-absolute (`C:\...`, `C:/...`), and UNC (`\\server\...`) forms are
+/// all rejected regardless of the host platform.
+pub(crate) fn parse_gitmodules_paths(content: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_submodule_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_submodule_section = line.starts_with("[submodule");
+            continue;
+        }
+        if !in_submodule_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "path" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty()
+            || is_any_platform_absolute(value)
+            || value.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            continue;
+        }
+        if !paths.iter().any(|p| p == value) {
+            paths.push(value.to_string());
+        }
+    }
+    paths
+}
+
+/// True when `value` is absolute in ANY platform's spelling — POSIX
+/// `/`-rooted, Windows drive-absolute (`C:\` / `C:/`), or UNC / rooted
+/// backslash (`\\server\share`, `\foo`). Checked textually (not via
+/// `Path::is_absolute`, which is host-platform-specific) because a hostile
+/// `.gitmodules` written on one platform can be swept on another.
+fn is_any_platform_absolute(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with('\\') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    // Windows drive prefix: ASCII letter + `:` (covers `C:\`, `C:/`, and the
+    // drive-relative `C:foo`, which still escapes the worktree on Windows).
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Normalize `git.diffs` `paths` entries against the worktree root
 /// (defense-in-depth, mirroring `git.showFile`'s absolute→relative
 /// conversion): an entry under `<worktree>/` is stripped to its
@@ -683,6 +740,65 @@ fn line_to_value(l: &intent_git::diff::DiffLine) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_gitmodules_paths_extracts_submodule_paths() {
+        let content = "[submodule \"packages/intentd\"]\n\
+             \tpath = packages/intentd\n\
+             \turl = https://github.com/intent-hq/intentd.git\n\
+             [submodule \"packages/fe\"]\n\
+             \tpath = packages/fe\n\
+             \turl = git@github.com:intent-hq/cloudlands-fe.git\n\
+             \tupdate = none\n";
+        assert_eq!(
+            parse_gitmodules_paths(content),
+            vec!["packages/intentd".to_string(), "packages/fe".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_gitmodules_paths_skips_unsafe_and_foreign_entries() {
+        // `path` keys outside a submodule section, absolute paths, traversal
+        // segments, empty values, and duplicates are all dropped.
+        let content = "[core]\n\
+             \tpath = not-a-submodule\n\
+             [submodule \"a\"]\n\
+             \tpath = /abs/path\n\
+             [submodule \"b\"]\n\
+             \tpath = ../escape\n\
+             [submodule \"c\"]\n\
+             \tpath =\n\
+             [submodule \"d\"]\n\
+             \tpath = sub\n\
+             [submodule \"e\"]\n\
+             \tpath = sub\n";
+        assert_eq!(parse_gitmodules_paths(content), vec!["sub".to_string()]);
+    }
+
+    #[test]
+    fn parse_gitmodules_paths_rejects_windows_absolute_and_unc_entries() {
+        // Windows drive-absolute, drive-relative, UNC, and rooted-backslash
+        // values must be dropped on every host platform: `Path::join`
+        // replaces the base for absolute paths, so any of these escaping the
+        // guard would let a hostile `.gitmodules` register an arbitrary
+        // host repo.
+        let content = "[submodule \"a\"]\n\
+             \tpath = C:\\evil\\repo\n\
+             [submodule \"b\"]\n\
+             \tpath = c:/evil/repo\n\
+             [submodule \"c\"]\n\
+             \tpath = C:relative-but-drive-qualified\n\
+             [submodule \"d\"]\n\
+             \tpath = \\\\server\\share\\repo\n\
+             [submodule \"e\"]\n\
+             \tpath = \\rooted\\backslash\n\
+             [submodule \"f\"]\n\
+             \tpath = safe/sub\n";
+        assert_eq!(
+            parse_gitmodules_paths(content),
+            vec!["safe/sub".to_string()]
+        );
+    }
 
     #[test]
     fn normalize_diff_paths_strips_absolute_entries_under_the_worktree() {

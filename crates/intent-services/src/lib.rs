@@ -14,12 +14,13 @@ use base64::Engine as _;
 use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
-    LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
-    TASK_AGENT_UNLINKED, TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED,
-    WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, LINE_ATTRIBUTION_UPDATED,
+    NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, SEARCH_DONE,
+    SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED, TASK_AGENT_UNLINKED,
+    TASK_CREATED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
+    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DELETE_CANCELLED, WORKSPACE_DELETE_SCHEDULED, WORKSPACE_SETUP_COMPLETED,
+    WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -41,8 +42,8 @@ use intent_core::{
     TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -53,6 +54,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod attachment_upload;
 mod auto_commit;
 pub mod browser_ops;
 mod clone_ops;
@@ -287,6 +289,19 @@ pub struct Services {
     /// only — a daemon restart forgets the streak (the provider-block
     /// classifier still applies via the persisted `stop_reason`).
     agent_failure_streaks: Arc<Mutex<HashMap<AgentId, (String, u32)>>>,
+    /// Handoff slot for a terminal error the streaming path already persisted
+    /// (monorepo#2050): `agent_id → PersistedTerminalError`. When
+    /// `run_prompt_turn` (or the worker's idle-timeout-cap branch) persists
+    /// `status = error` + `stop_reason` BEFORE it emits the terminal
+    /// `agent:failed`/`agent:stream:end` pair — the durable-before-observable
+    /// guarantee — it stashes the persisted context here so the turn worker's
+    /// [`handle_terminal_turn_failure`](crate::agent_manager) reuses it instead
+    /// of recording the identical-failure streak and writing the Error status a
+    /// SECOND time (which would double-count the poison streak). Entries are
+    /// single-shot: the handler removes the slot as soon as it settles the
+    /// failure, so a stale entry never bleeds into a later turn. In-memory only.
+    pending_terminal_error:
+        Arc<Mutex<HashMap<AgentId, crate::agent_manager::PersistedTerminalError>>>,
     /// Last `agent:failed` wake delivered per `(parent, child)` pair
     /// (monorepo#840): the error text of the most recent failure wake. A
     /// repeated child failure with an UNCHANGED error is suppressed (the
@@ -525,6 +540,13 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_display_statuses: Arc<workspace_status::DisplayStatusCache>,
+    /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1):
+    /// the recompute-and-compare seam behind
+    /// [`Services::maybe_emit_waiting_changed`]. See
+    /// [`workspace_status::WaitingStatusCache`] — the map is private to the
+    /// `workspace_status` module. Shared across clones so every service
+    /// handle compares against the same last-emitted value.
+    last_waiting_statuses: Arc<workspace_status::WaitingStatusCache>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -707,6 +729,14 @@ pub struct Services {
     /// restart drops pending imports (staging dirs are swept lazily by the
     /// next `begin`), and the FE simply restarts the upload.
     transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
+    /// In-flight staged attachment uploads (`file.attachmentUpload.*`, keyed
+    /// by `uploadId`): destination + declared size/sha + chunk cursor
+    /// between `begin` and `commit`/`abort`. Shared across clones so chunks
+    /// arriving over any connection stage into the same session. In-memory
+    /// only — a daemon restart drops pending uploads (staging dirs are swept
+    /// lazily by the next `begin`), and the client simply restarts the
+    /// upload.
+    attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -781,6 +811,7 @@ impl Services {
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
+            pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
@@ -821,6 +852,7 @@ impl Services {
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
+            last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -851,6 +883,7 @@ impl Services {
             pending_workspace_deletes: delete_grace::PendingDeletes::default(),
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
+            attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -1408,6 +1441,36 @@ impl Services {
         Arc::clone(&self.git_status_cache)
     }
 
+    /// Resolve the target path for a workspace-scoped `git.*` read
+    /// (monorepo#2053): with `git_root_id` set, look up the registered git
+    /// root and validate it belongs to `ws` — an unknown id or one registered
+    /// to another workspace is `InvalidParams` (`-32602`) so a caller cannot
+    /// read an arbitrary root through a foreign workspace. Without it, fall
+    /// back to the workspace worktree exactly as before (`None` when the
+    /// workspace has no local path).
+    async fn resolve_git_read_root(
+        &self,
+        ws: &Workspace,
+        git_root_id: Option<&WorkspaceGitRootId>,
+    ) -> Result<Option<PathBuf>> {
+        let Some(id) = git_root_id else {
+            return Ok(git_ops::worktree_path(ws));
+        };
+        let root = match self.store.get_workspace_git_root(id).await {
+            Ok(r) => r,
+            Err(Error::NotFound(_)) => {
+                return Err(Error::InvalidParams(format!("Unknown git root: {id}")))
+            }
+            Err(e) => return Err(e),
+        };
+        if root.workspace_id != ws.id {
+            // Same message as the unknown-id case so a foreign root is not
+            // distinguishable from a nonexistent one.
+            return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+        }
+        Ok(Some(PathBuf::from(root.path)))
+    }
+
     /// Hydrate the in-memory script registry from the persisted definitions
     /// (§5.8; FE `.workspace/scripts.json` parity). Called once by the
     /// composition root on boot so `script.*` survives daemon restarts; runtime
@@ -1718,6 +1781,27 @@ impl Services {
         {
             let host_end = rest.find('/').unwrap_or(rest.len());
             let host = &rest[..host_end];
+            if host != "github.com" {
+                return None;
+            }
+            let path = &rest[host_end..];
+            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+        }
+
+        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
+        if let Some(rest) = trimmed.strip_prefix("ssh://") {
+            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
+            let host_end = rest.find('/').unwrap_or(rest.len());
+            let host = &rest[..host_end];
+            // Strip a numeric port; a non-numeric suffix stays part of the
+            // host and fails the strict check below.
+            let host = host.split_once(':').map_or(host, |(h, port)| {
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    h
+                } else {
+                    host
+                }
+            });
             if host != "github.com" {
                 return None;
             }
@@ -2135,8 +2219,7 @@ impl Services {
     /// Raising `unread` never downgrades a persistent `review_required` flag
     /// (which only `workspace.dismissAttention` retires): the write is guarded
     /// on `attention = none`, so a completed turn on a review-required
-    /// workspace is a no-op — no event, no `needs_attention → unread`
-    /// demotion in the derived displayStatus.
+    /// workspace is a no-op — no event.
     pub(crate) async fn raise_attention(
         &self,
         workspace_id: &WorkspaceId,
@@ -2167,10 +2250,14 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // The attention flag feeds the derived displayStatus (`unread` /
-        // `review_required` axes, §6.5): recompute-and-compare after the
-        // flag change so the transition emits.
-        self.maybe_emit_display_status_changed(workspace_id).await;
+        // The `unread` flag is not a displayStatus axis (§6.5), so the
+        // turn-end unread raise (the sole caller) never moves the derived
+        // rollup — skip the recompute (it would be a guaranteed no-op). A
+        // non-`unread` raise can move the `review_required` axis, so
+        // recompute-and-compare for those so the transition emits.
+        if level != WorkspaceAttention::Unread {
+            self.maybe_emit_display_status_changed(workspace_id).await;
+        }
         Ok(())
     }
 
@@ -2543,6 +2630,430 @@ impl Services {
         &self.store
     }
 
+    /// Best-effort read of a git root's current HEAD commit SHA, for
+    /// stamping `registered_commit_sha` at registration time (monorepo#2053
+    /// follow-up). Fail-soft: an unreadable HEAD (unborn branch, corrupt
+    /// repo, unreachable mount) yields `None` — never an error. The read is
+    /// git I/O (roots may live on network/FUSE mounts), so it runs on the
+    /// blocking pool — never on the RPC task.
+    async fn read_git_root_head_sha(path: &std::path::Path) -> Option<String> {
+        let dir = path.to_path_buf();
+        tokio::task::spawn_blocking(move || intent_git::refs::rev_parse(&dir, "HEAD"))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
+    /// Persist (insert-or-merge) a workspace git root and emit the matching
+    /// change event (monorepo#2053): `gitRoot:registered` when the upsert
+    /// inserted a new row, `gitRoot:updated` when an existing row was merged
+    /// (re-registration / attribution append). The inserted-vs-merged fact
+    /// comes from the store's serialized upsert itself, so two concurrent
+    /// registrations of the same path emit exactly one `gitRoot:registered`
+    /// (the loser of the insert race observes the merge and emits
+    /// `gitRoot:updated`). On insert the row's `registered_commit_sha` is
+    /// persisted as supplied; on merge the existing value is always retained
+    /// (the store upsert never touches the column). Returns the stored row.
+    /// Callers (the `ws.git.registerRoot` MCP binding, submodule
+    /// auto-detection) validate the path before reaching this.
+    pub async fn register_git_root(
+        &self,
+        root: &intent_core::WorkspaceGitRoot,
+    ) -> Result<intent_core::WorkspaceGitRoot> {
+        let (stored, inserted) = self.store.upsert_workspace_git_root(root).await?;
+        let event_type = if inserted {
+            GIT_ROOT_REGISTERED
+        } else {
+            GIT_ROOT_UPDATED
+        };
+        publish_event(&self.event_bus, git_root_changed_event(event_type, &stored)).await;
+        Ok(stored)
+    }
+
+    /// Delete a workspace git root and emit `gitRoot:unregistered`
+    /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
+    /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
+    pub async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
+        let root = self.store.get_workspace_git_root(git_root_id).await?;
+        self.store.delete_workspace_git_root(git_root_id).await?;
+        publish_event(
+            &self.event_bus,
+            git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Sweep one workspace's tracked git roots (monorepo#2053), run by the
+    /// background PR-refresh loop after the workspace's own PR refresh:
+    /// 1. auto-detect the worktree's initialized git submodules (`.gitmodules`
+    ///    entries with a nested `.git`) and register them as `source: "auto"`
+    ///    roots — idempotent: already-tracked paths are left untouched, and a
+    ///    root removed via `ws.git.unregisterRoot` is re-added by the scan
+    ///    while the submodule exists on disk;
+    /// 2. auto-prune roots whose path no longer exists on disk — only a
+    ///    positive `NotFound`/`NotADirectory` stat prunes; any other stat
+    ///    error (transient `PermissionDenied`/EIO on a flaky mount) logs and
+    ///    skips (emitting `gitRoot:unregistered` via
+    ///    [`Services::unregister_git_root`] when pruning);
+    /// 3. best-effort backfill: a surviving root with a NULL
+    ///    `registered_commit_sha` (predates the column, or HEAD was
+    ///    unreadable at registration) is stamped with its CURRENT HEAD via
+    ///    the `IS NULL`-guarded store write, so old roots gain a boundary
+    ///    going forward (a set value is never overwritten);
+    /// 4. refresh each remaining root's PR linkage by its current branch
+    ///    against its detected repo ([`Services::refresh_git_root_pr`]).
+    ///
+    /// Fail-soft per root: every per-root error is logged and never aborts
+    /// the sweep, so a bad root never fails the workspace refresh. Each
+    /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
+    /// like the workspace refresh itself.
+    ///
+    /// `sc` is `None` when no SourceControl provider is configured: steps
+    /// 1–3 are pure git/store work and still run (so submodule detection,
+    /// pruning, and the commit-sha backfill don't require forge
+    /// credentials); only the per-root PR refresh (step 4) is skipped.
+    async fn sweep_workspace_git_roots(
+        &self,
+        ws: &Workspace,
+        sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+    ) {
+        if ws.is_remote || ws.archived {
+            return;
+        }
+        if let Some(worktree) = git_ops::worktree_path(ws) {
+            let gitmodules = tokio::fs::read_to_string(worktree.join(".gitmodules"))
+                .await
+                .unwrap_or_default();
+            let primary = tokio::fs::canonicalize(&worktree).await.ok();
+            for rel in git_ops::parse_gitmodules_paths(&gitmodules) {
+                let Ok(canonical) = tokio::fs::canonicalize(worktree.join(&rel)).await else {
+                    continue;
+                };
+                // Only initialized submodules (a nested `.git` entry) are
+                // registrable roots; the primary root stays implicit.
+                if !canonical.join(".git").exists() || primary.as_ref() == Some(&canonical) {
+                    continue;
+                }
+                let path = canonical.to_string_lossy().into_owned();
+                match self
+                    .store
+                    .find_workspace_git_root_by_path(&ws.id, &path)
+                    .await
+                {
+                    // Already tracked — no churn (a re-register upsert would
+                    // emit `gitRoot:updated` on every sweep).
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            error = %e,
+                            "git root sweep: root lookup failed"
+                        );
+                        continue;
+                    }
+                }
+                // Best-effort repo detection, mirroring `ws.git.registerRoot`;
+                // non-GitHub remotes leave owner/name unset. The remote read
+                // is git I/O (roots may live on network/FUSE mounts), so it
+                // runs on the blocking pool — never inline on the runtime.
+                let origin_dir = canonical.clone();
+                let (repo_owner, repo_name) = tokio::task::spawn_blocking(move || {
+                    intent_git::remote::origin_url(&origin_dir)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|url| Self::parse_github_owner_repo(&url))
+                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                // Stamp the root's HEAD at registration time (fail-soft:
+                // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
+                let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
+                let ts = now_iso();
+                let root = intent_core::WorkspaceGitRoot {
+                    id: WorkspaceGitRootId::new(),
+                    workspace_id: ws.id.clone(),
+                    path,
+                    source: intent_core::WorkspaceGitRootSource::Auto,
+                    repo_owner,
+                    repo_name,
+                    registered_by_agent_ids: vec![],
+                    registered_commit_sha,
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    pull_requests: None,
+                    created_at: ts.clone(),
+                    updated_at: ts,
+                };
+                if let Err(e) = self.register_git_root(&root).await {
+                    tracing::warn!(
+                        workspace = %ws.id.as_str(),
+                        path = %root.path,
+                        error = %e,
+                        "git root sweep: submodule auto-register failed"
+                    );
+                }
+            }
+        }
+        let roots = match self.store.list_workspace_git_roots(&ws.id).await {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    error = %e,
+                    "git root sweep: listing roots failed"
+                );
+                return;
+            }
+        };
+        for root in roots {
+            // Auto-prune only on a genuine path-gone (`NotFound`, or a parent
+            // component that is no longer a directory). Roots may live
+            // anywhere on the host (network/FUSE mounts included), so a
+            // transient `PermissionDenied`/EIO must never delete an
+            // agent-registered root with its attribution and PR history —
+            // those kinds log and skip the root until the next sweep.
+            if let Err(e) = tokio::fs::metadata(&root.path).await {
+                match e.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                        if let Err(e) = self.unregister_git_root(&root.id).await {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root sweep: auto-prune failed"
+                            );
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            workspace = %ws.id.as_str(),
+                            git_root = %root.id.as_str(),
+                            error = %e,
+                            "git root sweep: root path unreadable, skipping (not pruned)"
+                        );
+                    }
+                }
+                continue;
+            }
+            let mut root = root;
+            // Best-effort backfill: stamp a NULL `registered_commit_sha` with
+            // the root's CURRENT HEAD (rows predating the column, or whose
+            // HEAD was unreadable at registration). The store write is
+            // `IS NULL`-guarded, so a set value is never overwritten; a still
+            // unreadable HEAD leaves the row NULL for the next pass.
+            if root.registered_commit_sha.is_none() {
+                if let Some(sha) =
+                    Self::read_git_root_head_sha(std::path::Path::new(&root.path)).await
+                {
+                    let ts = now_iso();
+                    match self
+                        .store
+                        .backfill_workspace_git_root_commit_sha(&root.id, &sha, &ts)
+                        .await
+                    {
+                        Ok(true) => {
+                            root.registered_commit_sha = Some(sha);
+                            root.updated_at = ts;
+                            publish_event(
+                                &self.event_bus,
+                                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                            )
+                            .await;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                workspace = %ws.id.as_str(),
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root sweep: commit-sha backfill failed"
+                            );
+                        }
+                    }
+                }
+            }
+            // Step 4 (PR refresh) needs a forge; without one the sweep's
+            // local steps above have already done their work.
+            let Some(sc) = sc else {
+                continue;
+            };
+            let root_id = root.id.clone();
+            let refreshed = match tokio::time::timeout(
+                self.pr_refresh_fetch_timeout,
+                self.refresh_git_root_pr(root, sc),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::Internal(format!(
+                    "git root PR refresh timed out after {:?}",
+                    self.pr_refresh_fetch_timeout
+                ))),
+            };
+            if let Err(e) = refreshed {
+                tracing::warn!(
+                    workspace = %ws.id.as_str(),
+                    git_root = %root_id.as_str(),
+                    error = %e,
+                    "git root sweep: root refresh failed"
+                );
+            }
+        }
+    }
+
+    /// Refresh one tracked git root's PR linkage against the forge
+    /// (monorepo#2053) — the per-root analogue of
+    /// [`Services::refresh_workspace_pr_with_sc`], keyed by the root's
+    /// live-read current branch (roots have no `baseRef`). Roots without a
+    /// detected GitHub repo are skipped before any forge call — they stay
+    /// listed for changes browsing. Same semantics as the workspace flow
+    /// otherwise: a linked PR is re-fetched and its snapshot diffed
+    /// (unlinking only on a positive branch mismatch), a linked PR fetched
+    /// as merged/closed stays recorded in `pull_requests` and triggers
+    /// discovery of a newer open PR on the same branch, and an unlinked
+    /// root discovers an open PR by branch. Persists via the scoped
+    /// `update_workspace_git_root_pr` and emits `gitRoot:updated` only on
+    /// change.
+    async fn refresh_git_root_pr(
+        &self,
+        mut root: intent_core::WorkspaceGitRoot,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> Result<pr_ops::PrRefreshOutcome> {
+        use pr_ops::PrRefreshOutcome;
+        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+            return Ok(PrRefreshOutcome::Skipped);
+        };
+        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
+        // The live HEAD read is git I/O (roots may live on network/FUSE
+        // mounts), so it runs on the blocking pool — never inline on the
+        // runtime.
+        let branch_path = std::path::PathBuf::from(&root.path);
+        let branch = tokio::task::spawn_blocking(move || {
+            intent_git::status::current_branch_at(&branch_path)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        match root.pr_number {
+            Some(number) => {
+                let pr = sc
+                    .get_pr(&repo_ref, number)
+                    .await
+                    .map_err(pr_ops::map_sc_err)?;
+                // Clear a stale link only on a positive mismatch against the
+                // root's current branch; an unreadable HEAD (empty branch)
+                // never unlinks.
+                if pr_ops::pr_workspace_mismatch(&pr, &branch, None) {
+                    root.pr_number = None;
+                    root.pr_url = None;
+                    root.pr_status = None;
+                    root.updated_at = now_iso();
+                    self.store.update_workspace_git_root_pr(&root).await?;
+                    publish_event(
+                        &self.event_bus,
+                        git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                    )
+                    .await;
+                    return Ok(PrRefreshOutcome::Unlinked);
+                }
+                let info = pr_ops::build_pr_info(&pr);
+                let list_changed = pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                // A merged/closed linked PR stays recorded in `pull_requests`
+                // but no longer blocks discovery: relink to a newer open PR on
+                // the same branch. A discovery failure degrades to the plain
+                // update path below so the status delta is never lost.
+                if matches!(
+                    info.status,
+                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+                ) && !branch.is_empty()
+                {
+                    let discovered = match pr_ops::discover_matching_open_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &branch,
+                        None,
+                        Some(number),
+                    )
+                    .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            tracing::warn!(
+                                git_root = %root.id.as_str(),
+                                error = %e,
+                                "git root refresh: relink discovery failed, persisting status only"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(open_pr) = discovered {
+                        let open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
+                        root.pr_number = Some(open_pr.number);
+                        root.pr_url = Some(open_pr.url.clone());
+                        root.pr_status = Some(open_info.status);
+                        root.updated_at = now_iso();
+                        self.store.update_workspace_git_root_pr(&root).await?;
+                        publish_event(
+                            &self.event_bus,
+                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                        )
+                        .await;
+                        return Ok(PrRefreshOutcome::Linked);
+                    }
+                }
+                let changed = list_changed
+                    || root.pr_status != Some(info.status)
+                    || root.pr_url.as_deref() != Some(pr.url.as_str());
+                if !changed {
+                    return Ok(PrRefreshOutcome::Unchanged);
+                }
+                root.pr_status = Some(info.status);
+                root.pr_url = Some(pr.url.clone());
+                root.updated_at = now_iso();
+                self.store.update_workspace_git_root_pr(&root).await?;
+                publish_event(
+                    &self.event_bus,
+                    git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                )
+                .await;
+                Ok(PrRefreshOutcome::Updated)
+            }
+            None => {
+                if branch.is_empty() {
+                    return Ok(PrRefreshOutcome::Skipped);
+                }
+                let found =
+                    pr_ops::discover_matching_open_pr(sc.as_ref(), &repo_ref, &branch, None, None)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?;
+                match found {
+                    Some(pr) => {
+                        let info = pr_ops::build_pr_info(&pr);
+                        pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
+                        root.pr_number = Some(pr.number);
+                        root.pr_url = Some(pr.url.clone());
+                        root.pr_status = Some(info.status);
+                        root.updated_at = now_iso();
+                        self.store.update_workspace_git_root_pr(&root).await?;
+                        publish_event(
+                            &self.event_bus,
+                            git_root_changed_event(GIT_ROOT_UPDATED, &root),
+                        )
+                        .await;
+                        Ok(PrRefreshOutcome::Linked)
+                    }
+                    None => Ok(PrRefreshOutcome::Unchanged),
+                }
+            }
+        }
+    }
+
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
     /// any change and emitting the matching `pr:*` event. Used both on demand
     /// and by the background loop. The matching rule is `pr.head.ref ==
@@ -2778,11 +3289,14 @@ impl Services {
         if workspaces.is_empty() {
             return;
         }
+        // An unavailable provider (no credentials / gh setup) skips only the
+        // forge-touching work; the git-root sweep's local steps (submodule
+        // auto-detect, prune, commit-sha backfill) still run below.
         let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
-            Ok(sc) => sc,
+            Ok(sc) => Some(sc),
             Err(e) => {
-                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping sweep");
-                return;
+                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping PR refresh");
+                None
             }
         };
         for ws in workspaces {
@@ -2794,25 +3308,31 @@ impl Services {
             // timeouts: a refresh that pends indefinitely maps to the same
             // log-and-continue path as any other per-workspace error instead
             // of wedging the sweep for every other workspace.
-            let refreshed = match tokio::time::timeout(
-                self.pr_refresh_fetch_timeout,
-                self.refresh_workspace_pr_with_sc(ws, &sc),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Error::Internal(format!(
-                    "PR refresh timed out after {:?}",
-                    self.pr_refresh_fetch_timeout
-                ))),
-            };
-            if let Err(e) = refreshed {
-                tracing::warn!(
-                    workspace = %ws_id.as_str(),
-                    error = %e,
-                    "pr refresh: workspace refresh failed"
-                );
+            if let Some(sc) = &sc {
+                let refreshed = match tokio::time::timeout(
+                    self.pr_refresh_fetch_timeout,
+                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Internal(format!(
+                        "PR refresh timed out after {:?}",
+                        self.pr_refresh_fetch_timeout
+                    ))),
+                };
+                if let Err(e) = refreshed {
+                    tracing::warn!(
+                        workspace = %ws_id.as_str(),
+                        error = %e,
+                        "pr refresh: workspace refresh failed"
+                    );
+                }
             }
+            // After the workspace's own refresh, sweep its tracked git roots
+            // (submodule auto-detect, auto-prune, per-root PR refresh;
+            // monorepo#2053). Fail-soft internally, per-root timeouts inside.
+            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
@@ -3220,6 +3740,47 @@ impl Services {
         self.agent_failure_streaks
             .lock()
             .expect("agent failure streak registry poisoned")
+            .remove(agent_id);
+    }
+
+    /// Stash the terminal-error context the streaming path already persisted
+    /// (monorepo#2050) so the turn worker's terminal-failure handler reuses it
+    /// instead of recording the failure streak and writing the Error status a
+    /// second time. Overwrites any prior slot for `agent_id` (single-shot).
+    pub(crate) fn stash_pending_terminal_error(
+        &self,
+        agent_id: &AgentId,
+        error: crate::agent_manager::PersistedTerminalError,
+    ) {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
+            .insert(agent_id.clone(), error);
+    }
+
+    /// Take (and remove) the stashed terminal-error context for `agent_id`, if
+    /// the streaming path persisted one for this failure (monorepo#2050).
+    pub(crate) fn take_pending_terminal_error(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<crate::agent_manager::PersistedTerminalError> {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
+            .remove(agent_id)
+    }
+
+    /// Drop any stashed terminal-error context for `agent_id` WITHOUT
+    /// consuming it. Teardown paths that abort the turn worker (stop,
+    /// interrupt, retry, delete) can land between the streaming path's stash
+    /// and the terminal-failure handler's take; the orphaned entry would
+    /// otherwise survive and mis-describe a LATER failure (its streak /
+    /// stop_reason belong to the aborted turn), so every worker-abort path
+    /// discards the slot alongside its other per-turn flags.
+    pub(crate) fn discard_pending_terminal_error(&self, agent_id: &AgentId) {
+        self.pending_terminal_error
+            .lock()
+            .expect("pending terminal error registry poisoned")
             .remove(agent_id);
     }
 
@@ -4018,9 +4579,13 @@ impl Services {
                 if newly_recorded && event.event_type == AGENT_FAILED {
                     // The grouped watch stays armed (group settlement owns
                     // it), so this immediate wake must NOT carry the
-                    // retirement suffix.
+                    // retirement suffix — and its metadata says so
+                    // machine-readably (`watchStillArmed: true`,
+                    // monorepo#2060, mirroring the hook wakes'
+                    // `hookStillActive` flag).
                     let wake = format_completion_wake(child_id, event, None, false);
-                    let metadata = build_event_notification_metadata(&[event]);
+                    let mut metadata = build_event_notification_metadata(&[event]);
+                    metadata["watchStillArmed"] = serde_json::json!(true);
                     if let Err(e) = self
                         .deliver_parent_wake(
                             &parent_ws,
@@ -4122,9 +4687,13 @@ impl Services {
                 continue;
             }
             // `remove_watch` just retired the one-shot watch, so the wake
-            // carries the retirement + re-arm suffix (issue monorepo#2051).
+            // carries the retirement + re-arm suffix (issue monorepo#2051)
+            // and the machine-readable `watchStillArmed: false` metadata
+            // flag (monorepo#2060, mirroring the hook wakes'
+            // `hookStillActive`) so consumers don't parse the note text.
             let wake = format_completion_wake(child_id, event, stall.as_ref(), true);
             let mut metadata = build_event_notification_metadata(&[event]);
+            metadata["watchStillArmed"] = serde_json::json!(false);
             crate::agent_ops::ready_delta::stamp_trigger_tasks(&mut metadata, &trigger_tasks);
             if let Err(e) = self
                 .deliver_parent_wake(
@@ -5017,7 +5586,10 @@ impl Services {
                     message_metadata.as_ref(),
                 ) {
                     match self
-                        .unblocked_section_for_delivery(std::iter::once(message_metadata.as_ref()))
+                        .unblocked_section_for_delivery(
+                            &parent_agent_id,
+                            std::iter::once(message_metadata.as_ref()),
+                        )
                         .await
                     {
                         Some(section) => format!("{content}\n\n{section}"),
@@ -5792,20 +6364,22 @@ pub(crate) fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
     stats
 }
 
-/// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
-/// `getWorkspaceTasks` (`workspace-summaries.ts`) over the `getSpecTaskNotes`
-/// (`task-stats.ts`) filter: spec-linked direct child task notes, **including
-/// cancelled** (renderer selectors derive counts/groupings). When the spec body
-/// has no task links, all direct children with task metadata count (TS
-/// backward-compat fallback). Order follows the stored note order; the title
-/// falls back to `Untitled task` to match the TS `note.title || 'Untitled task'`.
+/// Project a workspace's notes into the canonical `WorkspaceTask` list:
+/// EVERY task note in the workspace (any note with task metadata except the
+/// spec itself) — direct spec children, subtasks, and unlinked tasks alike,
+/// **including cancelled** (renderer selectors derive counts/groupings). Each
+/// row carries `specLinked`: true iff the task id appears in the spec body's
+/// `intent://local/task/{id}` links (false for every row when the spec has no
+/// links; not conditioned on `parent_id`), plus the backing note's
+/// `parentId` so clients can tell subtasks from top-level tasks. Order
+/// follows the stored note order (deduped by id); the title falls back to
+/// `Untitled task` to match the TS `note.title || 'Untitled task'`.
 fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
     let linked = notes
         .iter()
         .find(|n| n.id.as_str() == "spec")
         .map(|n| extract_spec_task_ids(&n.content))
         .unwrap_or_default();
-    let has_links = !linked.is_empty();
     let status_by_id = task_status_by_id(notes);
 
     let mut seen = HashSet::new();
@@ -5816,12 +6390,6 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
         };
         let id = note.id.as_str();
         if id == "spec" {
-            continue;
-        }
-        if note.parent_id.as_ref().map(|p| p.as_str()) != Some("spec") {
-            continue;
-        }
-        if has_links && !linked.contains(id) {
             continue;
         }
         if !seen.insert(id.to_string()) {
@@ -5836,6 +6404,8 @@ fn workspace_task_list(notes: &[Note]) -> Vec<WorkspaceTask> {
             },
             status: task.status,
             updated_at: note.updated_at.clone(),
+            spec_linked: linked.contains(id),
+            parent_id: note.parent_id.clone(),
             depends_on: task.depends_on.clone(),
             conflicts_with: task.conflicts_with.clone(),
             unmet_depends_on: unmet_depends_on_ids(&task.depends_on, &status_by_id),
@@ -6043,10 +6613,12 @@ fn ensure_no_tree_relative_dependency(
 /// `Untitled task` title fallback. Returns `Internal` when the note is not a
 /// task (mirrors `task.getMyTask`'s "Note is not a task" guard).
 /// `status_by_id` feeds the computed `unmetDependsOn` (callers may pass an
-/// empty map when the note has no `dependsOn` edges).
+/// empty map when the note has no `dependsOn` edges); `spec_linked` is
+/// whether the task id appears in the spec body's task links.
 fn note_to_workspace_task(
     note: &Note,
     status_by_id: &HashMap<String, TaskStatus>,
+    spec_linked: bool,
 ) -> Result<WorkspaceTask> {
     let task = match &note.metadata.task {
         Some(t) => t,
@@ -6061,6 +6633,8 @@ fn note_to_workspace_task(
         },
         status: task.status,
         updated_at: note.updated_at.clone(),
+        spec_linked,
+        parent_id: note.parent_id.clone(),
         depends_on: task.depends_on.clone(),
         conflicts_with: task.conflicts_with.clone(),
         unmet_depends_on: unmet_depends_on_ids(&task.depends_on, status_by_id),
@@ -6221,6 +6795,26 @@ pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     } else {
         base.to_string()
     }
+}
+
+/// True when `repo_path` is a daemon-provisioned (workspace-owned) checkout
+/// that must stay OUT of the `known_repo` registry
+/// (intent-hq/monorepo#2227): either the workspace's `repository_path` IS its
+/// checkout (standalone clone / cache hydration, where
+/// `repository_path == worktree_path`), or the path lives under one of the
+/// daemon's workspace roots (covers `ws.path` fallbacks, worktree-less rows,
+/// and leftovers from deleted workspaces). Genuine user repos live outside
+/// the roots and are never their own checkout.
+fn is_workspace_owned_checkout(
+    repo_path: &str,
+    worktree_path: Option<&str>,
+    workspaces_roots: &[PathBuf],
+) -> bool {
+    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path) {
+        return true;
+    }
+    let path = Path::new(repo_path);
+    workspaces_roots.iter().any(|root| path.starts_with(root))
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -7051,21 +7645,47 @@ mod orphan_trash_sweep_tests {
 }
 
 /// Upsert into the registry every workspace that carries a `repository_path`
-/// (TS `repo.list` one-time sync). Best-effort: callers ignore the result so a
+/// (TS `repo.list` one-time sync), skipping workspace-owned checkouts
+/// ([`is_workspace_owned_checkout`]) — then sweep pre-existing registry rows
+/// that point at such checkouts so polluted registries self-heal
+/// (intent-hq/monorepo#2227). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
-async fn sync_repos_from_workspaces(store: &Store) -> Result<()> {
+async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf]) -> Result<()> {
     let workspaces = store.list_workspaces(true).await?;
-    for ws in workspaces {
+    for ws in &workspaces {
         let Some(repo_path) = ws.repository_path.as_deref() else {
             continue;
         };
         if repo_path.is_empty() {
             continue;
         }
+        if is_workspace_owned_checkout(repo_path, ws.worktree_path.as_deref(), workspaces_roots) {
+            continue;
+        }
         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
         store
             .upsert_known_repo(repo_path, &name, ws.repository_owner.as_deref())
             .await?;
+    }
+    // Self-heal: drop rows registered before the skip above existed. A row is
+    // workspace-owned when it sits under a workspaces root (also covers
+    // leftovers from deleted workspaces) or matches a live workspace's
+    // standalone checkout (`repository_path == worktree_path`) that lives
+    // outside the current roots (e.g. under a former worktrees location).
+    let standalone: std::collections::HashSet<&str> = workspaces
+        .iter()
+        .filter(|ws| {
+            ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
+                && ws.repository_path == ws.worktree_path
+        })
+        .filter_map(|ws| ws.repository_path.as_deref())
+        .collect();
+    for repo in store.list_known_repos().await? {
+        if standalone.contains(repo.path.as_str())
+            || is_workspace_owned_checkout(&repo.path, None, workspaces_roots)
+        {
+            store.remove_known_repo(&repo.path).await?;
+        }
     }
     Ok(())
 }
@@ -7559,13 +8179,73 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
     }
 }
 
+/// Build a `workspace:setup:started` event (§6.5): an effective setup script
+/// was resolved for the create's setup stage and a spawn will be attempted.
+fn workspace_setup_started_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SETUP_STARTED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+        }),
+    }
+}
+
+/// Build a `workspace:setup:completed` event (§6.5): the create's setup stage
+/// reached a terminal state. `ran_script` is true only when the script's
+/// terminal actually spawned; `exit_code` is present only when the script ran
+/// to exit and its status was observable. `exitCode` is omitted (not null)
+/// when unavailable so the payload stays self-sufficient.
+pub(crate) fn workspace_setup_completed_event(
+    workspace_id: &WorkspaceId,
+    ran_script: bool,
+    exit_code: Option<u32>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "ranScript": ran_script,
+    });
+    if let Some(code) = exit_code {
+        data["exitCode"] = serde_json::json!(code);
+    }
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SETUP_COMPLETED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    }
+}
+
 /// Publish a `workspace:created` event for a workspace row inserted outside
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
 /// like every change-event publish: failures are logged, never returned.
+///
+/// Import paths run no setup stage, so the matching
+/// `workspace:setup:completed { ranScript: false }` is published immediately
+/// after — otherwise the watcher registry would hold the workspace's watcher
+/// start pending for the full setup backstop (§6.5 pairs every logical create
+/// with exactly one completion).
 pub async fn publish_workspace_created(bus: &EventBus, ws: &Workspace) {
     if let Err(e) = bus.publish(&workspace_created_event(ws)).await {
         tracing::warn!(error = %e, "failed to publish workspace:created event");
+    }
+    if let Err(e) = bus
+        .publish(&workspace_setup_completed_event(&ws.id, false, None))
+        .await
+    {
+        tracing::warn!(error = %e, "failed to publish workspace:setup:completed event");
     }
 }
 
@@ -7881,6 +8561,78 @@ fn token_usage_changed_event(workspace_id: &WorkspaceId, usage: &TokenUsage) -> 
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "tokenUsage": usage,
+        }),
+    }
+}
+
+/// Build a `gitRoot:registered` / `gitRoot:updated` event (§6.5,
+/// monorepo#2053) carrying the full persisted row as `gitRoot` so clients
+/// re-render without a follow-up `gitRoot.list`. `event_type` must be
+/// [`GIT_ROOT_REGISTERED`] or [`GIT_ROOT_UPDATED`].
+pub(crate) fn git_root_changed_event(
+    event_type: &str,
+    root: &intent_core::WorkspaceGitRoot,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: root.workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": root.workspace_id.as_str(),
+            "gitRoot": root,
+        }),
+    }
+}
+
+/// Serialize persisted [`intent_core::WorkspaceGitRoot`] rows into their wire
+/// rows — the persisted fields plus a live-read `branch` (never persisted;
+/// HEAD moves outside the daemon's control, so it is read per call like the
+/// FE's own branch display). The branch reads are per-root git I/O, so
+/// callers run this on the blocking pool — never on the RPC task (the
+/// "no per-item git operations" cost contract, AGENTS.md). Shared by
+/// `gitRoot.list` and `ws.git.registerRoot` so the two surfaces cannot drift
+/// (monorepo#2053).
+pub(crate) fn git_root_wire_rows(
+    roots: &[intent_core::WorkspaceGitRoot],
+) -> Vec<serde_json::Value> {
+    roots
+        .iter()
+        .map(|root| {
+            let branch = intent_git::status::current_branch_at(std::path::Path::new(&root.path));
+            let mut v = serde_json::to_value(root).unwrap_or_default();
+            if let (Some(obj), Some(branch)) = (v.as_object_mut(), branch) {
+                obj.insert("branch".to_string(), serde_json::Value::String(branch));
+            }
+            v
+        })
+        .collect()
+}
+
+/// Build a `gitRoot:unregistered` event (§6.5, monorepo#2053). Carries the
+/// removed root's id and path so clients drop the row without a re-list.
+pub(crate) fn git_root_unregistered_event(
+    workspace_id: &WorkspaceId,
+    git_root_id: &WorkspaceGitRootId,
+    path: &str,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: GIT_ROOT_UNREGISTERED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "gitRootId": git_root_id.as_str(),
+            "path": path,
         }),
     }
 }
@@ -8636,7 +9388,10 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// `ws.agent.watch` re-arm pointer (or, for `agent:deleted`, a "cannot be
 /// re-watched" note — a deleted agent is rejected by `agent.watch` and has
 /// no next completion); `false` on the immediate grouped-failure path,
-/// whose watch stays armed for group settlement.
+/// whose watch stays armed for group settlement. Both call sites pair the
+/// note with the machine-readable `watchStillArmed` flag on the wake's
+/// `event_notification` metadata (monorepo#2060, the `hookStillActive`
+/// twin): `!watch_retired` there.
 fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
@@ -10514,6 +11269,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_read_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            // Blocking thread: a 16 MiB window read should not stall the
+            // async executor (matching workspace.export.read).
+            tokio::task::spawn_blocking(move || file_ops::read_chunk(&root, &path, offset, length))
+                .await
+                .map_err(|e| Error::Internal(format!("file.readChunk task failed: {e}")))?
+        })
+    }
+
     fn file_write(
         &self,
         workspace_id: WorkspaceId,
@@ -10807,6 +11582,52 @@ impl WorkspaceApi for Services {
             }
             Ok(result)
         })
+    }
+
+    fn file_attachment_upload_begin(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+        mime_type: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_begin_op(
+                workspace_id,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+            )
+            .await
+        })
+    }
+
+    fn file_attachment_upload_chunk(
+        &self,
+        upload_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.file_attachment_upload_chunk_op(upload_id, seq, data)
+                .await
+        })
+    }
+
+    fn file_attachment_upload_commit(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_commit_op(upload_id).await })
+    }
+
+    fn file_attachment_upload_abort(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.file_attachment_upload_abort_op(upload_id).await })
     }
 
     fn file_get_attachment_info(
@@ -11500,6 +12321,13 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    // Kept alongside the resolved parent below: the known-repo
+                    // registration hook checks BOTH roots (a configured
+                    // `worktreesLocation` may differ from the boot root, and a
+                    // path under either is daemon-managed storage).
+                    let boot_root = workspaces_root
+                        .clone()
+                        .unwrap_or_else(default_workspaces_root);
                     let workspaces_root = resolve_workspaces_parent(
                         workspaces_root,
                         workspaces_root_pinned,
@@ -12098,6 +12926,7 @@ impl WorkspaceApi for Services {
                         token_usage: None,
                         cow_supported: None,
                         display_status: None,
+                        waiting: false,
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
@@ -12740,14 +13569,32 @@ impl WorkspaceApi for Services {
                     }
                     // Register the repo in the persistent registry so it survives
                     // workspace deletion and appears in `repo.list` without a restart
-                    // (TS `workspace.service` `addRepo` hook). Best-effort: a registry
+                    // (TS `workspace.service` `addRepo` hook). Workspace-owned
+                    // checkouts (standalone clone / cache hydration, or any path
+                    // under the workspaces root — including the `ws.path`
+                    // fallback) are not user repos and stay out of the registry
+                    // (intent-hq/monorepo#2227). Best-effort: a registry
                     // failure must not fail workspace creation.
+                    // Same two-root set as the `repo.list` sweep: the resolved
+                    // create-time parent plus the boot root, so a stale
+                    // checkout under the other root never registers either.
+                    let mut registry_roots = vec![workspaces_root_pathbuf.clone()];
+                    if !registry_roots.contains(&boot_root) {
+                        registry_roots.push(boot_root.clone());
+                    }
                     let repo_path = ws
                         .repository_path
                         .as_deref()
                         .filter(|p| !p.is_empty())
                         .or(ws.path.as_deref())
-                        .filter(|p| !p.is_empty());
+                        .filter(|p| !p.is_empty())
+                        .filter(|p| {
+                            !is_workspace_owned_checkout(
+                                p,
+                                ws.worktree_path.as_deref(),
+                                &registry_roots,
+                            )
+                        });
                     if let Some(repo_path) = repo_path {
                         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
                         if let Err(e) = store
@@ -12825,6 +13672,16 @@ impl WorkspaceApi for Services {
                         } else {
                             metadata.remove("initialMessage");
                         }
+                        // The effective session-level image blocks, mirroring
+                        // the `agent_create_op` harvest (top-level param wins
+                        // over the `metadata.imageBlocks` fallback). Captured
+                        // here because the created `AgentLite` no longer
+                        // serves `imageBlocks` (list-projection cost contract)
+                        // and the first-turn threading below still needs them.
+                        let image_blocks = agent
+                            .image_blocks
+                            .or_else(|| metadata.get("imageBlocks").cloned())
+                            .filter(|v| !v.is_null());
                         let extra = intent_core::AgentCreateExtra {
                             provider: nonempty_owned(agent.provider),
                             agent_type: nonempty_owned(agent.agent_type),
@@ -12832,7 +13689,7 @@ impl WorkspaceApi for Services {
                             context_references: agent
                                 .context_references
                                 .filter(|v| !v.is_null()),
-                            image_blocks: agent.image_blocks.filter(|v| !v.is_null()),
+                            image_blocks: image_blocks.clone(),
                             file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
                             // The initial agent is the workspace's
                             // foreground agent (top-level wins over any
@@ -12861,14 +13718,12 @@ impl WorkspaceApi for Services {
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
-                        // Extract image_blocks and context_references from the created
-                        // agent (STAB-69: thread them into the first turn so imageBlocks
-                        // attached to the initial prompt reach the ACP).
-                        let created_image_blocks = created
-                            .get("agent")
-                            .and_then(|a| a.get("imageBlocks"))
-                            .filter(|v| !v.is_null())
-                            .cloned();
+                        // Extract file_blocks and context_references from the created
+                        // agent (STAB-69: thread them into the first turn so attachments
+                        // on the initial prompt reach the ACP). Image blocks come from
+                        // the harvested input above — the `AgentLite` create result no
+                        // longer carries `imageBlocks`.
+                        let created_image_blocks = image_blocks;
                         let created_file_blocks = created
                             .get("agent")
                             .and_then(|a| a.get("fileBlocks"))
@@ -12934,12 +13789,19 @@ impl WorkspaceApi for Services {
                     // Skipped when skipWorktree or no worktree was provisioned.
                     // Lives inside the idempotency closure so a cached response (same idempotencyKey)
                     // returns immediately without re-executing the script.
+                    // Setup lifecycle (§6.5): `workspace:setup:started` fires iff an
+                    // effective script was resolved and a spawn will be attempted;
+                    // exactly one `workspace:setup:completed` fires per logical create
+                    // on every terminal path of the setup stage. Idempotent replays
+                    // publish nothing (same as `workspace:created`).
                     let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
-                    if !ws.skip_worktree {
-                    if let Some(worktree_path_buf) =
+                    let setup_worktree = if ws.skip_worktree {
+                        None
+                    } else {
                         crate::git_ops::worktree_path(&ws)
-                    {
+                    };
+                    if let Some(worktree_path_buf) = setup_worktree {
                         // Spawn background task to read + execute setup script (fire-and-forget).
                         // Move config IO into the task so workspace.create doesn't block on it.
                         let workspace_id = ws.id.clone();
@@ -12978,7 +13840,15 @@ impl WorkspaceApi for Services {
                             };
                             let script = match effective_script {
                                 Some(s) => s,
-                                None => return, // No script to execute
+                                None => {
+                                    // No script to execute: the setup stage is done.
+                                    publish_event(
+                                        &bus_for_setup,
+                                        workspace_setup_completed_event(&workspace_id, false, None),
+                                    )
+                                    .await;
+                                    return;
+                                }
                             };
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
@@ -12986,6 +13856,15 @@ impl WorkspaceApi for Services {
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
+                            // A script was resolved and a spawn will be attempted.
+                            publish_event(
+                                &bus_for_setup,
+                                workspace_setup_started_event(&workspace_id),
+                            )
+                            .await;
+                            // Every terminal path below funnels into exactly one
+                            // `workspace:setup:completed` publish after this block.
+                            let (ran_script, exit_code): (bool, Option<u32>) = 'setup: {
                             // Write script to a private file under worktree .intent/ directory
                             // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
                             let script_id = uuid::Uuid::new_v4();
@@ -12998,7 +13877,7 @@ impl WorkspaceApi for Services {
                                         workspace = %workspace_id.as_str(),
                                         "setup script execution skipped: .intent is not a real directory (symlink or file)"
                                     );
-                                    return;
+                                    break 'setup (false, None);
                                 }
                             } else {
                                 // .intent doesn't exist, create it with restrictive permissions
@@ -13008,7 +13887,7 @@ impl WorkspaceApi for Services {
                                         error = %e,
                                         "failed to create .intent directory for setup script"
                                     );
-                                    return;
+                                    break 'setup (false, None);
                                 }
                                 #[cfg(unix)]
                                 {
@@ -13053,7 +13932,7 @@ impl WorkspaceApi for Services {
                                     error = %e,
                                     "failed to write setup script to private file"
                                 );
-                                return;
+                                break 'setup (false, None);
                             }
                             // cmd.exe fallback only: the timing wrapper is a
                             // sibling .cmd file rather than an inline `-c`
@@ -13071,7 +13950,7 @@ impl WorkspaceApi for Services {
                                         "failed to write setup script cmd wrapper"
                                     );
                                     let _ = tokio::fs::remove_file(&script_path).await;
-                                    return;
+                                    break 'setup (false, None);
                                 }
                                 Some(p)
                             } else {
@@ -13108,18 +13987,19 @@ impl WorkspaceApi for Services {
                                     // Spawn output stream to fan setup script output to event bus
                                     crate::terminal_ops::spawn_output_stream(
                                         pty_for_setup.clone(),
-                                        bus_for_setup,
+                                        bus_for_setup.clone(),
                                         workspace_id.clone(),
                                         pty_id,
                                         terminal_id,
                                     );
                                     // Wait for the script to actually complete before cleanup
-                                    let _ = pty_for_setup.wait(pty_id).await;
+                                    let exit = pty_for_setup.wait(pty_id).await;
                                     // Best-effort cleanup of the script + wrapper files (after exit)
                                     let _ = tokio::fs::remove_file(&script_path).await;
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
+                                    (true, exit.ok().map(|e| e.exit_code))
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -13132,10 +14012,28 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
+                                    (false, None)
                                 }
                             }
+                            };
+                            publish_event(
+                                &bus_for_setup,
+                                workspace_setup_completed_event(
+                                    &workspace_id,
+                                    ran_script,
+                                    exit_code,
+                                ),
+                            )
+                            .await;
                         });
-                    }
+                    } else {
+                        // skipWorktree / no worktree provisioned: the setup stage
+                        // never runs, but the lifecycle still completes.
+                        publish_event(
+                            &bus_for_setup,
+                            workspace_setup_completed_event(&ws.id, false, None),
+                        )
+                        .await;
                     }
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
@@ -14073,74 +14971,11 @@ impl WorkspaceApi for Services {
     }
 
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         let this = self.clone();
-        let manager = self.agent_manager();
-        Box::pin(async move {
-            if id.is_chief() {
-                return Ok(chief_workspace());
-            }
-            let mut ws = store.get_workspace(&id).await?;
-            ws.status = WorkspaceStatus::Active;
-            ws.archived = false;
-            ws.archived_at = None;
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
-            // Re-engage queues parked by the archived gates
-            // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
-            // background agent's drain organically, so without this a queue
-            // parked during archive — including the hook-cancel wake notices
-            // — would stay stranded until someone happened to message the
-            // agent. Kick the drain for every workspace agent with
-            // ready-to-send work (cheap summary read, no message hydration);
-            // `try_drain_queue` re-checks its own gates (busy, question
-            // hold, Error park). Best-effort: a listing failure is logged
-            // and unarchive still succeeds — parked queues then drain on the
-            // next explicit kick.
-            if let Some(manager) = manager {
-                match store.list_agent_session_summaries(&id).await {
-                    Ok(sessions) => {
-                        for session in sessions {
-                            if this.has_ready_to_send(&session.id) {
-                                manager
-                                    .clone()
-                                    .try_drain_queue(session.id, id.clone())
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        workspace = %id.as_str(),
-                        error = %e,
-                        "unarchive: agent session listing failed; parked queues drain on next kick"
-                    ),
-                }
-            }
-            // Derive `lastActivity` (§9.1) and persist it through the scoped
-            // monotonic write (monorepo#1585).
-            this.derive_and_persist_last_activity(&mut ws, "workspace.unarchive")
-                .await;
-            // Derive `activity` from live agent state (§9.9) so the mutation
-            // response carries `agent_running` when agents are in-flight,
-            // not the stale default `idle` from the persisted row.
-            ws.activity = this.workspace_activity(&ws.id);
-            // Full applied delta with an explicit JSON `null` for `archivedAt`
-            // so clients clear the field instead of keeping the stale value.
-            publish_event(
-                &bus,
-                workspace_updated_event(
-                    &ws.id,
-                    serde_json::json!({
-                        "archived": false,
-                        "status": ws.status,
-                        "archivedAt": serde_json::Value::Null,
-                    }),
-                ),
-            )
-            .await;
-            Ok(ws)
-        })
+        // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
+        // no `autoUnarchive` stamp on the emitted delta (absent ≠
+        // present-false, PROTOCOL §6.5).
+        Box::pin(async move { this.unarchive_workspace_inner(id, None).await })
     }
 
     fn duplicate_workspace(
@@ -14261,6 +15096,7 @@ impl WorkspaceApi for Services {
                 token_usage: None,
                 cow_supported: None,
                 display_status: None,
+                waiting: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -14682,6 +15518,10 @@ impl WorkspaceApi for Services {
                 );
             }
             publish_event(&bus, workspace_created_event(&ws)).await;
+            // `workspace.duplicate` never runs a setup script, but the setup
+            // lifecycle (§6.5) still completes so clients waiting on
+            // `workspace:setup:completed` converge on every create-shaped flow.
+            publish_event(&bus, workspace_setup_completed_event(&ws.id, false, None)).await;
             // Seed the default spec note for the new workspace (mirrors the
             // `workspace.create` flow so `note.list` returns the well-known
             // `spec` id immediately).
@@ -14903,8 +15743,8 @@ impl WorkspaceApi for Services {
                 // clears the blue dot together (PROTOCOL §6.5); emit only on an
                 // actual change.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The cleared flag feeds the derived displayStatus (`unread` /
-                // `review_required` axes, §6.5): recompute-and-compare.
+                // The cleared flag feeds the derived displayStatus
+                // (`review_required` axis, §6.5): recompute-and-compare.
                 this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
@@ -14943,10 +15783,9 @@ impl WorkspaceApi for Services {
                 )
                 .await?;
             if changed {
+                // The unread flag is not a displayStatus axis (§6.5), so
+                // clearing it never moves the derived rollup — no recompute.
                 publish_event(&bus, attention_changed_event(&id, WorkspaceAttention::None)).await;
-                // The retired unread flag feeds the derived displayStatus
-                // (`unread` axis, §6.5): recompute-and-compare.
-                this.maybe_emit_display_status_changed(&id).await;
             }
             let mut ws = store.get_workspace(&id).await?;
             // Derive `activity` from live agent state (§9.9) so the mutation
@@ -16466,9 +17305,10 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             let notes = store.list_notes(&workspace_id).await?;
-            // `stats` is the workspace-wide rollup over the full spec-linked
-            // set (mirrors the FE `computeTaskStats`); the optional `status`
-            // filter narrows `tasks` only.
+            // `tasks` membership is workspace-wide (every task note, flagged
+            // with `specLinked`); `stats` stays the rollup over the full
+            // spec-linked set (mirrors the FE `computeTaskStats`). The
+            // optional `status` filter narrows `tasks` only.
             let stats = compute_task_stats(&notes);
             let mut tasks = workspace_task_list(&notes);
             if let Some(f) = filter {
@@ -16492,15 +17332,31 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            // Only fetch the workspace note set when there are `dependsOn`
-            // edges to project into `unmetDependsOn`.
-            let status_by_id = match &note.metadata.task {
+            // `specLinked` needs the spec body; only fetch the full workspace
+            // note set when there are `dependsOn` edges to project into
+            // `unmetDependsOn` (the spec rides along in that read), otherwise
+            // a single spec-note read suffices.
+            let (status_by_id, linked) = match &note.metadata.task {
                 Some(t) if !t.depends_on.is_empty() => {
-                    task_status_by_id(&store.list_notes(&workspace_id).await?)
+                    let notes = store.list_notes(&workspace_id).await?;
+                    let linked = notes
+                        .iter()
+                        .find(|n| n.id.as_str() == "spec")
+                        .map(|n| extract_spec_task_ids(&n.content))
+                        .unwrap_or_default();
+                    (task_status_by_id(&notes), linked)
                 }
-                _ => HashMap::new(),
+                _ => {
+                    let linked = match store.get_note(&workspace_id, &NoteId::from("spec")).await {
+                        Ok(spec) => extract_spec_task_ids(&spec.content),
+                        Err(Error::NotFound(_)) => HashSet::new(),
+                        Err(e) => return Err(e),
+                    };
+                    (HashMap::new(), linked)
+                }
             };
-            note_to_workspace_task(&note, &status_by_id)
+            let spec_linked = linked.contains(note.id.as_str());
+            note_to_workspace_task(&note, &status_by_id, spec_linked)
         })
     }
 
@@ -17951,22 +18807,27 @@ impl WorkspaceApi for Services {
     fn git_status(
         &self,
         workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<intent_core::GitStatus>> {
         let svc = self.clone();
         Box::pin(async move {
             // Unknown workspace / remote / non-repo all return the empty status
-            // (the TS `getStatus` fallbacks), never an error.
+            // (the TS `getStatus` fallbacks), never an error — but an unknown
+            // `gitRootId` is `-32602` (monorepo#2053). The root resolves
+            // BEFORE the remote early-return so the id is validated even on a
+            // remote workspace; a valid id then degrades to the same empty
+            // result the primary gets.
             let ws = match svc.store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(Error::NotFound(_)) => return Ok(intent_git::status::empty_status()),
                 Err(e) => return Err(e),
             };
+            let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(intent_git::status::empty_status());
+            };
             if ws.is_remote {
                 return Ok(intent_git::status::empty_status());
             }
-            let Some(path) = git_ops::worktree_path(&ws) else {
-                return Ok(intent_git::status::empty_status());
-            };
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
@@ -17986,6 +18847,186 @@ impl WorkspaceApi for Services {
                 );
             }
             status.map(|s| (*s).clone())
+        })
+    }
+
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // A missing workspace is `NotFound` (router → -32602); a workspace
+            // with no registered roots is an empty list (monorepo#2053).
+            let _ = store.get_workspace(&workspace_id).await?;
+            let roots = store.list_workspace_git_roots(&workspace_id).await?;
+            // The per-root live branch reads are git I/O — batched onto the
+            // blocking pool so this list endpoint never performs per-item
+            // git operations on the RPC task (AGENTS.md cost contract).
+            let git_roots = tokio::task::spawn_blocking(move || git_root_wire_rows(&roots))
+                .await
+                .map_err(|e| Error::Internal(format!("gitRoot.list task failed: {e}")))?;
+            Ok(serde_json::json!({ "gitRoots": git_roots }))
+        })
+    }
+
+    fn git_root_register(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            let ws = svc.store.get_workspace(&workspace_id).await?;
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(Error::InvalidParams("path is required".to_string()));
+            }
+            // A relative path resolves against the workspace worktree — the
+            // caller is an agent whose cwd is the worktree, and resolving
+            // against the daemon's own cwd would be surprising and
+            // daemon-launch-dependent. Absolute paths pass through untouched.
+            let requested = if std::path::Path::new(trimmed).is_absolute() {
+                PathBuf::from(trimmed)
+            } else {
+                let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
+                    Error::InvalidParams(format!(
+                        "Relative path requires a workspace worktree to resolve against: \
+                         {trimmed}"
+                    ))
+                })?;
+                worktree.join(trimmed)
+            };
+            // Canonicalize next — registration is idempotent by canonical
+            // path, and the path may live anywhere on the host (no worktree
+            // containment, monorepo#2053).
+            let canonical = tokio::fs::canonicalize(&requested)
+                .await
+                .map_err(|_| Error::InvalidParams(format!("Path does not exist: {trimmed}")))?;
+            // A repo root has a `.git` entry — a directory for a normal
+            // clone, a file for linked worktrees and submodule checkouts.
+            if !canonical.join(".git").exists() {
+                return Err(Error::InvalidParams(format!(
+                    "Not a git repository root (no .git entry): {}",
+                    canonical.display()
+                )));
+            }
+            // The workspace's own primary root is tracked implicitly; only
+            // secondary roots are registrable.
+            if let Some(primary) = git_ops::worktree_path(&ws) {
+                if let Ok(primary) = tokio::fs::canonicalize(&primary).await {
+                    if primary == canonical {
+                        return Err(Error::InvalidParams(
+                            "The workspace's primary git root is tracked implicitly; \
+                             only secondary roots can be registered"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            // Best-effort repo owner/name detection from the root's `origin`
+            // remote — nullable, non-github remotes are left unset. The
+            // remote read is git I/O (the root may live on a network/FUSE
+            // mount), so it runs on the blocking pool — never on the RPC task.
+            let origin_dir = canonical.clone();
+            let (repo_owner, repo_name) =
+                tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&origin_dir))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten()
+                    .and_then(|url| Self::parse_github_owner_repo(&url))
+                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+            // Stamp the root's HEAD at registration time (fail-soft:
+            // unreadable HEAD ⇒ NULL; the store merge never overwrites an
+            // existing value on re-registration).
+            let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
+            let ts = now_iso();
+            let root = intent_core::WorkspaceGitRoot {
+                id: WorkspaceGitRootId::new(),
+                workspace_id,
+                path: canonical.to_string_lossy().into_owned(),
+                source: intent_core::WorkspaceGitRootSource::Agent,
+                repo_owner,
+                repo_name,
+                registered_by_agent_ids: vec![agent_id],
+                registered_commit_sha,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: ts.clone(),
+                updated_at: ts,
+            };
+            let stored = svc.register_git_root(&root).await?;
+            // The wire row's live branch read is git I/O — off the RPC task.
+            let row = tokio::task::spawn_blocking(move || {
+                git_root_wire_rows(std::slice::from_ref(&stored))
+                    .pop()
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("ws.git.registerRoot task failed: {e}")))?;
+            Ok(row)
+        })
+    }
+
+    fn git_root_unregister(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            let ws = svc.store.get_workspace(&workspace_id).await?;
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err(Error::InvalidParams("path is required".to_string()));
+            }
+            // Mirror `git_root_register`: a relative path resolves against
+            // the workspace worktree so the spelling that registered a root
+            // also unregisters it. No worktree → the raw spelling stands.
+            let requested = match git_ops::worktree_path(&ws) {
+                Some(worktree) if !std::path::Path::new(trimmed).is_absolute() => {
+                    worktree.join(trimmed)
+                }
+                _ => PathBuf::from(trimmed),
+            };
+            // Canonicalize when the directory still exists so the same
+            // spelling that registered the root resolves; fall back to the
+            // raw path for roots whose directory is already gone.
+            let lookup = match tokio::fs::canonicalize(&requested).await {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => trimmed.to_string(),
+            };
+            let root = svc
+                .store
+                .find_workspace_git_root_by_path(&workspace_id, &lookup)
+                .await?
+                .ok_or_else(|| {
+                    Error::NotFound(format!("No git root registered for path: {lookup}"))
+                })?;
+            svc.unregister_git_root(&root.id).await?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "gitRootId": root.id.as_str(),
+                "path": root.path,
+            }))
+        })
+    }
+
+    fn git_root_path(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        let svc = self.clone();
+        Box::pin(async move {
+            // Unlike the workspace-scoped reads, a missing workspace is an
+            // error here (the caller explicitly named a root to resolve).
+            let ws = svc.store.get_workspace(&workspace_id).await?;
+            let path = svc.resolve_git_read_root(&ws, Some(&git_root_id)).await?;
+            // `resolve_git_read_root` with `Some(id)` always yields a path.
+            path.map(|p| p.to_string_lossy().into_owned())
+                .ok_or_else(|| Error::InvalidParams(format!("Unknown git root: {git_root_id}")))
         })
     }
 
@@ -18691,13 +19732,17 @@ impl WorkspaceApi for Services {
 
     fn repo_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
+        let boot_root = self.workspaces_root.clone();
+        let worktrees_location = self.configured_worktrees_location();
         Box::pin(async move {
             // Return the known repos immediately — don't block on the sync.
             let repos = store.list_known_repos().await?;
             // One-time background sync: register repos from existing workspaces
             // so pre-existing workspaces (created before this feature) get
-            // picked up. Spawned so it never blocks/fails the response, and
-            // guarded to run at most once per process (TS `repoRegistrySynced`).
+            // picked up, and sweep out workspace-owned checkouts
+            // (intent-hq/monorepo#2227). Spawned so it never blocks/fails the
+            // response, and guarded to run at most once per process
+            // (TS `repoRegistrySynced`).
             if REPO_REGISTRY_SYNCED
                 .compare_exchange(
                     false,
@@ -18709,7 +19754,14 @@ impl WorkspaceApi for Services {
             {
                 let store = store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = sync_repos_from_workspaces(&store).await {
+                    // Same root set as the teardown sweeps: the boot root plus
+                    // the currently configured `workspace.worktreesLocation`
+                    // (workspaces provisioned there live there).
+                    let mut roots = vec![boot_root.unwrap_or_else(default_workspaces_root)];
+                    if let Some(location) = worktrees_location.filter(|l| !roots.contains(l)) {
+                        roots.push(location);
+                    }
+                    if let Err(e) = sync_repos_from_workspaces(&store, &roots).await {
                         tracing::warn!(error = %e, "failed to sync workspace repos to registry");
                     }
                 });
@@ -19140,7 +20192,11 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+    fn git_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
             // Same empty fallbacks as `git_status` (unknown/remote/non-repo →
@@ -19151,12 +20207,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(path) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(path) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
@@ -19174,7 +20232,9 @@ impl WorkspaceApi for Services {
         paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         let inflight = Arc::clone(&self.git_diffs_inflight);
         let slow_warns = Arc::clone(&self.git_diffs_slow_warns);
@@ -19186,12 +20246,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -19220,6 +20282,7 @@ impl WorkspaceApi for Services {
                 paths.clone(),
                 staged,
                 commit_hash.clone(),
+                git_root_id.clone(),
             );
             loop {
                 match inflight.join(&key) {
@@ -19319,7 +20382,9 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         commit_hash: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             let empty = git_ops::empty_commit_details(&commit_hash);
@@ -19328,12 +20393,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -19356,7 +20423,9 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             // §5.5 paginated read: clamp the page size to [1,200] (default 50)
@@ -19369,12 +20438,14 @@ impl WorkspaceApi for Services {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -19419,7 +20490,9 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         file_path: String,
         git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             // Same empty fallbacks as the other `git.*` reads (unknown/remote/
@@ -19431,12 +20504,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
@@ -22720,6 +23795,172 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.pr_monitor_flush_op(&workspace_id, &monitor_id, check)
                 .await
+        })
+    }
+}
+
+/// Workspace unarchive plumbing shared by the manual RPCs
+/// (`workspace.unarchive` / `workspace.restore`) and the turn-start
+/// auto-unarchive (monorepo — auto-unarchive on agent activity).
+impl Services {
+    /// Flip an archived workspace back to Active: persist the row, kick the
+    /// drains parked by the archived gates, derive `lastActivity`/`activity`,
+    /// and publish ONE `workspace:updated` delta. `auto_unarchive` — set only
+    /// on the turn-start trigger — is embedded additively in the delta's
+    /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
+    /// callers pass `None` and the field is absent (PROTOCOL §6.5).
+    async fn unarchive_workspace_inner(
+        &self,
+        id: WorkspaceId,
+        auto_unarchive: Option<serde_json::Value>,
+    ) -> Result<Workspace> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let manager = self.agent_manager();
+        if id.is_chief() {
+            return Ok(chief_workspace());
+        }
+        let mut ws = store.get_workspace(&id).await?;
+        ws.status = WorkspaceStatus::Active;
+        ws.archived = false;
+        ws.archived_at = None;
+        ws.updated_at = now_iso();
+        store.update_workspace(&ws).await?;
+        // Re-engage queues parked by the archived gates
+        // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
+        // background agent's drain organically, so without this a queue
+        // parked during archive — including the hook-cancel wake notices
+        // — would stay stranded until someone happened to message the
+        // agent. Kick the drain for every workspace agent with
+        // ready-to-send work (cheap summary read, no message hydration);
+        // `try_drain_queue` re-checks its own gates (busy, question
+        // hold, Error park). Best-effort: a listing failure is logged
+        // and unarchive still succeeds — parked queues then drain on the
+        // next explicit kick.
+        if let Some(manager) = manager {
+            match store.list_agent_session_summaries(&id).await {
+                Ok(sessions) => {
+                    for session in sessions {
+                        if self.has_ready_to_send(&session.id) {
+                            manager
+                                .clone()
+                                .try_drain_queue(session.id, id.clone())
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    workspace = %id.as_str(),
+                    error = %e,
+                    "unarchive: agent session listing failed; parked queues drain on next kick"
+                ),
+            }
+        }
+        // Derive `lastActivity` (§9.1) and persist it through the scoped
+        // monotonic write (monorepo#1585).
+        let ctx = if auto_unarchive.is_some() {
+            "auto-unarchive"
+        } else {
+            "workspace.unarchive"
+        };
+        self.derive_and_persist_last_activity(&mut ws, ctx).await;
+        // Derive `activity` from live agent state (§9.9) so the mutation
+        // response carries `agent_running` when agents are in-flight,
+        // not the stale default `idle` from the persisted row.
+        ws.activity = self.workspace_activity(&ws.id);
+        // Full applied delta with an explicit JSON `null` for `archivedAt`
+        // so clients clear the field instead of keeping the stale value.
+        let mut changes = serde_json::json!({
+            "archived": false,
+            "status": ws.status,
+            "archivedAt": serde_json::Value::Null,
+        });
+        if let Some(stamp) = auto_unarchive {
+            changes["autoUnarchive"] = stamp;
+        }
+        publish_event(&bus, workspace_updated_event(&ws.id, changes)).await;
+        Ok(ws)
+    }
+
+    /// Best-effort auto-unarchive at the turn-start choke point
+    /// ([`crate::agent_manager::AgentManager::try_begin_outcome`]'s
+    /// `Started` branch): when a real turn begins in an Archived workspace,
+    /// flip it back to Active and emit the §6.5 `workspace:updated` delta
+    /// stamped `autoUnarchive: { reason: "agent_activity", agentId,
+    /// agentName }`.
+    ///
+    /// Not serialized across concurrent turn starts: two agents winning
+    /// `try_begin` near-simultaneously in the same archived workspace can
+    /// each observe `archived: true` and both emit a stamped delta. The
+    /// row writes are idempotent; consumers keying UI (e.g. a toast) on
+    /// the stamp should dedup per workspace.
+    ///
+    /// Non-archived workspaces cost one point read (`archived` is part of
+    /// the workspace row already fetched by callers of the send path, but
+    /// this helper re-reads to stay self-contained at the choke point) and
+    /// nothing else. Chief is virtual and never archived, so it is skipped
+    /// without a read. NEVER fails the turn: every error is logged as a
+    /// warning and swallowed — a workspace stuck Archived is strictly
+    /// better than a lost turn, and the archived drain gates keep parking
+    /// follow-on wakes until a later trigger succeeds.
+    ///
+    /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
+    /// type cycle: this helper is awaited inside `try_begin`, and the
+    /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
+    /// the row is Active by then, so the re-entrant read short-circuits —
+    /// but the inferred future type would be infinite).
+    pub(crate) fn auto_unarchive_on_turn_start<'a>(
+        &'a self,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if workspace_id.is_chief() {
+                return;
+            }
+            match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => {}
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
+                    );
+                    return;
+                }
+            }
+            // Name lookup is display-only: a lookup failure (or a session
+            // with no row yet) degrades to `null`, never blocks the
+            // unarchive.
+            let agent_name = self
+                .store
+                .get_agent_session_name(agent_id)
+                .await
+                .ok()
+                .flatten();
+            let stamp = serde_json::json!({
+                "reason": "agent_activity",
+                "agentId": agent_id,
+                "agentName": agent_name,
+            });
+            match self
+                .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %agent_id,
+                    "auto-unarchived workspace on agent turn start"
+                ),
+                Err(e) => tracing::warn!(
+                    workspace = %workspace_id.as_str(),
+                    agent = %agent_id,
+                    error = %e,
+                    "auto-unarchive failed; turn proceeds in archived workspace"
+                ),
+            }
         })
     }
 }

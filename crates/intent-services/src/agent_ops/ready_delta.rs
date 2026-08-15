@@ -187,18 +187,18 @@ pub(crate) struct UnblockedTask {
     pub(crate) attention: Option<TaskStatus>,
 }
 
-/// Single-task readiness disposition against `snaps`: greedy-off, so
-/// `conflictsWith` overlap with running work reports as held, and classifying
-/// one id at a time keeps candidates from holding each other.
+/// Single-task readiness disposition against `snaps`: `conflictsWith`
+/// overlap with running work reports as held, and classifying one id at a
+/// time keeps candidates from holding each other.
 ///
-/// Cost: each call rebuilds the conflict adjacency and (greedy-off) runs the
+/// Cost: each call rebuilds the conflict adjacency and runs the
 /// critical-path pass over the whole snapshot, so [`ready_set_delta`] is
 /// O(candidates x (V+E)) with up to two calls per candidate. Acceptable at
 /// workspace task counts and off the hot RPC paths (it runs once per
 /// completion-wake delivery); revisit with a single-id fast path in
 /// [`classify_batch_tasks`] if that ever changes.
 fn classify_one(id: &str, snaps: &HashMap<String, BatchTaskSnap>) -> Option<BatchDisposition> {
-    classify_batch_tasks(&[id.to_string()], snaps, false)
+    classify_batch_tasks(&[id.to_string()], snaps)
         .into_iter()
         .next()
         .map(|(_, disposition)| disposition)
@@ -258,10 +258,7 @@ pub(crate) fn ready_set_delta(
         {
             continue;
         }
-        if !matches!(
-            classify_one(id, snaps),
-            Some(BatchDisposition::Start { .. })
-        ) {
+        if !matches!(classify_one(id, snaps), Some(BatchDisposition::Start)) {
             continue;
         }
         let reason = match classify_one(id, &before) {

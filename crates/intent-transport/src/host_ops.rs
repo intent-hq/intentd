@@ -28,12 +28,15 @@
 //! root so they unit-test cleanly with a temp directory.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use intent_core::path_utils::{
+    has_windows_exec_extension, is_executable_file, WINDOWS_EXEC_EXTENSIONS,
+};
 use intent_core::{path_utils, DiscoveryCache};
 use serde_json::{json, Map, Value};
 
@@ -127,11 +130,41 @@ fn resolve_binary_path_with_tool_dirs(
     common_paths: &[String],
     enriched_tool_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs_and_lookup(
+        name,
+        common_paths,
+        enriched_tool_dirs,
+        lookup_in_path,
+    )
+}
+
+fn resolve_binary_path_with_tool_dirs_and_lookup<F>(
+    name: &str,
+    common_paths: &[String],
+    enriched_tool_dirs: &[PathBuf],
+    path_lookup: F,
+) -> Option<PathBuf>
+where
+    F: FnOnce(&str) -> Option<PathBuf>,
+{
     if name.is_empty() {
         return None;
     }
+    // nvm can leave several Node versions installed while the inherited PATH
+    // still names an older one. enriched_tool_dirs orders nvm installs newest
+    // first, so honor that order before consulting PATH for Node specifically.
+    if name == "node" {
+        let nvm_dirs: Vec<PathBuf> = enriched_tool_dirs
+            .iter()
+            .filter(|dir| is_nvm_node_bin_dir(dir))
+            .cloned()
+            .collect();
+        if let Some(path) = find_executable_in_dir_candidates(name, &nvm_dirs) {
+            return Some(path);
+        }
+    }
     // 1. PATH which/where (ranked so Windows prefers a runnable extension)
-    if let Some(path) = lookup_in_path(name) {
+    if let Some(path) = path_lookup(name) {
         if path.is_file() || path.is_symlink() {
             return Some(path);
         }
@@ -154,22 +187,23 @@ fn resolve_binary_path_with_tool_dirs(
     None
 }
 
-/// Extensions Windows can actually run (`CreateProcess` / `cmd.exe`-runnable),
-/// in resolution-preference order. Mirrors the provider-discovery policy in
-/// `intent_providers::discover` so `host.findBinary` and provider spawning
-/// agree on what "runnable" means.
-const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
-
-/// True when `path` carries a Windows-runnable executable extension
-/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
-fn has_windows_exec_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            WINDOWS_EXEC_EXTENSIONS
-                .iter()
-                .any(|e| ext.eq_ignore_ascii_case(e))
-        })
+fn is_nvm_node_bin_dir(path: &Path) -> bool {
+    let Some(version_dir) = path.parent() else {
+        return false;
+    };
+    let Some(node_dir) = version_dir.parent() else {
+        return false;
+    };
+    let Some(versions_dir) = node_dir.parent() else {
+        return false;
+    };
+    let Some(nvm_dir) = versions_dir.parent() else {
+        return false;
+    };
+    path.file_name() == Some(OsStr::new("bin"))
+        && node_dir.file_name() == Some(OsStr::new("node"))
+        && versions_dir.file_name() == Some(OsStr::new("versions"))
+        && nvm_dir.file_name() == Some(OsStr::new(".nvm"))
 }
 
 /// Candidate filenames to try when resolving `name` in a directory, mirroring
@@ -196,6 +230,19 @@ fn find_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
         for candidate in &candidates {
             let full = dir.join(candidate);
             if full.is_file() || full.is_symlink() {
+                return Some(full);
+            }
+        }
+    }
+    None
+}
+
+fn find_executable_in_dir_candidates(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let candidates = name_candidates_for(name, cfg!(windows));
+    for dir in dirs {
+        for candidate in &candidates {
+            let full = dir.join(candidate);
+            if is_executable_file(&full) {
                 return Some(full);
             }
         }

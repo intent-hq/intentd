@@ -157,6 +157,65 @@ pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
     Ok(Value::String(content))
 }
 
+/// Maximum bytes served per `file.readChunk` call BEFORE base64 encoding.
+/// Matches the transfer chunk cap ([`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`])
+/// so the ~21.4 MiB encoded frame stays comfortably under the 40 MiB
+/// outbound cap (PROTOCOL §1.3).
+pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+
+/// `file.readChunk` → `{ content (base64), bytesRead, size }` — one
+/// offset-windowed slice of a workspace file's raw bytes, the FE-ward
+/// binary counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
+/// intent-hq/monorepo#2458). `length` is capped at
+/// [`READ_CHUNK_MAX_BYTES`] decoded (over-cap → -32602); a read at/past
+/// EOF returns an empty chunk with `bytesRead: 0`; a short window at EOF
+/// returns just the remaining bytes. Directories are rejected as -32602;
+/// a missing file surfaces as -32603 per the existing file-op convention.
+///
+/// Unlike the TS-parity CWD fallback the string `file.*` ops keep, an
+/// empty root (unknown or pathless workspace) is rejected outright:
+/// [`is_within`] treats an empty root as matching every path, so falling
+/// through would let an arbitrary `workspaceId` + absolute path turn this
+/// endpoint into an unrestricted raw-byte file reader.
+pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Result<Value> {
+    use base64::Engine as _;
+    use std::io::{Read as _, Seek as _};
+
+    if root.is_empty() {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
+    }
+    if length == 0 {
+        return Err(Error::InvalidParams("length must be positive".to_string()));
+    }
+    if length > READ_CHUNK_MAX_BYTES as u64 {
+        return Err(Error::InvalidParams(format!(
+            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
+        )));
+    }
+    let full = resolve_within(root, path)?;
+    let md = std::fs::metadata(&full).map_err(io_err)?;
+    if md.is_dir() {
+        return Err(Error::InvalidParams(format!(
+            "path is a directory — file.readChunk serves regular files: {path}"
+        )));
+    }
+    let size = md.len();
+    let len = if offset >= size {
+        0
+    } else {
+        (size - offset).min(length) as usize
+    };
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        let mut file = std::fs::File::open(&full).map_err(io_err)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(io_err)?;
+        file.read_exact(&mut buf).map_err(io_err)?;
+    }
+    let content = base64::engine::general_purpose::STANDARD.encode(&buf);
+    Ok(json!({ "content": content, "bytesRead": len, "size": size }))
+}
+
 /// `file.write` → `{ ok, path, size }` (size = UTF-16 code-unit length, matching
 /// JS `content.length`). Parent directories are created.
 pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
@@ -172,7 +231,7 @@ pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
 /// Reduce a client-supplied attachment file name to a safe basename: keep
 /// only the final path component (either separator style), then drop any
 /// remaining `..`/`.`/empty outcome. `None` when nothing usable is left.
-fn sanitize_attachment_name(file_name: &str) -> Option<String> {
+pub(crate) fn sanitize_attachment_name(file_name: &str) -> Option<String> {
     let base = file_name
         .rsplit(['/', '\\'])
         .next()
@@ -881,6 +940,94 @@ mod tests {
         assert_eq!(ds["isDirectory"], json!(true));
 
         assert!(matches!(stat(&root, "nope"), Err(Error::Internal(_))));
+    }
+
+    fn decode_chunk(v: &Value) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(v["content"].as_str().expect("content is base64 string"))
+            .expect("valid base64")
+    }
+
+    #[test]
+    fn read_chunk_serves_offset_windows_and_eof_short_read() {
+        let t = TempRoot::new();
+        let root = t.root();
+        // Binary bytes (invalid UTF-8) — exactly what `file.read` rejects.
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(std::path::Path::new(&root).join("blob.bin"), &bytes).unwrap();
+
+        // Full read in one window.
+        let full = read_chunk(&root, "blob.bin", 0, 1024).unwrap();
+        assert_eq!(full["size"], json!(256u64));
+        assert_eq!(full["bytesRead"], json!(256));
+        assert_eq!(decode_chunk(&full), bytes);
+
+        // Interior window.
+        let mid = read_chunk(&root, "blob.bin", 100, 50).unwrap();
+        assert_eq!(mid["bytesRead"], json!(50));
+        assert_eq!(decode_chunk(&mid), &bytes[100..150]);
+
+        // Short read at EOF: window extends past the end → remaining bytes.
+        let tail = read_chunk(&root, "blob.bin", 250, 50).unwrap();
+        assert_eq!(tail["bytesRead"], json!(6));
+        assert_eq!(tail["size"], json!(256u64));
+        assert_eq!(decode_chunk(&tail), &bytes[250..]);
+
+        // Offset at/past EOF: empty chunk, not an error.
+        let past = read_chunk(&root, "blob.bin", 256, 16).unwrap();
+        assert_eq!(past["bytesRead"], json!(0));
+        assert_eq!(decode_chunk(&past), Vec::<u8>::new());
+        let far = read_chunk(&root, "blob.bin", 10_000, 16).unwrap();
+        assert_eq!(far["bytesRead"], json!(0));
+    }
+
+    #[test]
+    fn read_chunk_rejects_containment_directory_cap_and_zero_length() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "a.txt", "x").unwrap();
+        mkdir(&root, "dir").unwrap();
+
+        // Containment: same ACCESS_DENIED as the other file ops.
+        match read_chunk(&root, "../escape.bin", 0, 16) {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied, got {other:?}"),
+        }
+        // Directory → -32602 naming the cause.
+        match read_chunk(&root, "dir", 0, 16) {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("directory"), "unexpected message: {m}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Over-cap length → -32602 naming the cap.
+        match read_chunk(&root, "a.txt", 0, READ_CHUNK_MAX_BYTES as u64 + 1) {
+            Err(Error::InvalidParams(m)) => {
+                assert!(
+                    m.contains(&READ_CHUNK_MAX_BYTES.to_string()),
+                    "unexpected message: {m}"
+                )
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Zero length → -32602.
+        assert!(matches!(
+            read_chunk(&root, "a.txt", 0, 0),
+            Err(Error::InvalidParams(_))
+        ));
+        // Missing file → -32603 per the existing file-op convention.
+        assert!(matches!(
+            read_chunk(&root, "missing.bin", 0, 16),
+            Err(Error::Internal(_))
+        ));
+        // Empty root (unknown/pathless workspace) → ACCESS_DENIED, never the
+        // CWD fallback: an empty root passes is_within for every path, which
+        // would make this an unrestricted raw-byte reader for absolute paths.
+        match read_chunk("", "/etc/hostname", 0, 16) {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied for empty root, got {other:?}"),
+        }
     }
 
     fn place_bytes(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {

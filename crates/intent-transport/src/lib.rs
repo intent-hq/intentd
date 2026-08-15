@@ -74,4 +74,5 @@ pub mod rpc_limit;
 pub mod server;
 mod subscriptions;
 pub mod tls;
+pub mod tunnel;
 pub mod ws;

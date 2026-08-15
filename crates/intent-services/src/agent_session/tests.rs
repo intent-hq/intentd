@@ -665,6 +665,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -944,6 +945,149 @@ async fn prompt_turn_streams_events_and_accumulates() {
         end.data["lastAgentResponse"],
         json!("Hello world"),
         "terminal stream:end carries the final preview from the full turn text"
+    );
+    // Normal `end_turn` endings stay metadata-free: no `finishReason` on the
+    // terminal stream:end and no metadata on the persisted assistant row.
+    assert!(
+        end.data.get("finishReason").is_none(),
+        "finishReason omitted on a normal end_turn ending"
+    );
+    assert!(
+        messages[0].metadata.is_none(),
+        "no row metadata on a normal end_turn ending"
+    );
+}
+
+/// Abnormal turn endings (PROTOCOL §7): a turn resolving with a non-`end_turn`
+/// stop reason (here `refusal`) persists `metadata.finishReason` on the turn's
+/// assistant row — durable across reload — and the terminal `agent:stream:end`
+/// carries the same `finishReason` so live clients render it without a
+/// transcript re-fetch. The turn still completes normally (`agent:idle`, no
+/// `agent:failed`).
+#[tokio::test]
+async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(prompt_updates(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The assistant row carries the durable finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the same finishReason live.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+
+    // The turn is a completion, not a failure: `agent:idle` fires (its
+    // `finishReason` is the existing lifecycle field) and `agent:failed`
+    // never does.
+    let idle = events
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .expect("agent:idle");
+    assert_eq!(idle.data["finishReason"], json!("refusal"));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
+    );
+}
+
+/// A ZERO-OUTPUT abnormal ending (PROTOCOL §7.3): the prompt resolves with an
+/// abnormal stop reason before emitting a single `session/update`. Because
+/// `agent:idle` / `agent:stream:end` are ephemeral, the turn must still
+/// persist an empty marker row (`contentBlocks: []`) tagged with
+/// `metadata.finishReason` so the ending survives a reload — mirroring the
+/// §7.2 pre-first-token interrupt marker row.
+#[tokio::test]
+async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(Vec::new(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The empty marker row is persisted: no content blocks, but the durable
+    // finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, json!([]));
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the finishReason and the marker row's id.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
     );
 }
 
@@ -2813,6 +2957,214 @@ fn connect_with_prompt_rpc_error(
     };
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
     (conn, note_rx, agent)
+}
+
+/// Mock agent whose `session/prompt` resolves with a JSON-RPC ERROR object
+/// carrying an explicit `code` (and message) — used to force a specific
+/// classifier-shaped `AcpError::Rpc`, e.g. the benign `-32800`
+/// request-cancelled code (monorepo#2050 streaming benign-cancel path).
+fn spawn_mock_agent_with_prompt_rpc_error_code<R, W>(
+    read: R,
+    write: W,
+    code: i64,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": code, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
+/// error carrying an explicit `code` + `message`.
+fn connect_with_prompt_rpc_error_code(
+    code: i64,
+    error_message: &str,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent_with_prompt_rpc_error_code(
+        c2a_agent,
+        a2c_agent,
+        code,
+        error_message.to_string(),
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
+/// Durable-before-observable on the STREAMING terminal-failure path
+/// (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error is
+/// emitted by `run_prompt_turn` itself (terminal `agent:stream:end` +
+/// `agent:failed`). The `status = error` + `stop_reason` store write must land
+/// BEFORE either event reaches the bus, so a client reading `agent.getSession`
+/// upon observing `agent:failed` is guaranteed the persisted Error. Runs
+/// `run_prompt_turn` on its own task and reads the store the moment
+/// `agent:failed` arrives — with the persist ordered first the read
+/// deterministically sees `error`. Analogous to the manager-side
+/// `terminal_failure_persists_error_before_publishing_events`.
+#[tokio::test]
+async fn streaming_terminal_failure_persists_error_before_publishing_events() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, note_rx, _agent) = connect_with_prompt_rpc_error(Vec::new(), "backend exploded");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let handle = {
+        let (services, agent_id, workspace_id) =
+            (services.clone(), agent_id.clone(), workspace_id.clone());
+        tokio::spawn(async move {
+            let mut note_rx = note_rx;
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    None,
+                )
+                .await
+                .expect_err("an ordinary prompt error fails the turn")
+        })
+    };
+
+    // Read the store the moment agent:failed lands: the persisted Error must
+    // already be visible.
+    'observed: loop {
+        let batch = timeout(Duration::from_secs(10), sub.recv())
+            .await
+            .expect("agent:failed within 10s")
+            .expect("bus open");
+        for event in batch {
+            if event.event_type == "agent:failed" {
+                break 'observed;
+            }
+        }
+    }
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "status is durably error when agent:failed is observable (monorepo#2050)"
+    );
+    assert!(
+        stored
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("backend exploded")),
+        "stop_reason persisted alongside the status: {:?}",
+        stored.stop_reason
+    );
+
+    let err = handle.await.unwrap();
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "ordinary terminal error keeps the wrapper: {err}"
+    );
+    // The persisted context was stashed for the turn worker to reuse (so the
+    // failure streak / Error status are written exactly once, not twice).
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "streaming path stashed the persisted terminal error for the worker"
+    );
+}
+
+/// A benign provider-resolved cancel (JSON-RPC `-32800` request-cancelled) on
+/// the streaming path must NOT persist an Error status (monorepo#2050): it is
+/// the expected outcome of a concurrent stop/cancel, classified benign by the
+/// same predicate the worker uses. `run_prompt_turn` still emits its terminal
+/// `agent:failed` (the worker suppresses the terminal-failure path), but no
+/// Error is persisted and nothing is stashed for the worker.
+#[tokio::test]
+async fn streaming_benign_cancel_does_not_persist_error() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error_code(-32800, "request cancelled");
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a cancel still returns Err");
+    assert!(
+        crate::agent_manager::prompt_cancellation_error(&err),
+        "the -32800 cancel classifies benign: {err}"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(
+        stored.status,
+        AgentStatus::Error,
+        "a benign cancel must not park the session in Error (monorepo#2050)"
+    );
+    assert!(
+        stored.stop_reason.is_none(),
+        "no error stop_reason for a benign cancel: {:?}",
+        stored.stop_reason
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_none(),
+        "nothing stashed for a benign cancel"
+    );
 }
 
 /// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the

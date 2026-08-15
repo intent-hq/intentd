@@ -10,6 +10,9 @@
 //! - Resumed agents complete their work (observable via WSS events)
 //! - `agent.listInterrupted` returns empty after auto-resume sweep completes
 //! - No `agent.resolveInterrupted` RPC required
+//! - `agents.resumeInterruptedOnStart=on` (written over WSS via
+//!   `settings.update`) runs the same sweep WITHOUT `--resume-all`, even when
+//!   a display is present
 
 #![cfg(unix)]
 
@@ -257,6 +260,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -499,4 +503,214 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     );
 
     eprintln!("SUCCESS: --resume-all auto-resumed agent AND agent completed its turn");
+}
+
+/// `agents.resumeInterruptedOnStart=on` gates the startup sweep without
+/// `--resume-all`: the setting is written over the real WSS transport
+/// (`settings.update`), the daemon is killed with an interrupted agent
+/// pending, and the restarted daemon — no `--resume-all` flag, DISPLAY set so
+/// `auto` would NOT resume — sweeps and resumes the agent anyway.
+#[tokio::test]
+async fn setting_on_resumes_without_resume_all_flag() {
+    let Some(script) = gate("setting_on_resumes_without_resume_all_flag") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+
+    let behavior = json!({
+        "response": "Agent resumed and completed!"
+    })
+    .to_string();
+
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+
+    // Phase 1: Boot daemon1, create workspace and agent, then interrupt it
+    eprintln!("Phase 1: Boot daemon1 and create interrupted agent");
+    let child1 = spawn_serve(&data_dir, "both", &env, false);
+    let _daemon1 = Daemon {
+        child: child1,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon1 did not start");
+
+    let ws_id = {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("insert ws");
+        ws.0
+    };
+
+    let create_result = uds_rpc(
+        &socket,
+        1,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Test Agent",
+            "model": "mock:default"
+        }),
+    )
+    .await;
+    let created_agent_id = create_result["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let _ = uds_rpc(
+        &socket,
+        2,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": created_agent_id,
+            "content": "Start working"
+        }),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Flip the setting to `on` over the real WSS transport — this is the wire
+    // path production clients use, and it persists to config.toml for daemon2.
+    eprintln!("Setting agents.resumeInterruptedOnStart=on over WSS");
+    {
+        let status = common::await_wss_status(&socket).await;
+        let port = status["result"]["port"].as_u64().expect("port") as u16;
+        let fingerprint = status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .to_string();
+        let cfg = client_config(&fingerprint);
+        let mut ws = connect_ws(port, cfg).await;
+        let result = wss_rpc(
+            &mut ws,
+            1,
+            "settings.update",
+            json!({ "changes": [
+                { "path": "agents.resumeInterruptedOnStart", "value": "on" }
+            ] }),
+        )
+        .await;
+        let applied = result["applied"].as_array().expect("applied array");
+        assert_eq!(applied.len(), 1, "{result}");
+        assert_eq!(applied[0]["path"], json!("agents.resumeInterruptedOnStart"));
+        assert_eq!(applied[0]["value"], json!("on"));
+    }
+
+    // Manually insert an interrupted_agent row (simulating daemon crash)
+    {
+        use intent_core::{now_iso, AgentId, WorkspaceId};
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        store
+            .insert_interrupted_agent(
+                &AgentId(created_agent_id.clone()),
+                &WorkspaceId(ws_id.clone()),
+                "active",
+                &now_iso(),
+            )
+            .await
+            .expect("insert interrupted agent");
+    }
+
+    eprintln!("Killing daemon1 to simulate interruption");
+    drop(_daemon1);
+
+    // Phase 2: Boot daemon2 WITHOUT --resume-all. DISPLAY is set so
+    // `detect_has_display()` is true: `auto` would skip the sweep, proving a
+    // resume here is the `on` setting and not the headless heuristic.
+    eprintln!("Phase 2: Boot daemon2 without --resume-all (setting=on, DISPLAY set)");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let env2: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("DISPLAY", ":99"),
+    ];
+    let child2 = spawn_serve(&data_dir, "both", &env2, false);
+    let _daemon2 = Daemon {
+        child: child2,
+        data_dir: data_dir.clone(),
+    };
+
+    assert!(await_uds(&socket).await, "daemon2 did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Phase 3: Poll agent status to confirm turn completion (agent reached idle)
+    eprintln!("Phase 3: Poll agent status to confirm turn completion");
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(actual_port, cfg).await;
+
+    eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
+    let mut agent_is_idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let agent_result = wss_rpc(
+            &mut ws,
+            2,
+            "agent.get",
+            json!({
+                "workspaceId": ws_id,
+                "agentId": created_agent_id
+            }),
+        )
+        .await;
+
+        let is_active = agent_result["agent"]["isActive"].as_bool().unwrap_or(false);
+        let status = agent_result["agent"]["status"].as_str().unwrap_or("");
+        eprintln!("Agent status: {status}, isActive: {is_active}");
+        if !is_active {
+            eprintln!("✓ Agent reached idle state after resume (isActive=false)");
+            agent_is_idle = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        agent_is_idle,
+        "Expected agent {created_agent_id} to complete turn and reach idle, but timed out"
+    );
+
+    // Phase 4: Poll agent.listInterrupted until resolution appears (bounded)
+    eprintln!("Phase 4: Poll interrupted agents list until resolution committed");
+    let mut list_is_empty = false;
+    for _ in 0..60 {
+        let list_result = wss_rpc(&mut ws, 3, "agent.listInterrupted", json!({})).await;
+        let agents = list_result["agents"].as_array().expect("agents array");
+        if agents.is_empty() {
+            eprintln!("✓ Interrupted agents list is empty (resolution committed)");
+            list_is_empty = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        list_is_empty,
+        "Expected interrupted agents list to become empty after setting=on sweep within 6s"
+    );
+
+    eprintln!("SUCCESS: setting=on auto-resumed agent without --resume-all");
 }

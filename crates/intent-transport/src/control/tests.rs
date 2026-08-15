@@ -38,6 +38,9 @@ impl FakeControl {
                 child_processes: Some(4),
                 child_memory_bytes: Some(2_684_354_560),
                 child_memory_peak_bytes: Some(5_368_709_120),
+                agent_memory_budget_bytes: Some(21_474_836_480),
+                agent_memory_charged_bytes: Some(3_221_225_472),
+                queued_spawns: Some(1),
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -160,6 +163,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         child_processes: None,
         child_memory_bytes: None,
         child_memory_peak_bytes: None,
+        agent_memory_budget_bytes: None,
+        agent_memory_charged_bytes: None,
+        queued_spawns: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -173,6 +179,11 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert_eq!(v["childProcesses"], Value::Null);
     assert_eq!(v["childMemoryBytes"], Value::Null);
     assert_eq!(v["childMemoryPeakBytes"], Value::Null);
+    // Budget off ⇒ the budget fields are ABSENT (presence-detected), not null.
+    let obj = v.as_object().unwrap();
+    assert!(!obj.contains_key("agentMemoryBudgetBytes"));
+    assert!(!obj.contains_key("agentMemoryChargedBytes"));
+    assert!(!obj.contains_key("queuedSpawns"));
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -190,6 +201,31 @@ fn status_json_carries_the_child_process_tree_sample() {
     assert_eq!(v["childMemoryPeakBytes"], 5_368_709_120u64);
     // Own-RSS and tree-RSS are distinct fields; the tree dwarfs the daemon.
     assert_eq!(v["memoryBytes"], 104_857_600u64);
+}
+
+/// With the aggregate budget installed (monorepo#2063) the three budget
+/// fields ride `system.status`, so a client can render "why is my agent
+/// queued" truthfully: the configured ceiling, the bytes admission actually
+/// compares, and the spawns currently waiting.
+#[test]
+fn status_json_carries_the_budget_fields_when_installed() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["agentMemoryBudgetBytes"], 21_474_836_480u64);
+    assert_eq!(v["agentMemoryChargedBytes"], 3_221_225_472u64);
+    assert_eq!(v["queuedSpawns"], 1);
+
+    // Budget installed but no tree sample yet: the budget is inert, so the
+    // charged bytes are absent while the ceiling and queue depth still serve.
+    let mut status = FakeControl::new().status;
+    status.agent_memory_charged_bytes = None;
+    status.queued_spawns = Some(0);
+    let v = status_json(&status, true);
+    assert_eq!(v["agentMemoryBudgetBytes"], 21_474_836_480u64);
+    assert!(!v
+        .as_object()
+        .unwrap()
+        .contains_key("agentMemoryChargedBytes"));
+    assert_eq!(v["queuedSpawns"], 0);
 }
 
 #[tokio::test]

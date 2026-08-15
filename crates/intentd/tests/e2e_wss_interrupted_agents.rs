@@ -233,6 +233,9 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
+    // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
+    // survive a restart, but the `auto` default resumes on headless hosts.
+    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -467,6 +470,9 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
+    // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
+    // is still pending after restart, but `auto` resumes on headless hosts.
+    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
@@ -672,6 +678,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

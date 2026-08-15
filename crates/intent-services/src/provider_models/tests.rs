@@ -131,8 +131,9 @@ fn parse_acp_models_empty_payloads_yield_no_rows() {
 fn parse_acp_models_from_claude_code_config_options() {
     // Canned from a live claude-agent-acp@0.60.0 session/new result
     // (2026-07-21): models live in configOptions[id="model"].options; the
-    // sibling mode/effort/fast select options must be ignored, and values are
-    // preserved verbatim (including effort-suffixed ids like "opus[1m]").
+    // sibling mode/fast select options are ignored; the effort select supplies
+    // the catalog-wide fallback. Model values remain verbatim (including
+    // effort-suffixed ids like "opus[1m]").
     let payload = json!({
         "sessionId": "sess_1",
         "modes": { "currentModeId": "acceptEdits", "availableModes": [] },
@@ -179,7 +180,8 @@ fn parse_acp_models_from_claude_code_config_options() {
     assert_eq!(
         rows[0],
         json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code",
-                "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" })
+                "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+                "effortLevels": ["low"] })
     );
     assert_eq!(rows[2]["name"], "Fable");
     assert!(rows.iter().all(|r| r["provider"] == "claude-code"));
@@ -296,6 +298,79 @@ fn parse_acp_models_carry_adapter_advertised_effort_levels() {
 }
 
 #[test]
+fn parse_acp_models_fall_back_to_session_thought_levels() {
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "category": "model", "type": "select",
+              "options": [
+                  { "value": "opus", "name": "Opus" },
+                  { "value": "haiku", "name": "Haiku" }
+              ] },
+            { "id": "effort", "category": "thought_level", "type": "select",
+              "currentValue": "default", "options": [
+                  { "value": "default", "name": "Default" },
+                  { "value": "low", "name": "Low" },
+                  { "value": "medium", "name": "Medium" },
+                  { "value": "high", "name": "High" },
+                  { "value": "max", "name": "Max" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row["effortLevels"] == json!(["low", "medium", "high", "max"])));
+}
+
+#[test]
+fn parse_acp_models_preserve_per_model_effort_levels_over_session_fallback() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "opus", "supportedEffortLevels": ["low", "high"] },
+            { "modelId": "sonnet", "effortLevels": ["medium", "max"] },
+            { "modelId": "haiku" }
+        ] },
+        "configOptions": [
+            { "id": "effort", "category": "thought_level", "type": "select",
+              "options": [
+                  { "value": "default", "name": "Default" },
+                  { "value": "low", "name": "Low" },
+                  { "value": "medium", "name": "Medium" },
+                  { "value": "high", "name": "High" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows[0]["effortLevels"], json!(["low", "high"]));
+    assert_eq!(rows[1]["effortLevels"], json!(["medium", "max"]));
+    assert_eq!(rows[2]["effortLevels"], json!(["low", "medium", "high"]));
+}
+
+#[test]
+fn parse_acp_models_ignore_non_levels_and_empty_thought_level_selects() {
+    for payload in [
+        json!({
+            "models": { "availableModels": [{ "modelId": "sonnet" }] },
+            "configOptions": [{
+                "id": "effort", "category": "thought_level", "type": "select",
+                "options": [{ "value": "DEFAULT" }, { "value": "  " }, { "name": "Missing" }]
+            }]
+        }),
+        json!({
+            "models": { "availableModels": [{ "modelId": "sonnet" }] },
+            "configOptions": [{
+                "id": "effort", "category": "thought_level", "type": "boolean",
+                "options": [{ "value": "high" }]
+            }]
+        }),
+    ] {
+        let rows = parse_acp_models(&payload, "claude-code");
+        assert!(!rows[0].as_object().unwrap().contains_key("effortLevels"));
+    }
+}
+
+#[test]
 fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
     let payload = json!({
         "models": {
@@ -312,8 +387,7 @@ fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
     assert_eq!(
         rows[0],
         json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex",
-                "description": "Flagship coding model",
-                "effortLevels": ["low", "medium", "high", "xhigh"] })
+                "description": "Flagship coding model" })
     );
     assert_eq!(
         rows[1],
@@ -322,15 +396,31 @@ fn parse_codex_models_collapse_effort_capable_models_to_one_row() {
 }
 
 #[test]
-fn parse_codex_models_effort_levels_without_description() {
+fn parse_codex_models_bare_id_without_description() {
     let payload = json!({ "models": { "availableModels": [ { "modelId": "gpt-5.2-codex" } ] } });
     let rows = parse_codex_acp_models(&payload);
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0],
-        json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex",
-                "effortLevels": ["low", "medium", "high", "xhigh"] })
+        json!({ "id": "gpt-5.2-codex", "name": "gpt-5.2-codex", "provider": "codex" })
     );
+}
+
+#[test]
+fn parse_codex_models_bare_ids_do_not_invent_effort_levels() {
+    for model_id in [
+        "gpt-5.6-sol",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
+        "gpt-5.1-codex-max",
+    ] {
+        let payload = json!({ "models": { "availableModels": [{ "modelId": model_id }] } });
+        let rows = parse_codex_acp_models(&payload);
+        assert!(
+            !rows[0].as_object().unwrap().contains_key("effortLevels"),
+            "unexpected invented levels for {model_id}"
+        );
+    }
 }
 
 #[test]
@@ -347,10 +437,111 @@ fn parse_codex_models_prefer_adapter_advertised_effort_levels() {
 }
 
 #[test]
+fn parse_codex_models_collapse_parenthesized_variants_for_unknown_family() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-6-nova", "name": "GPT-6 Nova (low)" },
+            { "modelId": "gpt-6-nova", "name": "GPT-6 Nova (medium)" },
+            { "modelId": "gpt-6-nova", "name": "GPT-6 Nova (max)" }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({ "id": "gpt-6-nova", "name": "GPT-6 Nova", "provider": "codex",
+                "effortLevels": ["low", "medium", "max"] })
+    );
+}
+
+#[test]
+fn parse_codex_models_collapse_effort_suffixed_ids() {
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "options": [
+                { "value": "gpt-5.6-sol/low", "name": "GPT-5.6-Sol (low)" },
+                { "value": "gpt-5.6-sol/medium", "name": "GPT-5.6-Sol (medium)" },
+                { "value": "gpt-5.6-sol/high", "name": "GPT-5.6-Sol (high)" },
+                { "value": "gpt-5.6-sol/xhigh", "name": "GPT-5.6-Sol (xhigh)" },
+                { "value": "gpt-5.6-sol/max", "name": "GPT-5.6-Sol (max)" }
+            ] }
+        ]
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "gpt-5.6-sol");
+    assert_eq!(rows[0]["name"], "GPT-5.6-Sol");
+    assert_eq!(
+        rows[0]["effortLevels"],
+        json!(["low", "medium", "high", "xhigh", "max"])
+    );
+}
+
+#[test]
+fn parse_codex_models_collapse_live_bracket_effort_ids() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.6-sol[LOW]", "name": "GPT-5.6-Sol",
+              "description": "Low effort", "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[medium]", "name": "GPT-5.6-Sol",
+              "description": "Medium effort", "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[high]", "name": "GPT-5.6-Sol",
+              "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[xhigh]", "name": "GPT-5.6-Sol",
+              "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[max]", "name": "GPT-5.6-Sol",
+              "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[ultra]", "name": "GPT-5.6-Sol (ultra)",
+              "effortLevels": ["medium"] },
+            { "modelId": "gpt-5.6-sol[none]", "name": "GPT-5.6-Sol",
+              "effortLevels": ["medium"] }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({ "id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "provider": "codex",
+                "effortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"] })
+    );
+}
+
+#[test]
+fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "gpt-5.6-sol[none]", "name": "GPT-5.6-Sol" }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert!(
+        !rows[0].as_object().unwrap().contains_key("effortLevels"),
+        "none is not usable effort evidence"
+    );
+}
+
+#[test]
+fn parse_codex_collapsed_variants_merge_adapter_levels() {
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "future-model/low", "name": "Future Model (low)",
+              "supportedEffortLevels": ["medium", "max"] },
+            { "modelId": "future-model/high", "name": "Future Model (high)" }
+        ] }
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["effortLevels"],
+        json!(["low", "medium", "high", "max"])
+    );
+}
+
+#[test]
 fn parse_codex_models_from_config_options() {
     // Canned from a live codex-acp@0.16.0 session/new result (2026-07-21):
-    // same configOptions[id="model"].options shape as claude-code. None of
-    // these ids are effort-capable, so no row carries `effortLevels`.
+    // same configOptions[id="model"].options shape as claude-code. Bare rows
+    // carry no `effortLevels` without adapter evidence.
     let payload = json!({
         "sessionId": "sess_2",
         "modes": { "currentModeId": "auto", "availableModes": [] },
@@ -387,6 +578,10 @@ fn parse_codex_models_from_config_options() {
             "gpt-5.3-codex-spark"
         ]
     );
+    assert!(
+        !rows[0].as_object().unwrap().contains_key("effortLevels"),
+        "bare model rows must not invent effort levels"
+    );
     assert_eq!(
         rows[1],
         json!({ "id": "gpt-5.5", "name": "GPT-5.5", "provider": "codex",
@@ -395,9 +590,7 @@ fn parse_codex_models_from_config_options() {
 }
 
 #[test]
-fn parse_codex_config_options_carry_effort_levels() {
-    // Effort-capable base models carry `effortLevels` when reported via
-    // configOptions too — still one row per model.
+fn parse_codex_config_options_bare_id_has_no_effort_levels() {
     let payload = json!({
         "configOptions": [
             { "id": "model",
@@ -406,10 +599,9 @@ fn parse_codex_config_options_carry_effort_levels() {
     });
     let rows = parse_codex_acp_models(&payload);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], "gpt-5.3-codex");
     assert_eq!(
-        rows[0]["effortLevels"],
-        json!(["low", "medium", "high", "xhigh"])
+        rows[0],
+        json!({ "id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "provider": "codex" })
     );
 }
 

@@ -13,8 +13,11 @@ use crate::error::{Error, Result};
 use crate::settings_file::SettingsFile;
 
 /// Default idle-reap TTL in minutes (`agents.idleReapMinutes`, §11.1); `0`
-/// disables the sweep entirely.
-pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 30;
+/// disables the sweep entirely. Lowered from 30 to 10 (monorepo#2109): idle
+/// reaping is the main lever on resident memory — every agent touched inside
+/// the window holds its whole subtree alive (~0.66 GB idle each) — and a
+/// 30-minute window kept a day's worth of touched agents resident at once.
+pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 10;
 
 /// Default daemon-wide cap on concurrently live ephemeral ACP adapters
 /// (`agents.maxConcurrentAdapters`): the one-shot `agent.completeOnce`

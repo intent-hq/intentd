@@ -12,7 +12,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
-use intent_core::{Config, ServerControl, WorkspaceApi};
+use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
     agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
     max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
@@ -92,6 +92,24 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
+    /// Read or change daemon settings (§5.12) on a running daemon. With no
+    /// arguments, lists every setting with its type and current value
+    /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
+    /// with `<name> <value>`, validates the value against the setting's
+    /// definition and applies it (`settings.update`). Values are coerced to
+    /// the definition's type: booleans take `true`/`false`, numbers a numeric
+    /// literal, enums one of the allowed strings, object/array settings a
+    /// JSON document. Sensitive values arrive pre-redacted from the daemon.
+    Settings {
+        /// Dotted setting path, e.g. `agents.resumeInterruptedOnStart`.
+        name: Option<String>,
+        /// New value, parsed per the setting's type (booleans: `true`/`false`;
+        /// numbers: a numeric literal; object/array settings: JSON).
+        /// `allow_hyphen_values`: a negative number (`-3`) must reach the
+        /// coercion layer instead of being rejected as an unknown flag.
+        #[arg(allow_hyphen_values = true)]
+        value: Option<String>,
+    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -214,6 +232,9 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
+        Command::Settings { name, value } => {
+            to_exit(cmd_settings(name.as_deref(), value.as_deref()).await)
+        }
         Command::McpBridge { connect } => {
             // The bridge reads stdin via `tokio::io::stdin()`, whose pending
             // blocking-pool read outlives `run_stdio_bridge`; returning
@@ -1114,29 +1135,42 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
-    // Aggregate child-tree memory budget (monorepo#2063), off unless
-    // `agents.memoryBudgetMb` is set. `process_cap` bounds agent *slots*, which
-    // is not a memory bound: a single agent's subtree was measured from 436 MB
-    // idle to 9.6 GB running a test suite. When installed, the budget reads the
-    // same descendant-tree sampler `system.status` reports (intentd#1139) and
-    // gates new spawns only — see [`ProcessRegistry::acquire`].
-    match agent_memory_budget_bytes(&boot_settings.effective) {
-        Some(budget_bytes) => {
-            manager
-                .registry()
-                .set_memory_budget(budget_bytes, child_usage.clone());
-            tracing::info!(
-                budget_bytes,
-                recommended_bytes = {
-                    let mut sys = sysinfo::System::new();
-                    sys.refresh_memory();
-                    recommended_memory_budget_bytes(sys.total_memory())
-                },
-                "aggregate agent memory budget enabled"
-            );
-        }
-        None => tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)"),
-    }
+    // Read-only tree probe for `agent.diagnostics` per-agent subtree memory
+    // attribution (monorepo#2063 A2): installed unconditionally, unlike the
+    // budget below, which only exists when the budget resolves positive.
+    manager.set_tree_probe(child_usage.clone());
+    // Aggregate child-tree memory budget (monorepo#2063): an absent key means
+    // auto (resolves to the recommended budget derived from system RAM), an
+    // explicit 0 means off, and a positive value is an explicit MB budget.
+    // `process_cap` bounds agent *slots*, which is not a memory bound: a single
+    // agent's subtree was measured from 436 MB idle to 9.6 GB running a test
+    // suite. When installed, the budget reads the same descendant-tree sampler
+    // `system.status` reports (intentd#1139) and gates new spawns only — see
+    // [`ProcessRegistry::acquire`].
+    let total_memory_bytes = {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    };
+    let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
+    let budget_enabled =
+        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
+            Some(budget_bytes) => {
+                manager
+                    .registry()
+                    .set_memory_budget(budget_bytes, child_usage.clone());
+                tracing::info!(
+                    budget_bytes,
+                    recommended_bytes,
+                    "aggregate agent memory budget enabled"
+                );
+                true
+            }
+            None => {
+                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+                false
+            }
+        };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1305,9 +1339,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown.
     let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
-    // configured TTL, killing each one's whole process group. Disabled entirely
-    // when `agents.idleReapMinutes == 0`.
-    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
+    // configured TTL, killing each one's whole process group — and, when an
+    // aggregate memory budget is installed (monorepo#2063), drain idle agents
+    // largest-first while over budget without waiting for the TTL. Disabled
+    // entirely when `agents.idleReapMinutes == 0` AND no budget is installed.
+    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled);
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
@@ -1548,27 +1584,39 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         }
     };
 
-    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
+    // Auto-resume interrupted agents at startup. `--resume-all` forces the
+    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
+    // (`auto` = headless hosts only, `on` = always, `off` = never).
     // Spawn in the background so it doesn't block startup; log failures per-agent.
-    if resume_all {
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    if resume_on_start {
         let services_clone = services.clone();
         tokio::spawn(async move {
-            tracing::info!("--resume-all: enumerating interrupted agents");
+            tracing::info!("resume-on-start: enumerating interrupted agents");
             // List all pending interrupted agents
             let rows = match services_clone.store().list_interrupted_agents().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
+                    tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
                     return;
                 }
             };
             if rows.is_empty() {
-                tracing::info!("--resume-all: no interrupted agents to resume");
+                tracing::info!("resume-on-start: no interrupted agents to resume");
                 return;
             }
             tracing::info!(
                 count = rows.len(),
-                "--resume-all: resuming interrupted agents"
+                "resume-on-start: resuming interrupted agents"
             );
             let mut resumed = Vec::new();
             let mut failed = Vec::new();
@@ -1580,7 +1628,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::info!(
                             agent_id = %agent_id,
                             workspace = %interrupted.workspace_id,
-                            "--resume-all: resumed agent"
+                            "resume-on-start: resumed agent"
                         );
                         resumed.push(agent_id.0);
                     }
@@ -1588,7 +1636,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
                         tracing::warn!(
                             agent_id = %agent_id,
                             error = %e,
-                            "--resume-all: failed to resume agent"
+                            "resume-on-start: failed to resume agent"
                         );
                         failed.push((agent_id.0, e.to_string()));
                     }
@@ -1597,7 +1645,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             tracing::info!(
                 resumed = resumed.len(),
                 failed = failed.len(),
-                "--resume-all: auto-resume sweep complete"
+                "resume-on-start: auto-resume sweep complete"
             );
         });
     }
@@ -1907,11 +1955,19 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
 /// exists to serve: by the time anyone captures a debug bundle the overshoot
 /// is minutes in the past and the tree has drained back to baseline. The peak
 /// survives it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChildTreeSample {
     count: usize,
     memory_bytes: u64,
     peak_memory_bytes: u64,
+    /// Resident bytes bucketed by registered agent root (monorepo#2063 Phase
+    /// A): each descendant's RSS credited to its nearest registered agent root,
+    /// from the same sweep as `memory_bytes` so the buckets and the aggregate
+    /// describe one tree. Descendants under no registered root (one-shot
+    /// adapter chains, `host.exec` children) appear only in the aggregate.
+    /// Measurement only today — nothing enforces per-agent limits with it.
+    /// Behind an `Arc` so `load()` stays a cheap clone.
+    agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
     /// Sweep counter, incremented on every store. Carried inside the sample for
     /// the same reason the other three fields are published together: the spawn
     /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
@@ -1934,16 +1990,17 @@ struct ChildTreeUsage {
 }
 
 impl ChildTreeUsage {
-    fn store(&self, count: usize, memory_bytes: u64) {
+    fn store(&self, count: usize, memory_bytes: u64, agent_bytes: HashMap<AgentId, u64>) {
         let mut guard = self.inner.write().expect("child tree usage lock poisoned");
-        let peak_memory_bytes = guard.map_or(memory_bytes, |prev| {
+        let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
             prev.peak_memory_bytes.max(memory_bytes)
         });
-        let seq = guard.map_or(1, |prev| prev.seq.wrapping_add(1));
+        let seq = guard.as_ref().map_or(1, |prev| prev.seq.wrapping_add(1));
         *guard = Some(ChildTreeSample {
             count,
             memory_bytes,
             peak_memory_bytes,
+            agent_bytes: std::sync::Arc::new(agent_bytes),
             seq,
         });
     }
@@ -1977,7 +2034,10 @@ impl ChildTreeUsage {
     }
 
     fn load(&self) -> Option<ChildTreeSample> {
-        *self.inner.read().expect("child tree usage lock poisoned")
+        self.inner
+            .read()
+            .expect("child tree usage lock poisoned")
+            .clone()
     }
 }
 
@@ -1986,6 +2046,14 @@ impl TreeMemoryProbe for ChildTreeUsage {
         // One read of the whole sample: the bytes and the sequence number that
         // identifies them come from the same sweep by construction.
         self.load().map(|s| (s.memory_bytes, s.seq))
+    }
+
+    fn agent_samples(&self) -> HashMap<AgentId, u64> {
+        // The per-agent buckets from the same sweep as `sample` (monorepo#2063
+        // A2): cheap clone off the Arc'd map, empty before the first sweep.
+        self.load()
+            .map(|s| s.agent_bytes.as_ref().clone())
+            .unwrap_or_default()
     }
 }
 
@@ -2054,10 +2122,19 @@ const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
 /// Absolute WARN threshold used when total system RAM cannot be determined.
 const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Aggregate `(process count, resident bytes)` of every pid reachable from
-/// `root` through the `pid -> children` adjacency, excluding `root` itself —
-/// the root is already reported as `memoryBytes`, and counting it twice would
-/// inflate every bundle's tree total.
+/// Aggregate `(process count, resident bytes, per-agent resident bytes)` of
+/// every pid reachable from `root` through the `pid -> children` adjacency,
+/// excluding `root` itself — the root is already reported as `memoryBytes`,
+/// and counting it twice would inflate every bundle's tree total.
+///
+/// `agent_roots` maps each registered agent's spawned child pid to its agent
+/// id. During the walk, every descendant is additionally credited to the
+/// nearest such root at or above it (an agent root is credited to its own
+/// bucket, a nested agent root starts a new bucket for its own subtree), so
+/// the buckets are a partition of the subset of the tree that sits under a
+/// registered agent. Descendants under no registered root count only toward
+/// the aggregate. One pass, O(processes) — attribution rides the existing
+/// traversal instead of re-walking per agent.
 ///
 /// Split from [`descendant_tree_usage`] so the traversal is testable without a
 /// live process table. The walk is iterative and visited-guarded: a pid table
@@ -2067,36 +2144,71 @@ fn walk_descendants(
     children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
     memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
     root: sysinfo::Pid,
-) -> (usize, u64) {
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
     let mut count = 0usize;
     let mut bytes = 0u64;
+    let mut agent_bytes: HashMap<AgentId, u64> = HashMap::new();
     let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
-    let mut stack = vec![root];
-    while let Some(pid) = stack.pop() {
+    // Each frame carries the bucket its subtree inherits: the nearest
+    // registered agent root at or above it (`None` outside any agent subtree).
+    let mut stack: Vec<(sysinfo::Pid, Option<&AgentId>)> = vec![(root, None)];
+    while let Some((pid, bucket)) = stack.pop() {
         for child in children.get(&pid).into_iter().flatten() {
             if !seen.insert(*child) {
                 continue;
             }
+            // A registered agent root opens its own bucket — including when
+            // nested under another agent's subtree, so a sub-agent's usage is
+            // credited to the sub-agent, not its ancestor.
+            let child_bucket = agent_roots.get(child).or(bucket);
             if let Some(memory) = memory_of(*child) {
                 count += 1;
                 bytes = bytes.saturating_add(memory);
+                if let Some(agent) = child_bucket {
+                    let slot = agent_bytes.entry(agent.clone()).or_insert(0);
+                    *slot = slot.saturating_add(memory);
+                }
             }
-            stack.push(*child);
+            stack.push((*child, child_bucket));
         }
     }
-    (count, bytes)
+    (count, bytes, agent_bytes)
 }
 
 /// Walk `root`'s descendants in the refreshed process table, returning
-/// `(process count, aggregate resident bytes)`.
-fn descendant_tree_usage(sys: &sysinfo::System, root: sysinfo::Pid) -> (usize, u64) {
+/// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+///
+/// Thread rows are excluded from both the adjacency and the sums: on Linux,
+/// sysinfo lists threads (`/proc/<pid>/task` entries) as `Process` rows whose
+/// `memory()` is the WHOLE process's RSS and whose `parent()` is the owning
+/// process, so counting them charged an N-threaded child N+1 times — up to
+/// 219x inflation of `childMemoryBytes` (monorepo#2342). macOS never lists
+/// thread rows, so `thread_kind()` is `None` there and nothing changes.
+fn descendant_tree_usage(
+    sys: &sysinfo::System,
+    root: sysinfo::Pid,
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid, proc) in sys.processes() {
+        if proc.thread_kind().is_some() {
+            continue;
+        }
         if let Some(parent) = proc.parent() {
             children.entry(parent).or_default().push(*pid);
         }
     }
-    walk_descendants(&children, &|pid| sys.process(pid).map(|p| p.memory()), root)
+    walk_descendants(
+        &children,
+        &|pid| {
+            sys.process(pid)
+                .filter(|p| p.thread_kind().is_none())
+                .map(|p| p.memory())
+        },
+        root,
+        agent_roots,
+    )
 }
 
 /// What one poll of the descendant-tree sampler should do.
@@ -2163,7 +2275,11 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
-        let refresh_kind = ProcessRefreshKind::nothing().with_memory();
+        // `without_tasks()`: on Linux, `nothing()` still enumerates every
+        // `/proc/<pid>/task` directory and lists each thread as a process
+        // row (monorepo#2342). The walk filters thread rows defensively,
+        // but not fetching them at all keeps the sweep cheap.
+        let refresh_kind = ProcessRefreshKind::nothing().with_memory().without_tasks();
         let mut sys = System::new();
         let mut warned = false;
         let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
@@ -2182,9 +2298,25 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsag
                 ChildTreeSweep::Peak => false,
             };
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
-            let (count, bytes) = descendant_tree_usage(&sys, pid);
+            // Snapshot of registered agent root pids, taken alongside the
+            // process-table refresh so the buckets describe the same instant
+            // as the tree they partition. Burst (peak-only) sweeps skip it:
+            // `observe_burst` consumes only the aggregate bytes, so paying
+            // the handles lock + per-descendant bucketing at sub-second
+            // cadence would buy nothing — an empty map keeps the walk on
+            // its aggregate-only fast path.
+            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
+                manager
+                    .agent_root_pids()
+                    .into_iter()
+                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
             if publish {
-                task_usage.store(count, bytes);
+                task_usage.store(count, bytes, agent_bytes);
                 // Stamped from the poll instant, not from here: dating the
                 // baseline from when the sweep *finished* would add its own
                 // ~12 ms to every period and let the published cadence drift.
@@ -2303,6 +2435,9 @@ impl SystemControl for DaemonControl {
         // matching the port/fingerprint/clients fallback, and self-correcting
         // on the next call.
         let tcp = port.is_some();
+        // Aggregate-budget visibility (monorepo#2063): absent when the budget
+        // is off, so the wire fields stay presence-detected.
+        let budget = self.manager.registry().budget_status();
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -2321,9 +2456,12 @@ impl SystemControl for DaemonControl {
             hostname,
             cpu_percent,
             memory_bytes,
-            child_processes: child_tree.map(|s| s.count),
-            child_memory_bytes: child_tree.map(|s| s.memory_bytes),
-            child_memory_peak_bytes: child_tree.map(|s| s.peak_memory_bytes),
+            child_processes: child_tree.as_ref().map(|s| s.count),
+            child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
+            child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
+            agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
+            agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
+            queued_spawns: budget.map(|(_, _, queued)| queued),
         }
     }
 
@@ -2975,30 +3113,72 @@ fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
 
-/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when disabled
-/// (`idle_reap_minutes == 0`). The sweep interval is derived from the TTL
-/// (≈4×/TTL), clamped so long TTLs still sweep and short ones do not busy-loop.
+/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
+/// sweep (`idle_reap_minutes == 0` and no memory budget). The sweep interval
+/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep and
+/// short ones do not busy-loop.
+///
+/// With a memory budget installed (monorepo#2063 level 2), every tick also
+/// drains idle agents largest-attributed-first while charged > budget — no
+/// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
+/// keeps the budget drain alive on the interval-clamp floor cadence, and TTL
+/// reaping on caps the shared interval at that same floor so a long TTL
+/// cannot slow the budget drain's reaction time.
 fn spawn_idle_reap_loop(
     manager: Arc<AgentManager>,
     idle_reap_minutes: u32,
+    budget_enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some((ttl, interval)) = reap_timings(idle_reap_minutes) else {
+    let timings = reap_timings(idle_reap_minutes);
+    if timings.is_none() && !budget_enabled {
         tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
         return None;
+    }
+    // TTL off but budget on: sweep at the same floor cadence the TTL clamp
+    // uses, running only the budget drain. With BOTH on, cap the shared
+    // interval at that floor — a long TTL may stretch its interval to 300s,
+    // and turning TTL reaping on must not slow the budget drain's reaction
+    // time below the budget-only cadence (an early TTL sweep is harmless: it
+    // just finds nothing old enough).
+    let budget_floor = Duration::from_secs(30);
+    let interval = match timings {
+        Some((ttl, interval)) => {
+            let interval = if budget_enabled {
+                interval.min(budget_floor)
+            } else {
+                interval
+            };
+            tracing::info!(
+                ttl_ms = ttl.as_millis() as u64,
+                interval_ms = interval.as_millis() as u64,
+                "idle agent reaping enabled"
+            );
+            interval
+        }
+        None => {
+            tracing::info!(
+                interval_ms = budget_floor.as_millis() as u64,
+                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+            );
+            budget_floor
+        }
     };
-    tracing::info!(
-        ttl_ms = ttl.as_millis() as u64,
-        interval_ms = interval.as_millis() as u64,
-        "idle agent reaping enabled"
-    );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let reaped = manager.reap_idle_older_than(ttl).await;
-            if reaped > 0 {
-                tracing::info!(reaped, "idle agent sweep evicted idle agents");
+            if let Some((ttl, _)) = timings {
+                let reaped = manager.reap_idle_older_than(ttl).await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "idle agent sweep evicted idle agents");
+                }
+            }
+            if budget_enabled {
+                let reaped = manager.reap_over_budget().await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "over-budget sweep evicted idle agents");
+                }
             }
         }
     }))
@@ -3377,6 +3557,236 @@ async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
     let result = response.get("result").cloned().unwrap_or(Value::Null);
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+/// `intentd settings` dispatcher: list (no args) / get (`<name>`) / set
+/// (`<name> <value>`), all against a running daemon over the local socket.
+async fn cmd_settings(name: Option<&str>, value: Option<&str>) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    match (name, value) {
+        (None, _) => cmd_settings_list(&config).await,
+        (Some(name), None) => cmd_settings_get(&config, name).await,
+        (Some(name), Some(value)) => cmd_settings_set(&config, name, value).await,
+    }
+}
+
+/// `rpc_call` wrapper for the `settings` subcommand: a connection failure
+/// gains guidance to start the daemon instead of a bare socket error.
+async fn settings_rpc(config: &Config, method: &str, params: Value) -> anyhow::Result<Value> {
+    rpc_call(&config.socket_path, method, params)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("cannot connect to daemon") {
+                anyhow::anyhow!(
+                    "{msg}\nintentd does not appear to be running — start it with \
+                     `intentd serve` or via the installed service"
+                )
+            } else {
+                e
+            }
+        })
+}
+
+async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
+    let response = settings_rpc(config, "settings.list", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let settings = response
+        .pointer("/result/settings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rows: Vec<(String, String, String)> = settings
+        .iter()
+        .map(|s| {
+            (
+                s.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                s.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                display_setting_value(s.get("value").unwrap_or(&Value::Null)),
+            )
+        })
+        .collect();
+    let path_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
+    let type_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
+    println!("{:<path_w$}  {:<type_w$}  VALUE", "PATH", "TYPE");
+    for (path, ty, value) in rows {
+        println!("{path:<path_w$}  {ty:<type_w$}  {value}");
+    }
+    Ok(())
+}
+
+async fn cmd_settings_get(config: &Config, name: &str) -> anyhow::Result<()> {
+    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
+    println!("{name} = {value}");
+    let definition = result.get("definition").cloned().unwrap_or(Value::Null);
+    println!("  type: {}", display_setting_type(&definition));
+    if let Some(default) = definition.get("defaultValue") {
+        println!("  default: {}", display_setting_value(default));
+    }
+    if let Some(origin) = result.get("origin").and_then(Value::as_str) {
+        println!("  origin: {origin}");
+    }
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+async fn cmd_settings_set(config: &Config, name: &str, raw: &str) -> anyhow::Result<()> {
+    // Fetch the definition first: an unknown name fails here with the
+    // daemon's own message, and the definition's type drives the coercion.
+    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let definition = response
+        .pointer("/result/definition")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let value =
+        coerce_setting_value(&definition, raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    let params = json!({ "changes": [{ "path": name, "value": value }] });
+    let response = settings_rpc(config, "settings.update", params).await?;
+    if let Some(error) = response.get("error") {
+        // Daemon-side validation (bad enum value, out-of-range number,
+        // read-only) surfaces its message verbatim.
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let applied = response
+        .pointer("/result/applied/0/value")
+        .cloned()
+        .unwrap_or_else(|| {
+            // Unreachable today (`settings.update` always echoes the applied
+            // entry), but if the response shape ever drifts, never fall back
+            // to the caller's plaintext for a sensitive setting — print the
+            // daemon's redaction placeholder instead.
+            if definition
+                .get("sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                json!("********")
+            } else {
+                value
+            }
+        });
+    println!("{name} = {}", display_setting_value(&applied));
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+/// Coerce a raw CLI string into a JSON value matching the setting
+/// definition's wire `type` (§5.12): boolean → `true`/`false`, number →
+/// numeric parse (integer shape preserved), enum/string → the string as-is,
+/// object → parsed JSON (object or array). Enum membership and number
+/// range stay with the daemon, whose `-32602` message is authoritative.
+fn coerce_setting_value(definition: &Value, raw: &str) -> anyhow::Result<Value> {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    match ty {
+        "boolean" => match raw {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => anyhow::bail!("expected a boolean: true or false (got `{raw}`)"),
+        },
+        "number" => {
+            if let Ok(n) = raw.parse::<i64>() {
+                return Ok(json!(n));
+            }
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("expected a number (got `{raw}`)"))?;
+            if !n.is_finite() {
+                anyhow::bail!("expected a finite number (got `{raw}`)");
+            }
+            Ok(json!(n))
+        }
+        "object" => {
+            let v: Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow::anyhow!("expected a JSON object or array: {e}"))?;
+            if !(v.is_object() || v.is_array()) {
+                anyhow::bail!("expected a JSON object or array (got `{raw}`)");
+            }
+            Ok(v)
+        }
+        // Enums are strings on the wire; strings pass through as-is.
+        _ => Ok(json!(raw)),
+    }
+}
+
+/// Render a setting value for terminal output: unset → `(unset)`, strings
+/// bare, everything else compact JSON. Sensitive values arrive pre-redacted
+/// from the daemon and are printed as-is.
+fn display_setting_value(value: &Value) -> String {
+    match value {
+        Value::Null => "(unset)".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Render a definition's type for terminal output, folding in the enum
+/// values / number bounds when present.
+fn display_setting_type(definition: &Value) -> String {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    match ty {
+        "enum" => {
+            let values = definition
+                .get("enumValues")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("enum [{values}]")
+        }
+        "number" => {
+            let mut bounds = Vec::new();
+            if let Some(min) = definition.get("min").and_then(Value::as_f64) {
+                bounds.push(format!("min {min}"));
+            }
+            if let Some(max) = definition.get("max").and_then(Value::as_f64) {
+                bounds.push(format!("max {max}"));
+            }
+            if bounds.is_empty() {
+                "number".to_string()
+            } else {
+                format!("number ({})", bounds.join(", "))
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn cmd_status() -> ExitCode {
@@ -3774,6 +4184,27 @@ async fn report_context_engine() {
         EngineAvailability::Unavailable { reason } => {
             println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
         }
+    }
+}
+
+/// Whether the startup interrupted-agent resume sweep should run. The
+/// `--resume-all` flag forces the sweep; otherwise the
+/// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
+/// `off` never resumes, and `auto` (the default) resumes only on headless
+/// hosts (no display detected).
+fn should_resume_on_start(
+    resume_all: bool,
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    has_display: bool,
+) -> bool {
+    use intent_core::settings_file::ResumeInterruptedOnStart;
+    if resume_all {
+        return true;
+    }
+    match setting {
+        ResumeInterruptedOnStart::On => true,
+        ResumeInterruptedOnStart::Off => false,
+        ResumeInterruptedOnStart::Auto => !has_display,
     }
 }
 
@@ -4206,6 +4637,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coerce_boolean_accepts_true_false_only() {
+        let def = json!({ "type": "boolean" });
+        assert_eq!(coerce_setting_value(&def, "true").unwrap(), json!(true));
+        assert_eq!(coerce_setting_value(&def, "false").unwrap(), json!(false));
+        let err = coerce_setting_value(&def, "on").unwrap_err().to_string();
+        assert!(err.contains("true or false"), "{err}");
+    }
+
+    #[test]
+    fn coerce_number_parses_integers_and_floats() {
+        let def = json!({ "type": "number", "min": 1.0, "max": 65535.0 });
+        assert_eq!(coerce_setting_value(&def, "5181").unwrap(), json!(5181));
+        assert_eq!(coerce_setting_value(&def, "0.5").unwrap(), json!(0.5));
+        assert_eq!(coerce_setting_value(&def, "-3").unwrap(), json!(-3));
+        let err = coerce_setting_value(&def, "abc").unwrap_err().to_string();
+        assert!(err.contains("expected a number"), "{err}");
+        // Range enforcement stays with the daemon: out-of-range parses fine.
+        assert_eq!(coerce_setting_value(&def, "99999").unwrap(), json!(99999));
+    }
+
+    #[test]
+    fn settings_value_accepts_hyphen_leading_values() {
+        // `allow_hyphen_values` on the positional: without it clap rejects
+        // `-3` as an unknown flag before the coercion layer ever runs.
+        let cli = Cli::try_parse_from(["intentd", "settings", "some.number", "-3"])
+            .expect("hyphen-leading value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value } => {
+                assert_eq!(name.as_deref(), Some("some.number"));
+                assert_eq!(value.as_deref(), Some("-3"));
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_number_rejects_non_finite() {
+        let def = json!({ "type": "number" });
+        for raw in ["inf", "-inf", "NaN"] {
+            let err = coerce_setting_value(&def, raw).unwrap_err().to_string();
+            assert!(err.contains("finite"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn coerce_enum_and_string_pass_through_as_strings() {
+        // Enum membership is validated by the daemon; the CLI only shapes
+        // the value as a string.
+        let enum_def = json!({ "type": "enum", "enumValues": ["on", "off", "auto"] });
+        assert_eq!(
+            coerce_setting_value(&enum_def, "auto").unwrap(),
+            json!("auto")
+        );
+        assert_eq!(
+            coerce_setting_value(&enum_def, "bogus").unwrap(),
+            json!("bogus")
+        );
+        let string_def = json!({ "type": "string" });
+        assert_eq!(
+            coerce_setting_value(&string_def, "true").unwrap(),
+            json!("true")
+        );
+        // A missing/unknown type falls back to string pass-through.
+        assert_eq!(coerce_setting_value(&Value::Null, "x").unwrap(), json!("x"));
+    }
+
+    #[test]
+    fn coerce_object_parses_json_objects_and_arrays() {
+        let def = json!({ "type": "object" });
+        assert_eq!(
+            coerce_setting_value(&def, r#"{"a":1}"#).unwrap(),
+            json!({ "a": 1 })
+        );
+        assert_eq!(
+            coerce_setting_value(&def, r#"["x","y"]"#).unwrap(),
+            json!(["x", "y"])
+        );
+        let err = coerce_setting_value(&def, "not json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+        // Valid JSON scalars are still rejected — the type wants a structure.
+        let err = coerce_setting_value(&def, "42").unwrap_err().to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+    }
+
+    #[test]
     fn listener_down_error_is_detected_from_data_code() {
         // Preferred detection: the machine-readable discriminator
         // (monorepo#1822) — message prose is irrelevant when it is present.
@@ -4236,6 +4754,33 @@ mod tests {
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[test]
+    fn resume_on_start_flag_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // --resume-all wins regardless of setting or display.
+        for setting in [R::Auto, R::On, R::Off] {
+            for has_display in [true, false] {
+                assert!(should_resume_on_start(true, setting, has_display));
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_setting_on_and_off_ignore_display() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        for has_display in [true, false] {
+            assert!(should_resume_on_start(false, R::On, has_display));
+            assert!(!should_resume_on_start(false, R::Off, has_display));
+        }
+    }
+
+    #[test]
+    fn resume_on_start_auto_resumes_only_headless() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        assert!(should_resume_on_start(false, R::Auto, false));
+        assert!(!should_resume_on_start(false, R::Auto, true));
     }
 
     #[test]
@@ -4685,11 +5230,56 @@ mod tests {
     fn child_tree_usage_is_none_until_the_first_sample() {
         let usage = ChildTreeUsage::default();
         assert_eq!(usage.load(), None);
-        usage.store(6, 4_294_967_296);
+        usage.store(6, 4_294_967_296, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(sample.count, 6);
         assert_eq!(sample.memory_bytes, 4_294_967_296);
         assert_eq!(sample.peak_memory_bytes, 4_294_967_296);
+    }
+
+    /// The per-agent buckets are published with, and replaced by, each full
+    /// sample — they describe the same sweep as `memory_bytes`, so a stale
+    /// bucket surviving a later sweep would pair buckets from one tree with
+    /// an aggregate from another.
+    #[test]
+    fn child_tree_usage_agent_buckets_follow_the_sample() {
+        let usage = ChildTreeUsage::default();
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            4,
+            1_000,
+            HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+        );
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.agent_bytes.get(&a), Some(&700));
+        assert_eq!(sample.agent_bytes.get(&b), Some(&200));
+
+        // A burst reading moves only the peak — the buckets stay put.
+        usage.observe_burst(9_000);
+        let after_burst = usage.load().expect("sampled");
+        assert_eq!(after_burst.agent_bytes, sample.agent_bytes);
+
+        // The next full sample replaces the buckets wholesale: an agent that
+        // exited between sweeps must not linger.
+        usage.store(1, 300, HashMap::from([(b.clone(), 300)]));
+        let next = usage.load().expect("sampled");
+        assert_eq!(next.agent_bytes.get(&a), None);
+        assert_eq!(next.agent_bytes.get(&b), Some(&300));
+    }
+
+    /// The probe's `agent_samples` (monorepo#2063 A2) serves the buckets from
+    /// the latest sweep — empty before the first sample, matching `sample`'s
+    /// `None` — so `agent.diagnostics` can stamp `subtreeMemoryBytes` from
+    /// the same sweep the aggregate came from.
+    #[test]
+    fn child_tree_usage_probe_serves_agent_samples() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert!(probe.agent_samples().is_empty());
+        let a = AgentId::from("agent-a");
+        usage.store(2, 900, HashMap::from([(a.clone(), 700)]));
+        assert_eq!(probe.agent_samples().get(&a), Some(&700));
     }
 
     /// The peak must survive the tree draining back to baseline — that is the
@@ -4699,9 +5289,9 @@ mod tests {
     #[test]
     fn child_tree_usage_peak_is_a_high_water_mark() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000);
-        usage.store(24, 5_000_000_000);
-        usage.store(0, 0);
+        usage.store(4, 1_000_000_000, HashMap::new());
+        usage.store(24, 5_000_000_000, HashMap::new());
+        usage.store(0, 0, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(
             (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
@@ -4718,9 +5308,9 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_reaches_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(0, 10_000_000);
+        usage.store(0, 10_000_000, HashMap::new());
         usage.observe_burst(6_970_000_000);
-        usage.store(0, 10_000_000);
+        usage.store(0, 10_000_000, HashMap::new());
         let sample = usage.load().expect("sampled");
         assert_eq!(
             sample.peak_memory_bytes, 6_970_000_000,
@@ -4737,7 +5327,7 @@ mod tests {
     #[test]
     fn child_tree_usage_burst_reading_moves_only_the_peak() {
         let usage = ChildTreeUsage::default();
-        usage.store(4, 1_000_000_000);
+        usage.store(4, 1_000_000_000, HashMap::new());
         let before = usage.load().expect("sampled");
         usage.observe_burst(7_000_000_000);
         let after = usage.load().expect("sampled");
@@ -4790,14 +5380,14 @@ mod tests {
         const A: (usize, u64) = (4, 1_000_000_000);
         const B: (usize, u64) = (24, 5_000_000_000);
         let usage = Arc::new(ChildTreeUsage::default());
-        usage.store(A.0, A.1);
+        usage.store(A.0, A.1, HashMap::new());
 
         let writer = {
             let usage = usage.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
                     let (count, bytes) = if i % 2 == 0 { A } else { B };
-                    usage.store(count, bytes);
+                    usage.store(count, bytes, HashMap::new());
                 }
             })
         };
@@ -4848,10 +5438,90 @@ mod tests {
         // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
         let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
         let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
         // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
         assert_eq!(bytes, 1400);
+        assert!(agent_bytes.is_empty(), "no registered roots, no buckets");
+    }
+
+    /// Attribution buckets each descendant under its nearest registered agent
+    /// root: the root's own RSS and its whole chain (npm exec → adapter → CLI)
+    /// are credited to the agent, siblings land in separate buckets, and a
+    /// descendant under no registered root counts only toward the aggregate.
+    #[test]
+    fn walk_descendants_buckets_rss_by_nearest_agent_root() {
+        // 1 (daemon) → 2 (agent A root) → 3 → 4, a sibling agent 1 → 5 (agent
+        // B root), and an unregistered chain 1 → 6 → 7 (host.exec-style).
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (1, 6), (6, 7)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(5), b.clone()),
+        ]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(count, 6);
+        assert_eq!(bytes, 200 + 300 + 400 + 500 + 600 + 700);
+        // Agent A: its root 2 plus descendants 3 and 4.
+        assert_eq!(agent_bytes.get(&a), Some(&(200 + 300 + 400)));
+        // Agent B: just its root 5.
+        assert_eq!(agent_bytes.get(&b), Some(&500));
+        // 6 → 7 is under no registered root: aggregate-only.
+        assert_eq!(agent_bytes.values().sum::<u64>(), 1400);
+    }
+
+    /// A registered root nested under another agent's subtree opens its own
+    /// bucket — a sub-agent's usage is credited to the sub-agent, not folded
+    /// into its ancestor's bucket (the buckets partition the tree).
+    #[test]
+    fn walk_descendants_nested_agent_root_starts_its_own_bucket() {
+        // 1 → 2 (agent A root) → 3 (agent B root, nested) → 4.
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(3), b.clone()),
+        ]);
+        let (_, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(bytes, 200 + 300 + 400);
+        assert_eq!(agent_bytes.get(&a), Some(&200), "only its own pid");
+        assert_eq!(agent_bytes.get(&b), Some(&(300 + 400)));
+    }
+
+    /// A registered root whose pid is not in the walked tree (already exited,
+    /// or its subtree reparented to init) simply contributes no bucket — the
+    /// aggregate is unaffected and no phantom zero-byte entry appears.
+    #[test]
+    fn walk_descendants_ignores_agent_roots_outside_the_tree() {
+        let children = adjacency(&[(1, 2)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        let roots = HashMap::from([(sysinfo::Pid::from(42), AgentId::from("agent-gone"))]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 10));
+        assert!(agent_bytes.is_empty());
+    }
+
+    /// An agent root that vanished mid-walk (its memory read fails) still
+    /// buckets the live descendants underneath it — the chain below a dead
+    /// `npm exec` is exactly the RSS the agent is responsible for.
+    #[test]
+    fn walk_descendants_buckets_survive_a_dead_agent_root() {
+        let children = adjacency(&[(1, 2), (2, 3)]);
+        let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
+        let a = AgentId::from("agent-a");
+        let roots = HashMap::from([(sysinfo::Pid::from(2), a.clone())]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 700));
+        assert_eq!(agent_bytes.get(&a), Some(&700));
     }
 
     /// A pid table sampled while processes exit and get reparented can contain
@@ -4861,7 +5531,8 @@ mod tests {
     fn walk_descendants_terminates_on_a_cycle() {
         let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
         let memory = |_: sysinfo::Pid| Some(10);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 2, "each pid is counted exactly once");
         assert_eq!(bytes, 20);
     }
@@ -4873,7 +5544,8 @@ mod tests {
     fn walk_descendants_skips_pids_that_exited_mid_walk() {
         let children = adjacency(&[(1, 2), (2, 3)]);
         let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
-        let (count, bytes) = walk_descendants(&children, &memory, sysinfo::Pid::from(1));
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
         assert_eq!(count, 1);
         assert_eq!(bytes, 700);
     }
@@ -4884,8 +5556,90 @@ mod tests {
         let children = adjacency(&[(9, 10)]);
         let memory = |_: sysinfo::Pid| Some(10);
         assert_eq!(
-            walk_descendants(&children, &memory, sysinfo::Pid::from(1)),
-            (0, 0)
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
+            (0, 0, HashMap::new())
+        );
+    }
+
+    /// Helper child for the thread-row regression test below: parks 16
+    /// sleeping threads so its `/proc/<pid>/task` directory is populated,
+    /// prints READY, and waits to be killed. Env-gated so a stray
+    /// `--include-ignored` run returns immediately instead of sleeping.
+    #[test]
+    #[ignore = "helper child process; spawned by descendant_tree_usage_excludes_linux_thread_rows"]
+    fn thread_heavy_child_helper() {
+        if std::env::var("INTENTD_TEST_THREAD_HEAVY_CHILD").is_err() {
+            return;
+        }
+        let park = || std::thread::sleep(Duration::from_secs(60));
+        let _threads: Vec<_> = (0..16).map(|_| std::thread::spawn(park)).collect();
+        println!("READY");
+        park();
+    }
+
+    /// The monorepo#2342 regression: on Linux, sysinfo's process table lists
+    /// threads (`/proc/<pid>/task` entries) as `Process` rows, each reporting
+    /// the WHOLE process's RSS and chaining into the tree via `parent()` ==
+    /// the owning process. The old walk counted an N-threaded child N+1
+    /// times — observed up to 219x inflation of `childMemoryBytes`. A walk
+    /// rooted at a multi-threaded process must charge its thread rows as
+    /// neither descendants nor bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_tree_usage_excludes_linux_thread_rows() {
+        use std::io::BufRead as _;
+
+        // Re-exec this test binary filtered to the thread-heavy helper above
+        // — the only guaranteed-available multi-threaded child.
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--include-ignored",
+                "--exact",
+                "tests::thread_heavy_child_helper",
+                "--nocapture",
+            ])
+            .env("INTENTD_TEST_THREAD_HEAVY_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn thread-heavy child");
+        let mut lines = std::io::BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+        loop {
+            match lines.next() {
+                Some(Ok(line)) if line.contains("READY") => break,
+                Some(_) => continue,
+                None => panic!("child exited before READY"),
+            }
+        }
+
+        // Refresh WITH tasks — the table shape the sampler saw before the
+        // fix — so the walk itself must be what excludes the thread rows.
+        let child_pid = sysinfo::Pid::from_u32(child.id());
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_tasks(),
+        );
+        let thread_rows = sys
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_some() && p.parent() == Some(child_pid))
+            .count();
+        let usage = descendant_tree_usage(&sys, child_pid, &HashMap::new());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            thread_rows >= 16,
+            "precondition: the refreshed table must list the child's thread rows (got {thread_rows})"
+        );
+        assert_eq!(
+            usage,
+            (0, 0, HashMap::new()),
+            "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }
 }

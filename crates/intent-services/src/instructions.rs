@@ -142,15 +142,47 @@ fn remove_section(text: &str, heading: &str) -> String {
 /// that this text still matches the bundled body verbatim).
 const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
 
+/// Start/end markers of common.md's "Task relations during delegation"
+/// subsection — the advisory task-graph teaching (intent-hq/monorepo#2457,
+/// reworked from the intentd#1116/#1147 batch-delegation doctrine) — removed
+/// when `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). It is an
+/// H3 inside "## Delegating Tasks" followed by plain section text, so
+/// [`remove_section`]'s H2 scan cannot express it; instead the text from the
+/// heading through the blank line before the "Keep delegated tasks visible"
+/// paragraph is cut by marker (unit tests guard both markers verbatim).
+const COMMON_TASK_RELATIONS_START: &str = "### Task relations during delegation";
+const COMMON_TASK_RELATIONS_END: &str = "Keep delegated tasks visible in the note";
+
+/// Remove the text between `start` (inclusive) and `end` (exclusive) markers.
+/// No-op unless both markers are present in order.
+fn remove_between(text: &str, start: &str, end: &str) -> String {
+    let Some(s) = text.find(start) else {
+        return text.to_string();
+    };
+    match text[s..].find(end) {
+        Some(e) => format!("{}{}", &text[..s], &text[s + e..]),
+        None => text.to_string(),
+    }
+}
+
 /// The `common` body with feature-gated sections omitted (spec audit rows 1,
 /// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
-/// "Raising Attention". When `hostExec` is off but the Waiting section
-/// survives, the `ws.host.exec` fallback sentence of its "Cross-repo PRs"
-/// bullet is scrubbed. With all defaults on this borrows the bundled body
-/// untouched (byte-identical prompts).
+/// "Raising Attention", and `taskGraph` gates the "Task relations during
+/// delegation" subsection (dispositions, `unlockPlan`, unblocked-wake
+/// guidance). When `hostExec` is off but the Waiting section survives, the
+/// `ws.host.exec` fallback sentence of its "Cross-repo PRs" bullet is
+/// scrubbed. With every gate open (`taskGraph` opted in) this borrows the
+/// bundled body untouched (byte-identical prompts).
 fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     let mut body = Cow::Borrowed(COMMON);
+    if !features.task_graph {
+        body = Cow::Owned(remove_between(
+            &body,
+            COMMON_TASK_RELATIONS_START,
+            COMMON_TASK_RELATIONS_END,
+        ));
+    }
     if !features.attention_requests {
         body = Cow::Owned(remove_section(&body, "Raising Attention"));
     }
@@ -163,6 +195,47 @@ fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
         body = Cow::Owned(remove_section(&body, "Rich Chat Rendering"));
     }
     body
+}
+
+/// Markers of the task-graph teaching in `task-breakdown.md` (from
+/// intentd#1116/#1135), removed when `agentFeatures.taskGraph` is off
+/// (intent-hq/monorepo#2445): the "Contract-First Splitting" and "Declaring
+/// Task Relations" H3 blocks run back-to-back and end at the next H2, and
+/// three inline mentions (the `dependsOn=` decomposition clause and the two
+/// fence-attribute lines of the Document Update Format example, which sit in
+/// a tab-indented block) are rewritten to their pre-attribute wording. Unit
+/// tests guard every needle verbatim.
+const BREAKDOWN_RELATIONS_START: &str = "### Contract-First Splitting";
+const BREAKDOWN_RELATIONS_END: &str = "## Breakdown Process";
+const BREAKDOWN_DEPENDS_ON_CLAUSE: &str =
+    " and declare the ordering as `dependsOn=` attributes on the task blocks";
+const BREAKDOWN_EXAMPLE_HEADER: &str = "\tExample (two subtasks, ordered with an inline relation):";
+const BREAKDOWN_EXAMPLE_HEADER_OFF: &str = "\tExample (two subtasks):";
+const BREAKDOWN_EXAMPLE_KEY_LINE: &str = "\t@@@task key=research";
+const BREAKDOWN_EXAMPLE_DEPENDS_LINE: &str = "\t@@@task dependsOn=research";
+const BREAKDOWN_EXAMPLE_PLAIN_LINE: &str = "\t@@@task";
+
+/// The `task-breakdown` body with the task-graph teaching omitted when
+/// `agentFeatures.taskGraph` is off; borrows the bundled body untouched when
+/// the toggle is on.
+fn gated_task_breakdown(features: &AgentFeaturesSettings) -> Cow<'static, str> {
+    if features.task_graph {
+        return Cow::Borrowed(TASK_BREAKDOWN);
+    }
+    let body = remove_between(
+        TASK_BREAKDOWN,
+        BREAKDOWN_RELATIONS_START,
+        BREAKDOWN_RELATIONS_END,
+    )
+    .replacen(BREAKDOWN_DEPENDS_ON_CLAUSE, "", 1)
+    .replacen(BREAKDOWN_EXAMPLE_HEADER, BREAKDOWN_EXAMPLE_HEADER_OFF, 1)
+    .replacen(BREAKDOWN_EXAMPLE_KEY_LINE, BREAKDOWN_EXAMPLE_PLAIN_LINE, 1)
+    .replacen(
+        BREAKDOWN_EXAMPLE_DEPENDS_LINE,
+        BREAKDOWN_EXAMPLE_PLAIN_LINE,
+        1,
+    );
+    Cow::Owned(body)
 }
 
 /// The dev-server guideline in `workspace-agent.md` gated by
@@ -201,6 +274,8 @@ pub(crate) fn get_instruction_with_common(
 ) -> String {
     let specific: Cow<'static, str> = if agent_type == "workspace-agent" {
         gated_workspace_agent(features)
+    } else if agent_type == "task-breakdown" {
+        gated_task_breakdown(features)
     } else {
         Cow::Borrowed(get_instruction_by_id(agent_type, true).unwrap_or(WORKSPACE))
     };
@@ -228,14 +303,23 @@ mod tests {
         AgentFeaturesSettings::default()
     }
 
+    /// Every gate open: the defaults plus the opt-in `taskGraph`, so gated
+    /// bodies are byte-identical to the bundled sources.
+    fn all_on() -> AgentFeaturesSettings {
+        AgentFeaturesSettings {
+            task_graph: true,
+            ..AgentFeaturesSettings::default()
+        }
+    }
+
     #[test]
     fn common_only_is_not_self_wrapped() {
-        assert_eq!(get_instruction_with_common("common", &defaults()), COMMON);
+        assert_eq!(get_instruction_with_common("common", &all_on()), COMMON);
     }
 
     #[test]
     fn workspace_gets_common_prepended_once() {
-        let out = get_instruction_with_common("workspace", &defaults());
+        let out = get_instruction_with_common("workspace", &all_on());
         assert_eq!(out, format!("{COMMON}\n\n---\n\n{WORKSPACE}"));
     }
 
@@ -273,7 +357,7 @@ mod tests {
 
     #[test]
     fn workspace_agent_gets_common_workspace_specific() {
-        let out = get_instruction_with_common("task-loop", &defaults());
+        let out = get_instruction_with_common("task-loop", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
@@ -283,7 +367,7 @@ mod tests {
     #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
         // The spawn default agent type is unknown → fallbackToWorkspace.
-        let out = get_instruction_with_common("interactive", &defaults());
+        let out = get_instruction_with_common("interactive", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
@@ -292,7 +376,7 @@ mod tests {
 
     #[test]
     fn fix_alias_resolves_to_debug() {
-        let out = get_instruction_with_common("fix", &defaults());
+        let out = get_instruction_with_common("fix", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
@@ -305,11 +389,11 @@ mod tests {
         // membership checks use the raw id ("review"/"walkthrough"), which are not
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
-            get_instruction_with_common("review", &defaults()),
+            get_instruction_with_common("review", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
-            get_instruction_with_common("walkthrough", &defaults()),
+            get_instruction_with_common("walkthrough", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }
@@ -317,12 +401,82 @@ mod tests {
     // --- [agentFeatures] prompt gating ---
 
     #[test]
-    fn defaults_keep_gated_bodies_borrowed_and_byte_identical() {
-        let d = defaults();
-        assert!(matches!(gated_common(&d), Cow::Borrowed(_)));
-        assert!(matches!(gated_workspace_agent(&d), Cow::Borrowed(_)));
-        assert_eq!(gated_common(&d).as_ref(), COMMON);
-        assert_eq!(gated_workspace_agent(&d).as_ref(), WORKSPACE_AGENT);
+    fn all_on_keeps_gated_bodies_borrowed_and_byte_identical() {
+        let a = all_on();
+        assert!(matches!(gated_common(&a), Cow::Borrowed(_)));
+        assert!(matches!(gated_workspace_agent(&a), Cow::Borrowed(_)));
+        assert!(matches!(gated_task_breakdown(&a), Cow::Borrowed(_)));
+        assert_eq!(gated_common(&a).as_ref(), COMMON);
+        assert_eq!(gated_workspace_agent(&a).as_ref(), WORKSPACE_AGENT);
+        assert_eq!(gated_task_breakdown(&a).as_ref(), TASK_BREAKDOWN);
+    }
+
+    #[test]
+    fn task_graph_off_removes_task_relations_from_common() {
+        // Guards: the markers still match the bundled body verbatim.
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_START));
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_END));
+        // Default features have `taskGraph` off (opt-in).
+        let common = gated_common(&defaults());
+        assert!(!common.contains("### Task relations during delegation"));
+        assert!(!common.contains("unlockPlan"));
+        assert!(!common.contains("Tasks now unblocked"));
+        // Single-task delegation guidance and the surrounding section survive
+        // with a clean seam (the pre-teaching layout).
+        assert!(common.contains("## Delegating Tasks"));
+        assert!(common.contains(
+            "waitMode: \"after_all\" })\n```\n\nKeep delegated tasks visible in the note"
+        ));
+    }
+
+    #[test]
+    fn task_graph_on_common_teaching_is_advisory_not_doctrine() {
+        // Flag ON: the advisory subsection is present…
+        let common = gated_common(&all_on());
+        assert!(common.contains("### Task relations during delegation"));
+        assert!(common.contains("**Holds are advisory, not final.**"));
+        // …and none of the batch-delegation doctrine phrases remain
+        // (intent-hq/monorepo#2445 regression, reworked per monorepo#2457).
+        for gone in [
+            "preferred for multi-task plans",
+            "remaining list",
+            "tasks: [\"t1\", \"t2\", \"t3\"]",
+            "Re-call delegate",
+            "re-call",
+            "greedy",
+        ] {
+            assert!(!common.contains(gone), "doctrine phrase survived: {gone:?}");
+        }
+    }
+
+    #[test]
+    fn task_graph_off_removes_relations_teaching_from_task_breakdown() {
+        // Guards: every needle still matches the bundled body verbatim.
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_RELATIONS_START));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_RELATIONS_END));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_DEPENDS_ON_CLAUSE));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_HEADER));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_KEY_LINE));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_DEPENDS_LINE));
+        let body = gated_task_breakdown(&defaults());
+        assert!(!body.contains("### Contract-First Splitting"));
+        assert!(!body.contains("### Declaring Task Relations"));
+        assert!(!body.contains("dependsOn"));
+        assert!(!body.contains("conflictsWith"));
+        assert!(!body.contains("key=research"));
+        assert!(!body.contains("effort="));
+        // Neighboring content survives with a clean seam, and the example
+        // reverts to plain `@@@task` fences.
+        assert!(body.contains("- \"Add single line comment\"\n\n## Breakdown Process"));
+        assert!(body.contains("\tExample (two subtasks):"));
+        assert!(body.contains("\t@@@task\n\t# Research existing patterns"));
+        assert!(body.contains("\t@@@task\n\t# Implement validation"));
+        assert!(body.contains("- Order subtasks by dependencies (what needs to happen first)\n"));
+        // The ungated convertBlocks materialization rule survives.
+        assert!(body.contains("ws.task.convertBlocks(\"spec\")"));
+        // Composition routes task-breakdown through the gate.
+        let out = get_instruction_with_common("task-breakdown", &defaults());
+        assert!(!out.contains("### Declaring Task Relations"));
     }
 
     #[test]

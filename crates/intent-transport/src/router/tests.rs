@@ -58,6 +58,7 @@ fn sample_ws() -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -808,8 +809,59 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
+            if workspace_id.as_str() == "missing" {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            }
+            Ok(serde_json::json!({
+                "gitRoots": [{
+                    "id": "root-1",
+                    "workspaceId": workspace_id.as_str(),
+                    "path": "/tmp/clone-a",
+                    "source": "agent",
+                    "branch": "feature",
+                }]
+            }))
+        })
+    }
+
+    fn git_root_path(
+        &self,
+        _workspace_id: WorkspaceId,
+        git_root_id: intent_core::WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if git_root_id.as_str() == "root-1" {
+                Ok("/repo".to_string())
+            } else {
+                Err(Error::InvalidParams(format!(
+                    "Unknown git root: {git_root_id}"
+                )))
+            }
+        })
+    }
+
+    fn git_status(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        Box::pin(async move {
+            if let Some(id) = &git_root_id {
+                if id.as_str() != "root-1" {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                return Ok(GitStatus {
+                    branch: "root-branch".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                    diverged: false,
+                    files: vec![],
+                    has_uncommitted_changes: false,
+                    has_untracked_files: false,
+                });
+            }
             if workspace_id.as_str() == "empty" {
                 return Ok(GitStatus {
                     branch: String::new(),
@@ -837,6 +889,33 @@ impl WorkspaceApi for FakeApi {
                 has_uncommitted_changes: true,
                 has_untracked_files: false,
             })
+        })
+    }
+
+    fn git_commit_details(
+        &self,
+        _workspace_id: WorkspaceId,
+        commit_hash: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if let Some(id) = &git_root_id {
+                if id.as_str() != "root-1" {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                return Ok(serde_json::json!({
+                    "commitHash": commit_hash,
+                    "message": "root-commit",
+                    "files": ["root-only.txt"],
+                    "fileDetails": [{ "path": "root-only.txt", "additions": 1, "deletions": 0 }],
+                }));
+            }
+            Ok(serde_json::json!({
+                "commitHash": commit_hash,
+                "message": "primary-commit",
+                "files": ["src/a.ts"],
+                "fileDetails": [{ "path": "src/a.ts", "additions": 1, "deletions": 0 }],
+            }))
         })
     }
 
@@ -1382,6 +1461,25 @@ impl WorkspaceApi for FakeApi {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+    }
+
+    fn file_read_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // Echo the window so the wire test can assert offset/length reach the
+        // service, alongside the documented result shape.
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "content": format!("b64:{path}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
     }
 
     fn file_write(
@@ -3779,6 +3877,152 @@ async fn git_status_missing_workspace_id_is_minus_32602() {
 }
 
 #[tokio::test]
+async fn git_status_with_git_root_id_scopes_to_root() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("root-branch"));
+}
+
+#[tokio::test]
+async fn git_status_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_root_list_returns_git_roots_envelope() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    let roots = v["result"]["gitRoots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], serde_json::json!("root-1"));
+    assert_eq!(roots[0]["branch"], serde_json::json!("feature"));
+}
+
+#[tokio::test]
+async fn git_root_list_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+}
+
+#[tokio::test]
+async fn git_root_list_unknown_workspace_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn git_branch_status_git_root_id_resolves_repo_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"workspaceId":"ws-1","gitRootId":"root-1","branchName":"feature"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["isCurrentBranch"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn git_branch_status_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"workspaceId":"ws-1","gitRootId":"nope","branchName":"feature"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    // Identical message to the other five gitRootId-scoped reads (§5.6):
+    // the domain error maps through `domain_to_rpc`, which prefixes
+    // `invalid params:` exactly like the `git.status` arm above.
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_status_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":""}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("main"));
+}
+
+#[tokio::test]
+async fn git_commit_details_with_git_root_id_scopes_to_root() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commitHash"], serde_json::json!("abc123"));
+    assert_eq!(v["result"]["message"], serde_json::json!("root-commit"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["root-only.txt"]));
+}
+
+#[tokio::test]
+async fn git_commit_details_without_git_root_id_targets_primary() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
+}
+
+#[tokio::test]
+async fn git_commit_details_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_commit_details_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
+}
+
+#[tokio::test]
 async fn git_stage_returns_ok_and_paths() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["src/a.ts","src/b.ts"]}}"#,
@@ -4727,6 +4971,17 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
     assert_eq!(v["result"], serde_json::json!("ws-1:a.txt"));
     assert!(v["result"].is_string());
 
+    // file.readChunk → { content, bytesRead, size } with offset/length routed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a.bin","offset":64,"length":32}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:a.bin:64:32", "bytesRead": 32, "size": 1000u64 })
+    );
+
     // file.write → { ok, path, size }.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a.txt","content":"hello"}}"#,
@@ -4839,6 +5094,20 @@ async fn file_methods_require_params() {
     // file.write missing content → -32602.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.readChunk missing offset / length → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","offset":0}}"#,
     )
     .await
     .unwrap();

@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 287 canonical methods routed through the main dispatch match in
+/// These are the 293 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -72,6 +72,10 @@ pub const ROUTER_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "file.attachmentUpload.abort",
+    "file.attachmentUpload.begin",
+    "file.attachmentUpload.chunk",
+    "file.attachmentUpload.commit",
     "file.delete",
     "file.exists",
     "file.getAttachmentInfo",
@@ -79,6 +83,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "file.mkdir",
     "file.placeAttachment",
     "file.read",
+    "file.readChunk",
     "file.rename",
     "file.stat",
     "file.tree",
@@ -111,6 +116,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.status",
     "git.unstage",
     "git.unstageHunk",
+    "gitRoot.list",
     "github.authStatus",
     "github.branches.list",
     "github.branches.listCached",

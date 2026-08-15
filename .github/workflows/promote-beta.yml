@@ -1,0 +1,171 @@
+# Manual promotion of an existing vX.Y.Z release to the beta channel.
+#
+# Every tagged release automatically updates alpha.json on `channel-alpha`
+# (publish-channel-manifest.yml, run as a dist post-announce hook). Beta is
+# promotion-only: run this workflow with the version of an existing release to
+# rebuild beta.json from that release's assets and upload it to the fixed
+# `channel-beta` release. Consumers (e.g. cloudlands-fe pin-bump automation,
+# installer scripts) discover the latest beta release from that manifest.
+#
+# When the INTENTD_RELEASES_TOKEN secret is configured, the promoted release's
+# platform archives + .sha256 sidecars are also mirrored to the public
+# intent-hq/intentd-releases repo (idempotent, so promoting a release cut
+# before mirroring existed backfills it), together with a beta.json whose
+# platform URLs point at the mirrored assets. The beta.json published on
+# this repo is unchanged (sitter fallback path + future open-source path).
+#
+# Tagged releases are published as GitHub Pre-releases (v-release.yml), so a
+# promotable release only has to exist and not be a draft. Unlike stable
+# promotion (promote-stable.yml), beta promotion does NOT touch the
+# prerelease/Latest flags — clearing the Pre-release flag and moving the
+# Latest badge remain stable-promotion semantics.
+#
+# Promotions do not comment on monorepo issues: the release notifier
+# (scripts/notify-fixed-issues.sh) runs only from the release tag build
+# (publish-channel-manifest.yml) and its comments are channel-free.
+name: Promote beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to promote to beta (e.g. 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# Never cancel a promotion in progress
+concurrency:
+  group: intentd-beta-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote-to-beta:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate version format
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            # Deliberately not echoing the raw input: it is unvalidated and could
+            # contain workflow-command sequences (log injection).
+            echo "::error::Invalid version input. Expected X.Y.Z (e.g. 0.1.0); prerelease/build suffixes are not allowed."
+            exit 1
+          fi
+          echo "Version $VERSION is valid"
+      # Pre-release is the expected state of an alpha release and stays set —
+      # beta promotion never touches the flag. Drafts are still rejected: they
+      # have no published assets to promote.
+      - name: Verify release exists and is not a draft
+        shell: bash
+        run: |
+          if ! is_draft=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq '.isDraft'); then
+            echo "::error::Release v${VERSION} does not exist on $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          if [[ "$is_draft" != "false" ]]; then
+            echo "::error::Release v${VERSION} is a draft; only published releases can be promoted"
+            exit 1
+          fi
+          echo "Release v${VERSION} exists and is not a draft"
+      # Read the outgoing beta.json before it is rebuilt so the summary can
+      # name it. Fail-soft: a missing asset/release (first promotion) or any
+      # error just leaves the previous version empty.
+      - name: Read previous beta version
+        id: prev-beta
+        continue-on-error: true
+        shell: bash
+        run: |
+          prev=""
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          if gh release download channel-beta --repo "$GITHUB_REPOSITORY" \
+            --pattern beta.json --dir "$tmpdir"; then
+            prev=$(jq -r '.version // empty' "$tmpdir/beta.json" || true)
+          else
+            echo "No existing beta.json on channel-beta (first promotion?)"
+          fi
+          if [[ ! "$prev" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            prev=""
+          fi
+          echo "version=$prev" >> "$GITHUB_OUTPUT"
+          echo "Previous beta version: ${prev:-<none>}"
+      - name: Build beta manifest
+        shell: bash
+        run: |
+          ./scripts/make-channel-manifest.sh "v${VERSION}" beta beta.json
+      - name: Publish manifest to channel-beta
+        shell: bash
+        run: |
+          ./scripts/publish-channel-manifest.sh beta beta.json
+      - name: Post summary
+        shell: bash
+        env:
+          PREV_BETA: ${{ steps.prev-beta.outputs.version }}
+        run: |
+          {
+            echo "## Beta promotion"
+            echo ""
+            echo "**Promoted version:** v$VERSION"
+            echo ""
+            echo "**Previous beta:** ${PREV_BETA:-unknown (first promotion?)}"
+            echo ""
+            echo "- [channel-beta release](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-beta)"
+            echo "- [beta.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-beta/beta.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # --- Public mirror: intent-hq/intentd-releases ---
+      # Runs last so a mirror failure (bad/expired token, network error) still
+      # fails the workflow loudly, but cannot skip the summary above — the
+      # primary promotion is fully done by this point. Skipped with a warning
+      # when the INTENTD_RELEASES_TOKEN secret is not configured, so a missing
+      # secret never blocks promotion.
+      - name: Check mirror token
+        id: mirror
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -n "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::INTENTD_RELEASES_TOKEN secret is not configured; skipping mirror to intent-hq/intentd-releases"
+          fi
+      # Idempotent: creates the mirrored release if missing and re-uploads the
+      # assets with --clobber, so promoting a pre-mirror release still works.
+      # Notes are copied from the source release body (download URLs rewritten
+      # to the mirror) and re-synced if the mirrored release already exists.
+      - name: Mirror release assets to intentd-releases
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          DEST_REPO: intent-hq/intentd-releases
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/mirror-release-assets.sh "v${VERSION}"
+      # Same release, but the platform URLs point at the mirrored assets.
+      - name: Build mirror beta manifest
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          ASSET_REPO: intent-hq/intentd-releases
+        run: |
+          mkdir -p mirror
+          ./scripts/make-channel-manifest.sh "v${VERSION}" beta mirror/beta.json
+      - name: Publish manifest to intentd-releases channel-beta
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/publish-channel-manifest.sh beta mirror/beta.json intent-hq/intentd-releases

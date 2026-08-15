@@ -310,6 +310,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -358,9 +359,13 @@ async fn setup_busy_agent_with_two_queued(data_dir: &Path, script: &str) -> Flus
     // First turn parks 2s: a deterministic window to queue both messages
     // while the worker is busy. Queue-drained turns run at full mock speed.
     let behavior = json!({ "response": "flush reply", "firstTurnDelayMs": 2000 }).to_string();
-    let env: [(&str, &str); 5] = [
+    let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the wait-note assertions
+        // exercise the annotation without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),

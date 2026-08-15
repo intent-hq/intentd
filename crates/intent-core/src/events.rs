@@ -110,11 +110,13 @@ pub const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cance
 pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 
 // Agent process-registry lifecycle events (new in intentd; PROTOCOL §6.5). Emitted
-// by the daemon-internal `ProcessRegistry` when a spawn queues for a concurrency
-// slot (all slots active), when a queued spawn resumes (a slot freed), and when
-// the registry evicts the LRU idle process. Self-sufficient payloads carry
-// `{ agentId, used, cap }` so a client can render the cap-saturation state without
-// polling. Mirrors the TS reference `agent-process-registry.ts` logging.
+// by the daemon-internal `ProcessRegistry` when a spawn queues for admission
+// (all slots active, or the aggregate memory budget is exceeded — monorepo#2063),
+// when a queued spawn resumes, and when the registry evicts the LRU idle process.
+// Self-sufficient payloads carry `{ agentId, used, cap, reason }` — `reason` is
+// `"slots"` or `"memory-budget"`, naming the admission constraint that drove the
+// event — so a client can render the saturation state without polling. Mirrors
+// the TS reference `agent-process-registry.ts` logging.
 pub const AGENT_PROCESS_QUEUED: &str = "agent:process:queued";
 pub const AGENT_PROCESS_RESUMED: &str = "agent:process:resumed";
 pub const AGENT_PROCESS_EVICTED: &str = "agent:process:evicted";
@@ -168,6 +170,18 @@ pub const GIT_PUSH: &str = "git:push";
 pub const GIT_PULL: &str = "git:pull";
 pub const GIT_BRANCH: &str = "git:branch";
 pub const GIT_MERGE: &str = "git:merge";
+
+// Workspace-git-root events (multi git root tracking,
+// intent-hq/monorepo#2053). Emitted when a secondary git root is registered
+// for a workspace, when a registered root's row changes (re-registration
+// attribution merge, PR-field refresh), and when a root is unregistered or
+// auto-pruned. Self-sufficient payloads: `gitRoot:registered` /
+// `gitRoot:updated` carry `{ workspaceId, gitRoot }` (the full wire
+// `WorkspaceGitRoot` row); `gitRoot:unregistered` carries
+// `{ workspaceId, gitRootId, path }`.
+pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
+pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
+pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
@@ -270,6 +284,16 @@ pub const WORKSPACE_DELETE_SCHEDULED: &str = "workspace:delete-scheduled";
 pub const WORKSPACE_DELETE_CANCELLED: &str = "workspace:delete-cancelled";
 pub const WORKSPACE_OPENED: &str = "workspace:opened";
 pub const WORKSPACE_CLOSED: &str = "workspace:closed";
+// Setup-script lifecycle of the `workspace.create` setup stage (PROTOCOL
+// §6.5). `workspace:setup:started` `{ workspaceId }` fires when an effective
+// setup script was resolved and a spawn will be attempted;
+// `workspace:setup:completed` `{ workspaceId, ranScript, exitCode? }` fires
+// exactly once per logical create on every terminal path (no script, spawn
+// failure, script exit) — including create paths that never reach the setup
+// stage (`skipWorktree`, no worktree) and `workspace.duplicate`, which runs
+// no setup. Idempotent replays publish nothing (same as `workspace:created`).
+pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
+pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
 pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
 // payloads carry the new derived value so the FE flips the green/blue dot with no
@@ -284,6 +308,13 @@ pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 // derivation; the self-sufficient payload `{ workspaceId, displayStatus }`
 // updates the workspace card badge with no follow-up fetch.
 pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-changed";
+// Orthogonal `Workspace.waiting` flag transition (PROTOCOL §5.1 / §6.5):
+// recomputed
+// and compared after the hook / PR-monitor / completion-watch lifecycle
+// transitions that can move the derivation; the self-sufficient payload
+// `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
+// no follow-up fetch.
+pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -467,6 +498,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_PULL,
     GIT_BRANCH,
     GIT_MERGE,
+    GIT_ROOT_REGISTERED,
+    GIT_ROOT_UPDATED,
+    GIT_ROOT_UNREGISTERED,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
@@ -507,10 +541,13 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_DELETE_CANCELLED,
     WORKSPACE_OPENED,
     WORKSPACE_CLOSED,
+    WORKSPACE_SETUP_STARTED,
+    WORKSPACE_SETUP_COMPLETED,
     WORKSPACE_ACTIVITY,
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
+    WORKSPACE_WAITING_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
     WORKSPACE_TRANSFER_PROGRESS,

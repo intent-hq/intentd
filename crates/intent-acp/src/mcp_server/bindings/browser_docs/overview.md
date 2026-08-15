@@ -33,4 +33,33 @@ Actions are executed as a sequence of declarative operations.
 The embedded browser supports http://, https://, and file:// URLs.
 You can open local HTML files directly: `{ action: "openTab", url: "file:///path/to/index.html" }`
 
+## Loopback URLs: daemon vs client machine
+
+The embedded browser runs on the client (user's) machine, while servers you start (via
+`ws.host.exec`, scripts, terminals) run on the daemon machine. In a remote-daemon setup
+these are different machines, so `navigate`/`openTab` URLs support reserved hostnames:
+
+- `daemon.localhost` — the machine where the daemon runs (where your servers run).
+  Local setup: rewritten to `127.0.0.1`. Remote setup: rewritten to the daemon host.
+- `client.localhost` — the user's machine (where the embedded browser runs). Always
+  rewritten to `127.0.0.1`.
+- Bare `127.0.0.1` / `localhost` / `[::1]` — ambiguous; assumed to mean the daemon
+  machine (your frame of reference). Unchanged in a local setup; in a remote setup it is
+  rewritten to the daemon host and the result carries a `warning` suggesting the explicit
+  aliases.
+
+Only the hostname is rewritten — scheme, port, path, query, and hash are preserved. Every
+rewritten action's result echoes `{ requestedUrl, finalUrl, rewritten: true, reason, tunneled?, warning? }`
+so you can see what was opened. Prefer `daemon.localhost` for servers you started.
+
+Remote-daemon caveat: the client's browser reaches daemon-side servers over the network,
+so prefer binding `0.0.0.0` and keeping the port reachable from the client machine. URLs
+rewritten to a remote daemon host are reachability-probed before navigating. If the origin
+cannot be reached, the Electron desktop client automatically forwards the port over the
+daemon connection and opens the tunneled URL instead — the result carries `tunneled: true`
+and the `reason` describes the forward — so servers bound to `127.0.0.1` on the daemon
+still work. If the tunnel forward itself fails, or on web-browser clients (which cannot
+open a local tunnel listener), the action fails with an explanatory error (pointing at
+`127.0.0.1`-only binding or a firewall) instead of opening a broken page.
+
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.

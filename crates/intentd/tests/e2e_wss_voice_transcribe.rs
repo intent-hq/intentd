@@ -289,6 +289,7 @@ async fn seed_vocab_workspace(fx: &Fixture, readme: &str) -> WorkspaceId {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        waiting: false,
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,

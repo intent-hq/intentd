@@ -2,11 +2,11 @@
 //! rate limiter for the "slow worktree hunk walk" WARN.
 //!
 //! Concurrent `git.diffs` calls with an identical request identity
-//! (`workspace_id`, `paths`, `staged`, `commit_hash`) coalesce onto one
-//! blocking-pool libgit2 walk whose result is shared; non-identical requests
-//! run independently. The leader registers the flight, runs the walk, and
-//! publishes the shared result; followers await it over a `watch` channel. A
-//! leader that vanishes without publishing (cancelled RPC, panicked walk)
+//! (`workspace_id`, `paths`, `staged`, `commit_hash`, `git_root_id`) coalesce
+//! onto one blocking-pool libgit2 walk whose result is shared; non-identical
+//! requests run independently. The leader registers the flight, runs the walk,
+//! and publishes the shared result; followers await it over a `watch` channel.
+//! A leader that vanishes without publishing (cancelled RPC, panicked walk)
 //! drops its guard, which unregisters the flight and closes the channel so
 //! followers retry — the next joiner is elected leader.
 
@@ -14,11 +14,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use intent_core::WorkspaceId;
+use intent_core::{WorkspaceGitRootId, WorkspaceId};
 use tokio::sync::watch;
 
-/// The full request identity a `git.diffs` call coalesces on.
-pub(crate) type DiffKey = (WorkspaceId, Option<Vec<String>>, bool, Option<String>);
+/// The full request identity a `git.diffs` call coalesces on. The
+/// `git_root_id` component keeps a registered-root walk (monorepo#2053) from
+/// coalescing with a primary-worktree walk on the same workspace.
+pub(crate) type DiffKey = (
+    WorkspaceId,
+    Option<Vec<String>>,
+    bool,
+    Option<String>,
+    Option<WorkspaceGitRootId>,
+);
 
 /// The result shape shared across coalesced callers. The payload is `Arc`ed so
 /// followers clone the JSON value, not re-run the walk; errors travel as their
@@ -141,7 +149,7 @@ mod tests {
     use super::*;
 
     fn key(ws: &WorkspaceId) -> DiffKey {
-        (ws.clone(), None, false, None)
+        (ws.clone(), None, false, None, None)
     }
 
     /// The first joiner leads; later joiners follow and receive the leader's
@@ -188,9 +196,9 @@ mod tests {
     async fn distinct_keys_lead_independently() {
         let flights = Arc::new(DiffSingleFlight::default());
         let ws = WorkspaceId::new();
-        let _a = flights.join(&(ws.clone(), None, false, None));
+        let _a = flights.join(&(ws.clone(), None, false, None, None));
         assert!(matches!(
-            flights.join(&(ws.clone(), None, true, None)),
+            flights.join(&(ws.clone(), None, true, None, None)),
             Join::Leader(_)
         ));
     }

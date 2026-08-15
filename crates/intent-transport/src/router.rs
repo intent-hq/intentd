@@ -10,7 +10,7 @@ use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 use tracing::Instrument;
@@ -1957,8 +1957,22 @@ async fn dispatch(
         }
         "git.status" => {
             let ws = require_ws_note(params)?;
-            let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // scan to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
+            let status = api
+                .git_status(ws, git_root_id)
+                .await
+                .map_err(domain_to_rpc)?;
             to_result_value(&status)
+        }
+        "gitRoot.list" => {
+            // Every registered git root for a workspace (agent-registered and
+            // auto-detected) as `{ gitRoots: [...] }`, each row carrying a
+            // live-read `branch` (monorepo#2053). Missing workspace → -32602.
+            let ws = require_ws_note(params)?;
+            let r = api.git_root_list(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
         }
         "git.getConfig" => {
             let ws = require_ws_note(params)?;
@@ -2087,7 +2101,25 @@ async fn dispatch(
             }
         }
         "git.branchStatus" => {
-            let repo_path = require_str_param(params, "repoPath")?;
+            // §5.6 extension (monorepo#2053): `workspaceId` + `gitRootId` may
+            // stand in for `repoPath` — the registered root resolves to its
+            // path (unknown/foreign id → -32602). `repoPath` wins when both
+            // are supplied so existing callers are byte-identical.
+            let repo_path = match opt_str(params, "repoPath") {
+                Some(p) => p,
+                None => match opt_git_root_id(params) {
+                    Some(id) => {
+                        let ws = require_ws_note(params)?;
+                        // An unknown/foreign id maps through `domain_to_rpc`
+                        // like the other five scoped reads, so all six carry
+                        // the identical `invalid params: Unknown git root: X`
+                        // message (§5.6).
+                        api.git_root_path(ws, id).await.map_err(domain_to_rpc)?
+                    }
+                    // Neither supplied: the pre-existing missing-param error.
+                    None => return Err(require_str_param(params, "repoPath").unwrap_err()),
+                },
+            };
             let branch_name = require_str_param(params, "branchName")?;
             match api.git_branch_status(repo_path, branch_name).await {
                 Ok(status) => to_result_value(&status),
@@ -2190,7 +2222,13 @@ async fn dispatch(
         }
         "git.changes" => {
             let ws = require_ws_note(params)?;
-            let r = api.git_changes(ws).await.map_err(domain_to_rpc)?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // scan to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
+            let r = api
+                .git_changes(ws, git_root_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
@@ -2211,8 +2249,11 @@ async fn dispatch(
             // §5.6 extension: when `commitHash` is set the result is the hunks
             // for `<commitHash>^..<commitHash>` and `staged` is ignored.
             let commit_hash = opt_str(params, "commitHash");
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // walk to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_diffs(ws, paths, staged, commit_hash)
+                .git_diffs(ws, paths, staged, commit_hash, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2220,8 +2261,11 @@ async fn dispatch(
         "git.commitDetails" => {
             let ws = require_ws_note(params)?;
             let commit_hash = require_str_param(params, "commitHash")?;
+            // §5.6 extension (monorepo#2477): optional `gitRootId` scopes the
+            // read to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_commit_details(ws, commit_hash)
+                .git_commit_details(ws, commit_hash, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2233,8 +2277,11 @@ async fn dispatch(
             // limit }); fall back to top-level `limit`/`nextToken` for parity
             // with the other paginated reads.
             let (limit, page_token) = parse_page_params(params);
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // walk to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_commits(ws, limit, page_token)
+                .git_commits(ws, limit, page_token, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2243,8 +2290,11 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let file_path = require_str_param(params, "filePath")?;
             let git_ref = require_str_param(params, "ref")?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // read to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_show_file(ws, file_path, git_ref)
+                .git_show_file(ws, file_path, git_ref, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -3093,6 +3143,15 @@ async fn dispatch(
             let path = require_str_param(params, "path")?;
             api.file_read(ws, path, None).await.map_err(domain_to_rpc)
         }
+        "file.readChunk" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.file_read_chunk(ws, path, offset, length, None)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "file.write" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
@@ -3157,6 +3216,36 @@ async fn dispatch(
         "file.getAttachmentInfo" => {
             let attachment_id = require_str_param(params, "attachmentId")?;
             api.file_get_attachment_info(attachment_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.begin" => {
+            let ws = require_ws_note(params)?;
+            let file_name = require_str_param(params, "fileName")?;
+            let size_bytes = require_u64(params, "sizeBytes")?;
+            let sha256 = require_str_param(params, "sha256")?;
+            let mime_type = opt_str(params, "mimeType");
+            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.chunk" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.file_attachment_upload_chunk(upload_id, seq, data)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.commit" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_commit(upload_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.abort" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_abort(upload_id)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -3674,6 +3763,13 @@ fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
 /// widened `provider`/`agentType`/`workspacePath` fields).
 fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     opt_str(params, name).filter(|s| !s.trim().is_empty())
+}
+
+/// Optional `gitRootId` param on the `git.*` reads (§5.6 extension,
+/// monorepo#2053). Empty/whitespace-only values are treated as absent so a
+/// client sending `gitRootId: ""` gets the primary-worktree behavior.
+fn opt_git_root_id(params: &Map<String, Value>) -> Option<WorkspaceGitRootId> {
+    opt_nonempty_str(params, "gitRootId").map(WorkspaceGitRootId::from)
 }
 
 /// Parse the `items` array from `workspace.updateContext` into a

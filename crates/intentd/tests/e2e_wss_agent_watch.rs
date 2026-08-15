@@ -349,6 +349,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -947,6 +948,12 @@ async fn agent_watch_wakes_on_target_idle_completion_over_wss() {
         text.contains(&format!("ws.agent.watch(\\\"{}\\\")", fx.target)),
         "idle wake carries the re-arm instruction naming the target: {text}"
     );
+    // monorepo#2060: the retiring wake's event_notification metadata carries
+    // the machine-readable twin of the retirement note.
+    assert!(
+        text.contains("\"watchStillArmed\":false"),
+        "idle wake metadata tags watchStillArmed=false: {text}"
+    );
     await_watch_count(
         &mut fx.setup.rpc,
         &mut fx.req_id,
@@ -997,6 +1004,12 @@ async fn agent_watch_wakes_on_blocker_and_discussion_attention_over_wss() {
     assert!(
         text.contains("remains armed"),
         "blocker wake states the watch remains armed: {text}"
+    );
+    // monorepo#2060: the attention wake's event_notification metadata carries
+    // the machine-readable twin of the "remains armed" note.
+    assert!(
+        text.contains("\"watchStillArmed\":true"),
+        "blocker wake metadata tags watchStillArmed=true: {text}"
     );
 
     // The trailing idle of the blocker turn consumed the watch; re-arm, then
@@ -1180,6 +1193,12 @@ async fn agent_watch_wakes_on_target_terminal_failure_over_wss() {
     assert!(
         text.contains(&format!("ws.agent.watch(\\\"{}\\\")", fx.target)),
         "failure wake carries the re-arm instruction naming the target: {text}"
+    );
+    // monorepo#2060: the terminal failure wake's metadata also tags the
+    // retirement machine-readably.
+    assert!(
+        text.contains("\"watchStillArmed\":false"),
+        "failure wake metadata tags watchStillArmed=false: {text}"
     );
 }
 

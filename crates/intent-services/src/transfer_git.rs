@@ -706,6 +706,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -1212,6 +1213,174 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(repo.join(".roundtrip-wt/README.md")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    /// Field shape (`.worktrees/<name>` regression): the nested repo is not
+    /// at the workdir root but one level down inside an UNTRACKED parent
+    /// directory. Status reports the nested dir itself (recursion stops at
+    /// the embedded repo), but staging must still skip it without erroring
+    /// and without dragging the parent dir into the WIP tree.
+    #[test]
+    fn snapshot_wip_skips_nested_repo_inside_untracked_parent_dir() {
+        let (_dir, repo) = temp_repo("nested-parent");
+        make_nested_repo(&repo, ".worktrees/inner");
+        fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds despite nested repo under untracked parent")
+            .expect("dirty repo snapshots");
+
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("wip.txt").is_some());
+            assert!(
+                tree.get_name(".worktrees").is_none(),
+                "untracked parent of a nested repo not in WIP tree"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(
+            status_fingerprint(&repo),
+            before,
+            "exact pre-snapshot status restored"
+        );
+        assert!(repo.join(".worktrees/inner/.git").is_dir());
+        assert_eq!(
+            fs::read_to_string(repo.join(".worktrees/inner/README.md")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    /// Exact field shape: `.worktrees/<name>` is a linked worktree of a
+    /// SUBMODULE of the outer repo — its `.git` is a file whose gitdir
+    /// points into `<outer>/.git/modules/<sub>/worktrees/<name>` — sitting
+    /// inside the untracked `.worktrees/` parent dir.
+    #[test]
+    fn snapshot_wip_skips_submodule_worktree_inside_untracked_parent_dir() {
+        let (dir, repo) = temp_repo("field-shape");
+        // Real submodule: checkout on disk, gitdir under `.git/modules/sub`.
+        let sub_src = dir.path().join("sub-src");
+        init_repo(&sub_src);
+        run_git(&repo, |cmd| {
+            cmd.args(["-c", "protocol.file.allow=always", "submodule", "add"])
+                .arg(sub_src.to_str().unwrap())
+                .arg("sub");
+        })
+        .unwrap();
+        run_git(&repo, |cmd| {
+            cmd.args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "add submodule",
+            ]);
+        })
+        .unwrap();
+
+        // Linked worktree of the submodule inside the outer workdir.
+        let wt = repo.join(".worktrees/cloudlands-fe-compact-wake-header");
+        run_git(&repo.join("sub"), |cmd| {
+            cmd.args(["worktree", "add", "-b", "wt-field"]).arg(&wt);
+        })
+        .unwrap();
+        assert!(
+            wt.join(".git").is_file(),
+            "submodule worktree .git is a gitdir file"
+        );
+        let gitdir = fs::read_to_string(wt.join(".git")).unwrap();
+        assert!(
+            gitdir.contains("modules/sub/worktrees"),
+            "gitdir points into the outer repo's submodule metadata: {gitdir}"
+        );
+
+        fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds despite submodule worktree under untracked parent")
+            .expect("dirty repo snapshots");
+
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("wip.txt").is_some());
+            assert!(
+                tree.get_name(".worktrees").is_none(),
+                "untracked parent of a submodule worktree not in WIP tree"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(
+            status_fingerprint(&repo),
+            before,
+            "exact pre-snapshot status restored"
+        );
+        assert!(wt.join(".git").is_file(), "worktree .git file intact");
+        assert_eq!(fs::read_to_string(wt.join("README.md")).unwrap(), "hello\n");
+    }
+
+    /// Parent dir ignored via `.git/info/exclude`: the nested repo inside it
+    /// must neither travel in the WIP tree nor make the snapshot error.
+    #[test]
+    fn snapshot_wip_skips_nested_repo_under_excluded_parent_dir() {
+        let (_dir, repo) = temp_repo("excluded-parent");
+        fs::create_dir_all(repo.join(".git/info")).unwrap();
+        fs::write(repo.join(".git/info/exclude"), ".worktrees/\n").unwrap();
+        make_nested_repo(&repo, ".worktrees/inner");
+        fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+
+        let base = head_sha(&repo);
+        let before = status_fingerprint(&repo);
+        let wip = snapshot_wip(&repo)
+            .expect("snapshot succeeds despite nested repo under excluded parent")
+            .expect("dirty repo snapshots");
+
+        {
+            let r = git2::Repository::open(&repo).unwrap();
+            let tree = r
+                .find_commit(git2::Oid::from_str(&wip).unwrap())
+                .unwrap()
+                .tree()
+                .unwrap();
+            assert!(tree.get_name("wip.txt").is_some());
+            assert!(
+                tree.get_name(".worktrees").is_none(),
+                "excluded parent dir not in WIP tree"
+            );
+        }
+
+        assert!(unwind_wip(&repo).unwrap());
+        assert_eq!(head_sha(&repo), base);
+        assert_eq!(
+            status_fingerprint(&repo),
+            before,
+            "exact pre-snapshot status restored"
+        );
+        assert!(repo.join(".worktrees/inner/.git").is_dir());
+        assert_eq!(
+            fs::read_to_string(repo.join(".worktrees/inner/README.md")).unwrap(),
             "hello\n"
         );
     }

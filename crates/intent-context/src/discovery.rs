@@ -13,12 +13,18 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 use intent_core::path_utils;
+use intent_core::path_utils::{
+    has_windows_exec_extension, is_executable_file, is_executable_file_for, WINDOWS_EXEC_EXTENSIONS,
+};
 
-/// Candidate auggie file names for the current platform (npm installs leave a
-/// `.cmd`/`.bat` shim on Windows; the Intent-managed binary is `auggie.exe`).
+/// Candidate auggie file names for the current platform. POSIX uses the bare
+/// name; Windows probes only runnable entry points (`.exe`/`.cmd`/`.bat`) in
+/// preference order and never the bare extensionless name — `CreateProcess`
+/// cannot run it, and the npm shim pair (`auggie` next to `auggie.cmd`) must
+/// resolve the `.cmd` shim.
 fn candidate_names() -> &'static [&'static str] {
     if cfg!(windows) {
-        &["auggie.exe", "auggie.cmd", "auggie.bat", "auggie"]
+        &["auggie.exe", "auggie.cmd", "auggie.bat"]
     } else {
         &["auggie"]
     }
@@ -60,25 +66,6 @@ pub fn enhanced_path() -> OsString {
     std::env::join_paths(enhanced_path_dirs()).unwrap_or_default()
 }
 
-/// True when `p` is a file that is executable (unix checks the exec bit; on
-/// other platforms existence as a file is sufficient — PATHEXT/shell invoke it).
-fn is_executable_file(p: &Path) -> bool {
-    if !p.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 /// Find the first auggie executable across `dirs` (first dir, first candidate
 /// name wins).
 pub fn find_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -101,13 +88,48 @@ pub fn find_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
 /// relative, or stale (points at something that is no longer an executable
 /// file), so a leftover marker never shadows a working install.
 fn marker_file_path_with_home(home: Option<&Path>) -> Option<PathBuf> {
+    marker_file_path_with_home_for(home, cfg!(windows))
+}
+
+/// [`marker_file_path_with_home`] parametrized on the platform (test seam —
+/// Windows CI is disabled, so the Windows arm is unit-tested on POSIX).
+fn marker_file_path_with_home_for(home: Option<&Path>, is_windows: bool) -> Option<PathBuf> {
     let marker = home?.join(".augment").join("auggie-path");
     let contents = std::fs::read_to_string(&marker).ok()?;
     let recorded = PathBuf::from(contents.lines().map(str::trim).find(|l| !l.is_empty())?);
-    if !recorded.is_absolute() || !is_executable_file(&recorded) {
+    if !recorded.is_absolute() {
         return None;
     }
-    Some(recorded)
+    resolve_runnable(&recorded, is_windows)
+}
+
+/// Resolve `recorded` to a runnable executable under the platform policy. A
+/// path that is already executable is returned as-is. On Windows a bare
+/// extensionless record (auggie's installer writes the marker as the bare
+/// `…\npm\auggie` even though only `auggie.cmd` is runnable there) is resolved
+/// to its runnable sibling by probing `.exe`/`.cmd`/`.bat` in the same
+/// directory, so the authoritative marker still works when that directory is
+/// off the daemon's minimal PATH.
+///
+/// Deliberate asymmetry with provider PATH scanning: marker resolution
+/// REPLACES a non-runnable extension (`with_extension` — the marker records
+/// one concrete install path, so `…\auggie.ps1` probes `…\auggie.exe`),
+/// while provider PATH-scan candidates APPEND runnable suffixes to the
+/// command as given (`name_candidates_for` in `intent_providers::discover` —
+/// `foo.py` probes `foo.py.exe`), matching how `cmd.exe` resolves PATHEXT.
+fn resolve_runnable(recorded: &Path, is_windows: bool) -> Option<PathBuf> {
+    if is_executable_file_for(recorded, is_windows) {
+        return Some(recorded.to_path_buf());
+    }
+    if is_windows && !has_windows_exec_extension(recorded) {
+        for ext in WINDOWS_EXEC_EXTENSIONS {
+            let candidate = recorded.with_extension(ext);
+            if is_executable_file_for(&candidate, is_windows) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Discover the auggie binary (focused port of `findAuggiePathAsync`): the
@@ -335,5 +357,82 @@ mod tests {
     fn enhanced_path_includes_current_path_entries() {
         let dirs = enhanced_path_dirs();
         assert!(!dirs.is_empty());
+    }
+
+    #[test]
+    fn has_windows_exec_extension_only_matches_runnable_exts() {
+        assert!(has_windows_exec_extension(Path::new("auggie.exe")));
+        assert!(has_windows_exec_extension(Path::new("auggie.cmd")));
+        assert!(has_windows_exec_extension(Path::new("auggie.CMD")));
+        assert!(has_windows_exec_extension(Path::new("auggie.bat")));
+        assert!(!has_windows_exec_extension(Path::new("auggie")));
+        assert!(!has_windows_exec_extension(Path::new("auggie.ps1")));
+    }
+
+    #[test]
+    fn is_executable_file_for_windows_requires_runnable_extension() {
+        let dir = unique_temp_dir("win-exec");
+        let bare = dir.path().join("auggie");
+        std::fs::write(&bare, "posix shim").unwrap();
+        let cmd = dir.path().join("auggie.cmd");
+        std::fs::write(&cmd, "@echo off").unwrap();
+        // Windows policy: a bare extensionless file is not runnable; `.cmd` is.
+        assert!(!is_executable_file_for(&bare, true));
+        assert!(is_executable_file_for(&cmd, true));
+        // A path that does not exist is never runnable.
+        assert!(!is_executable_file_for(&dir.path().join("nope.cmd"), true));
+    }
+
+    #[test]
+    fn resolve_runnable_windows_resolves_bare_marker_to_cmd_sibling() {
+        let dir = unique_temp_dir("resolve-cmd");
+        // npm layout: the bare POSIX shim next to the runnable `.cmd` shim.
+        let bare = dir.path().join("auggie");
+        std::fs::write(&bare, "posix shim").unwrap();
+        let cmd = dir.path().join("auggie.cmd");
+        std::fs::write(&cmd, "@echo off").unwrap();
+        assert_eq!(resolve_runnable(&bare, true), Some(cmd));
+    }
+
+    #[test]
+    fn resolve_runnable_windows_none_when_no_runnable_sibling() {
+        let dir = unique_temp_dir("resolve-none");
+        let bare = dir.path().join("auggie");
+        std::fs::write(&bare, "posix shim").unwrap();
+        assert_eq!(resolve_runnable(&bare, true), None);
+    }
+
+    #[test]
+    fn resolve_runnable_returns_existing_runnable_as_is() {
+        let dir = unique_temp_dir("resolve-asis");
+        let cmd = dir.path().join("auggie.cmd");
+        std::fs::write(&cmd, "@echo off").unwrap();
+        assert_eq!(resolve_runnable(&cmd, true), Some(cmd.clone()));
+    }
+
+    #[test]
+    fn marker_file_windows_resolves_bare_record_to_runnable_sibling() {
+        let dir = unique_temp_dir("marker-win-bare");
+        let npm = dir.path().join("npm");
+        std::fs::create_dir_all(&npm).unwrap();
+        let bare = npm.join("auggie");
+        std::fs::write(&bare, "posix shim").unwrap();
+        let cmd = npm.join("auggie.cmd");
+        std::fs::write(&cmd, "@echo off").unwrap();
+        write_marker(dir.path(), bare.to_str().unwrap());
+        assert_eq!(
+            marker_file_path_with_home_for(Some(dir.path()), true),
+            Some(cmd)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_in_dirs_windows_prefers_cmd_over_bare_shim() {
+        let dir = unique_temp_dir("win-find");
+        std::fs::write(dir.path().join("auggie"), "posix shim").unwrap();
+        std::fs::write(dir.path().join("auggie.cmd"), "@echo off").unwrap();
+        let got = find_in_dirs(&[dir.path().to_path_buf()]).expect("resolves cmd");
+        assert_eq!(got.file_name().unwrap(), std::ffi::OsStr::new("auggie.cmd"));
     }
 }

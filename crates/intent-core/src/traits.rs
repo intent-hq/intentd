@@ -7,7 +7,7 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId};
+use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
 use crate::model::{
     AgentDelegateInput, AgentLite, AgentSession, CommentAddResult, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentResolveThreadResult, CommentRespondResult,
@@ -1129,12 +1129,14 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `task.list`: project a workspace's spec-linked task notes into the
+    /// `task.list`: project ALL of a workspace's task notes (every note with
+    /// task metadata except the spec itself — direct spec children, subtasks,
+    /// and unlinked tasks alike, each flagged with `specLinked`) into the
     /// canonical `WorkspaceTask` list **plus** the workspace-wide `taskStats`
     /// aggregate (PROTOCOL §5.4). `status` optionally filters the task list to
-    /// a single status; `stats` is always computed over the unfiltered
-    /// spec-linked set so the FE can render the progress rollup verbatim
-    /// (mirrors the canonical FE `computeTaskStats` in `task-stats.ts`).
+    /// a single status; `stats` stays the unfiltered spec-linked direct-child
+    /// rollup so the FE can render the progress rollup verbatim (mirrors the
+    /// canonical FE `computeTaskStats` in `task-stats.ts`).
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -2767,12 +2769,96 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `git.status`: working-tree status for a workspace. Remote workspaces and
-    /// non-repositories return the empty status (PROTOCOL §5.6).
-    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
-        let _ = workspace_id;
+    /// non-repositories return the empty status (PROTOCOL §5.6). When
+    /// `git_root_id` is set, the scan runs against that registered git root's
+    /// path instead of the workspace worktree; an unknown id or one belonging
+    /// to another workspace is `InvalidParams` (`-32602`).
+    fn git_status(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        let _ = (workspace_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `gitRoot.list`: every registered git root for a workspace (agent-
+    /// registered and auto-detected), as the wire envelope
+    /// `{ gitRoots: [...] }` with each row carrying the persisted
+    /// `WorkspaceGitRoot` fields plus a live-read `branch`. A missing
+    /// workspace is `NotFound` (`-32602`); a workspace with no registered
+    /// roots returns an empty list (PROTOCOL §5.6 extensions,
+    /// intent-hq/monorepo#2053).
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Resolve a registered git root to its filesystem path after validating
+    /// it belongs to `workspace_id`. An unknown id — or an id registered to a
+    /// different workspace — is `InvalidParams` (`-32602`). Used by the
+    /// transport for path-based git reads (`git.branchStatus`) that accept a
+    /// `gitRootId` in place of a raw `repoPath`.
+    fn git_root_path(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        let _ = (workspace_id, git_root_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_path not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.git.registerRoot` (MCP-only): register an existing local git
+    /// repository root for the workspace's multi git root tracking
+    /// (monorepo#2053). `path` must exist and contain a `.git` entry; it is
+    /// canonicalized and may live anywhere on the host (no worktree
+    /// containment). The workspace's own primary root is rejected (it is
+    /// tracked implicitly). Registration is idempotent by canonical path —
+    /// re-registration appends `agent_id` to the row's attribution, and an
+    /// auto-detected row is upgraded to `source: "agent"` in place. Returns
+    /// the stored row in the `gitRoot.list` row shape (persisted fields plus
+    /// a live-read `branch`). Invalid paths are `InvalidParams` (`-32602`); a
+    /// missing workspace is `NotFound`.
+    fn git_root_register(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_register not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.git.unregisterRoot` (MCP-only): remove the git root registered for
+    /// `path` (canonicalized when the directory still exists, so the same
+    /// spelling that registered it resolves; the raw path is matched
+    /// otherwise). Returns `{ ok, gitRootId, path }`. A path with no
+    /// registered root is `NotFound` (monorepo#2053).
+    fn git_root_unregister(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_root_unregister not implemented".to_string(),
             ))
         })
     }
@@ -2955,9 +3041,15 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.changes`: the working-tree file list (`FileStatus[]`) for a
     /// workspace — the same `files` array as `git.status`. Remote workspaces and
-    /// non-repositories return an empty array (wire §7.7).
-    fn git_changes(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+    /// non-repositories return an empty array (wire §7.7). When `git_root_id`
+    /// is set, the scan targets that registered root's path; an unknown or
+    /// foreign id is `InvalidParams` (`-32602`).
+    fn git_changes(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_changes not implemented".to_string(),
@@ -2974,15 +3066,18 @@ pub trait WorkspaceApi: Send + Sync {
     /// the wire `path` param arrives folded into this set); `None` or an empty
     /// vec means the full tree. Returns `[{ path, hunks }]`; remote/non-repo
     /// workspaces and an unresolvable `commit_hash` return an empty array
-    /// (wire §7.7).
+    /// (wire §7.7). When `git_root_id` is set, the walk targets that
+    /// registered root's path; an unknown or foreign id is `InvalidParams`
+    /// (`-32602`).
     fn git_diffs(
         &self,
         workspace_id: WorkspaceId,
         paths: Option<Vec<String>>,
         staged: bool,
         commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, paths, staged, commit_hash);
+        let _ = (workspace_id, paths, staged, commit_hash, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_diffs not implemented".to_string(),
@@ -2996,13 +3091,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// files: string[], fileDetails: [{ path, additions, deletions }] }`.
     /// Remote/non-repo workspaces and an unresolvable hash return an empty
     /// envelope (`{ commitHash, fileDetails: [], files: [] }`) so the FE renders
-    /// a friendly empty state instead of crashing (wire §7.7).
+    /// a friendly empty state instead of crashing (wire §7.7). When
+    /// `git_root_id` is set, the read runs against that registered git root's
+    /// path instead of the workspace worktree; an unknown id or one belonging
+    /// to another workspace is `InvalidParams` (`-32602`).
     fn git_commit_details(
         &self,
         workspace_id: WorkspaceId,
         commit_hash: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, commit_hash);
+        let _ = (workspace_id, commit_hash, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commit_details not implemented".to_string(),
@@ -3012,14 +3111,17 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `git.commits`: paginated reverse-chronological commit history as the
     /// canonical §5.5 page envelope `{ items: CommitInfo[], nextToken }`. Remote
-    /// workspaces and non-repositories return an empty page (wire §7.7).
+    /// workspaces and non-repositories return an empty page (wire §7.7). When
+    /// `git_root_id` is set, the walk targets that registered root's path; an
+    /// unknown or foreign id is `InvalidParams` (`-32602`).
     fn git_commits(
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, limit, page_token);
+        let _ = (workspace_id, limit, page_token, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_commits not implemented".to_string(),
@@ -3031,14 +3133,17 @@ pub trait WorkspaceApi: Send + Sync {
     /// semantics) as `{ content }`. `ref` accepts anything revparse-able plus
     /// the index ref `":0"`; a path missing at the ref and remote/non-repo
     /// workspaces return `{ content: "" }` (wire §7.7), while an unresolvable
-    /// `ref` is `-32603` (PROTOCOL §5.6 extensions).
+    /// `ref` is `-32603` (PROTOCOL §5.6 extensions). When `git_root_id` is
+    /// set, the read targets that registered root's path; an unknown or
+    /// foreign id is `InvalidParams` (`-32602`).
     fn git_show_file(
         &self,
         workspace_id: WorkspaceId,
         file_path: String,
         git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, file_path, git_ref);
+        let _ = (workspace_id, file_path, git_ref, git_root_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::git_show_file not implemented".to_string(),
@@ -5268,6 +5373,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.readChunk`: one offset-windowed slice of a workspace file's raw
+    /// bytes as `{ content (base64), bytesRead, size }` — the FE-ward binary
+    /// counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
+    /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
+    /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
+    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    fn file_read_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_read_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file.write`: create/overwrite a file (parent dirs created); returns
     /// `{ ok: true, path, size }` where `size` is the content byte/char length
     /// (PROTOCOL §5.10).
@@ -5441,6 +5568,77 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_place_attachment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.begin`: open a staged chunked attachment
+    /// upload session for payloads larger than one RPC frame (PROTOCOL
+    /// §5.9). Validates the header — the workspace must exist, `file_name`
+    /// non-empty, `size_bytes` positive and within the 1 GiB attachment cap,
+    /// `sha256` 64 hex chars — and returns `{ uploadId, maxChunkBytes }`.
+    fn file_attachment_upload_begin(
+        &self,
+        workspace_id: WorkspaceId,
+        file_name: String,
+        size_bytes: u64,
+        sha256: String,
+        mime_type: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, file_name, size_bytes, sha256, mime_type);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_begin not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.chunk`: stage one seq-numbered base64 slice of
+    /// the payload; retrying a seq is idempotent and chunks may arrive in
+    /// any order (PROTOCOL §5.9). Returns `{ uploadId, seq, receivedBytes }`.
+    fn file_attachment_upload_chunk(
+        &self,
+        upload_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (upload_id, seq, data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.commit`: verify the assembled payload's
+    /// SHA-256 and place it through the same collision-safe placement +
+    /// attachment-registry path as `file.placeAttachment` (PROTOCOL §5.9).
+    /// The result is byte-shape-identical to a successful
+    /// `file.placeAttachment`: `{ ok, path, fileName, size, attachmentId,
+    /// mimeType?, uploadedAt }`.
+    fn file_attachment_upload_commit(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = upload_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_commit not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `file.attachmentUpload.abort`: drop the staged upload session and
+    /// delete its staging directory (PROTOCOL §5.9). Idempotent — aborting
+    /// an unknown id succeeds quietly. Returns `{ uploadId, aborted }`.
+    fn file_attachment_upload_abort(
+        &self,
+        upload_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = upload_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_attachment_upload_abort not implemented".to_string(),
             ))
         })
     }

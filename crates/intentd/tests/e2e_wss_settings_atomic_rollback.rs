@@ -641,6 +641,92 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
     assert_eq!(resp["result"]["origin"], json!("default"));
 }
 
+/// `agents.resumeInterruptedOnStart` over WSS (per AGENTS.md testing gate):
+/// the TOML-backed enum appears in `settings.list` with its definition and
+/// `auto` default, round-trips through `settings.update` / `settings.get` /
+/// `settings.reset` with `file` origin, and rejects unknown enum values with
+/// `-32602` (PROTOCOL §9).
+#[tokio::test]
+async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let path = "agents.resumeInterruptedOnStart";
+
+    // settings.list — advertised as an enum with the `auto` default.
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == path)
+        .unwrap_or_else(|| panic!("{path} missing from settings.list"));
+    assert_eq!(entry["type"], json!("enum"));
+    assert_eq!(entry["enumValues"], json!(["auto", "on", "off"]));
+    assert_eq!(entry["category"], json!("agents"));
+    assert_eq!(entry["defaultValue"], json!("auto"));
+    assert_eq!(entry["value"], json!("auto"));
+    assert_eq!(entry["origin"], json!("default"));
+
+    // Update → applied, reads back with `file` origin.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "on" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 2);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 1, "{resp}");
+    assert_eq!(applied[0]["path"], json!(path));
+    assert_eq!(applied[0]["value"], json!("on"));
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 3);
+    assert_eq!(resp["result"]["path"], json!(path));
+    assert_eq!(resp["result"]["value"], json!("on"));
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // Unknown enum values reject with -32602 (PROTOCOL §9).
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": path, "value": "maybe" }] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 4, -32602);
+
+    // Reset restores the `auto` default.
+    let resp = wss_rpc(&mut ws, 5, "settings.reset", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 5);
+    assert_eq!(resp["result"]["value"], json!("auto"));
+    let resp = wss_rpc(&mut ws, 6, "settings.get", json!({ "path": path })).await;
+    assert_success_envelope(&resp, 6);
+    assert_eq!(resp["result"]["value"], json!("auto"));
+    assert_eq!(resp["result"]["origin"], json!("default"));
+}
+
 /// Assert the JSON-RPC 2.0 success envelope (PROTOCOL §1): `jsonrpc: "2.0"`,
 /// the echoed `id`, a `result` object and no `error` member.
 fn assert_success_envelope(resp: &Value, id: i64) {
@@ -648,6 +734,152 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert_eq!(resp["id"], json!(id), "{resp}");
     assert!(resp.get("error").is_none(), "{resp}");
     assert!(resp["result"].is_object(), "{resp}");
+}
+
+/// The `agents` memory knobs as clients actually receive them (monorepo#2109):
+/// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
+/// `agents.idleReapMinutes` advertises the shipped 10-minute default.
+///
+/// The bound assertions are deliberately host-independent — a CI runner's RAM
+/// is not knowable here — so this pins the contract rather than a number:
+/// `max` is positive, never exceeds the static `config.toml` parse bound, the
+/// value one above it is rejected, and the advertised ceiling itself is
+/// actually settable. That last one is the regression this covers: a `max`
+/// above the parse bound would be accepted by catalog validation and then
+/// rejected by `SettingsFile::validate` inside `SettingsRegistry::apply`,
+/// i.e. the catalog advertising a value the write path refuses.
+#[tokio::test]
+async fn agent_memory_knobs_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // The static bound `SettingsFile` enforces when parsing config.toml. The
+    // catalog bound may sit below it (this machine's RAM) but never above.
+    const PARSE_BOUND_MB: f64 = 1_024_000.0;
+    let budget = "agents.memoryBudgetMb";
+    let reap = "agents.idleReapMinutes";
+
+    let list = wss_rpc(&mut ws, 1, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 1);
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == budget)
+        .unwrap_or_else(|| panic!("{budget} missing from settings.list"));
+    assert_eq!(entry["type"], json!("number"));
+    assert_eq!(entry["category"], json!("agents"));
+    assert_eq!(entry["min"], json!(0.0), "{entry}");
+    // The default is the *absent* key (auto, monorepo#2063): the wire entry
+    // omits `defaultValue` entirely (indexing would read an absent key as
+    // null too, so assert on the object) while `value` is always present and
+    // explicitly null on a fresh install.
+    let entry_obj = entry.as_object().expect("entry is an object");
+    assert!(
+        !entry_obj.contains_key("defaultValue"),
+        "defaultValue must be omitted, not null: {entry}"
+    );
+    assert!(entry_obj.contains_key("value"), "{entry}");
+    assert_eq!(entry["value"], Value::Null, "{entry}");
+    let max = entry["max"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{budget} must advertise a max: {entry}"));
+    assert!(max > 0.0, "a max of 0 would lock the setting off: {entry}");
+    assert!(
+        max <= PARSE_BOUND_MB,
+        "advertised max {max} exceeds the config.toml parse bound — settings.update would \
+         accept a value the write path then rejects: {entry}",
+    );
+
+    let entry = settings
+        .iter()
+        .find(|e| e["path"] == reap)
+        .unwrap_or_else(|| panic!("{reap} missing from settings.list"));
+    assert_eq!(entry["min"], json!(0.0), "{entry}");
+    assert_eq!(entry["defaultValue"], json!(10.0), "{entry}");
+    assert_eq!(entry["value"], json!(10.0), "{entry}");
+
+    // One above the advertised bound is refused (PROTOCOL §9 -32602).
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": budget, "value": max as u64 + 1 }] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 2, -32602);
+
+    // ...and the advertised ceiling itself round-trips through the write path.
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": budget, "value": max as u64 }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 3);
+    let resp = wss_rpc(&mut ws, 4, "settings.get", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 4);
+    // Numbers come back JSON-typed as f64 (`49152.0`), so compare numerically
+    // rather than against an integer literal.
+    assert_eq!(resp["result"]["value"].as_f64(), Some(max), "{resp}");
+    assert_eq!(resp["result"]["origin"], json!("file"));
+
+    // `0` stays valid on both knobs: off for the budget, disabled for reaping.
+    let resp = wss_rpc(
+        &mut ws,
+        5,
+        "settings.update",
+        json!({ "changes": [{ "path": budget, "value": 0 }, { "path": reap, "value": 0 }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 5);
+    let resp = wss_rpc(&mut ws, 6, "settings.get", json!({ "path": reap })).await;
+    assert_success_envelope(&resp, 6);
+    assert_eq!(resp["result"]["value"].as_f64(), Some(0.0), "{resp}");
+
+    // Reset restores the shipped 10-minute default over the wire.
+    let resp = wss_rpc(&mut ws, 7, "settings.reset", json!({ "path": reap })).await;
+    assert_success_envelope(&resp, 7);
+    assert_eq!(resp["result"]["value"].as_f64(), Some(10.0), "{resp}");
+
+    // The explicit 0 written above is a *stored* off, distinct from auto: it
+    // reads back as 0 with origin `file`.
+    let resp = wss_rpc(&mut ws, 8, "settings.get", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 8);
+    assert_eq!(resp["result"]["value"].as_f64(), Some(0.0), "{resp}");
+    assert_eq!(resp["result"]["origin"], json!("file"), "{resp}");
+
+    // `settings.reset` is the only wire path back to auto (monorepo#2063):
+    // it must *remove* the key — value returns to null, origin to `default`
+    // — not rewrite a literal 0, which would pin the install to off.
+    let resp = wss_rpc(&mut ws, 9, "settings.reset", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 9);
+    assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
+    let resp = wss_rpc(&mut ws, 10, "settings.get", json!({ "path": budget })).await;
+    assert_success_envelope(&resp, 10);
+    assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
+    assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
 }
 
 /// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,

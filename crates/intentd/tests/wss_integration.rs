@@ -1370,7 +1370,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1520,7 +1520,7 @@ async fn wss_agent_set_model_provider_id_param() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1702,7 +1702,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2418,7 +2418,7 @@ async fn wss_agent_delegate_persists_reasoning_effort() {
 async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_levels() {
     let dir = test_tempdir("intentd-wss-create-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2516,7 +2516,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
 async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let dir = test_tempdir("intentd-wss-settings-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -3509,7 +3509,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
             .unwrap_or(0)
     };
     let last_good = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -4658,6 +4658,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -4686,18 +4687,22 @@ fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-/// `task.list` over the real WSS wire returns `{ tasks, stats }` and the
-/// `stats` aggregate mirrors the FE `computeTaskStats` (`task-stats.ts`)
-/// classification: `total` excludes `cancelled`, `completed` counts `complete`,
-/// and `inProgress` counts `in_progress` + `review_required`. The optional
-/// `status` filter narrows `tasks` only — `stats` stays the unfiltered rollup
-/// so the FE renders the progress bar verbatim regardless of the active filter
-/// (PROTOCOL §5.4).
+/// `task.list` over the real WSS wire returns `{ tasks, stats }`: `tasks`
+/// membership is workspace-wide (every task note except the spec — direct
+/// spec children, subtasks, and unlinked tasks alike), each row carrying the
+/// `specLinked` flag (true iff the id appears in the spec body's
+/// `intent://local/task/{id}` links), while the `stats` aggregate stays the
+/// spec-linked direct-child rollup mirroring the FE `computeTaskStats`
+/// (`task-stats.ts`) classification: `total` excludes `cancelled`,
+/// `completed` counts `complete`, and `inProgress` counts `in_progress` +
+/// `review_required`. The optional `status` filter narrows `tasks` only —
+/// `stats` stays the unfiltered rollup so the FE renders the progress bar
+/// verbatim regardless of the active filter (PROTOCOL §5.4).
 #[tokio::test]
 async fn wss_task_list_emits_stats_aggregate() {
     let srv = start(WsOptions::default()).await;
 
-    // Seed a workspace + spec note + four task notes directly through the
+    // Seed a workspace + spec note + task notes directly through the
     // shared store — `note.create` mints a fresh `NoteId`, so the spec note
     // (which must have id == "spec") can only be created out-of-band.
     let ws = WorkspaceId::new();
@@ -4726,18 +4731,27 @@ async fn wss_task_list_emits_stats_aggregate() {
         });
         n
     };
+    // An unlinked task and a subtask (child of task-a) — both returned with
+    // `specLinked: false`, both excluded from the spec-linked `stats` rollup.
+    let mut orphan = mk_task("task-x", "Orphan", TaskStatus::NotStarted);
+    orphan.parent_id = None;
+    let mut sub = mk_task("task-sub", "Subtask", TaskStatus::InProgress);
+    sub.parent_id = Some(NoteId::from("task-a"));
     for n in [
         mk_task("task-a", "Alpha", TaskStatus::InProgress),
         mk_task("task-b", "Beta", TaskStatus::Complete),
         mk_task("task-c", "Gamma", TaskStatus::ReviewRequired),
         mk_task("task-d", "Delta", TaskStatus::Cancelled),
+        orphan,
+        sub,
     ] {
         srv.store.insert_note(&n).await.expect("insert task note");
     }
 
-    // Unfiltered: returns the four spec-linked tasks (cancelled included) and
-    // a `stats` rollup where `total` excludes the cancelled task and
-    // `inProgress` counts both in_progress + review_required.
+    // Unfiltered: returns all six task notes (cancelled, unlinked, and
+    // subtask included) and a `stats` rollup over the spec-linked set only,
+    // where `total` excludes the cancelled task and `inProgress` counts both
+    // in_progress + review_required.
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"task.list","params":{{"workspaceId":"{}"}}}}"#,
         ws.0
@@ -4760,7 +4774,10 @@ async fn wss_task_list_emits_stats_aggregate() {
         .map(|t| t["id"].as_str().expect("task id"))
         .collect();
     task_ids.sort_unstable();
-    assert_eq!(task_ids, vec!["task-a", "task-b", "task-c", "task-d"]);
+    assert_eq!(
+        task_ids,
+        vec!["task-a", "task-b", "task-c", "task-d", "task-sub", "task-x"]
+    );
     let by_id: std::collections::HashMap<&str, &Value> = tasks
         .iter()
         .map(|t| (t["id"].as_str().unwrap(), t))
@@ -4771,13 +4788,30 @@ async fn wss_task_list_emits_stats_aggregate() {
     assert_eq!(by_id["task-c"]["status"], "review_required");
     assert_eq!(by_id["task-d"]["status"], "cancelled");
     assert!(by_id["task-a"]["updatedAt"].is_string());
+    // `specLinked` is always serialized: true for spec-linked ids, false for
+    // the unlinked task and the subtask.
+    for id in ["task-a", "task-b", "task-c", "task-d"] {
+        assert_eq!(by_id[id]["specLinked"], true, "{id} is spec-linked");
+    }
+    for id in ["task-x", "task-sub"] {
+        assert_eq!(by_id[id]["specLinked"], false, "{id} is not spec-linked");
+    }
+    // `parentId` rides along (omitted when the note has no parent), so the
+    // subtask is distinguishable from the unlinked top-level task.
+    assert_eq!(by_id["task-a"]["parentId"], "spec");
+    assert_eq!(by_id["task-sub"]["parentId"], "task-a");
+    assert!(
+        by_id["task-x"].get("parentId").is_none(),
+        "parentId omitted for parentless notes: {}",
+        by_id["task-x"]
+    );
 
     let stats = &result["stats"];
     assert_eq!(stats["total"], 3, "total excludes cancelled: {stats}");
     assert_eq!(stats["completed"], 1, "completed = 1 complete: {stats}");
     assert_eq!(
         stats["inProgress"], 2,
-        "inProgress = in_progress + review_required: {stats}"
+        "inProgress = spec-linked in_progress + review_required: {stats}"
     );
     // Only the documented fields cross the wire (camelCase, no `tasks` array).
     let stats_keys: Vec<&str> = stats
@@ -5226,6 +5260,235 @@ async fn wss_git_commit_details_round_trip() {
         srv.cfg.clone(),
         &format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// `gitRoot.list` + the `gitRootId` param on the git reads over WSS
+/// (monorepo#2053): a registered secondary git root (a nested repo inside the
+/// workspace worktree) appears in `gitRoot.list` with its live-read branch,
+/// `git.status`/`git.changes` scoped by `gitRootId` target the nested repo
+/// instead of the workspace worktree, and an unknown `gitRootId` is `-32602`.
+#[tokio::test]
+async fn wss_git_root_list_and_scoped_reads_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed the primary repo with one commit and a nested repo inside it.
+    let repo_dir = test_tempdir("intentd-wssgitroot-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+    // A second commit unique to the nested repo — the identically-seeded
+    // repos can otherwise produce colliding seed-commit hashes, which would
+    // defeat the scoped-vs-unscoped `git.commitDetails` proof below.
+    std::fs::write(nested.join("nested-second.txt"), "nested\n").unwrap();
+    git(&nested, &["add", "nested-second.txt"]);
+    git(&nested, &["commit", "-q", "-m", "nested-second"]);
+    // An untracked file only the nested repo can see.
+    std::fs::write(nested.join("root-only.txt"), "hi\n").unwrap();
+
+    // Create a workspace pointing at the primary repo.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitRoot WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // No roots registered yet → empty list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["gitRoots"], serde_json::json!([]));
+
+    // Register the nested repo as a git root directly through the store (the
+    // agent-facing `ws.git.registerRoot` MCP binding lands separately).
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: Some("feedfacefeedfacefeedfacefeedfacefeedface".into()),
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    // gitRoot.list returns the root with its live-read branch + attribution.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let roots = resp["result"]["gitRoots"].as_array().expect("gitRoots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], root.id.as_str());
+    assert_eq!(roots[0]["path"], root.path);
+    assert_eq!(roots[0]["source"], "agent");
+    assert_eq!(
+        roots[0]["registeredByAgentIds"],
+        serde_json::json!(["agent-1"])
+    );
+    assert_eq!(
+        roots[0]["registeredCommitSha"],
+        "feedfacefeedfacefeedfacefeedfacefeedface"
+    );
+    assert!(
+        roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()),
+        "live-read branch present: {:?}",
+        roots[0]
+    );
+
+    // git.status scoped by gitRootId sees the nested repo's untracked file.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|f| f["path"] == "root-only.txt"),
+        "nested repo scan: {files:?}"
+    );
+
+    // git.changes scoped by gitRootId projects the same nested file list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.changes","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(changes.iter().any(|c| c["path"] == "root-only.txt"));
+
+    // The unscoped reads still target the primary worktree.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(
+        !changes.iter().any(|c| c["path"] == "root-only.txt"),
+        "primary scan unaffected: {changes:?}"
+    );
+
+    // Unknown gitRootId → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // git.commitDetails scoped by gitRootId resolves hashes in the nested
+    // repo's odb (monorepo#2477).
+    let nested_head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&nested)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["commitHash"],
+        Value::from(nested_head.clone())
+    );
+    assert_eq!(resp["result"]["message"], "nested-second");
+    assert_eq!(
+        resp["result"]["files"],
+        serde_json::json!(["nested-second.txt"])
+    );
+
+    // The unscoped read cannot resolve the nested repo's hash — the empty
+    // envelope, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["files"], serde_json::json!([]));
+
+    // Unknown gitRootId on git.commitDetails → -32602 (never an empty fallback).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"nope"}}}}"#
         ),
     )
     .await;
@@ -7916,6 +8179,310 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
+/// monorepo#2458): raw bytes of a binary workspace file are served as
+/// offset-windowed base64 chunks `{ content, bytesRead, size }` and
+/// reassemble byte-identically; a window past EOF is an empty chunk; a
+/// directory and an over-cap `length` are the documented `-32602`; and a
+/// traversal path is rejected by the containment guard (`-32603`).
+#[tokio::test]
+async fn wss_file_read_chunk_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-readchunk-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    // Binary payload (invalid UTF-8 — `file.read` would fail on it).
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("blob.bin"), &payload).expect("write blob");
+
+    // Reassemble the file in two windows and verify byte identity.
+    let frame1 = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":1024}}}}"#,
+        ws.0
+    );
+    let resp1 = wss_call(srv.port, srv.cfg.clone(), &frame1).await;
+    assert_eq!(resp1["jsonrpc"], "2.0", "envelope: {resp1}");
+    assert_eq!(resp1["id"], 1, "envelope: {resp1}");
+    assert_eq!(
+        resp1["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp1}"
+    );
+    assert_eq!(
+        resp1["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp1}"
+    );
+    let mut assembled = base64::engine::general_purpose::STANDARD
+        .decode(resp1["result"]["content"].as_str().expect("content"))
+        .expect("valid base64");
+
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":1024,"length":4096}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    // Short read at EOF: only the remaining bytes come back.
+    assert_eq!(
+        resp2["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp2}"
+    );
+    assembled.extend(
+        base64::engine::general_purpose::STANDARD
+            .decode(resp2["result"]["content"].as_str().expect("content"))
+            .expect("valid base64"),
+    );
+    assert_eq!(assembled, payload, "reassembled bytes differ");
+
+    // Window at/past EOF → empty chunk, not an error.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":2048,"length":16}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(
+        resp3["result"]["bytesRead"],
+        serde_json::json!(0),
+        "{resp3}"
+    );
+    assert_eq!(resp3["result"]["content"], serde_json::json!(""), "{resp3}");
+    assert_eq!(
+        resp3["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp3}"
+    );
+
+    // Directory → -32602 naming the cause.
+    std::fs::create_dir_all(root.join("subdir")).expect("mkdir");
+    let frame4 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"subdir","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp4 = wss_call(srv.port, srv.cfg.clone(), &frame4).await;
+    assert_eq!(resp4["error"]["code"].as_i64(), Some(-32602), "{resp4}");
+    assert!(
+        resp4["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("directory")),
+        "{resp4}"
+    );
+
+    // Over-cap length (> 16 MiB decoded) → -32602.
+    let frame5 = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":16777217}}}}"#,
+        ws.0
+    );
+    let resp5 = wss_call(srv.port, srv.cfg.clone(), &frame5).await;
+    assert_eq!(resp5["error"]["code"].as_i64(), Some(-32602), "{resp5}");
+
+    // Containment guard: a traversal path is rejected (-32603, same as the
+    // other file ops).
+    let frame6 = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"../escape.bin","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp6 = wss_call(srv.port, srv.cfg.clone(), &frame6).await;
+    assert_eq!(resp6["error"]["code"].as_i64(), Some(-32603), "{resp6}");
+
+    srv.ws.stop().await;
+}
+
+/// `file.attachmentUpload.begin` / `.chunk` / `.commit` / `.abort` (§5.9,
+/// v6.16): the staged chunked attachment upload lifecycle over the real WSS
+/// transport. A two-chunk payload is staged and committed; the commit result
+/// is byte-shape-identical to a successful `file.placeAttachment` result
+/// (registry fields included) and the reassembled bytes land under
+/// `.intent/attachments/`. An unknown uploadId is the documented -32602, the
+/// 5th concurrent per-workspace begin is the documented -32602 naming the
+/// cap (monorepo#2275), and `abort` retires a pending session idempotently.
+#[tokio::test]
+async fn wss_file_attachment_upload_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-attup-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
+    let sha = format!("{:x}", Sha256::digest(&payload));
+    let mid = payload.len() / 2;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    // begin → { uploadId, maxChunkBytes }.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"big.bin","sizeBytes":{},"sha256":"{sha}","mimeType":"application/octet-stream"}}}}"#,
+        ws.0,
+        payload.len()
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let upload_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    assert_eq!(
+        resp["result"]["maxChunkBytes"].as_u64(),
+        Some(16 * 1024 * 1024),
+        "{resp}"
+    );
+
+    // Two chunks; receivedBytes accumulates.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":0,"data":"{}"}}}}"#,
+        b64(&payload[..mid])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["seq"].as_u64(), Some(0), "{resp}");
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(mid as u64),
+        "{resp}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":1,"data":"{}"}}}}"#,
+        b64(&payload[mid..])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+
+    // commit → byte-shape-identical to a placeAttachment success.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.attachmentUpload.commit","params":{{"uploadId":"{upload_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["path"],
+        serde_json::json!(".intent/attachments/big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["fileName"],
+        serde_json::json!("big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["size"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+    assert!(resp["result"]["attachmentId"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["mimeType"],
+        serde_json::json!("application/octet-stream"),
+        "{resp}"
+    );
+    assert!(
+        resp["result"]["uploadedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/big.bin")).expect("placed file"),
+        payload
+    );
+
+    // The settled uploadId is unknown now → -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":2,"data":"{}"}}}}"#,
+        b64(b"late")
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no attachment upload in progress")),
+        "{resp}"
+    );
+
+    // Per-workspace session cap (monorepo#2275): the 5th live begin is the
+    // documented -32602 naming the cap, and settling a session (abort)
+    // frees the slot.
+    let mut cap_ids = Vec::new();
+    for i in 0..4 {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"cap-{i}.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+            ws.0
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        cap_ids.push(
+            resp["result"]["uploadId"]
+                .as_str()
+                .expect("uploadId")
+                .to_string(),
+        );
+    }
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":41,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"fifth.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("attachment uploads in progress") && m.contains("max 4")),
+        "{resp}"
+    );
+    for (i, cap_id) in cap_ids.iter().enumerate() {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{cap_id}"}}}}"#
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(
+            resp["result"]["aborted"],
+            serde_json::json!(true),
+            "abort {i}: {resp}"
+        );
+    }
+
+    // abort retires a pending session; a second abort is the idempotent
+    // non-error (`aborted: false`).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"other.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let abort_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["aborted"], serde_json::json!(true), "{resp}");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["aborted"],
+        serde_json::json!(false),
+        "{resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
 /// staged, atomic import lifecycle over the real WSS transport. A fixture
 /// zip archive (manifest + rows) is uploaded in two chunks and committed;
@@ -8040,7 +8607,7 @@ async fn wss_workspace_import_lifecycle() {
     let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
     sub_ws
         .send(Message::Text(
-            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created"]}}"#
+            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created","workspace:setup:completed"]}}"#
                 .to_string()
                 .into(),
         ))
@@ -8101,6 +8668,37 @@ async fn wss_workspace_import_lifecycle() {
     .await
     .expect("timed out waiting for workspace:created after import commit");
     assert_eq!(evt["workspaceId"], ws_id, "{evt}");
+
+    // Imports run no setup stage, so the commit pairs `workspace:created`
+    // with an immediate `workspace:setup:completed { ranScript: false }` —
+    // the watcher registry must not defer this workspace to the backstop.
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:setup:completed"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:setup:completed after import commit");
+    assert_eq!(
+        evt["data"],
+        serde_json::json!({ "workspaceId": ws_id, "ranScript": false }),
+        "{evt}"
+    );
 
     let list = wss_call(
         srv.port,
@@ -8478,8 +9076,9 @@ async fn wss_workspace_export_lifecycle() {
 /// checkout under the daemon's workspaces root (WIP snapshot unwound — the
 /// dirty file restored, not committed), rewrites the stored workspace row
 /// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
-/// direct), and registers the checkout in `known_repo`. Skips when `git` is
-/// unavailable on PATH (the bundler shells out to it).
+/// direct) — WITHOUT registering the workspace-owned checkout in
+/// `known_repo` (intent-hq/monorepo#2227). Skips when `git` is unavailable
+/// on PATH (the bundler shells out to it).
 #[tokio::test]
 async fn wss_workspace_import_commit_materializes_git() {
     use base64::Engine as _;
@@ -8645,13 +9244,12 @@ async fn wss_workspace_import_commit_materializes_git() {
         "uncommitted\n"
     );
 
-    // The checkout is registered in known_repo.
-    let known = srv.store.list_known_repos().await.expect("known repos");
-    assert!(
-        known
-            .iter()
-            .any(|r| r.path == checkout.to_string_lossy() && r.name == "test-repo"),
-        "checkout registered in known_repo: {known:?}"
+    // The materialized checkout is workspace-owned storage under the
+    // workspaces root and stays out of known_repo (intent-hq/monorepo#2227).
+    assert_eq!(
+        srv.store.list_known_repos().await.expect("known repos"),
+        vec![],
+        "materialized checkout is not registered in known_repo"
     );
 
     srv.ws.stop().await;

@@ -397,6 +397,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

@@ -2072,14 +2072,31 @@ impl Services {
                 )
                 .await;
         }
-        if !blocks.is_empty() {
+        // Abnormal finish reason (PROTOCOL §7): a turn that resolved with a
+        // non-`end_turn` stop reason (`refusal`, `max_tokens`,
+        // `max_turn_requests`, …) is durably tagged on the assistant row so
+        // clients can render the ending after a reload. Normal endings
+        // (`end_turn` / `stream_complete`) stay metadata-free — no noise on
+        // the common path. A zero-output abnormal turn still persists an
+        // empty marker row (mirroring the §7.2 pre-first-token interrupt
+        // marker): `agent:idle` / `agent:stream:end` are ephemeral, so the
+        // row is the only durable record of the ending.
+        let abnormal_finish_reason = result
+            .as_ref()
+            .ok()
+            .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
+            .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
+        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
+            let row_metadata = abnormal_finish_reason
+                .as_ref()
+                .map(|reason| json!({ "finishReason": reason }));
             self.store
                 .append_agent_message_with_id(
                     agent_id,
                     &message_id,
                     "assistant",
                     &Value::Array(blocks),
-                    None,
+                    row_metadata.as_ref(),
                     &now_iso(),
                 )
                 .await?;
@@ -2181,6 +2198,39 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
+        // Durable-before-observable for the streaming terminal-failure path
+        // (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error
+        // is terminal, and this function emits its own terminal
+        // `agent:stream:end` + `agent:failed` below. Persist `status = error` +
+        // `stop_reason` FIRST — ahead of those emits — and stash the persisted
+        // context so the turn worker's `handle_terminal_turn_failure` reuses it
+        // (recording the identical-failure streak and writing the Error status
+        // EXACTLY once, monorepo#840). Excluded and left to their existing
+        // handling: the pre-output transport failure (suppressed for a possible
+        // silent redrive) and the idle timeout (warn-and-continue; the worker
+        // owns the warn/terminal decision and its own persist). A benign
+        // provider-resolved cancel (JSON-RPC `-32800`, or a "cancelled"
+        // message) is NOT persisted as an Error — it is the expected outcome of
+        // a concurrent stop/cancel — classified here with the SAME predicate
+        // the worker's benign check uses so the two verdicts cannot drift. The
+        // wrapped text matches the ordinary error the final `map_err` returns
+        // below, so the persisted `stop_reason` is byte-identical to what the
+        // worker would have written.
+        if let Err(e) = &result {
+            if !pre_output_transport_failure && !prompt_idle_timeout {
+                let wrapped = Error::Internal(format!("session/prompt failed: {e}"));
+                if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
+                    let persist = crate::agent_manager::persist_terminal_error_status_via_services(
+                        self,
+                        agent_id,
+                        workspace_id,
+                        &wrapped.to_string(),
+                    )
+                    .await;
+                    self.stash_pending_terminal_error(agent_id, persist);
+                }
+            }
+        }
         // Exactly ONE terminal stream:end — complete and error both map here
         // (§7), EXCEPT a pre-output transport failure (monorepo#764): the
         // worker either redrives the prompt (the redriven attempt emits the
@@ -2204,6 +2254,11 @@ impl Services {
             // the logical turn it closes, same contract as `agent:failed`.
             if let Some(tid) = turn_id {
                 end_data["turnId"] = json!(tid);
+            }
+            // Abnormal finish reason: same value tagged on the persisted
+            // assistant row above — omitted on normal endings, never `null`.
+            if let Some(reason) = &abnormal_finish_reason {
+                end_data["finishReason"] = reason.clone();
             }
             // Final live-preview values (same fields as the throttled
             // activity frames) so a client tracking the preview push-style
