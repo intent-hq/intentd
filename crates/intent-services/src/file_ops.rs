@@ -171,10 +171,19 @@ pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MA
 /// EOF returns an empty chunk with `bytesRead: 0`; a short window at EOF
 /// returns just the remaining bytes. Directories are rejected as -32602;
 /// a missing file surfaces as -32603 per the existing file-op convention.
+///
+/// Unlike the TS-parity CWD fallback the string `file.*` ops keep, an
+/// empty root (unknown or pathless workspace) is rejected outright:
+/// [`is_within`] treats an empty root as matching every path, so falling
+/// through would let an arbitrary `workspaceId` + absolute path turn this
+/// endpoint into an unrestricted raw-byte file reader.
 pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Result<Value> {
     use base64::Engine as _;
     use std::io::{Read as _, Seek as _};
 
+    if root.is_empty() {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
+    }
     if length == 0 {
         return Err(Error::InvalidParams("length must be positive".to_string()));
     }
@@ -1012,6 +1021,13 @@ mod tests {
             read_chunk(&root, "missing.bin", 0, 16),
             Err(Error::Internal(_))
         ));
+        // Empty root (unknown/pathless workspace) → ACCESS_DENIED, never the
+        // CWD fallback: an empty root passes is_within for every path, which
+        // would make this an unrestricted raw-byte reader for absolute paths.
+        match read_chunk("", "/etc/hostname", 0, 16) {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied for empty root, got {other:?}"),
+        }
     }
 
     fn place_bytes(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
