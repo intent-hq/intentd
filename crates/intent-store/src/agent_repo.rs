@@ -25,14 +25,15 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled";
 
-/// Session metadata needed by the `AgentLite` summary projection. `system_prompt`
-/// is intentionally omitted: `AgentLite::from_session` strips it from the wire,
-/// and loading it made `agent.list` scale with the stored prompt bytes.
+/// Session metadata needed by the `AgentLite` summary projection.
+/// `system_prompt` and `image_blocks` are intentionally omitted:
+/// `AgentLite::from_session` strips them from the wire, and loading them made
+/// `agent.list` scale with the stored prompt/base64-image bytes.
 const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session_id, name, \
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    initial_message, context_references, image_blocks, file_blocks, is_background, metadata, sandbox_id, \
+    initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
 
 /// One agent session's usage inputs for the workspace token-usage tally
@@ -1857,16 +1858,21 @@ impl Store {
 }
 
 fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_system_prompt(row, col(row, "system_prompt")?)
+    map_session_row_with_heavy_cols(
+        row,
+        col(row, "system_prompt")?,
+        json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+    )
 }
 
 fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_system_prompt(row, None)
+    map_session_row_with_heavy_cols(row, None, None)
 }
 
-fn map_session_row_with_system_prompt(
+fn map_session_row_with_heavy_cols(
     row: &SqliteRow,
     system_prompt: Option<String>,
+    image_blocks: Option<serde_json::Value>,
 ) -> Result<AgentSession> {
     let backend: Option<String> = col(row, "backend_session_id")?;
     let parent: Option<String> = col(row, "parent_agent_id")?;
@@ -1912,7 +1918,7 @@ fn map_session_row_with_system_prompt(
             col(row, "context_references")?,
             "context_references",
         )?,
-        image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
+        image_blocks,
         file_blocks: json_col_from_db(col(row, "file_blocks")?, "file_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,

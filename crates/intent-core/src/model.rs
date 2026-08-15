@@ -2639,9 +2639,11 @@ pub struct AgentMetadata {
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
-/// the TS `AgentLite`: the full [`AgentSession`] with `messages` and
-/// `systemPrompt` stripped (clients fetch the transcript via
-/// `agent.getConversation`), plus a derived `messageCount`, the
+/// the TS `AgentLite`: the full [`AgentSession`] with `messages`,
+/// `systemPrompt`, and the session-level `imageBlocks` stripped (clients fetch
+/// the transcript via `agent.getConversation`; the spawn-time image blocks —
+/// potentially large base64 blobs — are detail-only and served by
+/// `agent.getSession`), plus a derived `messageCount`, the
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
@@ -2773,10 +2775,6 @@ pub struct AgentLite {
     /// when absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_references: Option<serde_json::Value>,
-    /// Session-level image blocks persisted at spawn (P3-1.2b); omitted when
-    /// absent so pre-gap wire shapes are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_blocks: Option<serde_json::Value>,
     /// Session-level file blocks persisted at spawn (PROTOCOL §5.5); omitted
     /// when absent so pre-existing wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2877,7 +2875,6 @@ impl AgentLite {
             last_message_id,
             digest,
             context_references: session.context_references,
-            image_blocks: session.image_blocks,
             file_blocks: session.file_blocks,
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,

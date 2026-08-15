@@ -4554,8 +4554,10 @@ async fn create_with_name_explicitly_set_false_stays_renameable() {
 /// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
 /// `metadata` spawn hint / top-level params and re-serves them via
 /// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
-/// session-level `contextReferences` / `imageBlocks`, and
-/// `metadata.isBackground` (G-A1/P3-1.2c).
+/// session-level `contextReferences`, and `metadata.isBackground`
+/// (G-A1/P3-1.2c). Session-level `imageBlocks` persist but stay OFF the lite
+/// projection (list-payload cost contract) — they are served by
+/// `agent.getSession` only.
 #[tokio::test]
 async fn create_persists_and_reserves_gap_fields() {
     let (_t, svc, ws) = setup().await;
@@ -4593,11 +4595,21 @@ async fn create_persists_and_reserves_gap_fields() {
         v["contextReferences"],
         json!([{ "type": "file", "path": "src/a.rs" }])
     );
-    assert_eq!(
-        v["imageBlocks"],
-        json!([{ "type": "image", "data": "abc" }])
+    assert!(
+        v.get("imageBlocks").is_none(),
+        "session-level imageBlocks must stay off the lite projection"
     );
     assert_eq!(v["metadata"]["isBackground"], json!(true));
+
+    // The persisted blocks are still served by the detail read.
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert_eq!(
+        session.image_blocks,
+        Some(json!([{ "type": "image", "data": "abc" }]))
+    );
 
     // And on `agent.list`.
     let agents = svc.agent_list_op(ws).await.expect("list");

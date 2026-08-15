@@ -125,15 +125,30 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
     let _ws_id = created["workspace"]["id"].as_str().unwrap();
     let agent_id = created["initialAgent"]["id"].as_str().unwrap();
 
-    // (1) Verify the agent session persists the imageBlocks.
-    let agent = wss_rpc(&mut rpc, 2, "agent.get", json!({ "agentId": agent_id })).await;
-    let agent_obj = &agent["agent"];
-    let image_blocks = &agent_obj["imageBlocks"];
+    // (1) Verify the agent session persists the imageBlocks. The full
+    // `agent.getSession` detail read serves them; the lite `agent.get`
+    // projection deliberately omits them (list-payload cost contract).
+    let full = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.getSession",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let image_blocks = &full["session"]["imageBlocks"];
     assert!(image_blocks.is_array(), "imageBlocks should be persisted");
     let blocks = image_blocks.as_array().unwrap();
     assert_eq!(blocks.len(), 1, "one image block persisted");
     assert_eq!(blocks[0]["data"], image_data, "image data matches");
     assert_eq!(blocks[0]["mimeType"], "image/png", "mime type matches");
+
+    // The lite projection must NOT carry the base64 blob.
+    let agent = wss_rpc(&mut rpc, 4, "agent.get", json!({ "agentId": agent_id })).await;
+    let agent_obj = &agent["agent"];
+    assert!(
+        agent_obj.get("imageBlocks").is_none(),
+        "agent.get must omit session-level imageBlocks: {agent_obj}"
+    );
 
     // (2) Verify the orchestration recorded an initialMessage in metadata.
     // The full image delivery to ACP requires a mock ACP fixture — that's
