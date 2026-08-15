@@ -8202,6 +8202,48 @@ async fn run_message_worker(
                 break 'outer;
             }
         }
+        // Archived-workspace gate (intent-hq/monorepo#2513): the archive
+        // sweep keeps pending queues persisted and the enqueue paths
+        // (`try_drain_queue` / `deliver_wake_message`) park messages while
+        // the workspace is archived — but this end-of-turn drain used to
+        // bypass that gate. A wake parked mid-turn (e.g. the hook-cancel
+        // notice from an archive initiated by this agent's own hook) was
+        // popped at turn end: the pre-release arm ran a stray turn in the
+        // archived workspace, and the post-release raced re-check re-claimed
+        // the slot via `try_begin`, whose auto-unarchive (#1216) flipped the
+        // freshly archived workspace straight back to Active. Mirror the
+        // `try_drain_queue` gate here: when the workspace is archived at
+        // turn end, leave everything parked (unarchive kicks the drain for
+        // every parked queue) and exit the worker. Chief is virtual and
+        // never archived, so skip the row read; fail open on a lookup error
+        // — the gate only parks affirmatively-archived workspaces. The
+        // redelivery call mirrors the empty-queue exit arm below (no-op
+        // unless the queue is empty and an interim-skipped idle is marked).
+        if !workspace_id.is_chief() {
+            match mgr.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "worker end-of-turn drain parked: workspace is archived"
+                    );
+                    mgr.end_turn(&agent_id).await;
+                    mgr.services
+                        .redeliver_completion_after_queue_mutation(&agent_id)
+                        .await;
+                    break 'outer;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "worker end-of-turn drain: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Question hold (PROTOCOL §5.5): questions may still be pending —
         // asked by the turn that just ended, or by an earlier turn the hold
         // has kept armed since — so draining the next AUTOMATIC queued
@@ -8391,6 +8433,40 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         };
+        // Archived re-check on the raced pop (intent-hq/monorepo#2513): the
+        // popped entry can be a wake parked by the archived gates AFTER the
+        // gate at the top of this drain ran — e.g. the hook-cancel notice
+        // from `workspace.archive`'s post-persist tail, enqueued exactly in
+        // this arm's race window. Re-claiming the slot via `try_begin` would
+        // auto-unarchive (#1216) the workspace that wake was parked FOR —
+        // publishing the archive delta and then flipping the row back, so a
+        // client that saw the delta reads `archived: false`. The pop
+        // happens-after the park, and the park happens-after the archived
+        // row's persist, so this re-read is authoritative when it matters:
+        // hand the batch back (same shape as the slot-race arm below) and
+        // exit — unarchive kicks the drain for every parked queue.
+        if !workspace_id.is_chief() {
+            match mgr.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "worker raced re-check parked: workspace is archived"
+                    );
+                    mgr.services.requeue_front_batch(&agent_id, raced);
+                    break 'outer;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "worker raced re-check: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         if mgr.try_begin(&agent_id, &workspace_id).await {
             // A multi-entry raced pop (hold + `all` above) is already the
             // complete ready batch in stored order — run it as one combined
