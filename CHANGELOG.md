@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2026-08-15
+
+### 🚀 Features
+
+- Warn on JSON-RPC frames over 1 MiB ([#1241](https://github.com/intent-hq/intentd/pull/1241))
+- *(cli)* Read sensitive settings from stdin or hidden prompt instead of argv ([#1243](https://github.com/intent-hq/intentd/pull/1243))
+
+### 🐛 Bug Fixes
+
+- Emit script definition change events ([#1170](https://github.com/intent-hq/intentd/pull/1170))
+- Run startup resume sweep to completion before serving traffic ([#1246](https://github.com/intent-hq/intentd/pull/1246))
+
+
 ## [0.7.1] - 2026-08-15
 
 ### 🚀 Features
