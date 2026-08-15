@@ -6112,7 +6112,9 @@ impl Services {
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
-        use batch::{classify_batch_tasks, project_unlock_plan, BatchDisposition};
+        use batch::{
+            classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
+        };
         use intent_core::BatchTaskEntry;
 
         let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
@@ -6210,6 +6212,12 @@ impl Services {
         }
 
         let classified = classify_batch_tasks(&requested, &snaps);
+        // Relation-less annotation (monorepo#2457 part 3): requested tasks
+        // the graph does not cover (no relations of their own, not
+        // referenced by any other requested task) classify exactly as
+        // before, but their rows carry `relationsUnknown: true` and the
+        // summary counts the started ones.
+        let relations_unknown = relations_unknown_ids(&requested, &snaps);
 
         // Delegate the start subset through the unchanged single-task path.
         // A per-task failure becomes an `error` disposition rather than
@@ -6220,6 +6228,9 @@ impl Services {
             let title = titles.get(id).cloned().unwrap_or_default();
             let mut row = json!({ "taskNoteId": id, "title": title });
             let obj = row.as_object_mut().unwrap();
+            if relations_unknown.contains(id) {
+                obj.insert("relationsUnknown".into(), json!(true));
+            }
             match disposition {
                 BatchDisposition::Start => {
                     // Per-entry overrides beat the top-level defaults, field
@@ -6349,6 +6360,18 @@ impl Services {
         if let Some(minutes) = critical_path_minutes {
             unlock_message.push_str(&format!(
                 " ~{minutes} min of serial work remains on the critical path."
+            ));
+        }
+        // Count started relation-less tasks in the human-readable summary
+        // (annotation only — nothing about the start decision changed).
+        let started_unknown = started_ids
+            .iter()
+            .filter(|id| relations_unknown.contains(*id))
+            .count();
+        if started_unknown > 0 {
+            unlock_message.push_str(&format!(
+                " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
+                started_ids.len()
             ));
         }
 

@@ -183,6 +183,37 @@ pub(crate) fn serial_remaining_minutes(
     (minutes > 0).then_some(minutes)
 }
 
+/// Requested tasks the relation graph does not cover (monorepo#2457 part 3):
+/// own `dependsOn` and `conflictsWith` both empty, AND not referenced by any
+/// other requested task's relations. Annotation only — classification
+/// (start/hold/skip) is untouched; the delegate op stamps
+/// `relationsUnknown: true` on these rows and counts the started ones in the
+/// human-readable result summary, so a coordinator can tell "ready by the
+/// graph" apart from "the graph says nothing about this task".
+pub(crate) fn relations_unknown_ids(
+    requested: &[String],
+    snaps: &HashMap<String, BatchTaskSnap>,
+) -> HashSet<String> {
+    let mut referenced: HashSet<&str> = HashSet::new();
+    for id in requested {
+        if let Some(snap) = snaps.get(id) {
+            referenced.extend(snap.depends_on.iter().map(String::as_str));
+            referenced.extend(snap.conflicts_with.iter().map(String::as_str));
+        }
+    }
+    requested
+        .iter()
+        .filter(|id| {
+            snaps.get(id.as_str()).is_some_and(|s| {
+                s.depends_on.is_empty()
+                    && s.conflicts_with.is_empty()
+                    && !referenced.contains(id.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Classified disposition for one requested task.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BatchDisposition {
@@ -428,6 +459,51 @@ mod tests {
             .filter(|(_, d)| matches!(d, BatchDisposition::Start))
             .map(|(id, _)| id.as_str())
             .collect()
+    }
+
+    // Relation-less annotation (monorepo#2457 part 3): mixed request — the
+    // task with no relations flags, the relation-bearing pair does not.
+    #[test]
+    fn relations_unknown_flags_only_uncovered_tasks_in_a_mixed_request() {
+        let mut snaps = HashMap::new();
+        snaps.insert("t1".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("t2".into(), snap(TaskStatus::NotStarted, &["t1"], &[]));
+        snaps.insert("lone".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        let unknown = relations_unknown_ids(&ids(&["t1", "t2", "lone"]), &snaps);
+        assert_eq!(unknown, HashSet::from(["lone".to_string()]));
+    }
+
+    // All-relation-less request: every task flags.
+    #[test]
+    fn relations_unknown_flags_every_task_when_none_carry_relations() {
+        let mut snaps = HashMap::new();
+        snaps.insert("a".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("b".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        let unknown = relations_unknown_ids(&ids(&["a", "b"]), &snaps);
+        assert_eq!(unknown, HashSet::from(["a".to_string(), "b".to_string()]));
+    }
+
+    // A task declaring no relations but referenced by another requested
+    // task's `dependsOn` is covered by the graph — NOT flagged. Same for a
+    // `conflictsWith` reference. References only count from REQUESTED tasks:
+    // an edge from an unrequested note does not cover a requested one.
+    #[test]
+    fn relations_unknown_spares_tasks_referenced_by_other_requested_tasks() {
+        let mut snaps = HashMap::new();
+        snaps.insert("dep".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("t".into(), snap(TaskStatus::NotStarted, &["dep"], &[]));
+        snaps.insert("rival".into(), snap(TaskStatus::NotStarted, &[], &[]));
+        snaps.insert("c".into(), snap(TaskStatus::NotStarted, &[], &["rival"]));
+        let unknown = relations_unknown_ids(&ids(&["dep", "t", "rival", "c"]), &snaps);
+        assert!(unknown.is_empty(), "{unknown:?}");
+
+        // Drop the referencing tasks from the request: the same notes now
+        // flag — the graph visible to THIS request does not cover them.
+        let unknown = relations_unknown_ids(&ids(&["dep", "rival"]), &snaps);
+        assert_eq!(
+            unknown,
+            HashSet::from(["dep".to_string(), "rival".to_string()])
+        );
     }
 
     #[test]
