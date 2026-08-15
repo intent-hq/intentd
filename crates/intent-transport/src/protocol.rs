@@ -166,10 +166,20 @@
 //! UTF-8-only `file.read`, with the same within-workspace containment
 //! guard, a 16 MiB decoded per-call cap (over-cap → -32602), directory
 //! rejection (-32602), and empty-chunk reads at/past EOF — 293 router
-//! methods, 332 total.
+//! methods, 332 total. Version 7.0 reworks the batch `agent.delegate`
+//! form (breaking; §5.5, part 2 of monorepo#2457): each `tasks` entry now
+//! accepts a bare taskNoteId string OR an object
+//! `{ taskNoteId, specialist?, model?, reasoningEffort? }` whose per-task
+//! options override the call's top-level defaults (additive half), while
+//! the `greedy` batch param is REMOVED — a request passing it is rejected
+//! with `-32602` ("greedy was removed; delegate a held task individually
+//! to force it past the conflict hold"), the batch result no longer echoes
+//! `greedy`, `started` rows never carry conflict overlap, and the
+//! `held:conflict` reason now points at individual delegation — no
+//! method-catalog change, 293 router methods, 332 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.18";
+pub const PROTOCOL_VERSION: &str = "7.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
