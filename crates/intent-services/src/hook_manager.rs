@@ -1330,7 +1330,7 @@ impl Services {
     /// loop: without this the row can sit in `running`/`scheduled` with no
     /// live task behind it. Every step here is itself best-effort (the store
     /// may still be failing) — log and move on rather than propagate.
-    async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
+    pub(crate) async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
         let error = format!("scheduler stopped after a store error: {cause}");
         tracing::warn!(hook = %hook.hook_id.0, error = %error, "evicting hook after store error");
         if let Err(e) = self

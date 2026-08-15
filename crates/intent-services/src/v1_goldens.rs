@@ -943,6 +943,52 @@ async fn golden_hook_eviction_notice_bytes() {
     );
 }
 
+/// Hook eviction notice, internal-error variant: exact bytes when the
+/// scheduler evicts after a store error (`evict_hook_after_store_error`).
+#[tokio::test]
+async fn golden_hook_eviction_internal_error_notice_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-evict-2");
+    seed_agent(&svc, &ws, &owner).await;
+    let mut hook = intent_core::Hook {
+        hook_id: intent_core::HookId::from("hook-evict-2"),
+        workspace_id: ws.clone(),
+        agent_id: owner.clone(),
+        name: "store-victim".to_string(),
+        code: "return { dispatch: false };".to_string(),
+        delay_ms: 600_000,
+        state: intent_core::HookState::Scheduled,
+        created_at: now_iso(),
+        last_run_at: None,
+        next_run_at: None,
+        run_count: 0,
+        last_error: None,
+        last_logs: None,
+        last_state: None,
+        expires_at: None,
+        perpetual: false,
+        dispatch_count: 0,
+    };
+    svc.store().insert_hook(&hook).await.expect("insert");
+    let cause = intent_core::Error::Internal("db locked".to_string());
+    svc.evict_hook_after_store_error(&mut hook, &cause).await;
+    let texts = wake_texts_when(&svc, &owner, 1).await;
+    assert_eq!(
+        texts,
+        vec![
+            "[Background hook \"store-victim\"] Your background hook \"store-victim\" was \
+             evicted after an internal error: scheduler stopped after a store error: \
+             internal error: db locked\n\
+             \n\
+             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             if the condition is still worth watching.]"
+                .to_string()
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Delegation preamble + notices (`agent_ops.rs`)
 // ---------------------------------------------------------------------------
