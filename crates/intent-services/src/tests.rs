@@ -13835,7 +13835,7 @@ mod file_tracking {
         // git.commitDetails degrades to an empty envelope (graceful) — same as
         // the other git reads — when the workspace has no worktree.
         let details = svc
-            .git_commit_details(ws, "deadbeef".to_string())
+            .git_commit_details(ws, "deadbeef".to_string(), None)
             .await
             .unwrap();
         assert_eq!(details["commitHash"], "deadbeef");
@@ -13878,7 +13878,10 @@ mod file_tracking {
             .to_string();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let details = svc.git_commit_details(ws_id, head.clone()).await.unwrap();
+        let details = svc
+            .git_commit_details(ws_id, head.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(details["commitHash"], head);
         assert_eq!(details["author"], "Test");
         assert_eq!(details["authorEmail"], "test@example.com");
@@ -13905,6 +13908,7 @@ mod file_tracking {
             .git_commit_details(
                 ws_id,
                 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                None,
             )
             .await
             .unwrap();
@@ -14051,6 +14055,54 @@ mod file_tracking {
             .unwrap()
             .starts_with("seed commit"));
 
+        // git.commitDetails resolves hashes in the secondary root's odb. Land
+        // a commit unique to the secondary root first — the deterministic
+        // fixture gives both repos an identical seed-commit hash.
+        let secondary_head = {
+            let r = Repository::open(&secondary.dir).unwrap();
+            std::fs::write(secondary.dir.join("extra.txt"), "extra\n").unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("extra.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "secondary-only",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+            .to_string()
+        };
+        let details = svc
+            .git_commit_details(ws_id.clone(), secondary_head.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], secondary_head);
+        assert_eq!(details["message"], "secondary-only");
+        assert!(details["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "extra.txt"));
+        // ...while the primary worktree cannot resolve that hash (empty
+        // envelope, not an error).
+        let unscoped = svc
+            .git_commit_details(ws_id.clone(), secondary_head.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(unscoped["files"], serde_json::json!([]));
+
         // git.showFile reads blobs at the secondary root's HEAD.
         let shown = svc
             .git_show_file(
@@ -14091,7 +14143,18 @@ mod file_tracking {
             .await
             .unwrap();
         let err = svc
-            .git_changes(ws_id, Some(foreign.id.clone()))
+            .git_changes(ws_id.clone(), Some(foreign.id.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // git.commitDetails follows the same policy (never an empty fallback).
+        let err = svc
+            .git_commit_details(
+                ws_id,
+                "deadbeef".to_string(),
+                Some(intent_core::WorkspaceGitRootId::new()),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
@@ -14127,6 +14190,15 @@ mod file_tracking {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        let err = svc
+            .git_commit_details(
+                ws_id.clone(),
+                "deadbeef".to_string(),
+                Some(intent_core::WorkspaceGitRootId::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // Valid id → the remote empty fallback, not an error.
         let status = svc
@@ -14134,8 +14206,17 @@ mod file_tracking {
             .await
             .unwrap();
         assert!(status.files.is_empty(), "{status:?}");
-        let changes = svc.git_changes(ws_id, Some(root.id.clone())).await.unwrap();
+        let changes = svc
+            .git_changes(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
         assert_eq!(changes, serde_json::json!([]));
+        let details = svc
+            .git_commit_details(ws_id, "deadbeef".to_string(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], "deadbeef");
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
     /// `parse_github_owner_repo` accepts the `ssh://` URL form (with

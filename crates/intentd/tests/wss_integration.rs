@@ -5300,6 +5300,12 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
         git(dir, &["add", "seed.txt"]);
         git(dir, &["commit", "-q", "-m", "seed"]);
     }
+    // A second commit unique to the nested repo — the identically-seeded
+    // repos can otherwise produce colliding seed-commit hashes, which would
+    // defeat the scoped-vs-unscoped `git.commitDetails` proof below.
+    std::fs::write(nested.join("nested-second.txt"), "nested\n").unwrap();
+    git(&nested, &["add", "nested-second.txt"]);
+    git(&nested, &["commit", "-q", "-m", "nested-second"]);
     // An untracked file only the nested repo can see.
     std::fs::write(nested.join("root-only.txt"), "hi\n").unwrap();
 
@@ -5428,6 +5434,61 @@ async fn wss_git_root_list_and_scoped_reads_round_trip() {
         srv.cfg.clone(),
         &format!(
             r#"{{"jsonrpc":"2.0","id":7,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // git.commitDetails scoped by gitRootId resolves hashes in the nested
+    // repo's odb (monorepo#2477).
+    let nested_head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&nested)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["commitHash"],
+        Value::from(nested_head.clone())
+    );
+    assert_eq!(resp["result"]["message"], "nested-second");
+    assert_eq!(
+        resp["result"]["files"],
+        serde_json::json!(["nested-second.txt"])
+    );
+
+    // The unscoped read cannot resolve the nested repo's hash — the empty
+    // envelope, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["files"], serde_json::json!([]));
+
+    // Unknown gitRootId on git.commitDetails → -32602 (never an empty fallback).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"nope"}}}}"#
         ),
     )
     .await;
