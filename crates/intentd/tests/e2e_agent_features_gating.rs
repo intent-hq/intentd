@@ -572,11 +572,11 @@ async fn agent_features_gate_new_sessions_only() {
         prompt_a.contains("## Raising Attention"),
         "full prompt must contain the attentionRequests section"
     );
-    // `taskGraph` is the opt-in exception: with defaults, the batch-delegation
+    // `taskGraph` is the opt-in exception: with defaults, the task-relations
     // teaching is absent from the prompt (intent-hq/monorepo#2445).
     assert!(
-        !prompt_a.contains("### Batch delegation"),
-        "default prompt must not teach batch delegation (taskGraph opt-in)"
+        !prompt_a.contains("### Task relations during delegation"),
+        "default prompt must not teach task relations (taskGraph opt-in)"
     );
     assert!(
         prompt_a.contains("## Delegating Tasks"),
