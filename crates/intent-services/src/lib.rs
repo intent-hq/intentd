@@ -130,6 +130,8 @@ pub mod workspace_vocabulary;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v1_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
@@ -9392,7 +9394,7 @@ pub(crate) fn event_carries_report(data: &serde_json::Value) -> bool {
 /// note with the machine-readable `watchStillArmed` flag on the wake's
 /// `event_notification` metadata (monorepo#2060, the `hookStillActive`
 /// twin): `!watch_retired` there.
-fn format_completion_wake(
+pub(crate) fn format_completion_wake(
     child_id: &AgentId,
     event: &Event,
     stall: Option<&StallSuspicion>,
@@ -9567,7 +9569,7 @@ pub(crate) struct StallSuspicion {
 
 impl StallSuspicion {
     /// The suffix appended to the wake text / per-child group line.
-    fn annotation_suffix(&self) -> String {
+    pub(crate) fn annotation_suffix(&self) -> String {
         format!(
             " No completion report and assigned task \"{}\" is still {} — the agent may have \
              stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
@@ -9657,7 +9659,7 @@ impl Services {
 /// was deleted or failed, else `completed`) followed by the accumulated
 /// per-child lines. STAB-160: a failed member must not be reported as
 /// `completed` — failures count toward `partial` just like deletions.
-fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
+pub(crate) fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     let total = group.expected_agent_ids.len();
     let any_failed = group
         .raw_events

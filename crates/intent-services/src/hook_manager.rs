@@ -388,7 +388,7 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// `[hook logs]` section, head-truncated to [`HOOK_WAKE_LOGS_CAP`] chars so a
 /// log-heavy run cannot flood the owner's queue. No-op when the run logged
 /// nothing.
-fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
+pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
     let Some(logs) = logs.filter(|l| !l.is_empty()) else {
         return message.to_string();
     };

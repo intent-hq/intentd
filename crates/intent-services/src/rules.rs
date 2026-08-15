@@ -289,7 +289,7 @@ pub(crate) struct SpecialistPromptInjection {
 /// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
 ///   direct-mode + cow_supported=true): parallel delegation safety guidance.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
-fn build_isolation_hint(
+pub(crate) fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
