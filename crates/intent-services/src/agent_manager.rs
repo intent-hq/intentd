@@ -3255,7 +3255,7 @@ impl AgentManager {
         if prompt.is_empty() {
             return None;
         }
-        Some(format!("<system>\n{prompt}\n</system>"))
+        Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
     /// Compute the fire-once workspace-naming instruction for the outbound
     /// prompt, or `None` when it should be omitted. Ported from the reference
@@ -3312,9 +3312,7 @@ impl AgentManager {
                 GENERIC_NAMING_TOOL_REFERENCE
             }
         };
-        Some(format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        ))
+        Some(crate::harness::latest().naming_nudge(tool_ref))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3356,31 +3354,26 @@ impl AgentManager {
             }
             _ => content.to_string(),
         };
+        // Resolve each envelope layer's data (gating stays here); the
+        // harness owns the wording and the layering order.
+        //
         // Role reminder is rebuilt every turn (interval = 1, port of
         // acp-provider.ts) and prepended to the outbound prompt for specialist
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
         let body = self.build_turn_body(agent_id, &combined).await;
-        let prompt_text = match reminder {
-            Some(r) => format!("{r}\n\n{body}"),
-            None => body,
-        };
         // Fire-once workspace-naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
         // first turn of an agent in a still-untitled / slug-titled workspace,
-        // prepend a `<system>` block asking the agent to set the workspace
-        // title as its first action. Never mutates the persisted user
-        // message; agent-rename half is deferred until the daemon exposes a
+        // a `<system>` block asking the agent to set the workspace title as
+        // its first action. Never mutates the persisted user message;
+        // agent-rename half is deferred until the daemon exposes a
         // `set_agent_name` tool.
         let naming = self
             .build_workspace_naming_instruction(agent_id, workspace_id)
             .await;
-        let prompt_text = match naming {
-            Some(sys) => format!("{sys}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
-        // `stdinContext` is prepended verbatim as a `Context:` block; the
+        // `stdinContext` renders verbatim as a `Context:` block; the
         // trailing separator matches the reference `acp-provider.ts` so
         // downstream consumers see the same shape whether the prompt
         // originates from the daemon or the legacy Electron main path.
@@ -3392,42 +3385,37 @@ impl AgentManager {
             Some(ctx) if !ctx.is_empty() => None,
             _ => build_stdin_context_from_context_references(options.context_references.as_ref()),
         };
-        let prompt_text = match options.stdin_context.as_deref() {
-            Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
-            _ => match synthesised.as_deref() {
-                Some(ctx) if !ctx.is_empty() => {
-                    format!("Context:\n{ctx}\n\n---\n\n{prompt_text}")
-                }
-                _ => prompt_text,
-            },
+        let stdin_context = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => Some(ctx),
+            _ => synthesised.as_deref().filter(|ctx| !ctx.is_empty()),
         };
         // Per-turn agent state snapshot (`current ws.agent.snapshot() =>
         // {...}`): the outermost RECURRING per-turn decoration — before
-        // context/naming/reminder, after only the fire-once FirstTurnPrepend
-        // below. Rebuilt every turn for ALL agents (specialist and
+        // context/naming/reminder, after only the fire-once FirstTurnPrepend.
+        // Rebuilt every turn for ALL agents (specialist and
         // non-specialist, unlike the role reminder) and never persisted.
         // `agent_state_snapshot_line` reads `agentFeatures.stateSnapshot`
         // LIVE and returns `None` when the toggle is off or the snapshot is
         // trivial (all counts zero, no pending attention), leaving the
         // prompt byte-identical to pre-feature output.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
-        let prompt_text = match snapshot_line {
-            Some(line) => format!("{line}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
-        // assembled system prompt
-        // is delivered as the OUTERMOST `<system>` block on the first prompt
-        // of each fresh ACP session — before context/naming/reminder/user
-        // content. Armed by `start_session` on `session/new` (brand-new or
-        // recreate, never `session/load` resume) and consumed here so it
-        // fires exactly once per fresh session.
+        // assembled system prompt is delivered as the OUTERMOST `<system>`
+        // block on the first prompt of each fresh ACP session — before
+        // context/naming/reminder/user content. Armed by `start_session` on
+        // `session/new` (brand-new or recreate, never `session/load` resume)
+        // and consumed here so it fires exactly once per fresh session.
         let prepend = self.build_first_turn_prepend(agent_id).await;
-        let prompt_text = match prepend {
-            Some(sys) => format!("{sys}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
+        let prompt_text =
+            crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
+                first_turn_prepend: prepend.as_deref(),
+                snapshot_line: snapshot_line.as_deref(),
+                stdin_context,
+                naming_nudge: naming.as_deref(),
+                role_reminder: reminder.as_deref(),
+                body: &body,
+            });
         let mut blocks = text_prompt(&prompt_text);
         append_attachment_blocks(&mut blocks, options);
         // Resolve `noteIds` to `workspace-asset://` image content blocks
@@ -7459,22 +7447,14 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
 /// tool naming convention is unknown (or its workspace-MCP wiring hasn't
-/// landed yet).
-pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
-    "the `set_workspace_title` tool from the workspace MCP server";
+/// landed yet). Wording owned by the harness (H5).
+pub(crate) use crate::harness::v1::GENERIC_NAMING_TOOL_REFERENCE;
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
-/// nudge. Providers affix the MCP server name differently: auggie exposes
-/// `<tool>_<server>` (trailing suffix → `set_workspace_title_workspace-mcp`),
-/// opencode exposes `<server>_<tool>` (leading prefix →
-/// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
-/// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
+/// nudge (e.g. auggie → `set_workspace_title_workspace-mcp`, opencode →
+/// `workspace-mcp_set_workspace_title`). Wording owned by the harness (H5).
 pub(crate) fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
-    match provider_id {
-        "auggie" => "the `set_workspace_title_workspace-mcp` tool",
-        "opencode" => "the `workspace-mcp_set_workspace_title` tool",
-        _ => GENERIC_NAMING_TOOL_REFERENCE,
-    }
+    crate::harness::latest().naming_tool_reference(provider_id)
 }
 
 /// Resolve everything needed to spawn (or respawn) this
