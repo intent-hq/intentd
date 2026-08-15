@@ -1499,6 +1499,29 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         panic!("control OnceLock should only be set once");
     }
 
+    // Auto-resume interrupted agents at startup. `--resume-all` forces the
+    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
+    // (`auto` = headless hosts only, `on` = always, `off` = never). Awaited to
+    // completion BEFORE any listener starts (WS/WSS below, UDS further down)
+    // so the first `agent.listInterrupted` a client issues on connect never
+    // sees rows the sweep is about to claim (no interrupted-agents modal
+    // blip). "Complete" means every resume was initiated/claimed — the resumed
+    // agent turns still run in the background — and every failure inside the
+    // sweep only logs, so a bad sweep never wedges startup.
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    if resume_on_start {
+        run_startup_resume_sweep(&services).await;
+    }
+
     // Resolve the boot-time TCP listener decision once: `--insecure` always
     // starts the plain-ws listener; otherwise the secure WSS listener starts
     // iff the effective server.wsApi.enabled is true (handled further below,
@@ -1592,72 +1615,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             }
         }
     };
-
-    // Auto-resume interrupted agents at startup. `--resume-all` forces the
-    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
-    // (`auto` = headless hosts only, `on` = always, `off` = never).
-    // Spawn in the background so it doesn't block startup; log failures per-agent.
-    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
-    let has_display = detect_has_display();
-    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
-    tracing::info!(
-        resume_all,
-        setting = resume_setting.as_str(),
-        has_display,
-        resume = resume_on_start,
-        "startup interrupted-agent resume decision"
-    );
-    if resume_on_start {
-        let services_clone = services.clone();
-        tokio::spawn(async move {
-            tracing::info!("resume-on-start: enumerating interrupted agents");
-            // List all pending interrupted agents
-            let rows = match services_clone.store().list_interrupted_agents().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
-                    return;
-                }
-            };
-            if rows.is_empty() {
-                tracing::info!("resume-on-start: no interrupted agents to resume");
-                return;
-            }
-            tracing::info!(
-                count = rows.len(),
-                "resume-on-start: resuming interrupted agents"
-            );
-            let mut resumed = Vec::new();
-            let mut failed = Vec::new();
-            // Resume each agent using the same service operation as agent.resolveInterrupted
-            for interrupted in rows {
-                let agent_id = interrupted.agent_id.clone();
-                match services_clone.resume_interrupted_agent(&agent_id).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            agent_id = %agent_id,
-                            workspace = %interrupted.workspace_id,
-                            "resume-on-start: resumed agent"
-                        );
-                        resumed.push(agent_id.0);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            error = %e,
-                            "resume-on-start: failed to resume agent"
-                        );
-                        failed.push((agent_id.0, e.to_string()));
-                    }
-                }
-            }
-            tracing::info!(
-                resumed = resumed.len(),
-                failed = failed.len(),
-                "resume-on-start: auto-resume sweep complete"
-            );
-        });
-    }
 
     // Wake-triggered auto-resume (sleep-resume Task D). When wakeResume is
     // enabled, subscribe to the suspend detector's resume-event stream and, on
@@ -4454,6 +4411,62 @@ fn should_resume_on_start(
         ResumeInterruptedOnStart::Off => false,
         ResumeInterruptedOnStart::Auto => !has_display,
     }
+}
+
+/// Run the startup interrupted-agent resume sweep to completion: list the
+/// pending interrupted agents and resume each via the same service operation
+/// as `agent.resolveInterrupted`. Awaited in `serve` BEFORE any listener
+/// starts, so a client's first `agent.listInterrupted` never sees rows the
+/// sweep is about to claim. Never fails startup: a store error listing agents
+/// logs and returns (the daemon still serves), and per-agent resume failures
+/// are logged and skipped.
+async fn run_startup_resume_sweep(services: &Services) {
+    tracing::info!("resume-on-start: enumerating interrupted agents");
+    // List all pending interrupted agents
+    let rows = match services.store().list_interrupted_agents().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        tracing::info!("resume-on-start: no interrupted agents to resume");
+        return;
+    }
+    tracing::info!(
+        count = rows.len(),
+        "resume-on-start: resuming interrupted agents"
+    );
+    let mut resumed = Vec::new();
+    let mut failed = Vec::new();
+    // Resume each agent using the same service operation as agent.resolveInterrupted
+    for interrupted in rows {
+        let agent_id = interrupted.agent_id.clone();
+        match services.resume_interrupted_agent(&agent_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    workspace = %interrupted.workspace_id,
+                    "resume-on-start: resumed agent"
+                );
+                resumed.push(agent_id.0);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "resume-on-start: failed to resume agent"
+                );
+                failed.push((agent_id.0, e.to_string()));
+            }
+        }
+    }
+    tracing::info!(
+        resumed = resumed.len(),
+        failed = failed.len(),
+        "resume-on-start: auto-resume sweep complete"
+    );
 }
 
 /// §5.7 / §12.3 host capabilities: display availability + derived locality. The
