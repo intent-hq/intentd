@@ -66,14 +66,18 @@ open a local tunnel listener), the action fails with an explanatory error (point
 
 Explicit port forwards from the client machine to daemon-loopback ports — the tab-free
 counterpart to the implicit `openTab`/`navigate` auto-tunnel above. Use them when you
-need the forwarded port itself rather than a browser tab. The same three actions work
-uniformly on every transport: remote daemons forward over the daemon connection
-(`backend: "tunnel"`), local daemons use a loopback relay (`backend: "direct"`). Never
-branch on the backend — it is diagnostic only.
+need the forwarded port itself rather than a browser tab. On the Electron desktop client
+the same three actions work uniformly on every transport: remote daemons forward over
+the daemon connection (`backend: "tunnel"`), local daemons use a loopback relay
+(`backend: "direct"`). Never branch on the backend — it is diagnostic only. On
+web-browser clients (which cannot open a local listener) no tunnel backend exists:
+`openTunnel`/`closeTunnel` fail with an explanatory error and `listTunnels` returns
+`{ tunnels: [] }`.
 
 - `{ action: "openTunnel", remotePort }` → `{ remotePort, localPort, backend: "tunnel"|"direct", reused }`
   — forward daemon-side `remotePort`; reach it at `127.0.0.1:<localPort>` on the client.
   Reuses a live forward for the same `remotePort` (`reused: true`) or creates one.
+  `reused` is best-effort/diagnostic — like `backend`, don't branch on it.
 - `{ action: "listTunnels" }` → `{ tunnels: [{ remotePort, localPort, backend }] }`
 - `{ action: "closeTunnel", remotePort }` → `{ remotePort, closed: true }` — errors when
   no active forward exists for that port.

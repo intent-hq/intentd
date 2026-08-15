@@ -55,7 +55,9 @@ in the result) in a remote setup. See topic="overview" for the full convention.
 ## Forwarding a Daemon Port (Tunnels)
 
 When you need the port itself (curl, WebSockets, API clients) rather than a browser tab,
-forward it explicitly. Works uniformly on every transport — do not branch on `backend`:
+forward it explicitly. On the Electron desktop client this works uniformly on every
+transport — do not branch on `backend`. (Web-browser clients cannot open a local
+listener, so there `openTunnel` fails with an explanatory error.)
 
 ```json
 // Forward daemon-side port 8000 to a client-local port
