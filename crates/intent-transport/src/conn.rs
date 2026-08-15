@@ -297,6 +297,14 @@ pub(crate) async fn process_frame(
         // guard: a panicking handler yields `-32603` with the echoed request
         // `id` (no frame for notifications) and the connection stays open.
         let (rpc_id, method) = panic_guard::request_identity(value);
+        // Single inbound chokepoint shared by UDS and WS (both read loops
+        // route through `process_frame`): log-only large-frame warning,
+        // throttled per method, bulk-transfer methods exempt.
+        crate::protocol::warn_if_large_frame(
+            crate::protocol::FrameDirection::Inbound,
+            &method,
+            raw.len(),
+        );
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
                 let is_uds = !crate::context::is_tcp_connection();

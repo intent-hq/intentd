@@ -317,8 +317,17 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         Ok(v) => {
             let frame = success_string(echo_id.clone(), v);
             if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                // Existing hard-cap error path — no additional soft warn on
+                // top of the `error!` already emitted there.
                 oversized_response_string(echo_id, method, frame.len())
             } else {
+                // Log-only large-frame warning, throttled per method,
+                // bulk-transfer methods exempt.
+                crate::protocol::warn_if_large_frame(
+                    crate::protocol::FrameDirection::Outbound,
+                    method,
+                    frame.len(),
+                );
                 frame
             }
         }

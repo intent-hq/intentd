@@ -178,6 +178,9 @@
 //! `held:conflict` reason now points at individual delegation — no
 //! method-catalog change, 293 router methods, 332 total.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 /// Protocol version exposed on the wire (§5.17, §5.7).
 pub const PROTOCOL_VERSION: &str = "7.0";
 
@@ -193,3 +196,297 @@ pub const MAX_INBOUND_MESSAGE_BYTES: usize = 40 * 1024 * 1024;
 /// dirty worktree produced a 277 MiB response and HOL'd the UDS writer for
 /// ~38s. Cap matches inbound; producers should also size payloads down.
 pub const MAX_OUTBOUND_MESSAGE_BYTES: usize = MAX_INBOUND_MESSAGE_BYTES;
+
+/// Soft warning threshold for a single JSON-RPC frame in either direction.
+/// Frames above this size are far below the hard 40 MiB caps but usually
+/// indicate a payload that should be chunked, projected, or paged instead of
+/// shipped whole (see the RPC cost contract in `packages/intentd/AGENTS.md`),
+/// so the transport emits a throttled `warn` log — log-only, no wire
+/// behavior change. Known bulk-transfer methods are exempt (see
+/// [`is_bulk_transfer_method`]).
+pub const LARGE_MESSAGE_WARN_BYTES: usize = 1024 * 1024;
+
+/// Minimum interval between two large-frame warns for the same method, so a
+/// burst of oversized frames (e.g. a chunked upload missing an exemption)
+/// does not flood the log.
+const LARGE_MESSAGE_WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Methods whose payloads are legitimately large — chunked/base64 bulk
+/// transfers in either direction. One shared list serves both the inbound
+/// and outbound checks; a method only ever trips one direction in practice.
+const BULK_TRANSFER_METHODS: &[&str] = &[
+    // Inbound: chunked/base64 uploads and whole-content writes.
+    "file.attachmentUpload.chunk",
+    "workspace.import.chunk",
+    "drafts.set",
+    "file.write",
+    "note.saveAsset",
+    "voice.transcribe",
+    // Outbound: chunked/base64 downloads and whole-content reads.
+    "workspace.export.read",
+    "file.read",
+    "file.readChunk",
+    "note.readAsset",
+    "drafts.get",
+];
+
+/// Whether `method` is a known bulk-transfer method exempt from the
+/// [`LARGE_MESSAGE_WARN_BYTES`] warning.
+pub(crate) fn is_bulk_transfer_method(method: &str) -> bool {
+    BULK_TRANSFER_METHODS.contains(&method)
+}
+
+/// Direction tag for the large-frame warn log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameDirection {
+    Inbound,
+    Outbound,
+}
+
+/// Per-method throttle state for large-frame warns. A `Vec` keyed by method
+/// name is deliberate: only methods that actually exceed the threshold ever
+/// land here, so the scan is short and the const-initializable `Vec` avoids
+/// a lazy static.
+pub(crate) struct LargeFrameWarnThrottle(Mutex<Vec<(String, Instant)>>);
+
+impl LargeFrameWarnThrottle {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    /// Decide whether a frame of `bytes` for `method` warrants a warn at
+    /// `now`: over-threshold, not exempt, and no warn for the same method
+    /// within [`LARGE_MESSAGE_WARN_INTERVAL`]. `now` is injectable so tests
+    /// can drive the throttle deterministically. Never blocks beyond the
+    /// short mutex hold; a `true` return records `now` as the method's last
+    /// warn time.
+    pub(crate) fn should_warn(&self, method: &str, bytes: usize, now: Instant) -> bool {
+        if bytes <= LARGE_MESSAGE_WARN_BYTES || is_bulk_transfer_method(method) {
+            return false;
+        }
+        let mut entries = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match entries.iter_mut().find(|(m, _)| m == method) {
+            Some((_, last)) => {
+                if now.duration_since(*last) < LARGE_MESSAGE_WARN_INTERVAL {
+                    false
+                } else {
+                    *last = now;
+                    true
+                }
+            }
+            None => {
+                entries.push((method.to_string(), now));
+                true
+            }
+        }
+    }
+}
+
+/// Process-wide throttle shared by both directions: one warn per method per
+/// second regardless of which side the oversized frame appeared on.
+static LARGE_FRAME_WARN_THROTTLE: LargeFrameWarnThrottle = LargeFrameWarnThrottle::new();
+
+/// Emit a throttled `warn` when a JSON-RPC frame exceeds
+/// [`LARGE_MESSAGE_WARN_BYTES`] and the method is not a known bulk transfer.
+/// Log-only: never rejects or mutates the frame. Frames without a method
+/// (unparseable / envelope-invalid) are skipped — there is nothing useful to
+/// attribute the size to.
+pub(crate) fn warn_if_large_frame(direction: FrameDirection, method: &str, bytes: usize) {
+    if method.is_empty() {
+        return;
+    }
+    if !LARGE_FRAME_WARN_THROTTLE.should_warn(method, bytes, Instant::now()) {
+        return;
+    }
+    match direction {
+        FrameDirection::Inbound => tracing::warn!(
+            method,
+            bytes,
+            limit = LARGE_MESSAGE_WARN_BYTES,
+            "large inbound JSON-RPC frame"
+        ),
+        FrameDirection::Outbound => tracing::warn!(
+            method,
+            bytes,
+            limit = LARGE_MESSAGE_WARN_BYTES,
+            "large outbound JSON-RPC frame"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    const OVER: usize = LARGE_MESSAGE_WARN_BYTES + 1;
+
+    #[test]
+    fn bulk_transfer_exemptions_cover_both_directions() {
+        for method in [
+            "file.attachmentUpload.chunk",
+            "workspace.import.chunk",
+            "drafts.set",
+            "file.write",
+            "note.saveAsset",
+            "voice.transcribe",
+            "workspace.export.read",
+            "file.read",
+            "file.readChunk",
+            "note.readAsset",
+            "drafts.get",
+        ] {
+            assert!(is_bulk_transfer_method(method), "{method} must be exempt");
+        }
+        for method in ["git.diffs", "agent.getConversation", "workspace.list", ""] {
+            assert!(!is_bulk_transfer_method(method), "{method:?} must warn");
+        }
+    }
+
+    #[test]
+    fn should_warn_fires_only_over_threshold() {
+        let throttle = LargeFrameWarnThrottle::new();
+        let now = Instant::now();
+        assert!(!throttle.should_warn("a.b", LARGE_MESSAGE_WARN_BYTES, now));
+        assert!(!throttle.should_warn("a.b", 10, now));
+        assert!(throttle.should_warn("a.b", LARGE_MESSAGE_WARN_BYTES + 1, now));
+    }
+
+    #[test]
+    fn should_warn_suppresses_exempt_methods() {
+        let throttle = LargeFrameWarnThrottle::new();
+        let now = Instant::now();
+        assert!(!throttle.should_warn("file.attachmentUpload.chunk", OVER, now));
+        assert!(!throttle.should_warn("workspace.export.read", OVER, now));
+    }
+
+    #[test]
+    fn should_warn_throttles_per_method_per_second() {
+        let throttle = LargeFrameWarnThrottle::new();
+        let t0 = Instant::now();
+        assert!(throttle.should_warn("a.b", OVER, t0));
+        // Same method within 1s: silently skipped.
+        assert!(!throttle.should_warn("a.b", OVER, t0 + Duration::from_millis(500)));
+        assert!(!throttle.should_warn("a.b", OVER, t0 + Duration::from_millis(999)));
+        // At/after the interval: fires again and re-arms from that instant.
+        assert!(throttle.should_warn("a.b", OVER, t0 + Duration::from_secs(1)));
+        assert!(!throttle.should_warn("a.b", OVER, t0 + Duration::from_millis(1500)));
+        assert!(throttle.should_warn("a.b", OVER, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn throttle_is_independent_per_method() {
+        let throttle = LargeFrameWarnThrottle::new();
+        let t0 = Instant::now();
+        assert!(throttle.should_warn("a.b", OVER, t0));
+        // A different method is not throttled by a.b's recent warn.
+        assert!(throttle.should_warn("c.d", OVER, t0 + Duration::from_millis(10)));
+        assert!(!throttle.should_warn("c.d", OVER, t0 + Duration::from_millis(20)));
+    }
+
+    /// Minimal capturing subscriber: records `(level, rendered fields +
+    /// message)` per event. Hand-rolled because `tracing-subscriber` is not a
+    /// dependency of this crate.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<StdMutex<Vec<(tracing::Level, String)>>>);
+
+    impl Capture {
+        fn lines(&self) -> Vec<(tracing::Level, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn capture_warns(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), f);
+        capture.lines()
+    }
+
+    // The tests below go through `warn_if_large_frame`, which uses the
+    // process-global throttle — each uses method names unique to that test so
+    // parallel test threads cannot throttle each other.
+
+    #[test]
+    fn warn_if_large_frame_emits_one_warn_with_method_and_bytes() {
+        let lines = capture_warns(|| {
+            warn_if_large_frame(FrameDirection::Inbound, "test.inboundEmit", OVER);
+        });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, tracing::Level::WARN);
+        assert!(lines[0].1.contains("large inbound JSON-RPC frame"));
+        assert!(lines[0].1.contains("method=\"test.inboundEmit\""));
+        assert!(lines[0].1.contains(&format!("bytes={OVER}")));
+        assert!(lines[0]
+            .1
+            .contains(&format!("limit={LARGE_MESSAGE_WARN_BYTES}")));
+    }
+
+    #[test]
+    fn warn_if_large_frame_outbound_direction_message() {
+        let lines = capture_warns(|| {
+            warn_if_large_frame(FrameDirection::Outbound, "test.outboundEmit", OVER);
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].1.contains("large outbound JSON-RPC frame"));
+    }
+
+    #[test]
+    fn warn_if_large_frame_skips_small_exempt_and_methodless_frames() {
+        let lines = capture_warns(|| {
+            warn_if_large_frame(
+                FrameDirection::Inbound,
+                "test.underThreshold",
+                LARGE_MESSAGE_WARN_BYTES,
+            );
+            warn_if_large_frame(FrameDirection::Inbound, "file.attachmentUpload.chunk", OVER);
+            warn_if_large_frame(FrameDirection::Outbound, "workspace.export.read", OVER);
+            warn_if_large_frame(FrameDirection::Inbound, "", OVER);
+        });
+        assert!(lines.is_empty(), "unexpected warns: {lines:?}");
+    }
+
+    #[test]
+    fn warn_if_large_frame_throttles_repeat_warns() {
+        let lines = capture_warns(|| {
+            warn_if_large_frame(FrameDirection::Inbound, "test.throttleRepeat", OVER);
+            warn_if_large_frame(FrameDirection::Inbound, "test.throttleRepeat", OVER);
+            warn_if_large_frame(FrameDirection::Outbound, "test.throttleRepeat", OVER);
+        });
+        assert_eq!(lines.len(), 1, "expected exactly one warn: {lines:?}");
+    }
+}
