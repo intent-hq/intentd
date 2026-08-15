@@ -4175,7 +4175,7 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
-        self.try_begin_outcome(agent_id, workspace_id).await == TryBeginOutcome::Started
+        self.try_begin_outcome(agent_id, workspace_id, true).await == TryBeginOutcome::Started
     }
 
     /// [`AgentManager::try_begin`] with the loss reason: callers that behave
@@ -4184,10 +4184,20 @@ impl AgentManager {
     /// slot; the handle is being torn down) need the distinction decided under
     /// the SAME `busy`-lock acquisition as the claim itself — re-probing after
     /// a `bool` loss would race the claim's release (monorepo#2118 review).
+    ///
+    /// `auto_unarchive` gates the #1216 auto-unarchive on a `Started` claim:
+    /// every normal turn start passes `true`. The worker's end-of-turn raced
+    /// re-claim passes `false` — its pre-claim archived gate is inherently
+    /// check-then-act, so an archive persisting between that row read and
+    /// this claim would otherwise be flipped straight back to Active by the
+    /// claim itself; suppressing the flip lets the caller re-check the row
+    /// while HOLDING the slot and park instead (monorepo#2513, PR #1244
+    /// review).
     async fn try_begin_outcome(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        auto_unarchive: bool,
     ) -> TryBeginOutcome {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
@@ -4252,10 +4262,14 @@ impl AgentManager {
             // own events arrive. Best-effort: never blocks the turn. The
             // enqueue paths (archived gates in `try_drain_queue` /
             // `deliver_wake_message`) are untouched — only a claimed slot
-            // triggers this.
-            self.services
-                .auto_unarchive_on_turn_start(workspace_id, agent_id)
-                .await;
+            // triggers this. Suppressed (`auto_unarchive = false`) only by
+            // the worker's raced re-claim, whose own post-claim archived
+            // re-check parks instead of un-archiving (monorepo#2513).
+            if auto_unarchive {
+                self.services
+                    .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                    .await;
+            }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -5953,7 +5967,7 @@ impl AgentManager {
         // to the prompt turn that won the slot: marking idle here would flag
         // the process eviction-eligible (and pop a spawn waiter)
         // mid-prompt-turn.
-        match self.try_begin_outcome(agent_id, workspace_id).await {
+        match self.try_begin_outcome(agent_id, workspace_id, true).await {
             TryBeginOutcome::Started => {}
             TryBeginOutcome::Busy => {
                 self.services
@@ -8227,11 +8241,37 @@ async fn run_message_worker(
                         workspace = %workspace_id.as_str(),
                         "worker end-of-turn drain parked: workspace is archived"
                     );
+                    // Deregister BEFORE releasing the slot (the wake-listener
+                    // teardown order): while the slot is held no concurrent
+                    // drain can claim it and register a replacement worker,
+                    // so this provably removes only this worker's own entry.
+                    // `break 'outer` would instead reach the shared post-loop
+                    // `clear_worker` AFTER the release — an unarchive-kicked
+                    // drain can spawn (and register) a replacement in that
+                    // gap, and the late clear would deregister the
+                    // replacement, leaving it running but unreachable by
+                    // interrupt/stop (PR #1244 review). Returning also skips
+                    // the turn-end attention raise: the queue parked, the
+                    // agent did not finish its work.
+                    mgr.clear_worker(&agent_id);
                     mgr.end_turn(&agent_id).await;
                     mgr.services
                         .redeliver_completion_after_queue_mutation(&agent_id)
                         .await;
-                    break 'outer;
+                    // Close the unarchive strand window (PR #1244 review): an
+                    // unarchive that persisted between this gate's row read
+                    // and the `end_turn` above had its drain kick bounce off
+                    // this worker's still-held slot — leaving ready entries
+                    // parked in a now-Active workspace with nothing to kick
+                    // them. Re-kick now that the slot is released: the kick
+                    // self-gates (still archived → parks again; unarchived in
+                    // the window → drains), and an unarchive persisting after
+                    // ITS row read finds the slot free, so its own kick
+                    // proceeds — the window is closed from both sides.
+                    mgr.clone()
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                    return;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -8433,41 +8473,61 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         };
-        // Archived re-check on the raced pop (intent-hq/monorepo#2513): the
-        // popped entry can be a wake parked by the archived gates AFTER the
-        // gate at the top of this drain ran — e.g. the hook-cancel notice
-        // from `workspace.archive`'s post-persist tail, enqueued exactly in
-        // this arm's race window. Re-claiming the slot via `try_begin` would
-        // auto-unarchive (#1216) the workspace that wake was parked FOR —
-        // publishing the archive delta and then flipping the row back, so a
-        // client that saw the delta reads `archived: false`. The pop
-        // happens-after the park, and the park happens-after the archived
-        // row's persist, so this re-read is authoritative when it matters:
-        // hand the batch back (same shape as the slot-race arm below) and
-        // exit — unarchive kicks the drain for every parked queue.
-        if !workspace_id.is_chief() {
-            match mgr.services.store.get_workspace(&workspace_id).await {
-                Ok(ws) if ws.archived => {
-                    tracing::debug!(
-                        agent = %agent_id,
-                        workspace = %workspace_id.as_str(),
-                        "worker raced re-check parked: workspace is archived"
-                    );
-                    mgr.services.requeue_front_batch(&agent_id, raced);
-                    break 'outer;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        agent = %agent_id,
-                        workspace = %workspace_id.as_str(),
-                        error = %e,
-                        "worker raced re-check: workspace archived-state lookup failed; proceeding"
-                    );
+        if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
+        {
+            // Archived re-check on the raced pop (intent-hq/monorepo#2513):
+            // the popped entry can be a wake parked by the archived gates
+            // AFTER the gate at the top of this drain ran — e.g. the
+            // hook-cancel notice from `workspace.archive`'s post-persist
+            // tail, enqueued exactly in this arm's race window. Running that
+            // wake would flip the workspace the wake was parked FOR straight
+            // back to Active — publishing the archive delta and then
+            // un-archiving, so a client that saw the delta reads `archived:
+            // false`. The check runs AFTER the slot re-claim, under the held
+            // slot (a pre-claim read is check-then-act: an archive
+            // persisting between the read and the claim would be flipped
+            // back by the claim's own #1216 auto-unarchive — PR #1244
+            // review), which is why the claim above SUPPRESSES the
+            // auto-unarchive: this read decides instead. Archived → hand the
+            // batch back, deregister, release the slot, and re-kick the
+            // self-gating drain (same closure as the pre-release arm: an
+            // unarchive whose kick bounced off this still-held slot — or
+            // whose `has_ready_to_send` probe ran while the batch sat in the
+            // local `raced`, invisible to it — is covered by our own kick
+            // against the now-requeued entries). Not archived → fall through
+            // to the turn with nothing to unarchive; fail open on a lookup
+            // error, matching the auto-unarchive's own error path (turn
+            // proceeds, workspace stays as-is).
+            if !workspace_id.is_chief() {
+                match mgr.services.store.get_workspace(&workspace_id).await {
+                    Ok(ws) if ws.archived => {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            "worker raced re-check parked: workspace is archived"
+                        );
+                        mgr.services.requeue_front_batch(&agent_id, raced);
+                        // Deregister BEFORE releasing the slot, then return —
+                        // same teardown order and rationale as the
+                        // pre-release archived arm above.
+                        mgr.clear_worker(&agent_id);
+                        mgr.end_turn(&agent_id).await;
+                        mgr.clone()
+                            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                            .await;
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            error = %e,
+                            "worker raced re-check: workspace archived-state lookup failed; proceeding"
+                        );
+                    }
                 }
             }
-        }
-        if mgr.try_begin(&agent_id, &workspace_id).await {
             // A multi-entry raced pop (hold + `all` above) is already the
             // complete ready batch in stored order — run it as one combined
             // turn directly; folding or reordering here would break the

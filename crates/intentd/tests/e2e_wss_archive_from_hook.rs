@@ -581,7 +581,12 @@ async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
         // hook-cancel wake land while this turn is still in flight: the wake
         // must take the busy fast-enqueue branch, putting the end-of-turn
         // drain (not the delivery-time gate) on the hook for parking it.
-        "firstTurnDelayMs": 4000,
+        // Scaled by INTENTD_TEST_TIMEOUT_MULTIPLIER: the flake this test
+        // guards reproduced on slow coverage runners, where an unscaled
+        // stall could elapse before `hook.runNow`'s archive lands — the wake
+        // then takes the idle delivery-time gate instead and the test
+        // silently stops covering the end-of-turn drain path.
+        "firstTurnDelayMs": common::test_timeout(Duration::from_millis(4000)).as_millis() as u64,
         "response": "acknowledged",
     })
     .to_string();
