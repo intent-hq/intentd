@@ -26,6 +26,14 @@
 #   INTENTD_INSTALL_SERVICE=1  (or --service, on direct runs)     set up
 #   INTENTD_INSTALL_SERVICE=0  (or --no-service, on direct runs)  skip
 #
+# When a service is set up, the script also asks whether it should auto-resume
+# interrupted agents at startup (the daemon setting
+# agents.resumeInterruptedOnStart). The default `auto` resumes only on headless
+# hosts, so answering auto — or having no terminal — writes nothing; on/off are
+# applied via `intentd settings` once the daemon is up. Force an answer:
+#
+#   INTENTD_AUTO_RESUME=auto|on|off  (or --auto-resume=<value>, on direct runs)
+#
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
 # serves the same data dir the install-time CLI used.
@@ -71,6 +79,37 @@ verify_daemon() {
   warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
 }
 
+# Lowercase a flag/env auto-resume value so validation is case-insensitive,
+# matching the interactive prompt (and install.ps1).
+normalize_auto_resume() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Fail fast on a bogus auto-resume value from the flag or env var
+# (already lowercased via normalize_auto_resume).
+validate_auto_resume() {
+  case "$1" in
+    auto | on | off) ;;
+    *) fail "invalid auto-resume value '$1' (expected auto, on, or off)" ;;
+  esac
+}
+
+# Apply an explicit on/off auto-resume answer via the settings CLI once the
+# daemon is reachable (runs after verify_daemon). `auto` is the daemon default,
+# so there is nothing to write. A failure is a warning, not a fatal install
+# error: the setting can be changed later with the same command.
+apply_auto_resume() {
+  case "$auto_resume" in
+    on | off) ;;
+    *) return 0 ;;
+  esac
+  if "$install_dir/intentd" settings agents.resumeInterruptedOnStart "$auto_resume" >/dev/null 2>&1; then
+    info "auto-resume on service start set to '$auto_resume' (agents.resumeInterruptedOnStart)"
+  else
+    warn "could not set agents.resumeInterruptedOnStart=$auto_resume — set it later with: intentd settings agents.resumeInterruptedOnStart $auto_resume"
+  fi
+}
+
 setup_service_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "systemd not found — cannot register a service; start the daemon manually with: intentd serve"
@@ -95,9 +134,14 @@ setup_service_linux() {
 Description=Intent backend daemon (intentd)
 After=network.target
 
+# A systemd user unit does not inherit the graphical session's DISPLAY /
+# WAYLAND_DISPLAY, so the daemon sees this service as headless: the default
+# agents.resumeInterruptedOnStart=auto resumes interrupted agents at startup
+# even on a desktop. Opt out with:
+#   intentd settings agents.resumeInterruptedOnStart off
 [Service]
 Type=simple
-ExecStart="$exec_path" serve --resume-all
+ExecStart="$exec_path" serve
 ExecStop="$exec_path" stop
 Restart=on-failure
 $env_line
@@ -133,6 +177,7 @@ EOF
   fi
 
   verify_daemon
+  apply_auto_resume
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
 }
 
@@ -169,7 +214,6 @@ setup_service_macos() {
 	<array>
 		<string>$xml_bin</string>
 		<string>serve</string>
-		<string>--resume-all</string>
 	</array>
 $env_block	<key>RunAtLoad</key>
 	<true/>
@@ -206,18 +250,30 @@ EOF
   info "LaunchAgent installed and started: $plist"
 
   verify_daemon
+  apply_auto_resume
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
 }
 
 main() {
   service_arg=""
+  auto_resume_arg=""
   for arg in "$@"; do
     case "$arg" in
       --service) service_arg="yes" ;;
       --no-service) service_arg="no" ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service)" ;;
+      --auto-resume=*)
+        auto_resume_arg=$(normalize_auto_resume "${arg#--auto-resume=}")
+        validate_auto_resume "$auto_resume_arg"
+        ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off)" ;;
     esac
   done
+  # Validated before any download so garbage fails fast, interactive or not.
+  auto_resume_env=""
+  if [ -n "${INTENTD_AUTO_RESUME:-}" ]; then
+    auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
+    validate_auto_resume "$auto_resume_env"
+  fi
 
   os=$(uname -s)
   case "$os" in
@@ -355,6 +411,35 @@ main() {
   fi
 
   if [ "$service_mode" = "yes" ]; then
+    # Auto-resume choice: flag beats the env var beats the prompt (both were
+    # lowercased + validated above). Same /dev/tty pattern as the service
+    # prompt; `auto` — or no terminal — is the daemon default and writes
+    # nothing. Note the answer is applied only after the service's first
+    # start (apply_auto_resume runs after verify_daemon), so on a re-install
+    # over an existing data dir that first start still runs under the prior
+    # effective setting.
+    auto_resume="$auto_resume_arg"
+    if [ -z "$auto_resume" ]; then
+      auto_resume="$auto_resume_env"
+    fi
+    if [ -z "$auto_resume" ]; then
+      if (exec </dev/tty) 2>/dev/null; then
+        printf 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto) ' >/dev/tty
+        reply=""
+        read -r reply </dev/tty || reply=""
+        case "$reply" in
+          [Oo][Nn]) auto_resume="on" ;;
+          [Oo][Ff][Ff]) auto_resume="off" ;;
+          '' | [Aa][Uu][Tt][Oo]) auto_resume="auto" ;;
+          *)
+            warn "unrecognized answer '$reply' — keeping the default (auto)"
+            auto_resume="auto"
+            ;;
+        esac
+      else
+        auto_resume="auto"
+      fi
+    fi
     if [ "$os" = "Darwin" ]; then
       setup_service_macos
     else

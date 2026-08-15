@@ -811,7 +811,7 @@ jobs:
           unit=packaging/deb/intentd.service
           grep -qx 'Description=Intent backend daemon (intentd)' "$unit"
           grep -qx 'Type=simple' "$unit"
-          grep -qx 'ExecStart=/usr/bin/intentd serve --resume-all' "$unit"
+          grep -qx 'ExecStart=/usr/bin/intentd serve' "$unit"
           grep -qx 'ExecStop=/usr/bin/intentd stop' "$unit"
           grep -qx 'Restart=on-failure' "$unit"
           grep -qx 'WantedBy=default.target' "$unit"

@@ -1347,6 +1347,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             &["all", "systemOnly", "off"],
             "all",
         ),
+        enumerated(
+            "agents.resumeInterruptedOnStart",
+            "Resume interrupted agents on start",
+            "Whether the daemon resumes interrupted agents at startup when --resume-all is absent: \
+             auto resumes only on headless hosts (no display detected), on always resumes, \
+             off never resumes (changes apply on daemon restart)",
+            "agents",
+            &["auto", "on", "off"],
+            "auto",
+        ),
         number(
             "events.streamRetentionHours",
             "Event stream retention hours",
@@ -2786,6 +2796,95 @@ mod tests {
             .expect("reset");
         assert_eq!(reset["value"], json!("all"));
         let got = svc.get("agents.flushQueuedMessages").await.expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `agents.resumeInterruptedOnStart` is a TOML-backed enum (`auto` / `on`
+    /// / `off`) defaulting to `auto`: the catalog entry and wire round-trip
+    /// through the registry-wired service (default origin → file override →
+    /// reset).
+    #[tokio::test]
+    async fn agents_resume_interrupted_on_start_round_trip_via_registry() {
+        let def = find_definition("agents.resumeInterruptedOnStart")
+            .expect("agents.resumeInterruptedOnStart missing");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(def.ty, SettingType::Enum(values) if values == ["auto", "on", "off"]));
+        assert_eq!(def.default_value, Some(json!("auto")));
+        assert!(KNOWN_PATHS.contains(&"agents.resumeInterruptedOnStart"));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-resume-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-resume-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default with `default` origin.
+        let got = svc
+            .get("agents.resumeInterruptedOnStart")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!("auto"));
+        assert_eq!(got["origin"], json!("default"));
+
+        // Update persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([
+            { "path": "agents.resumeInterruptedOnStart", "value": "on" },
+        ]))
+        .await
+        .expect("update");
+        let got = svc
+            .get("agents.resumeInterruptedOnStart")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!("on"));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("resumeInterruptedOnStart"), "{text}");
+        assert_eq!(
+            store
+                .get_setting("agents.resumeInterruptedOnStart")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Rejects an unknown enum value.
+        let err = svc
+            .update(&json!([
+                { "path": "agents.resumeInterruptedOnStart", "value": "maybe" },
+            ]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resumeInterruptedOnStart"),
+            "{err}"
+        );
+
+        // Reset restores the default.
+        let reset = svc
+            .reset("agents.resumeInterruptedOnStart")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!("auto"));
+        let got = svc
+            .get("agents.resumeInterruptedOnStart")
+            .await
+            .expect("get");
         assert_eq!(got["origin"], json!("default"));
 
         let _ = std::fs::remove_file(&config_path);

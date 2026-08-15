@@ -8,6 +8,8 @@ set -e
 if [ "$1" = "configure" ]; then
     echo "intentd installed. To start it now and at every login, run as your user:"
     echo "    systemctl --user enable --now intentd"
+    echo "Startup auto-resume of interrupted agents defaults to auto (headless hosts only);"
+    echo "toggle it with: intentd settings agents.resumeInterruptedOnStart on|off"
 fi
 
 exit 0
