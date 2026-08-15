@@ -14420,7 +14420,8 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
 /// `redeliver_completion_after_queue_mutation` with hooks still active — the
 /// monorepo#1945 report bypass must NOT consume the deferral and fire the
 /// stale report; only the LAST hook's terminal transition (child genuinely
-/// settled) delivers the settlement wake.
+/// settled) delivers the settlement wake, and (cancel-path parity: no child
+/// turn ran to clear the report) that wake must NOT carry the stale report.
 #[tokio::test]
 async fn registration_deferral_survives_non_last_hook_terminal_transition() {
     let (_t, svc, ws) = setup().await;
@@ -14482,6 +14483,12 @@ async fn registration_deferral_survives_non_last_hook_terminal_transition() {
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "settled watch retired"
+    );
+    assert!(
+        !parent_messages_text(&svc, &watcher)
+            .await
+            .contains("PR ready; hooks armed"),
+        "settlement wake must not carry the pre-registration stale report"
     );
 }
 

@@ -4222,9 +4222,17 @@ impl Services {
             "agentName": session.name,
             "isBackground": session.is_background,
         });
-        if let Some(report) = session.completion_report {
-            data["completionReport"] = serde_json::Value::String(report.clone());
-            data["report"] = serde_json::Value::String(report);
+        // monorepo#2532 Gap B (PR #1250 review): a stale-provenance marker
+        // means the persisted report predates every remaining watcher (they
+        // armed AFTER the report) and no child turn ran since — dropping the
+        // report keys keeps the settlement wake's freshness independent of
+        // WHICH terminal transition settled it (a dispatch/expiry wake runs
+        // an owner turn that clears the report; an external cancel does not).
+        if !had_stale_report {
+            if let Some(report) = session.completion_report {
+                data["completionReport"] = serde_json::Value::String(report.clone());
+                data["report"] = serde_json::Value::String(report);
+            }
         }
         // Idle-visibility: the synthesized idle carries the same
         // `waitingOnHooks` stamp as a real `agent:idle` emit — empty
