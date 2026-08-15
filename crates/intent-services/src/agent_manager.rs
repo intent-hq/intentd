@@ -3461,10 +3461,7 @@ impl AgentManager {
                             blocks.push(img);
                         }
                     }
-                    let notice = format!(
-                        "[System: {n} image(s) from the referenced note(s) are attached to this message.]",
-                        n = images.len(),
-                    );
+                    let notice = note_images_notice(images.len());
                     blocks.extend(text_prompt(&notice));
                 }
             }
@@ -7319,6 +7316,31 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
+/// The system notice appended after note-referenced images are inlined
+/// (Fidelity B, PROTOCOL §5.5).
+pub(crate) fn note_images_notice(n: usize) -> String {
+    format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+}
+
+/// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
+/// `ws.file.getAttachment` retrieval instruction — the file bytes never ride
+/// the prompt for reference blocks.
+pub(crate) fn attachment_reference_notice(
+    name: &str,
+    mime: Option<&str>,
+    size: Option<u64>,
+    id: &str,
+) -> String {
+    let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
+    let size_note = size.map(|s| format!(", {s} bytes")).unwrap_or_default();
+    format!(
+        "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
+         file is NOT inlined in this message. Call \
+         ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
+         then read it from the returned path.]"
+    )
+}
+
 /// Push one content block per well-formed file entry: inline
 /// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
 /// the blob; attachment-reference `{ attachmentId, fileName }` entries
@@ -7336,18 +7358,8 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty());
             if let (Some(id), Some(name)) = (attachment_id, name) {
-                let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
-                let size_note = file
-                    .get("size")
-                    .and_then(Value::as_u64)
-                    .map(|s| format!(", {s} bytes"))
-                    .unwrap_or_default();
-                let text = format!(
-                    "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
-                     file is NOT inlined in this message. Call \
-                     ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
-                     then read it from the returned path.]"
-                );
+                let size = file.get("size").and_then(Value::as_u64);
+                let text = attachment_reference_notice(name, mime, size, id);
                 if let Ok(block) =
                     serde_json::from_value::<ContentBlock>(json!({ "type": "text", "text": text }))
                 {

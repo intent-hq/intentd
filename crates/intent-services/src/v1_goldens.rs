@@ -156,6 +156,9 @@ fn golden_dequeue_wait_note() {
     );
 }
 
+// Deliberately redundant with the byte-exact table in
+// `agent_manager::tests` (queue-note context there); kept here so the
+// H0 baseline is self-contained. Update both together.
 #[test]
 fn golden_format_wait_duration() {
     let f = crate::agent_manager::format_wait_duration;
@@ -410,6 +413,10 @@ fn golden_event_subscription_wake() {
 // Ready-set delta section (`agent_ops/ready_delta.rs`)
 // ---------------------------------------------------------------------------
 
+// Deliberately redundant with `ready_delta`'s own byte-exact tests
+// (`render_section_links_tasks_and_flips_plural_framing`,
+// `render_section_annotates_attention_statuses_instead_of_dropping`);
+// kept here so the H0 baseline is self-contained. Update both together.
 #[test]
 fn golden_unblocked_section() {
     use crate::agent_ops::ready_delta::{render_unblocked_section, UnblockedReason, UnblockedTask};
@@ -678,6 +685,264 @@ fn golden_pr_monitor_diff_lines() {
     );
 }
 
+/// Checklist branch lines beyond the happy path: draft, conflicts, behind,
+/// failing required checks, changes-requested, blocked reason, and the two
+/// rules-unknown renderings. (The per-field diff LINES beyond
+/// `golden_pr_monitor_diff_lines` are byte-pinned by `pr_monitor::tests::
+/// diff_detects_each_field_class` and companions — exact `assert_eq` on each
+/// line — so they are not re-pinned here.)
+#[test]
+fn golden_pr_monitor_checklist_branch_lines() {
+    let mut s = pr_snapshot("open");
+    let r = &mut s.requirements;
+    r.is_draft = true;
+    r.has_conflicts = true;
+    r.is_behind = true;
+    r.mergeable = Some(false);
+    r.checks.failed = 1;
+    r.checks.passed = 1;
+    r.checks.failing_required = vec!["build".to_string()];
+    r.checks.pending_required = vec![];
+    r.approvals.changes_requested = 1;
+    r.merge_blocked_reason = Some("merge conflicts".to_string());
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0/1 required)\n\
+         - changes requested by 1 reviewer\n\
+         - checks: 1 passed, 1 failed, 1 pending (of 3); failing required: build\n\
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - merge conflicts present\n\
+         - branch is behind its base\n\
+         - blocked: merge conflicts"
+    );
+    // Rules-unknown: approvals fall back to the bare count, threads drop the
+    // resolution tail, and the trailer line appears; unknown required-check
+    // flags add the availability note.
+    let mut s = pr_snapshot("open");
+    let r = &mut s.requirements;
+    r.rules_known = false;
+    r.approvals.needed = None;
+    r.threads.resolution_required = None;
+    r.checks.required_known = false;
+    r.checks.pending_required = vec![];
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0 approving)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
+         - unresolved threads: 1\n\
+         - (branch rules unreadable — approval/thread requirements unknown)"
+    );
+}
+
+/// FE-cancel and archive-sweep notices for hooks and PR monitors: exact
+/// wake bytes delivered to the owning agent.
+#[tokio::test]
+async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-cancel");
+    seed_agent(&svc, &ws, &owner).await;
+    // Hook FE-cancel (caller = None).
+    let out = svc
+        .hook_schedule_op(
+            &ws,
+            &owner,
+            &json!({
+                "name": "watcher",
+                "code": "return { dispatch: false };",
+                "delayMs": 10_000,
+            }),
+        )
+        .await
+        .expect("schedule");
+    let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
+    svc.hook_cancel_op(&ws, &hook_id, None)
+        .await
+        .expect("cancel");
+    let texts = wake_texts_when(&svc, &owner, 1).await;
+    assert_eq!(
+        texts,
+        vec!["[Background hook \"watcher\"] This hook was cancelled from the app.".to_string()]
+    );
+    // PR monitor FE-cancel + archive-sweep notices.
+    let mut monitor = pr_monitor_row();
+    monitor.workspace_id = ws.clone();
+    monitor.agent_id = owner.clone();
+    assert!(svc
+        .store()
+        .insert_pr_monitor(&monitor)
+        .await
+        .expect("insert"));
+    svc.pr_monitor_cancel(&ws, &monitor.monitor_id, None)
+        .await
+        .expect("cancel monitor");
+    let texts = wake_texts_when(&svc, &owner, 2).await;
+    assert_eq!(
+        texts[1],
+        "[PR monitor o/r#42] This monitor was cancelled from the app — it will not \
+         report again."
+    );
+    let mut monitor2 = pr_monitor_row();
+    monitor2.monitor_id = intent_core::PrMonitorId::from("prmon-2");
+    monitor2.workspace_id = ws.clone();
+    monitor2.agent_id = owner.clone();
+    assert!(svc
+        .store()
+        .insert_pr_monitor(&monitor2)
+        .await
+        .expect("insert 2"));
+    svc.cancel_workspace_pr_monitors(&ws).await;
+    let texts = wake_texts_when(&svc, &owner, 3).await;
+    assert_eq!(
+        texts[2],
+        "[PR monitor o/r#42] This monitor was cancelled because its workspace was \
+         archived — it will not report again."
+    );
+}
+
+/// Archive-sweep hook cancel notice: exact wake bytes (framed like every
+/// hook wake).
+#[tokio::test]
+async fn golden_hook_archive_cancel_notice_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-arch");
+    seed_agent(&svc, &ws, &owner).await;
+    svc.hook_schedule_op(
+        &ws,
+        &owner,
+        &json!({
+            "name": "sweeper",
+            "code": "return { dispatch: false };",
+            "delayMs": 10_000,
+        }),
+    )
+    .await
+    .expect("schedule");
+    svc.cancel_workspace_hooks(&ws).await;
+    let texts = wake_texts_when(&svc, &owner, 1).await;
+    assert_eq!(
+        texts,
+        vec![
+            "[Background hook \"sweeper\"] This hook was cancelled because its workspace \
+             was archived."
+                .to_string()
+        ]
+    );
+}
+
+/// Hook expiry notices: exact bytes for the one-shot ("without a dispatch")
+/// and perpetual ("N runs, N dispatches") tallies, including singular and
+/// plural forms.
+#[tokio::test]
+async fn golden_hook_expiry_notice_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-exp");
+    seed_agent(&svc, &ws, &owner).await;
+    let past = "2026-01-02T03:04:05Z".to_string();
+    let hook =
+        |id: &str, name: &str, perpetual: bool, runs: i64, dispatches: i64| intent_core::Hook {
+            hook_id: intent_core::HookId::from(id),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: name.to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 600_000,
+            state: intent_core::HookState::Scheduled,
+            created_at: past.clone(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: runs,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(past.clone()),
+            perpetual,
+            dispatch_count: dispatches,
+        };
+    // One-shot, plural runs; rehydration expires already-past hooks at boot.
+    svc.store()
+        .insert_hook(&hook("hook-exp-1", "one-shot", false, 2, 0))
+        .await
+        .expect("insert 1");
+    // Perpetual, singular tallies.
+    svc.store()
+        .insert_hook(&hook("hook-exp-2", "perpetual", true, 1, 1))
+        .await
+        .expect("insert 2");
+    svc.rehydrate_hooks().await.expect("rehydrate");
+    let mut texts = wake_texts_when(&svc, &owner, 2).await;
+    texts.sort();
+    assert_eq!(
+        texts,
+        vec![
+            "[Background hook \"one-shot\"] Your background hook \"one-shot\" expired after \
+             reaching its TTL (2 runs completed without a dispatch). Schedule a new hook via \
+             ws.hook.schedule if the condition is still worth watching."
+                .to_string(),
+            "[Background hook \"perpetual\"] Your background hook \"perpetual\" expired after \
+             reaching its TTL (1 run, 1 dispatch). Schedule a new hook via ws.hook.schedule \
+             if the condition is still worth watching."
+                .to_string(),
+        ]
+    );
+}
+
+/// Hook eviction notice: exact bytes for a throwing run (failed-run wording
+/// + terminal note).
+#[tokio::test]
+async fn golden_hook_eviction_notice_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-evict");
+    seed_agent(&svc, &ws, &owner).await;
+    // Seed a scheduled row directly (a throwing script would fail the
+    // schedule-time validation run) and drive one run via runNow.
+    let hook = intent_core::Hook {
+        hook_id: intent_core::HookId::from("hook-evict-1"),
+        workspace_id: ws.clone(),
+        agent_id: owner.clone(),
+        name: "will-throw".to_string(),
+        code: "throw new Error('kaput');".to_string(),
+        delay_ms: 600_000,
+        state: intent_core::HookState::Scheduled,
+        created_at: now_iso(),
+        last_run_at: None,
+        next_run_at: None,
+        run_count: 0,
+        last_error: None,
+        last_logs: None,
+        last_state: None,
+        expires_at: None,
+        perpetual: false,
+        dispatch_count: 0,
+    };
+    svc.store().insert_hook(&hook).await.expect("insert");
+    svc.rehydrate_hooks().await.expect("rehydrate");
+    svc.hook_run_now_op(&ws, &hook.hook_id)
+        .await
+        .expect("runNow");
+    let texts = wake_texts_when(&svc, &owner, 1).await;
+    assert_eq!(
+        texts,
+        vec![
+            "[Background hook \"will-throw\"] Your background hook \"will-throw\" was \
+             evicted after a failed run: Error: kaput\n\
+             \n\
+             [This hook will not run again. Schedule a new hook via ws.hook.schedule \
+             if the condition is still worth watching.]"
+                .to_string()
+        ]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Delegation preamble + notices (`agent_ops.rs`)
 // ---------------------------------------------------------------------------
@@ -878,6 +1143,180 @@ async fn golden_attention_request_wake_bytes() {
             ),
         ]
     );
+}
+
+/// Watcher fan-out attention wake (monorepo#1229/#2051): an explicit
+/// non-parent `ws.agent.watch` watcher gets the remains-armed variant, with
+/// the ungrouped completion promise.
+#[tokio::test]
+async fn golden_watcher_attention_wake_bytes() {
+    let (_t, svc, ws) = setup().await;
+    let parent = AgentId::from("agent-parent");
+    let watcher = AgentId::from("agent-watcher");
+    seed_agent(&svc, &ws, &parent).await;
+    seed_agent(&svc, &ws, &watcher).await;
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let child_name = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child")
+        .name;
+    svc.agent_watch_op(ws.clone(), watcher.clone(), child.clone())
+        .await
+        .expect("watch");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        "sandbox exploded".into(),
+        Some(child.clone()),
+    )
+    .await
+    .expect("blocker");
+    let texts = wake_texts_when(&svc, &watcher, 1).await;
+    assert_eq!(
+        texts,
+        vec![format!(
+            "[WORKSPACE EVENTS] Watched agent {child_name} ({}) reports a blocker: sandbox \
+             exploded (Your watch on this agent remains armed; you will still be woken at \
+             its completion.)",
+            child.0
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Prompt notices (`agent_manager.rs`)
+// ---------------------------------------------------------------------------
+
+/// Note-image and attachment-reference notices: exact bytes, including the
+/// optional mime/size fragments.
+#[test]
+fn golden_image_and_attachment_notice_bytes() {
+    assert_eq!(
+        crate::agent_manager::note_images_notice(2),
+        "[System: 2 image(s) from the referenced note(s) are attached to this message.]"
+    );
+    assert_eq!(
+        crate::agent_manager::attachment_reference_notice(
+            "report.pdf",
+            Some("application/pdf"),
+            Some(1234),
+            "att-1"
+        ),
+        "[Attachment: \"report.pdf\", type application/pdf, 1234 bytes — attachmentId: att-1. \
+         The file is NOT inlined in this message. Call ws.file.getAttachment(\"att-1\") to \
+         copy it into your working directory, then read it from the returned path.]"
+    );
+    assert_eq!(
+        crate::agent_manager::attachment_reference_notice("notes.txt", None, None, "att-2"),
+        "[Attachment: \"notes.txt\" — attachmentId: att-2. The file is NOT inlined in this \
+         message. Call ws.file.getAttachment(\"att-2\") to copy it into your working \
+         directory, then read it from the returned path.]"
+    );
+}
+
+/// Supervisor-history truncation markers: the omitted-exchanges comment
+/// (exact bytes inside the wrapper) and the middle-truncation marker line
+/// inside an oversized tool_result.
+#[test]
+fn golden_supervisor_history_truncation_markers() {
+    use intent_core::AgentMessage;
+    let msg = |id: &str, role: &str, blocks: serde_json::Value| AgentMessage {
+        id: id.to_string(),
+        agent_id: AgentId::from("agent-h"),
+        seq: 0,
+        role: role.to_string(),
+        content: blocks,
+        metadata: None,
+        app_message_id: None,
+        created_at: "2026-01-02T03:04:05Z".to_string(),
+    };
+    // Two exchanges with a budget that only fits the newest: the omission
+    // comment names the count and sits right after the preamble.
+    let messages = vec![
+        msg(
+            "m1",
+            "user",
+            json!([{ "type": "text", "text": "first question" }]),
+        ),
+        msg(
+            "m2",
+            "assistant",
+            json!([{ "type": "text", "text": "first answer" }]),
+        ),
+        msg("m3", "user", json!([{ "type": "text", "text": "second" }])),
+        msg(
+            "m4",
+            "assistant",
+            json!([{ "type": "text", "text": "reply" }]),
+        ),
+    ];
+    let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
+                        conversation history from the prior session so you can continue \
+                        seamlessly.\nDo NOT mention session recovery to the user. Just \
+                        continue naturally as if nothing happened.\n\n"
+        .len();
+    let closing_len = "Continue the conversation from this point. Do not mention session \
+                       recovery or interruption.\n</supervisor>"
+        .len();
+    let newest_exchange = "<exchange>\n\
+                           \x20 <user_request_or_tool_results>\n\
+                           \x20   <text>second</text>\n\
+                           \x20 </user_request_or_tool_results>\n\
+                           \x20 <agent_response_or_tool_uses>\n\
+                           \x20   <text>reply</text>\n\
+                           \x20 </agent_response_or_tool_uses>\n\
+                           </exchange>\n";
+    let max_omission = "<!-- 2 earlier exchanges omitted due to size limits -->\n".len();
+    let budget = preamble_len + closing_len + max_omission + newest_exchange.len();
+    let xml = crate::history_xml::format_history_as_xml(&messages, budget);
+    assert_eq!(
+        xml,
+        format!(
+            "<supervisor>\n\
+             The previous ACP session was lost. Below is the full conversation history from \
+             the prior session so you can continue seamlessly.\n\
+             Do NOT mention session recovery to the user. Just continue naturally as if \
+             nothing happened.\n\
+             \n\
+             <!-- 1 earlier exchanges omitted due to size limits -->\n\
+             {newest_exchange}\
+             Continue the conversation from this point. Do not mention session recovery or \
+             interruption.\n\
+             </supervisor>"
+        )
+    );
+    // Middle-truncation marker: an oversized tool_result is head+tail kept
+    // with the exact `... [N characters truncated] ...` line between. Cap is
+    // 4000 chars with 60 reserved for the marker (half-budget 1970).
+    let big = "y".repeat(5000);
+    let messages = vec![msg(
+        "m5",
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t1", "content": big }]),
+    )];
+    let xml =
+        crate::history_xml::format_history_as_xml(&messages, crate::history_xml::MAX_HISTORY_CHARS);
+    let expected_block = format!(
+        "    <tool_result tool_use_id=\"t1\" is_error=\"false\">\n\
+         \x20     {}\n... [1060 characters truncated] ...\n{}\n\
+         \x20   </tool_result>\n",
+        "y".repeat(1970),
+        "y".repeat(1970),
+    );
+    assert!(xml.contains(&expected_block), "{xml}");
 }
 
 // ---------------------------------------------------------------------------
