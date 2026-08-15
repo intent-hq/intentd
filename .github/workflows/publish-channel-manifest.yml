@@ -20,8 +20,13 @@
 #
 # When the MONOREPO_ISSUES_TOKEN secret is configured, monorepo issues
 # referenced by commits/PRs in (previous tag, released tag] also get a
-# fail-soft "Fixed in intentd vX.Y.Z (alpha)" comment
-# (scripts/notify-fixed-issues.sh).
+# fail-soft, channel-free "This fix is included in intentd vX.Y.Z." comment
+# (scripts/notify-fixed-issues.sh). Posting is gated on completeness: an
+# issue whose linked intentd fix PRs are not all merged and contained in the
+# released tag stays silent until a later release delivers them. The gate
+# needs the token to read PRs on this repo too (pull-requests:read), and
+# this is the only workflow that comments — beta/stable promotions post
+# nothing.
 #
 # When the FE_DISPATCH_TOKEN secret is configured, a repository_dispatch of
 # type `intentd-alpha-published` (client_payload.version = the released
@@ -95,7 +100,7 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::MONOREPO_ISSUES_TOKEN secret is not configured; skipping fixed-issue notifications"
           fi
-      - name: Notify fixed monorepo issues (alpha)
+      - name: Notify fixed monorepo issues
         if: steps.notify-token.outputs.enabled == 'true'
         continue-on-error: true
         shell: bash
@@ -143,7 +148,7 @@ jobs:
             echo "::warning::No semver tag before $TAG (first release?); skipping fixed-issue notifications"
             exit 0
           fi
-          ./scripts/notify-fixed-issues.sh intentd "${TAG#v}" alpha "$prev" "$TAG"
+          ./scripts/notify-fixed-issues.sh intentd "${TAG#v}" "$prev" "$TAG"
       # --- Public mirror: intent-hq/intentd-releases ---
       # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
       # configured, so a missing secret never blocks the release itself.

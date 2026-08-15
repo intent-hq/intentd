@@ -20,10 +20,9 @@
 # prerelease/Latest flags — clearing the Pre-release flag and moving the
 # Latest badge remain stable-promotion semantics.
 #
-# When the MONOREPO_ISSUES_TOKEN secret is configured, monorepo issues
-# referenced by commits/PRs in (previous beta, promoted] also get a
-# fail-soft "intentd vX.Y.Z promoted to beta" comment
-# (scripts/notify-fixed-issues.sh).
+# Promotions do not comment on monorepo issues: the release notifier
+# (scripts/notify-fixed-issues.sh) runs only from the release tag build
+# (publish-channel-manifest.yml) and its comments are channel-free.
 name: Promote beta
 
 on:
@@ -36,9 +35,6 @@ on:
 
 permissions:
   contents: write
-  # The notifier script reads squash-merged PR bodies on this repo via
-  # `gh pr view` with the default GITHUB_TOKEN (job-level GH_TOKEN).
-  pull-requests: read
 
 # Never cancel a promotion in progress
 concurrency:
@@ -82,9 +78,9 @@ jobs:
             exit 1
           fi
           echo "Release v${VERSION} exists and is not a draft"
-      # Read the outgoing beta.json before it is rebuilt so the notifier can
-      # scan (previous beta, promoted]. Fail-soft: a missing asset/release
-      # (first promotion) or any error just leaves the previous version empty.
+      # Read the outgoing beta.json before it is rebuilt so the summary can
+      # name it. Fail-soft: a missing asset/release (first promotion) or any
+      # error just leaves the previous version empty.
       - name: Read previous beta version
         id: prev-beta
         continue-on-error: true
@@ -127,71 +123,12 @@ jobs:
             echo "- [channel-beta release](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-beta)"
             echo "- [beta.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-beta/beta.json)"
           } >> "$GITHUB_STEP_SUMMARY"
-      # --- Issue notifier: comment on fixed monorepo issues ---
-      # Fail-soft: skipped with a warning when the MONOREPO_ISSUES_TOKEN
-      # secret is not configured, and continue-on-error so a notification
-      # failure never blocks manifest publishing (already done above) or the
-      # mirror steps below.
-      - name: Check issues token
-        id: notify-token
-        shell: bash
-        env:
-          MONOREPO_ISSUES_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
-        run: |
-          if [[ -n "$MONOREPO_ISSUES_TOKEN" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::MONOREPO_ISSUES_TOKEN secret is not configured; skipping fixed-issue notifications"
-          fi
-      - name: Notify fixed monorepo issues (beta)
-        if: steps.notify-token.outputs.enabled == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          PREV_BETA: ${{ steps.prev-beta.outputs.version }}
-          ISSUES_GH_TOKEN: ${{ secrets.MONOREPO_ISSUES_TOKEN }}
-        run: |
-          # First promotion (or unreadable beta.json): there is no sane
-          # range to scan, so skip rather than guess.
-          if [[ -z "$PREV_BETA" ]]; then
-            echo "::warning::Previous beta version unknown (first promotion?); skipping fixed-issue notifications"
-            exit 0
-          fi
-          # The checkout is shallow; the notifier needs full history and tags
-          # to scan the (previous beta, promoted] commit range. The checkout
-          # does not persist credentials, so authenticate the fetch with the
-          # job's GH_TOKEN via a one-shot credential helper — the token is
-          # read from the environment at runtime and never appears in argv or
-          # gets persisted (intent-hq/monorepo#1279). --force lets the fetch
-          # update tags left stale by earlier runs on this non-ephemeral
-          # runner — without it a rejected tag update ("would clobber
-          # existing tag") makes the fetch exit 1 with no output at all
-          # under --quiet, so the fallback fetch drops --quiet to keep git's
-          # own diagnostics visible; log loudly if it still fails
-          # (intent-hq/monorepo#1921).
-          auth_helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
-          git -c credential.helper= -c credential.helper="$auth_helper" \
-            fetch --quiet --force --tags --unshallow 2>/dev/null \
-            || git -c credential.helper= -c credential.helper="$auth_helper" \
-              fetch --force --tags \
-            || {
-              echo "::error::git fetch --tags failed (exit $?); cannot resolve range v${PREV_BETA}..v${VERSION} - issue notifications skipped"
-              exit 1
-            }
-          for tag in "v${PREV_BETA}" "v${VERSION}"; do
-            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-              echo "::warning::Tag $tag not found in checkout; skipping fixed-issue notifications"
-              exit 0
-            fi
-          done
-          ./scripts/notify-fixed-issues.sh intentd "$VERSION" beta "v${PREV_BETA}" "v${VERSION}"
       # --- Public mirror: intent-hq/intentd-releases ---
       # Runs last so a mirror failure (bad/expired token, network error) still
-      # fails the workflow loudly, but can no longer skip the fail-soft notes
-      # steps or the summary above — the primary promotion is fully done by
-      # this point. Skipped with a warning when the INTENTD_RELEASES_TOKEN
-      # secret is not configured, so a missing secret never blocks promotion.
+      # fails the workflow loudly, but cannot skip the summary above — the
+      # primary promotion is fully done by this point. Skipped with a warning
+      # when the INTENTD_RELEASES_TOKEN secret is not configured, so a missing
+      # secret never blocks promotion.
       - name: Check mirror token
         id: mirror
         shell: bash
