@@ -6,7 +6,7 @@
 //! cannot read parses to `None` and the scheduler falls back to
 //! [`DEFAULT_EFFORT_MINUTES`].
 
-/// Fallback used by the greedy-off scheduler when a task carries no
+/// Fallback used by the batch-delegate scheduler when a task carries no
 /// parseable estimate: every task still contributes to critical-path
 /// lengths, just with a neutral weight.
 pub(crate) const DEFAULT_EFFORT_MINUTES: u64 = 30;
