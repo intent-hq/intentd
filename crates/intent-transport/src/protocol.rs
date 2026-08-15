@@ -155,10 +155,21 @@
 //! byte-shape-identical to a successful `placeAttachment` result. Sessions
 //! are in-memory only: a daemon restart drops them and orphaned staging
 //! dirs are swept lazily by the next `begin` — 292 router methods, 331
-//! total.
+//! total. Version 6.17 adds the daemon-owned orthogonal `waiting` flag on
+//! `Workspace` projections plus the `workspace:waiting-changed` event
+//! (additive; §5.1, §6.5), and unwinds the hook/PR-monitor/completion-watch
+//! folds from the `displayStatus` `in_progress` promotion — no
+//! method-catalog change, 292 router methods, 331 total. Version 6.18 adds
+//! the `file.readChunk` router method (additive; §5.9, monorepo#2458): one
+//! offset-windowed slice of a workspace file's raw bytes served FE-ward as
+//! `{ content (base64), bytesRead, size }` — the binary counterpart of the
+//! UTF-8-only `file.read`, with the same within-workspace containment
+//! guard, a 16 MiB decoded per-call cap (over-cap → -32602), directory
+//! rejection (-32602), and empty-chunk reads at/past EOF — 293 router
+//! methods, 332 total.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "6.16";
+pub const PROTOCOL_VERSION: &str = "6.18";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
