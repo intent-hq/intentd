@@ -4603,6 +4603,9 @@ mod tests {
         // Insert agent session
         let agent_id = AgentId("agent-summary-test".to_string());
         let system_prompt = "large system prompt".repeat(4096);
+        let image_blocks = serde_json::json!([
+            {"type": "image", "data": "A".repeat(4096), "mimeType": "image/png"}
+        ]);
         let session = AgentSession {
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
@@ -4633,7 +4636,7 @@ mod tests {
             delegation_depth: None,
             initial_message: None,
             context_references: None,
-            image_blocks: None,
+            image_blocks: Some(image_blocks.clone()),
             file_blocks: None,
             is_background: false,
             metadata: None,
@@ -4673,6 +4676,11 @@ mod tests {
             "full session reads should retain system_prompt"
         );
         assert_eq!(
+            full[0].image_blocks.as_ref(),
+            Some(&image_blocks),
+            "full session reads should retain image_blocks"
+        );
+        assert_eq!(
             full[0].messages.len(),
             1,
             "list_agent_sessions should include messages"
@@ -4695,9 +4703,17 @@ mod tests {
             summaries[0].system_prompt, None,
             "summary reads should not load system_prompt"
         );
+        assert_eq!(
+            summaries[0].image_blocks, None,
+            "summary reads should not load image_blocks"
+        );
         assert!(
             !SESSION_SUMMARY_COLUMNS.contains("system_prompt"),
             "the summary SELECT must not mention system_prompt"
+        );
+        assert!(
+            !SESSION_SUMMARY_COLUMNS.contains("image_blocks"),
+            "the summary SELECT must not mention image_blocks"
         );
     }
 
