@@ -2378,6 +2378,7 @@ dependencies = [
  "intent-store",
  "intent-transport",
  "intent-voice",
+ "libc",
  "nix 0.31.3",
  "openssl-sys",
  "qrcode",

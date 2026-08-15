@@ -346,6 +346,8 @@ front for the `settings.list` / `settings.get` / `settings.update` RPCs:
 intentd settings                                    # list every setting: path, type, current value
 intentd settings agents.resumeInterruptedOnStart    # print one setting (value, type, default, description)
 intentd settings agents.resumeInterruptedOnStart on # validate + apply a change
+intentd settings linear.token                       # sensitive: prompt for the value with input hidden
+op read op://vault/linear/token | intentd settings linear.token --stdin  # sensitive: read from stdin
 ```
 
 Values are coerced to the setting's declared type — booleans take `true`/`false`,
@@ -354,13 +356,14 @@ settings a JSON document. Unknown names, invalid values (bad enum value, out-of-
 number, read-only setting), and a stopped daemon all fail with a clear message and a
 non-zero exit; sensitive values are printed pre-redacted by the daemon.
 
-> **Caution — secrets on the command line.** Setting a sensitive value (e.g.
-> `intentd settings linear.token <token>`) passes the plaintext as a process
-> argument, which lands in your shell history and is visible in process listings
-> (`ps`) while the command runs. Prefer pasting such commands with a leading space
-> (most shells skip history) or clearing the history entry afterwards. A
-> stdin/prompt input path for sensitive settings is tracked in
-> [intent-hq/monorepo#2512](https://github.com/intent-hq/monorepo/issues/2512).
+> **Secrets never need to touch argv.** For a `sensitive` setting, omit the value
+> to be prompted for it interactively with echo disabled (`read -s` style), or pipe
+> it via `--stdin` (equivalently, pass `-` as the value) for scripted use — stdin
+> input is read to EOF with exactly one trailing newline trimmed. On a non-TTY with
+> no value, the command errors with guidance instead of hanging. Passing the
+> plaintext as an argument still works but prints a warning, since argv lands in
+> shell history and is visible in process listings (`ps`) while the command runs.
+> `--stdin` / `-` are accepted for non-sensitive settings too.
 
 ### Pairing a remote client (WSS)
 

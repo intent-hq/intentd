@@ -706,3 +706,176 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+/// Run `intentd settings <args…>` against the daemon in `data_dir`. With
+/// `stdin: Some(bytes)` the bytes are piped in and stdin closes at EOF; with
+/// `None` stdin is `/dev/null` (a non-TTY with immediate EOF), so prompt
+/// paths must error instead of hanging.
+fn run_settings(data_dir: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
+    use std::io::Write;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    cmd.arg("settings")
+        .args(args)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn intentd settings");
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write settings stdin");
+    }
+    child.wait_with_output().expect("wait intentd settings")
+}
+
+/// intent-hq/monorepo#2512: sensitive settings must be settable without the
+/// plaintext ever appearing in argv — `--stdin`, a `-` value, and the hidden
+/// prompt (which errors on a non-TTY) — and no path may echo the plaintext
+/// back in any output.
+#[tokio::test]
+async fn settings_sensitive_stdin_paths_never_echo_plaintext() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let combined = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // --stdin reads the piped secret (one trailing newline trimmed), the
+    // daemon persists it, and the echoed applied value is pre-redacted.
+    let secret = "tok-stdin-e2e-1";
+    let output = run_settings(
+        &data_dir,
+        &["linear.token", "--stdin"],
+        Some("tok-stdin-e2e-1\n"),
+    );
+    assert!(
+        output.status.success(),
+        "--stdin set failed: {}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("linear.token = ********"),
+        "applied echo must be redacted: {stdout}"
+    );
+    assert!(
+        !combined(&output).contains(secret),
+        "plaintext leaked on the --stdin path"
+    );
+
+    // `-` as the value is the same stdin path.
+    let secret = "tok-dash-e2e-2";
+    let output = run_settings(&data_dir, &["linear.token", "-"], Some("tok-dash-e2e-2\n"));
+    assert!(
+        output.status.success(),
+        "`-` set failed: {}",
+        combined(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("linear.token = ********"),
+        "applied echo must be redacted"
+    );
+    assert!(
+        !combined(&output).contains(secret),
+        "plaintext leaked on the `-` path"
+    );
+
+    // A sensitive value via argv still applies but warns on stderr — and
+    // still never echoes the plaintext back.
+    let secret = "tok-argv-e2e-3";
+    let output = run_settings(&data_dir, &["linear.token", secret], None);
+    assert!(
+        output.status.success(),
+        "argv set failed: {}",
+        combined(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("linear.token is sensitive") && stderr.contains("--stdin"),
+        "argv path must warn toward the safe paths: {stderr}"
+    );
+    assert!(
+        !combined(&output).contains(secret),
+        "plaintext leaked on the argv path"
+    );
+
+    // Sensitive + no value on a non-TTY: a clear error naming --stdin, not
+    // a hang (stdin is /dev/null) and not a redacted get.
+    let output = run_settings(&data_dir, &["linear.token"], None);
+    assert!(
+        !output.status.success(),
+        "non-TTY prompt must fail: {}",
+        combined(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("linear.token is sensitive") && stderr.contains("--stdin"),
+        "non-TTY error must point at --stdin: {stderr}"
+    );
+
+    // Non-sensitive settings: argv stays exactly as before (no warning),
+    // and --stdin works there too — the piped value round-trips verbatim
+    // minus exactly one trailing newline.
+    let output = run_settings(&data_dir, &["git.autoCommit", "false"], None);
+    assert!(
+        output.status.success(),
+        "non-sensitive argv set failed: {}",
+        combined(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("git.autoCommit = false"),
+        "non-sensitive argv echo unchanged"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("sensitive"),
+        "non-sensitive argv must not warn: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_settings(
+        &data_dir,
+        &["workspace.sshKeyPath", "--stdin"],
+        Some("/tmp/id_ed25519_e2e\n"),
+    );
+    assert!(
+        output.status.success(),
+        "non-sensitive --stdin set failed: {}",
+        combined(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("workspace.sshKeyPath = /tmp/id_ed25519_e2e"),
+        "stdin value must apply with its trailing newline trimmed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Ambiguous combination is rejected up front.
+    let output = run_settings(&data_dir, &["linear.token", "x", "--stdin"], None);
+    assert!(!output.status.success(), "--stdin + value must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot combine --stdin"),
+        "conflict error expected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

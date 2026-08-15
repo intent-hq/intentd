@@ -100,15 +100,24 @@ enum Command {
     /// the definition's type: booleans take `true`/`false`, numbers a numeric
     /// literal, enums one of the allowed strings, object/array settings a
     /// JSON document. Sensitive values arrive pre-redacted from the daemon.
+    /// For `sensitive` settings, omitting the value prompts for it with input
+    /// hidden (`read -s` style), and `--stdin` / a `-` value read it from
+    /// stdin — both keep the plaintext out of shell history and `ps`.
     Settings {
         /// Dotted setting path, e.g. `agents.resumeInterruptedOnStart`.
         name: Option<String>,
         /// New value, parsed per the setting's type (booleans: `true`/`false`;
-        /// numbers: a numeric literal; object/array settings: JSON).
+        /// numbers: a numeric literal; object/array settings: JSON). `-`
+        /// reads the value from stdin (same as `--stdin`).
         /// `allow_hyphen_values`: a negative number (`-3`) must reach the
         /// coercion layer instead of being rejected as an unknown flag.
         #[arg(allow_hyphen_values = true)]
         value: Option<String>,
+        /// Read the new value from stdin (to EOF, trimming exactly one
+        /// trailing newline) so secrets never appear in argv, e.g.
+        /// `op read op://vault/linear/token | intentd settings linear.token --stdin`.
+        #[arg(long)]
+        stdin: bool,
     },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
@@ -232,8 +241,8 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
-        Command::Settings { name, value } => {
-            to_exit(cmd_settings(name.as_deref(), value.as_deref()).await)
+        Command::Settings { name, value, stdin } => {
+            to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
         }
         Command::McpBridge { connect } => {
             // The bridge reads stdin via `tokio::io::stdin()`, whose pending
@@ -3560,14 +3569,166 @@ async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// `intentd settings` dispatcher: list (no args) / get (`<name>`) / set
-/// (`<name> <value>`), all against a running daemon over the local socket.
-async fn cmd_settings(name: Option<&str>, value: Option<&str>) -> anyhow::Result<()> {
+/// (`<name> <value>`, `<name> --stdin`, `<name> -`, or — for sensitive
+/// settings — a hidden interactive prompt), all against a running daemon
+/// over the local socket.
+async fn cmd_settings(
+    name: Option<&str>,
+    value: Option<&str>,
+    use_stdin: bool,
+) -> anyhow::Result<()> {
     let config = resolve_config()?;
-    match (name, value) {
-        (None, _) => cmd_settings_list(&config).await,
-        (Some(name), None) => cmd_settings_get(&config, name).await,
-        (Some(name), Some(value)) => cmd_settings_set(&config, name, value).await,
+    let Some(name) = name else {
+        if use_stdin {
+            anyhow::bail!("--stdin requires a setting name");
+        }
+        return cmd_settings_list(&config).await;
+    };
+    // Fetch the definition first: an unknown name fails here with the
+    // daemon's own message, `sensitive` picks the input path before any
+    // value is read, and the type drives the coercion.
+    let response = settings_rpc(&config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
     }
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    let definition = result.get("definition").cloned().unwrap_or(Value::Null);
+    let sensitive = definition
+        .get("sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let raw = match settings_value_source(value, use_stdin, sensitive)? {
+        SettingsValueSource::Get => return print_setting_get(name, &result),
+        SettingsValueSource::Stdin => read_value_from_stdin()?,
+        SettingsValueSource::Prompt => prompt_sensitive_value(name)?,
+        SettingsValueSource::Argv { value, warn } => {
+            if warn {
+                eprintln!(
+                    "warning: {name} is sensitive; passing the value as a command-line \
+                     argument exposes it to shell history and process listings — prefer \
+                     `intentd settings {name}` (hidden prompt) or `--stdin`"
+                );
+            }
+            value
+        }
+    };
+    cmd_settings_set(&config, name, &definition, &raw).await
+}
+
+/// Where the value for `intentd settings <name> …` comes from. Pure decision
+/// over the parsed args + the definition's `sensitive` flag, so the matrix is
+/// unit-testable without a TTY or a daemon.
+#[derive(Debug, PartialEq)]
+enum SettingsValueSource {
+    /// No value anywhere → print the setting (`settings.get`).
+    Get,
+    /// Explicit argv value; `warn` when the definition is sensitive (the
+    /// plaintext already leaked to shell history / `ps`, but still applies).
+    Argv { value: String, warn: bool },
+    /// `--stdin` or a literal `-` value: read the value from stdin to EOF.
+    Stdin,
+    /// Sensitive setting with no value on a TTY: hidden interactive prompt.
+    Prompt,
+}
+
+fn settings_value_source(
+    value: Option<&str>,
+    use_stdin: bool,
+    sensitive: bool,
+) -> anyhow::Result<SettingsValueSource> {
+    let stdin_sentinel = value == Some("-");
+    if use_stdin && value.is_some() && !stdin_sentinel {
+        anyhow::bail!("cannot combine --stdin with a value argument");
+    }
+    if use_stdin || stdin_sentinel {
+        return Ok(SettingsValueSource::Stdin);
+    }
+    match value {
+        Some(v) => Ok(SettingsValueSource::Argv {
+            value: v.to_string(),
+            warn: sensitive,
+        }),
+        None if sensitive => Ok(SettingsValueSource::Prompt),
+        None => Ok(SettingsValueSource::Get),
+    }
+}
+
+/// Read a `--stdin` / `-` value: the whole of stdin to EOF, minus exactly
+/// one trailing newline (`pipe`-friendly: `op read … | intentd settings
+/// linear.token --stdin`). Never logs or echoes the value.
+fn read_value_from_stdin() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to read value from stdin: {e}"))?;
+    Ok(trim_one_trailing_newline(buf))
+}
+
+/// Trim exactly one trailing newline (`\n` or `\r\n`); anything else —
+/// including a second newline — is part of the value.
+fn trim_one_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// Prompt for a sensitive value with terminal echo disabled (`read -s`
+/// style). Errors — instead of hanging — when stdin is not a TTY.
+fn prompt_sensitive_value(name: &str) -> anyhow::Result<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(non_tty_sensitive_error(name));
+    }
+    eprint!("Enter value for {name} (input hidden): ");
+    std::io::stderr().flush()?;
+    let value = trim_one_trailing_newline(read_line_no_echo()?);
+    if value.is_empty() {
+        anyhow::bail!("no value entered; nothing changed");
+    }
+    Ok(value)
+}
+
+/// The non-interactive guidance for a sensitive setting with no value:
+/// point at `--stdin` for scripts instead of hanging on a prompt that can
+/// never be answered.
+fn non_tty_sensitive_error(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{name} is sensitive and no value was given; pipe the value via `--stdin` \
+         (e.g. `op read op://vault/item/field | intentd settings {name} --stdin`) \
+         or run interactively for a hidden prompt"
+    )
+}
+
+/// Read one line from the TTY with echo suppressed via termios; echo is
+/// restored before returning on every path. The newline the user types is
+/// swallowed by the suppressed echo, so print one to keep output aligned.
+fn read_line_no_echo() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    let fd = libc::STDIN_FILENO;
+    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let orig = unsafe { orig.assume_init() };
+    let mut noecho = orig;
+    noecho.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+    eprintln!();
+    read?;
+    if restore != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(line)
 }
 
 /// `rpc_call` wrapper for the `settings` subcommand: a connection failure
@@ -3623,12 +3784,9 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_settings_get(config: &Config, name: &str) -> anyhow::Result<()> {
-    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("{}", rpc_error_text(error));
-    }
-    let result = response.get("result").cloned().unwrap_or(Value::Null);
+/// Print one setting (`settings.get` output shape) from the already-fetched
+/// `settings.get` result: value, type, default, origin, description.
+fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");
     let definition = result.get("definition").cloned().unwrap_or(Value::Null);
@@ -3649,19 +3807,18 @@ async fn cmd_settings_get(config: &Config, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_settings_set(config: &Config, name: &str, raw: &str) -> anyhow::Result<()> {
-    // Fetch the definition first: an unknown name fails here with the
-    // daemon's own message, and the definition's type drives the coercion.
-    let response = settings_rpc(config, "settings.get", json!({ "path": name })).await?;
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("{}", rpc_error_text(error));
-    }
-    let definition = response
-        .pointer("/result/definition")
-        .cloned()
-        .unwrap_or(Value::Null);
+/// Apply one setting change: coerce `raw` against the pre-fetched
+/// `definition` (from the dispatcher's `settings.get`), send
+/// `settings.update`, and print the applied value (sensitive values are
+/// echoed pre-redacted by the daemon — never the caller's plaintext).
+async fn cmd_settings_set(
+    config: &Config,
+    name: &str,
+    definition: &Value,
+    raw: &str,
+) -> anyhow::Result<()> {
     let value =
-        coerce_setting_value(&definition, raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+        coerce_setting_value(definition, raw).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
     let params = json!({ "changes": [{ "path": name, "value": value }] });
     let response = settings_rpc(config, "settings.update", params).await?;
     if let Some(error) = response.get("error") {
@@ -4664,12 +4821,97 @@ mod tests {
         let cli = Cli::try_parse_from(["intentd", "settings", "some.number", "-3"])
             .expect("hyphen-leading value must parse as a positional");
         match cli.command {
-            Command::Settings { name, value } => {
+            Command::Settings { name, value, stdin } => {
                 assert_eq!(name.as_deref(), Some("some.number"));
                 assert_eq!(value.as_deref(), Some("-3"));
+                assert!(!stdin);
             }
             other => panic!("expected Settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_parses_stdin_flag_and_dash_value() {
+        let cli = Cli::try_parse_from(["intentd", "settings", "linear.token", "--stdin"])
+            .expect("--stdin must parse");
+        match cli.command {
+            Command::Settings { name, value, stdin } => {
+                assert_eq!(name.as_deref(), Some("linear.token"));
+                assert_eq!(value, None);
+                assert!(stdin);
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+        // A literal `-` value reaches the dispatcher (mapped to the stdin
+        // path there) thanks to `allow_hyphen_values`.
+        let cli = Cli::try_parse_from(["intentd", "settings", "linear.token", "-"])
+            .expect("`-` value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value, stdin } => {
+                assert_eq!(name.as_deref(), Some("linear.token"));
+                assert_eq!(value.as_deref(), Some("-"));
+                assert!(!stdin);
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_value_source_matrix() {
+        use SettingsValueSource::*;
+        // No value: get for non-sensitive, hidden prompt for sensitive.
+        assert_eq!(settings_value_source(None, false, false).unwrap(), Get);
+        assert_eq!(settings_value_source(None, false, true).unwrap(), Prompt);
+        // `--stdin` and the `-` sentinel map to the same stdin path,
+        // regardless of sensitivity (consistent behavior).
+        assert_eq!(settings_value_source(None, true, false).unwrap(), Stdin);
+        assert_eq!(settings_value_source(None, true, true).unwrap(), Stdin);
+        assert_eq!(
+            settings_value_source(Some("-"), false, false).unwrap(),
+            Stdin
+        );
+        assert_eq!(settings_value_source(Some("-"), true, true).unwrap(), Stdin);
+        // Plain argv: unchanged for non-sensitive, warn for sensitive.
+        assert_eq!(
+            settings_value_source(Some("false"), false, false).unwrap(),
+            Argv {
+                value: "false".into(),
+                warn: false
+            }
+        );
+        assert_eq!(
+            settings_value_source(Some("tok"), false, true).unwrap(),
+            Argv {
+                value: "tok".into(),
+                warn: true
+            }
+        );
+        // `--stdin` plus a non-`-` value is ambiguous → error.
+        let err = settings_value_source(Some("tok"), true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot combine --stdin"), "{err}");
+    }
+
+    #[test]
+    fn trim_one_trailing_newline_trims_exactly_one() {
+        assert_eq!(trim_one_trailing_newline("tok\n".into()), "tok");
+        assert_eq!(trim_one_trailing_newline("tok\r\n".into()), "tok");
+        assert_eq!(trim_one_trailing_newline("tok".into()), "tok");
+        // Only ONE trailing newline is trimmed; the rest is the value.
+        assert_eq!(trim_one_trailing_newline("tok\n\n".into()), "tok\n");
+        assert_eq!(
+            trim_one_trailing_newline("multi\nline\n".into()),
+            "multi\nline"
+        );
+        assert_eq!(trim_one_trailing_newline(String::new()), "");
+    }
+
+    #[test]
+    fn non_tty_sensitive_error_names_the_stdin_path_without_any_value() {
+        let err = non_tty_sensitive_error("linear.token").to_string();
+        assert!(err.contains("linear.token is sensitive"), "{err}");
+        assert!(err.contains("--stdin"), "{err}");
     }
 
     #[test]
