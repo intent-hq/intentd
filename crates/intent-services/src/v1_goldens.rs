@@ -383,11 +383,15 @@ fn golden_group_wake_header() {
          - Builder (agent-a) completed. Report: Done A.\n\
          - Builder (agent-b) completed. Report: Done B."
     );
-    // A failed member flips the status to partial (STAB-160).
+    // A failed member flips the status to partial (STAB-160); the child
+    // lines are unchanged.
     group.raw_events[1] = Arc::new(completion_event(AGENT_FAILED, &child_b, json!({})));
-    assert!(crate::format_group_wake(&group).starts_with(
-        "[WORKSPACE EVENTS] All 2 delegated child agent(s) settled (completionStatus: partial)."
-    ));
+    assert_eq!(
+        crate::format_group_wake(&group),
+        "[WORKSPACE EVENTS] All 2 delegated child agent(s) settled (completionStatus: partial).\n\
+         - Builder (agent-a) completed. Report: Done A.\n\
+         - Builder (agent-b) completed. Report: Done B."
+    );
 }
 
 #[test]
@@ -448,11 +452,19 @@ fn golden_hook_wake_logs_section() {
         crate::hook_manager::with_wake_logs("msg", Some("line1\nline2")),
         "msg\n\n[hook logs]\nline1\nline2"
     );
-    // Over-cap logs are head-truncated with the marker line.
-    let logs = "x".repeat(3000);
-    let truncated = crate::hook_manager::with_wake_logs("msg", Some(&logs));
-    assert!(truncated.starts_with("msg\n\n[hook logs]\n[earlier log lines truncated]\n"));
-    assert!(truncated.ends_with(&"x".repeat(2048)));
+    // Over-cap logs are head-truncated with the marker line: exactly the
+    // LAST 2048 chars survive, nothing more. Positionally distinct bytes
+    // pin which end is retained and the exact cap.
+    let logs: String = (0..3000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    assert_eq!(
+        crate::hook_manager::with_wake_logs("msg", Some(&logs)),
+        format!(
+            "msg\n\n[hook logs]\n[earlier log lines truncated]\n{}",
+            &logs[3000 - 2048..]
+        )
+    );
 }
 
 /// End-to-end hook wake bytes: schedule a one-shot hook whose validation run
@@ -1183,4 +1195,33 @@ async fn golden_snapshot_line_shape() {
         "field set + order pin: {line}"
     );
     assert_eq!(obj["queuedMessages"], json!(1));
+}
+
+/// The full snapshot field catalog: every optional field populated, pinned
+/// as exact serialized bytes so a rename, reorder, or serde-attribute change
+/// on any field fails the golden (the live-line test above only exercises
+/// `queuedMessages`).
+#[test]
+fn golden_snapshot_full_field_serialization() {
+    let snap = crate::agent_ops::AgentSnapshot {
+        time: "2026-01-02T03:04:05Z".to_string(),
+        hooks: 1,
+        agent_watches: 2,
+        queued_messages: 3,
+        event_subscriptions: 4,
+        running_sub_agents: 5,
+        num_questions_asked: 6,
+        pr_monitors: vec![
+            "intent-hq/intentd#7".to_string(),
+            "intent-hq/monorepo#8 (changes pending)".to_string(),
+        ],
+        pending_attention: Some("blocker".to_string()),
+    };
+    assert_eq!(
+        serde_json::to_string(&snap).unwrap(),
+        "{\"time\":\"2026-01-02T03:04:05Z\",\"hooks\":1,\"agentWatches\":2,\
+         \"queuedMessages\":3,\"eventSubscriptions\":4,\"runningSubAgents\":5,\
+         \"numQuestionsAsked\":6,\"prMonitors\":[\"intent-hq/intentd#7\",\
+         \"intent-hq/monorepo#8 (changes pending)\"],\"pendingAttention\":\"blocker\"}"
+    );
 }
