@@ -155,24 +155,84 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let response = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(
+        response.get("error").is_none(),
+        "rpc {method} errored: {response}"
+    );
+    response["result"].clone()
+}
+
+async fn wss_rpc_envelope<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(common::rpc_read_timeout(), ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                let value: Value = serde_json::from_str(&text).expect("json frame");
+                if value["id"] == json!(id) {
+                    return value;
                 }
             }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
+            Some(Ok(Message::Ping(payload))) => {
+                let _ = ws.send(Message::Pong(payload)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+async fn next_script_change<S>(
+    ws: &mut WebSocketStream<S>,
+    subscription_id: &str,
+    workspace_id: &str,
+    script_id: &str,
+    action: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(common::rpc_read_timeout(), ws.next())
+            .await
+            .expect("script change timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                if frame["method"] != "events.event" {
+                    continue;
+                }
+                assert_eq!(frame["jsonrpc"], "2.0", "event envelope: {frame}");
+                assert!(frame.get("id").is_none(), "notification has no id: {frame}");
+                assert_eq!(
+                    frame["params"]["subscriptionId"], subscription_id,
+                    "subscription envelope: {frame}"
+                );
+                let event = &frame["params"]["event"];
+                assert_eq!(event["type"], "script:changed", "event type: {frame}");
+                assert_eq!(event["workspaceId"], workspace_id, "workspace: {frame}");
+                assert_eq!(event["data"]["scriptId"], script_id, "script: {frame}");
+                assert_eq!(event["data"]["action"], action, "action: {frame}");
+                assert!(event["id"].is_string(), "event id: {frame}");
+                assert!(event["timestamp"].is_string(), "timestamp: {frame}");
+                assert_eq!(event["actor"]["type"], "system", "actor: {frame}");
+                return;
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                let _ = ws.send(Message::Pong(payload)).await;
             }
             Some(Ok(_)) => continue,
             other => panic!("expected text frame, got {other:?}"),
@@ -255,6 +315,174 @@ where
         id += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Real authenticated WSS contract for script definition changes. Successful
+/// create, update, and remove mutations emit ordered workspace-scoped events;
+/// causal barrier mutations prove failure silence and workspace isolation.
+#[tokio::test]
+async fn script_definition_changes_emit_over_authenticated_wss() {
+    let data_dir = scratch_dir("change-events");
+    let (child, port, cfg) = boot(&data_dir).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub_a = connect_ws(port, cfg.clone()).await;
+    let mut sub_b = connect_ws(port, cfg).await;
+    let workspace_a = "ws-script-events-a";
+    let workspace_b = "ws-script-events-b";
+
+    let subscribed_a = wss_rpc(
+        &mut sub_a,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["script:changed"], "workspaceId": workspace_a }),
+    )
+    .await;
+    let subscription_a = subscribed_a["subscriptionId"]
+        .as_str()
+        .expect("subscription A id")
+        .to_string();
+    let subscribed_b = wss_rpc(
+        &mut sub_b,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["script:changed"], "workspaceId": workspace_b }),
+    )
+    .await;
+    let subscription_b = subscribed_b["subscriptionId"]
+        .as_str()
+        .expect("subscription B id")
+        .to_string();
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "script.create",
+        json!({
+            "workspaceId": workspace_a,
+            "name": "dev",
+            "command": "pnpm dev",
+            "mode": "service",
+            "scriptId": "script-a",
+        }),
+    )
+    .await;
+    assert_eq!(created["id"], "script-a");
+    next_script_change(
+        &mut sub_a,
+        &subscription_a,
+        workspace_a,
+        "script-a",
+        "created",
+    )
+    .await;
+
+    let updated = wss_rpc(
+        &mut rpc,
+        11,
+        "script.create",
+        json!({
+            "workspaceId": workspace_a,
+            "name": "dev",
+            "command": "pnpm dev --host",
+            "mode": "service",
+            "scriptId": "script-a",
+        }),
+    )
+    .await;
+    assert_eq!(updated["command"], "pnpm dev --host");
+    next_script_change(
+        &mut sub_a,
+        &subscription_a,
+        workspace_a,
+        "script-a",
+        "updated",
+    )
+    .await;
+
+    let removed = wss_rpc(
+        &mut rpc,
+        12,
+        "script.remove",
+        json!({ "workspaceId": workspace_a, "scriptId": "script-a" }),
+    )
+    .await;
+    assert_eq!(removed["ok"], json!(true));
+    next_script_change(
+        &mut sub_a,
+        &subscription_a,
+        workspace_a,
+        "script-a",
+        "removed",
+    )
+    .await;
+
+    let failed = wss_rpc_envelope(
+        &mut rpc,
+        13,
+        "script.remove",
+        json!({ "workspaceId": workspace_a, "scriptId": "missing" }),
+    )
+    .await;
+    assert_eq!(failed["jsonrpc"], "2.0");
+    assert_eq!(failed["id"], 13);
+    assert!(
+        failed["error"].is_object(),
+        "missing remove errors: {failed}"
+    );
+
+    // A successful same-workspace mutation is a causal stream barrier: if
+    // the failed remove emitted anything, it must arrive before this event.
+    wss_rpc(
+        &mut rpc,
+        14,
+        "script.create",
+        json!({
+            "workspaceId": workspace_a,
+            "name": "barrier A",
+            "command": "true",
+            "mode": "command",
+            "scriptId": "barrier-a",
+        }),
+    )
+    .await;
+    next_script_change(
+        &mut sub_a,
+        &subscription_a,
+        workspace_a,
+        "barrier-a",
+        "created",
+    )
+    .await;
+
+    // A workspace-B event is a causal barrier after every workspace-A
+    // mutation. Subscriber B must observe only its own filtered event.
+    wss_rpc(
+        &mut rpc,
+        15,
+        "script.create",
+        json!({
+            "workspaceId": workspace_b,
+            "name": "barrier B",
+            "command": "true",
+            "mode": "command",
+            "scriptId": "barrier-b",
+        }),
+    )
+    .await;
+    next_script_change(
+        &mut sub_b,
+        &subscription_b,
+        workspace_b,
+        "barrier-b",
+        "created",
+    )
+    .await;
+
+    drop(rpc);
+    drop(sub_a);
+    drop(sub_b);
+    stop(child);
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// `script.create` persists the definition; a daemon restart on the same data

@@ -228,11 +228,12 @@ pub const TERMINAL_CWD: &str = "terminal:cwd";
 
 // Script streaming family (new in intentd; PROTOCOL §5.8/§6.5). Scripts run on
 // the unified PTY host (§12); the daemon fans live script output to subscribers
-// as `script:output` (base64 `chunk`) and publishes runtime/state transitions
-// (start, exit, auto-restart, URL detection) as `script:state`. Both payloads
-// are self-sufficient and carry the `scriptId`.
+// as `script:output` (base64 `chunk`), publishes runtime/state transitions
+// (start, exit, auto-restart, URL detection) as `script:state`, and definition
+// mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
 pub const SCRIPT_STATE: &str = "script:state";
+pub const SCRIPT_CHANGED: &str = "script:changed";
 
 // Background-hook lifecycle events (new in intentd). Emitted by the hook
 // scheduler on lifecycle transitions: `hook:scheduled` (schedule accepted),
@@ -516,6 +517,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TERMINAL_CWD,
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
+    SCRIPT_CHANGED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
