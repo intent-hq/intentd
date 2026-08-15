@@ -35,9 +35,6 @@ intent-pty = { path = "../intent-pty", version = "0.7.1" }
 intent-search = { path = "../intent-search", version = "0.7.1" }
 intent-transport = { path = "../intent-transport", version = "0.7.1" }
 intent-js = { path = "../intent-js", version = "0.7.1", optional = true }
-# No-echo terminal input for `intentd settings <sensitive>` prompts
-# (termios); already in the workspace dependency tree via intent-core.
-libc = "0.2"
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
@@ -85,6 +82,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
+# No-echo terminal input for `intentd settings <sensitive>` prompts
+# (termios); already in the workspace dependency tree via intent-core.
+libc = "0.2"
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).

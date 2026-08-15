@@ -3704,31 +3704,104 @@ fn non_tty_sensitive_error(name: &str) -> anyhow::Error {
     )
 }
 
+/// Whether a hidden read is in flight, i.e. whether [`HIDDEN_READ_ORIG`]
+/// holds valid terminal attributes for [`restore_echo_on_signal`] to restore.
+#[cfg(unix)]
+static HIDDEN_READ_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The original termios saved across a hidden read so the signal handler can
+/// restore echo. `static mut` accessed only via raw pointers: written once by
+/// [`read_line_no_echo`] (single-threaded CLI code) before handlers are
+/// installed, read by the async-signal handler.
+#[cfg(unix)]
+static mut HIDDEN_READ_ORIG: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+
+/// Signal handler installed for the duration of a hidden read: terminal
+/// attributes are device state, so a `Ctrl-C` / `Ctrl-Z` / kill arriving
+/// while echo is disabled would otherwise hand the shell back a terminal
+/// that no longer echoes. Restore the saved attributes (`tcsetattr` is
+/// async-signal-safe), then re-raise with the default disposition so the
+/// signal's outcome (terminate / stop) is unchanged.
+#[cfg(unix)]
+extern "C" fn restore_echo_on_signal(sig: libc::c_int) {
+    unsafe {
+        if HIDDEN_READ_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            libc::tcsetattr(
+                libc::STDIN_FILENO,
+                libc::TCSAFLUSH,
+                (&raw const HIDDEN_READ_ORIG).cast(),
+            );
+        }
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
 /// Read one line from the TTY with echo suppressed via termios; echo is
-/// restored before returning on every path. The newline the user types is
-/// swallowed by the suppressed echo, so print one to keep output aligned.
+/// restored on every return path AND on cancellation: while it is disabled,
+/// SIGINT/SIGTERM/SIGQUIT/SIGHUP/SIGTSTP run [`restore_echo_on_signal`],
+/// which puts the terminal back before the default disposition fires (after
+/// a `Ctrl-Z` + resume the read continues with echo visible — safe, just no
+/// longer hidden). The newline the user types is swallowed by the suppressed
+/// echo, so print one to keep output aligned.
+#[cfg(unix)]
 fn read_line_no_echo() -> anyhow::Result<String> {
     use std::io::BufRead;
+    use std::sync::atomic::Ordering;
     let fd = libc::STDIN_FILENO;
     let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
     if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let orig = unsafe { orig.assume_init() };
+
+    // Publish the saved attrs and install the restoring handlers BEFORE
+    // disabling echo, so no window exists where a signal skips the restore.
+    const SIGNALS: [libc::c_int; 5] = [
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGQUIT,
+        libc::SIGHUP,
+        libc::SIGTSTP,
+    ];
+    unsafe { (&raw mut HIDDEN_READ_ORIG).write(std::mem::MaybeUninit::new(orig)) };
+    HIDDEN_READ_ACTIVE.store(true, Ordering::SeqCst);
+    let handler = restore_echo_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let previous = SIGNALS.map(|sig| unsafe { libc::signal(sig, handler) });
+
     let mut noecho = orig;
     noecho.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+        Err(anyhow::Error::from(std::io::Error::last_os_error()))
+    } else {
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+        eprintln!();
+        match read {
+            Err(e) => Err(e.into()),
+            Ok(_) if restore != 0 => Err(std::io::Error::last_os_error().into()),
+            Ok(_) => Ok(line),
+        }
+    };
+
+    for (sig, prev) in SIGNALS.iter().zip(previous) {
+        if prev != libc::SIG_ERR {
+            unsafe { libc::signal(*sig, prev) };
+        }
     }
-    let mut line = String::new();
-    let read = std::io::stdin().lock().read_line(&mut line);
-    let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
-    eprintln!();
-    read?;
-    if restore != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(line)
+    HIDDEN_READ_ACTIVE.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Non-unix has no termios; keep secrets off the screen by pointing at the
+/// stdin path instead of echoing a "hidden" prompt that is not.
+#[cfg(not(unix))]
+fn read_line_no_echo() -> anyhow::Result<String> {
+    anyhow::bail!(
+        "hidden input is not supported on this platform; pipe the value via `--stdin` instead"
+    )
 }
 
 /// `rpc_call` wrapper for the `settings` subcommand: a connection failure
