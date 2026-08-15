@@ -1,6 +1,6 @@
 [package]
 name = "intent-sourcecontrol"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "SourceControl trait + GitHubSourceControl (PR/issue/review/check-run/mergeability)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.7.0" }
+intent-core = { path = "../intent-core", version = "0.7.1" }
 octocrab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
