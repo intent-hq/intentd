@@ -8,7 +8,8 @@
 //! Coverage:
 //! - `--resume-all` auto-resumes all pending interrupted agents at startup
 //! - Resumed agents complete their work (observable via WSS events)
-//! - `agent.listInterrupted` returns empty after auto-resume sweep completes
+//! - The sweep completes BEFORE the listeners start: `agent.listInterrupted`
+//!   is already empty on the first RPC after connect (no client-visible blip)
 //! - No `agent.resolveInterrupted` RPC required
 //! - `agents.resumeInterruptedOnStart=on` (written over WSS via
 //!   `settings.update`) runs the same sweep WITHOUT `--resume-all`, even when
@@ -439,11 +440,23 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         .expect("fingerprint")
         .to_string();
 
-    // Phase 3: Poll agent status to confirm turn completion (agent reached idle)
-    eprintln!("Phase 3: Poll agent status to confirm turn completion");
+    // Phase 3: The startup sweep completes BEFORE the listeners start, so the
+    // very first RPC on a fresh connection must already see zero pending rows
+    // — this is the client-visible contract (no interrupted-agents modal blip).
+    eprintln!("Phase 3: Assert listInterrupted is empty on first connect");
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(actual_port, cfg).await;
+    let list_result = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+    let agents = list_result["agents"].as_array().expect("agents array");
+    assert!(
+        agents.is_empty(),
+        "expected agent.listInterrupted to be empty on first connect after a \
+         resuming start, got {agents:?}"
+    );
+    eprintln!("✓ Interrupted agents list is empty on first connect");
 
+    // Phase 4: Poll agent status to confirm turn completion (agent reached idle)
+    eprintln!("Phase 4: Poll agent status to confirm turn completion");
     // Poll agent.get to wait for the agent to complete its turn and reach idle
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
@@ -451,7 +464,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     while tokio::time::Instant::now() < deadline {
         let agent_result = wss_rpc(
             &mut ws,
-            1,
+            2,
             "agent.get",
             json!({
                 "workspaceId": ws_id,
@@ -479,27 +492,6 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     assert!(
         agent_is_idle,
         "Expected agent {created_agent_id} to complete turn and reach idle, but timed out"
-    );
-
-    // Phase 4: Poll agent.listInterrupted until resolution appears (bounded)
-    // set_interrupted_resolution commits after agent state updates to idle, so we must
-    // poll the durable signal (DB resolution) rather than relying on timing. This is
-    // deterministic: the resolution write happens, we just need to wait for commit.
-    eprintln!("Phase 4: Poll interrupted agents list until resolution committed");
-    let mut list_is_empty = false;
-    for _ in 0..60 {
-        let list_result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
-        let agents = list_result["agents"].as_array().expect("agents array");
-        if agents.is_empty() {
-            eprintln!("✓ Interrupted agents list is empty (resolution committed)");
-            list_is_empty = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        list_is_empty,
-        "Expected interrupted agents list to become empty after --resume-all within 6s"
     );
 
     eprintln!("SUCCESS: --resume-all auto-resumed agent AND agent completed its turn");
@@ -659,11 +651,39 @@ async fn setting_on_resumes_without_resume_all_flag() {
         .expect("fingerprint")
         .to_string();
 
-    // Phase 3: Poll agent status to confirm turn completion (agent reached idle)
-    eprintln!("Phase 3: Poll agent status to confirm turn completion");
+    // Phase 3: The startup sweep completes BEFORE the listeners start, so the
+    // very first RPC on a fresh connection must already see zero pending rows
+    // — this is the client-visible contract (no interrupted-agents modal blip).
+    eprintln!("Phase 3: Assert listInterrupted is empty on first connect");
     let cfg = client_config(&fingerprint);
     let mut ws = connect_ws(actual_port, cfg).await;
+    let list_result = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+    let agents = list_result["agents"].as_array().expect("agents array");
+    assert!(
+        agents.is_empty(),
+        "expected agent.listInterrupted to be empty on first connect after a \
+         resuming start, got {agents:?}"
+    );
+    eprintln!("✓ Interrupted agents list is empty on first connect");
 
+    // The startup ordering is also visible in daemon2's log: the sweep summary
+    // line must precede the UDS "starting intentd" socket line (the log file
+    // is truncated per spawn, so it only contains daemon2's output).
+    let log = std::fs::read_to_string(data_dir.join("daemon.log")).expect("read daemon2 log");
+    let sweep_idx = log
+        .find("resume-on-start: auto-resume sweep complete")
+        .expect("sweep-complete line missing from daemon2 log");
+    let socket_idx = log
+        .find("starting intentd")
+        .expect("'starting intentd' line missing from daemon2 log");
+    assert!(
+        sweep_idx < socket_idx,
+        "sweep-complete log line must precede the 'starting intentd' socket line"
+    );
+    eprintln!("✓ Sweep-complete log line precedes the socket line");
+
+    // Phase 4: Poll agent status to confirm turn completion (agent reached idle)
+    eprintln!("Phase 4: Poll agent status to confirm turn completion");
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -692,24 +712,6 @@ async fn setting_on_resumes_without_resume_all_flag() {
     assert!(
         agent_is_idle,
         "Expected agent {created_agent_id} to complete turn and reach idle, but timed out"
-    );
-
-    // Phase 4: Poll agent.listInterrupted until resolution appears (bounded)
-    eprintln!("Phase 4: Poll interrupted agents list until resolution committed");
-    let mut list_is_empty = false;
-    for _ in 0..60 {
-        let list_result = wss_rpc(&mut ws, 3, "agent.listInterrupted", json!({})).await;
-        let agents = list_result["agents"].as_array().expect("agents array");
-        if agents.is_empty() {
-            eprintln!("✓ Interrupted agents list is empty (resolution committed)");
-            list_is_empty = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        list_is_empty,
-        "Expected interrupted agents list to become empty after setting=on sweep within 6s"
     );
 
     eprintln!("SUCCESS: setting=on auto-resumed agent without --resume-all");
