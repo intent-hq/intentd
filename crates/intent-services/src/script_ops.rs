@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use intent_core::events::{SCRIPT_OUTPUT, SCRIPT_STATE};
+use intent_core::events::{SCRIPT_CHANGED, SCRIPT_OUTPUT, SCRIPT_STATE};
 use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
     ScriptStatus, WorkspaceId,
@@ -239,6 +239,11 @@ impl ScriptManager {
             ),
             None => ("user".to_string(), now_iso(), None),
         };
+        let change = if existing.is_some() {
+            "updated"
+        } else {
+            "created"
+        };
         if let Some(mut old) = existing {
             // Cooperative teardown (monorepo#1180): kill the recorded PTY,
             // then *await* the supervisor instead of aborting it. An abort
@@ -283,6 +288,15 @@ impl ScriptManager {
                 generation: next_generation(),
             },
         );
+        publish_event(
+            &self.bus,
+            script_event(
+                &workspace_id,
+                SCRIPT_CHANGED,
+                json!({ "scriptId": def.id.clone(), "action": change }),
+            ),
+        )
+        .await;
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
     }
 
@@ -489,6 +503,15 @@ impl ScriptManager {
             }
         }
         self.store.remove_script(script_id).await?;
+        publish_event(
+            &self.bus,
+            script_event(
+                workspace_id,
+                SCRIPT_CHANGED,
+                json!({ "scriptId": script_id, "action": "removed" }),
+            ),
+        )
+        .await;
         Ok(json!({ "ok": true, "scriptId": script_id }))
     }
 
@@ -1479,7 +1502,7 @@ mod tests {
         now_iso, ScriptCreateParams, ScriptMode, ScriptStatus, Workspace, WorkspaceActivity,
         WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
     };
-    use intent_store::Store;
+    use intent_store::{EventQuery, Store};
     use serde_json::{json, Value};
 
     use super::*;
@@ -1833,6 +1856,23 @@ mod tests {
         }
     }
 
+    async fn await_script_change(sub: &mut Subscription, action: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let batch = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("script change delivered before liveness deadline")
+                .expect("subscription open");
+            for ev in &batch {
+                let value = serde_json::to_value(ev).expect("serialize");
+                if value["type"] == "script:changed" && value["data"]["action"] == action {
+                    return value;
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn script_status_returns_not_found_for_missing_id() {
         let h = harness().await;
@@ -1847,12 +1887,32 @@ mod tests {
     #[tokio::test]
     async fn script_remove_returns_not_found_for_missing_id() {
         let h = harness().await;
+        let mut sub = subscribe(&h);
         let err = h
             .services
             .script_remove(h.ws.clone(), "nope".into())
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        let live = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+        assert!(
+            live.is_err(),
+            "failed remove must not emit an event: {live:?}"
+        );
+        let durable = h
+            .services
+            .store()
+            .query_events(&EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![SCRIPT_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query script changes");
+        assert!(
+            durable.is_empty(),
+            "failed remove must not persist an event"
+        );
     }
 
     #[tokio::test]
@@ -1925,6 +1985,59 @@ mod tests {
         assert_eq!(entry["autoStart"], true);
         assert_eq!(entry["source"], "user");
         assert_eq!(entry["runtime"]["status"], "idle");
+    }
+
+    #[tokio::test]
+    async fn script_definition_mutations_emit_changed_events() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "dev", "pnpm dev", ScriptMode::Service).await;
+        let created = await_script_change(&mut sub, "created").await;
+        assert_eq!(created["workspaceId"], h.ws.as_str());
+        assert_eq!(created["data"]["scriptId"], id);
+        assert_eq!(created["actor"]["id"], "system");
+        assert!(created["timestamp"]
+            .as_str()
+            .is_some_and(|ts| !ts.is_empty()));
+
+        create(
+            &h,
+            ScriptCreateParams {
+                name: "dev".into(),
+                command: "pnpm dev --host".into(),
+                mode: ScriptMode::Service,
+                script_id: Some(id.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let updated = await_script_change(&mut sub, "updated").await;
+        assert_eq!(updated["data"]["scriptId"], id);
+
+        h.services
+            .script_remove(h.ws.clone(), id.clone())
+            .await
+            .expect("remove");
+        let removed = await_script_change(&mut sub, "removed").await;
+        assert_eq!(removed["data"]["scriptId"], id);
+
+        let durable = h
+            .services
+            .store()
+            .query_events(&EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![SCRIPT_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query script changes");
+        assert_eq!(durable.len(), 3, "one event per successful mutation");
+        let mut actions: Vec<&str> = durable
+            .iter()
+            .filter_map(|event| event.data["action"].as_str())
+            .collect();
+        actions.sort_unstable();
+        assert_eq!(actions, vec!["created", "removed", "updated"]);
     }
 
     #[tokio::test]

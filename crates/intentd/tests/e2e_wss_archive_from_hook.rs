@@ -534,3 +534,217 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
         "no further run scheduled: {row}"
     );
 }
+
+/// Regression (intent-hq/monorepo#2513): the hook-cancel wake from a
+/// hook-initiated archive must STAY PARKED behind the archived gate even when
+/// it lands while the hook owner is mid-turn.
+///
+/// The archive tail's hook sweep wakes the owner; when the owner's turn is
+/// still in flight the wake takes `deliver_wake_message`'s fast enqueue
+/// branch (busy → queue) — bypassing that path's archived gate, which only
+/// covers the idle-delivery arm. The owner's worker then popped the parked
+/// wake in its end-of-turn drain, whose `try_begin` re-claim auto-unarchived
+/// (intentd#1216) the workspace that was just archived: subscribers saw the
+/// §6.5 archive delta, yet a follow-up `workspace.get` read `archived:
+/// false`. The fix gates the end-of-turn drain (and its post-release raced
+/// re-check) on the archived row, mirroring `try_drain_queue`.
+///
+/// Drives the mid-turn window deterministically: the kickoff turn schedules
+/// the hook, then stalls (`firstTurnDelayMs`) so `hook.runNow`'s archive +
+/// cancel-wake land while the owner is provably busy. Asserts the workspace
+/// REMAINS archived after the owner settles and the wake is parked in the
+/// queue (not consumed by a stray turn).
+#[tokio::test]
+async fn hook_cancel_wake_parked_mid_turn_does_not_unarchive_the_workspace() {
+    let Some(script) = gate("WSS archive-from-hook parked-wake E2E") else {
+        return;
+    };
+
+    let hook_code = "if (hookState && hookState.armed) { \
+                     await ws.workspace.archive(); \
+                     } \
+                     return { dispatch: false, state: { armed: true } };";
+    let schedule_js = format!(
+        "return await ws.hook.schedule({{ name: 'archiver', code: {}, delayMs: 600000 }});",
+        json!(hook_code)
+    );
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": SCHEDULE_MARKER,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": schedule_js, "summary": "schedule archiving hook" }
+            },
+            "response": "scheduled the archiving hook",
+        }],
+        // Stall the kickoff turn AFTER the tool call so the archive + the
+        // hook-cancel wake land while this turn is still in flight: the wake
+        // must take the busy fast-enqueue branch, putting the end-of-turn
+        // drain (not the delivery-time gate) on the hook for parking it.
+        // Scaled by INTENTD_TEST_TIMEOUT_MULTIPLIER: the flake this test
+        // guards reproduced on slow coverage runners, where an unscaled
+        // stall could elapse before `hook.runNow`'s archive lands — the wake
+        // then takes the idle delivery-time gate instead and the test
+        // silently stops covering the end-of-turn drain path.
+        "firstTurnDelayMs": common::test_timeout(Duration::from_millis(4000)).as_millis() as u64,
+        "response": "acknowledged",
+    })
+    .to_string();
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event can be missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["hook:*", "workspace:updated"],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-PARKED-WAKE", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": format!("{SCHEDULE_MARKER} please watch in the background"),
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // `hook:scheduled` is emitted mid-turn (during the tool call), so the
+    // kickoff turn's post-tool-call stall keeps the owner busy from here on.
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    let mut hook_id = None::<String>;
+    while hook_id.is_none() {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!("hook:scheduled never landed"),
+        };
+        if ev["type"] == json!("hook:scheduled") && ev["data"]["name"] == json!("archiver") {
+            hook_id = Some(ev["data"]["hookId"].as_str().expect("hookId").to_string());
+        }
+    }
+    let hook_id = hook_id.expect("hook:scheduled carried the hookId");
+
+    // Archive from the hook while the owner is mid-stall.
+    let ran = wss_hook_run_now(&mut rpc, json!({ "workspaceId": ws_id, "hookId": hook_id })).await;
+    assert_eq!(ran["ok"], json!(true), "{ran}");
+
+    // The archive delta and the hook cancellation land while the owner's
+    // kickoff turn is still in flight. If ANY `workspace:updated` flips
+    // `archived` back to false, that is the #2513 auto-unarchive — fail fast.
+    let mut archive_delta_seen = false;
+    let mut hook_cancelled = false;
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    while !archive_delta_seen || !hook_cancelled {
+        let ev = match wss_event_until(&mut sub, deadline).await {
+            Some(ev) => ev,
+            None => panic!(
+                "timed out: archive_delta_seen={archive_delta_seen} hook_cancelled={hook_cancelled}"
+            ),
+        };
+        match ev["type"].as_str().unwrap_or_default() {
+            "workspace:updated" if ev["data"]["changes"]["archived"] == json!(true) => {
+                archive_delta_seen = true;
+            }
+            "workspace:updated" if ev["data"]["changes"]["archived"] == json!(false) => {
+                panic!("workspace auto-unarchived by the parked cancel wake (#2513): {ev}");
+            }
+            "hook:cancelled" if ev["data"]["hookId"] == json!(hook_id) => {
+                hook_cancelled = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Let the owner settle: the stalled kickoff turn finishes, and the
+    // end-of-turn drain must PARK the queued cancel wake behind the archived
+    // gate instead of running it as a fresh turn.
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let listed = wss_rpc(&mut rpc, "agent.list", json!({ "workspaceId": ws_id })).await;
+        let row = listed["agents"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .find(|a| a["id"] == json!(agent_id))
+            .cloned()
+            .unwrap_or_else(|| panic!("agent listed: {listed}"));
+        if row["isResponding"] == json!(false) && row["turnInFlight"] == json!(false) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the hook owner's turn never settled: {row}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The workspace REMAINS archived after the owner settled (the #2513
+    // symptom was `archived: false` here despite the delta above)...
+    let fetched = wss_rpc(&mut rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        fetched["workspace"]["archived"],
+        json!(true),
+        "workspace stays archived; the parked wake must not restart a turn: {fetched}"
+    );
+    assert_eq!(fetched["workspace"]["status"], json!("Archived"));
+
+    // ...and the cancel wake is still PARKED in the owner's queue — proof it
+    // was gated rather than consumed by a stray turn.
+    let queue = wss_rpc(
+        &mut rpc,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let entries = queue["queue"].as_array().expect("queue array");
+    assert!(
+        entries.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("cancelled because its workspace was archived"))),
+        "the hook-cancel wake stays parked until unarchive: {queue}"
+    );
+}

@@ -80,6 +80,16 @@ pub(crate) fn maybe_inject_panic(_method: &str) {}
 
 /// Run an async handler that yields an optional response frame, converting a
 /// panic into the `-32603` frame (requests) or `None` (notifications).
+///
+/// This is also the single outbound chokepoint for the log-only large-frame
+/// warning: every response path in [`crate::conn::process_frame`] — inline or
+/// spawned, router-dispatched or fast-path (`control.*`, `server.*`,
+/// `pairing.*`, `host.*`, `browser.*`, `forward.*`, `client.*`, `drafts.*`) —
+/// returns its frame through here, so responses that bypass the router (e.g.
+/// a `host.exec` result embedding untruncated stdout) are covered too. No
+/// double warn with the router's `-32010` oversized-response path: the router
+/// replaces the oversized frame with a small error frame before it reaches
+/// this point.
 pub(crate) async fn guard_frame<F>(method: &str, rpc_id: Option<Value>, fut: F) -> Option<String>
 where
     F: Future<Output = Option<String>>,
@@ -91,7 +101,16 @@ where
     .catch_unwind()
     .await;
     match result {
-        Ok(frame) => frame,
+        Ok(frame) => {
+            if let Some(frame) = &frame {
+                crate::protocol::warn_if_large_frame(
+                    crate::protocol::FrameDirection::Outbound,
+                    method,
+                    frame.len(),
+                );
+            }
+            frame
+        }
         Err(payload) => {
             tracing::error!(
                 method,
@@ -205,6 +224,44 @@ mod tests {
     async fn guard_frame_passes_through_without_panic() {
         let frame = guard_frame("x.y", Some(json!(1)), async { Some("ok".to_string()) }).await;
         assert_eq!(frame.as_deref(), Some("ok"));
+    }
+
+    // `guard_frame` is the single outbound chokepoint for the large-frame
+    // warn, covering responses that bypass the router dispatcher (the
+    // `host.*` fast path in particular — `host.exec` embeds untruncated
+    // stdout). The warn throttle is process-global, so each test uses method
+    // names unique to it.
+
+    #[tokio::test]
+    async fn guard_frame_warns_on_large_non_exempt_response() {
+        let big = "x".repeat(crate::protocol::LARGE_MESSAGE_WARN_BYTES + 1);
+        let lines = crate::protocol::test_capture::capture_events(|| {
+            let frame =
+                futures::executor::block_on(guard_frame("host.exec", Some(json!(1)), async {
+                    Some(big)
+                }));
+            assert!(frame.is_some(), "frame must pass through unchanged");
+        });
+        assert_eq!(lines.len(), 1, "expected exactly one warn: {lines:?}");
+        assert_eq!(lines[0].0, tracing::Level::WARN);
+        assert!(lines[0].1.contains("large outbound JSON-RPC frame"));
+        assert!(lines[0].1.contains("method=\"host.exec\""));
+    }
+
+    #[tokio::test]
+    async fn guard_frame_does_not_warn_on_small_or_exempt_responses() {
+        let big = "x".repeat(crate::protocol::LARGE_MESSAGE_WARN_BYTES + 1);
+        let lines = crate::protocol::test_capture::capture_events(|| {
+            // Small frame on a non-exempt method: under threshold, no warn.
+            futures::executor::block_on(guard_frame("guard.small", Some(json!(1)), async {
+                Some("ok".to_string())
+            }));
+            // Large frame on an exempt bulk-transfer method: no warn.
+            futures::executor::block_on(guard_frame("file.readChunk", Some(json!(2)), async {
+                Some(big)
+            }));
+        });
+        assert!(lines.is_empty(), "unexpected warns: {lines:?}");
     }
 
     #[tokio::test]
