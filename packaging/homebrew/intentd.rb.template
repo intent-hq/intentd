@@ -51,11 +51,13 @@ class Intentd < Formula
   # The sitter supervises the daemon itself (updates + crash respawn);
   # keep_alive covers the sitter process: relaunch on crash, but a clean exit
   # (`brew services stop intentd`, or a clean daemon shutdown the sitter
-  # mirrors with exit 0) does not relaunch. --resume-all auto-resumes
-  # interrupted agents, since this headless service has no desktop app
-  # attached to resume them manually.
+  # mirrors with exit 0) does not relaunch. Startup auto-resume of interrupted
+  # agents is governed by the agents.resumeInterruptedOnStart setting (default
+  # auto: resume only on headless hosts, so servers keep resuming while desktop
+  # hosts leave it to the app's prompt) — toggle it with
+  # `intentd settings agents.resumeInterruptedOnStart on|off`.
   service do
-    run [opt_bin/"intentd", "serve", "--resume-all"]
+    run [opt_bin/"intentd", "serve"]
     keep_alive crashed: true, successful_exit: false
     log_path var/"log/intentd.log"
     error_log_path var/"log/intentd.err.log"

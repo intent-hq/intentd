@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/intentd serve --resume-all
+ExecStart=/usr/bin/intentd serve
 ExecStop=/usr/bin/intentd stop
 Restart=on-failure
 

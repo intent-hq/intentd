@@ -10,12 +10,19 @@
 # the installed binary.
 #
 # After a successful install it offers to register a per-user Scheduled Task
-# ("intentd") that runs `intentd serve --resume-all` at logon, and starts it
-# now. The prompt only appears on an interactive console and never hangs in
+# ("intentd") that runs `intentd serve` at logon, and starts it now. The
+# prompt only appears on an interactive console and never hangs in
 # non-interactive runs (default: skip with a hint). Force either way:
 #
 #   $env:INTENTD_INSTALL_SERVICE = '1'  (or -Service, on direct runs)     set up
 #   $env:INTENTD_INSTALL_SERVICE = '0'  (or -NoService, on direct runs)   skip
+#
+# When the task is set up, the installer also asks whether the service should
+# auto-resume interrupted agents at startup (the daemon setting
+# agents.resumeInterruptedOnStart). The default 'auto' resumes only on
+# headless hosts, so answering auto — or a non-interactive run — writes
+# nothing; on/off are applied via `intentd settings` once the daemon is up.
+# $env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off' forces an answer.
 #
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
@@ -125,6 +132,21 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
+    # Auto-resume choice: env var beats the prompt; 'auto' — or a
+    # non-interactive run — is the daemon default and writes nothing. Applied
+    # via `intentd settings` after the wait-for-daemon loop below.
+    $autoResume = ''
+    if ($env:INTENTD_AUTO_RESUME) {
+        $autoResume = $env:INTENTD_AUTO_RESUME.ToLowerInvariant()
+        if (@('auto', 'on', 'off') -notcontains $autoResume) {
+            throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
+        }
+    } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $reply = (Read-Host 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto)').Trim().ToLowerInvariant()
+        $autoResume = if (@('on', 'off') -contains $reply) { $reply } else { 'auto' }
+    } else {
+        $autoResume = 'auto'
+    }
     # Per-user Scheduled Task at logon: no admin rights needed, and -Force
     # makes re-runs update the existing task instead of duplicating it.
     $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
@@ -133,9 +155,9 @@ if ($serviceMode -eq 'yes') {
     # wrap through cmd (the quotes survive & and spaces in the path).
     $action = if ($env:INTENTD_DATA_DIR) {
         New-ScheduledTaskAction -Execute $env:ComSpec `
-            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve --resume-all')
+            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve')
     } else {
-        New-ScheduledTaskAction -Execute $dest -Argument 'serve --resume-all'
+        New-ScheduledTaskAction -Execute $dest -Argument 'serve'
     }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     # S4U logon: the task runs as this user with the profile loaded but outside
@@ -174,6 +196,17 @@ if ($serviceMode -eq 'yes') {
         Write-Host "install.ps1: daemon is up - 'intentd status' responds"
     } else {
         Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+    }
+    # 'auto' is the daemon default — nothing to write. A failure is a warning,
+    # not a fatal install error: the setting can be changed later with the
+    # same command.
+    if (@('on', 'off') -contains $autoResume) {
+        & $dest settings agents.resumeInterruptedOnStart $autoResume *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "install.ps1: auto-resume on service start set to '$autoResume' (agents.resumeInterruptedOnStart)"
+        } else {
+            Write-Warning "install.ps1: could not set agents.resumeInterruptedOnStart=$autoResume - set it later with: intentd settings agents.resumeInterruptedOnStart $autoResume"
+        }
     }
     Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
 } else {
