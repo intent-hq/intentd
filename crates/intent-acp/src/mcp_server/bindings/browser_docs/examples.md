@@ -52,6 +52,46 @@ Bare loopback URLs (`http://localhost:3000`, `http://127.0.0.1:3000`) are assume
 daemon-local: unchanged in a local setup, rewritten to the daemon host (with a `warning`
 in the result) in a remote setup. See topic="overview" for the full convention.
 
+## Forwarding a Daemon Port (Tunnels)
+
+When you need the port itself (curl, WebSockets, API clients) rather than a browser tab,
+forward it explicitly. On the Electron desktop client this works uniformly on every
+transport — do not branch on `backend`. (Web-browser clients cannot open a local
+listener, so there `openTunnel` fails with an explanatory error.)
+
+```json
+// Forward daemon-side port 8000 to a client-local port
+{
+  "actions": [
+    { "action": "openTunnel", "remotePort": 8000 }
+  ]
+}
+// → { remotePort: 8000, localPort: 52341, backend: "tunnel", reused: false }
+// Reach the daemon-side server at http://127.0.0.1:52341 (the returned localPort).
+
+// Inspect and clean up
+{
+  "actions": [
+    { "action": "listTunnels" }
+  ]
+}
+// → { tunnels: [{ remotePort: 8000, localPort: 52341, backend: "tunnel" }] }
+
+{
+  "actions": [
+    { "action": "closeTunnel", "remotePort": 8000 }
+  ]
+}
+// → { remotePort: 8000, closed: true }
+```
+
+Recovery: `localPort` is ephemeral — forwards are client-process state and drop on client
+restart or transport change. If a connect to a previously returned `localPort` is refused,
+or the forward is missing from `listTunnels`, just call `openTunnel` with the same
+`remotePort` again: it returns the current `localPort` (`reused: true` when the forward
+was still alive, a transparent recreate when it was not). Re-opening is the standard
+move, not an error to diagnose.
+
 ## Cleaning Up Tabs
 
 Close tabs you opened for testing/automation when you are done with them. `closeTab`
