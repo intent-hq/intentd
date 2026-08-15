@@ -29,7 +29,9 @@
 # channel-suffixed markers) are skipped, so tag rebuilds / workflow re-runs
 # never double-post. With --dry-run, prints the issue list and comment bodies
 # without posting (ISSUES_GH_TOKEN is then optional; the marker check and
-# the completeness gate fall back to ambient gh auth, best-effort).
+# the completeness gate fall back to ambient gh auth, best-effort — a failed
+# gate preflight warns and continues instead of aborting, since dry-run posts
+# nothing anyway).
 #
 # This script is best-effort by design: the caller
 # (publish-channel-manifest.yml) runs it fail-soft so a notification failure
@@ -158,16 +160,25 @@ echo "issues referenced in $range: $(tr '\n' ' ' <<<"$issue_nums")" >&2
 # Gate preflight: the completeness gate enumerates the issue's linked
 # SOURCE_REPO fix PRs with the same token used for ISSUES_REPO. A token that
 # cannot see SOURCE_REPO PRs gets them silently omitted from the GraphQL
-# response, which would defeat the gate — so verify visibility up front and
-# refuse to post anything when it is missing (fail-safe: never post a
-# possibly-false claim).
-if ! gh_issues api "repos/${SOURCE_REPO}/pulls?state=all&per_page=1" >/dev/null 2>&1; then
-  msg="the notifier token (ISSUES_GH_TOKEN; MONOREPO_ISSUES_TOKEN secret in workflows) cannot list pull requests on ${SOURCE_REPO}; grant it pull-requests:read on ${SOURCE_REPO} — completeness is indeterminate, skipping all notifications"
+# response, which would defeat the gate — so verify visibility up front, on
+# the same GraphQL surface the gate reads (REST and GraphQL visibility can
+# differ, e.g. for fine-grained PATs), and refuse to post anything when it
+# is missing (fail-safe: never post a possibly-false claim). Dry-run warns
+# and continues instead: it posts nothing, and the per-issue gate still
+# surfaces enumeration failures as skips.
+preflight_query='query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) { pullRequests(first: 1) { totalCount } }
+}'
+if ! gh_issues api graphql -f query="$preflight_query" \
+  -f owner="${SOURCE_REPO%/*}" -f repo="${SOURCE_REPO#*/}" >/dev/null 2>&1; then
+  msg="the notifier token (ISSUES_GH_TOKEN; MONOREPO_ISSUES_TOKEN secret in workflows) cannot list pull requests on ${SOURCE_REPO} via GraphQL; grant it pull-requests:read on ${SOURCE_REPO} — completeness is indeterminate, skipping all notifications"
   echo "warning: $msg" >&2
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
     echo "::warning::$msg"
   fi
-  exit 1
+  if [[ "$DRY_RUN" != true ]]; then
+    exit 1
+  fi
 fi
 
 marker="<!-- release-notifier: ${COMPONENT} v${VERSION} -->"
@@ -283,6 +294,15 @@ else
   echo "posted $posted comment(s), skipped $skipped already-notified or incomplete issue(s)" >&2
 fi
 if [[ "$failed" -ne 0 ]]; then
-  echo "error: one or more notifications failed" >&2
+  # Callers run this fail-soft (continue-on-error), and a notification
+  # dropped here is dropped permanently — later release ranges will not
+  # re-reference the issue. Annotate loudly so it is visible without
+  # opening the step log (same rationale as the on_err trap;
+  # intent-hq/monorepo#1921).
+  msg="one or more issue notifications failed and will not be retried by later releases; check the log and comment manually if needed"
+  echo "error: $msg" >&2
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::error::$msg"
+  fi
   exit 1
 fi

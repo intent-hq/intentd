@@ -1,6 +1,6 @@
 # Manual promotion of an existing vX.Y.Z release to the stable channel.
 #
-# Every tagged release automatically updates beta.json on `channel-beta`
+# Every tagged release automatically updates alpha.json on `channel-alpha`
 # (publish-channel-manifest.yml, run as a dist post-announce hook). Stable is
 # promotion-only: run this workflow with the version of an existing release to
 # rebuild stable.json from that release's assets and upload it to the fixed
