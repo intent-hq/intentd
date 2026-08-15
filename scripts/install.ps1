@@ -43,6 +43,17 @@ if ($arch -ne 'AMD64') {
     throw "install.ps1: unsupported architecture '$arch' (only x86_64/AMD64 Windows builds are published)"
 }
 
+# Validate INTENTD_AUTO_RESUME before any download so garbage fails fast
+# (matching install.sh) instead of aborting mid-install after the binary is
+# already on disk. Consumed in the service branch below.
+$autoResumeEnv = ''
+if ($env:INTENTD_AUTO_RESUME) {
+    $autoResumeEnv = $env:INTENTD_AUTO_RESUME.Trim().ToLowerInvariant()
+    if (@('auto', 'on', 'off') -notcontains $autoResumeEnv) {
+        throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
+    }
+}
+
 $installDir = if ($env:INTENTD_INSTALL_DIR) {
     $env:INTENTD_INSTALL_DIR
 } else {
@@ -132,18 +143,24 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
-    # Auto-resume choice: env var beats the prompt; 'auto' — or a
-    # non-interactive run — is the daemon default and writes nothing. Applied
-    # via `intentd settings` after the wait-for-daemon loop below.
+    # Auto-resume choice: env var (validated up front) beats the prompt;
+    # 'auto' — or a non-interactive run — is the daemon default and writes
+    # nothing. Applied via `intentd settings` after the wait-for-daemon loop
+    # below, so on a re-install over an existing data dir the first service
+    # start still runs under the prior effective setting.
     $autoResume = ''
-    if ($env:INTENTD_AUTO_RESUME) {
-        $autoResume = $env:INTENTD_AUTO_RESUME.ToLowerInvariant()
-        if (@('auto', 'on', 'off') -notcontains $autoResume) {
-            throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
-        }
+    if ($autoResumeEnv) {
+        $autoResume = $autoResumeEnv
     } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
         $reply = (Read-Host 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto)').Trim().ToLowerInvariant()
-        $autoResume = if (@('on', 'off') -contains $reply) { $reply } else { 'auto' }
+        if (@('on', 'off') -contains $reply) {
+            $autoResume = $reply
+        } else {
+            if ($reply -and $reply -ne 'auto') {
+                Write-Warning "install.ps1: unrecognized answer '$reply' - keeping the default (auto)"
+            }
+            $autoResume = 'auto'
+        }
     } else {
         $autoResume = 'auto'
     }

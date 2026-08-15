@@ -347,6 +347,14 @@ settings a JSON document. Unknown names, invalid values (bad enum value, out-of-
 number, read-only setting), and a stopped daemon all fail with a clear message and a
 non-zero exit; sensitive values are printed pre-redacted by the daemon.
 
+> **Caution — secrets on the command line.** Setting a sensitive value (e.g.
+> `intentd settings linear.token <token>`) passes the plaintext as a process
+> argument, which lands in your shell history and is visible in process listings
+> (`ps`) while the command runs. Prefer pasting such commands with a leading space
+> (most shells skip history) or clearing the history entry afterwards. A
+> stdin/prompt input path for sensitive settings is tracked in
+> [intent-hq/monorepo#2512](https://github.com/intent-hq/monorepo/issues/2512).
+
 ### Pairing a remote client (WSS)
 
 `intentd pair` prints everything a client needs to pair with this machine over the

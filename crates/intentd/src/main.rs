@@ -105,6 +105,9 @@ enum Command {
         name: Option<String>,
         /// New value, parsed per the setting's type (booleans: `true`/`false`;
         /// numbers: a numeric literal; object/array settings: JSON).
+        /// `allow_hyphen_values`: a negative number (`-3`) must reach the
+        /// coercion layer instead of being rejected as an unknown flag.
+        #[arg(allow_hyphen_values = true)]
         value: Option<String>,
     },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
@@ -3669,7 +3672,21 @@ async fn cmd_settings_set(config: &Config, name: &str, raw: &str) -> anyhow::Res
     let applied = response
         .pointer("/result/applied/0/value")
         .cloned()
-        .unwrap_or(value);
+        .unwrap_or_else(|| {
+            // Unreachable today (`settings.update` always echoes the applied
+            // entry), but if the response shape ever drifts, never fall back
+            // to the caller's plaintext for a sensitive setting — print the
+            // daemon's redaction placeholder instead.
+            if definition
+                .get("sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                json!("********")
+            } else {
+                value
+            }
+        });
     println!("{name} = {}", display_setting_value(&applied));
     if let Some(description) = definition
         .get("description")
@@ -4638,6 +4655,21 @@ mod tests {
         assert!(err.contains("expected a number"), "{err}");
         // Range enforcement stays with the daemon: out-of-range parses fine.
         assert_eq!(coerce_setting_value(&def, "99999").unwrap(), json!(99999));
+    }
+
+    #[test]
+    fn settings_value_accepts_hyphen_leading_values() {
+        // `allow_hyphen_values` on the positional: without it clap rejects
+        // `-3` as an unknown flag before the coercion layer ever runs.
+        let cli = Cli::try_parse_from(["intentd", "settings", "some.number", "-3"])
+            .expect("hyphen-leading value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value } => {
+                assert_eq!(name.as_deref(), Some("some.number"));
+                assert_eq!(value.as_deref(), Some("-3"));
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
     }
 
     #[test]

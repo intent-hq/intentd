@@ -386,7 +386,10 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
 /// suites that assert rows stay pending in `agent.listInterrupted` need this
 /// pin: the setting defaults to `auto`, which resumes on headless hosts (no
 /// display) — exactly what CI runners are. Appends to an existing seeded
-/// config; no-op if an `[agents]` table is already present.
+/// config; idempotent when the pin is already present (restart suites call
+/// this on every daemon boot). Panics if an `[agents]` table exists WITHOUT
+/// the pin — silently skipping would only surface as a flake on headless
+/// runners.
 #[allow(dead_code)]
 pub fn disable_resume_on_start(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
@@ -397,7 +400,18 @@ pub fn disable_resume_on_start(data_dir: &std::path::Path) {
         Err(e) => panic!("read {}: {e}", path.display()),
     };
     if text.lines().any(|l| l.trim_start().starts_with("[agents]")) {
-        return;
+        if text
+            .lines()
+            .any(|l| l.trim() == "resumeInterruptedOnStart = \"off\"")
+        {
+            return;
+        }
+        panic!(
+            "{} already has an [agents] table without resumeInterruptedOnStart = \
+             \"off\" — disable_resume_on_start cannot append a second table; merge \
+             the pin into the existing [agents] table at the test site instead",
+            path.display()
+        );
     }
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');

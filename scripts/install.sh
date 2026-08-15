@@ -79,7 +79,14 @@ verify_daemon() {
   warn "daemon did not respond within 60s — it may still be downloading; check later with: intentd status"
 }
 
-# Fail fast on a bogus auto-resume value from the flag or env var.
+# Lowercase a flag/env auto-resume value so validation is case-insensitive,
+# matching the interactive prompt (and install.ps1).
+normalize_auto_resume() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Fail fast on a bogus auto-resume value from the flag or env var
+# (already lowercased via normalize_auto_resume).
 validate_auto_resume() {
   case "$1" in
     auto | on | off) ;;
@@ -250,15 +257,17 @@ main() {
       --service) service_arg="yes" ;;
       --no-service) service_arg="no" ;;
       --auto-resume=*)
-        auto_resume_arg="${arg#--auto-resume=}"
+        auto_resume_arg=$(normalize_auto_resume "${arg#--auto-resume=}")
         validate_auto_resume "$auto_resume_arg"
         ;;
       *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
+  auto_resume_env=""
   if [ -n "${INTENTD_AUTO_RESUME:-}" ]; then
-    validate_auto_resume "$INTENTD_AUTO_RESUME"
+    auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
+    validate_auto_resume "$auto_resume_env"
   fi
 
   os=$(uname -s)
@@ -398,11 +407,15 @@ main() {
 
   if [ "$service_mode" = "yes" ]; then
     # Auto-resume choice: flag beats the env var beats the prompt (both were
-    # validated above). Same /dev/tty pattern as the service prompt; `auto` —
-    # or no terminal — is the daemon default and writes nothing.
+    # lowercased + validated above). Same /dev/tty pattern as the service
+    # prompt; `auto` — or no terminal — is the daemon default and writes
+    # nothing. Note the answer is applied only after the service's first
+    # start (apply_auto_resume runs after verify_daemon), so on a re-install
+    # over an existing data dir that first start still runs under the prior
+    # effective setting.
     auto_resume="$auto_resume_arg"
     if [ -z "$auto_resume" ]; then
-      auto_resume="${INTENTD_AUTO_RESUME:-}"
+      auto_resume="$auto_resume_env"
     fi
     if [ -z "$auto_resume" ]; then
       if (exec </dev/tty) 2>/dev/null; then
