@@ -313,21 +313,17 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     if is_notification {
         return None;
     }
+    // The log-only large-frame warning for outbound responses lives in
+    // `panic_guard::guard_frame` (the chokepoint covering fast-path responses
+    // that bypass this dispatcher, e.g. `host.exec`). The `-32010`
+    // replacement below hands a small error frame to that check, so an
+    // oversized response is never double-warned on top of its `error!`.
     Some(match result {
         Ok(v) => {
             let frame = success_string(echo_id.clone(), v);
             if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                // Existing hard-cap error path — no additional soft warn on
-                // top of the `error!` already emitted there.
                 oversized_response_string(echo_id, method, frame.len())
             } else {
-                // Log-only large-frame warning, throttled per method,
-                // bulk-transfer methods exempt.
-                crate::protocol::warn_if_large_frame(
-                    crate::protocol::FrameDirection::Outbound,
-                    method,
-                    frame.len(),
-                );
                 frame
             }
         }

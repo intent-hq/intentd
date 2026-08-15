@@ -243,10 +243,18 @@ pub(crate) enum FrameDirection {
     Outbound,
 }
 
+/// Hard cap on tracked `(method, last-warn)` entries. Method names arrive
+/// before catalog validation, so they are client-controlled; without a cap a
+/// stream of >1 MiB frames with distinct bogus methods would grow the
+/// structure (and its scan) without bound. On overflow the stalest entry is
+/// evicted — harmless for a throttle: worst case the evicted method re-warns
+/// early.
+const MAX_TRACKED_METHODS: usize = 128;
+
 /// Per-method throttle state for large-frame warns. A `Vec` keyed by method
 /// name is deliberate: only methods that actually exceed the threshold ever
-/// land here, so the scan is short and the const-initializable `Vec` avoids
-/// a lazy static.
+/// land here, the length is bounded by [`MAX_TRACKED_METHODS`], so the scan
+/// stays short and the const-initializable `Vec` avoids a lazy static.
 pub(crate) struct LargeFrameWarnThrottle(Mutex<Vec<(String, Instant)>>);
 
 impl LargeFrameWarnThrottle {
@@ -278,9 +286,28 @@ impl LargeFrameWarnThrottle {
                 }
             }
             None => {
+                if entries.len() >= MAX_TRACKED_METHODS {
+                    if let Some(stalest) = entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (_, last))| *last)
+                        .map(|(i, _)| i)
+                    {
+                        entries.swap_remove(stalest);
+                    }
+                }
                 entries.push((method.to_string(), now));
                 true
             }
+        }
+    }
+
+    /// Test-only view of how many methods are currently tracked.
+    #[cfg(test)]
+    fn tracked_len(&self) -> usize {
+        match self.0.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
         }
     }
 }
@@ -317,11 +344,68 @@ pub(crate) fn warn_if_large_frame(direction: FrameDirection, method: &str, bytes
     }
 }
 
+/// Test-only capturing `tracing` subscriber shared by the large-frame warn
+/// tests here and in `panic_guard` / `router`. Hand-rolled because
+/// `tracing-subscriber` is not a dependency of this crate.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_capture {
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Records `(level, rendered fields + message)` per event.
+    #[derive(Clone, Default)]
+    pub(crate) struct Capture(Arc<StdMutex<Vec<(tracing::Level, String)>>>);
+
+    impl Capture {
+        pub(crate) fn lines(&self) -> Vec<(tracing::Level, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Run `f` with a fresh [`Capture`] installed as the thread-default
+    /// subscriber and return the recorded events.
+    pub(crate) fn capture_events(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), f);
+        capture.lines()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_capture::capture_events as capture_warns;
+    use super::*;
 
     const OVER: usize = LARGE_MESSAGE_WARN_BYTES + 1;
 
@@ -388,53 +472,33 @@ mod tests {
         assert!(!throttle.should_warn("c.d", OVER, t0 + Duration::from_millis(20)));
     }
 
-    /// Minimal capturing subscriber: records `(level, rendered fields +
-    /// message)` per event. Hand-rolled because `tracing-subscriber` is not a
-    /// dependency of this crate.
-    #[derive(Clone, Default)]
-    struct Capture(Arc<StdMutex<Vec<(tracing::Level, String)>>>);
-
-    impl Capture {
-        fn lines(&self) -> Vec<(tracing::Level, String)> {
-            self.0.lock().unwrap().clone()
+    #[test]
+    fn throttle_caps_tracked_methods_and_evicts_stalest() {
+        let throttle = LargeFrameWarnThrottle::new();
+        let t0 = Instant::now();
+        // Fill the structure with distinct (client-controlled) method names,
+        // each a millisecond apart so staleness ordering is deterministic.
+        for i in 0..MAX_TRACKED_METHODS {
+            assert!(throttle.should_warn(
+                &format!("bogus.m{i}"),
+                OVER,
+                t0 + Duration::from_millis(i as u64)
+            ));
         }
-    }
-
-    impl tracing::Subscriber for Capture {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Visitor(String);
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
-                }
-            }
-            let mut visitor = Visitor(String::new());
-            event.record(&mut visitor);
-            self.0
-                .lock()
-                .unwrap()
-                .push((*event.metadata().level(), visitor.0));
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
-    fn capture_warns(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
-        let capture = Capture::default();
-        tracing::subscriber::with_default(capture.clone(), f);
-        capture.lines()
+        assert_eq!(throttle.tracked_len(), MAX_TRACKED_METHODS);
+        // One more distinct method: warns, but the map does not grow — the
+        // stalest entry (bogus.m0) is evicted instead.
+        let t_new = t0 + Duration::from_millis(MAX_TRACKED_METHODS as u64);
+        assert!(throttle.should_warn("bogus.overflow", OVER, t_new));
+        assert_eq!(throttle.tracked_len(), MAX_TRACKED_METHODS);
+        // Surviving entries keep their throttle state: bogus.m1 warned at
+        // t0+1ms and stays suppressed inside its 1s window.
+        assert!(!throttle.should_warn("bogus.m1", OVER, t0 + Duration::from_millis(500)));
+        // The evicted method (bogus.m0, the stalest) re-warns early with a
+        // fresh entry — the documented worst case, not a suppression bug —
+        // and the map still does not grow.
+        assert!(throttle.should_warn("bogus.m0", OVER, t_new + Duration::from_millis(1)));
+        assert_eq!(throttle.tracked_len(), MAX_TRACKED_METHODS);
     }
 
     // The tests below go through `warn_if_large_frame`, which uses the
