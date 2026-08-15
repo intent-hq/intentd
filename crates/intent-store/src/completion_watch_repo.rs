@@ -122,6 +122,21 @@ impl Store {
         Ok(())
     }
 
+    /// Reset `report_delivered = 0` (fresh-interest re-arm on watch reuse,
+    /// monorepo#2532).
+    pub async fn clear_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE completion_watch SET report_delivered = 0 WHERE id = ?")
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "clear completion_watch report_delivered failed: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     /// Convert a grouped watch into an ungrouped watch (group settlement
     /// retaining a failed-not-deleted member, STAB-129).
     pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
