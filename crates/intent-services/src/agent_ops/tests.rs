@@ -24876,6 +24876,7 @@ mod resume_tail_recap {
                 json!([
                     { "type": "text", "text": "look at this screenshot" },
                     { "type": "image", "data": "aGk=", "mimeType": "image/png" },
+                    { "type": "image", "data": "eW8=", "mimeType": "image/jpeg" },
                     { "type": "file", "attachmentId": "att-1", "fileName": "notes.txt" },
                 ]),
                 None,
@@ -24885,13 +24886,28 @@ mod resume_tail_recap {
         let recap = build_resume_tail_recap(&messages).expect("recap");
         assert!(recap.text.contains("look at this screenshot"));
         let images = recap.image_blocks.expect("image blocks carried");
-        assert_eq!(images.as_array().map(Vec::len), Some(1));
+        assert_eq!(images.as_array().map(Vec::len), Some(2));
+        // Intra-row order is preserved (the backward walk must not flip
+        // blocks within a single multi-attachment row).
         assert_eq!(images[0]["data"], json!("aGk="));
         assert_eq!(images[0]["mimeType"], json!("image/png"));
+        assert_eq!(images[1]["data"], json!("eW8="));
         let files = recap.file_blocks.expect("file blocks carried");
         assert_eq!(files.as_array().map(Vec::len), Some(1));
         assert_eq!(files[0]["attachmentId"], json!("att-1"));
         assert_eq!(files[0]["fileName"], json!("notes.txt"));
+    }
+
+    /// A tail of only interrupted-assistant rows (no user row — e.g. the
+    /// interrupting request itself was a system-originated turn) still
+    /// replays the uncommitted partial: intentional since the multi-restart
+    /// rework, where the walk no longer requires a user row to anchor on.
+    #[test]
+    fn recap_replays_partial_only_tail() {
+        let messages = vec![interrupted_assistant("partial work so far")];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(recap.text.contains("partial work so far"));
+        assert!(recap.text.contains("did NOT"));
     }
 
     /// A restart loop cannot grow the recap without bound: beyond the

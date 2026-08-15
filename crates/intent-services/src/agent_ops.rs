@@ -10086,8 +10086,10 @@ enum TailSegment {
 /// current) or when an unexpected row shape makes the tail unreadable.
 fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap> {
     let mut segments: Vec<TailSegment> = Vec::new();
-    let mut image_blocks: Vec<Value> = Vec::new();
-    let mut file_blocks: Vec<Value> = Vec::new();
+    // Grouped per row so reversing the walk order can't flip the block order
+    // WITHIN a multi-attachment row.
+    let mut image_rows: Vec<Vec<Value>> = Vec::new();
+    let mut file_rows: Vec<Vec<Value>> = Vec::new();
     for m in messages.iter().rev() {
         match m.role.as_str() {
             "system" => continue,
@@ -10117,12 +10119,20 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
                     // every resume, never replayed.
                     continue;
                 }
+                let mut row_images: Vec<Value> = Vec::new();
+                let mut row_files: Vec<Value> = Vec::new();
                 for b in blocks {
                     match b.get("type").and_then(Value::as_str) {
-                        Some("image") => image_blocks.push(b.clone()),
-                        Some("file") => file_blocks.push(b.clone()),
+                        Some("image") => row_images.push(b.clone()),
+                        Some("file") => row_files.push(b.clone()),
                         _ => {}
                     }
+                }
+                if !row_images.is_empty() {
+                    image_rows.push(row_images);
+                }
+                if !row_files.is_empty() {
+                    file_rows.push(row_files);
                 }
                 if !text.is_empty() {
                     segments.push(TailSegment::User(text));
@@ -10137,8 +10147,10 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         return None;
     }
     segments.reverse();
-    image_blocks.reverse();
-    file_blocks.reverse();
+    image_rows.reverse();
+    file_rows.reverse();
+    let image_blocks: Vec<Value> = image_rows.into_iter().flatten().collect();
+    let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
     let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
     if elided > 0 {
         segments.drain(1..1 + elided);
