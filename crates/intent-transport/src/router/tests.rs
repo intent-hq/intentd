@@ -1436,6 +1436,25 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
     }
 
+    fn file_read_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // Echo the window so the wire test can assert offset/length reach the
+        // service, alongside the documented result shape.
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "content": format!("b64:{path}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
+    }
+
     fn file_write(
         &self,
         _workspace_id: WorkspaceId,
@@ -4877,6 +4896,17 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
     assert_eq!(v["result"], serde_json::json!("ws-1:a.txt"));
     assert!(v["result"].is_string());
 
+    // file.readChunk → { content, bytesRead, size } with offset/length routed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a.bin","offset":64,"length":32}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:a.bin:64:32", "bytesRead": 32, "size": 1000u64 })
+    );
+
     // file.write → { ok, path, size }.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a.txt","content":"hello"}}"#,
@@ -4989,6 +5019,20 @@ async fn file_methods_require_params() {
     // file.write missing content → -32602.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.readChunk missing offset / length → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","offset":0}}"#,
     )
     .await
     .unwrap();

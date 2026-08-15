@@ -8118,6 +8118,122 @@ async fn wss_file_place_attachment_round_trip() {
     srv.ws.stop().await;
 }
 
+/// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
+/// monorepo#2458): raw bytes of a binary workspace file are served as
+/// offset-windowed base64 chunks `{ content, bytesRead, size }` and
+/// reassemble byte-identically; a window past EOF is an empty chunk; a
+/// directory and an over-cap `length` are the documented `-32602`; and a
+/// traversal path is rejected by the containment guard (`-32603`).
+#[tokio::test]
+async fn wss_file_read_chunk_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-readchunk-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    // Binary payload (invalid UTF-8 — `file.read` would fail on it).
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("blob.bin"), &payload).expect("write blob");
+
+    // Reassemble the file in two windows and verify byte identity.
+    let frame1 = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":1024}}}}"#,
+        ws.0
+    );
+    let resp1 = wss_call(srv.port, srv.cfg.clone(), &frame1).await;
+    assert_eq!(resp1["jsonrpc"], "2.0", "envelope: {resp1}");
+    assert_eq!(resp1["id"], 1, "envelope: {resp1}");
+    assert_eq!(
+        resp1["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp1}"
+    );
+    assert_eq!(
+        resp1["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp1}"
+    );
+    let mut assembled = base64::engine::general_purpose::STANDARD
+        .decode(resp1["result"]["content"].as_str().expect("content"))
+        .expect("valid base64");
+
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":1024,"length":4096}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    // Short read at EOF: only the remaining bytes come back.
+    assert_eq!(
+        resp2["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp2}"
+    );
+    assembled.extend(
+        base64::engine::general_purpose::STANDARD
+            .decode(resp2["result"]["content"].as_str().expect("content"))
+            .expect("valid base64"),
+    );
+    assert_eq!(assembled, payload, "reassembled bytes differ");
+
+    // Window at/past EOF → empty chunk, not an error.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":2048,"length":16}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(
+        resp3["result"]["bytesRead"],
+        serde_json::json!(0),
+        "{resp3}"
+    );
+    assert_eq!(resp3["result"]["content"], serde_json::json!(""), "{resp3}");
+    assert_eq!(
+        resp3["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp3}"
+    );
+
+    // Directory → -32602 naming the cause.
+    std::fs::create_dir_all(root.join("subdir")).expect("mkdir");
+    let frame4 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"subdir","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp4 = wss_call(srv.port, srv.cfg.clone(), &frame4).await;
+    assert_eq!(resp4["error"]["code"].as_i64(), Some(-32602), "{resp4}");
+    assert!(
+        resp4["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("directory")),
+        "{resp4}"
+    );
+
+    // Over-cap length (> 16 MiB decoded) → -32602.
+    let frame5 = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":16777217}}}}"#,
+        ws.0
+    );
+    let resp5 = wss_call(srv.port, srv.cfg.clone(), &frame5).await;
+    assert_eq!(resp5["error"]["code"].as_i64(), Some(-32602), "{resp5}");
+
+    // Containment guard: a traversal path is rejected (-32603, same as the
+    // other file ops).
+    let frame6 = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"../escape.bin","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp6 = wss_call(srv.port, srv.cfg.clone(), &frame6).await;
+    assert_eq!(resp6["error"]["code"].as_i64(), Some(-32603), "{resp6}");
+
+    srv.ws.stop().await;
+}
+
 /// `file.attachmentUpload.begin` / `.chunk` / `.commit` / `.abort` (§5.9,
 /// v6.16): the staged chunked attachment upload lifecycle over the real WSS
 /// transport. A two-chunk payload is staged and committed; the commit result

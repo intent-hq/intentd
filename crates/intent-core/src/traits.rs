@@ -5369,6 +5369,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `file.readChunk`: one offset-windowed slice of a workspace file's raw
+    /// bytes as `{ content (base64), bytesRead, size }` — the FE-ward binary
+    /// counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
+    /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
+    /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
+    /// `caller_agent_id` enables CoW sandbox containment (prefers sandbox path).
+    fn file_read_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, path, offset, length, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_read_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `file.write`: create/overwrite a file (parent dirs created); returns
     /// `{ ok: true, path, size }` where `size` is the content byte/char length
     /// (PROTOCOL §5.10).
