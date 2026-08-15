@@ -371,6 +371,11 @@ async fn batch_delegate_request_response_shape_over_wss() {
     let agent_id = r1["agentId"].as_str().expect("agentId").to_string();
     assert_eq!(r1["title"], json!("T1"));
     assert_eq!(resp["startedTaskIds"], json!([t1]));
+    // Every requested task is covered by the graph (t2 depends on t1, t3
+    // conflicts with t1), so no row carries `relationsUnknown`.
+    for row in resp["tasks"].as_array().unwrap() {
+        assert!(row.get("relationsUnknown").is_none(), "{row}");
+    }
 
     let r2 = row_for(&resp, &t2);
     assert_eq!(r2["disposition"], json!("held:blocked-on-deps"));
@@ -520,6 +525,17 @@ async fn batch_delegate_request_response_shape_over_wss() {
     assert_eq!(r4["disposition"], json!("started"), "{started}");
     let r5 = row_for(&started, &t5);
     assert_eq!(r5["disposition"], json!("started"), "{started}");
+    // t4/t5 carry no relations and reference nothing requested: both rows
+    // flag `relationsUnknown` and the summary counts them (monorepo#2457).
+    assert_eq!(r4["relationsUnknown"], json!(true), "{started}");
+    assert_eq!(r5["relationsUnknown"], json!(true), "{started}");
+    assert!(
+        started["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 of 2 started tasks carry no relations — the graph does not cover them."),
+        "{started}"
+    );
     let plain_agent = wss_rpc(
         &mut ws,
         64,
