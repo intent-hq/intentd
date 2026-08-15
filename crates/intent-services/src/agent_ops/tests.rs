@@ -24027,6 +24027,34 @@ async fn batch_delegate_flags_all_uncovered_and_spares_referenced_tasks() {
     );
 }
 
+/// The flag is stamped regardless of disposition: an uncovered task that
+/// skips (already complete) still carries `relationsUnknown: true`, and the
+/// count sentence stays absent when flagged tasks exist but none started.
+#[tokio::test]
+async fn batch_delegate_flags_non_started_rows_and_counts_started_only() {
+    let (_t, svc, ws) = setup().await;
+    let done = seed_task(&svc, &ws, "Done").await;
+    svc.task_update_note_status(ws.clone(), done.clone(), "complete".into(), None, None)
+        .await
+        .expect("complete");
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&done]), None)
+        .await
+        .expect("batch");
+    let rd = row_for(&resp, &done);
+    assert_eq!(rd["disposition"], "skipped", "{resp}");
+    assert_eq!(rd["relationsUnknown"], json!(true), "{resp}");
+    assert_eq!(resp["startedTaskIds"], json!([] as [String; 0]), "{resp}");
+    assert!(
+        !resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("carry no relations"),
+        "{resp}"
+    );
+}
+
 /// Conflicts: the later task of a conflicting pair holds, naming the pair,
 /// and the reason points at individual delegation (no more greedy override).
 #[tokio::test]
