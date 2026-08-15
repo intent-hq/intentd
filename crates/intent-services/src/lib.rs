@@ -321,6 +321,17 @@ pub struct Services {
     /// wake. Cleared by any non-interim completion delivery. In-memory only,
     /// like the other live delivery state.
     interim_skipped_idles: Arc<Mutex<HashSet<AgentId>>>,
+    /// Subset of [`Self::interim_skipped_idles`] whose marker was recorded by
+    /// a REGISTRATION-TIME hook/PR-monitor deferral (monorepo#2532 Gap B):
+    /// the new watcher armed AFTER the child's persisted completion report,
+    /// so that report is STALE for it. The queue-mutation redelivery's
+    /// monorepo#1945 report bypass consults this provenance and keeps
+    /// deferring while hooks/monitors remain active — only the LAST
+    /// hook/monitor terminal transition (child genuinely settled) fires the
+    /// settlement wake. Cleared with the marker (any take), and superseded by
+    /// a live interim idle (the child ran a new turn, so the session report
+    /// is current again). In-memory only, like the parent set.
+    stale_report_interim_skips: Arc<Mutex<HashSet<AgentId>>>,
     /// Message ids whose questions-dismissed notice has already been claimed
     /// per agent (`agent.dismissQuestions`, PROTOCOL §5.5). The persisted
     /// dismissal marker is single-slot (most recent id only), so this set is
@@ -814,6 +825,7 @@ impl Services {
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
             failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             interim_skipped_idles: Arc::new(Mutex::new(HashSet::new())),
+            stale_report_interim_skips: Arc::new(Mutex::new(HashSet::new())),
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -3917,6 +3929,32 @@ impl Services {
             .lock()
             .expect("interim skipped idle registry poisoned")
             .insert(child_id.clone());
+        // A live-path marker supersedes any stale-report provenance: the
+        // child either ran a new turn (its session report is current again)
+        // or the marker's origin is the live queue/busy/hook classification,
+        // where the report — if any — belongs to the delivery the watcher
+        // was armed for.
+        self.stale_report_interim_skips
+            .lock()
+            .expect("stale-report interim skip registry poisoned")
+            .remove(child_id);
+    }
+
+    /// [`Self::mark_interim_skipped_idle`] variant for the REGISTRATION-TIME
+    /// hook/PR-monitor deferral (monorepo#2532 Gap B): also records
+    /// stale-report provenance, so the queue-mutation redelivery keeps
+    /// deferring past the monorepo#1945 report bypass while hooks/monitors
+    /// remain active — the watcher armed after the persisted report and must
+    /// only be woken by the child's genuine settlement.
+    pub(crate) fn mark_interim_skipped_idle_stale_report(&self, child_id: &AgentId) {
+        self.interim_skipped_idles
+            .lock()
+            .expect("interim skipped idle registry poisoned")
+            .insert(child_id.clone());
+        self.stale_report_interim_skips
+            .lock()
+            .expect("stale-report interim skip registry poisoned")
+            .insert(child_id.clone());
     }
 
     /// Whether an interim-skipped idle is recorded for `child_id`.
@@ -3927,10 +3965,24 @@ impl Services {
             .contains(child_id)
     }
 
+    /// Whether the recorded interim-skip marker for `child_id` carries
+    /// stale-report provenance (registration-time deferral).
+    fn has_stale_report_interim_skip(&self, child_id: &AgentId) -> bool {
+        self.stale_report_interim_skips
+            .lock()
+            .expect("stale-report interim skip registry poisoned")
+            .contains(child_id)
+    }
+
     /// Take (check-and-clear) the interim-skip marker for `child_id`,
     /// returning whether it was set. Clearing on read makes the retraction
-    /// redelivery at-most-once per skipped idle.
+    /// redelivery at-most-once per skipped idle. The stale-report provenance
+    /// travels with the marker (cleared on any take).
     fn take_interim_skipped_idle(&self, child_id: &AgentId) -> bool {
+        self.stale_report_interim_skips
+            .lock()
+            .expect("stale-report interim skip registry poisoned")
+            .remove(child_id);
         self.interim_skipped_idles
             .lock()
             .expect("interim skipped idle registry poisoned")
@@ -4112,13 +4164,21 @@ impl Services {
         if !self.active_hooks_for_agent(child_id).await.is_empty()
             || !self.active_pr_monitors_for_agent(child_id).await.is_empty()
         {
-            let completion_reported = self
-                .store
-                .get_agent_session(child_id)
-                .await
-                .ok()
-                .and_then(|s| s.completion_report)
-                .is_some_and(|r| !r.is_empty());
+            // monorepo#2532 Gap B provenance gate: when the marker was
+            // recorded by a REGISTRATION-TIME deferral, the persisted report
+            // predates the watcher — the #1945 bypass would deliver that
+            // STALE report to the very watch the deferral protected. Keep
+            // deferring while any hook/monitor remains; the LAST terminal
+            // transition re-enters with the guard above false and settles
+            // the watch with the child's genuine completion.
+            let completion_reported = !self.has_stale_report_interim_skip(child_id)
+                && self
+                    .store
+                    .get_agent_session(child_id)
+                    .await
+                    .ok()
+                    .and_then(|s| s.completion_report)
+                    .is_some_and(|r| !r.is_empty());
             if !completion_reported {
                 if let Some(gid) = self.seal_group_for_parent(child_id).await {
                     Box::pin(self.try_fire_group(&gid)).await;
@@ -4126,6 +4186,9 @@ impl Services {
                 return;
             }
         }
+        // The take clears the stale-report provenance with the marker;
+        // remember it for the error-restore below.
+        let had_stale_report = self.has_stale_report_interim_skip(child_id);
         // Consume the marker only after the guards pass; losing this take to
         // a concurrent mutation path means that path owns the redelivery.
         if !self.take_interim_skipped_idle(child_id) {
@@ -4139,12 +4202,16 @@ impl Services {
                     error = %e,
                     "queue-retraction redelivery: session lookup failed; watch stays armed and any open after_all group stays unsealed"
                 );
-                // Restore the marker so a later queue mutation (or drain
-                // no-op) can retry the redelivery — a transient store error
-                // must not permanently strand the watch or leave the agent's
-                // open after_all group unsealed forever (the retried
-                // redelivery seals it below).
-                self.mark_interim_skipped_idle(child_id);
+                // Restore the marker (with its provenance) so a later queue
+                // mutation (or drain no-op) can retry the redelivery — a
+                // transient store error must not permanently strand the
+                // watch or leave the agent's open after_all group unsealed
+                // forever (the retried redelivery seals it below).
+                if had_stale_report {
+                    self.mark_interim_skipped_idle_stale_report(child_id);
+                } else {
+                    self.mark_interim_skipped_idle(child_id);
+                }
                 return;
             }
         };

@@ -415,7 +415,7 @@ impl Services {
         new_parent_name: Option<String>,
         resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
-        let (id, name, home_ws, changed) = {
+        let (id, name, home_ws, changed, rearmed) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -440,29 +440,47 @@ impl Services {
                     changed = true;
                 }
             }
+            // monorepo#2532: every reuse call site expresses fresh interest
+            // in the child's NEXT completion (delegate/create/wakeOrCreate/
+            // sender auto-subscribe) — clear the report-time disarm so the
+            // reused watch fires on the next `agent:idle` instead of
+            // silently retiring (mirrors the `insert_watch_in_memory`
+            // adoption reset).
+            let rearmed = std::mem::replace(&mut watch.report_delivered, false);
             (
                 watch.id.clone(),
                 watch.parent_agent_name.clone(),
                 watch.parent_workspace_id.clone(),
                 changed,
+                rearmed,
             )
         };
-        // Best-effort DB sync of the refreshed name/anchor (restart
+        // Best-effort DB sync of the refreshed name/anchor/re-arm (restart
         // durability), skipped when nothing changed (the common
-        // waitFor-called-twice case). This is a spawned UPDATE ... WHERE id,
+        // waitFor-called-twice case). These are spawned UPDATE ... WHERE id,
         // so racing a concurrent fire/delete is benign: against a deleted
-        // row it affects 0 rows (it cannot resurrect an orphan); the only
-        // loss is the refreshed name/anchor not persisting — the in-memory
-        // watch is already refreshed and the row is gone anyway.
-        if changed {
+        // row they affect 0 rows (they cannot resurrect an orphan); the only
+        // loss is the refreshed state not persisting — the in-memory watch
+        // is already refreshed and the row is gone anyway.
+        if changed || rearmed {
             let store = self.store.clone();
             let watch_id = id.clone();
             tokio::spawn(async move {
-                if let Err(e) = store
-                    .update_completion_watch_parent(&watch_id, &name, &home_ws)
-                    .await
-                {
-                    tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                if changed {
+                    if let Err(e) = store
+                        .update_completion_watch_parent(&watch_id, &name, &home_ws)
+                        .await
+                    {
+                        tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                    }
+                }
+                if rearmed {
+                    if let Err(e) = store
+                        .clear_completion_watch_report_delivered(&watch_id)
+                        .await
+                    {
+                        tracing::warn!("completion_watch re-arm persist failed {watch_id}: {e}");
+                    }
                 }
             });
         }
@@ -1428,20 +1446,22 @@ impl Services {
                         // skip the live path's deferrals) fires the fresh
                         // watch with the STALE report. Defer like the
                         // agent-waiting branch above: record the interim-skip
-                        // marker and leave the watch armed — the hook/monitor
-                        // terminal-transition backstops
+                        // marker WITH stale-report provenance — so the
+                        // redelivery backstop's own #1945 bypass also keeps
+                        // deferring while hooks/monitors remain — and leave
+                        // the watch armed; the LAST hook/monitor
+                        // terminal-transition backstop
                         // (`redeliver_completion_after_queue_mutation`)
-                        // synthesize the real completion later. Boot
-                        // REHYDRATION keeps current semantics (report =
-                        // settlement; a missed wake must deliver at boot —
-                        // e.g. SUB-1 sender-watches that get no report-time
-                        // wake).
+                        // synthesizes the real completion. Boot REHYDRATION
+                        // keeps current semantics (report = settlement; a
+                        // missed wake must deliver at boot — e.g. SUB-1
+                        // sender-watches that get no report-time wake).
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
                             && (!self.active_hooks_for_agent(child_id).await.is_empty()
                                 || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
                         {
-                            self.mark_interim_skipped_idle(child_id);
+                            self.mark_interim_skipped_idle_stale_report(child_id);
                             return;
                         }
                         settled
