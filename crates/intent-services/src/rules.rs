@@ -289,7 +289,7 @@ pub(crate) struct SpecialistPromptInjection {
 /// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
 ///   direct-mode + cow_supported=true): parallel delegation safety guidance.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
-fn build_isolation_hint(
+pub(crate) fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
@@ -366,6 +366,14 @@ fn build_isolation_hint(
     None
 }
 
+/// Format the RTK instruction line for the given usable subcommands.
+pub(crate) fn rtk_instruction_line(subcommands: &[String]) -> String {
+    format!(
+        "Prefix these commands with rtk for compressed, LLM-friendly output: {}",
+        subcommands.join(", ")
+    )
+}
+
 /// Build the RTK instruction line when enabled and available.
 /// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
 /// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
@@ -386,10 +394,7 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
         return None;
     }
 
-    Some(format!(
-        "Prefix these commands with rtk for compressed, LLM-friendly output: {}",
-        status.subcommands.join(", ")
-    ))
+    Some(rtk_instruction_line(&status.subcommands))
 }
 
 /// Assemble the effective system prompt (the **internal** injection pipeline,

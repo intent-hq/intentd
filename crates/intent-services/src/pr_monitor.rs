@@ -427,7 +427,7 @@ fn plural(n: i64) -> &'static str {
 }
 
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
-fn monitor_label(m: &PrMonitor) -> String {
+pub(crate) fn monitor_label(m: &PrMonitor) -> String {
     format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number)
 }
 
@@ -553,7 +553,7 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
 
 /// Render the refreshed merge-requirements checklist as the wake's
 /// "where the PR stands now" section.
-fn render_checklist(s: &PrMonitorSnapshot) -> String {
+pub(crate) fn render_checklist(s: &PrMonitorSnapshot) -> String {
     let r = &s.requirements;
     let mut lines = vec![format!("state: {}", r.state)];
     let approvals = match r.approvals.needed {
@@ -623,7 +623,11 @@ fn render_checklist(s: &PrMonitorSnapshot) -> String {
 
 /// The consolidated change wake: what moved since the last emit, followed by
 /// the refreshed checklist.
-fn render_change_wake(m: &PrMonitor, changes: &[String], snapshot: &PrMonitorSnapshot) -> String {
+pub(crate) fn render_change_wake(
+    m: &PrMonitor,
+    changes: &[String],
+    snapshot: &PrMonitorSnapshot,
+) -> String {
     let label = monitor_label(m);
     let bullets = changes
         .iter()
@@ -643,7 +647,11 @@ fn render_change_wake(m: &PrMonitor, changes: &[String], snapshot: &PrMonitorSna
 
 /// The terminal wake: the PR merged or closed, so monitoring stopped. States
 /// that explicitly, with the reason, so the model does not keep waiting.
-fn render_terminal_wake(m: &PrMonitor, changes: &[String], snapshot: &PrMonitorSnapshot) -> String {
+pub(crate) fn render_terminal_wake(
+    m: &PrMonitor,
+    changes: &[String],
+    snapshot: &PrMonitorSnapshot,
+) -> String {
     let label = monitor_label(m);
     let outcome = if snapshot.requirements.state == "merged" {
         "was MERGED"

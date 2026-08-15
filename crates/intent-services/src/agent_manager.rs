@@ -69,7 +69,7 @@ fn title_case_ascii(s: &str) -> String {
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
 /// blindly re-report the same content (duplicate parent wake).
-fn stale_redrive_note(report_timestamp: &str) -> String {
+pub(crate) fn stale_redrive_note(report_timestamp: &str) -> String {
     format!(
         "[SYSTEM NOTE] This message was queued before you completed; your completion report \
          was already delivered to your parent at {report_timestamp}. Only call reportToParent \
@@ -89,7 +89,7 @@ const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// and only when the wait reached [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`]
 /// (monorepo#2353). Coexists with the #576 stale-redrive note (both may
 /// appear).
-fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
+pub(crate) fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
     format!(
         "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
     )
@@ -127,7 +127,7 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
 /// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
-fn format_wait_duration(secs: i64) -> String {
+pub(crate) fn format_wait_duration(secs: i64) -> String {
     let secs = secs.max(0);
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
@@ -3461,10 +3461,7 @@ impl AgentManager {
                             blocks.push(img);
                         }
                     }
-                    let notice = format!(
-                        "[System: {n} image(s) from the referenced note(s) are attached to this message.]",
-                        n = images.len(),
-                    );
+                    let notice = note_images_notice(images.len());
                     blocks.extend(text_prompt(&notice));
                 }
             }
@@ -7319,6 +7316,31 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
+/// The system notice appended after note-referenced images are inlined
+/// (Fidelity B, PROTOCOL §5.5).
+pub(crate) fn note_images_notice(n: usize) -> String {
+    format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+}
+
+/// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
+/// `ws.file.getAttachment` retrieval instruction — the file bytes never ride
+/// the prompt for reference blocks.
+pub(crate) fn attachment_reference_notice(
+    name: &str,
+    mime: Option<&str>,
+    size: Option<u64>,
+    id: &str,
+) -> String {
+    let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
+    let size_note = size.map(|s| format!(", {s} bytes")).unwrap_or_default();
+    format!(
+        "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
+         file is NOT inlined in this message. Call \
+         ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
+         then read it from the returned path.]"
+    )
+}
+
 /// Push one content block per well-formed file entry: inline
 /// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
 /// the blob; attachment-reference `{ attachmentId, fileName }` entries
@@ -7336,18 +7358,8 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty());
             if let (Some(id), Some(name)) = (attachment_id, name) {
-                let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
-                let size_note = file
-                    .get("size")
-                    .and_then(Value::as_u64)
-                    .map(|s| format!(", {s} bytes"))
-                    .unwrap_or_default();
-                let text = format!(
-                    "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
-                     file is NOT inlined in this message. Call \
-                     ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
-                     then read it from the returned path.]"
-                );
+                let size = file.get("size").and_then(Value::as_u64);
+                let text = attachment_reference_notice(name, mime, size, id);
                 if let Ok(block) =
                     serde_json::from_value::<ContentBlock>(json!({ "type": "text", "text": text }))
                 {
@@ -7448,7 +7460,7 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
 /// tool naming convention is unknown (or its workspace-MCP wiring hasn't
 /// landed yet).
-const GENERIC_NAMING_TOOL_REFERENCE: &str =
+pub(crate) const GENERIC_NAMING_TOOL_REFERENCE: &str =
     "the `set_workspace_title` tool from the workspace MCP server";
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
@@ -7457,7 +7469,7 @@ const GENERIC_NAMING_TOOL_REFERENCE: &str =
 /// opencode exposes `<server>_<tool>` (leading prefix →
 /// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
 /// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
-fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
+pub(crate) fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
     match provider_id {
         "auggie" => "the `set_workspace_title_workspace-mcp` tool",
         "opencode" => "the `workspace-mcp_set_workspace_title` tool",
@@ -9833,7 +9845,7 @@ fn idle_timeout_turn_streamed(err: &Error) -> bool {
 /// window is the ACTUAL configured value ([`intent_acp::session::prompt_idle_timeout`],
 /// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
 /// literal.
-fn idle_timeout_warning_text(window: std::time::Duration) -> String {
+pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     let secs = window.as_secs_f64();
     let rendered = if secs.fract() == 0.0 {
         window.as_secs().to_string()
@@ -10933,6 +10945,183 @@ mod dead_child_respawn_tests {
             "only the mapping drops out; the handle awaits the exit watcher"
         );
         mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod v1_turn_envelope_goldens {
+    //! Composed turn-envelope goldens (harness-versioning H0,
+    //! intent-hq/monorepo#2459): byte-exact pins of the FULL prompt
+    //! [`AgentManager::build_turn_prompt`] emits with every decoration
+    //! stacked, for specialist + non-specialist and first-turn +
+    //! steady-state. Complements the per-surface literals in
+    //! `crate::v1_goldens`. The snapshot line carries a live timestamp, so
+    //! it is validated by shape and stripped before the byte comparison.
+
+    use super::role_reminder_tests::{manager_with, session, workspace};
+    use super::*;
+
+    /// First text block's text from a built prompt.
+    fn prompt_text(prompt: &[ContentBlock]) -> String {
+        serde_json::to_value(prompt).unwrap()[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Split off a leading snapshot line (when present): validate its shape
+    /// and return the remaining prompt bytes.
+    fn strip_snapshot_line(text: &str) -> String {
+        let Some(rest) = text.strip_prefix("current ws.agent.snapshot() => ") else {
+            return text.to_string();
+        };
+        let (json_line, remainder) = rest.split_once("\n\n").expect("snapshot separator");
+        let v: serde_json::Value = serde_json::from_str(json_line).expect("snapshot JSON");
+        assert!(v.get("time").is_some(), "snapshot always carries time");
+        remainder.to_string()
+    }
+
+    /// Non-specialist steady state: ZERO decorations — the prompt is the
+    /// user content, byte-identical.
+    #[tokio::test]
+    async fn golden_envelope_plain_steady_state() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "just the message",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "just the message");
+    }
+
+    /// Specialist steady state: role reminder + body only.
+    #[tokio::test]
+    async fn golden_envelope_specialist_steady_state() {
+        let dir = crate::tests::test_tempdir("intentd-envgold-");
+        std::fs::write(
+            dir.path().join("implementor.md"),
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        )
+        .unwrap();
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "fix the bug",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(
+            text,
+            "[Role Reminder: You are a Implementor. Stay in scope.]\n\nfix the bug"
+        );
+    }
+
+    /// Fully decorated first turn: FirstTurnPrepend + snapshot line +
+    /// Context block + naming nudge + role reminder + body, in that exact
+    /// composition order with `\n\n` joins.
+    #[tokio::test]
+    async fn golden_envelope_first_turn_fully_decorated() {
+        let dir = crate::tests::test_tempdir("intentd-envgold-");
+        std::fs::write(
+            dir.path().join("implementor.md"),
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        )
+        .unwrap();
+        let (mgr, _seeded, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        // Untitled workspace + auggie-modeled agent → deterministic naming
+        // nudge with the auggie tool spelling.
+        let ws = WorkspaceId::from("ws-untitled");
+        let mut w = workspace(&ws);
+        w.title = String::new();
+        mgr.services.store.insert_workspace(&w).await.unwrap();
+        let agent_id = AgentId::from("agent-env");
+        let mut s = session(&agent_id, &ws, Some("implementor"));
+        s.model = Some("auggie:sonnet4.5".to_string());
+        s.system_prompt = Some("SP body".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        // Arm the §18.1 prepend fallback (mock has no native SP mechanism)
+        // and make the snapshot non-trivial (one queued message).
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        mgr.services
+            .enqueue_message(&agent_id, "pending".into(), None, None, None, None, false);
+        let options = TurnOptions {
+            stdin_context: Some("repo: demo".to_string()),
+            ..Default::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "start the task", &options)
+                .await,
+        );
+        // Outermost: the fire-once <system> prepend.
+        let rest = text
+            .strip_prefix("<system>\nSP body\n</system>\n\n")
+            .expect("first-turn prepend outermost");
+        // Then the (live-timestamped) snapshot line.
+        let rest = strip_snapshot_line(rest);
+        assert_eq!(
+            rest,
+            "Context:\nrepo: demo\n\n---\n\n\
+             <system>\n\
+             This workspace needs a title. As your first action, call the \
+             `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case \
+             title describing the task. This can be called in parallel with \
+             information-gathering.\n\
+             </system>\n\n\
+             [Role Reminder: You are a Implementor. Stay in scope.]\n\n\
+             start the task"
+        );
+        // Steady state on the same session: prepend consumed, naming nudge
+        // suppressed after an assistant reply, reminder + snapshot remain.
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "on it" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "continue", &TurnOptions::default())
+                .await,
+        );
+        let rest = strip_snapshot_line(&text);
+        assert_eq!(
+            rest,
+            "[Role Reminder: You are a Implementor. Stay in scope.]\n\ncontinue"
+        );
+    }
+
+    /// Combined interrupt delivery (monorepo#1014): the preempted text rides
+    /// ahead of the interrupt content inside the same body.
+    #[tokio::test]
+    async fn golden_envelope_prepend_content_composition() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let options = TurnOptions {
+            prepend_content: Some("original message".to_string()),
+            ..Default::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "interrupt message",
+                &options,
+            )
+            .await,
+        );
+        assert_eq!(text, "original message\n\ninterrupt message");
     }
 }
 
