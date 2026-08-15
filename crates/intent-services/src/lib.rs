@@ -20382,7 +20382,9 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         commit_hash: String,
+        git_root_id: Option<WorkspaceGitRootId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let svc = self.clone();
         let store = self.store.clone();
         Box::pin(async move {
             let empty = git_ops::empty_commit_details(&commit_hash);
@@ -20391,12 +20393,14 @@ impl WorkspaceApi for Services {
                 Err(Error::NotFound(_)) => return Ok(empty),
                 Err(e) => return Err(e),
             };
+            // `gitRootId` is validated before the remote early-return (same
+            // policy as `git_status`).
+            let Some(worktree) = svc.resolve_git_read_root(&ws, git_root_id.as_ref()).await? else {
+                return Ok(empty);
+            };
             if ws.is_remote {
                 return Ok(empty);
             }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(empty);
-            };
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }

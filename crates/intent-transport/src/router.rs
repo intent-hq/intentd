@@ -2261,8 +2261,11 @@ async fn dispatch(
         "git.commitDetails" => {
             let ws = require_ws_note(params)?;
             let commit_hash = require_str_param(params, "commitHash")?;
+            // §5.6 extension (monorepo#2477): optional `gitRootId` scopes the
+            // read to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_commit_details(ws, commit_hash)
+                .git_commit_details(ws, commit_hash, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
