@@ -5381,6 +5381,154 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
+/// issue intent-hq/monorepo#2528: the immediate report wake must say
+/// "reported" (a report is not necessarily a completion) and, when it flips
+/// the parent's ungrouped watch to `report_delivered` (disarming its
+/// `agent:idle` delivery), disclose the disarm — retirement NOTE with the
+/// `ws.agent.watch` re-arm pointer in the text (monorepo#2051 parity) plus
+/// `watchStillArmed: false` on the wake metadata (monorepo#2060 parity).
+#[tokio::test]
+async fn report_wake_says_reported_and_discloses_watch_disarm() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    // Immediate-mode delegation arms a completion watch on the child.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("progress so far"), Some(child.clone()))
+        .await
+        .expect("report");
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let msg = session.messages.last().expect("report wake delivered");
+    let text = serde_json::to_string(&msg.content).expect("serialize content");
+    assert!(
+        text.contains("reported. Report: progress so far"),
+        "wake text must say 'reported', not 'completed': {text}"
+    );
+    assert!(
+        !text.contains("completed. Report:"),
+        "a report is not a completion: {text}"
+    );
+    assert!(
+        text.contains("consumed your one-shot watch"),
+        "wake text must disclose the watch disarm: {text}"
+    );
+    assert!(
+        text.contains(&format!("ws.agent.watch(\\\"{}\\\")", child.0)),
+        "disarm NOTE must carry the re-arm pointer: {text}"
+    );
+    let metadata = msg.metadata.as_ref().expect("wake metadata");
+    assert_eq!(
+        metadata["watchStillArmed"],
+        json!(false),
+        "report wake that disarmed a watch carries watchStillArmed: false: {metadata}"
+    );
+}
+
+/// issue intent-hq/monorepo#2528: when the report flips NO watch (none exists
+/// for the parent, or a repeat report finds it already `report_delivered`),
+/// the wake carries neither the disarm NOTE nor the `watchStillArmed` key.
+#[tokio::test]
+async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Case 1: a parented child with no completion watch at all.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Unwatched".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create child");
+    let unwatched = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    svc.agent_report_to_parent_op(ws.clone(), json!("no watch"), Some(unwatched))
+        .await
+        .expect("report without watch");
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let msg = session.messages.last().expect("report wake delivered");
+    let text = serde_json::to_string(&msg.content).expect("serialize content");
+    assert!(
+        text.contains("reported. Report: no watch"),
+        "wake still says 'reported': {text}"
+    );
+    assert!(
+        !text.contains("consumed your one-shot watch"),
+        "no watch was flipped, so no disarm NOTE: {text}"
+    );
+    let metadata = msg.metadata.as_ref().expect("wake metadata");
+    assert!(
+        metadata.get("watchStillArmed").is_none(),
+        "watchStillArmed key must be absent when no watch was flipped: {metadata}"
+    );
+
+    // Case 2: a repeat report — the delegate-armed watch was flipped by the
+    // first report, so the second wake must carry no disclosure either.
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate");
+    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    svc.agent_report_to_parent_op(ws.clone(), json!("first"), Some(child.clone()))
+        .await
+        .expect("first report");
+    svc.agent_report_to_parent_op(ws.clone(), json!("second"), Some(child))
+        .await
+        .expect("second report");
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    let msg = session.messages.last().expect("second report wake");
+    let text = serde_json::to_string(&msg.content).expect("serialize content");
+    assert!(
+        text.contains("reported. Report: second"),
+        "second wake carries the second report: {text}"
+    );
+    assert!(
+        !text.contains("consumed your one-shot watch"),
+        "repeat report flips no watch, so no disarm NOTE: {text}"
+    );
+    let metadata = msg.metadata.as_ref().expect("wake metadata");
+    assert!(
+        metadata.get("watchStillArmed").is_none(),
+        "watchStillArmed key must be absent on a repeat report: {metadata}"
+    );
+}
+
 /// Regression for PR #237: after a child calls reportToParent (which marks the
 /// watch as report_delivered and delivers an immediate wake), `agent:failed` and
 /// `agent:deleted` events STILL deliver their completion wake to the parent.

@@ -4974,12 +4974,39 @@ impl Services {
                 .await
                 .map(|s| s.workspace_id)
                 .unwrap_or_else(|_| workspace_id.clone());
+            // Mark any ungrouped watches whose parent matches this parent as
+            // report_delivered, so deliver_completion_to_watches will skip agent:idle
+            // for them (suppressing the duplicate wake). Do NOT mark watches for other
+            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
+            // completion wake and should not receive the report wake. The marking runs
+            // BEFORE the wake is built (issue intent-hq/monorepo#2528) so the wake's
+            // disarm disclosure — text suffix + metadata — reflects the actual flip.
+            let watches = self.find_watches_for_child(&caller);
+            let mut marked = false;
+            for watch in watches.iter().filter(|w| {
+                w.group_id.is_none() && w.parent_agent_id == parent && !w.report_delivered
+            }) {
+                marked |= self.mark_watch_report_delivered(&watch.id);
+            }
             // Deliver exactly ONE wake to the parent, regardless of watch count.
-            // Format the wake message with the persisted report.
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Child agent {} ({}) completed. Report: {}",
+            // Format the wake message with the persisted report. "reported", not
+            // "completed" — a report is not necessarily a completion (monorepo#2528).
+            let mut wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) reported. Report: {}",
                 session.name, caller.0, report_text
             );
+            if marked {
+                // The flip disarmed the parent's one-shot watch for agent:idle —
+                // it never fires on the child's completion again (failure/deletion
+                // still deliver). Disclose it with the re-arm pointer, mirroring
+                // the #2051 retirement note in `format_completion_wake`.
+                wake_text.push_str(&format!(
+                    " NOTE: this report consumed your one-shot watch on this agent — it will NOT \
+                     fire again on completion (failure/deletion still deliver). Call \
+                     ws.agent.watch(\"{}\") again to be woken at its next completion.",
+                    caller.0
+                ));
+            }
             // Build event notification metadata (mirroring deliver_completion_to_watches).
             let mut metadata = json!({
                 "type": "event_notification",
@@ -5014,6 +5041,12 @@ impl Services {
                     &[(workspace_id.0.clone(), note_id.0.clone())],
                 );
             }
+            // Machine-readable disarm flag (monorepo#2060 parity, the
+            // `hookStillActive` twin): present iff this call flipped a watch;
+            // omitted entirely when nothing was disarmed.
+            if marked {
+                metadata["watchStillArmed"] = json!(false);
+            }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
             if let Err(e) = self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
@@ -5025,20 +5058,6 @@ impl Services {
                     child = %caller.0,
                     "failed to deliver reportToParent wake to parent"
                 );
-            }
-
-            // Mark any ungrouped watches whose parent matches this parent as
-            // report_delivered, so deliver_completion_to_watches will skip agent:idle
-            // for them (suppressing the duplicate wake). Do NOT mark watches for other
-            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
-            // completion wake and should not receive the report wake.
-            let watches = self.find_watches_for_child(&caller);
-            let mut marked = false;
-            for watch in watches
-                .iter()
-                .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
-            {
-                marked |= self.mark_watch_report_delivered(&watch.id);
             }
             // Marking flips the parent's waiting projection (report_delivered
             // watches are excluded), so publish the refreshed flags in the
