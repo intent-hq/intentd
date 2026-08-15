@@ -142,15 +142,16 @@ fn remove_section(text: &str, heading: &str) -> String {
 /// that this text still matches the bundled body verbatim).
 const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
 
-/// Start/end markers of common.md's "Batch delegation" subsection — the
-/// task-graph teaching from intentd#1116/#1147 — removed when
-/// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). It is an H3
-/// inside "## Delegating Tasks" followed by plain section text, so
+/// Start/end markers of common.md's "Task relations during delegation"
+/// subsection — the advisory task-graph teaching (intent-hq/monorepo#2457,
+/// reworked from the intentd#1116/#1147 batch-delegation doctrine) — removed
+/// when `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). It is an
+/// H3 inside "## Delegating Tasks" followed by plain section text, so
 /// [`remove_section`]'s H2 scan cannot express it; instead the text from the
 /// heading through the blank line before the "Keep delegated tasks visible"
 /// paragraph is cut by marker (unit tests guard both markers verbatim).
-const COMMON_BATCH_DELEGATION_START: &str = "### Batch delegation (preferred for multi-task plans)";
-const COMMON_BATCH_DELEGATION_END: &str = "Keep delegated tasks visible in the note";
+const COMMON_TASK_RELATIONS_START: &str = "### Task relations during delegation";
+const COMMON_TASK_RELATIONS_END: &str = "Keep delegated tasks visible in the note";
 
 /// Remove the text between `start` (inclusive) and `end` (exclusive) markers.
 /// No-op unless both markers are present in order.
@@ -167,8 +168,8 @@ fn remove_between(text: &str, start: &str, end: &str) -> String {
 /// The `common` body with feature-gated sections omitted (spec audit rows 1,
 /// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
-/// "Raising Attention", and `taskGraph` gates the "Batch delegation"
-/// subsection (batch `delegate({ tasks })`, `unlockPlan`, unblocked-wake
+/// "Raising Attention", and `taskGraph` gates the "Task relations during
+/// delegation" subsection (dispositions, `unlockPlan`, unblocked-wake
 /// guidance). When `hostExec` is off but the Waiting section survives, the
 /// `ws.host.exec` fallback sentence of its "Cross-repo PRs" bullet is
 /// scrubbed. With every gate open (`taskGraph` opted in) this borrows the
@@ -178,8 +179,8 @@ fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     if !features.task_graph {
         body = Cow::Owned(remove_between(
             &body,
-            COMMON_BATCH_DELEGATION_START,
-            COMMON_BATCH_DELEGATION_END,
+            COMMON_TASK_RELATIONS_START,
+            COMMON_TASK_RELATIONS_END,
         ));
     }
     if !features.attention_requests {
@@ -411,22 +412,41 @@ mod tests {
     }
 
     #[test]
-    fn task_graph_off_removes_batch_delegation_from_common() {
+    fn task_graph_off_removes_task_relations_from_common() {
         // Guards: the markers still match the bundled body verbatim.
-        assert!(COMMON.contains(COMMON_BATCH_DELEGATION_START));
-        assert!(COMMON.contains(COMMON_BATCH_DELEGATION_END));
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_START));
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_END));
         // Default features have `taskGraph` off (opt-in).
         let common = gated_common(&defaults());
-        assert!(!common.contains("### Batch delegation"));
+        assert!(!common.contains("### Task relations during delegation"));
         assert!(!common.contains("unlockPlan"));
         assert!(!common.contains("Tasks now unblocked"));
-        assert!(!common.contains("greedy"));
         // Single-task delegation guidance and the surrounding section survive
         // with a clean seam (the pre-teaching layout).
         assert!(common.contains("## Delegating Tasks"));
         assert!(common.contains(
             "waitMode: \"after_all\" })\n```\n\nKeep delegated tasks visible in the note"
         ));
+    }
+
+    #[test]
+    fn task_graph_on_common_teaching_is_advisory_not_doctrine() {
+        // Flag ON: the advisory subsection is present…
+        let common = gated_common(&all_on());
+        assert!(common.contains("### Task relations during delegation"));
+        assert!(common.contains("**Holds are advisory, not final.**"));
+        // …and none of the batch-delegation doctrine phrases remain
+        // (intent-hq/monorepo#2445 regression, reworked per monorepo#2457).
+        for gone in [
+            "preferred for multi-task plans",
+            "remaining list",
+            "tasks: [\"t1\", \"t2\", \"t3\"]",
+            "Re-call delegate",
+            "re-call",
+            "greedy",
+        ] {
+            assert!(!common.contains(gone), "doctrine phrase survived: {gone:?}");
+        }
     }
 
     #[test]
