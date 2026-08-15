@@ -11269,6 +11269,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn file_read_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            // Blocking thread: a 16 MiB window read should not stall the
+            // async executor (matching workspace.export.read).
+            tokio::task::spawn_blocking(move || file_ops::read_chunk(&root, &path, offset, length))
+                .await
+                .map_err(|e| Error::Internal(format!("file.readChunk task failed: {e}")))?
+        })
+    }
+
     fn file_write(
         &self,
         workspace_id: WorkspaceId,

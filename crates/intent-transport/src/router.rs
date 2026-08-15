@@ -3140,6 +3140,15 @@ async fn dispatch(
             let path = require_str_param(params, "path")?;
             api.file_read(ws, path, None).await.map_err(domain_to_rpc)
         }
+        "file.readChunk" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.file_read_chunk(ws, path, offset, length, None)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "file.write" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
