@@ -154,7 +154,8 @@ at logon and starts it now; non-interactive runs skip with a hint. Set
 without prompting, `'0'` / `-NoService` to skip. When the task is set up, the
 installer also asks whether the service should auto-resume interrupted agents at
 startup (see [Auto-resume on start](#auto-resume-on-start));
-`$env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off'` answers non-interactively.
+`$env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off'` (or `-AutoResume auto|on|off` on a
+direct run) answers non-interactively.
 
 ### Homebrew (macOS / Linux)
 
@@ -210,6 +211,12 @@ Whether the daemon resumes interrupted agents when it starts (as a service or vi
   resume path there.
 - **`on`** — always resume interrupted agents on start.
 - **`off`** — never resume on start.
+
+Note for Linux services: a systemd user unit (the `.deb` unit, the one
+`install.sh` writes, and `brew services` on Linux) does not inherit the
+graphical session's `DISPLAY`/`WAYLAND_DISPLAY`, so under `auto` the daemon
+classifies the service as headless and resumes on start even on a desktop.
+Set the setting to `off` to keep a Linux desktop service from resuming.
 
 Change it with the settings CLI (applies at the next daemon start):
 

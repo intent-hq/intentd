@@ -22,12 +22,14 @@
 # agents.resumeInterruptedOnStart). The default 'auto' resumes only on
 # headless hosts, so answering auto — or a non-interactive run — writes
 # nothing; on/off are applied via `intentd settings` once the daemon is up.
-# $env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off' forces an answer.
+# $env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off' (or -AutoResume <value>, on
+# direct runs) forces an answer.
 #
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
     [switch]$Service,
-    [switch]$NoService
+    [switch]$NoService,
+    [string]$AutoResume = ''
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
@@ -43,9 +45,17 @@ if ($arch -ne 'AMD64') {
     throw "install.ps1: unsupported architecture '$arch' (only x86_64/AMD64 Windows builds are published)"
 }
 
-# Validate INTENTD_AUTO_RESUME before any download so garbage fails fast
-# (matching install.sh) instead of aborting mid-install after the binary is
-# already on disk. Consumed in the service branch below.
+# Validate -AutoResume and INTENTD_AUTO_RESUME before any download so garbage
+# fails fast (matching install.sh) instead of aborting mid-install after the
+# binary is already on disk. Both consumed in the service branch below, where
+# the parameter beats the env var.
+$autoResumeArg = ''
+if ($AutoResume) {
+    $autoResumeArg = $AutoResume.Trim().ToLowerInvariant()
+    if (@('auto', 'on', 'off') -notcontains $autoResumeArg) {
+        throw "install.ps1: invalid -AutoResume value '$AutoResume' (expected auto, on, or off)"
+    }
+}
 $autoResumeEnv = ''
 if ($env:INTENTD_AUTO_RESUME) {
     $autoResumeEnv = $env:INTENTD_AUTO_RESUME.Trim().ToLowerInvariant()
@@ -143,13 +153,15 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
-    # Auto-resume choice: env var (validated up front) beats the prompt;
-    # 'auto' — or a non-interactive run — is the daemon default and writes
-    # nothing. Applied via `intentd settings` after the wait-for-daemon loop
-    # below, so on a re-install over an existing data dir the first service
-    # start still runs under the prior effective setting.
+    # Auto-resume choice: parameter beats the env var beats the prompt (both
+    # validated up front); 'auto' — or a non-interactive run — is the daemon
+    # default and writes nothing. Applied via `intentd settings` after the
+    # wait-for-daemon loop below, so on a re-install over an existing data dir
+    # the first service start still runs under the prior effective setting.
     $autoResume = ''
-    if ($autoResumeEnv) {
+    if ($autoResumeArg) {
+        $autoResume = $autoResumeArg
+    } elseif ($autoResumeEnv) {
         $autoResume = $autoResumeEnv
     } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
         $reply = (Read-Host 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto)').Trim().ToLowerInvariant()

@@ -55,7 +55,11 @@ class Intentd < Formula
   # agents is governed by the agents.resumeInterruptedOnStart setting (default
   # auto: resume only on headless hosts, so servers keep resuming while desktop
   # hosts leave it to the app's prompt) — toggle it with
-  # `intentd settings agents.resumeInterruptedOnStart on|off`.
+  # `intentd settings agents.resumeInterruptedOnStart on|off`. Note: on Linux
+  # the brew service is a systemd user unit that runs without the session's
+  # DISPLAY/WAYLAND_DISPLAY, so `auto` treats it as headless and resumes even
+  # on a desktop (use `off` to opt out); macOS launchd agents count as having
+  # a display.
   service do
     run [opt_bin/"intentd", "serve"]
     keep_alive crashed: true, successful_exit: false
