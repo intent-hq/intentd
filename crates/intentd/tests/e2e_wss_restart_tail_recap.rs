@@ -543,17 +543,10 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    let continuation_pid = continuation["pid"].as_i64();
-    let loaded_via = sessions
-        .iter()
-        .rev()
-        .find(|s| s["pid"] == continuation["pid"])
-        .map(|s| s["method"].clone());
-    // The prompt log has no pid field; correlate by order instead — the LAST
-    // session establishment before the continuation prompt must be a load.
-    let _ = continuation_pid;
+    // The prompt log has no pid field to correlate on; the LAST session
+    // establishment before the continuation prompt must be a load.
     assert_eq!(
-        loaded_via.or_else(|| sessions.last().map(|s| s["method"].clone())),
+        sessions.last().map(|s| s["method"].clone()),
         Some(json!("session/load")),
         "resume must go through session/load (recreate would mask the bug): {sessions:?}"
     );
