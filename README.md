@@ -58,7 +58,7 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 | `intent-store` | SQLite persistence via `sqlx` + embedded migrations. |
 | `intent-services` | `WorkspaceApi` implementation (the shared service surface) + the `AgentManager`, MCP callback server, and per-domain ops. |
 | `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, and heartbeat. |
-| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`mcp-bridge`). |
+| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`settings`/`import`/`mcp-bridge`). |
 | `intent-acp` | ACP client core + `AgentManager` orchestration, agent→BE MCP callback server, and the loopback MCP bridge. |
 | `intent-providers` | Provider registry + model resolution for spawning agent runtimes. |
 | `intent-sourcecontrol` | GitHub/PR via `octocrab` (REST + GraphQL), token resolution, GHE support. |
@@ -135,6 +135,11 @@ on a direct run) to set it up without prompting, `INTENTD_INSTALL_SERVICE=0` /
 once lingering is enabled (`sudo loginctl enable-linger $USER` — the script prints
 this hint).
 
+When a service is set up, the script also asks whether it should auto-resume
+interrupted agents at startup (see [Auto-resume on start](#auto-resume-on-start);
+answering `auto` — the default — writes nothing). `INTENTD_AUTO_RESUME=auto|on|off`
+(or `--auto-resume=<value>` on a direct run) answers non-interactively.
+
 ### One-line script (Windows)
 
 ```powershell
@@ -143,16 +148,19 @@ powershell -c "irm https://github.com/intent-hq/intentd-releases/releases/downlo
 
 Installs `intentd.exe` to `%LOCALAPPDATA%\intentd\bin` (override with
 `INTENTD_INSTALL_DIR`) and adds that directory to the user `PATH`. After installing,
-it offers to register a per-user Scheduled Task that runs `intentd serve --resume-all`
+it offers to register a per-user Scheduled Task that runs `intentd serve`
 at logon and starts it now; non-interactive runs skip with a hint. Set
 `$env:INTENTD_INSTALL_SERVICE = '1'` (or `-Service` on a direct run) to set it up
-without prompting, `'0'` / `-NoService` to skip.
+without prompting, `'0'` / `-NoService` to skip. When the task is set up, the
+installer also asks whether the service should auto-resume interrupted agents at
+startup (see [Auto-resume on start](#auto-resume-on-start));
+`$env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off'` answers non-interactively.
 
 ### Homebrew (macOS / Linux)
 
 ```sh
 brew install intent-hq/tap/intentd
-# Run as a login service (launchd/systemd) — executes `intentd serve --resume-all`:
+# Run as a login service (launchd/systemd) — executes `intentd serve`:
 brew services start intentd
 ```
 
@@ -168,7 +176,7 @@ Sitter releases ship Debian packages (`intentd_<version>_amd64.deb` /
 `intentd_<version>_arm64.deb`, with constant-named `intentd_amd64.deb` /
 `intentd_arm64.deb` copies on the fixed `sitter-latest` release) installing the sitter at
 `/usr/bin/intentd` and a systemd **user** unit at
-`/usr/lib/systemd/user/intentd.service` (runs `intentd serve --resume-all`):
+`/usr/lib/systemd/user/intentd.service` (runs `intentd serve`):
 
 ```sh
 curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/intentd_amd64.deb
@@ -190,6 +198,27 @@ curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter
 tar -xJf intentd-aarch64-apple-darwin.tar.xz
 # → intentd-aarch64-apple-darwin/intentd
 ```
+
+### Auto-resume on start
+
+Whether the daemon resumes interrupted agents when it starts (as a service or via
+`intentd serve`) is governed by the `agents.resumeInterruptedOnStart` setting:
+
+- **`auto`** (default) — resume only on headless hosts (no display detected).
+  Servers keep resuming on start; desktop hosts (macOS/Windows/Linux with a
+  display) do **not** silently resume — the desktop app's resume prompt is the
+  resume path there.
+- **`on`** — always resume interrupted agents on start.
+- **`off`** — never resume on start.
+
+Change it with the settings CLI (applies at the next daemon start):
+
+```sh
+intentd settings agents.resumeInterruptedOnStart on|off|auto
+```
+
+`intentd serve --resume-all` force-enables the sweep for that single run,
+regardless of the setting.
 
 ### Channels
 
@@ -300,6 +329,23 @@ cargo run -p intentd -- doctor   # data-dir writable + SQLite/migrations current
 Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
+
+### Settings
+
+`intentd settings` reads and changes daemon settings on a running daemon — a friendlier
+front for the `settings.list` / `settings.get` / `settings.update` RPCs:
+
+```bash
+intentd settings                                    # list every setting: path, type, current value
+intentd settings agents.resumeInterruptedOnStart    # print one setting (value, type, default, description)
+intentd settings agents.resumeInterruptedOnStart on # validate + apply a change
+```
+
+Values are coerced to the setting's declared type — booleans take `true`/`false`,
+numbers a numeric literal, enums one of their allowed strings, and object/array
+settings a JSON document. Unknown names, invalid values (bad enum value, out-of-range
+number, read-only setting), and a stopped daemon all fail with a clear message and a
+non-zero exit; sensitive values are printed pre-redacted by the daemon.
 
 ### Pairing a remote client (WSS)
 
