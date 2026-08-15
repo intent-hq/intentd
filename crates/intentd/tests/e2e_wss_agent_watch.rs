@@ -2069,3 +2069,295 @@ async fn agent_watch_on_reported_hook_waiting_child_defers_over_wss() {
     .await;
     assert_eq!(wakes, 1, "exactly one completion wake for the hooked child");
 }
+
+/// The agent's persisted wake rows (user rows framed with
+/// `[WORKSPACE EVENTS]`), each serialized WHOLE — content blocks plus the
+/// row's metadata — for per-row disclosure assertions (wake metadata such as
+/// `watchStillArmed` round-trips on transcript reads).
+async fn wake_rows_serialized(
+    rpc: &mut TlsWs,
+    id: i64,
+    ws_id: &str,
+    agent_id: &str,
+) -> Vec<String> {
+    let convo = wss_rpc(
+        rpc,
+        id,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m.to_string())
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect()
+}
+
+/// monorepo#2528: the immediate `agent.reportToParent` wake over the real
+/// transport says "reported" (a report is not necessarily a completion) and
+/// discloses the watch disarm exactly when the call flips the parent's
+/// ungrouped watch to `report_delivered`:
+///  - the FIRST report in a turn carries the retirement NOTE with the
+///    `ws.agent.watch` re-arm pointer (#2051 parity) plus
+///    `watchStillArmed: false` on the wake metadata (#2060 parity);
+///  - a REPEAT report in the same turn (watch already flipped) and a
+///    post-retirement report (no watch left at all) still wake the parent but
+///    carry neither the NOTE nor the `watchStillArmed` key;
+///  - the child's genuine idle after the report delivers NO completion wake —
+///    the flipped watch suppresses `agent:idle` and silently retires.
+/// (The disclosed re-arm path itself — `ws.agent.watch` after the report wake
+/// firing at the child's next genuine completion — is covered by the WATCH5
+/// adoption test above.)
+#[tokio::test]
+async fn report_wake_disclosure_iff_watch_flipped_and_idle_suppressed_over_wss() {
+    let Some(script) = gate("WSS report-wake disclosure E2E") else {
+        return;
+    };
+    let budget = Budget::start();
+
+    const SPAWN_GO: &str = "WATCH7_SPAWN_GO";
+    const CHILD_GO: &str = "WATCH7_CHILD_GO";
+    const CHILD_AGAIN: &str = "WATCH7_CHILD_AGAIN";
+    const REPORT1: &str = "WATCH7_REPORT_ONE first slice landed";
+    const REPORT2: &str = "WATCH7_REPORT_TWO second slice landed";
+    const REPORT3: &str = "WATCH7_REPORT_THREE post-retirement progress";
+
+    let spawn_js = format!(
+        "const r = await ws.agent.create('DiscloseChild', '{CHILD_GO} do your work', \
+         {{ model: 'mock:default' }}); return 'spawned=' + r.ok;"
+    );
+    let report1_js = format!("return await ws.agent.reportToParent({});", json!(REPORT1));
+    let report2_js = format!("return await ws.agent.reportToParent({});", json!(REPORT2));
+    let report3_js = format!("return await ws.agent.reportToParent({});", json!(REPORT3));
+    // Wake-ack rule FIRST (wake turns must never re-run a marker rule off
+    // replayed history), and CHILD_AGAIN before CHILD_GO: the child's second
+    // turn replays its kickoff prompt in history, so the later marker must
+    // match first.
+    let behavior = json!({
+        "rules": [
+            { "ifPromptContains": "[WORKSPACE EVENTS]", "response": "wake acknowledged" },
+            {
+                "ifPromptContains": SPAWN_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": spawn_js, "summary": "spawn the reporting child" }
+                },
+                "emitToolBlocks": true,
+                "response": "child spawned",
+            },
+            {
+                "ifPromptContains": CHILD_AGAIN,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report3_js, "summary": "child reports post-retirement" }
+                },
+                "emitToolBlocks": true,
+                "response": "child reported again",
+            },
+            {
+                "ifPromptContains": CHILD_GO,
+                "toolCalls": [
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": report1_js, "summary": "child first report" }
+                    },
+                    {
+                        "name": "workspace_api",
+                        "arguments": { "code": report2_js, "summary": "child repeat report" }
+                    },
+                ],
+                "emitToolBlocks": true,
+                "response": "child kickoff done",
+            },
+        ],
+    })
+    .to_string();
+    let mut setup = boot_daemon(&script, &behavior, json!(["agent:*"]), budget).await;
+    let ws_id = setup.ws_id.clone();
+
+    // The parent spawns the child through the bridge (parent linkage makes
+    // reportToParent legal and arms the auto parent→child watch).
+    let parent = create_agent(&mut setup.rpc, 10, &ws_id, "DiscloseParent").await;
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": SPAWN_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "spawn send ok: {sent}");
+    let mut req_id = 20i64;
+    let child = await_agent_id_by_name(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        "DiscloseChild",
+        budget.step(60),
+    )
+    .await;
+
+    // The child's kickoff turn reports twice and ends holding nothing — its
+    // idle is GENUINE (no outgoing watches, no hooks).
+    let child_idle = await_idle_event(&mut setup.sub, &child, budget.step(90)).await;
+    assert_ne!(
+        child_idle["data"]["isWaitingForOtherAgents"],
+        json!(true),
+        "child idle is genuine: {child_idle}"
+    );
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        REPORT2,
+        budget.step(60),
+    )
+    .await;
+
+    // Per-row disclosure audit. First report flipped the auto watch: full
+    // disclosure — "reported", retirement NOTE with the re-arm pointer, and
+    // the machine-readable metadata twin.
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    req_id += 1;
+    let row1 = rows
+        .iter()
+        .find(|r| r.contains(REPORT1))
+        .unwrap_or_else(|| panic!("first report wake row present: {rows:?}"));
+    assert!(
+        row1.contains("reported. Report:"),
+        "first report wake says reported: {row1}"
+    );
+    assert!(
+        row1.contains("consumed your one-shot watch"),
+        "first report wake carries the disarm NOTE: {row1}"
+    );
+    assert!(
+        row1.contains(&format!("ws.agent.watch(\\\"{child}\\\")")),
+        "disarm NOTE carries the re-arm pointer naming the child: {row1}"
+    );
+    assert!(
+        row1.contains("\"watchStillArmed\":false"),
+        "first report wake metadata tags watchStillArmed=false: {row1}"
+    );
+    // Repeat report in the same turn found the watch already flipped: the
+    // wake still delivers but carries NO disclosure — no NOTE, and the
+    // watchStillArmed key is absent entirely.
+    let row2 = rows
+        .iter()
+        .find(|r| r.contains(REPORT2))
+        .unwrap_or_else(|| panic!("repeat report wake row present: {rows:?}"));
+    assert!(
+        row2.contains("reported. Report:"),
+        "repeat report wake says reported: {row2}"
+    );
+    assert!(
+        !row2.contains("consumed your one-shot watch"),
+        "repeat report wake must not carry the disarm NOTE: {row2}"
+    );
+    assert!(
+        !row2.contains("watchStillArmed"),
+        "repeat report wake metadata must omit the watchStillArmed key: {row2}"
+    );
+
+    // Suppression: the flipped watch skips the child's genuine agent:idle and
+    // silently retires — the parent gets NO completion wake, only the two
+    // report wakes.
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("completed."),
+        "the reported child's idle must not deliver a second wake: {text}"
+    );
+    let wakes = wake_row_count(
+        &mut setup.rpc,
+        req_id,
+        &ws_id,
+        &parent,
+        "Child agent DiscloseChild",
+    )
+    .await;
+    req_id += 1;
+    assert_eq!(wakes, 2, "exactly the two report wakes, nothing else");
+
+    // Post-retirement report (the watch is gone, nothing to flip): the wake
+    // still delivers, again with no disclosure.
+    let sent = wss_rpc(
+        &mut setup.rpc,
+        40,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child, "content": CHILD_AGAIN }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "child again send ok: {sent}");
+    await_conversation_contains(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        REPORT3,
+        budget.step(60),
+    )
+    .await;
+    let rows = wake_rows_serialized(&mut setup.rpc, req_id, &ws_id, &parent).await;
+    req_id += 1;
+    let row3 = rows
+        .iter()
+        .find(|r| r.contains(REPORT3))
+        .unwrap_or_else(|| panic!("post-retirement report wake row present: {rows:?}"));
+    assert!(
+        row3.contains("reported. Report:"),
+        "post-retirement report wake says reported: {row3}"
+    );
+    assert!(
+        !row3.contains("consumed your one-shot watch"),
+        "post-retirement report wake must not carry the disarm NOTE: {row3}"
+    );
+    assert!(
+        !row3.contains("watchStillArmed"),
+        "post-retirement report wake metadata must omit the watchStillArmed key: {row3}"
+    );
+    // And the watchless idle after this second turn delivers nothing either.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let text = await_conversation_settled(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        budget.step(60),
+    )
+    .await;
+    assert!(
+        !text.contains("completed."),
+        "the watchless child's idle must not deliver a completion wake: {text}"
+    );
+    let wakes = wake_row_count(
+        &mut setup.rpc,
+        req_id,
+        &ws_id,
+        &parent,
+        "Child agent DiscloseChild",
+    )
+    .await;
+    assert_eq!(wakes, 3, "exactly the three report wakes, nothing else");
+}
