@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.3] - 2026-08-15
+
+### 🐛 Bug Fixes
+
+- Gate worker end-of-turn drain on archived workspace ([#1244](https://github.com/intent-hq/intentd/pull/1244))
+
+### 📚 Documentation
+
+- *(browser)* Document tunnel actions and lifecycle in browser_docs ([#1247](https://github.com/intent-hq/intentd/pull/1247))
+
+
 ## [0.7.2] - 2026-08-15
 
 ### 🚀 Features
