@@ -23934,6 +23934,99 @@ async fn batch_delegate_starts_ready_holds_dep_blocked_and_projects_unlock() {
     assert_eq!(again["startedTaskIds"], json!([] as [String; 0]));
 }
 
+/// Relation-less annotation (monorepo#2457 part 3): a mixed request — a
+/// relation-bearing pair plus a task the graph does not cover. The uncovered
+/// task still starts exactly as before, but its row carries
+/// `relationsUnknown: true`, the relation-bearing rows carry no flag, and the
+/// unlock message counts the started uncovered tasks.
+#[tokio::test]
+async fn batch_delegate_annotates_relation_less_tasks_and_counts_them() {
+    let (_t, svc, ws) = setup().await;
+    let t1 = seed_task(&svc, &ws, "First").await;
+    let t2 = seed_task(&svc, &ws, "Second").await;
+    svc.task_set_relations(ws.clone(), t2.clone(), Some(vec![t1.clone()]), None)
+        .await
+        .expect("t2 dependsOn t1");
+    let lone = seed_task(&svc, &ws, "Lone").await;
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&t1, &t2, &lone]), None)
+        .await
+        .expect("batch");
+    let r1 = row_for(&resp, &t1);
+    assert_eq!(r1["disposition"], "started");
+    assert!(r1.get("relationsUnknown").is_none(), "{r1}");
+    let r2 = row_for(&resp, &t2);
+    assert_eq!(r2["disposition"], "held:blocked-on-deps");
+    assert!(r2.get("relationsUnknown").is_none(), "{r2}");
+    let rl = row_for(&resp, &lone);
+    assert_eq!(
+        rl["disposition"], "started",
+        "annotation never holds: {resp}"
+    );
+    assert_eq!(rl["relationsUnknown"], json!(true), "{resp}");
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 2 started tasks carry no relations — the graph does not cover them."),
+        "{resp}"
+    );
+}
+
+/// All-relation-less request: every row flags and the summary counts them
+/// all. A task referenced by another requested task's `dependsOn` while
+/// declaring none itself is covered by the graph — no flag, no count.
+#[tokio::test]
+async fn batch_delegate_flags_all_uncovered_and_spares_referenced_tasks() {
+    let (_t, svc, ws) = setup().await;
+    let a = seed_task(&svc, &ws, "A").await;
+    let b = seed_task(&svc, &ws, "B").await;
+
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&a, &b]), None)
+        .await
+        .expect("all relation-less");
+    for id in [&a, &b] {
+        let row = row_for(&resp, id);
+        assert_eq!(row["disposition"], "started", "{resp}");
+        assert_eq!(row["relationsUnknown"], json!(true), "{resp}");
+    }
+    assert!(
+        resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 of 2 started tasks carry no relations — the graph does not cover them."),
+        "{resp}"
+    );
+
+    // `dep` declares no relations but `t` (also requested) depends on it:
+    // the graph covers dep, so neither row flags and no count is appended.
+    let dep = seed_task(&svc, &ws, "Dep").await;
+    let t = seed_task(&svc, &ws, "T").await;
+    svc.task_set_relations(ws.clone(), t.clone(), Some(vec![dep.clone()]), None)
+        .await
+        .expect("t dependsOn dep");
+    let resp = svc
+        .agent_delegate_op(ws.clone(), batch_input(&[&dep, &t]), None)
+        .await
+        .expect("referenced pair");
+    let rd = row_for(&resp, &dep);
+    assert_eq!(rd["disposition"], "started", "{resp}");
+    assert!(rd.get("relationsUnknown").is_none(), "{rd}");
+    assert!(
+        row_for(&resp, &t).get("relationsUnknown").is_none(),
+        "{resp}"
+    );
+    assert!(
+        !resp["unlockPlan"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("carry no relations"),
+        "{resp}"
+    );
+}
+
 /// Conflicts: the later task of a conflicting pair holds, naming the pair,
 /// and the reason points at individual delegation (no more greedy override).
 #[tokio::test]
