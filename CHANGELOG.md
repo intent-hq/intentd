@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-08-15
+
+### 🚀 Features
+
+- Add chunked binary file read method (file.readChunk) ([#1231](https://github.com/intent-hq/intentd/pull/1231))
+- *(prompts)* Rework flag-ON task-graph teaching from doctrine to advisory ([#1229](https://github.com/intent-hq/intentd/pull/1229))
+- *(git)* Add optional gitRootId param to git.commitDetails ([#1235](https://github.com/intent-hq/intentd/pull/1235))
+- *(delegate)* [**breaking**] Per-task options in batch delegate; remove greedy param ([#1236](https://github.com/intent-hq/intentd/pull/1236))
+
+### 🐛 Bug Fixes
+
+- Keep session-level base64 imageBlocks out of the AgentLite projection ([#1230](https://github.com/intent-hq/intentd/pull/1230))
+
+
 ## [0.6.21] - 2026-08-14
 
 ### 🚀 Features
