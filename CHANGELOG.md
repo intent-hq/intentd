@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-08-15
+
+### 🚀 Features
+
+- Make startup auto-resume a setting with installer prompts ([#1238](https://github.com/intent-hq/intentd/pull/1238))
+- *(delegate)* Annotate relation-less tasks in batch classification ([#1237](https://github.com/intent-hq/intentd/pull/1237))
+
+
 ## [0.7.0] - 2026-08-15
 
 ### 🚀 Features
