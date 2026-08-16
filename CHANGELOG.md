@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.10] - 2026-08-16
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Persist worktreePath for isNewRepo direct-mode creates and fall back to repositoryPath in spawn cwd ([#1265](https://github.com/intent-hq/intentd/pull/1265))
+
+
 ## [0.7.9] - 2026-08-16
 
 ### 🚀 Features
