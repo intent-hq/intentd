@@ -29,8 +29,9 @@ pub(crate) const UNBLOCKED_TRIGGER_TASKS_KEY: &str = "unblockedTriggerTasks";
 /// Stable prefix of the rendered unblocked section, used by the delivery
 /// paths as an idempotency guard (a requeued entry whose content already
 /// carries a section is never re-annotated — same contract as the
-/// dequeue-wait note).
-pub(crate) const UNBLOCKED_SECTION_PREFIX: &str = "Tasks now unblocked by";
+/// dequeue-wait note). Owned by the harness (H6) alongside the section
+/// wording.
+pub(crate) use crate::harness::v1::UNBLOCKED_SECTION_PREFIX;
 
 /// Stamp `triggers` (`(workspace_id, task_note_id)` pairs) onto a wake's
 /// `event_notification` metadata under [`UNBLOCKED_TRIGGER_TASKS_KEY`].
@@ -131,35 +132,7 @@ pub(crate) fn collect_trigger_tasks<'a>(
 /// task is otherwise unblocked. `multiple_triggers` flips the singular/plural
 /// framing when a coalesced batch covered more than one completion.
 pub(crate) fn render_unblocked_section(delta: &[UnblockedTask], multiple_triggers: bool) -> String {
-    let noun = if multiple_triggers {
-        "these completions"
-    } else {
-        "this completion"
-    };
-    let items = delta
-        .iter()
-        .map(|t| {
-            let reason = match t.reason {
-                UnblockedReason::DepsSatisfied => "deps satisfied",
-                UnblockedReason::ConflictCleared => "conflict cleared",
-            };
-            let attention = match t.attention {
-                Some(TaskStatus::Waiting) => "; currently waiting — needs attention",
-                Some(TaskStatus::DiscussionNeeded) => {
-                    "; currently discussion_needed — needs attention"
-                }
-                Some(TaskStatus::Blocked) => "; currently blocked — needs attention",
-                Some(TaskStatus::ReviewRequired) => "; currently review_required — needs attention",
-                _ => "",
-            };
-            format!(
-                "[{}](intent://local/task/{}) ({}{})",
-                t.title, t.note_id, reason, attention
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{UNBLOCKED_SECTION_PREFIX} {noun}: {items}.")
+    crate::harness::latest().unblocked_section(delta, multiple_triggers)
 }
 
 /// Why a task appears in the delta.

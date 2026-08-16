@@ -4800,16 +4800,7 @@ impl Services {
         let count = self
             .dismissed_question_count(agent_id, dismissed_message_id)
             .await;
-        let noun = match count {
-            0 => "questions".to_string(),
-            1 => "1 question".to_string(),
-            n => format!("{n} questions"),
-        };
-        let content = format!(
-            "User dismissed your {noun} without answering. This is an informative \
-             notice only — do not re-ask and do not proceed with any work; end \
-             your turn and wait for the user's next message."
-        );
+        let content = crate::harness::latest().questions_dismissed_notice(count);
         let metadata = json!({
             "type": QUESTIONS_DISMISSED_METADATA_TYPE,
             "source": "system",
@@ -5041,22 +5032,17 @@ impl Services {
             // Deliver exactly ONE wake to the parent, regardless of watch count.
             // Format the wake message with the persisted report. "reported", not
             // "completed" — a report is not necessarily a completion (monorepo#2528).
-            let mut wake_text = format!(
-                "[WORKSPACE EVENTS] Child agent {} ({}) reported. Report: {}",
-                session.name, caller.0, report_text
+            // `marked` = the flip disarmed the parent's one-shot watch for
+            // agent:idle — it never fires on the child's completion again
+            // (failure/deletion still deliver); the wake discloses it with the
+            // re-arm pointer, mirroring the #2051 retirement note in
+            // `format_completion_wake`. Wording owned by the harness (H6).
+            let wake_text = crate::harness::latest().report_to_parent_wake(
+                &session.name,
+                &caller.0,
+                &report_text,
+                marked,
             );
-            if marked {
-                // The flip disarmed the parent's one-shot watch for agent:idle —
-                // it never fires on the child's completion again (failure/deletion
-                // still deliver). Disclose it with the re-arm pointer, mirroring
-                // the #2051 retirement note in `format_completion_wake`.
-                wake_text.push_str(&format!(
-                    " NOTE: this report consumed your one-shot watch on this agent — it will NOT \
-                     fire again on completion (failure/deletion still deliver). Call \
-                     ws.agent.watch(\"{}\") again to be woken at its next completion.",
-                    caller.0
-                ));
-            }
             // Build event notification metadata (mirroring deliver_completion_to_watches).
             let mut metadata = json!({
                 "type": "event_notification",
@@ -5262,18 +5248,16 @@ impl Services {
         let caller = caller_agent_id.ok_or_else(|| {
             Error::Internal("requestAttention is only available to agents".to_string())
         })?;
-        let (meta_kind, task_target, task_target_word, wake_verb) = match kind.as_str() {
+        let (meta_kind, task_target, task_target_word) = match kind.as_str() {
             "discussion" => (
                 "discussion-request",
                 intent_core::TaskStatus::DiscussionNeeded,
                 "discussion_needed",
-                "requests a discussion",
             ),
             "blocker" => (
                 "blocker-report",
                 intent_core::TaskStatus::Blocked,
                 "blocked",
-                "reports a blocker",
             ),
             other => {
                 return Err(Error::InvalidParams(format!(
@@ -5402,9 +5386,11 @@ impl Services {
                 .await
                 .map(|s| s.workspace_id)
                 .unwrap_or_else(|_| workspace_id.clone());
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
-                session.name, caller.0, wake_verb, reason
+            let wake_text = crate::harness::latest().attention_parent_wake(
+                &session.name,
+                &caller.0,
+                &kind,
+                &reason,
             );
             let metadata = json!({
                 "type": "event_notification",
@@ -5453,15 +5439,12 @@ impl Services {
             // into an `after_all` delegation group wakes at group settlement,
             // not this agent's individual completion, so state the promise
             // that actually holds.
-            let completion_promise = if watch.group_id.is_some() {
-                "you will be woken when its delegation group settles"
-            } else {
-                "you will still be woken at its completion"
-            };
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {} (Your watch on this agent \
-                 remains armed; {completion_promise}.)",
-                session.name, caller.0, wake_verb, reason
+            let wake_text = crate::harness::latest().attention_watcher_wake(
+                &session.name,
+                &caller.0,
+                &kind,
+                &reason,
+                watch.group_id.is_some(),
             );
             // `watchStillArmed: true` (monorepo#2060) is the machine-readable
             // twin of the "remains armed" note above, mirroring the hook
@@ -5592,27 +5575,11 @@ impl Services {
         // subscriber and the `git_ops` commit gate.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
-            // Build the preamble from adjacent string literals (via `concat!`)
-            // so no source-level indentation leaks into the emitted bytes. Every
-            // `\n` is explicit; the resulting string is byte-for-byte the
-            // reference `DelegateTaskTool` preamble
-            // (`agent-interaction-tools.ts`).
-            let preamble = format!(
-                concat!(
-                    "**Your Task Note:** \"{title}\" (ID: {note_id})\n",
-                    "This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n",
-                    "\n",
-                    "**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
-                ),
-                title = title,
-                note_id = note_id,
-            );
-            message = Some(match message {
-                Some(body) if !body.is_empty() => {
-                    format!("{body}\n\n---\n{preamble}")
-                }
-                _ => preamble,
-            });
+            message = Some(crate::harness::latest().delegation_first_message(
+                message.as_deref(),
+                &title,
+                &note_id.0,
+            ));
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`
         // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
