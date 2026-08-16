@@ -9,12 +9,53 @@ use std::collections::{HashMap, HashSet};
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE};
 use intent_core::TaskStatus;
 
-use super::{ChildSettlementParams, Harness, TurnEnvelopeParams};
+use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
 use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
 use crate::pr_monitor::PrMonitorSnapshot;
 
 /// The v1 harness singleton.
 pub(crate) struct V1;
+
+/// v1's bundled doctrine: the `resources/agent-instructions/v1/` instruction
+/// set and the `resources/specialists/v1/` embedded specialist bundle.
+static DOCTRINE: Doctrine = Doctrine {
+    instructions: &crate::instructions::V1,
+    specialists: crate::specialists::EMBEDDED_BUNDLED_V1,
+};
+
+/// The v1 registry row. `version` is intent-core's stamped `"1.0"` (asserted
+/// equal to `CURRENT_HARNESS_VERSION` by registry tests); the feature
+/// defaults are the `[agentFeatures]` defaults this doctrine was written
+/// against (all on except the opt-in `taskGraph`), used to gate legacy
+/// NULL-snapshot sessions the way a live read would have when v1 was current.
+pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
+    version: "1.0",
+    harness: &V1,
+    doctrine: &DOCTRINE,
+    default_features: intent_core::settings_file::AgentFeaturesSettings::default,
+    feature_labels: FEATURE_LABELS,
+};
+
+/// Human-readable labels for every `agentFeatures` toggle v1 knows about.
+const FEATURE_LABELS: &[(&str, &str)] = &[
+    ("backgroundHooks", "Background hooks (ws.hook.*)"),
+    ("hostExec", "Host command execution (ws.host.exec)"),
+    ("scripts", "Saved scripts (ws.script.*)"),
+    ("terminalAccess", "Terminal read access (ws.terminal.*)"),
+    ("browserAutomation", "Browser automation (ws.browser.*)"),
+    ("richChatBlocks", "Rich chat block guidance"),
+    (
+        "structuredQuestions",
+        "Structured questions (ws.app.question.ask)",
+    ),
+    (
+        "attentionRequests",
+        "Attention requests (reportBlocker / requestDiscussion)",
+    ),
+    ("stateSnapshot", "Per-turn state snapshot line"),
+    ("prMonitor", "Centralized PR monitoring (ws.pr.monitor)"),
+    ("taskGraph", "Task-graph workflow teaching"),
+];
 
 /// The `\n\n---\n\n` separator every assembled-prompt layer is joined with.
 const LAYER_SEPARATOR: &str = "\n\n---\n\n";

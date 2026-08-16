@@ -3304,6 +3304,54 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         sandbox_branch: None,
     }
 }
+/// The `IS NULL` guard's race contract at the store level: the first
+/// materialization wins, and a second call with a DIFFERENT snapshot (the
+/// lost-race path — caller's in-memory session still NULL while the DB row
+/// was stamped concurrently) leaves the row untouched and returns the
+/// winner's snapshot. `updated_at` stays untouched throughout.
+#[tokio::test]
+async fn materialize_harness_features_first_write_wins() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let session = sample_agent_session(&agent_id, &ws);
+    let original_updated_at = session.updated_at.clone();
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let winner = serde_json::json!({"taskGraph": true});
+    let loser = serde_json::json!({"taskGraph": false});
+    let first = store
+        .materialize_agent_session_harness_features(&agent_id, &winner)
+        .await
+        .expect("first materialization");
+    assert_eq!(first, Some(winner.clone()), "first write persists");
+    let second = store
+        .materialize_agent_session_harness_features(&agent_id, &loser)
+        .await
+        .expect("second materialization");
+    assert_eq!(
+        second,
+        Some(winner),
+        "lost race adopts the winner's snapshot, not the loser's"
+    );
+    let row = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get session");
+    assert_eq!(
+        row.updated_at, original_updated_at,
+        "materialization must not touch updated_at"
+    );
+}
+
 #[tokio::test]
 async fn agent_session_round_trip_and_append_only_log() {
     let tmp = TempDb::new();
