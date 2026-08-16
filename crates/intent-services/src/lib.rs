@@ -9484,71 +9484,59 @@ pub(crate) fn format_completion_wake(
     stall: Option<&StallSuspicion>,
     watch_retired: bool,
 ) -> String {
-    let kind = match event.event_type.as_str() {
-        AGENT_IDLE => "completed",
-        AGENT_FAILED => "failed",
-        AGENT_DELETED => "was deleted",
-        other => other,
+    harness::latest().completion_wake(
+        &child_settlement_params(child_id, event, None, stall),
+        watch_retired,
+    )
+}
+
+/// Extract the data half of a child-settlement report from its `agent:*`
+/// event into the harness's typed params: resolve the display name, the
+/// report (an explicit `completion_report` wins; else the event's
+/// `completionReport`, canonical, falling back to the legacy `report` key),
+/// summary, error, attention fold, and stall context. Empty strings resolve
+/// to `None`; precedence between the fields is wording and lives in the
+/// harness.
+fn child_settlement_params<'a>(
+    child_id: &'a AgentId,
+    event: &'a Event,
+    completion_report: Option<&'a str>,
+    stall: Option<&'a StallSuspicion>,
+) -> harness::ChildSettlementParams<'a> {
+    let data_str = |key: &str| {
+        event
+            .data
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
     };
-    let label = event
-        .data
-        .get("agentName")
-        .and_then(|v| v.as_str())
-        .or(event.actor.name.as_deref())
-        .map(|name| format!("{name} ({})", child_id.0))
-        .unwrap_or_else(|| child_id.0.clone());
-    let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
-    let mut report_rendered = false;
-    if let Some(report) = event
-        .data
-        .get("completionReport")
-        .or_else(|| event.data.get("report"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        msg.push_str(&format!(" Report: {report}"));
-        report_rendered = true;
-    } else if let Some(summary) = event
-        .data
-        .get("lastResponseSummary")
-        .and_then(|v| v.as_str())
-    {
-        if !summary.is_empty() {
-            msg.push_str(&format!(" Summary: {summary}"));
-        }
+    let attention = data_str("attentionRequestKind").map(|kind| {
+        (
+            kind,
+            event
+                .data
+                .get("attentionRequestReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+    });
+    harness::ChildSettlementParams {
+        child_id: &child_id.0,
+        agent_name: event
+            .data
+            .get("agentName")
+            .and_then(|v| v.as_str())
+            .or(event.actor.name.as_deref()),
+        event_type: &event.event_type,
+        completion_report: completion_report
+            .filter(|r| !r.is_empty())
+            .or_else(|| data_str("completionReport"))
+            .or_else(|| data_str("report")),
+        last_response_summary: data_str("lastResponseSummary"),
+        error: data_str("error"),
+        attention,
+        stall: stall.map(|s| (s.task_title.as_str(), s.task_status.as_str())),
     }
-    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            msg.push_str(&format!(" Error: {err}"));
-        }
-    }
-    // monorepo#1898: the stall suspicion and the report can come from
-    // different session reads, so the tail is derived from what was actually
-    // rendered — a wake carrying a `Report:` clause never gets the
-    // contradictory "No completion report … may have stalled" suffix.
-    if let Some(stall) = stall {
-        if !report_rendered {
-            msg.push_str(&stall.annotation_suffix());
-        }
-    }
-    if watch_retired {
-        // A deleted agent fails closed in `agent.watch` (rejected as unknown)
-        // and has no next completion, so the deleted-kind wake must not carry
-        // the re-arm pointer — say the agent cannot be re-watched instead.
-        if event.event_type == AGENT_DELETED {
-            msg.push_str(
-                " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
-                 now retired. The agent was deleted, so it cannot be re-watched.",
-            );
-        } else {
-            msg.push_str(&format!(
-                " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
-                 retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
-                child_id.0
-            ));
-        }
-    }
-    msg
 }
 
 /// Build one per-child summary line for a delegation group's aggregated wake.
@@ -9564,79 +9552,12 @@ pub(crate) fn format_group_child_line(
     completion_report: Option<&str>,
     stall: Option<&StallSuspicion>,
 ) -> String {
-    let kind = match event.event_type.as_str() {
-        AGENT_IDLE => "completed",
-        AGENT_FAILED => "failed",
-        AGENT_DELETED => "was deleted",
-        other => other,
-    };
-    let label = event
-        .data
-        .get("agentName")
-        .and_then(|v| v.as_str())
-        .or(event.actor.name.as_deref())
-        .map(|name| format!("{name} ({})", child_id.0))
-        .unwrap_or_else(|| child_id.0.clone());
-    let mut line = format!("- {label} {kind}.");
-    let mut report_rendered = false;
-    if let Some(report) = completion_report
-        .or_else(|| {
-            event
-                .data
-                .get("completionReport")
-                .or_else(|| event.data.get("report"))
-                .and_then(|v| v.as_str())
-        })
-        .filter(|r| !r.is_empty())
-    {
-        line.push_str(&format!(" Report: {report}"));
-        report_rendered = true;
-    } else if let Some(summary) = event
-        .data
-        .get("lastResponseSummary")
-        .and_then(|v| v.as_str())
-    {
-        if !summary.is_empty() {
-            line.push_str(&format!(" Summary: {summary}"));
-        }
-    }
-    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            line.push_str(&format!(" Error: {err}"));
-        }
-    }
-    // Pending attention request (agent:attention-requested): the child's
-    // immediate parent wake already fired at raise time (the alert); the
-    // aggregated line carries the kind-flavored attention text as the record
-    // (annotated onto the event data by the group-record sites from the
-    // persisted session fields).
-    if let Some(kind) = event
-        .data
-        .get("attentionRequestKind")
-        .and_then(|v| v.as_str())
-        .filter(|k| !k.is_empty())
-    {
-        let verb = if kind == "blocker" {
-            "Reported a blocker"
-        } else {
-            "Requested a discussion"
-        };
-        let reason = event
-            .data
-            .get("attentionRequestReason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        line.push_str(&format!(" {verb}: {reason}"));
-    }
-    // monorepo#1898: same consistency guard as `format_completion_wake` —
-    // never append the "No completion report" tail to a line that already
-    // rendered a `Report:` clause.
-    if let Some(stall) = stall {
-        if !report_rendered {
-            line.push_str(&stall.annotation_suffix());
-        }
-    }
-    line
+    harness::latest().group_child_line(&child_settlement_params(
+        child_id,
+        event,
+        completion_report,
+        stall,
+    ))
 }
 
 /// A suspected-stall completion (monorepo#1016): the child went idle WITHOUT
@@ -9652,16 +9573,6 @@ pub(crate) struct StallSuspicion {
 }
 
 impl StallSuspicion {
-    /// The suffix appended to the wake text / per-child group line.
-    pub(crate) fn annotation_suffix(&self) -> String {
-        format!(
-            " No completion report and assigned task \"{}\" is still {} — the agent may have \
-             stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
-             resume it.",
-            self.task_title, self.task_status
-        )
-    }
-
     /// Fields merged into the event's `data` so the FE metadata (and the
     /// grouped raw_events) carry the machine-readable flag.
     pub(crate) fn annotate_event_data(&self, data: &mut serde_json::Value) {
@@ -9750,15 +9661,7 @@ pub(crate) fn format_group_wake(group: &agent_subscriptions::DelegationGroup) ->
         .iter()
         .any(|e| e.event_type == AGENT_FAILED);
     let partial = !group.deleted_agent_ids.is_empty() || any_failed;
-    let status = if partial { "partial" } else { "completed" };
-    let mut msg = format!(
-        "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
-    );
-    for line in &group.event_summaries {
-        msg.push('\n');
-        msg.push_str(line);
-    }
-    msg
+    harness::latest().group_settlement_wake(total, partial, &group.event_summaries)
 }
 
 /// Human-readable identifier for a `@@@task` block in conversion warnings:

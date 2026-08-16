@@ -68,19 +68,16 @@ fn title_case_ascii(s: &str) -> String {
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
-/// blindly re-report the same content (duplicate parent wake).
+/// blindly re-report the same content (duplicate parent wake). Wording owned
+/// by the harness (H6).
 pub(crate) fn stale_redrive_note(report_timestamp: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued before you completed; your completion report \
-         was already delivered to your parent at {report_timestamp}. Only call reportToParent \
-         again if this message materially changes the outcome — do not re-send the same report."
-    )
+    crate::harness::latest().stale_redrive_note(report_timestamp)
 }
 
 /// Stable prefix of [`stale_redrive_note`], used to keep the annotation
-/// idempotent when a stale entry is requeued and redriven again.
-const STALE_REDRIVE_NOTE_PREFIX: &str =
-    "[SYSTEM NOTE] This message was queued before you completed";
+/// idempotent when a stale entry is requeued and redriven again. Owned by
+/// the harness (H6) alongside the note wording.
+use crate::harness::v1::STALE_REDRIVE_NOTE_PREFIX;
 
 /// Deterministic system note appended to a drained queue entry so the
 /// target agent knows when the message entered the queue and how long it
@@ -88,20 +85,17 @@ const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// are NOT annotated — the note is applied only on the queue-drain paths,
 /// and only when the wait reached [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`]
 /// (monorepo#2353). Coexists with the #576 stale-redrive note (both may
-/// appear).
+/// appear). Wording owned by the harness (H6).
 pub(crate) fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
-    )
+    crate::harness::latest().dequeue_wait_note(queued_at, waited)
 }
 
 /// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
 /// idempotent when an already-annotated entry is requeued and drained again
 /// (the original wait deliberately stays — a terminal-failure requeue keeps
-/// its first-delivery numbers). Distinct from [`STALE_REDRIVE_NOTE_PREFIX`]
-/// ("…queued before you completed"), so the two checks never shadow each
-/// other.
-const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+/// its first-delivery numbers). Owned by the harness (H6) alongside the note
+/// wording.
+use crate::harness::v1::DEQUEUE_WAIT_NOTE_PREFIX;
 
 /// Minimum wait (milliseconds) before a drained entry earns the dequeue-wait
 /// annotation (monorepo#2353). Incidental queue hops — e.g. a question-wizard
@@ -127,16 +121,9 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
 /// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
+/// Wording owned by the harness (H6).
 pub(crate) fn format_wait_duration(secs: i64) -> String {
-    let secs = secs.max(0);
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
+    crate::harness::latest().wait_duration(secs)
 }
 
 /// Dequeue-wait annotation: appends [`dequeue_wait_note`] to a drained
@@ -7321,28 +7308,21 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
 }
 
 /// The system notice appended after note-referenced images are inlined
-/// (Fidelity B, PROTOCOL §5.5).
+/// (Fidelity B, PROTOCOL §5.5). Wording owned by the harness (H6).
 pub(crate) fn note_images_notice(n: usize) -> String {
-    format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+    crate::harness::latest().note_images_notice(n)
 }
 
 /// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
 /// `ws.file.getAttachment` retrieval instruction — the file bytes never ride
-/// the prompt for reference blocks.
+/// the prompt for reference blocks. Wording owned by the harness (H6).
 pub(crate) fn attachment_reference_notice(
     name: &str,
     mime: Option<&str>,
     size: Option<u64>,
     id: &str,
 ) -> String {
-    let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
-    let size_note = size.map(|s| format!(", {s} bytes")).unwrap_or_default();
-    format!(
-        "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
-         file is NOT inlined in this message. Call \
-         ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
-         then read it from the returned path.]"
-    )
+    crate::harness::latest().attachment_reference_notice(name, mime, size, id)
 }
 
 /// Push one content block per well-formed file entry: inline
@@ -9840,7 +9820,8 @@ fn idle_timeout_turn_streamed(err: &Error) -> bool {
 /// Render the warn-and-continue message injected after an idle timeout. The
 /// window is the ACTUAL configured value ([`intent_acp::session::prompt_idle_timeout`],
 /// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
-/// literal.
+/// literal. Wording owned by the harness (H6); the caller renders the
+/// seconds value (integer form for whole windows, float otherwise).
 pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     let secs = window.as_secs_f64();
     let rendered = if secs.fract() == 0.0 {
@@ -9848,13 +9829,7 @@ pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     } else {
         secs.to_string()
     };
-    format!(
-        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
-         and was interrupted. If you were waiting on something external, schedule a \
-         `ws.hook.schedule` background hook to watch the condition and end your turn instead \
-         of blocking — the hook's wake message resumes you. Assess where you left off and \
-         continue the work."
-    )
+    crate::harness::latest().idle_timeout_warning(&rendered)
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign

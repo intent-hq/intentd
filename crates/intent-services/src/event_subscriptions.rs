@@ -443,6 +443,8 @@ fn normalize_batch_window_ms(batch_window: Option<i64>) -> i64 {
 
 /// Human-readable wake text summarizing one delivered batch (the FE-visible
 /// `event_notification` metadata carries the structured per-event payload).
+/// Wording owned by the harness (H6); this resolves the deduplicated
+/// first-seen type list.
 pub(crate) fn format_event_subscription_wake(events: &[&Event]) -> String {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut types: Vec<&str> = Vec::new();
@@ -451,11 +453,7 @@ pub(crate) fn format_event_subscription_wake(events: &[&Event]) -> String {
             types.push(e.event_type.as_str());
         }
     }
-    format!(
-        "[WORKSPACE EVENTS] {} event(s) matched your subscription: {}.",
-        events.len(),
-        types.join(", ")
-    )
+    crate::harness::latest().event_subscription_wake(events.len(), &types)
 }
 
 /// In-memory → persisted row. `None` for front-door subscriptions (no
