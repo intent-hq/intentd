@@ -722,9 +722,9 @@ pub struct AgentFeaturesSettings {
     pub attention_requests: bool,
     /// `agentFeatures.stateSnapshot` — inject the per-turn agent state
     /// snapshot line (`current ws.agent.snapshot() => {...}`) into outbound
-    /// turn prompts. Unlike the other toggles this is read LIVE each turn —
-    /// flipping it affects the very next turn of every session, existing
-    /// ones included. The `ws.agent.snapshot()` MCP tool itself is never
+    /// turn prompts. Captured into the per-session harness feature snapshot
+    /// at creation like the other toggles, so flipping it applies to new
+    /// sessions only. The `ws.agent.snapshot()` MCP tool itself is never
     /// gated.
     pub state_snapshot: bool,
     /// `agentFeatures.prMonitor` — expose centralized PR monitoring
@@ -1360,8 +1360,7 @@ structuredQuestions = true
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
 # State snapshot -- inject the per-turn agent state snapshot line into turn
-# prompts; unlike the other toggles this applies to the next turn of every
-# session (live), existing sessions included.
+# prompts.
 stateSnapshot = true
 # PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
 # ws.pr.unmonitor) to agents.

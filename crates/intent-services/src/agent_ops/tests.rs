@@ -24038,6 +24038,53 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     assert_eq!(parsed["pendingAttention"], json!("blocker"));
 }
 
+/// Regression (snapshot gating): the injection line follows the session's
+/// captured harness feature snapshot, not the live setting — flipping
+/// `agentFeatures.stateSnapshot` after creation never changes an existing
+/// session's injection, while a session created after the flip captures the
+/// new value. The `ws.agent.snapshot()` op itself stays un-gated.
+#[tokio::test]
+async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
+    let (_t, svc, ws, registry, _cfg) = setup_with_task_graph(false).await;
+    let before = create_agent(&svc, &ws, "Before").await;
+    svc.enqueue_message(&before, "pending".into(), None, None, None, None, false);
+    assert!(
+        svc.agent_state_snapshot_line(&before).await.is_some(),
+        "stamped-on session injects"
+    );
+
+    registry
+        .apply(&[("agentFeatures.stateSnapshot".into(), json!(false))])
+        .expect("flip off");
+    assert!(
+        svc.agent_state_snapshot_line(&before).await.is_some(),
+        "a live flip must not change an existing session's injection"
+    );
+
+    let after = create_agent(&svc, &ws, "After").await;
+    svc.enqueue_message(&after, "pending".into(), None, None, None, None, false);
+    assert_eq!(
+        svc.agent_state_snapshot_line(&after).await,
+        None,
+        "session created after the flip captures stateSnapshot off"
+    );
+    // The MCP snapshot op is never gated by the toggle.
+    let v = svc
+        .agent_snapshot_op(ws.clone(), after.clone())
+        .await
+        .expect("snapshot op un-gated");
+    assert_eq!(v["queuedMessages"], json!(1));
+
+    registry
+        .apply(&[("agentFeatures.stateSnapshot".into(), json!(true))])
+        .expect("flip back on");
+    assert_eq!(
+        svc.agent_state_snapshot_line(&after).await,
+        None,
+        "captured-off session stays gated after the setting flips back on"
+    );
+}
+
 /// A settled (terminal) child no longer counts toward `runningSubAgents`.
 #[tokio::test]
 async fn agent_snapshot_excludes_settled_children() {

@@ -7442,18 +7442,20 @@ impl Services {
     }
 
     /// The per-turn snapshot injection line for `agent_id`, or `None` when
-    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off
-    /// (read LIVE each turn — a deliberate deviation from the
-    /// captured-at-creation agentFeatures convention, so flipping the toggle
-    /// affects the very next turn of every session), the snapshot is trivial
-    /// (every field other than `time` zero/absent — `time` alone never forces
-    /// an injection), or the snapshot could not be built (fails open to no
-    /// line so a store error never blocks a turn).
+    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off in
+    /// the session's captured harness feature snapshot
+    /// ([`Services::session_agent_features`] — like every other toggle,
+    /// flipping the setting affects new sessions only; legacy NULL-snapshot
+    /// rows fall back to the live settings until their first-activation
+    /// freeze), the snapshot is trivial (every field other than `time`
+    /// zero/absent — `time` alone never forces an injection), or the
+    /// snapshot could not be built (fails open to no line so a store error
+    /// never blocks a turn).
     pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
-        if !self.effective_settings().agent_features.state_snapshot {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        if !self.session_agent_features(&session).state_snapshot {
             return None;
         }
-        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let snapshot = self.build_agent_snapshot(&session).await.ok()?;
         if snapshot.is_trivial() {
             return None;
