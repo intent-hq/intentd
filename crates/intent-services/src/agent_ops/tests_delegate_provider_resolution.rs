@@ -88,6 +88,11 @@ async fn delegate_with_no_explicit_model_resolves_configured_default_provider() 
         .await
         .expect("delegate resolves the configured default");
     let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        resp["provider"].as_str(),
+        Some("mock"),
+        "delegate result surfaces the resolved provider (PROTOCOL §5.5): {resp}"
+    );
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
     assert_eq!(
@@ -278,6 +283,10 @@ async fn delegate_with_nothing_configured_leaves_provider_unset() {
         .await
         .expect("delegate succeeds with nothing configured");
     let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert!(
+        resp.get("provider").is_none(),
+        "delegate result omits `provider` when the session has none (never null): {resp}"
+    );
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
     assert_eq!(got.provider, None, "no configured default to resolve to");
@@ -306,6 +315,11 @@ async fn delegate_with_explicit_model_skips_d2_resolution() {
         .await
         .expect("explicit model bypasses D2 entirely, so the unavailable default never errors");
     let agent_id = intent_core::AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    assert_eq!(
+        resp["provider"].as_str(),
+        Some("opencode"),
+        "delegate result surfaces the compound-model provider prefix: {resp}"
+    );
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
     assert_eq!(

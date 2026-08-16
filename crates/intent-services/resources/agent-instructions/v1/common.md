@@ -15,6 +15,14 @@ ws.agent.delegate({ taskNoteId: "abc-123", waitMode: "after_all" })
 ws.agent.delegate({ taskNoteId: "def-456", waitMode: "after_all" })
 ```
 
+### Task relations during delegation
+
+Delegate tasks individually with `ws.agent.delegate({ taskNoteId, specialist, model, ... })`, choosing the specialist and model per task, in the batch sizes your workflow calls for — an individual delegation starts its task as asked, without enforcing relations. Task relations (`dependsOn`/`conflictsWith`) declared on the tasks feed back through batch results and wake messages:
+
+- **Batch results report graph state.** A batch call (`tasks: [taskNoteId, ...]`) starts only the tasks whose relations allow it; each result carries a disposition (`started` / `held:blocked-on-deps` / `held:conflict` / `skipped`; every non-started row names a reason), and `unlockPlan` names which held tasks become startable when the running set settles. With effort estimates on the tasks, `unlockPlan.criticalPathMinutes` estimates the serial work remaining — reported when any requested chain carries an explicit estimate, and reflecting only estimated chains, so it can understate when an unestimated chain is longer.
+- **Holds are advisory, not final.** A task held on an unmet dependency or a conflict with a running task is not auto-started later — delegate it yourself when the blocker clears, or proceed deliberately if you know better. A held task whose dependency was cancelled or deleted comes back flagged "decision needed": resolve it with the user rather than re-delegating in a loop. A dependency whose agent failed is not flagged — it stays plain `held:blocked-on-deps`, so check the dependency's task status if a hold persists.
+- **Completion wakes name newly unblocked tasks.** When a delegated task's completion makes other tasks startable, the wake message carries an advisory section — `Tasks now unblocked by this completion: [Title](intent://local/task/{id}) (deps satisfied)` / `(conflict cleared)` — computed fresh when the wake is delivered, so it reflects current task state even if the wake sat queued behind your busy turn; several completions delivered together coalesce into one section headed `Tasks now unblocked by these completions:`. Treat it as a hint, not an action: nothing auto-starts, so delegate the unblocked tasks you want started next. An entry annotated "needs attention" (waiting / discussion_needed / blocked / review_required) is unblocked on relations but sitting in an attention state — delegate will still start it, so resolve the attention state before (re)starting it.
+
 Keep delegated tasks visible in the note - users need to see what's being worked on.
 
 ## GitHub & Git Operations

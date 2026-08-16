@@ -10,17 +10,26 @@
 # the installed binary.
 #
 # After a successful install it offers to register a per-user Scheduled Task
-# ("intentd") that runs `intentd serve --resume-all` at logon, and starts it
-# now. The prompt only appears on an interactive console and never hangs in
+# ("intentd") that runs `intentd serve` at logon, and starts it now. The
+# prompt only appears on an interactive console and never hangs in
 # non-interactive runs (default: skip with a hint). Force either way:
 #
 #   $env:INTENTD_INSTALL_SERVICE = '1'  (or -Service, on direct runs)     set up
 #   $env:INTENTD_INSTALL_SERVICE = '0'  (or -NoService, on direct runs)   skip
 #
+# When the task is set up, the installer also asks whether the service should
+# auto-resume interrupted agents at startup (the daemon setting
+# agents.resumeInterruptedOnStart). The default 'auto' resumes only on
+# headless hosts, so answering auto — or a non-interactive run — writes
+# nothing; on/off are applied via `intentd settings` once the daemon is up.
+# $env:INTENTD_AUTO_RESUME = 'auto'|'on'|'off' (or -AutoResume <value>, on
+# direct runs) forces an answer.
+#
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
     [switch]$Service,
-    [switch]$NoService
+    [switch]$NoService,
+    [string]$AutoResume = ''
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
@@ -34,6 +43,25 @@ $Archive = 'intentd-x86_64-pc-windows-msvc.zip'
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne 'AMD64') {
     throw "install.ps1: unsupported architecture '$arch' (only x86_64/AMD64 Windows builds are published)"
+}
+
+# Validate -AutoResume and INTENTD_AUTO_RESUME before any download so garbage
+# fails fast (matching install.sh) instead of aborting mid-install after the
+# binary is already on disk. Both consumed in the service branch below, where
+# the parameter beats the env var.
+$autoResumeArg = ''
+if ($AutoResume) {
+    $autoResumeArg = $AutoResume.Trim().ToLowerInvariant()
+    if (@('auto', 'on', 'off') -notcontains $autoResumeArg) {
+        throw "install.ps1: invalid -AutoResume value '$AutoResume' (expected auto, on, or off)"
+    }
+}
+$autoResumeEnv = ''
+if ($env:INTENTD_AUTO_RESUME) {
+    $autoResumeEnv = $env:INTENTD_AUTO_RESUME.Trim().ToLowerInvariant()
+    if (@('auto', 'on', 'off') -notcontains $autoResumeEnv) {
+        throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
+    }
 }
 
 $installDir = if ($env:INTENTD_INSTALL_DIR) {
@@ -125,6 +153,29 @@ if (-not $serviceMode) {
 }
 
 if ($serviceMode -eq 'yes') {
+    # Auto-resume choice: parameter beats the env var beats the prompt (both
+    # validated up front); 'auto' — or a non-interactive run — is the daemon
+    # default and writes nothing. Applied via `intentd settings` after the
+    # wait-for-daemon loop below, so on a re-install over an existing data dir
+    # the first service start still runs under the prior effective setting.
+    $autoResume = ''
+    if ($autoResumeArg) {
+        $autoResume = $autoResumeArg
+    } elseif ($autoResumeEnv) {
+        $autoResume = $autoResumeEnv
+    } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $reply = (Read-Host 'Auto-resume interrupted agents when the service starts? [auto/on/off] (default auto)').Trim().ToLowerInvariant()
+        if (@('on', 'off') -contains $reply) {
+            $autoResume = $reply
+        } else {
+            if ($reply -and $reply -ne 'auto') {
+                Write-Warning "install.ps1: unrecognized answer '$reply' - keeping the default (auto)"
+            }
+            $autoResume = 'auto'
+        }
+    } else {
+        $autoResume = 'auto'
+    }
     # Per-user Scheduled Task at logon: no admin rights needed, and -Force
     # makes re-runs update the existing task instead of duplicating it.
     $taskName = if ($env:INTENTD_SERVICE_NAME) { $env:INTENTD_SERVICE_NAME } else { 'intentd' }
@@ -133,9 +184,9 @@ if ($serviceMode -eq 'yes') {
     # wrap through cmd (the quotes survive & and spaces in the path).
     $action = if ($env:INTENTD_DATA_DIR) {
         New-ScheduledTaskAction -Execute $env:ComSpec `
-            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve --resume-all')
+            -Argument ('/d /c set "INTENTD_DATA_DIR=' + $env:INTENTD_DATA_DIR + '" && "' + $dest + '" serve')
     } else {
-        New-ScheduledTaskAction -Execute $dest -Argument 'serve --resume-all'
+        New-ScheduledTaskAction -Execute $dest -Argument 'serve'
     }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     # S4U logon: the task runs as this user with the profile loaded but outside
@@ -174,6 +225,17 @@ if ($serviceMode -eq 'yes') {
         Write-Host "install.ps1: daemon is up - 'intentd status' responds"
     } else {
         Write-Warning "install.ps1: daemon did not respond within 60s - it may still be downloading; check later with: intentd status"
+    }
+    # 'auto' is the daemon default — nothing to write. A failure is a warning,
+    # not a fatal install error: the setting can be changed later with the
+    # same command.
+    if (@('on', 'off') -contains $autoResume) {
+        & $dest settings agents.resumeInterruptedOnStart $autoResume *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "install.ps1: auto-resume on service start set to '$autoResume' (agents.resumeInterruptedOnStart)"
+        } else {
+            Write-Warning "install.ps1: could not set agents.resumeInterruptedOnStart=$autoResume - set it later with: intentd settings agents.resumeInterruptedOnStart $autoResume"
+        }
     }
     Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
 } else {

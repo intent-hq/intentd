@@ -65,9 +65,11 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -106,7 +108,8 @@ async fn note_add_edit_edit_lines() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     let note_id = note.id.clone();
 
     // Test note.add
@@ -190,7 +193,8 @@ async fn note_list_tasks() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     // List tasks
     let tasks = services
@@ -226,7 +230,8 @@ async fn note_update_metadata() {
     let note = services
         .create_note(ws.clone(), create_input, None, None)
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     // Update metadata (title and tags)
     let update_result = services

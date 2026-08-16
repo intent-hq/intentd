@@ -150,6 +150,63 @@ pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Worktree-relative submodule `path` entries parsed from `.gitmodules`
+/// content (multi git root tracking, monorepo#2053). A tolerant INI-ish
+/// parse: only `path = <value>` lines inside `[submodule "..."]` sections
+/// count, order is preserved, duplicates are dropped, and unsafe values
+/// (empty, absolute on ANY platform, containing `..`) are skipped — the
+/// background sweep joins these against the worktree root, and `Path::join`
+/// REPLACES the base when handed an absolute path, so a hostile
+/// `.gitmodules` must never smuggle one in. `/`-rooted, Windows
+/// drive-absolute (`C:\...`, `C:/...`), and UNC (`\\server\...`) forms are
+/// all rejected regardless of the host platform.
+pub(crate) fn parse_gitmodules_paths(content: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_submodule_section = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_submodule_section = line.starts_with("[submodule");
+            continue;
+        }
+        if !in_submodule_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "path" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty()
+            || is_any_platform_absolute(value)
+            || value.split(['/', '\\']).any(|seg| seg == "..")
+        {
+            continue;
+        }
+        if !paths.iter().any(|p| p == value) {
+            paths.push(value.to_string());
+        }
+    }
+    paths
+}
+
+/// True when `value` is absolute in ANY platform's spelling — POSIX
+/// `/`-rooted, Windows drive-absolute (`C:\` / `C:/`), or UNC / rooted
+/// backslash (`\\server\share`, `\foo`). Checked textually (not via
+/// `Path::is_absolute`, which is host-platform-specific) because a hostile
+/// `.gitmodules` written on one platform can be swept on another.
+fn is_any_platform_absolute(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with('\\') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    // Windows drive prefix: ASCII letter + `:` (covers `C:\`, `C:/`, and the
+    // drive-relative `C:foo`, which still escapes the worktree on Windows).
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Normalize `git.diffs` `paths` entries against the worktree root
 /// (defense-in-depth, mirroring `git.showFile`'s absolute→relative
 /// conversion): an entry under `<worktree>/` is stripped to its
@@ -404,7 +461,19 @@ pub(crate) fn build_diffs(
                     continue;
                 }
             }
-            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_binary {
+            // A gitlink delta has no blob content for libgit2 to patch, so
+            // synthesize the `Subproject commit <sha>` pseudo-hunk from the
+            // pin SHAs (monorepo#1739). Only the gitlink side(s) contribute a
+            // pin line — on a gitlink↔file type change the regular side's
+            // blob is never rendered as a pin.
+            let gitlink_hunks;
+            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_gitlink() {
+                gitlink_hunks = intent_git::diff::gitlink_hunks(
+                    entry.file.gitlink_old_sha(),
+                    entry.file.gitlink_new_sha(),
+                );
+                &gitlink_hunks
+            } else if entry.file.is_binary {
                 &[]
             } else {
                 &entry.hunks
@@ -443,7 +512,13 @@ pub(crate) fn build_diffs(
                 continue;
             }
         }
-        let hunks = if fd.is_binary {
+        let hunks = if fd.is_gitlink() {
+            // Gitlink pins are commit SHAs in the submodule's odb — not blobs
+            // here — so `hunks_between` cannot hydrate them; synthesize the
+            // `Subproject commit <sha>` pseudo-hunk instead (monorepo#1739),
+            // from the pin side(s) only.
+            intent_git::diff::gitlink_hunks(fd.gitlink_old_sha(), fd.gitlink_new_sha())
+        } else if fd.is_binary {
             Vec::new()
         } else {
             intent_git::diff::hunks_between(
@@ -580,8 +655,24 @@ pub(crate) fn build_branch_diff(
         // pre-images for added files and empty post-images for deletions.
         // Any other error (revparse failure, repository IO) is a real problem
         // — surface it instead of silently returning empty content.
-        let old_content = intent_git::show::show_file(worktree, &boundary, &fd.path)?;
-        let new_content = intent_git::show::show_file(worktree, target_ref, &fd.path)?;
+        // A gitlink side is not a blob (`show_file` would fail typed
+        // `NotAFile` and sink the whole call), so synthesize the same
+        // `Subproject commit <sha>` pseudo-content `git.diffs` renders
+        // (monorepo#1739); a missing side stays empty content.
+        let pin_content = |sha: Option<&str>| {
+            sha.map(|s| format!("Subproject commit {s}\n"))
+                .unwrap_or_default()
+        };
+        let old_content = if fd.old_is_gitlink {
+            pin_content(fd.gitlink_old_sha())
+        } else {
+            intent_git::show::show_file(worktree, &boundary, &fd.path)?
+        };
+        let new_content = if fd.new_is_gitlink {
+            pin_content(fd.gitlink_new_sha())
+        } else {
+            intent_git::show::show_file(worktree, target_ref, &fd.path)?
+        };
         out.push(json!({
             "file": fd.path,
             "chunks": Vec::<Value>::new(),
@@ -649,6 +740,65 @@ fn line_to_value(l: &intent_git::diff::DiffLine) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_gitmodules_paths_extracts_submodule_paths() {
+        let content = "[submodule \"packages/intentd\"]\n\
+             \tpath = packages/intentd\n\
+             \turl = https://github.com/intent-hq/intentd.git\n\
+             [submodule \"packages/fe\"]\n\
+             \tpath = packages/fe\n\
+             \turl = git@github.com:intent-hq/cloudlands-fe.git\n\
+             \tupdate = none\n";
+        assert_eq!(
+            parse_gitmodules_paths(content),
+            vec!["packages/intentd".to_string(), "packages/fe".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_gitmodules_paths_skips_unsafe_and_foreign_entries() {
+        // `path` keys outside a submodule section, absolute paths, traversal
+        // segments, empty values, and duplicates are all dropped.
+        let content = "[core]\n\
+             \tpath = not-a-submodule\n\
+             [submodule \"a\"]\n\
+             \tpath = /abs/path\n\
+             [submodule \"b\"]\n\
+             \tpath = ../escape\n\
+             [submodule \"c\"]\n\
+             \tpath =\n\
+             [submodule \"d\"]\n\
+             \tpath = sub\n\
+             [submodule \"e\"]\n\
+             \tpath = sub\n";
+        assert_eq!(parse_gitmodules_paths(content), vec!["sub".to_string()]);
+    }
+
+    #[test]
+    fn parse_gitmodules_paths_rejects_windows_absolute_and_unc_entries() {
+        // Windows drive-absolute, drive-relative, UNC, and rooted-backslash
+        // values must be dropped on every host platform: `Path::join`
+        // replaces the base for absolute paths, so any of these escaping the
+        // guard would let a hostile `.gitmodules` register an arbitrary
+        // host repo.
+        let content = "[submodule \"a\"]\n\
+             \tpath = C:\\evil\\repo\n\
+             [submodule \"b\"]\n\
+             \tpath = c:/evil/repo\n\
+             [submodule \"c\"]\n\
+             \tpath = C:relative-but-drive-qualified\n\
+             [submodule \"d\"]\n\
+             \tpath = \\\\server\\share\\repo\n\
+             [submodule \"e\"]\n\
+             \tpath = \\rooted\\backslash\n\
+             [submodule \"f\"]\n\
+             \tpath = safe/sub\n";
+        assert_eq!(
+            parse_gitmodules_paths(content),
+            vec!["safe/sub".to_string()]
+        );
+    }
 
     #[test]
     fn normalize_diff_paths_strips_absolute_entries_under_the_worktree() {
@@ -752,5 +902,79 @@ mod tests {
         assert!(assert_agent_commit_allowed(true, false).is_ok());
         assert!(assert_agent_commit_allowed(false, true).is_ok());
         assert!(assert_agent_commit_allowed(true, true).is_ok());
+    }
+
+    /// `git.branchDiff` on a range containing a gitlink pin bump synthesizes
+    /// `Subproject commit <sha>` pseudo-content instead of failing the whole
+    /// call with the typed `NotAFile` error `show_file` now returns for
+    /// non-blob entries (monorepo#1739 review follow-up).
+    #[test]
+    fn branch_diff_gitlink_bump_synthesizes_pin_content() {
+        let dir = std::env::temp_dir().join(format!("intentd-bdgl-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Test").unwrap();
+        cfg.set_str("user.email", "test@example.com").unwrap();
+        let sig = repo.signature().unwrap();
+        let commit = |repo: &git2::Repository, msg: &str, parents: &[&git2::Commit]| {
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, parents)
+                .unwrap()
+        };
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("seed.txt")).unwrap();
+        let old_pin = "7257a190564088376227525989c4994e46082ad1";
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: git2::Oid::from_str(old_pin).unwrap(),
+                flags: 0,
+                flags_extended: 0,
+                path: b"sub".to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        let base_oid = commit(&repo, "base with gitlink", &[]);
+        let base = repo.find_commit(base_oid).unwrap();
+        // Bump the pin on the branch tip.
+        let new_pin = "7908777602d4e96f13c663c8a70a617163f38413";
+        let mut index = repo.index().unwrap();
+        index
+            .add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: 0o160000,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: git2::Oid::from_str(new_pin).unwrap(),
+                flags: 0,
+                flags_extended: 0,
+                path: b"sub".to_vec(),
+            })
+            .unwrap();
+        index.write().unwrap();
+        commit(&repo, "bump gitlink", &[&base]);
+
+        let result =
+            build_branch_diff(&dir, None, Some(&base_oid.to_string()), "HEAD", None).unwrap();
+        let items = result.as_array().unwrap();
+        let sub = items.iter().find(|i| i["file"] == "sub").unwrap();
+        assert_eq!(sub["oldContent"], format!("Subproject commit {old_pin}\n"));
+        assert_eq!(sub["newContent"], format!("Subproject commit {new_pin}\n"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -50,3 +50,11 @@ pub fn iso_minutes_ago(minutes: i64) -> String {
         .format(&Rfc3339)
         .unwrap_or_default()
 }
+
+/// UTC timestamp `ms` milliseconds in the future, as an RFC-3339 string. Backs
+/// the delete grace window's `deleteAt` deadline (`now + undoDelayMs`, §5.1).
+pub fn iso_ms_from_now(ms: u64) -> String {
+    (OffsetDateTime::now_utc() + Duration::milliseconds(ms as i64))
+        .format(&Rfc3339)
+        .unwrap_or_default()
+}

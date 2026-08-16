@@ -62,9 +62,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -907,13 +909,16 @@ async fn agent_bindings_send_single_pending_message_guard() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
     services
         .mark_as_task(
             ws.clone(),
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )
@@ -1497,7 +1502,8 @@ async fn note_bindings_edit_and_edit_lines() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let agent_val = services
         .agent_create(

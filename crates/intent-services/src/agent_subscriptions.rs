@@ -121,6 +121,19 @@ pub(crate) struct SubscriptionRegistry {
     pub delegation_groups: Vec<DelegationGroup>,
 }
 
+/// Which call site is running
+/// [`Services::reconcile_watch_child_on_rehydration`] (monorepo#2532): a NEW
+/// explicit registration (`agent.watch` / `app.agents.waitFor`) asks for the
+/// child's NEXT completion — a reported idle child still owning active hooks
+/// or PR monitors defers instead of firing instantly with the stale report —
+/// while boot REHYDRATION keeps report-equals-settlement semantics (a missed
+/// wake must deliver at boot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchReconcileCallSite {
+    Registration,
+    Rehydration,
+}
+
 /// The shared registration safety gate: a non-chief parent may only watch
 /// children inside its own workspace; a chief-workspace parent may watch any
 /// agent. Enforced in [`Services::register_completion_watch`] (the single
@@ -286,6 +299,12 @@ impl Services {
                     existing.group_id = Some(gid);
                 }
                 existing.wake_on_attention = existing.wake_on_attention || wake_on_attention;
+                // monorepo#2532: adoption expresses fresh interest in the
+                // child's NEXT completion — clear the report-time disarm so
+                // a re-armed watch fires on the next `agent:idle` (mirrors
+                // the failure-wake dedup clear below). Persisted by the
+                // callers' write-through upsert of the returned watch.
+                existing.report_delivered = false;
                 // Refresh the parent display name and home-workspace anchor
                 // from the current registration (mirroring
                 // `find_and_refresh_ungrouped_watch`): a watch created with
@@ -396,7 +415,7 @@ impl Services {
         new_parent_name: Option<String>,
         resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
-        let (id, name, home_ws, changed) = {
+        let (id, name, home_ws, changed, rearmed) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -421,29 +440,47 @@ impl Services {
                     changed = true;
                 }
             }
+            // monorepo#2532: every reuse call site expresses fresh interest
+            // in the child's NEXT completion (delegate/create/wakeOrCreate/
+            // sender auto-subscribe) — clear the report-time disarm so the
+            // reused watch fires on the next `agent:idle` instead of
+            // silently retiring (mirrors the `insert_watch_in_memory`
+            // adoption reset).
+            let rearmed = std::mem::replace(&mut watch.report_delivered, false);
             (
                 watch.id.clone(),
                 watch.parent_agent_name.clone(),
                 watch.parent_workspace_id.clone(),
                 changed,
+                rearmed,
             )
         };
-        // Best-effort DB sync of the refreshed name/anchor (restart
+        // Best-effort DB sync of the refreshed name/anchor/re-arm (restart
         // durability), skipped when nothing changed (the common
-        // waitFor-called-twice case). This is a spawned UPDATE ... WHERE id,
+        // waitFor-called-twice case). These are spawned UPDATE ... WHERE id,
         // so racing a concurrent fire/delete is benign: against a deleted
-        // row it affects 0 rows (it cannot resurrect an orphan); the only
-        // loss is the refreshed name/anchor not persisting — the in-memory
-        // watch is already refreshed and the row is gone anyway.
-        if changed {
+        // row they affect 0 rows (they cannot resurrect an orphan); the only
+        // loss is the refreshed state not persisting — the in-memory watch
+        // is already refreshed and the row is gone anyway.
+        if changed || rearmed {
             let store = self.store.clone();
             let watch_id = id.clone();
             tokio::spawn(async move {
-                if let Err(e) = store
-                    .update_completion_watch_parent(&watch_id, &name, &home_ws)
-                    .await
-                {
-                    tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                if changed {
+                    if let Err(e) = store
+                        .update_completion_watch_parent(&watch_id, &name, &home_ws)
+                        .await
+                    {
+                        tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                    }
+                }
+                if rearmed {
+                    if let Err(e) = store
+                        .clear_completion_watch_report_delivered(&watch_id)
+                        .await
+                    {
+                        tracing::warn!("completion_watch re-arm persist failed {watch_id}: {e}");
+                    }
                 }
             });
         }
@@ -486,9 +523,10 @@ impl Services {
 
     /// Whether any TOP-LEVEL agent homed in `workspace_id` holds at least
     /// one active completion watch (ungrouped or grouped) — the third
-    /// `displayStatus` in-progress promotion signal alongside a running
-    /// agent and active hooks: an idle parent still waiting on delegated
-    /// children reads as active work. `report_delivered` watches are
+    /// `Workspace.waiting` signal alongside active hooks and active PR
+    /// monitors (§5.1, via [`Services::workspace_is_waiting`]): an idle
+    /// parent still waiting on delegated children reads as waiting, without
+    /// promoting the `displayStatus` rollup. `report_delivered` watches are
     /// excluded, matching the agent-waiting projection and settlement
     /// predicate ([`Services::waiting_watches_for_parent`]): a watch whose
     /// report-time wake already fired no longer reads as pending work.
@@ -497,7 +535,7 @@ impl Services {
     /// — never the child's. The top-level filter matches
     /// [`Services::workspace_attention_signals`] (no `parent_agent_id`, not
     /// background, not deleted), so watches held by child/background agents
-    /// never promote. The in-memory registry is consulted first, so the
+    /// never count. The in-memory registry is consulted first, so the
     /// common no-watch case costs no store read; otherwise this is one
     /// message-free session-summaries read. Best-effort: a store read
     /// failure is logged and fails open to `false` (mirrors
@@ -1320,8 +1358,12 @@ impl Services {
         to_reconcile.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
         to_reconcile.dedup_by(|a, b| a.0 == b.0);
         for (child_id, child_ws) in to_reconcile {
-            self.reconcile_watch_child_on_rehydration(&child_id, &child_ws)
-                .await;
+            self.reconcile_watch_child_on_rehydration(
+                &child_id,
+                &child_ws,
+                WatchReconcileCallSite::Rehydration,
+            )
+            .await;
         }
         Ok(loaded)
     }
@@ -1349,12 +1391,15 @@ impl Services {
     /// route it through [`Services::deliver_completion_to_watches`] so the
     /// parent wakes now instead of waiting for an event that already fired.
     /// Used both at startup rehydration (child settled while the daemon was
-    /// down) and at `app.agents.waitFor` registration time (target settled
-    /// before — or concurrently with — the registration).
+    /// down) and at `agent.watch` / `app.agents.waitFor` registration time
+    /// (target settled before — or concurrently with — the registration);
+    /// `call_site` distinguishes the two (monorepo#2532, see
+    /// [`WatchReconcileCallSite`]).
     pub(crate) async fn reconcile_watch_child_on_rehydration(
         &self,
         child_id: &AgentId,
         fallback_ws: &WorkspaceId,
+        call_site: WatchReconcileCallSite,
     ) {
         use intent_core::AgentStatus;
         let (event_type, event_ws, status_value, completion_report) =
@@ -1390,6 +1435,33 @@ impl Services {
                         // without a wake, then leave the watch armed.
                         if settled && self.agent_is_waiting_on_agents(child_id) {
                             self.mark_interim_skipped_idle(child_id);
+                            return;
+                        }
+                        // Registration-time hook/PR-monitor deferral
+                        // (monorepo#2532 Gap B): a NEW explicit watch on a
+                        // reported idle child that still owns active hooks or
+                        // PR monitors asks for the child's NEXT completion —
+                        // the caller already has the report, so an instant
+                        // synthetic idle (whose #1945 report bypass would
+                        // skip the live path's deferrals) fires the fresh
+                        // watch with the STALE report. Defer like the
+                        // agent-waiting branch above: record the interim-skip
+                        // marker WITH stale-report provenance — so the
+                        // redelivery backstop's own #1945 bypass also keeps
+                        // deferring while hooks/monitors remain — and leave
+                        // the watch armed; the LAST hook/monitor
+                        // terminal-transition backstop
+                        // (`redeliver_completion_after_queue_mutation`)
+                        // synthesizes the real completion. Boot REHYDRATION
+                        // keeps current semantics (report = settlement; a
+                        // missed wake must deliver at boot — e.g. SUB-1
+                        // sender-watches that get no report-time wake).
+                        if settled
+                            && matches!(call_site, WatchReconcileCallSite::Registration)
+                            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                                || !self.active_pr_monitors_for_agent(child_id).await.is_empty())
+                        {
+                            self.mark_interim_skipped_idle_stale_report(child_id);
                             return;
                         }
                         settled
@@ -1636,6 +1708,19 @@ impl Services {
                             session.attention_request_kind.as_deref(),
                             session.attention_request_reason.as_deref(),
                         );
+                        // Record-time trigger capture (intent-hq/monorepo#2044):
+                        // same stamp as the live record paths, so the
+                        // aggregated wake keeps the trigger even if this
+                        // reconciled child is deleted before the group fires.
+                        if event_type == intent_core::events::AGENT_IDLE {
+                            if let Some(n) = &session.task_note_id {
+                                crate::agent_ops::ready_delta::stamp_event_trigger_task(
+                                    &mut data,
+                                    &session.workspace_id.0,
+                                    &n.0,
+                                );
+                            }
+                        }
                         // monorepo#1945: a non-empty persisted
                         // completion_report (set by `agent.reportToParent`)
                         // is the child's explicit completion signal — it
@@ -1888,6 +1973,15 @@ impl Services {
                     s.attention_request_reason.clone(),
                 )
             });
+            // Record-time trigger capture (intent-hq/monorepo#2044): stamp
+            // the settled child's linked task onto the recorded event so the
+            // aggregated wake keeps the trigger even if the child session is
+            // deleted before the group settles.
+            let trigger = session.as_ref().and_then(|s| {
+                s.task_note_id
+                    .clone()
+                    .map(|n| (s.workspace_id.0.clone(), n.0))
+            });
             let report = session.and_then(|s| s.completion_report);
             let mut data = event_data.clone();
             if let Some(s) = &stall {
@@ -1895,6 +1989,9 @@ impl Services {
             }
             if let Some((kind, reason)) = &attention {
                 annotate_attention_request(&mut data, kind.as_deref(), reason.as_deref());
+            }
+            if let Some((ws, task)) = &trigger {
+                crate::agent_ops::ready_delta::stamp_event_trigger_task(&mut data, ws, task);
             }
             let event = Event {
                 id: String::new(),
@@ -2123,14 +2220,18 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             disk_usage: None,
             execution_environment: None,
+            pending_delete_at: None,
         }
     }
 
     fn agent(ws: &WorkspaceId, id: &str, parent: Option<&str>, background: bool) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: parent.map(AgentId::from),
@@ -2159,6 +2260,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: background,
             metadata: None,
             created_at: now_iso(),
@@ -2169,6 +2271,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -2194,23 +2297,37 @@ mod tests {
         (tmp, root, services, ws)
     }
 
-    async fn enriched_display_status(svc: &Services, ws: &WorkspaceId) -> WorkspaceDisplayStatus {
+    async fn enriched(svc: &Services, ws: &WorkspaceId) -> (WorkspaceDisplayStatus, bool) {
         let mut row = svc.store().get_workspace(ws).await.expect("get ws");
         svc.enrich_workspace_aggregates(&mut row).await;
-        row.display_status.expect("display_status computed")
+        (
+            row.display_status.expect("display_status computed"),
+            row.waiting,
+        )
     }
 
-    /// An armed completion watch held by an idle top-level parent promotes
-    /// the derived `displayStatus` to `in_progress` on the list/get
-    /// enrichment path — for ungrouped and grouped (`after_all`) watches
-    /// alike.
+    /// Refresh the last-observed `waiting` baseline after a direct registry
+    /// mutation. Production watch mutations always route through
+    /// [`Services::publish_subscriptions_changed`], which runs this recompute;
+    /// tests that poke the registry directly must mirror it because the
+    /// list/get enrichment serves `waiting` from the last-observed cache
+    /// (rung 1 of the derived-field ladder), probing the store only on a
+    /// cache miss.
+    async fn recompute_waiting(svc: &Services, ws: &WorkspaceId) {
+        svc.maybe_emit_waiting_changed(ws).await;
+    }
+
+    /// An armed completion watch held by an idle top-level parent sets the
+    /// orthogonal `waiting` flag on the list/get enrichment path without
+    /// promoting the derived `displayStatus` — for ungrouped and grouped
+    /// (`after_all`) watches alike.
     #[tokio::test]
-    async fn armed_watch_promotes_display_status_to_in_progress() {
+    async fn armed_watch_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws) = setup().await;
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::Idle
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, false)
         );
         let ungrouped = svc
             .register_completion_watch(
@@ -2222,13 +2339,14 @@ mod tests {
                 None,
             )
             .expect("register");
+        recompute_waiting(&svc, &ws).await;
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::InProgress,
-            "idle parent with an armed watch must read in_progress"
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, true),
+            "idle parent with an armed watch reads waiting on the base rollup"
         );
-        // A grouped (`after_all`) watch promotes through the same registry.
+        // A grouped (`after_all`) watch counts through the same registry.
         svc.register_completion_watch(
             &ws,
             &ws,
@@ -2239,18 +2357,19 @@ mod tests {
         )
         .expect("register grouped");
         assert!(svc.remove_watch(&ungrouped));
+        recompute_waiting(&svc, &ws).await;
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::InProgress,
-            "a grouped watch promotes too"
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, true),
+            "a grouped watch reads waiting too"
         );
     }
 
-    /// Retiring the last watch demotes the workspace back to the base
-    /// rollup (`idle`).
+    /// Retiring the last watch drops the `waiting` flag; the base rollup is
+    /// unchanged throughout.
     #[tokio::test]
-    async fn retired_watch_demotes_display_status() {
+    async fn retired_watch_drops_waiting() {
         let (_tmp, _root, svc, ws) = setup().await;
         let id = svc
             .register_completion_watch(
@@ -2263,24 +2382,25 @@ mod tests {
             )
             .expect("register");
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::InProgress
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, true)
         );
         assert!(svc.remove_watch(&id));
+        recompute_waiting(&svc, &ws).await;
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::Idle,
-            "retired watches never promote"
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, false),
+            "retired watches never read waiting"
         );
     }
 
-    /// A `report_delivered` watch stops promoting `displayStatus`: once the
+    /// A `report_delivered` watch stops reading as waiting: once the
     /// report-time wake fired, the parent no longer reads as pending work —
     /// matching the agent-waiting projection and settlement predicate
     /// (monorepo#1649).
     #[tokio::test]
-    async fn report_delivered_watch_does_not_promote_display_status() {
+    async fn report_delivered_watch_does_not_read_waiting() {
         let (_tmp, _root, svc, ws) = setup().await;
         let id = svc
             .register_completion_watch(
@@ -2294,18 +2414,19 @@ mod tests {
             .expect("register");
         assert!(svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert!(svc.mark_watch_report_delivered(&id));
+        recompute_waiting(&svc, &ws).await;
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::Idle,
-            "report_delivered watches must not promote"
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, false),
+            "report_delivered watches must not read waiting"
         );
     }
 
-    /// Watches held by child or background agents never promote — only
-    /// top-level sessions count (same filter as `workspace_attention_signals`).
+    /// Watches held by child or background agents never count — only
+    /// top-level sessions do (same filter as `workspace_attention_signals`).
     #[tokio::test]
-    async fn child_or_background_held_watch_does_not_promote() {
+    async fn child_or_background_held_watch_does_not_read_waiting() {
         let (_tmp, _root, svc, ws) = setup().await;
         svc.store()
             .insert_agent_session(&agent(&ws, "agent-bg", None, true))
@@ -2333,14 +2454,14 @@ mod tests {
         .expect("register background-held");
         assert!(!svc.workspace_has_waiting_agent_subscriptions(&ws).await);
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::Idle,
-            "child/background-held watches must not promote"
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, false),
+            "child/background-held watches must not read waiting"
         );
     }
 
     /// A watch anchors in the parent's HOME workspace: a chief-workspace
-    /// parent watching a child in `ws` promotes chief, never `ws`.
+    /// parent watching a child in `ws` reads waiting on chief, never `ws`.
     #[tokio::test]
     async fn watch_anchors_in_parents_home_workspace() {
         let (_tmp, _root, svc, ws) = setup().await;
@@ -2358,8 +2479,8 @@ mod tests {
             "the child's workspace must not read the chief-anchored watch"
         );
         assert_eq!(
-            enriched_display_status(&svc, &ws).await,
-            WorkspaceDisplayStatus::Idle
+            enriched(&svc, &ws).await,
+            (WorkspaceDisplayStatus::Idle, false)
         );
     }
 }

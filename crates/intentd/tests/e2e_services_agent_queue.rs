@@ -67,9 +67,11 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 

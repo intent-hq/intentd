@@ -29,6 +29,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+use tokio_tungstenite::tungstenite::extensions::{Extensions, ExtensionsConfig};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig};
@@ -36,7 +38,7 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
-use crate::conn::{self, ConnSubs, OUTBOUND_CAPACITY};
+use crate::conn::{self, ConnSubs};
 use crate::forward::ForwardRegistry;
 use crate::lifecycle::{StartState, DEFAULT_PORT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::reverse::{PrimaryReverseRegistry, ReverseChannel};
@@ -68,6 +70,9 @@ pub struct WsOptions {
     /// and hands the same clone to every listener, so the cap spans UDS + WSS;
     /// the default is unlimited for standalone / test wiring.
     pub rpc_limiter: RpcLimiter,
+    /// `/tunnel` caps and timeouts; defaults are production values, tests
+    /// shrink them to exercise idle/connect/forward timeout behavior.
+    pub tunnel_limits: crate::tunnel::TunnelLimits,
 }
 
 impl Default for WsOptions {
@@ -81,6 +86,7 @@ impl Default for WsOptions {
             heartbeat_interval: HEARTBEAT_INTERVAL,
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             rpc_limiter: RpcLimiter::unlimited(),
+            tunnel_limits: crate::tunnel::TunnelLimits::default(),
         }
     }
 }
@@ -149,6 +155,8 @@ pub(crate) struct WsInner {
     /// (`server.maxOutstandingRpcs`); unlimited unless the composition root
     /// wires one through [`WsOptions::rpc_limiter`].
     pub rpc_limiter: RpcLimiter,
+    /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
+    pub tunnel_limits: crate::tunnel::TunnelLimits,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -194,6 +202,7 @@ impl WsApiServer {
             server_pairing_info: None,
             control,
             rpc_limiter: options.rpc_limiter,
+            tunnel_limits: options.tunnel_limits,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -231,6 +240,7 @@ impl WsApiServer {
             server_pairing_info: None,
             control,
             rpc_limiter: options.rpc_limiter,
+            tunnel_limits: options.tunnel_limits,
         };
         Self {
             inner: Arc::new(inner),
@@ -422,6 +432,7 @@ impl WsInner {
         let target = req.path.unwrap_or("");
         let path = target.split('?').next().unwrap_or(target);
         let (mut origin, mut authorization, mut ws_key) = (None, None, None);
+        let mut ws_extensions: Vec<String> = Vec::new();
         for h in req.headers.iter() {
             if h.name.eq_ignore_ascii_case("origin") {
                 origin = header_str(h.value);
@@ -429,15 +440,22 @@ impl WsInner {
                 authorization = header_str(h.value);
             } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
                 ws_key = header_str(h.value);
+            } else if h.name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                // A client may spread its extension offers over multiple
+                // header lines (RFC 9110 §5.3); collect them all, in order.
+                if let Some(v) = header_str(h.value) {
+                    ws_extensions.push(v);
+                }
             }
         }
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
-        if path != "/ws" {
+        if path != "/ws" && path != "/tunnel" {
             return reject(&mut stream, 404, "Not Found").await;
         }
-        // §5.3 upgrade gate: enable flag, origin allow-list, then bearer token.
+        // §5.3 upgrade gate (shared by `/ws` and `/tunnel`): enable flag,
+        // origin allow-list, then bearer token.
         if !self.enabled {
             return reject(&mut stream, 403, "Forbidden").await;
         }
@@ -464,9 +482,20 @@ impl WsInner {
             return reject(&mut stream, 400, "Bad Request").await;
         };
         let accept = derive_accept_key(key.as_bytes());
-        let response = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        // RFC 7692 permessage-deflate: negotiate the client's
+        // `Sec-WebSocket-Extensions` offer(s). When an offer is accepted the
+        // agreed parameters are echoed in the 101 response and the socket is
+        // built with the negotiated compression context; when the client
+        // offers nothing (or nothing acceptable) no header is emitted and the
+        // connection is a plain uncompressed WebSocket, exactly as before.
+        let (extensions, extensions_header) = negotiate_extensions(&ws_extensions);
+        let mut response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n"
         );
+        if let Some(value) = &extensions_header {
+            response.push_str(&format!("Sec-WebSocket-Extensions: {value}\r\n"));
+        }
+        response.push_str("\r\n");
         stream.write_all(response.as_bytes()).await?;
         stream.flush().await?;
         // Explicit inbound size limits (monorepo#472): cap a whole message at
@@ -474,11 +503,33 @@ impl WsInner {
         // default 16 MiB) to the same value so a legitimate large payload sent
         // as a single unfragmented frame is still accepted. Over-limit frames
         // fail fast on the frame header, without buffering the payload.
+        // `/tunnel` gets a much smaller cap: the 40 MiB limit is sized for
+        // JSON-RPC envelopes, while tunnel frames are bounded per-`DATA` so
+        // the frame-count relay queues cannot buffer GiBs of payload.
+        let max_message = if path == "/tunnel" {
+            crate::tunnel::MAX_TUNNEL_MESSAGE_BYTES
+        } else {
+            crate::MAX_INBOUND_MESSAGE_BYTES
+        };
         let config = WebSocketConfig::default()
-            .max_message_size(Some(crate::MAX_INBOUND_MESSAGE_BYTES))
-            .max_frame_size(Some(crate::MAX_INBOUND_MESSAGE_BYTES));
-        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
-        self.spawn_connection(ws);
+            .max_message_size(Some(max_message))
+            .max_frame_size(Some(max_message));
+        let ws = if extensions_header.is_some() {
+            WebSocketStream::from_raw_socket_with_extensions(
+                stream,
+                Role::Server,
+                Some(config),
+                extensions,
+            )
+            .await
+        } else {
+            WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await
+        };
+        if path == "/tunnel" {
+            self.spawn_tunnel_connection(ws);
+        } else {
+            self.spawn_connection(ws);
+        }
         Ok(())
     }
 
@@ -522,6 +573,37 @@ impl WsInner {
         );
     }
 
+    /// Register a new `/tunnel` client and spawn its mux loop. Tunnel
+    /// connections live in the same registry as `/ws` clients, so the
+    /// heartbeat reaper, `stop()` shutdown close, and the `/health` count all
+    /// cover them identically.
+    fn spawn_tunnel_connection<S>(self: &Arc<Self>, ws: WebSocketStream<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ConnCmd>(8);
+        let last_pong = Arc::new(AtomicI64::new(now_ms()));
+        let this = self.clone();
+        let limits = self.tunnel_limits;
+        let handle = tokio::spawn({
+            let last_pong = last_pong.clone();
+            async move {
+                crate::tunnel::run_tunnel_connection(ws, cmd_rx, last_pong, limits).await;
+                this.deregister(id);
+            }
+        });
+        let abort = handle.abort_handle();
+        self.clients.lock().expect("ws clients poisoned").insert(
+            id,
+            ClientHandle {
+                cmd_tx,
+                last_pong,
+                abort,
+            },
+        );
+    }
+
     /// Remove a client from the registry (idempotent).
     fn deregister(&self, id: u64) {
         self.clients
@@ -543,10 +625,13 @@ impl WsInner {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut sink, mut stream) = ws.split();
-        let (app_tx, mut app_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+        // Two-lane outbound queue: RPC responses on the priority lane, event/
+        // subscription pushes on the bulk lane; `recv()` drains priority first
+        // so responses overtake queued bulk traffic on a saturated link.
+        let (app_tx, mut app_rx) = conn::outbound_channel();
         let mut subs = ConnSubs::default();
         let mut forwards = ForwardRegistry::default();
-        let reverse = ReverseChannel::new(app_tx.clone());
+        let reverse = ReverseChannel::new(app_tx.priority_sender());
         // REV-1: register this connection's reverse channel with the shared
         // primary-target set so agent-initiated `browser.exec` calls can route
         // to whichever client connected first. Guard drops when this loop
@@ -718,6 +803,36 @@ where
     Ok(())
 }
 
+/// The server's extension posture for the WSS listener: accept RFC 7692
+/// permessage-deflate offers with the default parameter set (deflate level
+/// per the flate2 default, 15-bit windows, context takeover allowed —
+/// per-parameter negotiation narrows these to what the client asked for).
+fn server_extensions_config() -> ExtensionsConfig {
+    let mut config = ExtensionsConfig::default();
+    config.permessage_deflate = Some(DeflateConfig::default());
+    config
+}
+
+/// Negotiate the client's `Sec-WebSocket-Extensions` offer(s) against the
+/// server posture. Returns the negotiated [`Extensions`] for the connection
+/// plus the exact header value to echo in the `101` response when an offer
+/// was accepted. No offers, unacceptable offers, and malformed offers all
+/// decline to a clean uncompressed connection (RFC 7692 §7 requires declining
+/// rather than failing the upgrade), leaving the wire behavior identical to a
+/// client that never offered compression.
+fn negotiate_extensions(offers: &[String]) -> (Extensions, Option<String>) {
+    if offers.is_empty() {
+        return (Extensions::default(), None);
+    }
+    match server_extensions_config().negotiate_offers(offers) {
+        Ok((extensions, header)) => (extensions, header),
+        Err(e) => {
+            tracing::debug!(error = %e, "declining Sec-WebSocket-Extensions offer");
+            (Extensions::default(), None)
+        }
+    }
+}
+
 /// Trim a header value to a non-empty UTF-8 string, or `None`.
 fn header_str(value: &[u8]) -> Option<String> {
     std::str::from_utf8(value)
@@ -727,9 +842,79 @@ fn header_str(value: &[u8]) -> Option<String> {
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::negotiate_extensions;
+
+    /// No `Sec-WebSocket-Extensions` header ⇒ no response header, plain
+    /// uncompressed connection (the pre-deflate behavior).
+    #[test]
+    fn negotiate_declines_when_client_offers_nothing() {
+        let (_extensions, header) = negotiate_extensions(&[]);
+        assert_eq!(header, None);
+    }
+
+    /// A standard browser offer is accepted and the response header names the
+    /// agreed extension.
+    #[test]
+    fn negotiate_accepts_browser_deflate_offer() {
+        let offers = vec!["permessage-deflate; client_max_window_bits".to_string()];
+        let (_extensions, header) = negotiate_extensions(&offers);
+        let header = header.expect("deflate offer accepted");
+        assert!(
+            header.starts_with("permessage-deflate"),
+            "response names the agreed extension: {header}"
+        );
+    }
+
+    /// An unknown extension is ignored: no response header, clean connection.
+    #[test]
+    fn negotiate_declines_unknown_extension() {
+        let offers = vec!["x-unknown-extension".to_string()];
+        let (_extensions, header) = negotiate_extensions(&offers);
+        assert_eq!(header, None);
+    }
+
+    /// RFC 7692 §7 offers a server MUST decline (unknown parameter, invalid
+    /// value, duplicate parameter) fall back to an uncompressed connection
+    /// instead of failing the upgrade.
+    #[test]
+    fn negotiate_declines_unacceptable_deflate_offers() {
+        for offer in [
+            "permessage-deflate; parameter-from-the-future=3",
+            "permessage-deflate; client_max_window_bits=99",
+            "permessage-deflate; client_no_context_takeover; client_no_context_takeover",
+        ] {
+            let (_extensions, header) = negotiate_extensions(&[offer.to_string()]);
+            assert_eq!(header, None, "offer must be declined: {offer}");
+        }
+    }
+
+    /// Multiple header lines are negotiated in order: a declined first offer
+    /// falls back to an acceptable second one.
+    #[test]
+    fn negotiate_accepts_fallback_offer_across_header_lines() {
+        let offers = vec![
+            "permessage-deflate; parameter-from-the-future=3".to_string(),
+            "permessage-deflate".to_string(),
+        ];
+        let (_extensions, header) = negotiate_extensions(&offers);
+        assert_eq!(header.as_deref(), Some("permessage-deflate"));
+    }
+
+    /// A syntactically malformed header declines cleanly rather than erroring
+    /// the upgrade.
+    #[test]
+    fn negotiate_declines_malformed_header() {
+        let offers = vec!["permessage-deflate; =".to_string()];
+        let (_extensions, header) = negotiate_extensions(&offers);
+        assert_eq!(header, None);
+    }
 }

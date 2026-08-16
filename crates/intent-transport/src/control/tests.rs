@@ -31,8 +31,18 @@ impl FakeControl {
                 max_agents: 20,
                 version: "0.1.0".to_string(),
                 uptime_seconds: 123,
+                local_ips: vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()],
+                hostname: "studio.local".to_string(),
                 cpu_percent: 12.5,
                 memory_bytes: 104_857_600,
+                child_processes: Some(4),
+                child_memory_bytes: Some(2_684_354_560),
+                child_memory_peak_bytes: Some(5_368_709_120),
+                agent_memory_budget_bytes: Some(21_474_836_480),
+                agent_memory_charged_bytes: Some(3_221_225_472),
+                queued_spawns: Some(1),
+                workspaces_disk_available_bytes: Some(250_000_000_000),
+                workspaces_disk_total_bytes: Some(1_000_000_000_000),
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -116,6 +126,8 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
+    assert_eq!(local["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(local["hostname"], "studio.local");
     assert_eq!(local["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
@@ -124,6 +136,10 @@ fn status_json_local_vs_remote_locality() {
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
     assert_eq!(remote["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
+    // The routing fields are served to remote callers too — that is the point:
+    // an authenticated WSS client refreshes its host list from system.status.
+    assert_eq!(remote["localIps"], json!(["192.168.1.10", "10.0.0.5"]));
+    assert_eq!(remote["hostname"], "studio.local");
 }
 
 #[test]
@@ -142,13 +158,90 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         max_agents: 8,
         version: "0.1.0".to_string(),
         uptime_seconds: 456,
+        local_ips: Vec::new(),
+        hostname: "intent".to_string(),
         cpu_percent: 0.0,
         memory_bytes: 0,
+        child_processes: None,
+        child_memory_bytes: None,
+        child_memory_peak_bytes: None,
+        agent_memory_budget_bytes: None,
+        agent_memory_charged_bytes: None,
+        queued_spawns: None,
+        workspaces_disk_available_bytes: None,
+        workspaces_disk_total_bytes: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
     assert_eq!(v["port"], Value::Null);
     assert_eq!(v["fingerprint"], Value::Null);
+    // No routable interfaces still yields an (empty) array, never null.
+    assert_eq!(v["localIps"], json!([]));
+    assert_eq!(v["hostname"], "intent");
+    // An unsampled child tree is explicitly null — never a misleading 0, which
+    // a bundle would read as "the daemon has no child processes".
+    assert_eq!(v["childProcesses"], Value::Null);
+    assert_eq!(v["childMemoryBytes"], Value::Null);
+    assert_eq!(v["childMemoryPeakBytes"], Value::Null);
+    // Budget off ⇒ the budget fields are ABSENT (presence-detected), not null.
+    let obj = v.as_object().unwrap();
+    assert!(!obj.contains_key("agentMemoryBudgetBytes"));
+    assert!(!obj.contains_key("agentMemoryChargedBytes"));
+    assert!(!obj.contains_key("queuedSpawns"));
+    // No disk sample ⇒ the disk fields are ABSENT (presence-detected), not null.
+    assert!(!obj.contains_key("workspacesDiskAvailableBytes"));
+    assert!(!obj.contains_key("workspacesDiskTotalBytes"));
+}
+
+/// The descendant-tree fields ride `system.status` so a debug
+/// bundle can attribute system memory pressure to agent child processes: the
+/// daemon's own `memoryBytes` is a small fraction of what its tree costs.
+#[test]
+fn status_json_carries_the_child_process_tree_sample() {
+    let control = FakeControl::new();
+    let v = status_json(&control.status, true);
+    assert_eq!(v["childProcesses"], 4);
+    assert_eq!(v["childMemoryBytes"], 2_684_354_560u64);
+    // The peak is a separate field, not a copy of the instantaneous value: a
+    // bundle captured after a burst drains sees baseline in `childMemoryBytes`
+    // and the overshoot only in `childMemoryPeakBytes`.
+    assert_eq!(v["childMemoryPeakBytes"], 5_368_709_120u64);
+    // Own-RSS and tree-RSS are distinct fields; the tree dwarfs the daemon.
+    assert_eq!(v["memoryBytes"], 104_857_600u64);
+}
+
+/// With the aggregate budget installed (monorepo#2063) the three budget
+/// fields ride `system.status`, so a client can render "why is my agent
+/// queued" truthfully: the configured ceiling, the bytes admission actually
+/// compares, and the spawns currently waiting.
+#[test]
+fn status_json_carries_the_budget_fields_when_installed() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["agentMemoryBudgetBytes"], 21_474_836_480u64);
+    assert_eq!(v["agentMemoryChargedBytes"], 3_221_225_472u64);
+    assert_eq!(v["queuedSpawns"], 1);
+
+    // Budget installed but no tree sample yet: the budget is inert, so the
+    // charged bytes are absent while the ceiling and queue depth still serve.
+    let mut status = FakeControl::new().status;
+    status.agent_memory_charged_bytes = None;
+    status.queued_spawns = Some(0);
+    let v = status_json(&status, true);
+    assert_eq!(v["agentMemoryBudgetBytes"], 21_474_836_480u64);
+    assert!(!v
+        .as_object()
+        .unwrap()
+        .contains_key("agentMemoryChargedBytes"));
+    assert_eq!(v["queuedSpawns"], 0);
+}
+
+/// The workspaces-root disk fields ride `system.status` so a client can warn
+/// when the volume hosting workspace checkouts is running out of space.
+#[test]
+fn status_json_carries_the_workspaces_disk_fields_when_sampled() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["workspacesDiskAvailableBytes"], 250_000_000_000u64);
+    assert_eq!(v["workspacesDiskTotalBytes"], 1_000_000_000_000u64);
 }
 
 #[tokio::test]

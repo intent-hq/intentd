@@ -1,17 +1,23 @@
-//! WSS e2e for the active-hook `displayStatus` promotion (PROTOCOL §6.5
-//! step 1): a workspace whose idle agent still owns an ACTIVE background hook
-//! keeps serving `displayStatus: "in_progress"` — the hook folds into the
-//! `agent_running` promotion — and settling the hook demotes it. Over the
-//! real WSS transport (TLS + bearer auth, mock ACP agent):
+//! WSS e2e for the orthogonal `waiting` workspace flag (PROTOCOL §5.1): a
+//! workspace whose idle agent owns an ACTIVE background hook serves its base
+//! `displayStatus` rollup (`idle`) with additive `waiting: true` — wait
+//! signals no longer fold into the `in_progress` promotion — and settling
+//! the hook drops the flag. Over the real WSS transport (TLS + bearer auth,
+//! mock ACP agent):
 //!
 //! 1. An agent turn schedules a watcher hook via the MCP-only
-//!    `ws.hook.schedule`; after the turn's terminal `agent:idle` (and past
-//!    the debounced not-running recompute), `workspace.get` and
-//!    `workspace.list` still serve `in_progress` and NO demotion
-//!    `workspace:displayStatus-changed` fires.
+//!    `ws.hook.schedule`; the turn itself promotes `in_progress`
+//!    (agent running), the newly ACTIVE hook emits the transition-only
+//!    `workspace:waiting-changed` raise (`{ workspaceId, waiting: true }`,
+//!    asserted over a real WSS subscription), and after the terminal
+//!    `agent:idle` the debounced recompute demotes to `idle` despite the
+//!    ACTIVE hook. `workspace.get` and `workspace.list` then serve `idle`
+//!    with `waiting: true`.
 //! 2. The FE settles the hook via the `hook.cancel` router method (§5.40):
-//!    `hook:cancelled` fires, `workspace:displayStatus-changed` demotes to
-//!    `idle`, and both read paths serve the demoted status.
+//!    `hook:cancelled` fires, the `workspace:waiting-changed` drop
+//!    (`{ workspaceId, waiting: false }`) is asserted on the same
+//!    subscription, and both read paths drop the `waiting` field (omitted
+//!    when false) while the rollup stays `idle`.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -316,38 +322,41 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         })
         .await
         .expect("insert ws");
     ws.0
 }
 
+/// `workspace.get` → the full workspace row.
+async fn get_workspace_row(rpc: &mut TlsWs, ws_id: &str) -> Value {
+    let got = wss_rpc(rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    got["workspace"].clone()
+}
+
 /// `workspace.get` → the derived `displayStatus` string.
 async fn get_display_status(rpc: &mut TlsWs, ws_id: &str) -> String {
-    let got = wss_rpc(rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
-    got["workspace"]["displayStatus"]
+    get_workspace_row(rpc, ws_id).await["displayStatus"]
         .as_str()
         .expect("displayStatus string")
         .to_string()
 }
 
-/// `workspace.list` → the seeded workspace's row `displayStatus` string.
-async fn list_display_status(rpc: &mut TlsWs, ws_id: &str) -> String {
+/// `workspace.list` → the seeded workspace's full row.
+async fn list_workspace_row(rpc: &mut TlsWs, ws_id: &str) -> Value {
     let listed = wss_rpc(rpc, "workspace.list", json!({})).await;
-    let row = listed["workspaces"]
+    listed["workspaces"]
         .as_array()
         .expect("workspaces array")
         .iter()
         .find(|w| w["id"] == json!(ws_id))
         .cloned()
-        .expect("seeded workspace listed");
-    row["displayStatus"]
-        .as_str()
-        .expect("displayStatus string")
-        .to_string()
+        .expect("seeded workspace listed")
 }
 
 /// Poll `workspace.get` until `displayStatus == want` (bounded), asserting
@@ -367,13 +376,14 @@ async fn poll_display_status(rpc: &mut TlsWs, ws_id: &str, want: &str) {
     panic!("displayStatus never settled at {want}");
 }
 
-/// The active-hook hold + `hook.cancel` demotion (see module docs): the
-/// agent's turn schedules a persisting watcher hook, the workspace keeps
-/// serving `in_progress` after the turn's terminal idle (no demotion event
-/// fires), and cancelling the hook over the wire emits the demotion
-/// transition and settles both read paths at `idle`.
+/// The active-hook `waiting` flag + `hook.cancel` settlement (see module
+/// docs): the agent's turn schedules a persisting watcher hook, the turn's
+/// terminal idle demotes the rollup to `idle` despite the ACTIVE hook, both
+/// read paths serve `idle` with `waiting: true`, and cancelling the hook
+/// over the wire drops the flag (omitted on the wire) with the rollup
+/// unchanged.
 #[tokio::test]
-async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
+async fn active_hook_serves_waiting_and_hook_cancel_drops_it_over_wss() {
     let Some(script) = gate("WSS displayStatus active-hook E2E") else {
         return;
     };
@@ -433,7 +443,12 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
         &mut sub,
         "events.subscribe",
         json!({
-            "eventTypes": ["workspace:displayStatus-changed", "hook:*", "agent:*"],
+            "eventTypes": [
+                "workspace:displayStatus-changed",
+                "workspace:waiting-changed",
+                "hook:*",
+                "agent:*",
+            ],
             "workspaceId": ws_id,
         }),
     )
@@ -467,28 +482,58 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
 
     // Order-insensitive milestones under one deadline: the in_progress
-    // promotion (turn start or hook schedule — whichever transitions first
-    // emits), the persisted hook:scheduled (carrying the hookId), and the
-    // turn's terminal agent:idle. Every displayStatus transition along the
-    // way must be the in_progress promotion — never a demotion.
+    // promotion (the running turn — wait signals no longer promote), the
+    // persisted hook:scheduled (carrying the hookId), the transition-only
+    // `workspace:waiting-changed` raise (the newly ACTIVE hook flips the
+    // orthogonal flag; self-sufficient `{ workspaceId, waiting }` payload,
+    // PROTOCOL §6.5), the turn's terminal agent:idle, and the debounced
+    // not-running demotion back to `idle` (the ACTIVE hook no longer holds
+    // the rollup). Every displayStatus transition must be one of that
+    // promotion/demotion pair — never needs_attention — and no
+    // waiting-changed emission in this phase may report `false`.
     let mut promoted = false;
     let mut hook_id = None::<String>;
+    let mut waiting_raised = false;
     let mut idle = false;
+    let mut demoted = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
-    while !(promoted && hook_id.is_some() && idle) {
+    while !(promoted && hook_id.is_some() && waiting_raised && idle && demoted) {
         let ev = match wss_event_until(&mut sub, deadline).await {
             Some(ev) => ev,
-            None => panic!("timed out: promoted={promoted} hook_id={hook_id:?} idle={idle}"),
+            None => panic!(
+                "timed out: promoted={promoted} hook_id={hook_id:?} \
+                 waiting_raised={waiting_raised} idle={idle} demoted={demoted}"
+            ),
         };
         let data = &ev["data"];
         match ev["type"].as_str().unwrap_or_default() {
-            "workspace:displayStatus-changed" => {
+            "workspace:displayStatus-changed" if data["displayStatus"] == "in_progress" => {
                 assert_eq!(
                     data,
                     &json!({ "workspaceId": ws_id, "displayStatus": "in_progress" }),
                     "self-sufficient in_progress promotion payload (PROTOCOL §6.5): {ev}"
                 );
                 promoted = true;
+            }
+            "workspace:displayStatus-changed" => {
+                assert_eq!(
+                    data,
+                    &json!({ "workspaceId": ws_id, "displayStatus": "idle" }),
+                    "the post-turn demotion serves the base rollup despite the hook: {ev}"
+                );
+                demoted = true;
+            }
+            "workspace:waiting-changed" => {
+                assert_eq!(
+                    data,
+                    &json!({ "workspaceId": ws_id, "waiting": true }),
+                    "self-sufficient waiting raise payload (PROTOCOL §6.5): {ev}"
+                );
+                assert!(
+                    !waiting_raised,
+                    "transition-only: the raise must emit exactly once: {ev}"
+                );
+                waiting_raised = true;
             }
             "hook:scheduled" if data["name"] == "dswatch" => {
                 assert_eq!(data["agentId"], json!(agent_id), "hook owner: {ev}");
@@ -500,33 +545,30 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     }
     let hook_id = hook_id.expect("hook:scheduled carried the hookId");
 
-    // Quiet window past the turn's debounced not-running recompute (~3s
-    // grace): with the hook ACTIVE the recompute is a silent no-op — any
-    // displayStatus transition here would be the demotion regression this
-    // suite guards against.
-    let quiet = tokio::time::Instant::now() + Duration::from_millis(4000);
-    while let Some(ev) = wss_event_until(&mut sub, quiet).await {
-        assert_ne!(
-            ev["type"],
-            json!("workspace:displayStatus-changed"),
-            "no displayStatus transition may fire while the hook holds the status: {ev}"
-        );
-    }
-
-    // Both read paths still serve in_progress: the idle agent's active hook
-    // folds into the agent_running promotion (§6.5 step 1).
+    // Both read paths serve the base rollup with the orthogonal waiting
+    // flag: `idle` + `waiting: true` while the hook is ACTIVE.
+    let row = get_workspace_row(&mut rpc, &ws_id).await;
     assert_eq!(
-        get_display_status(&mut rpc, &ws_id).await,
-        "in_progress",
-        "workspace.get serves in_progress while the hook is active"
+        row["displayStatus"], "idle",
+        "workspace.get serves the base rollup while the hook is active: {row}"
     );
     assert_eq!(
-        list_display_status(&mut rpc, &ws_id).await,
-        "in_progress",
-        "workspace.list serves in_progress while the hook is active"
+        row["waiting"],
+        json!(true),
+        "workspace.get carries waiting: true while the hook is active: {row}"
+    );
+    let row = list_workspace_row(&mut rpc, &ws_id).await;
+    assert_eq!(
+        row["displayStatus"], "idle",
+        "workspace.list serves the base rollup while the hook is active: {row}"
+    );
+    assert_eq!(
+        row["waiting"],
+        json!(true),
+        "workspace.list carries waiting: true while the hook is active: {row}"
     );
 
-    // ---- (2) Settle: hook.cancel over the wire demotes the status ----
+    // ---- (2) Settle: hook.cancel over the wire drops the flag ----
     let cancelled = wss_rpc(
         &mut rpc,
         "hook.cancel",
@@ -537,21 +579,22 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     assert_eq!(cancelled["hook"]["state"], "cancelled", "{cancelled}");
     assert_eq!(cancelled["hook"]["hookId"], json!(hook_id));
 
-    // Milestones: hook:cancelled, the demotion transition, and the wake
-    // turn's terminal agent:idle (the FE cancel wakes the owner, whose
+    // Milestones: hook:cancelled, the transition-only
+    // `workspace:waiting-changed` drop (the last ACTIVE hook settled —
+    // self-sufficient `{ workspaceId, waiting: false }` payload), and the
+    // wake turn's terminal agent:idle (the FE cancel wakes the owner, whose
     // follow-up turn may transiently re-promote in_progress — tolerated;
-    // needs_attention never appears). The demoted status is `unread`, not
-    // `idle`: the completed turns raised the server-owned unread flag
-    // (§9.9), which promotes the idle base (§6.5 step 9).
+    // needs_attention never appears).
     let mut hook_cancelled = false;
-    let mut demoted = false;
+    let mut waiting_dropped = false;
     let mut wake_idle = false;
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
-    while !(hook_cancelled && demoted && wake_idle) {
+    while !(hook_cancelled && waiting_dropped && wake_idle) {
         let ev = match wss_event_until(&mut sub, deadline).await {
             Some(ev) => ev,
             None => panic!(
-                "timed out: hook_cancelled={hook_cancelled} demoted={demoted} wake_idle={wake_idle}"
+                "timed out: hook_cancelled={hook_cancelled} \
+                 waiting_dropped={waiting_dropped} wake_idle={wake_idle}"
             ),
         };
         let data = &ev["data"];
@@ -560,19 +603,23 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
                 assert_eq!(data["state"], "cancelled", "{ev}");
                 hook_cancelled = true;
             }
+            "workspace:waiting-changed" => {
+                assert_eq!(
+                    data,
+                    &json!({ "workspaceId": ws_id, "waiting": false }),
+                    "self-sufficient waiting drop payload (PROTOCOL §6.5): {ev}"
+                );
+                assert!(
+                    !waiting_dropped,
+                    "transition-only: the drop must emit exactly once: {ev}"
+                );
+                waiting_dropped = true;
+            }
             "workspace:displayStatus-changed" => {
                 assert_ne!(
                     data["displayStatus"], "needs_attention",
                     "hook settlement never raises needs_attention: {ev}"
                 );
-                if data["displayStatus"] == "unread" {
-                    assert_eq!(
-                        data,
-                        &json!({ "workspaceId": ws_id, "displayStatus": "unread" }),
-                        "self-sufficient demotion payload (PROTOCOL §6.5): {ev}"
-                    );
-                    demoted = true;
-                }
             }
             "agent:idle" if data["agentId"] == json!(agent_id) => wake_idle = true,
             _ => {}
@@ -580,20 +627,21 @@ async fn active_hook_holds_in_progress_and_hook_cancel_demotes_over_wss() {
     }
 
     // With the hook settled and the wake turn over, both read paths settle
-    // at the demoted status. `workspace.markSeen` retires the unread flag
-    // and the rollup lands on the true idle base.
-    poll_display_status(&mut rpc, &ws_id, "unread").await;
-    assert_eq!(
-        list_display_status(&mut rpc, &ws_id).await,
-        "unread",
-        "workspace.list serves the demoted status after hook.cancel"
-    );
-    let seen = wss_rpc(
-        &mut rpc,
-        "workspace.markSeen",
-        json!({ "workspaceId": ws_id }),
-    )
-    .await;
-    assert_eq!(seen["workspace"]["attention"], "none", "{seen}");
+    // at the base rollup with the waiting field dropped — omitted on the
+    // wire, never `false` (presence-detected, §5 convention).
     poll_display_status(&mut rpc, &ws_id, "idle").await;
+    let row = get_workspace_row(&mut rpc, &ws_id).await;
+    assert!(
+        row.get("waiting").is_none(),
+        "workspace.get omits waiting after hook.cancel: {row}"
+    );
+    let row = list_workspace_row(&mut rpc, &ws_id).await;
+    assert_eq!(
+        row["displayStatus"], "idle",
+        "workspace.list settles at the base rollup after hook.cancel: {row}"
+    );
+    assert!(
+        row.get("waiting").is_none(),
+        "workspace.list omits waiting after hook.cancel: {row}"
+    );
 }

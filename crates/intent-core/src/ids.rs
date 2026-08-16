@@ -115,3 +115,8 @@ id_newtype!(
     /// Identifier for a PR monitor (an agent-owned pull-request watch).
     PrMonitorId
 );
+id_newtype!(
+    /// Identifier for a registered workspace git root (a secondary local git
+    /// repository tracked for a workspace).
+    WorkspaceGitRootId
+);

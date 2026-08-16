@@ -359,6 +359,8 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
     for a in 0..100 {
         let ts = now_iso();
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(format!("agent-{}", uuid::Uuid::new_v4())),
             workspace_id: WorkspaceId(ws_id.clone()),
             backend_session_id: None,
@@ -387,6 +389,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             messages: vec![],
@@ -397,6 +400,7 @@ async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         let contents: Vec<serde_json::Value> = (0..60)
             .map(|m| {

@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    model::AgentDelegateInput, AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin,
-    NoteId, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    model::{AgentDelegateInput, BatchTaskEntry},
+    AgentCreateExtra, AgentId, AgentWakeOrCreateInput, MessageOrigin, NoteId, WorkspaceApi,
+    WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 use serde_json::{json, Value};
 
@@ -283,6 +284,23 @@ async fn delegate(
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    let tasks = match args.get("tasks").and_then(Value::as_array) {
+        Some(a) => {
+            let mut entries: Vec<BatchTaskEntry> = Vec::with_capacity(a.len());
+            for v in a {
+                match serde_json::from_value::<BatchTaskEntry>(v.clone()) {
+                    Ok(entry) => entries.push(entry),
+                    Err(_) => {
+                        return Err(format!(
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, reasoningEffort? }} objects, got: {v}"
+                        ));
+                    }
+                }
+            }
+            Some(entries)
+        }
+        None => None,
+    };
     let input = AgentDelegateInput {
         task_note_id: opt_str(args, "taskNoteId").map(NoteId::from_string),
         note_id: opt_str(args, "noteId").map(NoteId::from_string),
@@ -302,6 +320,10 @@ async fn delegate(
         // parse errors surface here, bounds are validated by the op.
         vm_resources: parse_vm_resources(args)?,
         force: opt_bool(args, "force"),
+        tasks,
+        // Presence-sensitive: `greedy` is REMOVED and any supplied value
+        // (even `null`) must reach the service layer for its rejection.
+        greedy: args.get("greedy").map(Value::as_bool),
     };
     let v = api
         .agent_delegate(ws.clone(), input, caller.cloned())

@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{run_one_shot_acp, OneShotCommand, OneShotError};
+use super::{run_one_shot_acp, run_one_shot_acp_in, OneShotCommand, OneShotError};
+use crate::acp_adapter::AdapterSlots;
 
 /// Write `body` as an executable-by-node mock adapter script and return a
 /// launch command for it. The tempdir is returned so the caller keeps it
@@ -77,7 +78,12 @@ const onPrompt = () => {{}};
 ",
         pidfile = pidfile.to_string_lossy(),
     ));
-    let err = run_one_shot_acp(cmd, "hang", None, Duration::from_millis(500))
+    // A private single-slot bound keeps the deliberately short budget honest:
+    // under full-suite load the process-global bound can be saturated by
+    // sibling tests for longer than 500ms, which would turn the asserted
+    // PromptTimeout into a QueueTimeout (monorepo#2379).
+    let slots = AdapterSlots::new(1);
+    let err = run_one_shot_acp_in(&slots, cmd, "hang", None, Duration::from_millis(500))
         .await
         .unwrap_err();
     assert!(
@@ -268,5 +274,142 @@ async fn missing_adapter_binary_surfaces_typed_spawn_error() {
     assert!(
         matches!(err, OneShotError::Spawn(_)),
         "expected Spawn, got {err}"
+    );
+}
+
+/// Count the lines the mock adapters have appended to `log` so far (each line
+/// is one adapter that actually started).
+fn started_count(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Poll `cond` until it holds, failing with `what` if it never does.
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+/// The daemon-wide adapter bound end to end (monorepo#2062): a burst of
+/// concurrent one-shots spawns at most `limit` adapter chains, the rest wait
+/// their turn rather than piling ~610 MB of provider CLI on top of each other,
+/// a caller whose own timeout expires while queued gets the distinguishable
+/// [`OneShotError::QueueTimeout`] (never a hang, never something a client
+/// could read as a slow model), and every queued caller that does get a slot
+/// still completes normally.
+///
+/// The mock adapters park in `session/prompt` until the test creates a release
+/// file, so "how many started" is read at a moment the test controls rather
+/// than raced against.
+///
+/// Runner-agnostic: the bound is a process-global `OnceLock`, so under a
+/// single-process runner an earlier test may already have installed one and
+/// the `init_adapter_slots` call below is a no-op. The test therefore asks for
+/// a small cap but asserts against the limit it reads back, and sizes the
+/// burst from that — so it exercises a real over-subscription either way and
+/// never depends on unspecified test ordering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_is_bounded_queued_callers_complete_and_late_ones_report_queue_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("starts.log");
+    let release = dir.path().join("release");
+    let script = dir.path().join("parked-adapter.mjs");
+    std::fs::write(
+        &script,
+        format!(
+            "import fs from 'node:fs';
+fs.appendFileSync({log:?}, process.pid + '\\n');
+{ADAPTER_PRELUDE}
+const onPrompt = (id) => {{
+  const tick = setInterval(() => {{
+    if (!fs.existsSync({release:?})) return;
+    clearInterval(tick);
+    chunk('ok');
+    result(id, {{ stopReason: 'end_turn' }});
+  }}, 25);
+}};
+",
+            log = log.to_string_lossy(),
+            release = release.to_string_lossy(),
+        ),
+    )
+    .expect("write mock adapter");
+    let launch = || {
+        OneShotCommand::binary(
+            PathBuf::from("node"),
+            vec![script.to_string_lossy().into_owned()],
+        )
+    };
+
+    // Ask for a small cap; use whatever is actually in force.
+    crate::acp_adapter::init_adapter_slots(2);
+    let limit = crate::acp_adapter::adapter_slot_limit() as usize;
+    let burst = limit + 3;
+
+    let runs: Vec<_> = (0..burst)
+        .map(|_| {
+            let cmd = launch();
+            tokio::spawn(
+                async move { run_one_shot_acp(cmd, "go", None, Duration::from_secs(30)).await },
+            )
+        })
+        .collect();
+
+    // Everything that can start, has: the bound is saturated and the rest are
+    // queued behind it.
+    wait_until("the bound to fill", || started_count(&log) >= limit).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        started_count(&log),
+        limit,
+        "over-limit one-shots must queue, not spawn ({burst} concurrent calls, limit {limit})"
+    );
+
+    // A caller arriving into that full queue with a short timeout fails as a
+    // queue timeout — and still spawns nothing.
+    let queued_out = run_one_shot_acp(launch(), "go", None, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    let OneShotError::QueueTimeout {
+        waited_ms,
+        limit: reported,
+    } = queued_out
+    else {
+        panic!("expected QueueTimeout, got {queued_out}");
+    };
+    assert_eq!(
+        reported as usize, limit,
+        "the error names the configured cap"
+    );
+    assert!(
+        waited_ms >= 250,
+        "reported wait {waited_ms}ms is implausibly short"
+    );
+    assert_eq!(
+        started_count(&log),
+        limit,
+        "a queue-timed-out call must not have spawned an adapter"
+    );
+
+    // Let the parked adapters finish: every queued caller gets its turn.
+    std::fs::write(&release, "go").expect("write release");
+    for (i, run) in runs.into_iter().enumerate() {
+        let text = run
+            .await
+            .expect("task joins")
+            .unwrap_or_else(|e| panic!("queued one-shot #{i} failed: {e}"));
+        assert_eq!(text, "ok", "one-shot #{i}");
+    }
+    assert_eq!(
+        started_count(&log),
+        burst,
+        "every queued caller must eventually run"
     );
 }

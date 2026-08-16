@@ -80,9 +80,11 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -99,7 +101,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
         ]
     );
     assert_eq!(
@@ -109,7 +111,7 @@ async fn migration_status_reports_current_after_open() {
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
             69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100
         ]
     );
 }
@@ -602,6 +604,59 @@ async fn workspace_pull_requests_round_trip_and_clear() {
     store.update_workspace(&cleared).await.expect("update");
     let reread = store.get_workspace(&id).await.expect("re-get");
     assert!(reread.pull_requests.is_none());
+}
+
+/// `update_workspace_pr_linkage` writes ONLY the PR columns + `updated_at`:
+/// a stale snapshot carrying old values for other columns (title, archived)
+/// must never clobber a concurrent mutation of those columns.
+#[tokio::test]
+async fn workspace_pr_linkage_update_is_scoped() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&id, "Before", false))
+        .await
+        .expect("insert");
+    // Stale snapshot taken before a concurrent full-row mutation.
+    let mut stale = store.get_workspace(&id).await.expect("snapshot");
+
+    let mut concurrent = store.get_workspace(&id).await.expect("get");
+    concurrent.title = "Renamed meanwhile".to_string();
+    concurrent.archived = true;
+    concurrent.archived_at = Some(now_iso());
+    concurrent.status = WorkspaceStatus::Archived;
+    store
+        .update_workspace(&concurrent)
+        .await
+        .expect("concurrent mutation");
+
+    stale.pr_number = Some(99);
+    stale.pr_url = Some("https://example.com/pr/99".to_string());
+    stale.pr_status = Some(intent_core::PullRequestStatus::Merged);
+    stale.updated_at = now_iso();
+    store
+        .update_workspace_pr_linkage(&stale)
+        .await
+        .expect("scoped pr write");
+
+    let after = store.get_workspace(&id).await.expect("re-get");
+    assert_eq!(after.pr_number, Some(99), "pr columns written");
+    assert_eq!(
+        after.pr_status,
+        Some(intent_core::PullRequestStatus::Merged)
+    );
+    assert_eq!(
+        after.title, "Renamed meanwhile",
+        "stale snapshot must not clobber a concurrent title edit"
+    );
+    assert!(after.archived, "stale snapshot must not resurrect archived");
+
+    let missing = store
+        .update_workspace_pr_linkage(&sample_workspace(&WorkspaceId::new(), "?", false))
+        .await;
+    assert!(matches!(missing, Err(crate::Error::NotFound(_))));
 }
 
 /// `delete_workspace` records a tombstone so `workspace_id_ever_used` keeps
@@ -1600,6 +1655,9 @@ async fn task_metadata_round_trip_and_list_tasks() {
         started_at: Some(now_iso()),
         completed_at: None,
         peer_order: Some(100),
+        depends_on: vec![NoteId::from("dep-1")],
+        conflicts_with: vec![NoteId::from("conflict-1")],
+        unmet_depends_on: Vec::new(),
     };
     store
         .insert_note(&task_note(&ws_id, "Task A", Some(meta.clone())))
@@ -1612,7 +1670,28 @@ async fn task_metadata_round_trip_and_list_tasks() {
 
     let tasks = store.list_tasks(&ws_id).await.expect("list tasks");
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].metadata.task, Some(meta));
+    assert_eq!(tasks[0].metadata.task, Some(meta.clone()));
+
+    // The computed `unmet_depends_on` projection is stripped at encode time
+    // (monorepo#1979): a note written with it populated reads back clean.
+    let mut projected = task_note(
+        &ws_id,
+        "Task B",
+        Some(TaskMetadata {
+            unmet_depends_on: vec![NoteId::from("dep-1")],
+            ..meta
+        }),
+    );
+    store.insert_note(&projected).await.expect("insert B");
+    let read = store.get_note(&ws_id, &projected.id).await.expect("get B");
+    assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
+    projected.metadata.task.as_mut().unwrap().unmet_depends_on = vec![NoteId::from("dep-2")];
+    store.update_note(&projected).await.expect("update B");
+    let read = store
+        .get_note(&ws_id, &projected.id)
+        .await
+        .expect("get B after update");
+    assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
 }
 
 fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
@@ -3182,6 +3261,8 @@ async fn activate_incremental_vacuum_converts_legacy_none_db() {
 fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -3210,11 +3291,13 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -3222,6 +3305,54 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         sandbox_branch: None,
     }
 }
+/// The `IS NULL` guard's race contract at the store level: the first
+/// materialization wins, and a second call with a DIFFERENT snapshot (the
+/// lost-race path — caller's in-memory session still NULL while the DB row
+/// was stamped concurrently) leaves the row untouched and returns the
+/// winner's snapshot. `updated_at` stays untouched throughout.
+#[tokio::test]
+async fn materialize_harness_features_first_write_wins() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let session = sample_agent_session(&agent_id, &ws);
+    let original_updated_at = session.updated_at.clone();
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    let winner = serde_json::json!({"taskGraph": true});
+    let loser = serde_json::json!({"taskGraph": false});
+    let first = store
+        .materialize_agent_session_harness_features(&agent_id, &winner)
+        .await
+        .expect("first materialization");
+    assert_eq!(first, Some(winner.clone()), "first write persists");
+    let second = store
+        .materialize_agent_session_harness_features(&agent_id, &loser)
+        .await
+        .expect("second materialization");
+    assert_eq!(
+        second,
+        Some(winner),
+        "lost race adopts the winner's snapshot, not the loser's"
+    );
+    let row = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get session");
+    assert_eq!(
+        row.updated_at, original_updated_at,
+        "materialization must not touch updated_at"
+    );
+}
+
 #[tokio::test]
 async fn agent_session_round_trip_and_append_only_log() {
     let tmp = TempDb::new();
@@ -3833,6 +3964,46 @@ async fn agent_message_metadata_round_trip() {
     assert!(session.messages[1].metadata.is_none());
 }
 
+/// Attachment-registry rows round-trip (insert → get), an unknown id is
+/// `NotFound`, and the optional `mime_type` persists as NULL when absent
+/// (PROTOCOL §5.9).
+#[tokio::test]
+async fn attachment_registry_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+
+    let record = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000001".to_string(),
+        workspace_id: ws.clone(),
+        file_name: "report.pdf".to_string(),
+        mime_type: Some("application/pdf".to_string()),
+        size: 12345,
+        uploaded_at: "2026-08-12T00:00:00Z".to_string(),
+        stored_path: ".intent/attachments/report.pdf".to_string(),
+    };
+    store.insert_attachment(&record).await.expect("insert");
+    let loaded = store.get_attachment(&record.id).await.expect("get");
+    assert_eq!(loaded, record);
+
+    // Absent mime_type stays None.
+    let no_mime = crate::AttachmentRecord {
+        id: "0193e001-0000-7000-8000-000000000002".to_string(),
+        mime_type: None,
+        ..record.clone()
+    };
+    store.insert_attachment(&no_mime).await.expect("insert 2");
+    let loaded2 = store.get_attachment(&no_mime.id).await.expect("get 2");
+    assert_eq!(loaded2.mime_type, None);
+
+    // Unknown id → NotFound.
+    let missing = store.get_attachment("no-such-id").await;
+    assert!(
+        matches!(missing, Err(intent_core::Error::NotFound(_))),
+        "{missing:?}"
+    );
+}
+
 /// The P3-1.2b persistence-gap fields round-trip through insert → get →
 /// update → get: `completion_report(_timestamp)`, `delegation_depth`,
 /// `initial_message`, the JSON `context_references` / `image_blocks`, and
@@ -3853,6 +4024,8 @@ async fn agent_session_gap_fields_round_trip() {
     session.initial_message = Some("kick off".to_string());
     session.context_references = Some(json!([{ "type": "file", "path": "src/a.rs" }]));
     session.image_blocks = Some(json!([{ "type": "image", "data": "abc" }]));
+    session.file_blocks =
+        Some(json!([{ "type": "file", "attachmentId": "att-1", "fileName": "r.pdf" }]));
     session.is_background = true;
     store
         .insert_agent_session(&session)
@@ -3870,6 +4043,10 @@ async fn agent_session_gap_fields_round_trip() {
     assert_eq!(
         loaded.image_blocks,
         Some(json!([{ "type": "image", "data": "abc" }]))
+    );
+    assert_eq!(
+        loaded.file_blocks,
+        Some(json!([{ "type": "file", "attachmentId": "att-1", "fileName": "r.pdf" }]))
     );
     assert_eq!(loaded.completion_report, None);
 
@@ -4978,9 +5155,11 @@ async fn concurrent_writes_no_sqlite_busy() {
                     token_usage: None,
                     cow_supported: None,
                     display_status: None,
+                    waiting: false,
                     checkout_mode: None,
                     execution_environment: None,
                     disk_usage: None,
+                    pending_delete_at: None,
                 };
                 store.insert_workspace(&workspace).await
             })
@@ -5874,6 +6053,12 @@ async fn hook_state_run_and_error_updates() {
     assert_eq!(got.last_run_at.as_deref(), Some(ran_at.as_str()));
     assert_eq!(got.next_run_at.as_deref(), Some(next_at.as_str()));
 
+    // Atomic expiry: one call flips state AND clears next_run_at together.
+    store.expire_hook(&id).await.expect("atomic expiry");
+    let got = store.get_hook(&id).await.unwrap();
+    assert_eq!(got.state, HookState::Expired);
+    assert_eq!(got.next_run_at, None);
+
     store
         .update_hook_next_run(&id, None)
         .await
@@ -5928,6 +6113,7 @@ async fn hook_state_run_and_error_updates() {
             .update_hook_next_run(&missing, None)
             .await
             .expect_err("next run"),
+        store.expire_hook(&missing).await.expect_err("expire"),
         store
             .update_hook_last_error(&missing, None)
             .await

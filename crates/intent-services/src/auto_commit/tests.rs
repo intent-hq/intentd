@@ -13,7 +13,7 @@ use intent_store::{NewTrackedChange, Store};
 use serde_json::json;
 
 use crate::auto_commit::{
-    is_meaningful_agent_name, is_normal_finish_reason, normalize_subject, parse_commit_message,
+    is_meaningful_agent_name, is_normal_finish_reason, normalize_subject, parse_commit_message_json,
 };
 use crate::Services;
 
@@ -100,9 +100,11 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -137,6 +139,8 @@ fn session(
 ) -> AgentSession {
     let ts = now_iso();
     AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -165,6 +169,7 @@ fn session(
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
@@ -175,6 +180,7 @@ fn session(
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 
@@ -564,21 +570,99 @@ async fn idle_auto_commit_ignores_other_agents_attribution() {
 }
 
 #[test]
-fn parse_commit_message_extracts_tagged_output() {
-    let output = "some preamble\n<<<COMMIT_MESSAGE>>>\nfeat: add feature\n\nBody text\n<<</COMMIT_MESSAGE>>>\ntrailing text";
-    let parsed = parse_commit_message(output).unwrap();
-    assert_eq!(parsed, "feat: add feature\n\nBody text");
+fn parse_commit_message_accepts_clean_json() {
+    let parsed = parse_commit_message_json(r#"{"subject": "feat: add feature"}"#).unwrap();
+    assert_eq!(parsed, "feat: add feature");
 }
 
 #[test]
-fn parse_commit_message_rejects_missing_tags() {
-    assert!(parse_commit_message("no tags here").is_none());
-    assert!(parse_commit_message("<<<COMMIT_MESSAGE>>>incomplete").is_none());
+fn parse_commit_message_accepts_fenced_json() {
+    let output = "```json\n{\"subject\": \"fix: repair parser\"}\n```";
+    assert_eq!(
+        parse_commit_message_json(output).unwrap(),
+        "fix: repair parser"
+    );
+    let bare_fence = "```\n{\"subject\": \"fix: repair parser\"}\n```";
+    assert_eq!(
+        parse_commit_message_json(bare_fence).unwrap(),
+        "fix: repair parser"
+    );
 }
 
 #[test]
-fn parse_commit_message_rejects_empty() {
-    assert!(parse_commit_message("<<<COMMIT_MESSAGE>>>   <<</COMMIT_MESSAGE>>>").is_none());
+fn parse_commit_message_accepts_json_with_surrounding_prose() {
+    let output = "Here is the commit message:\n{\"subject\": \"chore: tidy up\"}\nHope that helps!";
+    assert_eq!(parse_commit_message_json(output).unwrap(), "chore: tidy up");
+}
+
+#[test]
+fn parse_commit_message_skips_brace_blob_before_valid_object() {
+    // A `{...}` blob in leading prose — whether malformed or a parseable
+    // object with a blank subject — must not mask a later valid object.
+    let malformed_first = r#"Sure {ok}: {"subject": "feat: x"}"#;
+    assert_eq!(
+        parse_commit_message_json(malformed_first).unwrap(),
+        "feat: x"
+    );
+    let empty_subject_first = r#"{"subject": ""} then the answer {"subject": "feat: y"}"#;
+    assert_eq!(
+        parse_commit_message_json(empty_subject_first).unwrap(),
+        "feat: y"
+    );
+}
+
+#[test]
+fn parse_commit_message_first_valid_object_wins() {
+    let output = r#"{"subject": "feat: first"} {"subject": "feat: second"}"#;
+    assert_eq!(parse_commit_message_json(output).unwrap(), "feat: first");
+}
+
+#[test]
+fn parse_commit_message_composes_multiline_body() {
+    // A body with escaped `\n` sequences composes into real newlines.
+    let output = r#"{"subject": "feat: add retry", "body": "Adds retry.\n\n- backoff\n- jitter"}"#;
+    assert_eq!(
+        parse_commit_message_json(output).unwrap(),
+        "feat: add retry\n\nAdds retry.\n\n- backoff\n- jitter"
+    );
+}
+
+#[test]
+fn parse_commit_message_composes_subject_and_body() {
+    let output = r#"{"subject": "feat: add feature", "body": "Explains what and why."}"#;
+    assert_eq!(
+        parse_commit_message_json(output).unwrap(),
+        "feat: add feature\n\nExplains what and why."
+    );
+    // Null / empty / whitespace-only bodies compose to the bare subject.
+    assert_eq!(
+        parse_commit_message_json(r#"{"subject": "feat: solo", "body": null}"#).unwrap(),
+        "feat: solo"
+    );
+    assert_eq!(
+        parse_commit_message_json(r#"{"subject": "feat: solo", "body": "   "}"#).unwrap(),
+        "feat: solo"
+    );
+}
+
+#[test]
+fn parse_commit_message_rejects_missing_or_empty_subject() {
+    assert!(parse_commit_message_json(r#"{"body": "no subject here"}"#).is_none());
+    assert!(parse_commit_message_json(r#"{"subject": ""}"#).is_none());
+    assert!(parse_commit_message_json(r#"{"subject": "   "}"#).is_none());
+}
+
+#[test]
+fn parse_commit_message_rejects_non_json_output() {
+    assert!(parse_commit_message_json("no json here").is_none());
+    assert!(parse_commit_message_json("{\"subject\": \"feat: unterminated").is_none());
+    assert!(parse_commit_message_json("feat: bare commit message").is_none());
+}
+
+#[test]
+fn parse_commit_message_rejects_empty_output() {
+    assert!(parse_commit_message_json("").is_none());
+    assert!(parse_commit_message_json("   \n  ").is_none());
 }
 
 #[cfg(unix)]
@@ -588,7 +672,7 @@ async fn generated_message_replaces_fallback_subject() {
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let (_bin_dir, bin) = fake_auggie(
         "gen-ok",
-        "printf '<<<COMMIT_MESSAGE>>>\\nfeat: implement auto-commit\\n<<</COMMIT_MESSAGE>>>'",
+        r#"printf '{"subject": "feat: implement auto-commit"}'"#,
     );
     let (_config_dir, registry) = auggie_active_registry();
     let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
@@ -612,9 +696,12 @@ async fn generation_uses_commit_quick_action_override() {
     // the CLI. The fake auggie echoes its argv into the generated subject.
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    // The argv includes `--mcp-config {"mcpServers":{}}`, so strip double
+    // quotes before embedding it in the JSON string to keep the reply valid.
     let (_bin_dir, bin) = fake_auggie(
         "gen-quick-action",
-        "printf '<<<COMMIT_MESSAGE>>>\\nfeat: %s\\n<<</COMMIT_MESSAGE>>>' \"$*\"",
+        r#"args=$(printf '%s' "$*" | tr -d '"')
+printf '{"subject": "feat: %s"}' "$args""#,
     );
     let (_config_dir, registry) = auggie_active_registry();
     registry
@@ -664,7 +751,7 @@ async fn generation_timeout_falls_back_to_subject() {
 async fn malformed_output_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let (_bin_dir, bin) = fake_auggie("malformed", "printf 'no tags at all'");
+    let (_bin_dir, bin) = fake_auggie("malformed", "printf 'no json at all'");
     let (_config_dir, registry) = auggie_active_registry();
     let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
     let agent = session("agent-m1", &ws_id, None, false, "Malformed Agent", true);
@@ -706,7 +793,7 @@ async fn generated_message_preserves_trailers() {
     svc.store().insert_note(&note).await.unwrap();
     let (_bin_dir, bin) = fake_auggie(
         "trailers",
-        "printf '<<<COMMIT_MESSAGE>>>\\nchore: generated commit\\n<<</COMMIT_MESSAGE>>>'",
+        r#"printf '{"subject": "chore: generated commit"}'"#,
     );
     let (_config_dir, registry) = auggie_active_registry();
     let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);

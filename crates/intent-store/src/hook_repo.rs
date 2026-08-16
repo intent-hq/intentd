@@ -153,6 +153,27 @@ impl Store {
         Ok(n as u64)
     }
 
+    /// Number of ACTIVE (`scheduled`/`running`) hooks in a workspace — the
+    /// count-only aggregate behind the `Workspace.waiting` hook probe: no
+    /// `code`/`last_state` blob hydration and no dependence on how many
+    /// terminal rows the workspace has accumulated over the daemon's
+    /// lifetime, unlike [`Store::list_hooks_by_workspace`] + in-memory
+    /// filtering (mirrors [`Store::count_active_hooks_by_agent`]).
+    pub async fn count_active_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let n: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM hook \
+             WHERE workspace_id = ? AND state IN ('scheduled', 'running')",
+        )
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("count workspace active hooks failed: {e}"))
+        })?
+        .get::<i64, _>("n");
+        Ok(n as u64)
+    }
+
     /// List all hooks owned by an agent, oldest first.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
@@ -174,6 +195,26 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("update hook state failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(intent_core::Error::NotFound(format!(
+                "hook {} not found",
+                hook_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Atomically persist a hook's TTL expiry: a single UPDATE sets
+    /// `state = 'expired'` AND clears `next_run_at`, so no reader can ever
+    /// observe an expired hook with a stale `next_run_at`; `NotFound` when
+    /// the row is absent.
+    pub async fn expire_hook(&self, hook_id: &HookId) -> Result<()> {
+        let res = sqlx::query("UPDATE hook SET state = ?, next_run_at = NULL WHERE hook_id = ?")
+            .bind(state_to_db(HookState::Expired))
+            .bind(&hook_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| intent_core::Error::Internal(format!("expire hook failed: {e}")))?;
         if res.rows_affected() == 0 {
             return Err(intent_core::Error::NotFound(format!(
                 "hook {} not found",

@@ -13,8 +13,25 @@ use crate::error::{Error, Result};
 use crate::settings_file::SettingsFile;
 
 /// Default idle-reap TTL in minutes (`agents.idleReapMinutes`, §11.1); `0`
-/// disables the sweep entirely.
-pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 30;
+/// disables the sweep entirely. Lowered from 30 to 10 (monorepo#2109): idle
+/// reaping is the main lever on resident memory — every agent touched inside
+/// the window holds its whole subtree alive (~0.66 GB idle each) — and a
+/// 30-minute window kept a day's worth of touched agents resident at once.
+pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 10;
+
+/// Default daemon-wide cap on concurrently live ephemeral ACP adapters
+/// (`agents.maxConcurrentAdapters`): the one-shot `agent.completeOnce`
+/// completions and model probes that spawn a provider-CLI chain without
+/// holding an agent slot. Each chain measures ~610 MB, so 6 bounds a
+/// quick-action fan-out at ~3.7 GB (monorepo#2062). There is no unlimited
+/// value — see [`MAX_CONCURRENT_ADAPTERS_LIMIT`].
+pub const DEFAULT_MAX_CONCURRENT_ADAPTERS: u32 = 6;
+
+/// Upper bound accepted for `agents.maxConcurrentAdapters`. Well above the
+/// 4–8 product range so an operator on a large host can raise it, and low
+/// enough that the setting cannot be turned back into the unbounded spawn
+/// this bound replaced (~610 MB × 64 ≈ 39 GB is already a bad day).
+pub const MAX_CONCURRENT_ADAPTERS_LIMIT: u32 = 64;
 
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h

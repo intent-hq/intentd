@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+use crate::ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 use crate::settings_file::SandboxType;
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
@@ -111,18 +114,18 @@ pub enum NoteVisibility {
 
 /// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
 /// the BE-owned canonical status rollup over the active/latest PR,
-/// `taskStats`, live agent activity, the per-workspace attention axes, and
-/// the dismissible workspace attention flag. Wire values are the snake_case
-/// variant names, matching the FE union exactly. Canonical precedence
-/// (§6.5): `Failed` (a top-level agent parked in `error`) > `Blocked` (a
-/// top-level pending `blocker` attention request) > `NeedsAttention`
-/// (discussion requests, pending structured questions, or the
-/// `review_required` attention flag) > `InProgress` (running agent) >
-/// `Unread` (the `unread` attention flag, promoting only over the
-/// idle/terminal bases `Idle`/`Complete`/`PrMerged`) > the PR/task rollup.
-/// Without a running agent, a task-stage rollup (`InProgress`/`NotStarted`)
-/// demotes to `Idle` — so `NotStarted` and the task-derived `InProgress`
-/// never reach the wire on their own.
+/// `taskStats`, live agent activity, and the per-workspace attention axes.
+/// Wire values are the snake_case variant names, matching the FE union
+/// exactly. Canonical precedence (§6.5): `Failed` (a top-level agent parked
+/// in `error`) > `Blocked` (a top-level pending `blocker` attention
+/// request) > `NeedsAttention` (discussion requests, pending structured
+/// questions, or the `review_required` attention flag) > `InProgress`
+/// (running agent) > the PR/task rollup. The dismissible `unread` attention
+/// flag (`Workspace.attention`, §9.9) never feeds the derivation — unread
+/// is the flag's own contract, not a display status. Without a running
+/// agent, a task-stage rollup (`InProgress`/`NotStarted`) demotes to `Idle`
+/// — so `NotStarted` and the task-derived `InProgress` never reach the wire
+/// on their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDisplayStatus {
@@ -131,7 +134,6 @@ pub enum WorkspaceDisplayStatus {
     NeedsAttention,
     Failed,
     Blocked,
-    Unread,
     Idle,
     Complete,
     PrReady,
@@ -224,6 +226,21 @@ pub struct Workspace {
     /// elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_status: Option<WorkspaceDisplayStatus>,
+    /// Daemon-owned orthogonal wait flag (PROTOCOL §5.1): `true` when the workspace
+    /// has any of ACTIVE background hooks, ACTIVE PR monitors, or waiting
+    /// agent subscriptions (undelivered child completion watches held by
+    /// top-level foreground agents, anchored in the parent's home
+    /// workspace; `event.subscribe` registrations deliberately do not
+    /// count) — the workspace is watching an external condition without a
+    /// running agent turn. Orthogonal to `displayStatus` (a workspace can
+    /// be `complete` or `pr_ready` and still waiting). Served from the
+    /// last-observed cache on the same `workspace.list` / `workspace.get` /
+    /// subscription emit path as `displayStatus` (never persisted; the
+    /// hook/monitor/watch mutation choke points keep the cache current, and
+    /// only a first-touch miss probes the store); omitted (not `false`)
+    /// when no wait signal is live.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -262,6 +279,14 @@ pub struct Workspace {
     /// directory (remote / skip-isolation / chief).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<WorkspaceDiskUsage>,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.1): set on
+    /// `workspace.list` / `workspace.get` rows while a `workspace.delete`
+    /// grace window (`undoDelayMs > 0`) is running, so clients can render or
+    /// hide the row as they choose. Never persisted — a daemon restart drops
+    /// the pending deletion and the field disappears. Omitted (not `null`)
+    /// when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
 }
 
 /// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
@@ -356,11 +381,13 @@ pub fn chief_workspace() -> Workspace {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        waiting: false,
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -877,6 +904,7 @@ pub struct WorkspaceCreateInitialAgent {
     pub agent_type: Option<String>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
+    pub file_blocks: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -1098,6 +1126,22 @@ pub struct TaskMetadata {
     pub completed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_order: Option<i64>,
+    /// Task-note ids this task depends on (hard ordering edges). Written via
+    /// `task.setRelations` / `task.markAsTask`; cycle-checked at write time.
+    /// Omitted on the wire when empty so pre-existing notes are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    /// Task-note ids this task conflicts with (advisory, symmetric by
+    /// convention — no cycle check). Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// **Computed, never persisted** (monorepo#1979): the `depends_on` subset
+    /// whose task note is not `complete` (missing and cancelled deps count as
+    /// unmet — same rule as the `task.list` projection). Projected onto
+    /// note-shaped reads/pushes at the service layer; stripped from
+    /// `task_json` at store encode time. Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Comment discriminant (§9.1). Serializes to the TS wire form (e.g.
@@ -1264,6 +1308,73 @@ pub struct NoteEditLinesInput {
     pub content: String,
 }
 
+/// Result of `note.create` — the created (post-auto-convert) note plus the
+/// `@@@task` conversion outcome, matching the four content-write results.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteCreateResult {
+    pub note: Note,
+    pub converted_count: i64,
+    pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for NoteCreateResult {
+    /// Legacy-tolerant decode: `note.create` idempotency records persisted
+    /// before the conversion fields existed contain a serialized bare `Note`,
+    /// so a replay of a pre-upgrade key must still decode. A bare note maps
+    /// to a zeroed conversion outcome; the current `{ note, ... }` shape
+    /// decodes as derived (the count/id fields tolerate absence like the
+    /// `#[serde(default)]` vecs, for symmetry with older-daemon responses).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Current {
+            note: Note,
+            #[serde(default)]
+            converted_count: i64,
+            #[serde(default)]
+            created_task_note_ids: Vec<String>,
+            #[serde(default)]
+            created_tasks: Vec<CreatedTaskEntry>,
+            #[serde(default)]
+            warnings: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Compat {
+            Current(Current),
+            LegacyBareNote(Note),
+        }
+        match Compat::deserialize(deserializer)? {
+            Compat::Current(c) => Ok(NoteCreateResult {
+                note: c.note,
+                converted_count: c.converted_count,
+                created_task_note_ids: c.created_task_note_ids,
+                created_tasks: c.created_tasks,
+                warnings: c.warnings,
+            }),
+            Compat::LegacyBareNote(note) => Ok(NoteCreateResult {
+                note,
+                converted_count: 0,
+                created_task_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
+            }),
+        }
+    }
+}
+
 /// Result of `note.add` — mirrors the TS `ws.note.add` peer return shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1277,6 +1388,14 @@ pub struct NoteAddResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.edit` — first exact-match replacement.
@@ -1293,6 +1412,14 @@ pub struct NoteEditResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.editLines` — 1-based inclusive replace/delete/insert.
@@ -1309,6 +1436,14 @@ pub struct NoteEditLinesResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.setContent` — full replace with the reduction guard.
@@ -1326,6 +1461,14 @@ pub struct NoteSetContentResult {
     pub new_content: String,
     pub converted_count: i64,
     pub created_task_note_ids: Vec<String>,
+    /// One entry per task note created by the auto-conversion, in block
+    /// order (parallel to `created_task_note_ids`).
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal auto-conversion warnings (see
+    /// [`TaskConvertBlocksResult::warnings`]).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `note.updateMetadata`. Either a normal title/tags update or a
@@ -1366,6 +1509,15 @@ pub struct NoteTaskRow {
     pub status: String,
     pub task_note_id: Option<String>,
     pub linked_task_note_id: Option<String>,
+    /// Relations mirrored from the linked task note's metadata (empty and
+    /// omitted for rows without a linked task note).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Result of `note.readAsset` (PROTOCOL §5.2). `data` is base64; `sizeKb` is
@@ -1559,6 +1711,10 @@ pub struct TaskGetMyTaskResult {
     pub assigned_agents: Vec<AgentId>,
     /// Monotonic version counter echoed from the backing note (§8.3/§8.4).
     pub rev: i64,
+    /// Computed: `dependsOn` ids whose task is not yet `complete` (missing
+    /// and cancelled deps count as unmet). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// Canonical task facts for a workspace (TS `WorkspaceTask`, `shared/types.ts`).
@@ -1572,13 +1728,35 @@ pub struct WorkspaceTask {
     pub title: String,
     pub status: TaskStatus,
     pub updated_at: String,
+    /// True iff this task's id appears in the spec note body as an
+    /// `intent://local/task/{id}` link. Additive field, always serialized
+    /// (`false` for every row when the spec has no links); not conditioned
+    /// on `parent_id`.
+    #[serde(default)]
+    pub spec_linked: bool,
+    /// Backing note's parent pointer, so clients can distinguish subtasks
+    /// (parent is another task) from top-level tasks (parent is the spec or
+    /// absent) and reconstruct the hierarchy from `task.list` alone.
+    /// Additive; omitted when the note has no parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NoteId>,
+    /// Task relations (empty and omitted for tasks without them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<NoteId>,
+    /// Computed: `dependsOn` ids whose task is not yet `complete`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_depends_on: Vec<NoteId>,
 }
 
 /// `task.list` result envelope: the projected `WorkspaceTask` list (honouring
 /// the optional `status` filter) **and** the workspace-wide `taskStats`
-/// aggregate (always computed over the unfiltered spec-linked set, mirroring
-/// the canonical FE `computeTaskStats` in `task-stats.ts`). Lets the FE render
-/// the progress rollup verbatim instead of re-deriving it from `note.list`.
+/// aggregate. `tasks` membership is workspace-wide — every task note except
+/// the spec itself, each flagged with `specLinked` — while `stats` stays the
+/// spec-linked direct-child rollup (mirrors the canonical FE
+/// `computeTaskStats` in `task-stats.ts`). Lets the FE render the progress
+/// rollup verbatim instead of re-deriving it from `note.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskListResult {
@@ -1595,6 +1773,32 @@ pub struct TaskMarkAsTaskResult {
     pub status: TaskStatus,
 }
 
+/// Result of `task.setRelations` (PROTOCOL §5.4). Echoes the stored relations
+/// after the write so callers see the normalized (deduped) lists — always
+/// present (a cleared list echoes `[]`), unlike the omitted-when-empty
+/// projections on the read paths.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSetRelationsResult {
+    pub ok: bool,
+    pub note_id: NoteId,
+    #[serde(default)]
+    pub depends_on: Vec<NoteId>,
+    #[serde(default)]
+    pub conflicts_with: Vec<NoteId>,
+}
+
+/// One task note created by `@@@task` block conversion: the block's `key=`
+/// header attribute (when authored), its title, and the created note's id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedTaskEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub title: String,
+    pub note_id: String,
+}
+
 /// Result of `task.convertBlocks`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1602,6 +1806,17 @@ pub struct TaskConvertBlocksResult {
     pub ok: bool,
     pub converted_count: i64,
     pub created_note_ids: Vec<String>,
+    /// One entry per task note created by this conversion, in block order
+    /// (parallel to `created_note_ids`); reused existing children are not
+    /// listed.
+    #[serde(default)]
+    pub created_tasks: Vec<CreatedTaskEntry>,
+    /// Non-fatal conversion problems: header parse issues, unresolvable or
+    /// ambiguous `dependsOn`/`conflictsWith` references, and validator-
+    /// rejected edges. Conversion never fails on these — the blocks still
+    /// convert and each skipped edge/attribute adds one entry here.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `task.createPrerequisite`.
@@ -2084,6 +2299,24 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// The harness version stamped on every newly created agent session
+/// (intent-hq/monorepo#2459). Single-source constant: session creation
+/// (`agent.create` and everything funneling through it — delegate,
+/// wakeOrCreate) stamps exactly this value, and a new session ALWAYS gets the
+/// current version — the stamp depends only on creation time, never on the
+/// creating parent's pinned version. Bump when doctrine text or feature
+/// defaults change materially; existing sessions keep their stamped version
+/// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
+/// (migration 0096).
+pub const CURRENT_HARNESS_VERSION: &str = "1.0";
+
+/// Serde default for [`AgentSession::harness_version`]: payloads persisted or
+/// exported before harness versioning existed deserialize as "1.0", matching
+/// the migration-0096 backfill.
+fn default_harness_version() -> String {
+    CURRENT_HARNESS_VERSION.to_string()
+}
+
 /// Metadata key under which the question-dismissal marker is persisted on the
 /// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
 /// assistant message whose trailing question resource blocks the user
@@ -2266,6 +2499,12 @@ pub struct AgentSession {
     /// `imageBlocks`); an opaque JSON array persisted verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Session-level file blocks captured at spawn (FE top-level
+    /// `fileBlocks`); an opaque JSON array persisted verbatim. Entries carry
+    /// EITHER inline `data` or an attachment-registry `attachmentId`
+    /// reference (PROTOCOL §5.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
     /// workspaces with CoW support). `None` for shared-mode agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2317,6 +2556,33 @@ pub struct AgentSession {
     /// the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.getSession` reads while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session. NOT persisted — the
+    /// service layer overlays it on read from the in-memory registry, and a
+    /// daemon restart drops the pending deletion (the session survives and
+    /// the field disappears). Omitted (not `null`) when no deletion is
+    /// pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
+    /// Harness version this session was stamped with at creation
+    /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
+    /// upgrade never changes it, and there is no upgrade/migration/pinning
+    /// op. Pre-feature rows read back "1.0" (migration-0096 backfill; same
+    /// serde default for pre-feature payloads).
+    #[serde(default = "default_harness_version")]
+    pub harness_version: String,
+    /// JSON snapshot of the effective `agentFeatures` on/off values captured
+    /// at session creation ([`crate::settings_file::AgentFeaturesSettings`]
+    /// in its camelCase wire form). Immutable like `harness_version` once
+    /// set; later settings changes affect only new sessions. `None` only for
+    /// legacy pre-snapshot rows that have not been activated since the
+    /// feature landed: the service layer projects the current settings on
+    /// read so the wire always carries a value, and the row's first
+    /// activation freezes the snapshot lazily (one-time materialization;
+    /// the legacy `task_graph_enabled` pin wins over the live setting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_features: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2459,9 +2725,11 @@ pub struct AgentMetadata {
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
-/// the TS `AgentLite`: the full [`AgentSession`] with `messages` and
-/// `systemPrompt` stripped (clients fetch the transcript via
-/// `agent.getConversation`), plus a derived `messageCount`, the
+/// the TS `AgentLite`: the full [`AgentSession`] with `messages`,
+/// `systemPrompt`, and the session-level `imageBlocks` stripped (clients fetch
+/// the transcript via `agent.getConversation`; the spawn-time image blocks —
+/// potentially large base64 blobs — are detail-only and served by
+/// `agent.getSession`), plus a derived `messageCount`, the
 /// `lastAgentResponse` / `digest` / `lastUserMessage` computed from the
 /// transcript, a nested `metadata` object, and the runtime activity flags the
 /// iOS coverflow reads.
@@ -2593,10 +2861,10 @@ pub struct AgentLite {
     /// when absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_references: Option<serde_json::Value>,
-    /// Session-level image blocks persisted at spawn (P3-1.2b); omitted when
-    /// absent so pre-gap wire shapes are unchanged.
+    /// Session-level file blocks persisted at spawn (PROTOCOL §5.5); omitted
+    /// when absent so pre-existing wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_blocks: Option<serde_json::Value>,
+    pub file_blocks: Option<serde_json::Value>,
     /// Canonical stop/finish reason from the latest terminal stream/status event
     /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2610,6 +2878,26 @@ pub struct AgentLite {
     /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_corrupted: bool,
+    /// ISO deadline of an in-memory pending deletion (PROTOCOL §5.5): set on
+    /// `agent.list` / `agent.get` rows while an `agent.delete` grace window
+    /// (`undoDelayMs > 0`) is running for this session, so clients can render
+    /// or hide the row as they choose. Never persisted — overlaid by the
+    /// service projection from the in-memory registry (stays `None` in
+    /// [`AgentLite::from_session`], which has no runtime context); a daemon
+    /// restart drops the pending deletion and the field disappears. Omitted
+    /// (not `null`) when no deletion is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_delete_at: Option<String>,
+    /// Harness version the session was stamped with at creation; mirrors
+    /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
+    #[serde(default = "default_harness_version")]
+    pub harness_version: String,
+    /// Captured `agentFeatures` snapshot; mirrors
+    /// [`AgentSession::harness_features`]. `None` for pre-snapshot rows here
+    /// (no settings context) — the service projection overlays the current
+    /// settings so the wire always carries a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_features: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
 }
 
@@ -2683,10 +2971,13 @@ impl AgentLite {
             last_message_id,
             digest,
             context_references: session.context_references,
-            image_blocks: session.image_blocks,
+            file_blocks: session.file_blocks,
             stop_reason: session.stop_reason,
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
+            pending_delete_at: session.pending_delete_at,
+            harness_version: session.harness_version,
+            harness_features: session.harness_features,
             metadata,
         }
     }
@@ -2719,6 +3010,10 @@ pub struct AgentCreateExtra {
     pub workspace_context: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
+    /// Session-level file blocks captured at spawn (PROTOCOL §5.5): entries
+    /// carry EITHER inline `data` or an attachment-registry `attachmentId`
+    /// reference; validated at the create seam like send/queue.
+    pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
     /// Internal override for the created session's `nameExplicitlySet` flag.
     /// Not accepted from the wire (`#[serde(skip)]`): `agent_delegate_op`
@@ -2768,6 +3063,72 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+    /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
+    /// together — each entry either a bare task-note id or a
+    /// [`BatchTaskEntry::Options`] object carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides. Mutually exclusive
+    /// with `taskNoteId`/`noteId`/`taskText`, and the single-task-only
+    /// `agentInstructions`/`force` are rejected alongside it; when present
+    /// the result enumerates every listed task with its disposition
+    /// (`started` / `held:*` / `skipped`) plus the unlock plan. Single-task
+    /// calls (this field absent) behave exactly as before.
+    pub tasks: Option<Vec<BatchTaskEntry>>,
+    /// REMOVED batch conflict override (PROTOCOL §5.5): kept as a field only
+    /// so a request still passing `greedy` gets a clear rejection instead of
+    /// being silently ignored — delegate a held task individually to force
+    /// it past a conflict hold. `Option<Option<bool>>` via
+    /// [`deserialize_optional_field`] so an explicit `null` (`Some(None)`)
+    /// is detected as present and rejected too; only a missing field
+    /// (`None`) passes.
+    #[serde(deserialize_with = "deserialize_optional_field")]
+    pub greedy: Option<Option<bool>>,
+}
+
+/// One entry of the batch `agent.delegate` `tasks` array (PROTOCOL §5.5):
+/// either a bare task-note id string (the original shape, unchanged) or an
+/// object carrying the id plus per-task option overrides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BatchTaskEntry {
+    /// Bare task-note id — inherits the call's top-level
+    /// `specialist`/`model`/`reasoningEffort` defaults.
+    Id(NoteId),
+    /// Object entry with per-task overrides.
+    Options(BatchTaskOptions),
+}
+
+impl BatchTaskEntry {
+    /// The task-note id this entry addresses, regardless of shape.
+    pub fn task_note_id(&self) -> &NoteId {
+        match self {
+            BatchTaskEntry::Id(id) => id,
+            BatchTaskEntry::Options(opts) => &opts.task_note_id,
+        }
+    }
+}
+
+/// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
+/// `specialist`/`model`/`reasoningEffort` override the call's top-level
+/// defaults for that task only. `agentInstructions` is carried solely so the
+/// delegate op can reject it with a clear error — it is never honored (each
+/// started task's first message resolves from its own task note).
+/// `deny_unknown_fields` so a typo'd or unsupported per-entry key (e.g.
+/// `behaviorPrompt`, `waitMode`, `greedy`) fails deserialization instead of
+/// being silently dropped — the same silent-ignore failure mode the modeled
+/// rejection fields exist to prevent (works with `untagged`: serde buffers
+/// the content).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchTaskOptions {
+    pub task_note_id: NoteId,
+    #[serde(default)]
+    pub specialist: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub agent_instructions: Option<String>,
 }
 
 /// Per-agent microVM sizing override (`vmResources` on `agent.delegate` /
@@ -2880,12 +3241,26 @@ pub enum GitFileStatus {
 /// One entry in [`GitStatus::files`] (`{ path, status, staged }`), mirroring the
 /// TS `FileStatus`. A file with both staged and unstaged changes yields two
 /// entries (matching the TS `parseStatusOutput`).
+///
+/// Submodule (gitlink) entries additionally carry `mode: "160000"` plus the
+/// old/new pin SHAs (monorepo#1739) so a client can route them to a dedicated
+/// presentation without probing `git.showFile`. All three fields are omitted
+/// for regular file entries (additive, backward-compatible).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStatus {
     pub path: String,
     pub status: GitFileStatus,
     pub staged: bool,
+    /// Octal tree-entry mode string, present only for gitlinks (`"160000"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Pre-change submodule pin SHA (`None` for a newly added submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_sha: Option<String>,
+    /// Post-change submodule pin SHA (`None` for a deleted submodule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_sha: Option<String>,
 }
 
 /// `git.status` result (`GitStatus` in `src/shared/types.ts`). `diverged` is true
@@ -3220,6 +3595,65 @@ pub struct PrMonitor {
     pub updated_at: String,
 }
 
+/// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
+/// lowercase variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceGitRootSource {
+    /// Registered explicitly by an agent (`ws.git.registerRoot`).
+    Agent,
+    /// Auto-detected by the daemon (the workspace worktree's git submodules).
+    Auto,
+}
+
+/// A secondary local git repository tracked for a workspace (multi git root
+/// tracking, intent-hq/monorepo#2053) — an agent-created subtree checkout, a
+/// submodule, or a sibling clone anywhere on the host. Persisted to the
+/// `workspace_git_root` table (rows cascade with their workspace); the daemon
+/// runs the same background PR discovery on each root as on the primary
+/// workspace root, so the PR fields mirror the [`Workspace`] PR fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitRoot {
+    pub id: WorkspaceGitRootId,
+    pub workspace_id: WorkspaceId,
+    /// Canonicalized absolute path of the git repository root. Registration
+    /// is idempotent by `(workspaceId, path)`.
+    pub path: String,
+    pub source: WorkspaceGitRootSource,
+    /// Repository owner detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_owner: Option<String>,
+    /// Repository name detected from the root's `origin` remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
+    /// Agents that registered this root, in registration order (deduped).
+    /// Empty for auto-detected roots with no explicit registrations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_by_agent_ids: Vec<AgentId>,
+    /// The root's HEAD commit SHA captured when the root was first registered
+    /// (agent registration or sweep auto-detect); immutable once set — merges
+    /// never touch it. `None` when HEAD was unreadable at registration or the
+    /// row predates the field; the background sweep best-effort-backfills
+    /// such rows with the root's current HEAD (a going-forward boundary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_commit_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// Persisted PR lifecycle status for the root's linked PR (§7.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_status: Option<PullRequestStatus>,
+    /// Persisted list of PR snapshots discovered for the root's current
+    /// branch (§7.6). `None` = never populated by the daemon; `Some(vec![])`
+    /// = explicitly no discovered PRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests: Option<Vec<PullRequestInfo>>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
 /// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
@@ -3315,6 +3749,71 @@ mod tests {
         // Round-trips back to an equal value.
         let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn agent_delegate_input_tasks_accepts_mixed_string_and_object_entries() {
+        // PROTOCOL §5.5 batch form: a bare taskNoteId string and an object
+        // entry with per-task overrides deserialize side by side.
+        let input: AgentDelegateInput = serde_json::from_value(json!({
+            "tasks": [
+                "bare-id",
+                { "taskNoteId": "obj-id", "specialist": "verifier",
+                  "model": "mock:m", "reasoningEffort": "high" },
+                { "taskNoteId": "min-id" },
+            ],
+            "specialist": "implementor",
+        }))
+        .unwrap();
+        let tasks = input.tasks.expect("tasks");
+        assert_eq!(tasks.len(), 3);
+        assert!(matches!(&tasks[0], BatchTaskEntry::Id(id) if id.0 == "bare-id"));
+        assert_eq!(tasks[0].task_note_id().0, "bare-id");
+        match &tasks[1] {
+            BatchTaskEntry::Options(o) => {
+                assert_eq!(o.task_note_id.0, "obj-id");
+                assert_eq!(o.specialist.as_deref(), Some("verifier"));
+                assert_eq!(o.model.as_deref(), Some("mock:m"));
+                assert_eq!(o.reasoning_effort.as_deref(), Some("high"));
+                assert!(o.agent_instructions.is_none());
+            }
+            other => panic!("expected Options, got {other:?}"),
+        }
+        assert_eq!(tasks[2].task_note_id().0, "min-id");
+
+        // An object entry without a taskNoteId fails to deserialize.
+        assert!(serde_json::from_value::<AgentDelegateInput>(
+            json!({ "tasks": [{ "specialist": "verifier" }] })
+        )
+        .is_err());
+
+        // deny_unknown_fields: a typo'd or unsupported per-entry key fails
+        // deserialization instead of being silently dropped.
+        for bad in [
+            json!({ "taskNoteId": "x", "speciallist": "verifier" }),
+            json!({ "taskNoteId": "x", "behaviorPrompt": "be terse" }),
+            json!({ "taskNoteId": "x", "waitMode": "after_all" }),
+            json!({ "taskNoteId": "x", "greedy": true }),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentDelegateInput>(json!({ "tasks": [bad] })).is_err(),
+                "unknown per-entry key must fail deserialization: {bad}"
+            );
+        }
+
+        // The removed `greedy` param is presence-aware: a missing field is
+        // `None`, while `true`/`false`/an explicit `null` all deserialize as
+        // present (`Some(..)`) so the service layer can reject any of them.
+        assert!(input.greedy.is_none());
+        for (val, expect) in [
+            (json!(true), Some(Some(true))),
+            (json!(false), Some(Some(false))),
+            (json!(null), Some(None)),
+        ] {
+            let with_greedy: AgentDelegateInput =
+                serde_json::from_value(json!({ "tasks": ["x"], "greedy": val })).unwrap();
+            assert_eq!(with_greedy.greedy, expect);
+        }
     }
 
     #[test]
@@ -3667,11 +4166,13 @@ mod tests {
             agent_summary: None,
             diff_summary: None,
             display_status: None,
+            waiting: false,
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -3690,9 +4191,18 @@ mod tests {
         ] {
             assert!(v.get(key).is_none(), "expected `{key}` to be omitted");
         }
+        // Presence-detected `waiting`: omitted when false, emitted when true.
+        assert!(v.get("waiting").is_none(), "waiting omitted when false");
         // Round-trips back with optionals defaulted to None.
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, ws);
+
+        let mut waiting_ws = ws.clone();
+        waiting_ws.waiting = true;
+        let v = serde_json::to_value(&waiting_ws).unwrap();
+        assert_eq!(v["waiting"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, waiting_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing
@@ -4191,6 +4701,8 @@ mod tests {
     fn agent_lite_metadata_and_activity_wire_shape() {
         let ts = "t1".to_string();
         let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: Some(AgentId::from("agent-parent")),
@@ -4219,6 +4731,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: true,
             metadata: Some(json!({
                 DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
@@ -4228,6 +4741,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -4278,6 +4792,8 @@ mod tests {
     #[test]
     fn agent_lite_is_initial_agent_omitted_unless_true() {
         let session = |metadata: Option<serde_json::Value>| AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -4306,11 +4822,13 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -4348,6 +4866,8 @@ mod tests {
     #[test]
     fn agent_session_camel_case_parity() {
         let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -4385,11 +4905,13 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
@@ -4418,6 +4940,7 @@ mod tests {
                     "contentBlocks": [{ "type": "text", "text": "hi" }],
                     "timestamp": "t0"
                 }],
+                "harnessVersion": CURRENT_HARNESS_VERSION,
                 "createdAt": "t0",
                 "updatedAt": "t1"
             })
@@ -4666,5 +5189,58 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, json!({ "vcpus": 4, "memMib": 4096 }));
+    }
+
+    #[test]
+    fn note_create_result_decodes_legacy_bare_note_idempotency_record() {
+        // `note.create` idempotency records persisted before the conversion
+        // fields existed contain a serialized bare `Note` — a replayed key
+        // must decode it as a zeroed conversion outcome, not fail.
+        let note_json = json!({
+            "id": "n-1",
+            "workspaceId": "ws-1",
+            "title": "T",
+            "content": "c",
+            "contentType": "markdown",
+            "tags": [],
+            "isPinned": false,
+            "isArchived": false,
+            "isDefault": false,
+            "parentId": null,
+            "visibility": "workspace",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "rev": 0,
+            "updatedAt": "2026-01-01T00:00:00Z"
+        });
+        let legacy: NoteCreateResult = serde_json::from_value(note_json.clone()).unwrap();
+        assert_eq!(legacy.note.id.0, "n-1");
+        assert_eq!(legacy.converted_count, 0);
+        assert!(legacy.created_task_note_ids.is_empty());
+        assert!(legacy.created_tasks.is_empty());
+        assert!(legacy.warnings.is_empty());
+
+        // The current shape round-trips (serialize → deserialize → equal).
+        let current = NoteCreateResult {
+            note: legacy.note.clone(),
+            converted_count: 2,
+            created_task_note_ids: vec!["t-1".into(), "t-2".into()],
+            created_tasks: vec![CreatedTaskEntry {
+                key: Some("k".into()),
+                title: "Child".into(),
+                note_id: "t-1".into(),
+            }],
+            warnings: vec!["w".into()],
+        };
+        let back: NoteCreateResult =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(back, current);
+
+        // An enveloped record missing the conversion fields (older-daemon
+        // response shape) also decodes with defaults.
+        let sparse: NoteCreateResult =
+            serde_json::from_value(json!({ "note": note_json })).unwrap();
+        assert_eq!(sparse.note.id.0, "n-1");
+        assert_eq!(sparse.converted_count, 0);
+        assert!(sparse.warnings.is_empty());
     }
 }

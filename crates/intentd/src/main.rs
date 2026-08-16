@@ -3,6 +3,7 @@
 //! This binary is the composition root (§3.2 rule 5): it is the only place that
 //! wires concrete implementations together (store → services → transport).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
@@ -11,16 +12,19 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
-use intent_core::{Config, ServerControl, WorkspaceApi};
+use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
-    GitStatusRefresher, PermissionPolicy, Services, WatcherRegistry,
+    agent_memory_budget_bytes, default_process_cap, init_adapter_slots, live_adapters,
+    max_concurrent_adapters, max_concurrent_agents, recommended_memory_budget_bytes, AgentManager,
+    BusEventSink, EventBus, GitStatusRefresher, PermissionPolicy, Services, TreeMemoryProbe,
+    WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
-    detect_has_display, ensure_tls_certificate, get_or_create_token, serve_uds_with_reverse,
-    AsyncTokenStore, CertStatus, FileTokenStore, PrimaryReverseRegistry, RpcLimiter, SystemControl,
-    SystemStatus, TokenStore, WsApiServer, WsOptions,
+    collect_local_ips, detect_has_display, ensure_tls_certificate, get_or_create_token,
+    local_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
+    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
+    WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -88,6 +92,33 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
+    /// Read or change daemon settings (§5.12) on a running daemon. With no
+    /// arguments, lists every setting with its type and current value
+    /// (`settings.list`); with `<name>`, prints that setting (`settings.get`);
+    /// with `<name> <value>`, validates the value against the setting's
+    /// definition and applies it (`settings.update`). Values are coerced to
+    /// the definition's type: booleans take `true`/`false`, numbers a numeric
+    /// literal, enums one of the allowed strings, object/array settings a
+    /// JSON document. Sensitive values arrive pre-redacted from the daemon.
+    /// For `sensitive` settings, omitting the value prompts for it with input
+    /// hidden (`read -s` style), and `--stdin` / a `-` value read it from
+    /// stdin — both keep the plaintext out of shell history and `ps`.
+    Settings {
+        /// Dotted setting path, e.g. `agents.resumeInterruptedOnStart`.
+        name: Option<String>,
+        /// New value, parsed per the setting's type (booleans: `true`/`false`;
+        /// numbers: a numeric literal; object/array settings: JSON). `-`
+        /// reads the value from stdin (same as `--stdin`).
+        /// `allow_hyphen_values`: a negative number (`-3`) must reach the
+        /// coercion layer instead of being rejected as an unknown flag.
+        #[arg(allow_hyphen_values = true)]
+        value: Option<String>,
+        /// Read the new value from stdin (to EOF, trimming exactly one
+        /// trailing newline) so secrets never appear in argv, e.g.
+        /// `op read op://vault/linear/token | intentd settings linear.token --stdin`.
+        #[arg(long)]
+        stdin: bool,
+    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -210,6 +241,9 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
+        Command::Settings { name, value, stdin } => {
+            to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
+        }
         Command::McpBridge { connect } => {
             // The bridge reads stdin via `tokio::io::stdin()`, whose pending
             // blocking-pool read outlives `run_stdio_bridge`; returning
@@ -546,7 +580,7 @@ async fn cmd_import_legacy(
     // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
     // hermetic test harness) mean "legacy import disabled": return before
     // touching the store so no app-level blobs land and no completion marker
-    // is written — consistent with `maybe_import_on_first_boot`.
+    // is written — consistent with `decide_first_boot_import`.
     if roots.is_empty() {
         println!("legacy import disabled: no legacy roots to scan");
         return Ok(());
@@ -564,11 +598,18 @@ async fn cmd_import_legacy(
             force,
             assets_root: Some(config.data_dir.join("assets")),
             app_dir,
+            // Offline CLI: no daemon, no live subscribers — no events. A
+            // running daemon learns about the rows via `system.importLegacy`
+            // or its next boot, both of which publish.
+            event_bus: None,
         },
     )
     .await?;
     println!("{report}");
     if !dry_run {
+        // Keep the persisted failure summary in sync: a clean run (e.g. the
+        // documented `--force` retry) clears any stale row from a prior run.
+        legacy_import::persist_failure_summary(&store, &report).await;
         if !report.has_compatibility_failures() {
             // Marker write failure is a warning, not a command failure — the
             // import itself completed (mirrors the first-boot hook in `serve`).
@@ -861,20 +902,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             "auto_vacuum activation failed; continuing without incremental vacuum"
         ),
     }
-    // First-boot legacy workspace import: on a fresh DB with no completion
-    // marker, scan the legacy roots and import `.workspace/workspace.json`
-    // workspaces. Runs to completion inline after migrations (inside
-    // `Store::open`) and before any transport serves RPCs; it never fails
-    // startup, but a large legacy tree does delay this first boot (accepted
-    // one-time tradeoff — see `maybe_import_on_first_boot`).
-    legacy_import::maybe_import_on_first_boot(
-        &store,
-        db_existed,
-        legacy_import::default_roots(),
-        Some(config.data_dir.join("assets")),
-        legacy_import::default_app_dir(),
-    )
-    .await;
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().
@@ -882,6 +909,52 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
+    // Serializes import runs: shared between the first-boot background task
+    // below and the `system.importLegacy` RPC (via DaemonControl), so the two
+    // can never interleave workspace inserts — without the lock both could
+    // observe a missing row before either inserts it, turning the loser's
+    // idempotent skip into a spurious `insert failed` failure-summary entry.
+    let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // First-boot legacy workspace import: the eligibility decision (fresh DB
+    // / marker state) is made synchronously here, but the import itself runs
+    // in a spawned background task concurrently with the transports coming up
+    // — `serve` never awaits it, so a large legacy tree no longer delays
+    // first boot. `decide_first_boot_import` persists a pending marker before
+    // the run starts; a daemon killed mid-import resumes on the next boot
+    // (the importer is idempotent). A concurrent `system.importLegacy` RPC —
+    // a concurrency window the inline pre-transport import never had — is
+    // serialized behind `legacy_import_lock`. Aborted during shutdown before
+    // Store::close() — the pending marker then resumes the run next boot; the
+    // abort cancels the outer task at its current await point and detaches
+    // any in-flight per-workspace unit, which the pool close + idempotent
+    // resume make benign (bounding it would need cancellation plumbed through
+    // `run()` for no behavioral gain).
+    let legacy_import_handle = {
+        let roots = legacy_import::default_roots();
+        match legacy_import::decide_first_boot_import(&store, db_existed, &roots).await {
+            legacy_import::FirstBootDecision::Skip => None,
+            decision => {
+                let store = store.clone();
+                let assets_root = Some(config.data_dir.join("assets"));
+                let app_dir = legacy_import::default_app_dir();
+                let event_bus = Some(bus.clone());
+                let lock = legacy_import_lock.clone();
+                let resumed = decision == legacy_import::FirstBootDecision::Resume;
+                Some(tokio::spawn(async move {
+                    let _guard = lock.lock().await;
+                    legacy_import::run_first_boot_import(
+                        &store,
+                        roots,
+                        assets_root,
+                        app_dir,
+                        event_bus,
+                        resumed,
+                    )
+                    .await;
+                }))
+            }
+        }
+    };
     // Hold a store handle for the §10.2 retention sweep before the store is
     // moved into the services surface below.
     let retention_store = store.clone();
@@ -953,6 +1026,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
     let process_cap =
         max_concurrent_agents(&boot_settings.effective).unwrap_or_else(default_process_cap);
+    // Install the daemon-wide ephemeral-adapter bound before anything can
+    // spawn one. One-shot completions and model probes hold no agent slot, so
+    // this — not `process_cap` — is what stops a quick-action fan-out from
+    // running the host out of memory (monorepo#2062). Applies on restart, like
+    // `agents.maxConcurrent`.
+    let adapter_cap = max_concurrent_adapters(&boot_settings.effective);
+    if !init_adapter_slots(adapter_cap) {
+        tracing::warn!(
+            limit = adapter_cap,
+            "ephemeral adapter bound was already installed; keeping the existing one"
+        );
+    }
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
@@ -1024,6 +1109,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // (§6.7/M3.5).
     let permission_policy = resolve_permission_policy();
     tracing::info!(?permission_policy, "agent permission policy");
+    // Descendant-tree memory sample shared by `system.status` (intentd#1139) and
+    // the optional aggregate spawn budget below (monorepo#2063). Constructed
+    // here because the budget is installed on the registry right after the
+    // manager exists, while the sampler task that fills it needs that manager.
+    let child_usage = Arc::new(ChildTreeUsage::default());
     let manager = Arc::new(
         AgentManager::new(
             services.clone(),
@@ -1066,6 +1156,42 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
     // visible to every clone, including the api handed to the transport below).
     services.attach_agent_manager(&manager);
+    // Read-only tree probe for `agent.diagnostics` per-agent subtree memory
+    // attribution (monorepo#2063 A2): installed unconditionally, unlike the
+    // budget below, which only exists when the budget resolves positive.
+    manager.set_tree_probe(child_usage.clone());
+    // Aggregate child-tree memory budget (monorepo#2063): an absent key means
+    // auto (resolves to the recommended budget derived from system RAM), an
+    // explicit 0 means off, and a positive value is an explicit MB budget.
+    // `process_cap` bounds agent *slots*, which is not a memory bound: a single
+    // agent's subtree was measured from 436 MB idle to 9.6 GB running a test
+    // suite. When installed, the budget reads the same descendant-tree sampler
+    // `system.status` reports (intentd#1139) and gates new spawns only — see
+    // [`ProcessRegistry::acquire`].
+    let total_memory_bytes = {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    };
+    let recommended_bytes = recommended_memory_budget_bytes(total_memory_bytes);
+    let budget_enabled =
+        match agent_memory_budget_bytes(&boot_settings.effective, total_memory_bytes) {
+            Some(budget_bytes) => {
+                manager
+                    .registry()
+                    .set_memory_budget(budget_bytes, child_usage.clone());
+                tracing::info!(
+                    budget_bytes,
+                    recommended_bytes,
+                    "aggregate agent memory budget enabled"
+                );
+                true
+            }
+            None => {
+                tracing::debug!("aggregate agent memory budget disabled (agents.memoryBudgetMb=0)");
+                false
+            }
+        };
     tracing::info!(
         process_cap = manager.registry().cap(),
         "agent manager ready"
@@ -1191,6 +1317,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             );
         }
     });
+    // Sweep stale export staging dirs (workspace.export.*): export sessions
+    // are in-memory only, so after a restart every leftover staging dir is an
+    // orphan. Spawned + best-effort like the worktree trash sweep above.
+    let services_export_sweep = services.clone();
+    tokio::spawn(async move {
+        services_export_sweep.sweep_stale_export_staging().await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
@@ -1227,9 +1360,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown.
     let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
-    // configured TTL, killing each one's whole process group. Disabled entirely
-    // when `agents.idleReapMinutes == 0`.
-    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
+    // configured TTL, killing each one's whole process group — and, when an
+    // aggregate memory budget is installed (monorepo#2063), drain idle agents
+    // largest-first while over budget without waiting for the TTL. Disabled
+    // entirely when `agents.idleReapMinutes == 0` AND no budget is installed.
+    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled);
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
@@ -1351,6 +1486,32 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
+    spawn_child_tree_sampler(manager.clone(), child_usage.clone());
+    let route_info = spawn_route_info_sampler();
+    // Workspaces-root disk sampler: report the volume `workspace.create`
+    // actually provisions under, resolved with the same precedence as the
+    // create path (`resolve_workspaces_parent`) — the startup-pinned
+    // `workspaces.root` (`INTENTD_WORKSPACES_DIR`, pinned above) wins, then a
+    // non-empty `workspace.worktreesLocation`, then the default root. Resolved
+    // once at boot from the boot snapshot; a `worktreesLocation` change
+    // applies to the sampler on restart. The non-panicking resolver returns
+    // `None` under the hermetic test guard with no workspaces dir; the fields
+    // then stay absent.
+    let workspaces_root_pinned =
+        boot_settings.origin("workspaces.root") == Some(intent_services::SettingOrigin::Flag);
+    let worktrees_location = boot_settings
+        .effective
+        .workspace
+        .worktrees_location
+        .clone()
+        .unwrap_or_default();
+    let workspaces_disk = match intent_services::try_workspaces_provisioning_parent(
+        workspaces_root_pinned,
+        &worktrees_location,
+    ) {
+        Some(root) => spawn_workspaces_disk_sampler(root),
+        None => Arc::new(WorkspacesDiskUsage::default()),
+    };
 
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
@@ -1358,9 +1519,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
         proc_usage,
+        child_usage,
+        route_info,
+        workspaces_disk,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
-        legacy_import_lock: tokio::sync::Mutex::new(()),
+        legacy_import_lock: legacy_import_lock.clone(),
+        legacy_import_bus: bus.clone(),
         settings_registry: settings_registry.clone(),
     });
 
@@ -1369,6 +1534,29 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // DaemonControl and WsRuntimeControl.
     if runtime.control.set(control.clone()).is_err() {
         panic!("control OnceLock should only be set once");
+    }
+
+    // Auto-resume interrupted agents at startup. `--resume-all` forces the
+    // sweep; otherwise the `agents.resumeInterruptedOnStart` setting decides
+    // (`auto` = headless hosts only, `on` = always, `off` = never). Awaited to
+    // completion BEFORE any listener starts (WS/WSS below, UDS further down)
+    // so the first `agent.listInterrupted` a client issues on connect never
+    // sees rows the sweep is about to claim (no interrupted-agents modal
+    // blip). "Complete" means every resume was initiated/claimed — the resumed
+    // agent turns still run in the background — and every failure inside the
+    // sweep only logs, so a bad sweep never wedges startup.
+    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let has_display = detect_has_display();
+    let resume_on_start = should_resume_on_start(resume_all, resume_setting, has_display);
+    tracing::info!(
+        resume_all,
+        setting = resume_setting.as_str(),
+        has_display,
+        resume = resume_on_start,
+        "startup interrupted-agent resume decision"
+    );
+    if resume_on_start {
+        run_startup_resume_sweep(&services).await;
     }
 
     // Resolve the boot-time TCP listener decision once: `--insecure` always
@@ -1464,60 +1652,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
             }
         }
     };
-
-    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
-    // Spawn in the background so it doesn't block startup; log failures per-agent.
-    if resume_all {
-        let services_clone = services.clone();
-        tokio::spawn(async move {
-            tracing::info!("--resume-all: enumerating interrupted agents");
-            // List all pending interrupted agents
-            let rows = match services_clone.store().list_interrupted_agents().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
-                    return;
-                }
-            };
-            if rows.is_empty() {
-                tracing::info!("--resume-all: no interrupted agents to resume");
-                return;
-            }
-            tracing::info!(
-                count = rows.len(),
-                "--resume-all: resuming interrupted agents"
-            );
-            let mut resumed = Vec::new();
-            let mut failed = Vec::new();
-            // Resume each agent using the same service operation as agent.resolveInterrupted
-            for interrupted in rows {
-                let agent_id = interrupted.agent_id.clone();
-                match services_clone.resume_interrupted_agent(&agent_id).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            agent_id = %agent_id,
-                            workspace = %interrupted.workspace_id,
-                            "--resume-all: resumed agent"
-                        );
-                        resumed.push(agent_id.0);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            error = %e,
-                            "--resume-all: failed to resume agent"
-                        );
-                        failed.push((agent_id.0, e.to_string()));
-                    }
-                }
-            }
-            tracing::info!(
-                resumed = resumed.len(),
-                failed = failed.len(),
-                "--resume-all: auto-resume sweep complete"
-            );
-        });
-    }
 
     // Wake-triggered auto-resume (sleep-resume Task D). When wakeResume is
     // enabled, subscribe to the suspend detector's resume-event stream and, on
@@ -1652,6 +1786,12 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         );
     }
 
+    // Stop the background first-boot legacy import (if still running) before
+    // closing the store; the pending marker makes the next boot resume it.
+    if let Some(handle) = legacy_import_handle {
+        handle.abort();
+    }
+
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
 
@@ -1679,11 +1819,25 @@ struct DaemonControl {
     start_time: std::time::Instant,
     /// Latest own-process CPU/memory sample from the background sampler.
     proc_usage: Arc<ProcUsage>,
+    /// Latest descendant-tree memory sample (agent child processes and
+    /// everything they spawn) from the background sampler.
+    child_usage: Arc<ChildTreeUsage>,
+    /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
+    /// background sampler, so `status()` never enumerates interfaces inline.
+    route_info: Arc<RouteInfo>,
+    /// Latest workspaces-root disk sample (available/total bytes) from the
+    /// background sampler, so `status()` never calls `statfs(2)` inline.
+    workspaces_disk: Arc<WorkspacesDiskUsage>,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
     /// Prevent overlapping import runs from racing workspace inserts/copies.
-    legacy_import_lock: tokio::sync::Mutex<()>,
+    /// Shared with the first-boot background import task, which acquires it
+    /// for its whole run, so the RPC and the boot import never interleave.
+    legacy_import_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Event bus for `workspace:created` publishes on imported rows, so live
+    /// subscribers learn about workspaces the importer writes through `Store`.
+    legacy_import_bus: EventBus,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -1715,6 +1869,44 @@ impl ProcUsage {
             self.memory_bytes.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Cached route-discovery snapshot (`localIps` + `hostname`) for
+/// `system.status` (§5.7), written by the background sampler task and read
+/// from `status()` without touching the OS. `localIps` is invalidated by
+/// external network activity, so per the derived-field ladder it is refreshed
+/// off the read path (TTL cache) rather than computed inline on read.
+struct RouteInfo {
+    inner: std::sync::RwLock<(Vec<String>, String)>,
+}
+
+impl RouteInfo {
+    fn load(&self) -> (Vec<String>, String) {
+        self.inner.read().expect("route info lock poisoned").clone()
+    }
+}
+
+/// Spawn the route-info sampler backing `system.status` (§5.7). Takes one
+/// synchronous sample first so `localIps`/`hostname` are populated before the
+/// listeners come up, then refreshes on a slow tick — the interface list only
+/// changes with external network state, so a short-TTL cache keeps the status
+/// read path free of `getifaddrs(3)`/hostname syscalls.
+fn spawn_route_info_sampler() -> Arc<RouteInfo> {
+    let info = Arc::new(RouteInfo {
+        inner: std::sync::RwLock::new((collect_local_ips(), local_hostname())),
+    });
+    let task_info = info.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(15);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let sample = (collect_local_ips(), local_hostname());
+            *task_info.inner.write().expect("route info lock poisoned") = sample;
+        }
+    });
+    info
 }
 
 /// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
@@ -1754,6 +1946,474 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         }
     });
     usage
+}
+
+/// Latest workspaces-root disk sample (`available`, `total` bytes of the
+/// volume containing the resolved workspaces root) for `system.status` (§5.7),
+/// written by the background sampler task and read from `status()` without
+/// touching the OS. `None` until the first sample lands or when no mounted
+/// volume matches the root, so the wire fields stay presence-detected —
+/// absent, never a misleading 0.
+#[derive(Default)]
+struct WorkspacesDiskUsage {
+    inner: std::sync::RwLock<Option<(u64, u64)>>,
+}
+
+impl WorkspacesDiskUsage {
+    fn load(&self) -> Option<(u64, u64)> {
+        *self
+            .inner
+            .read()
+            .expect("workspaces disk usage lock poisoned")
+    }
+}
+
+/// Resolve `(available, total)` bytes of the mounted volume containing
+/// `root`: the disk whose mount point is the longest path-prefix of the
+/// canonicalized root (canonicalization resolves symlinks so e.g. a macOS
+/// `/tmp` root matches its real `/private/tmp` volume; a not-yet-created root
+/// falls back to prefix-matching the raw path). `None` when no mount matches.
+fn workspaces_disk_sample(root: &Path) -> Option<(u64, u64)> {
+    let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| target.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| (d.available_space(), d.total_space()))
+}
+
+/// Spawn the workspaces-root disk sampler backing `system.status` (§5.7).
+/// Takes one synchronous sample first so the fields are populated before the
+/// listeners come up, then refreshes on a slow tick — free space moves slowly
+/// at the granularity clients care about (disk-pressure warnings), so a
+/// short-TTL cache keeps the status read path free of `statfs(2)` calls, per
+/// the derived-field ladder. The root is the provisioning parent resolved once
+/// at boot with `workspace.create` precedence
+/// (`intent_services::try_workspaces_provisioning_parent`); a
+/// `workspace.worktreesLocation` change applies to the sampler on restart.
+fn spawn_workspaces_disk_sampler(root: PathBuf) -> Arc<WorkspacesDiskUsage> {
+    let usage = Arc::new(WorkspacesDiskUsage::default());
+    let sample = move |usage: &WorkspacesDiskUsage| {
+        let sampled = workspaces_disk_sample(&root);
+        *usage
+            .inner
+            .write()
+            .expect("workspaces disk usage lock poisoned") = sampled;
+    };
+    sample(&usage);
+
+    let task_usage = usage.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(30);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            sample(&task_usage);
+        }
+    });
+    usage
+}
+
+/// Latest descendant-process-tree sample for `system.status`, written by the
+/// background sampler task and read lock-free from `status()`. `memory_bytes`
+/// is the aggregate resident memory of every process descended from the
+/// daemon — agent provider CLIs dominate it, so the daemon's own
+/// `memoryBytes` badly understates what the daemon costs the machine.
+/// `has_sample` stays false until the first walk lands, so a status read that
+/// beats the sampler reports `null` rather than a misleading zero.
+///
+/// `peak_memory_bytes` is a high-water mark since daemon start. The
+/// instantaneous pair alone is close to useless for the case this telemetry
+/// exists to serve: by the time anyone captures a debug bundle the overshoot
+/// is minutes in the past and the tree has drained back to baseline. The peak
+/// survives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildTreeSample {
+    count: usize,
+    memory_bytes: u64,
+    peak_memory_bytes: u64,
+    /// Resident bytes bucketed by registered agent root (monorepo#2063 Phase
+    /// A): each descendant's RSS credited to its nearest registered agent root,
+    /// from the same sweep as `memory_bytes` so the buckets and the aggregate
+    /// describe one tree. Descendants under no registered root (one-shot
+    /// adapter chains, `host.exec` children) appear only in the aggregate.
+    /// Measurement only today — nothing enforces per-agent limits with it.
+    /// Behind an `Arc` so `load()` stays a cheap clone.
+    agent_bytes: std::sync::Arc<HashMap<AgentId, u64>>,
+    /// Sweep counter, incremented on every store. Carried inside the sample for
+    /// the same reason the other three fields are published together: the spawn
+    /// budget (monorepo#2063) uses it to tell a re-measured reading from the one
+    /// it has already corrected for, and pairing a sequence number from one
+    /// sweep with a byte total from the next would make it discard a correction
+    /// it should keep, or keep one it should discard.
+    seq: u64,
+}
+
+/// The three fields are published together under one lock rather than as
+/// separate atomics: they are only meaningful as a set, and a reader that
+/// paired a count from one sweep with a byte total from the next would report
+/// a tree that never existed. Same shape as [`RouteInfo`] above, and the
+/// contention is nil — one writer every [`CHILD_TREE_BASE_PERIOD`] (plus the
+/// peak-only writer of [`Self::observe_burst`] during a burst), readers only on
+/// a `system.status` call.
+#[derive(Default)]
+struct ChildTreeUsage {
+    inner: std::sync::RwLock<Option<ChildTreeSample>>,
+}
+
+impl ChildTreeUsage {
+    fn store(&self, count: usize, memory_bytes: u64, agent_bytes: HashMap<AgentId, u64>) {
+        let mut guard = self.inner.write().expect("child tree usage lock poisoned");
+        let peak_memory_bytes = guard.as_ref().map_or(memory_bytes, |prev| {
+            prev.peak_memory_bytes.max(memory_bytes)
+        });
+        let seq = guard.as_ref().map_or(1, |prev| prev.seq.wrapping_add(1));
+        *guard = Some(ChildTreeSample {
+            count,
+            memory_bytes,
+            peak_memory_bytes,
+            agent_bytes: std::sync::Arc::new(agent_bytes),
+            seq,
+        });
+    }
+
+    /// Raise the high-water mark from a burst-cadence reading, without
+    /// publishing it as the current sample (monorepo#2107).
+    ///
+    /// Only `peak_memory_bytes` moves. `count` / `memory_bytes` / `seq` keep the
+    /// [`CHILD_TREE_BASE_PERIOD`] cadence they have always had, because `seq` is
+    /// the spawn budget's "this reading is new" signal: seeing it change is what
+    /// makes [`intent_services::ProcessRegistry`] drop the provisional charge it
+    /// holds for spawns admitted since the last sample (monorepo#2063). At
+    /// sub-second cadence that correction would be cleared before an admitted
+    /// spawn is resident in the tree at all, and a whole burst would be admitted
+    /// against one stale total — a bound that was just validated, silently
+    /// loosened in the name of a telemetry field. The peak has no such consumer:
+    /// it is a max over every reading ever taken, so extra readings can only
+    /// make it more true.
+    ///
+    /// A no-op before the first full sample lands: there is no tree reading to
+    /// raise yet, and seeding one here would publish a peak while
+    /// `childProcesses` / `childMemoryBytes` are still `null`, breaking the
+    /// all-null-or-all-present contract §5.7 gives the three fields. The
+    /// sampler's first sweep is always a full one, so the window is the first
+    /// few hundred milliseconds of daemon life.
+    fn observe_burst(&self, memory_bytes: u64) {
+        let mut guard = self.inner.write().expect("child tree usage lock poisoned");
+        if let Some(sample) = guard.as_mut() {
+            sample.peak_memory_bytes = sample.peak_memory_bytes.max(memory_bytes);
+        }
+    }
+
+    fn load(&self) -> Option<ChildTreeSample> {
+        self.inner
+            .read()
+            .expect("child tree usage lock poisoned")
+            .clone()
+    }
+}
+
+impl TreeMemoryProbe for ChildTreeUsage {
+    fn sample(&self) -> Option<(u64, u64)> {
+        // One read of the whole sample: the bytes and the sequence number that
+        // identifies them come from the same sweep by construction.
+        self.load().map(|s| (s.memory_bytes, s.seq))
+    }
+
+    fn agent_samples(&self) -> HashMap<AgentId, u64> {
+        // The per-agent buckets from the same sweep as `sample` (monorepo#2063
+        // A2): cheap clone off the Arc'd map, empty before the first sweep.
+        self.load()
+            .map(|s| s.agent_bytes.as_ref().clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Baseline sweep interval for the descendant-tree sampler — the cadence at
+/// which the published sample (`childProcesses` / `childMemoryBytes`) is
+/// refreshed, to the [`CHILD_TREE_BURST_PERIOD`] granularity the loop polls at.
+/// Slower than the ~1s own-process tick because this one needs a full-system
+/// process refresh to reconstruct the parent/child links: ~10 ms on a
+/// 1008-process macOS host (intentd#1139), re-measured at 12.5 ms median /
+/// 19.9 ms p95 on a 1105-process one, i.e. ~0.25% of one core at this cadence.
+const CHILD_TREE_BASE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Sweep interval while an ephemeral adapter chain is live, and the cadence at
+/// which the sampler checks whether one is (monorepo#2107).
+///
+/// The baseline is too coarse for the case `childMemoryPeakBytes` exists to
+/// serve. Every `agent.completeOnce` / `agent.enhancePrompt` quick action and
+/// every model probe spawns an adapter chain that lives for **seconds**, and
+/// those bursts are large and sharp: measured, 16 concurrent one-shots reached
+/// 6.97 GB and were spawned and fully reaped inside 3.3 s, entirely between two
+/// baseline ticks. The sampler saw `childProcesses: 0` throughout and the peak
+/// never moved — a 99% under-report of a burst that a 1 Hz `ps` walk had no
+/// trouble seeing, and low enough that the same burst *unbounded* read cheaper
+/// than it did under the `agents.maxConcurrentAdapters` bound.
+///
+/// 500 ms is half the cadence that was already shown sufficient (the `ps` walk
+/// the field was validated against ran at 1 Hz), which leaves margin for a
+/// chain whose ramp is sharper than the ones measured. It is not free: at
+/// 12.5 ms a sweep, sweeping this fast costs ~2.5% of one core, measured in
+/// situ as daemon CPU going from 1.65% to 3.84% mean across the same 16-chain
+/// burst. So it is spent only while chains are actually live — with none live
+/// the poll is one atomic read of the adapter bound and no sweep happens at
+/// all, leaving an idle or steadily-working daemon exactly as cheap as before.
+///
+/// The cadence holds for as long as chains are live, so a one-shot that sits
+/// there until its own timeout pays it for its whole life: measured over a 25 s
+/// chain, 3.2% of one core against 0.6% idle — one core of sixteen, for the
+/// duration of a call that is already the pathological case.
+///
+/// Two residual blind spots, worth stating rather than leaving for the next
+/// person to measure their way to (which is how monorepo#2107 was found):
+///
+/// 1. A chain born *and* reaped inside one 500 ms poll gap. Nothing observed
+///    comes close — the shortest measured chain lived 2.5 s.
+/// 2. Everything in the tree that never takes a slot in the adapter bound is
+///    still sampled at [`CHILD_TREE_BASE_PERIOD`] only. The fast cadence keys
+///    off [`intent_services::live_adapters`], so it covers the two
+///    [`intent_services`] paths that go through the bound — the one-shot ACP
+///    runner and the model probe — and nothing else. The auggie route of the
+///    same quick actions spawns its CLI directly and takes no slot; so do
+///    `host.exec` children, PTY sessions, MCP bridge servers, the Unsloth
+///    server, and the tool children a long-lived agent runs. Those are mostly
+///    long-lived enough for the baseline to see (an agent subtree lives for
+///    minutes to hours), but a short, sharp excursion from one of them can
+///    still be missed the way an adapter burst used to be.
+const CHILD_TREE_BURST_PERIOD: Duration = Duration::from_millis(500);
+
+/// Fraction of total system RAM the descendant tree may occupy before each
+/// sample logs a WARN. Agents are budgeted ~1 GB each by
+/// [`intent_services::compute_process_cap`], and the process cap lets that
+/// reach most of RAM on a large machine, so crossing half of total RAM means
+/// the daemon's children are a first-order contributor to system memory
+/// pressure and the log should say so before the OS starts swapping.
+const CHILD_TREE_WARN_FRACTION: f64 = 0.5;
+
+/// Absolute WARN threshold used when total system RAM cannot be determined.
+const CHILD_TREE_WARN_FALLBACK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Aggregate `(process count, resident bytes, per-agent resident bytes)` of
+/// every pid reachable from `root` through the `pid -> children` adjacency,
+/// excluding `root` itself — the root is already reported as `memoryBytes`,
+/// and counting it twice would inflate every bundle's tree total.
+///
+/// `agent_roots` maps each registered agent's spawned child pid to its agent
+/// id. During the walk, every descendant is additionally credited to the
+/// nearest such root at or above it (an agent root is credited to its own
+/// bucket, a nested agent root starts a new bucket for its own subtree), so
+/// the buckets are a partition of the subset of the tree that sits under a
+/// registered agent. Descendants under no registered root count only toward
+/// the aggregate. One pass, O(processes) — attribution rides the existing
+/// traversal instead of re-walking per agent.
+///
+/// Split from [`descendant_tree_usage`] so the traversal is testable without a
+/// live process table. The walk is iterative and visited-guarded: a pid table
+/// sampled while processes exit and get reparented can contain a cycle, and
+/// recursion over a deep chain could blow the stack.
+fn walk_descendants(
+    children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
+    memory_of: &dyn Fn(sysinfo::Pid) -> Option<u64>,
+    root: sysinfo::Pid,
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut agent_bytes: HashMap<AgentId, u64> = HashMap::new();
+    let mut seen: HashSet<sysinfo::Pid> = HashSet::from([root]);
+    // Each frame carries the bucket its subtree inherits: the nearest
+    // registered agent root at or above it (`None` outside any agent subtree).
+    let mut stack: Vec<(sysinfo::Pid, Option<&AgentId>)> = vec![(root, None)];
+    while let Some((pid, bucket)) = stack.pop() {
+        for child in children.get(&pid).into_iter().flatten() {
+            if !seen.insert(*child) {
+                continue;
+            }
+            // A registered agent root opens its own bucket — including when
+            // nested under another agent's subtree, so a sub-agent's usage is
+            // credited to the sub-agent, not its ancestor.
+            let child_bucket = agent_roots.get(child).or(bucket);
+            if let Some(memory) = memory_of(*child) {
+                count += 1;
+                bytes = bytes.saturating_add(memory);
+                if let Some(agent) = child_bucket {
+                    let slot = agent_bytes.entry(agent.clone()).or_insert(0);
+                    *slot = slot.saturating_add(memory);
+                }
+            }
+            stack.push((*child, child_bucket));
+        }
+    }
+    (count, bytes, agent_bytes)
+}
+
+/// Walk `root`'s descendants in the refreshed process table, returning
+/// `(process count, aggregate resident bytes, per-agent resident bytes)`.
+///
+/// Thread rows are excluded from both the adjacency and the sums: on Linux,
+/// sysinfo lists threads (`/proc/<pid>/task` entries) as `Process` rows whose
+/// `memory()` is the WHOLE process's RSS and whose `parent()` is the owning
+/// process, so counting them charged an N-threaded child N+1 times — up to
+/// 219x inflation of `childMemoryBytes` (monorepo#2342). macOS never lists
+/// thread rows, so `thread_kind()` is `None` there and nothing changes.
+fn descendant_tree_usage(
+    sys: &sysinfo::System,
+    root: sysinfo::Pid,
+    agent_roots: &HashMap<sysinfo::Pid, AgentId>,
+) -> (usize, u64, HashMap<AgentId, u64>) {
+    let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+    for (pid, proc) in sys.processes() {
+        if proc.thread_kind().is_some() {
+            continue;
+        }
+        if let Some(parent) = proc.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+    walk_descendants(
+        &children,
+        &|pid| {
+            sys.process(pid)
+                .filter(|p| p.thread_kind().is_none())
+                .map(|p| p.memory())
+        },
+        root,
+        agent_roots,
+    )
+}
+
+/// What one poll of the descendant-tree sampler should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildTreeSweep {
+    /// Nothing worth the process-table refresh: no ephemeral chain is live and
+    /// the baseline sample is not due yet.
+    Skip,
+    /// Walk the tree and fold the reading into the high-water mark only.
+    Peak,
+    /// Walk the tree and publish it as the current sample.
+    Full,
+}
+
+/// Decide a poll (monorepo#2107). A due baseline sample always wins — the
+/// published sample keeps its cadence whether or not a burst is in flight, so
+/// `childProcesses` / `childMemoryBytes` / the budget's sample sequence behave
+/// exactly as they did before the burst cadence existed.
+fn child_tree_sweep(live_chains: usize, since_full: Duration) -> ChildTreeSweep {
+    if since_full >= CHILD_TREE_BASE_PERIOD {
+        ChildTreeSweep::Full
+    } else if live_chains > 0 {
+        ChildTreeSweep::Peak
+    } else {
+        ChildTreeSweep::Skip
+    }
+}
+
+/// Spawn the descendant-tree memory sampler backing `system.status`'s
+/// `childProcesses` / `childMemoryBytes`. The daemon's own RSS
+/// is a poor proxy for what it costs the machine: a single claude-code agent
+/// subtree measures ~650–750 MB resident, so N live agents dwarf the ~230 MB
+/// daemon. Sampling the tree is what lets a debug bundle attribute system-wide
+/// memory pressure to agents instead of inferring it.
+///
+/// Each sample refreshes the whole process table (needed for the parent links)
+/// with memory only — no CPU, no disk, no env — and logs a WARN when the tree
+/// crosses [`CHILD_TREE_WARN_FRACTION`] of total RAM. The WARN is edge-
+/// triggered: it fires on the crossing and re-arms only after the tree falls
+/// back under the threshold, so a sustained overshoot costs one line, not one
+/// per tick. Burst sweeps are checked against the threshold too — the same
+/// edge-trigger, so still one line per crossing — which is how a transient
+/// overshoot leaves a trace even though it never becomes the published sample.
+///
+/// The loop polls at [`CHILD_TREE_BURST_PERIOD`] and [`child_tree_sweep`]
+/// decides what each poll costs: a full sweep every [`CHILD_TREE_BASE_PERIOD`],
+/// a peak-only sweep in between while an ephemeral adapter chain is live, and
+/// nothing at all otherwise.
+fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: Arc<ChildTreeUsage>) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        tracing::warn!("cannot resolve own pid; child-process memory sampling disabled");
+        return;
+    };
+    let warn_threshold = {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        match sys.total_memory() {
+            0 => CHILD_TREE_WARN_FALLBACK_BYTES,
+            total => (total as f64 * CHILD_TREE_WARN_FRACTION) as u64,
+        }
+    };
+
+    let task_usage = usage.clone();
+    tokio::spawn(async move {
+        // `without_tasks()`: on Linux, `nothing()` still enumerates every
+        // `/proc/<pid>/task` directory and lists each thread as a process
+        // row (monorepo#2342). The walk filters thread rows defensively,
+        // but not fetching them at all keeps the sweep cheap.
+        let refresh_kind = ProcessRefreshKind::nothing().with_memory().without_tasks();
+        let mut sys = System::new();
+        let mut warned = false;
+        let mut tick = tokio::time::interval(CHILD_TREE_BURST_PERIOD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `None` reads as "the baseline sample is due", so the first poll —
+        // which `interval` fires immediately — always publishes a full sample.
+        let mut last_full: Option<std::time::Instant> = None;
+        loop {
+            let polled_at = tick.tick().await.into_std();
+            let since_full = last_full.map_or(CHILD_TREE_BASE_PERIOD, |at: std::time::Instant| {
+                polled_at.saturating_duration_since(at)
+            });
+            let publish = match child_tree_sweep(live_adapters(), since_full) {
+                ChildTreeSweep::Skip => continue,
+                ChildTreeSweep::Full => true,
+                ChildTreeSweep::Peak => false,
+            };
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+            // Snapshot of registered agent root pids, taken alongside the
+            // process-table refresh so the buckets describe the same instant
+            // as the tree they partition. Burst (peak-only) sweeps skip it:
+            // `observe_burst` consumes only the aggregate bytes, so paying
+            // the handles lock + per-descendant bucketing at sub-second
+            // cadence would buy nothing — an empty map keeps the walk on
+            // its aggregate-only fast path.
+            let agent_roots: HashMap<sysinfo::Pid, AgentId> = if publish {
+                manager
+                    .agent_root_pids()
+                    .into_iter()
+                    .map(|(pid, agent)| (sysinfo::Pid::from_u32(pid), agent))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            let (count, bytes, agent_bytes) = descendant_tree_usage(&sys, pid, &agent_roots);
+            if publish {
+                task_usage.store(count, bytes, agent_bytes);
+                // Stamped from the poll instant, not from here: dating the
+                // baseline from when the sweep *finished* would add its own
+                // ~12 ms to every period and let the published cadence drift.
+                last_full = Some(polled_at);
+            } else {
+                task_usage.observe_burst(bytes);
+            }
+            if bytes >= warn_threshold && !warned {
+                warned = true;
+                tracing::warn!(
+                    child_processes = count,
+                    child_memory_bytes = bytes,
+                    warn_threshold_bytes = warn_threshold,
+                    agents = manager.registry().size(),
+                    max_agents = manager.registry().cap(),
+                    "daemon child processes are a first-order source of system memory pressure"
+                );
+            } else if bytes < warn_threshold {
+                warned = false;
+            }
+        }
+    });
 }
 
 /// Runtime control for the WSS listener, shared between DaemonControl and
@@ -1835,6 +2495,13 @@ impl SystemControl for DaemonControl {
         };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
+        // `None` until the slower descendant-tree sampler lands its first walk.
+        let child_tree = self.child_usage.load();
+        // Alternative routes for remote clients: same sources as
+        // `server.pairingInfo`, so a remote caller can refresh its stored
+        // host list from `system.status` alone. Served from the background
+        // sampler's TTL cache — never enumerated inline on the read path.
+        let (local_ips, hostname) = self.route_info.load();
         // Derived transport surface: UDS always serves; `tcp`/`listenMode`
         // reflect the live TCP listener state (runtime toggles included), so
         // `listenMode` is `both` while the listener is up and `uds` otherwise.
@@ -1843,6 +2510,13 @@ impl SystemControl for DaemonControl {
         // matching the port/fingerprint/clients fallback, and self-correcting
         // on the next call.
         let tcp = port.is_some();
+        // Aggregate-budget visibility (monorepo#2063): absent when the budget
+        // is off, so the wire fields stay presence-detected.
+        let budget = self.manager.registry().budget_status();
+        // Workspaces-volume disk space from the background sampler: `None`
+        // (absent on the wire) until the first sample lands or when no
+        // mounted volume matches the root.
+        let workspaces_disk = self.workspaces_disk.load();
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -1857,8 +2531,18 @@ impl SystemControl for DaemonControl {
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
+            local_ips,
+            hostname,
             cpu_percent,
             memory_bytes,
+            child_processes: child_tree.as_ref().map(|s| s.count),
+            child_memory_bytes: child_tree.as_ref().map(|s| s.memory_bytes),
+            child_memory_peak_bytes: child_tree.as_ref().map(|s| s.peak_memory_bytes),
+            agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
+            agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
+            queued_spawns: budget.map(|(_, _, queued)| queued),
+            workspaces_disk_available_bytes: workspaces_disk.map(|(avail, _)| avail),
+            workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
         }
     }
 
@@ -1883,11 +2567,15 @@ impl SystemControl for DaemonControl {
                     force,
                     assets_root: Some(self.legacy_import_assets_root.clone()),
                     app_dir: legacy_import::default_app_dir(),
+                    event_bus: Some(self.legacy_import_bus.clone()),
                 },
             )
             .await
             .map_err(|e| e.to_string())?;
 
+            // Keep the persisted failure summary in sync: a clean run (e.g.
+            // the documented `--force` retry) clears any stale row.
+            legacy_import::persist_failure_summary(&self.legacy_import_store, &report).await;
             let compatibility_failures = report.has_compatibility_failures();
             let marker_written = if compatibility_failures {
                 false
@@ -2447,7 +3135,8 @@ struct DataDirLock;
 
 /// Acquire the data-dir lock (§5.6): open/create `data_dir/intentd.lock` and take
 /// a non-blocking exclusive advisory `flock`. On contention another live instance
-/// already holds the lock, so refuse to start.
+/// already holds the lock, so refuse to start — naming the probable holder (from
+/// the pidfile) so logs and support bundles are actionable.
 #[cfg(unix)]
 fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
     use nix::fcntl::{Flock, FlockArg};
@@ -2462,9 +3151,39 @@ fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(DataDirLock { _lock: lock }),
         Err((_, errno)) => anyhow::bail!(
-            "intentd data dir {} is locked by another running instance ({errno}) — refusing to start a second instance",
-            config.data_dir.display()
+            "intentd data dir {} is locked by another running instance ({}) — refusing to start a second instance",
+            config.data_dir.display(),
+            lock_holder_detail(&config.pid_path, errno)
         ),
+    }
+}
+
+/// Describe the probable holder of a contended data-dir lock for the error
+/// message above: the pidfile's pid plus a signal-0 liveness verdict (e.g.
+/// `pid 12345, alive`). Falls back to the raw errno when the pidfile does not
+/// implicate a holder — the flock holder and the pidfile owner are the same
+/// live daemon in the normal contention case, but the pidfile is only a
+/// best-effort hint, never load-bearing for the locking semantics.
+///
+/// Only contention (`EAGAIN`/`EWOULDBLOCK`) is attributed to the pidfile
+/// owner; any other errno is a real flock failure (e.g. `ENOLCK`) and stays
+/// visible as-is. Pids outside `1..=i32::MAX` are ignored: `kill(0, 0)`
+/// probes our own process group and larger values go negative in the
+/// `i32` cast, so a malformed pidfile would falsely read as `alive`.
+#[cfg(unix)]
+fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
+    use nix::errno::Errno;
+    if errno != Errno::EAGAIN && errno != Errno::EWOULDBLOCK {
+        return errno.to_string();
+    }
+    match read_pid(pid_path).filter(|pid| (1..=i32::MAX as u32).contains(pid)) {
+        Some(pid) if pid_is_alive(pid) => format!("pid {pid}, alive"),
+        // A contended flock is by definition held by a live process, so a
+        // dead pidfile pid cannot be the holder — say what is actually known
+        // instead of the self-contradictory "running instance (pid N, not
+        // running)".
+        Some(pid) => format!("stale pidfile names pid {pid} (not running); holder unknown"),
+        None => errno.to_string(),
     }
 }
 
@@ -2475,30 +3194,72 @@ fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
 
-/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when disabled
-/// (`idle_reap_minutes == 0`). The sweep interval is derived from the TTL
-/// (≈4×/TTL), clamped so long TTLs still sweep and short ones do not busy-loop.
+/// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
+/// sweep (`idle_reap_minutes == 0` and no memory budget). The sweep interval
+/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep and
+/// short ones do not busy-loop.
+///
+/// With a memory budget installed (monorepo#2063 level 2), every tick also
+/// drains idle agents largest-attributed-first while charged > budget — no
+/// TTL, no spawn attempt required. TTL reaping off (`idleReapMinutes == 0`)
+/// keeps the budget drain alive on the interval-clamp floor cadence, and TTL
+/// reaping on caps the shared interval at that same floor so a long TTL
+/// cannot slow the budget drain's reaction time.
 fn spawn_idle_reap_loop(
     manager: Arc<AgentManager>,
     idle_reap_minutes: u32,
+    budget_enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some((ttl, interval)) = reap_timings(idle_reap_minutes) else {
+    let timings = reap_timings(idle_reap_minutes);
+    if timings.is_none() && !budget_enabled {
         tracing::info!("idle agent reaping disabled (agents.idleReapMinutes = 0)");
         return None;
+    }
+    // TTL off but budget on: sweep at the same floor cadence the TTL clamp
+    // uses, running only the budget drain. With BOTH on, cap the shared
+    // interval at that floor — a long TTL may stretch its interval to 300s,
+    // and turning TTL reaping on must not slow the budget drain's reaction
+    // time below the budget-only cadence (an early TTL sweep is harmless: it
+    // just finds nothing old enough).
+    let budget_floor = Duration::from_secs(30);
+    let interval = match timings {
+        Some((ttl, interval)) => {
+            let interval = if budget_enabled {
+                interval.min(budget_floor)
+            } else {
+                interval
+            };
+            tracing::info!(
+                ttl_ms = ttl.as_millis() as u64,
+                interval_ms = interval.as_millis() as u64,
+                "idle agent reaping enabled"
+            );
+            interval
+        }
+        None => {
+            tracing::info!(
+                interval_ms = budget_floor.as_millis() as u64,
+                "idle agent TTL reaping disabled; budget-triggered idle reap enabled"
+            );
+            budget_floor
+        }
     };
-    tracing::info!(
-        ttl_ms = ttl.as_millis() as u64,
-        interval_ms = interval.as_millis() as u64,
-        "idle agent reaping enabled"
-    );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let reaped = manager.reap_idle_older_than(ttl).await;
-            if reaped > 0 {
-                tracing::info!(reaped, "idle agent sweep evicted idle agents");
+            if let Some((ttl, _)) = timings {
+                let reaped = manager.reap_idle_older_than(ttl).await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "idle agent sweep evicted idle agents");
+                }
+            }
+            if budget_enabled {
+                let reaped = manager.reap_over_budget().await;
+                if reaped > 0 {
+                    tracing::info!(reaped, "over-budget sweep evicted idle agents");
+                }
             }
         }
     }))
@@ -2882,6 +3643,475 @@ async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
     let result = response.get("result").cloned().unwrap_or(Value::Null);
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+/// `intentd settings` dispatcher: list (no args) / get (`<name>`) / set
+/// (`<name> <value>`, `<name> --stdin`, `<name> -`, or — for sensitive
+/// settings — a hidden interactive prompt), all against a running daemon
+/// over the local socket.
+async fn cmd_settings(
+    name: Option<&str>,
+    value: Option<&str>,
+    use_stdin: bool,
+) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    let Some(name) = name else {
+        if use_stdin {
+            anyhow::bail!("--stdin requires a setting name");
+        }
+        return cmd_settings_list(&config).await;
+    };
+    // Fetch the definition first: an unknown name fails here with the
+    // daemon's own message, `sensitive` picks the input path before any
+    // value is read, and the type drives the coercion.
+    let response = settings_rpc(&config, "settings.get", json!({ "path": name })).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    let definition = result.get("definition").cloned().unwrap_or(Value::Null);
+    let sensitive = definition
+        .get("sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let raw = match settings_value_source(value, use_stdin, sensitive)? {
+        SettingsValueSource::Get => return print_setting_get(name, &result),
+        SettingsValueSource::Stdin => read_value_from_stdin()?,
+        SettingsValueSource::Prompt => prompt_sensitive_value(name)?,
+        SettingsValueSource::Argv { value, warn } => {
+            if warn {
+                eprintln!(
+                    "warning: {name} is sensitive; passing the value as a command-line \
+                     argument exposes it to shell history and process listings — prefer \
+                     `intentd settings {name}` (hidden prompt) or `--stdin`"
+                );
+            }
+            value
+        }
+    };
+    cmd_settings_set(&config, name, &definition, &raw).await
+}
+
+/// Where the value for `intentd settings <name> …` comes from. Pure decision
+/// over the parsed args + the definition's `sensitive` flag, so the matrix is
+/// unit-testable without a TTY or a daemon.
+#[derive(Debug, PartialEq)]
+enum SettingsValueSource {
+    /// No value anywhere → print the setting (`settings.get`).
+    Get,
+    /// Explicit argv value; `warn` when the definition is sensitive (the
+    /// plaintext already leaked to shell history / `ps`, but still applies).
+    Argv { value: String, warn: bool },
+    /// `--stdin` or a literal `-` value: read the value from stdin to EOF.
+    Stdin,
+    /// Sensitive setting with no value on a TTY: hidden interactive prompt.
+    Prompt,
+}
+
+fn settings_value_source(
+    value: Option<&str>,
+    use_stdin: bool,
+    sensitive: bool,
+) -> anyhow::Result<SettingsValueSource> {
+    let stdin_sentinel = value == Some("-");
+    if use_stdin && value.is_some() && !stdin_sentinel {
+        anyhow::bail!("cannot combine --stdin with a value argument");
+    }
+    if use_stdin || stdin_sentinel {
+        return Ok(SettingsValueSource::Stdin);
+    }
+    match value {
+        Some(v) => Ok(SettingsValueSource::Argv {
+            value: v.to_string(),
+            warn: sensitive,
+        }),
+        None if sensitive => Ok(SettingsValueSource::Prompt),
+        None => Ok(SettingsValueSource::Get),
+    }
+}
+
+/// Read a `--stdin` / `-` value: the whole of stdin to EOF, minus exactly
+/// one trailing newline (`pipe`-friendly: `op read … | intentd settings
+/// linear.token --stdin`). Never logs or echoes the value. Empty input is
+/// rejected — same as the hidden prompt — so a failed upstream producer
+/// (e.g. `op read` exiting with empty stdout) never silently blanks a
+/// stored secret.
+fn read_value_from_stdin() -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to read value from stdin: {e}"))?;
+    let value = trim_one_trailing_newline(buf);
+    if value.is_empty() {
+        anyhow::bail!("no value provided on stdin; nothing changed");
+    }
+    Ok(value)
+}
+
+/// Trim exactly one trailing newline (`\n` or `\r\n`); anything else —
+/// including a second newline — is part of the value.
+fn trim_one_trailing_newline(mut s: String) -> String {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+    s
+}
+
+/// Prompt for a sensitive value with terminal echo disabled (`read -s`
+/// style). Errors — instead of hanging — when stdin is not a TTY.
+fn prompt_sensitive_value(name: &str) -> anyhow::Result<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err(non_tty_sensitive_error(name));
+    }
+    eprint!("Enter value for {name} (input hidden): ");
+    std::io::stderr().flush()?;
+    let value = trim_one_trailing_newline(read_line_no_echo()?);
+    if value.is_empty() {
+        anyhow::bail!("no value entered; nothing changed");
+    }
+    Ok(value)
+}
+
+/// The non-interactive guidance for a sensitive setting with no value:
+/// point at `--stdin` for scripts instead of hanging on a prompt that can
+/// never be answered.
+fn non_tty_sensitive_error(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{name} is sensitive and no value was given; pipe the value via `--stdin` \
+         (e.g. `op read op://vault/item/field | intentd settings {name} --stdin`) \
+         or run interactively for a hidden prompt"
+    )
+}
+
+/// Whether a hidden read is in flight, i.e. whether [`HIDDEN_READ_ORIG`]
+/// holds valid terminal attributes for [`restore_echo_on_signal`] to restore.
+#[cfg(unix)]
+static HIDDEN_READ_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The original termios saved across a hidden read so the signal handler can
+/// restore echo. `static mut` accessed only via raw pointers: written once by
+/// [`read_line_no_echo`] (single-threaded CLI code) before handlers are
+/// installed, read by the async-signal handler.
+#[cfg(unix)]
+static mut HIDDEN_READ_ORIG: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+
+/// Signal handler installed for the duration of a hidden read: terminal
+/// attributes are device state, so a `Ctrl-C` / `Ctrl-Z` / kill arriving
+/// while echo is disabled would otherwise hand the shell back a terminal
+/// that no longer echoes. Restore the saved attributes (`tcsetattr` is
+/// async-signal-safe), then re-raise with the default disposition so the
+/// signal's outcome (terminate / stop) is unchanged.
+#[cfg(unix)]
+extern "C" fn restore_echo_on_signal(sig: libc::c_int) {
+    unsafe {
+        if HIDDEN_READ_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            libc::tcsetattr(
+                libc::STDIN_FILENO,
+                libc::TCSAFLUSH,
+                (&raw const HIDDEN_READ_ORIG).cast(),
+            );
+        }
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Read one line from the TTY with echo suppressed via termios; echo is
+/// restored on every return path AND on cancellation: while it is disabled,
+/// SIGINT/SIGTERM/SIGQUIT/SIGHUP/SIGTSTP run [`restore_echo_on_signal`],
+/// which puts the terminal back before the default disposition fires (after
+/// a `Ctrl-Z` + resume the read continues with echo visible — safe, just no
+/// longer hidden). The newline the user types is swallowed by the suppressed
+/// echo, so print one to keep output aligned.
+#[cfg(unix)]
+fn read_line_no_echo() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    use std::sync::atomic::Ordering;
+    let fd = libc::STDIN_FILENO;
+    let mut orig = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, orig.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let orig = unsafe { orig.assume_init() };
+
+    // Publish the saved attrs and install the restoring handlers BEFORE
+    // disabling echo, so no window exists where a signal skips the restore.
+    const SIGNALS: [libc::c_int; 5] = [
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGQUIT,
+        libc::SIGHUP,
+        libc::SIGTSTP,
+    ];
+    unsafe { (&raw mut HIDDEN_READ_ORIG).write(std::mem::MaybeUninit::new(orig)) };
+    HIDDEN_READ_ACTIVE.store(true, Ordering::SeqCst);
+    let handler = restore_echo_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let previous = SIGNALS.map(|sig| unsafe { libc::signal(sig, handler) });
+
+    let mut noecho = orig;
+    noecho.c_lflag &= !libc::ECHO;
+    let result = if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) } != 0 {
+        Err(anyhow::Error::from(std::io::Error::last_os_error()))
+    } else {
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        let restore = unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &orig) };
+        eprintln!();
+        match read {
+            Err(e) => Err(e.into()),
+            Ok(_) if restore != 0 => Err(std::io::Error::last_os_error().into()),
+            Ok(_) => Ok(line),
+        }
+    };
+
+    for (sig, prev) in SIGNALS.iter().zip(previous) {
+        if prev != libc::SIG_ERR {
+            unsafe { libc::signal(*sig, prev) };
+        }
+    }
+    HIDDEN_READ_ACTIVE.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Non-unix has no termios; keep secrets off the screen by pointing at the
+/// stdin path instead of echoing a "hidden" prompt that is not.
+#[cfg(not(unix))]
+fn read_line_no_echo() -> anyhow::Result<String> {
+    anyhow::bail!(
+        "hidden input is not supported on this platform; pipe the value via `--stdin` instead"
+    )
+}
+
+/// `rpc_call` wrapper for the `settings` subcommand: a connection failure
+/// gains guidance to start the daemon instead of a bare socket error.
+async fn settings_rpc(config: &Config, method: &str, params: Value) -> anyhow::Result<Value> {
+    rpc_call(&config.socket_path, method, params)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.starts_with("cannot connect to daemon") {
+                anyhow::anyhow!(
+                    "{msg}\nintentd does not appear to be running — start it with \
+                     `intentd serve` or via the installed service"
+                )
+            } else {
+                e
+            }
+        })
+}
+
+async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
+    let response = settings_rpc(config, "settings.list", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let settings = response
+        .pointer("/result/settings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rows: Vec<(String, String, String)> = settings
+        .iter()
+        .map(|s| {
+            (
+                s.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                s.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+                display_setting_value(s.get("value").unwrap_or(&Value::Null)),
+            )
+        })
+        .collect();
+    let path_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).max(4);
+    let type_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
+    println!("{:<path_w$}  {:<type_w$}  VALUE", "PATH", "TYPE");
+    for (path, ty, value) in rows {
+        println!("{path:<path_w$}  {ty:<type_w$}  {value}");
+    }
+    Ok(())
+}
+
+/// Print one setting (`settings.get` output shape) from the already-fetched
+/// `settings.get` result: value, type, default, origin, description.
+fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
+    let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
+    println!("{name} = {value}");
+    let definition = result.get("definition").cloned().unwrap_or(Value::Null);
+    println!("  type: {}", display_setting_type(&definition));
+    if let Some(default) = definition.get("defaultValue") {
+        println!("  default: {}", display_setting_value(default));
+    }
+    if let Some(origin) = result.get("origin").and_then(Value::as_str) {
+        println!("  origin: {origin}");
+    }
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+/// Apply one setting change: coerce `raw` against the pre-fetched
+/// `definition` (from the dispatcher's `settings.get`), send
+/// `settings.update`, and print the applied value (sensitive values are
+/// echoed pre-redacted by the daemon — never the caller's plaintext).
+async fn cmd_settings_set(
+    config: &Config,
+    name: &str,
+    definition: &Value,
+    raw: &str,
+) -> anyhow::Result<()> {
+    // Defense-in-depth: every sensitive definition is a string today, so
+    // coercion cannot fail on one — but if a sensitive setting were ever
+    // boolean/number-typed, the coercion error's `got \`{raw}\`` detail
+    // would print the prompt/stdin-supplied plaintext to stderr. Strip the
+    // raw value from the message for sensitive definitions.
+    let sensitive = definition
+        .get("sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let value = coerce_setting_value(definition, raw).map_err(|e| {
+        if sensitive {
+            let redacted = e.to_string().replace(raw, "********");
+            anyhow::anyhow!("{name}: {redacted}")
+        } else {
+            anyhow::anyhow!("{name}: {e}")
+        }
+    })?;
+    let params = json!({ "changes": [{ "path": name, "value": value }] });
+    let response = settings_rpc(config, "settings.update", params).await?;
+    if let Some(error) = response.get("error") {
+        // Daemon-side validation (bad enum value, out-of-range number,
+        // read-only) surfaces its message verbatim.
+        anyhow::bail!("{}", rpc_error_text(error));
+    }
+    let applied = response
+        .pointer("/result/applied/0/value")
+        .cloned()
+        .unwrap_or_else(|| {
+            // Unreachable today (`settings.update` always echoes the applied
+            // entry), but if the response shape ever drifts, never fall back
+            // to the caller's plaintext for a sensitive setting — print the
+            // daemon's redaction placeholder instead.
+            if sensitive {
+                json!("********")
+            } else {
+                value
+            }
+        });
+    println!("{name} = {}", display_setting_value(&applied));
+    if let Some(description) = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        println!("  {description}");
+    }
+    Ok(())
+}
+
+/// Coerce a raw CLI string into a JSON value matching the setting
+/// definition's wire `type` (§5.12): boolean → `true`/`false`, number →
+/// numeric parse (integer shape preserved), enum/string → the string as-is,
+/// object → parsed JSON (object or array). Enum membership and number
+/// range stay with the daemon, whose `-32602` message is authoritative.
+fn coerce_setting_value(definition: &Value, raw: &str) -> anyhow::Result<Value> {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    match ty {
+        "boolean" => match raw {
+            "true" => Ok(json!(true)),
+            "false" => Ok(json!(false)),
+            _ => anyhow::bail!("expected a boolean: true or false (got `{raw}`)"),
+        },
+        "number" => {
+            if let Ok(n) = raw.parse::<i64>() {
+                return Ok(json!(n));
+            }
+            let n: f64 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("expected a number (got `{raw}`)"))?;
+            if !n.is_finite() {
+                anyhow::bail!("expected a finite number (got `{raw}`)");
+            }
+            Ok(json!(n))
+        }
+        "object" => {
+            let v: Value = serde_json::from_str(raw)
+                .map_err(|e| anyhow::anyhow!("expected a JSON object or array: {e}"))?;
+            if !(v.is_object() || v.is_array()) {
+                anyhow::bail!("expected a JSON object or array (got `{raw}`)");
+            }
+            Ok(v)
+        }
+        // Enums are strings on the wire; strings pass through as-is.
+        _ => Ok(json!(raw)),
+    }
+}
+
+/// Render a setting value for terminal output: unset → `(unset)`, strings
+/// bare, everything else compact JSON. Sensitive values arrive pre-redacted
+/// from the daemon and are printed as-is.
+fn display_setting_value(value: &Value) -> String {
+    match value {
+        Value::Null => "(unset)".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Render a definition's type for terminal output, folding in the enum
+/// values / number bounds when present.
+fn display_setting_type(definition: &Value) -> String {
+    let ty = definition
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    match ty {
+        "enum" => {
+            let values = definition
+                .get("enumValues")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("enum [{values}]")
+        }
+        "number" => {
+            let mut bounds = Vec::new();
+            if let Some(min) = definition.get("min").and_then(Value::as_f64) {
+                bounds.push(format!("min {min}"));
+            }
+            if let Some(max) = definition.get("max").and_then(Value::as_f64) {
+                bounds.push(format!("max {max}"));
+            }
+            if bounds.is_empty() {
+                "number".to_string()
+            } else {
+                format!("number ({})", bounds.join(", "))
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn cmd_status() -> ExitCode {
@@ -3280,6 +4510,83 @@ async fn report_context_engine() {
             println!("[--] context engine: unavailable ({reason}) — retrieval degrades gracefully")
         }
     }
+}
+
+/// Whether the startup interrupted-agent resume sweep should run. The
+/// `--resume-all` flag forces the sweep; otherwise the
+/// `agents.resumeInterruptedOnStart` setting decides: `on` always resumes,
+/// `off` never resumes, and `auto` (the default) resumes only on headless
+/// hosts (no display detected).
+fn should_resume_on_start(
+    resume_all: bool,
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    has_display: bool,
+) -> bool {
+    use intent_core::settings_file::ResumeInterruptedOnStart;
+    if resume_all {
+        return true;
+    }
+    match setting {
+        ResumeInterruptedOnStart::On => true,
+        ResumeInterruptedOnStart::Off => false,
+        ResumeInterruptedOnStart::Auto => !has_display,
+    }
+}
+
+/// Run the startup interrupted-agent resume sweep to completion: list the
+/// pending interrupted agents and resume each via the same service operation
+/// as `agent.resolveInterrupted`. Awaited in `serve` BEFORE any listener
+/// starts, so a client's first `agent.listInterrupted` never sees rows the
+/// sweep is about to claim. Never fails startup: a store error listing agents
+/// logs and returns (the daemon still serves), and per-agent resume failures
+/// are logged and skipped.
+async fn run_startup_resume_sweep(services: &Services) {
+    tracing::info!("resume-on-start: enumerating interrupted agents");
+    // List all pending interrupted agents
+    let rows = match services.store().list_interrupted_agents().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "resume-on-start: failed to list interrupted agents");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        tracing::info!("resume-on-start: no interrupted agents to resume");
+        return;
+    }
+    tracing::info!(
+        count = rows.len(),
+        "resume-on-start: resuming interrupted agents"
+    );
+    let mut resumed = Vec::new();
+    let mut failed = Vec::new();
+    // Resume each agent using the same service operation as agent.resolveInterrupted
+    for interrupted in rows {
+        let agent_id = interrupted.agent_id.clone();
+        match services.resume_interrupted_agent(&agent_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    workspace = %interrupted.workspace_id,
+                    "resume-on-start: resumed agent"
+                );
+                resumed.push(agent_id.0);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "resume-on-start: failed to resume agent"
+                );
+                failed.push((agent_id.0, e.to_string()));
+            }
+        }
+    }
+    tracing::info!(
+        resumed = resumed.len(),
+        failed = failed.len(),
+        "resume-on-start: auto-resume sweep complete"
+    );
 }
 
 /// §5.7 / §12.3 host capabilities: display availability + derived locality. The
@@ -3722,6 +5029,178 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coerce_boolean_accepts_true_false_only() {
+        let def = json!({ "type": "boolean" });
+        assert_eq!(coerce_setting_value(&def, "true").unwrap(), json!(true));
+        assert_eq!(coerce_setting_value(&def, "false").unwrap(), json!(false));
+        let err = coerce_setting_value(&def, "on").unwrap_err().to_string();
+        assert!(err.contains("true or false"), "{err}");
+    }
+
+    #[test]
+    fn coerce_number_parses_integers_and_floats() {
+        let def = json!({ "type": "number", "min": 1.0, "max": 65535.0 });
+        assert_eq!(coerce_setting_value(&def, "5181").unwrap(), json!(5181));
+        assert_eq!(coerce_setting_value(&def, "0.5").unwrap(), json!(0.5));
+        assert_eq!(coerce_setting_value(&def, "-3").unwrap(), json!(-3));
+        let err = coerce_setting_value(&def, "abc").unwrap_err().to_string();
+        assert!(err.contains("expected a number"), "{err}");
+        // Range enforcement stays with the daemon: out-of-range parses fine.
+        assert_eq!(coerce_setting_value(&def, "99999").unwrap(), json!(99999));
+    }
+
+    #[test]
+    fn settings_value_accepts_hyphen_leading_values() {
+        // `allow_hyphen_values` on the positional: without it clap rejects
+        // `-3` as an unknown flag before the coercion layer ever runs.
+        let cli = Cli::try_parse_from(["intentd", "settings", "some.number", "-3"])
+            .expect("hyphen-leading value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value, stdin } => {
+                assert_eq!(name.as_deref(), Some("some.number"));
+                assert_eq!(value.as_deref(), Some("-3"));
+                assert!(!stdin);
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_parses_stdin_flag_and_dash_value() {
+        let cli = Cli::try_parse_from(["intentd", "settings", "linear.token", "--stdin"])
+            .expect("--stdin must parse");
+        match cli.command {
+            Command::Settings { name, value, stdin } => {
+                assert_eq!(name.as_deref(), Some("linear.token"));
+                assert_eq!(value, None);
+                assert!(stdin);
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+        // A literal `-` value reaches the dispatcher (mapped to the stdin
+        // path there) thanks to `allow_hyphen_values`.
+        let cli = Cli::try_parse_from(["intentd", "settings", "linear.token", "-"])
+            .expect("`-` value must parse as a positional");
+        match cli.command {
+            Command::Settings { name, value, stdin } => {
+                assert_eq!(name.as_deref(), Some("linear.token"));
+                assert_eq!(value.as_deref(), Some("-"));
+                assert!(!stdin);
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_value_source_matrix() {
+        use SettingsValueSource::*;
+        // No value: get for non-sensitive, hidden prompt for sensitive.
+        assert_eq!(settings_value_source(None, false, false).unwrap(), Get);
+        assert_eq!(settings_value_source(None, false, true).unwrap(), Prompt);
+        // `--stdin` and the `-` sentinel map to the same stdin path,
+        // regardless of sensitivity (consistent behavior).
+        assert_eq!(settings_value_source(None, true, false).unwrap(), Stdin);
+        assert_eq!(settings_value_source(None, true, true).unwrap(), Stdin);
+        assert_eq!(
+            settings_value_source(Some("-"), false, false).unwrap(),
+            Stdin
+        );
+        assert_eq!(settings_value_source(Some("-"), true, true).unwrap(), Stdin);
+        // Plain argv: unchanged for non-sensitive, warn for sensitive.
+        assert_eq!(
+            settings_value_source(Some("false"), false, false).unwrap(),
+            Argv {
+                value: "false".into(),
+                warn: false
+            }
+        );
+        assert_eq!(
+            settings_value_source(Some("tok"), false, true).unwrap(),
+            Argv {
+                value: "tok".into(),
+                warn: true
+            }
+        );
+        // `--stdin` plus a non-`-` value is ambiguous → error.
+        let err = settings_value_source(Some("tok"), true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot combine --stdin"), "{err}");
+    }
+
+    #[test]
+    fn trim_one_trailing_newline_trims_exactly_one() {
+        assert_eq!(trim_one_trailing_newline("tok\n".into()), "tok");
+        assert_eq!(trim_one_trailing_newline("tok\r\n".into()), "tok");
+        assert_eq!(trim_one_trailing_newline("tok".into()), "tok");
+        // Only ONE trailing newline is trimmed; the rest is the value.
+        assert_eq!(trim_one_trailing_newline("tok\n\n".into()), "tok\n");
+        assert_eq!(
+            trim_one_trailing_newline("multi\nline\n".into()),
+            "multi\nline"
+        );
+        assert_eq!(trim_one_trailing_newline(String::new()), "");
+    }
+
+    #[test]
+    fn non_tty_sensitive_error_names_the_stdin_path_without_any_value() {
+        let err = non_tty_sensitive_error("linear.token").to_string();
+        assert!(err.contains("linear.token is sensitive"), "{err}");
+        assert!(err.contains("--stdin"), "{err}");
+    }
+
+    #[test]
+    fn coerce_number_rejects_non_finite() {
+        let def = json!({ "type": "number" });
+        for raw in ["inf", "-inf", "NaN"] {
+            let err = coerce_setting_value(&def, raw).unwrap_err().to_string();
+            assert!(err.contains("finite"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn coerce_enum_and_string_pass_through_as_strings() {
+        // Enum membership is validated by the daemon; the CLI only shapes
+        // the value as a string.
+        let enum_def = json!({ "type": "enum", "enumValues": ["on", "off", "auto"] });
+        assert_eq!(
+            coerce_setting_value(&enum_def, "auto").unwrap(),
+            json!("auto")
+        );
+        assert_eq!(
+            coerce_setting_value(&enum_def, "bogus").unwrap(),
+            json!("bogus")
+        );
+        let string_def = json!({ "type": "string" });
+        assert_eq!(
+            coerce_setting_value(&string_def, "true").unwrap(),
+            json!("true")
+        );
+        // A missing/unknown type falls back to string pass-through.
+        assert_eq!(coerce_setting_value(&Value::Null, "x").unwrap(), json!("x"));
+    }
+
+    #[test]
+    fn coerce_object_parses_json_objects_and_arrays() {
+        let def = json!({ "type": "object" });
+        assert_eq!(
+            coerce_setting_value(&def, r#"{"a":1}"#).unwrap(),
+            json!({ "a": 1 })
+        );
+        assert_eq!(
+            coerce_setting_value(&def, r#"["x","y"]"#).unwrap(),
+            json!(["x", "y"])
+        );
+        let err = coerce_setting_value(&def, "not json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+        // Valid JSON scalars are still rejected — the type wants a structure.
+        let err = coerce_setting_value(&def, "42").unwrap_err().to_string();
+        assert!(err.contains("JSON object or array"), "{err}");
+    }
+
+    #[test]
     fn listener_down_error_is_detected_from_data_code() {
         // Preferred detection: the machine-readable discriminator
         // (monorepo#1822) — message prose is irrelevant when it is present.
@@ -3752,6 +5231,33 @@ mod tests {
         assert!(!is_listener_down_error(&other));
         let no_message = json!({ "code": -32603 });
         assert!(!is_listener_down_error(&no_message));
+    }
+
+    #[test]
+    fn resume_on_start_flag_forces_resume() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        // --resume-all wins regardless of setting or display.
+        for setting in [R::Auto, R::On, R::Off] {
+            for has_display in [true, false] {
+                assert!(should_resume_on_start(true, setting, has_display));
+            }
+        }
+    }
+
+    #[test]
+    fn resume_on_start_setting_on_and_off_ignore_display() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        for has_display in [true, false] {
+            assert!(should_resume_on_start(false, R::On, has_display));
+            assert!(!should_resume_on_start(false, R::Off, has_display));
+        }
+    }
+
+    #[test]
+    fn resume_on_start_auto_resumes_only_headless() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        assert!(should_resume_on_start(false, R::Auto, false));
+        assert!(!should_resume_on_start(false, R::Auto, true));
     }
 
     #[test]
@@ -3966,6 +5472,89 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_names_live_pidfile_holder() {
+        let config = temp_config();
+        // Our own pid is trivially alive, standing in for the lock holder.
+        let pid = std::process::id();
+        std::fs::write(&config.pid_path, pid.to_string()).unwrap();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {pid}, alive")),
+            "error names the live holder: {err}"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_names_dead_pidfile_holder() {
+        let config = temp_config();
+        // A pid essentially guaranteed not to be running.
+        std::fs::write(&config.pid_path, "2147483640").unwrap();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains("stale pidfile names pid 2147483640 (not running); holder unknown"),
+            "error flags the stale pidfile without claiming a dead holder: {err}"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_holder_detail_keeps_non_contention_errno_despite_pidfile() {
+        let config = temp_config();
+        // A real flock failure (e.g. ENOLCK) must stay visible as-is even
+        // when a parseable pidfile exists — only contention implicates it.
+        std::fs::write(&config.pid_path, std::process::id().to_string()).unwrap();
+        let detail = lock_holder_detail(&config.pid_path, nix::errno::Errno::ENOLCK);
+        assert_eq!(detail, nix::errno::Errno::ENOLCK.to_string());
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_holder_detail_ignores_implausible_pids() {
+        let config = temp_config();
+        // pid 0 would signal-0 our own process group; pids above i32::MAX go
+        // negative in the kill() cast. Both must fall back to the errno.
+        for bogus in ["0", "4294967295"] {
+            std::fs::write(&config.pid_path, bogus).unwrap();
+            let detail = lock_holder_detail(&config.pid_path, nix::errno::Errno::EAGAIN);
+            assert_eq!(
+                detail,
+                nix::errno::Errno::EAGAIN.to_string(),
+                "pidfile {bogus} must not be probed"
+            );
+        }
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_lock_contended_error_falls_back_to_errno_without_pidfile() {
+        let config = temp_config();
+        let _guard = acquire_data_dir_lock(&config).expect("first lock acquires");
+        let err = acquire_data_dir_lock(&config)
+            .map(|_| ())
+            .expect_err("a held data-dir lock must refuse a second acquire")
+            .to_string();
+        assert!(
+            err.contains("EAGAIN"),
+            "error keeps the raw errno when no pidfile pid is readable: {err}"
+        );
+        std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
     use std::sync::Mutex;
 
     /// A scriptable [`Signaller`] for the stop-escalation unit tests: it models
@@ -4107,6 +5696,427 @@ mod tests {
         assert_eq!(
             parse_permission_policy(Some("bogus")),
             PermissionPolicy::AllowAll
+        );
+    }
+
+    /// A status read that beats the sampler's first tick must report `null`,
+    /// not zero — a bundle reading `childMemoryBytes: 0` would conclude the
+    /// daemon has no children, which is the opposite of what an unsampled
+    /// tree means.
+    #[test]
+    fn child_tree_usage_is_none_until_the_first_sample() {
+        let usage = ChildTreeUsage::default();
+        assert_eq!(usage.load(), None);
+        usage.store(6, 4_294_967_296, HashMap::new());
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.count, 6);
+        assert_eq!(sample.memory_bytes, 4_294_967_296);
+        assert_eq!(sample.peak_memory_bytes, 4_294_967_296);
+    }
+
+    /// The per-agent buckets are published with, and replaced by, each full
+    /// sample — they describe the same sweep as `memory_bytes`, so a stale
+    /// bucket surviving a later sweep would pair buckets from one tree with
+    /// an aggregate from another.
+    #[test]
+    fn child_tree_usage_agent_buckets_follow_the_sample() {
+        let usage = ChildTreeUsage::default();
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        usage.store(
+            4,
+            1_000,
+            HashMap::from([(a.clone(), 700), (b.clone(), 200)]),
+        );
+        let sample = usage.load().expect("sampled");
+        assert_eq!(sample.agent_bytes.get(&a), Some(&700));
+        assert_eq!(sample.agent_bytes.get(&b), Some(&200));
+
+        // A burst reading moves only the peak — the buckets stay put.
+        usage.observe_burst(9_000);
+        let after_burst = usage.load().expect("sampled");
+        assert_eq!(after_burst.agent_bytes, sample.agent_bytes);
+
+        // The next full sample replaces the buckets wholesale: an agent that
+        // exited between sweeps must not linger.
+        usage.store(1, 300, HashMap::from([(b.clone(), 300)]));
+        let next = usage.load().expect("sampled");
+        assert_eq!(next.agent_bytes.get(&a), None);
+        assert_eq!(next.agent_bytes.get(&b), Some(&300));
+    }
+
+    /// The probe's `agent_samples` (monorepo#2063 A2) serves the buckets from
+    /// the latest sweep — empty before the first sample, matching `sample`'s
+    /// `None` — so `agent.diagnostics` can stamp `subtreeMemoryBytes` from
+    /// the same sweep the aggregate came from.
+    #[test]
+    fn child_tree_usage_probe_serves_agent_samples() {
+        let usage = ChildTreeUsage::default();
+        let probe: &dyn TreeMemoryProbe = &usage;
+        assert!(probe.agent_samples().is_empty());
+        let a = AgentId::from("agent-a");
+        usage.store(2, 900, HashMap::from([(a.clone(), 700)]));
+        assert_eq!(probe.agent_samples().get(&a), Some(&700));
+    }
+
+    /// The peak must survive the tree draining back to baseline — that is the
+    /// whole point of it. A quick-action burst spawns ~600 MB of adapter chain
+    /// per concurrent call and is gone in seconds, so a bundle captured after
+    /// the fact sees only the peak.
+    #[test]
+    fn child_tree_usage_peak_is_a_high_water_mark() {
+        let usage = ChildTreeUsage::default();
+        usage.store(4, 1_000_000_000, HashMap::new());
+        usage.store(24, 5_000_000_000, HashMap::new());
+        usage.store(0, 0, HashMap::new());
+        let sample = usage.load().expect("sampled");
+        assert_eq!(
+            (sample.count, sample.memory_bytes, sample.peak_memory_bytes),
+            (0, 0, 5_000_000_000),
+            "instantaneous drains to zero; the peak does not"
+        );
+    }
+
+    /// The failure monorepo#2107 filed: a burst that lives entirely between two
+    /// baseline sweeps. Measured, 16 one-shot chains reached 6.97 GB and were
+    /// gone in 3.3 s, and the peak reported 0.01 GB — low enough that the
+    /// unbounded run read *cheaper* than the same burst under the adapter
+    /// bound. The burst reading has to reach the peak.
+    #[test]
+    fn child_tree_usage_burst_reading_reaches_the_peak() {
+        let usage = ChildTreeUsage::default();
+        usage.store(0, 10_000_000, HashMap::new());
+        usage.observe_burst(6_970_000_000);
+        usage.store(0, 10_000_000, HashMap::new());
+        let sample = usage.load().expect("sampled");
+        assert_eq!(
+            sample.peak_memory_bytes, 6_970_000_000,
+            "a burst seen only between baseline sweeps must still set the peak"
+        );
+    }
+
+    /// A burst reading raises the peak and touches nothing else. `seq` in
+    /// particular must not move: the spawn budget (monorepo#2063) reads a
+    /// changed `seq` as "the tree has been re-measured since I admitted those
+    /// spawns" and drops its provisional charge for them. Bumping it every
+    /// 500 ms would clear that correction before an admitted spawn is resident,
+    /// admitting a whole burst against one stale total.
+    #[test]
+    fn child_tree_usage_burst_reading_moves_only_the_peak() {
+        let usage = ChildTreeUsage::default();
+        usage.store(4, 1_000_000_000, HashMap::new());
+        let before = usage.load().expect("sampled");
+        usage.observe_burst(7_000_000_000);
+        let after = usage.load().expect("sampled");
+        assert_eq!(after.peak_memory_bytes, 7_000_000_000);
+        assert_eq!(
+            (after.count, after.memory_bytes, after.seq),
+            (before.count, before.memory_bytes, before.seq),
+            "the published sample and its sequence number keep the baseline cadence"
+        );
+    }
+
+    /// A burst reading before the first full sweep is dropped rather than
+    /// published: §5.7 promises the three descendant-tree fields are all-null or
+    /// all-present, and a peak beside a null count would be neither.
+    #[test]
+    fn child_tree_usage_burst_reading_before_the_first_sample_is_dropped() {
+        let usage = ChildTreeUsage::default();
+        usage.observe_burst(7_000_000_000);
+        assert_eq!(usage.load(), None);
+    }
+
+    /// The cadence decision. A due baseline sweep always publishes, burst or
+    /// not; between baselines a live adapter chain buys a peak-only sweep and
+    /// an idle daemon buys nothing at all — the ~10 ms process-table refresh is
+    /// only spent while there is something to catch.
+    #[test]
+    fn child_tree_sweep_spends_the_refresh_only_when_it_can_pay() {
+        let mid = CHILD_TREE_BASE_PERIOD / 2;
+        assert_eq!(child_tree_sweep(0, mid), ChildTreeSweep::Skip);
+        assert_eq!(child_tree_sweep(1, mid), ChildTreeSweep::Peak);
+        assert_eq!(
+            child_tree_sweep(0, CHILD_TREE_BASE_PERIOD),
+            ChildTreeSweep::Full
+        );
+        assert_eq!(
+            child_tree_sweep(16, CHILD_TREE_BASE_PERIOD),
+            ChildTreeSweep::Full,
+            "a due baseline sample is never downgraded to peak-only"
+        );
+    }
+
+    /// The published triple must always come from ONE sweep. Reading a count
+    /// from sweep N beside a byte total from sweep N+1 would describe a tree
+    /// that never existed, and this telemetry's whole job is to be believed
+    /// later from a debug bundle. Hammers a writer alternating between two
+    /// self-consistent samples while readers assert they only ever see one or
+    /// the other — never a mix.
+    #[test]
+    fn child_tree_usage_never_publishes_a_torn_sample() {
+        const A: (usize, u64) = (4, 1_000_000_000);
+        const B: (usize, u64) = (24, 5_000_000_000);
+        let usage = Arc::new(ChildTreeUsage::default());
+        usage.store(A.0, A.1, HashMap::new());
+
+        let writer = {
+            let usage = usage.clone();
+            std::thread::spawn(move || {
+                for i in 0..20_000 {
+                    let (count, bytes) = if i % 2 == 0 { A } else { B };
+                    usage.store(count, bytes, HashMap::new());
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let usage = usage.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        let s = usage.load().expect("sampled before the threads started");
+                        assert!(
+                            (s.count, s.memory_bytes) == A || (s.count, s.memory_bytes) == B,
+                            "torn read: count {} paired with {} bytes",
+                            s.count,
+                            s.memory_bytes
+                        );
+                        // The peak is monotonic and never regresses below the
+                        // larger of the two samples once B has been written.
+                        assert!(s.peak_memory_bytes >= s.memory_bytes);
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().expect("writer thread");
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
+    }
+
+    /// Build a `pid -> children` adjacency from `(parent, child)` edges.
+    fn adjacency(edges: &[(usize, usize)]) -> HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> {
+        let mut map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+        for (parent, child) in edges {
+            map.entry(sysinfo::Pid::from(*parent))
+                .or_default()
+                .push(sysinfo::Pid::from(*child));
+        }
+        map
+    }
+
+    /// The walk must reach grandchildren, not just direct children: an agent's
+    /// provider CLI sits three levels below the daemon (`npm exec` → node ACP
+    /// adapter → the CLI), and the CLI's own RSS is the bulk of the ~700 MB an
+    /// agent costs. Counting only direct children would report ~90 MB/agent.
+    #[test]
+    fn walk_descendants_sums_the_whole_subtree_excluding_the_root() {
+        // 1 (daemon) → 2 (npm exec) → 3 (node adapter) → 4 (provider CLI),
+        // plus a second agent 1 → 5, and an unrelated tree 9 → 10.
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (9, 10)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
+        assert_eq!(count, 4, "2, 3, 4 and 5 are all descendants of 1");
+        // 200 + 300 + 400 + 500 — the root's own 100 is deliberately absent.
+        assert_eq!(bytes, 1400);
+        assert!(agent_bytes.is_empty(), "no registered roots, no buckets");
+    }
+
+    /// Attribution buckets each descendant under its nearest registered agent
+    /// root: the root's own RSS and its whole chain (npm exec → adapter → CLI)
+    /// are credited to the agent, siblings land in separate buckets, and a
+    /// descendant under no registered root counts only toward the aggregate.
+    #[test]
+    fn walk_descendants_buckets_rss_by_nearest_agent_root() {
+        // 1 (daemon) → 2 (agent A root) → 3 → 4, a sibling agent 1 → 5 (agent
+        // B root), and an unregistered chain 1 → 6 → 7 (host.exec-style).
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4), (1, 5), (1, 6), (6, 7)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(5), b.clone()),
+        ]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(count, 6);
+        assert_eq!(bytes, 200 + 300 + 400 + 500 + 600 + 700);
+        // Agent A: its root 2 plus descendants 3 and 4.
+        assert_eq!(agent_bytes.get(&a), Some(&(200 + 300 + 400)));
+        // Agent B: just its root 5.
+        assert_eq!(agent_bytes.get(&b), Some(&500));
+        // 6 → 7 is under no registered root: aggregate-only.
+        assert_eq!(agent_bytes.values().sum::<u64>(), 1400);
+    }
+
+    /// A registered root nested under another agent's subtree opens its own
+    /// bucket — a sub-agent's usage is credited to the sub-agent, not folded
+    /// into its ancestor's bucket (the buckets partition the tree).
+    #[test]
+    fn walk_descendants_nested_agent_root_starts_its_own_bucket() {
+        // 1 → 2 (agent A root) → 3 (agent B root, nested) → 4.
+        let children = adjacency(&[(1, 2), (2, 3), (3, 4)]);
+        let memory = |pid: sysinfo::Pid| Some(usize::from(pid) as u64 * 100);
+        let a = AgentId::from("agent-a");
+        let b = AgentId::from("agent-b");
+        let roots = HashMap::from([
+            (sysinfo::Pid::from(2), a.clone()),
+            (sysinfo::Pid::from(3), b.clone()),
+        ]);
+        let (_, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!(bytes, 200 + 300 + 400);
+        assert_eq!(agent_bytes.get(&a), Some(&200), "only its own pid");
+        assert_eq!(agent_bytes.get(&b), Some(&(300 + 400)));
+    }
+
+    /// A registered root whose pid is not in the walked tree (already exited,
+    /// or its subtree reparented to init) simply contributes no bucket — the
+    /// aggregate is unaffected and no phantom zero-byte entry appears.
+    #[test]
+    fn walk_descendants_ignores_agent_roots_outside_the_tree() {
+        let children = adjacency(&[(1, 2)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        let roots = HashMap::from([(sysinfo::Pid::from(42), AgentId::from("agent-gone"))]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 10));
+        assert!(agent_bytes.is_empty());
+    }
+
+    /// An agent root that vanished mid-walk (its memory read fails) still
+    /// buckets the live descendants underneath it — the chain below a dead
+    /// `npm exec` is exactly the RSS the agent is responsible for.
+    #[test]
+    fn walk_descendants_buckets_survive_a_dead_agent_root() {
+        let children = adjacency(&[(1, 2), (2, 3)]);
+        let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
+        let a = AgentId::from("agent-a");
+        let roots = HashMap::from([(sysinfo::Pid::from(2), a.clone())]);
+        let (count, bytes, agent_bytes) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &roots);
+        assert_eq!((count, bytes), (1, 700));
+        assert_eq!(agent_bytes.get(&a), Some(&700));
+    }
+
+    /// A pid table sampled while processes exit and get reparented can contain
+    /// a cycle. The visited guard must make the walk terminate rather than
+    /// hanging the sampler task (and with it every later `system.status` read).
+    #[test]
+    fn walk_descendants_terminates_on_a_cycle() {
+        let children = adjacency(&[(1, 2), (2, 3), (3, 1), (3, 2)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
+        assert_eq!(count, 2, "each pid is counted exactly once");
+        assert_eq!(bytes, 20);
+    }
+
+    /// A pid that vanished between the table refresh and the walk contributes
+    /// nothing, but its subtree is still traversed — a dead intermediate must
+    /// not hide the live grandchildren underneath it.
+    #[test]
+    fn walk_descendants_skips_pids_that_exited_mid_walk() {
+        let children = adjacency(&[(1, 2), (2, 3)]);
+        let memory = |pid: sysinfo::Pid| (usize::from(pid) != 2).then_some(700);
+        let (count, bytes, _) =
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new());
+        assert_eq!(count, 1);
+        assert_eq!(bytes, 700);
+    }
+
+    /// A leaf root reports an empty tree — the daemon before any agent spawns.
+    #[test]
+    fn walk_descendants_reports_zero_for_a_childless_root() {
+        let children = adjacency(&[(9, 10)]);
+        let memory = |_: sysinfo::Pid| Some(10);
+        assert_eq!(
+            walk_descendants(&children, &memory, sysinfo::Pid::from(1), &HashMap::new()),
+            (0, 0, HashMap::new())
+        );
+    }
+
+    /// Helper child for the thread-row regression test below: parks 16
+    /// sleeping threads so its `/proc/<pid>/task` directory is populated,
+    /// prints READY, and waits to be killed. Env-gated so a stray
+    /// `--include-ignored` run returns immediately instead of sleeping.
+    #[test]
+    #[ignore = "helper child process; spawned by descendant_tree_usage_excludes_linux_thread_rows"]
+    fn thread_heavy_child_helper() {
+        if std::env::var("INTENTD_TEST_THREAD_HEAVY_CHILD").is_err() {
+            return;
+        }
+        let park = || std::thread::sleep(Duration::from_secs(60));
+        let _threads: Vec<_> = (0..16).map(|_| std::thread::spawn(park)).collect();
+        println!("READY");
+        park();
+    }
+
+    /// The monorepo#2342 regression: on Linux, sysinfo's process table lists
+    /// threads (`/proc/<pid>/task` entries) as `Process` rows, each reporting
+    /// the WHOLE process's RSS and chaining into the tree via `parent()` ==
+    /// the owning process. The old walk counted an N-threaded child N+1
+    /// times — observed up to 219x inflation of `childMemoryBytes`. A walk
+    /// rooted at a multi-threaded process must charge its thread rows as
+    /// neither descendants nor bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_tree_usage_excludes_linux_thread_rows() {
+        use std::io::BufRead as _;
+
+        // Re-exec this test binary filtered to the thread-heavy helper above
+        // — the only guaranteed-available multi-threaded child.
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--include-ignored",
+                "--exact",
+                "tests::thread_heavy_child_helper",
+                "--nocapture",
+            ])
+            .env("INTENTD_TEST_THREAD_HEAVY_CHILD", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn thread-heavy child");
+        let mut lines = std::io::BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+        loop {
+            match lines.next() {
+                Some(Ok(line)) if line.contains("READY") => break,
+                Some(_) => continue,
+                None => panic!("child exited before READY"),
+            }
+        }
+
+        // Refresh WITH tasks — the table shape the sampler saw before the
+        // fix — so the walk itself must be what excludes the thread rows.
+        let child_pid = sysinfo::Pid::from_u32(child.id());
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_tasks(),
+        );
+        let thread_rows = sys
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_some() && p.parent() == Some(child_pid))
+            .count();
+        let usage = descendant_tree_usage(&sys, child_pid, &HashMap::new());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            thread_rows >= 16,
+            "precondition: the refreshed table must list the child's thread rows (got {thread_rows})"
+        );
+        assert_eq!(
+            usage,
+            (0, 0, HashMap::new()),
+            "threads are not descendant processes: a walk rooted at a multi-threaded child must charge nothing"
         );
     }
 }

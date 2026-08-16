@@ -1544,8 +1544,8 @@ mod mcp_tests {
 
     use intent_core::{
         AgentCreateExtra, AgentId, BoxFuture, Error, GitAgentCommitResult, Note, NoteAddInput,
-        NoteAddResult, NoteCreate, NoteId, Result, TaskAssignAgentResult, TaskGetMyTaskResult,
-        TaskMetadata, TaskStatus, TaskSubtask, WorkspaceApi, WorkspaceId,
+        NoteAddResult, NoteCreate, NoteCreateResult, NoteId, Result, TaskAssignAgentResult,
+        TaskGetMyTaskResult, TaskMetadata, TaskStatus, TaskSubtask, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -1604,28 +1604,34 @@ mod mcp_tests {
             input: NoteCreate,
             idempotency_key: Option<String>,
             _caller_agent_id: Option<AgentId>,
-        ) -> BoxFuture<'_, Result<Note>> {
+        ) -> BoxFuture<'_, Result<NoteCreateResult>> {
             self.created
                 .lock()
                 .unwrap()
                 .push((input.title.clone(), idempotency_key));
             Box::pin(async move {
-                Ok(Note {
-                    id: NoteId::from_string("n-created"),
-                    workspace_id,
-                    title: input.title,
-                    content: input.content.unwrap_or_default(),
-                    content_type: Default::default(),
-                    tags: input.tags.unwrap_or_default(),
-                    is_pinned: false,
-                    is_archived: false,
-                    is_default: false,
-                    parent_id: None,
-                    visibility: Default::default(),
-                    metadata: Default::default(),
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    rev: 0,
-                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                Ok(NoteCreateResult {
+                    note: Note {
+                        id: NoteId::from_string("n-created"),
+                        workspace_id,
+                        title: input.title,
+                        content: input.content.unwrap_or_default(),
+                        content_type: Default::default(),
+                        tags: input.tags.unwrap_or_default(),
+                        is_pinned: false,
+                        is_archived: false,
+                        is_default: false,
+                        parent_id: None,
+                        visibility: Default::default(),
+                        metadata: Default::default(),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        rev: 0,
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -1683,6 +1689,8 @@ mod mcp_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -1828,6 +1836,7 @@ mod mcp_tests {
                     assigned_agents: task.assigned_agent_ids.clone(),
                     task_metadata: task,
                     rev: 3,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -5267,9 +5276,11 @@ mod workspace_api_tool_tests {
                 token_usage: None,
                 cow_supported: None,
                 display_status: None,
+                waiting: false,
                 checkout_mode: None,
                 execution_environment: None,
                 disk_usage: None,
+                pending_delete_at: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
         }
@@ -5584,8 +5595,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        let default_srv = server("amber-forest", None);
-        let resp = default_srv
+        // Byte-identity needs every gate open, `taskGraph` (opt-in) included.
+        let all_on_srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                task_graph: true,
+                ..Default::default()
+            },
+        );
+        let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
             .unwrap();
@@ -5593,7 +5610,7 @@ mod workspace_api_tool_tests {
         assert_eq!(
             desc,
             crate::mcp_server::WORKSPACE_API_DESCRIPTION,
-            "all-defaults tools/list description must be byte-identical to the static const"
+            "every-gate-open tools/list description must be byte-identical to the static const"
         );
     }
 
@@ -5765,8 +5782,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A top-level bridge stays byte-identical to the static const.
-        let top = server("amber-forest", None).with_sub_agent(false);
+        // A top-level bridge with every gate open (`taskGraph` opted in)
+        // stays byte-identical to the static const.
+        let top = server("amber-forest", None)
+            .with_sub_agent(false)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                task_graph: true,
+                ..Default::default()
+            });
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -5850,12 +5873,12 @@ mod wsapi3_bindings_tests {
         AgentId, BoxFuture, CommentAddResult, CommentDeleteResult, CommentGetThreadResult,
         CommentListResult, CommentLocation, CommentRespondResult, CommentRespondThread,
         CommentType, CommentWire, Error, Note, NoteAddInput, NoteAddResult, NoteCreate,
-        NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-        NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateMetadataResult,
-        ReadAssetResult, Result, TaskAssignAgentResult, TaskConvertBlocksResult,
-        TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskMarkAsTaskResult, TaskMetadata,
-        TaskStatus, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-        WorkspaceApi, WorkspaceId,
+        NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
+        NoteEditResult, NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow,
+        NoteUpdateMetadataResult, ReadAssetResult, Result, TaskAssignAgentResult,
+        TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult,
+        TaskMarkAsTaskResult, TaskMetadata, TaskStatus, TaskUpdateNoteStatusResult,
+        TaskUpdateResult, TaskUpdateStatusResult, WorkspaceApi, WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -6018,7 +6041,7 @@ mod wsapi3_bindings_tests {
             input: NoteCreate,
             idempotency_key: Option<String>,
             _caller_agent_id: Option<AgentId>,
-        ) -> BoxFuture<'_, Result<Note>> {
+        ) -> BoxFuture<'_, Result<NoteCreateResult>> {
             self.create_note_calls.lock().unwrap().push((
                 input.title.clone(),
                 input.content.clone(),
@@ -6026,22 +6049,28 @@ mod wsapi3_bindings_tests {
                 idempotency_key,
             ));
             Box::pin(async move {
-                Ok(Note {
-                    id: NoteId::from_string("n-new"),
-                    workspace_id,
-                    title: input.title,
-                    content: input.content.unwrap_or_default(),
-                    content_type: Default::default(),
-                    tags: input.tags.unwrap_or_default(),
-                    is_pinned: false,
-                    is_archived: false,
-                    is_default: false,
-                    parent_id: None,
-                    visibility: Default::default(),
-                    metadata: Default::default(),
-                    created_at: "2026-01-01T00:00:00Z".to_string(),
-                    rev: 1,
-                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                Ok(NoteCreateResult {
+                    note: Note {
+                        id: NoteId::from_string("n-new"),
+                        workspace_id,
+                        title: input.title,
+                        content: input.content.unwrap_or_default(),
+                        content_type: Default::default(),
+                        tags: input.tags.unwrap_or_default(),
+                        is_pinned: false,
+                        is_archived: false,
+                        is_default: false,
+                        parent_id: None,
+                        visibility: Default::default(),
+                        metadata: Default::default(),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        rev: 1,
+                        updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                    converted_count: 0,
+                    created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6062,6 +6091,9 @@ mod wsapi3_bindings_tests {
                     status: "todo".to_string(),
                     task_note_id: None,
                     linked_task_note_id: None,
+                    depends_on: Vec::new(),
+                    conflicts_with: Vec::new(),
+                    unmet_depends_on: Vec::new(),
                 }])
             })
         }
@@ -6107,6 +6139,8 @@ mod wsapi3_bindings_tests {
                     new_content: content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6136,6 +6170,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6163,6 +6199,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.new,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6192,6 +6230,8 @@ mod wsapi3_bindings_tests {
                     new_content: input.content,
                     converted_count: 0,
                     created_task_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6341,6 +6381,7 @@ mod wsapi3_bindings_tests {
                     subtasks: Vec::new(),
                     assigned_agents: Vec::new(),
                     rev: 1,
+                    unmet_depends_on: Vec::new(),
                 })
             })
         }
@@ -6352,6 +6393,8 @@ mod wsapi3_bindings_tests {
             status: String,
             acceptance_criteria: Vec<String>,
             effort: Option<String>,
+            _depends_on: Option<Vec<NoteId>>,
+            _conflicts_with: Option<Vec<NoteId>>,
             _caller_agent_id: Option<AgentId>,
         ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
             self.mark_as_task_calls.lock().unwrap().push((
@@ -6386,6 +6429,8 @@ mod wsapi3_bindings_tests {
                     ok: true,
                     converted_count: 0,
                     created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
                 })
             })
         }
@@ -6788,6 +6833,12 @@ mod wsapi3_bindings_tests {
             v["markdownLink"],
             json!("[Hello](intent://local/amber-forest/note/n-new)")
         );
+        // Conversion outcome is appended to the binding result (parity with
+        // the content-write ops).
+        assert_eq!(v["convertedCount"], json!(0));
+        assert_eq!(v["createdTaskNoteIds"], json!([]));
+        assert_eq!(v["createdTasks"], json!([]));
+        assert_eq!(v["warnings"], json!([]));
         let created = api.create_note_calls.lock().unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].0, "Hello");
@@ -7760,6 +7811,8 @@ mod wsapi4_bindings_tests {
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -7794,10 +7847,11 @@ mod wsapi4_bindings_tests {
             last_message_role: None,
             last_message_id: None,
             context_references: None,
-            image_blocks: None,
+            file_blocks: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -8969,9 +9023,11 @@ mod workspace_api_output_limit_tests {
                     token_usage: None,
                     cow_supported: None,
                     display_status: None,
+                    waiting: false,
                     checkout_mode: None,
                     execution_environment: None,
                     disk_usage: None,
+                    pending_delete_at: None,
                 })
             })
         }

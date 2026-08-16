@@ -491,14 +491,18 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
     fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
         AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from_string(id),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -533,10 +537,11 @@ mod tests {
             last_message_role: None,
             last_message_id: None,
             context_references: None,
-            image_blocks: None,
+            file_blocks: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,

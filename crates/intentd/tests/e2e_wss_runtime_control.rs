@@ -674,6 +674,136 @@ async fn wss_system_status_includes_capacity_version_uptime() {
         r["memoryBytes"].as_u64().unwrap() > 0,
         "memoryBytes > 0: {r}"
     );
+    // Routing fields (additive): localIps is a string array (may be empty on
+    // hosts with no routable interface), hostname is a non-empty string.
+    let local_ips = r["localIps"].as_array().expect("localIps is array");
+    assert!(
+        local_ips.iter().all(Value::is_string),
+        "localIps entries are strings: {r}"
+    );
+    assert!(
+        !r["hostname"]
+            .as_str()
+            .expect("hostname is string")
+            .is_empty(),
+        "hostname non-empty: {r}"
+    );
+    // Aggregate-budget fields (monorepo#2063): the budget is ON by default
+    // (auto resolves to recommended), so agentMemoryBudgetBytes and queuedSpawns
+    // are present. agentMemoryChargedBytes only appears once the descendant-tree
+    // sampler lands its first sample.
+    let obj = r.as_object().expect("result is object");
+    assert!(
+        obj.contains_key("agentMemoryBudgetBytes"),
+        "agentMemoryBudgetBytes must be present (auto is on by default): {r}"
+    );
+    assert!(
+        obj["agentMemoryBudgetBytes"].as_u64().is_some(),
+        "agentMemoryBudgetBytes must be a positive u64: {r}"
+    );
+    assert!(
+        obj.contains_key("queuedSpawns"),
+        "queuedSpawns must be present when budget is active: {r}"
+    );
+    assert_eq!(
+        obj["queuedSpawns"].as_u64(),
+        Some(0),
+        "no spawn is queued in a fresh daemon: {r}"
+    );
+    // agentMemoryChargedBytes is absent until the sampler's first sample, but
+    // "before the first sample" is not deterministically observable from a
+    // client: the sampler can land its first sample before this RPC (seen on
+    // CI — monorepo#2567), making the field present-with-0 on a fresh daemon.
+    // Accept both orderings; when present it must be a u64, never null. Do
+    // not tighten this back to "must be absent" — the deterministic
+    // absent-until-first-sample contract is covered by the status_json unit
+    // tests in intent-transport's control/tests.rs.
+    match obj.get("agentMemoryChargedBytes") {
+        None => {}
+        Some(v) => {
+            assert!(
+                v.is_u64(),
+                "agentMemoryChargedBytes is u64 when present, never null: {r}"
+            );
+        }
+    }
+    // Workspaces-root disk fields (additive): the harness points
+    // INTENTD_WORKSPACES_DIR at an existing tempdir and the sampler takes a
+    // synchronous first sample before the listeners come up, so both fields
+    // are present with plausible volume sizes.
+    let disk_avail = obj["workspacesDiskAvailableBytes"]
+        .as_u64()
+        .expect("workspacesDiskAvailableBytes is u64");
+    let disk_total = obj["workspacesDiskTotalBytes"]
+        .as_u64()
+        .expect("workspacesDiskTotalBytes is u64");
+    assert!(disk_total > 0, "workspacesDiskTotalBytes > 0: {r}");
+    assert!(
+        disk_avail <= disk_total,
+        "available must not exceed total: {r}"
+    );
+}
+
+#[tokio::test]
+async fn wss_system_status_reports_budget_fields_when_installed() {
+    // With `agents.memoryBudgetMb` set, system.status carries the aggregate
+    // budget visibility fields (monorepo#2063): agentMemoryBudgetBytes always,
+    // agentMemoryChargedBytes once the descendant-tree sampler has landed a
+    // sample (absent before — the budget is inert until then), and
+    // queuedSpawns (0 with nothing queued).
+    let data_dir = temp_data_dir();
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[agents]\nmemoryBudgetMb = 20480\n",
+    )
+    .expect("seed config.toml with agents.memoryBudgetMb");
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status_logged(&socket, &data_dir.join("daemon.log")).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+    let resp = wss_rpc(&mut ws, 8, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 8);
+    assert_eq!(
+        r["agentMemoryBudgetBytes"].as_u64(),
+        Some(20_480u64 * 1024 * 1024),
+        "installed budget rides the wire: {r}"
+    );
+    assert_eq!(
+        r["queuedSpawns"].as_u64(),
+        Some(0),
+        "no spawn is queued in a fresh daemon: {r}"
+    );
+    // Charged bytes appear only once the sampler has landed its first tree
+    // sample (~5s cadence; a fast test can beat it). When present it must be
+    // a u64, never null — presence-detected like the other two.
+    match r
+        .as_object()
+        .expect("result is object")
+        .get("agentMemoryChargedBytes")
+    {
+        None => {}
+        Some(v) => {
+            assert!(
+                v.is_u64(),
+                "agentMemoryChargedBytes is u64 when present, never null: {r}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -744,4 +874,41 @@ async fn runtime_toggled_wss_serves_system_status() {
     assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
     assert!(r["version"].is_string(), "version is string: {r}");
     assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+
+    // The descendant-tree fields ride the real WSS wire, not just
+    // `status_json`. All three are sampled together, so the contract is
+    // all-null (sampler has not ticked yet) or all-present — never a mix,
+    // which would let a bundle read a count without a byte total. Asserting
+    // the pair rather than a concrete value keeps this deterministic: the
+    // first tick fires at startup but a fast test can still beat it.
+    for field in ["childProcesses", "childMemoryBytes", "childMemoryPeakBytes"] {
+        assert!(
+            r.get(field).is_some(),
+            "{field} must ride the WSS status result: {r}"
+        );
+    }
+    let sampled = [
+        &r["childProcesses"],
+        &r["childMemoryBytes"],
+        &r["childMemoryPeakBytes"],
+    ];
+    let nulls = sampled.iter().filter(|v| v.is_null()).count();
+    assert!(
+        nulls == 0 || nulls == 3,
+        "descendant-tree fields must be all-null or all-present, got {nulls} nulls: {r}"
+    );
+    if nulls == 0 {
+        let bytes = r["childMemoryBytes"].as_u64().expect("bytes when sampled");
+        let peak = r["childMemoryPeakBytes"]
+            .as_u64()
+            .expect("peak when sampled");
+        assert!(
+            r["childProcesses"].is_u64(),
+            "childProcesses is u64 when sampled: {r}"
+        );
+        assert!(
+            peak >= bytes,
+            "peak {peak} must be >= instantaneous {bytes}"
+        );
+    }
 }

@@ -14,6 +14,7 @@ pub use intent_core::{Error, Result};
 
 mod agent_queue_repo;
 mod agent_repo;
+mod attachment_repo;
 mod client_repo;
 mod comment_repo;
 mod completion_watch_repo;
@@ -37,9 +38,11 @@ mod settings_repo;
 mod stop_redelivery_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
+mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
 mod workspace_context_repo;
+mod workspace_git_root_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
@@ -48,6 +51,7 @@ pub use agent_repo::{
     AgentUsageRow, InterruptedAgent, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
     PROJECTION_TEXT_BLOCK_CAP,
 };
+pub use attachment_repo::AttachmentRecord;
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};
@@ -59,6 +63,7 @@ pub use pr_monitor_repo::PrMonitorPollUpdate;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use stop_redelivery_repo::StopRedeliveryRow;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
+pub use transfer_repo::{TRANSFER_EXCLUDED_TABLES, TRANSFER_TABLES};
 pub use usage_rate_repo::{UsageRateDelta, UsageRateRow};
 pub use usage_stats_repo::{LocalStamp, UsageStatsDelta, UsageStatsRow};
 
@@ -222,6 +227,18 @@ pub(crate) async fn commit_with_rollback_guard<T>(
 mod tests;
 
 /// Embedded schema migrations (§9.4).
+///
+/// **Adding workspace state? Transfer checklist.** A migration that adds a
+/// table or column does not automatically ride the workspace-transfer
+/// archive: tables must be listed in [`transfer_repo::TRANSFER_TABLES`] (with
+/// a workspace-scoping predicate) or [`transfer_repo::TRANSFER_EXCLUDED_TABLES`]
+/// (with a rationale) — schema-parity tests in `transfer_repo` fail until the
+/// decision is made explicit. Machine-local column values (absolute paths,
+/// client ids, daemon-local ids) need import-side rewriting in
+/// `intent-services/src/transfer_import.rs`. Remember non-DB state too: the
+/// assets dir and git bundle are exported separately, and runtime state
+/// (hooks, PR monitors, agent queues) is rehydrated from imported rows on the
+/// target.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// SQLite-backed persistence handle. Cheaply cloneable (the pools are `Arc`-ed).

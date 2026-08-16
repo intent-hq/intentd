@@ -257,6 +257,10 @@ async fn task_channel_snapshot_then_updated_delta() {
         task["rev"].is_number(),
         "rev echoed on task snapshot entity"
     );
+    assert_eq!(
+        task["specLinked"], false,
+        "specLinked stamped on snapshot rows (unlinked from spec body)"
+    );
 
     // task.updateNoteStatus → task:status-changed → updated delta (seq 1).
     rpc(
@@ -278,6 +282,10 @@ async fn task_channel_snapshot_then_updated_delta() {
     assert!(
         d1["params"]["delta"]["updated"][0]["rev"].is_number(),
         "rev echoed on task updated delta entity"
+    );
+    assert_eq!(
+        d1["params"]["delta"]["updated"][0]["specLinked"], false,
+        "specLinked stamped on updated delta rows"
     );
 
     let _ = shutdown_tx.send(());

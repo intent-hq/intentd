@@ -501,7 +501,7 @@ fn resolve_binary_path_searches_enriched_tool_dirs() {
 
 #[cfg(unix)]
 #[test]
-fn resolve_binary_path_finds_non_default_nvm_version() {
+fn resolve_binary_path_prefers_newest_nvm_node_version() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = unique_temp_dir("nvm-multi-version-home");
@@ -509,19 +509,41 @@ fn resolve_binary_path_finds_non_default_nvm_version() {
     let v24_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
     std::fs::create_dir_all(&v20_bin).unwrap();
     std::fs::create_dir_all(&v24_bin).unwrap();
-    std::fs::write(v20_bin.join("node"), "#!/bin/sh\nexit 0\n").unwrap();
-
-    let name = format!(
-        "intent-nvm-binary-{}",
-        home.path().file_name().unwrap().to_string_lossy()
-    );
-    let binary = v24_bin.join(&name);
+    let older_binary = v20_bin.join("node");
+    std::fs::write(&older_binary, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&older_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = v24_bin.join("node");
     std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let resolved = resolve_binary_path_with_home(&name, &[], home.path());
+    let resolved = resolve_binary_path_with_home("node", &[], home.path());
 
     assert_eq!(resolved.as_deref(), Some(binary.as_path()));
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_binary_path_skips_non_executable_nvm_node_for_path_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_temp_dir("nvm-non-executable-home");
+    let nvm_bin = home.path().join(".nvm/versions/node/v24.5.0/bin");
+    let path_bin = home.path().join("path-bin");
+    std::fs::create_dir_all(&nvm_bin).unwrap();
+    std::fs::create_dir_all(&path_bin).unwrap();
+    let non_executable = nvm_bin.join("node");
+    std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path_node = path_bin.join("node");
+    std::fs::write(&path_node, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path_node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool_dirs = vec![nvm_bin];
+
+    let resolved = resolve_binary_path_with_tool_dirs_and_lookup("node", &[], &tool_dirs, |_| {
+        Some(path_node.clone())
+    });
+
+    assert_eq!(resolved.as_deref(), Some(path_node.as_path()));
 }
 
 /// `find_binary_op` caches a POSITIVE resolution: removing the resolved
@@ -1059,5 +1081,117 @@ fn run_version_enriches_path_with_binary_parent_dir_for_env_shebangs() {
     assert!(
         version_minimal.is_none(),
         "run_version_with impossible PATH should fail when node is NOT on PATH (proves fix is needed)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Windows runnable-extension resolution (mirrors intent_providers::discover).
+//
+// These use the platform-parametrized `_for` seams so both arms run on the
+// POSIX CI host; POSIX behavior stays byte-identical (bare name only).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn has_windows_exec_extension_is_case_insensitive() {
+    assert!(has_windows_exec_extension(Path::new("pi.cmd")));
+    assert!(has_windows_exec_extension(Path::new("pi.EXE")));
+    assert!(has_windows_exec_extension(Path::new(r"C:\x\tool.Bat")));
+    assert!(!has_windows_exec_extension(Path::new("pi")));
+    assert!(!has_windows_exec_extension(Path::new("pi.ps1")));
+    assert!(!has_windows_exec_extension(Path::new("foo.py")));
+}
+
+#[test]
+fn name_candidates_posix_is_bare_name_only() {
+    assert_eq!(name_candidates_for("pi", false), vec!["pi"]);
+    assert_eq!(name_candidates_for("pi.exe", false), vec!["pi.exe"]);
+}
+
+#[test]
+fn name_candidates_windows_prefers_executable_extensions_over_bare_name() {
+    assert_eq!(
+        name_candidates_for("pi", true),
+        vec!["pi.exe", "pi.cmd", "pi.bat"],
+        "the bare extensionless name must not be a candidate on Windows"
+    );
+}
+
+#[test]
+fn name_candidates_windows_keeps_command_carrying_executable_extension() {
+    assert_eq!(name_candidates_for("pi.cmd", true), vec!["pi.cmd"]);
+    // Case-insensitive, matching Windows filename semantics.
+    assert_eq!(name_candidates_for("PI.EXE", true), vec!["PI.EXE"]);
+}
+
+#[test]
+fn select_lookup_line_posix_takes_first_line() {
+    // `which` prints a single line; the first non-empty line wins verbatim,
+    // even one without an extension (POSIX behavior is unchanged).
+    assert_eq!(
+        select_path_lookup_line("pi", &["/usr/local/bin/pi"], false),
+        Some("/usr/local/bin/pi".to_string())
+    );
+}
+
+#[test]
+fn select_lookup_line_windows_npm_shim_pair_prefers_cmd() {
+    // Regression: `where pi` lists the bare POSIX shim ahead of the runnable
+    // `pi.cmd`; the `.cmd` line must win (bare used to be taken first).
+    let lines = [
+        r"C:\Users\me\AppData\Roaming\npm\pi",
+        r"C:\Users\me\AppData\Roaming\npm\pi.cmd",
+    ];
+    assert_eq!(
+        select_path_lookup_line("pi", &lines, true),
+        Some(r"C:\Users\me\AppData\Roaming\npm\pi.cmd".to_string())
+    );
+}
+
+#[test]
+fn select_lookup_line_windows_prefers_exe_over_cmd_and_bat() {
+    let lines = [r"C:\tools\pi.bat", r"C:\tools\pi.cmd", r"C:\tools\pi.exe"];
+    assert_eq!(
+        select_path_lookup_line("pi", &lines, true),
+        Some(r"C:\tools\pi.exe".to_string()),
+        "exe outranks cmd/bat regardless of where output order"
+    );
+}
+
+#[test]
+fn select_lookup_line_windows_bare_only_does_not_resolve() {
+    // Only an extensionless shim on PATH: not CreateProcess-runnable, so PATH
+    // resolution fails here (falls through to dir scans / common paths).
+    let lines = [r"C:\Users\me\AppData\Roaming\npm\pi"];
+    assert_eq!(select_path_lookup_line("pi", &lines, true), None);
+}
+
+#[test]
+fn select_lookup_line_windows_keeps_first_line_when_name_has_exec_extension() {
+    // The caller asked for `pi.cmd` explicitly: keep the first match as-is.
+    let lines = [r"C:\a\pi.cmd", r"C:\b\pi.cmd"];
+    assert_eq!(
+        select_path_lookup_line("pi.cmd", &lines, true),
+        Some(r"C:\a\pi.cmd".to_string())
+    );
+}
+
+#[test]
+fn select_lookup_line_empty_is_none() {
+    assert_eq!(select_path_lookup_line("pi", &[], false), None);
+    assert_eq!(select_path_lookup_line("pi", &[], true), None);
+}
+
+/// `find_in_dir_candidates` uses the host platform's candidate set. On POSIX
+/// that is the bare name, so a bare executable resolves — proving the dir-scan
+/// path still works for Unix after the refactor away from `binary_filename`.
+#[cfg(unix)]
+#[test]
+fn find_in_dir_candidates_posix_resolves_bare_name() {
+    let dir = unique_temp_dir("dir-candidates-posix");
+    let bin = dir.path().join("some-bare-tool");
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(
+        find_in_dir_candidates("some-bare-tool", &[dir.path().to_path_buf()]),
+        Some(bin)
     );
 }

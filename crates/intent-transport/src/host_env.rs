@@ -45,7 +45,9 @@ pub fn detect_display_server() -> Option<String> {
 }
 
 /// Local OS hostname (`os.hostname()` equivalent), or `intent` on failure.
-pub(crate) fn local_hostname() -> String {
+/// Public so the composition root can include it in the `system.status`
+/// snapshot alongside `host.status` and `server.pairingInfo`.
+pub fn local_hostname() -> String {
     whoami::hostname()
         .ok()
         .filter(|h| !h.is_empty())

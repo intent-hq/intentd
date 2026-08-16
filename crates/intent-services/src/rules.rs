@@ -33,11 +33,24 @@ fn now_ms() -> i64 {
 }
 
 /// Wrap user-rule content for prompt injection (port of
-/// `formatUserRulesForContext`).
+/// `formatUserRulesForContext`). Wording owned by the harness (H5); prompt
+/// assembly routes through the session's pinned harness directly (H2), so
+/// this latest-bound wrapper remains for the golden pins.
+#[cfg(test)]
 pub(crate) fn format_user_rules_for_context(content: &str, source: &str) -> String {
-    format!(
-        "## User Rules & Guidelines\n\nThe following rules and guidelines have been configured for this project. Please follow these conventions and best practices:\n\n```\n{content}\n```\n\nThese rules are loaded from: {source}"
-    )
+    crate::harness::latest().user_rules_wrapper(content, source)
+}
+
+/// The harness registry row for a session's stamped `harnessVersion` (H2):
+/// the pinned harness + doctrine when a session is supplied, else the latest
+/// (session-less callers — previews, background one-shots).
+fn session_harness_entry(
+    agent_session: Option<&intent_core::AgentSession>,
+) -> &'static crate::harness::HarnessEntry {
+    match agent_session {
+        Some(s) => crate::harness::resolve_entry(&s.harness_version),
+        None => crate::harness::latest_entry(),
+    }
 }
 
 /// A workspace rule file resolved off the worktree.
@@ -232,7 +245,32 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 ///
 /// `agent_features` gates feature-specific sections of the tier-3 bundled
 /// bodies only; tier 1/2 user-supplied content is never filtered.
+///
+/// Latest-bound convenience form kept for unit tests; prompt assembly
+/// resolves the session's pinned set via [`get_specialization_rules_for`].
+#[cfg(test)]
 pub(crate) async fn get_specialization_rules(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+) -> String {
+    get_specialization_rules_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        store,
+        workspace_path,
+        agent_type,
+        agent_features,
+    )
+    .await
+}
+
+/// [`get_specialization_rules`] with an explicit tier-3 instruction set —
+/// the SESSION's pinned doctrine when called from [`assemble_system_prompt`]
+/// (H2): tier 1/2 user-supplied content is unversioned, only the bundled
+/// built-in comes from `set`.
+pub(crate) async fn get_specialization_rules_for(
+    set: &'static crate::instructions::InstructionSet,
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
@@ -255,8 +293,9 @@ pub(crate) async fn get_specialization_rules(
             }
         }
     }
-    // 3. Bundled built-in (composed with common/workspace per the reference).
-    crate::instructions::get_instruction_with_common(agent_type, agent_features)
+    // 3. Bundled built-in (composed with common/workspace per the reference),
+    // from the caller's pinned instruction set.
+    crate::instructions::get_instruction_with_common_for(set, agent_type, agent_features)
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
@@ -304,7 +343,7 @@ pub(crate) struct SpecialistPromptInjection {
 ///   direct mode or a standalone Cow/Direct checkout) and the delegate-scoped,
 ///   param/setting-driven wording.
 /// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
-fn build_isolation_hint(
+pub(crate) fn build_isolation_hint(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
@@ -318,19 +357,15 @@ fn build_isolation_hint(
         .and_then(|s| s.specialist_name.as_deref())
         .unwrap_or("");
 
+    // The session's pinned harness owns the hint wording (H2); session-less
+    // calls resolve to the latest.
+    let harness = session_harness_entry(agent_session).harness;
+
     // Case 1: microVM workspace — every agent runs isolated in its own VM
     if workspace
         .is_some_and(|ws| ws.execution_environment == Some(intent_core::SandboxType::Microvm))
     {
-        let guest_dir = crate::microvm::GUEST_WORKSPACE_DIR;
-        return Some(format!(
-            "## Workspace Isolation\n\n\
-             You are running **isolated inside a microVM sandbox**. The workspace at `{guest_dir}` \
-             is your own copy-on-write clone of the canonical checkout, mounted into the VM. \
-             When your work completes, the system automatically merges your changes back to the \
-             canonical checkout. The host filesystem outside your workspace is not accessible \
-             from inside the VM."
-        ));
+        return Some(harness.microvm_isolation_hint(crate::microvm::GUEST_WORKSPACE_DIR));
     }
 
     // Case 2: Sandboxed agent — inject isolation context. Keyed off
@@ -341,26 +376,7 @@ fn build_isolation_hint(
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
-
-        // We don't have base_commit_sha in AgentSession, but we can get it from the
-        // Sandbox record if needed. For now, use a placeholder as the base is tracked
-        // in the sandbox record.
-        let base_sha_note = "base commit tracked in sandbox metadata";
-
-        return Some(format!(
-            "## Workspace Isolation\n\n\
-             You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
-             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
-             target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
-             **Critical constraints:**\n\
-             - Do NOT switch branches or checkout other refs in your sandbox.\n\
-             - On completion, the system automatically merges your branch back to the canonical workspace.\n\
-             - If your changes conflict with canonical, you will be **woken with the conflicting paths** \
-             and a ref to reconcile against. When that happens, resolve the conflicts **in your sandbox only** \
-             (rebase or merge onto the fetched canonical ref), then end your turn again. The system will \
-             retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
-             - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
-        ));
+        return Some(harness.sandboxed_implementor_hint(sandbox_path, sandbox_branch));
     }
 
     // Case 3: Coordinator in a sandbox-eligible CoW-capable workspace.
@@ -398,50 +414,14 @@ fn build_isolation_hint(
                 // just delegates — the clarification must say so. A legacy
                 // CoW checkout without the persisted `cow` environment keeps
                 // the delegate-scoped wording (only delegates are sandboxed
-                // there).
+                // there). Wording is harness-owned (H2); gating stays here.
                 let uniform_isolation =
                     ws.execution_environment == Some(intent_core::SandboxType::Cow);
-                let checkout_note = if uniform_isolation {
-                    "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
-                         source repository (checkout-level isolation). **Every agent** in this \
-                         workspace — including you and top-level agents, not just delegates — \
-                         runs in its own per-agent CoW sandbox sourced from this checkout and \
-                         merged back on turn end."
-                } else if ws.checkout_mode == Some(intent_core::CheckoutMode::Cow) {
-                    "\n\nThis workspace's checkout is itself a **standalone CoW clone** of the \
-                         source repository (checkout-level isolation); the per-agent CoW sandboxes \
-                         described above apply to your delegated agents, sourced from this checkout."
-                } else {
-                    ""
-                };
-                // The lead sentence must match how isolation is actually
-                // resolved: in an `executionEnvironment: cow` workspace the
-                // param/setting are ignored (sandboxing is unconditional);
-                // legacy rows keep the param-then-setting wording.
-                let lead = if uniform_isolation {
-                    "Delegated agents in this workspace **always** run in isolated CoW sandboxes \
-                     — the workspace's execution environment is `cow`, so per-agent isolation is \
-                     unconditional (the `isolation` param and global settings do not change it)."
-                } else {
-                    "Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
-                     use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it)."
-                };
-                return Some(format!(
-                    "## Agent Delegation & Isolation\n\n\
-                     {lead} \
-                     Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
-                     so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
-                     stomp each other's work.\n\n\
-                     **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
-                     commits back into the canonical workspace **before** waking you. Clean merges propagate \
-                     completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
-                     with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
-                     the merge (up to 2 attempts).\n\n\
-                     **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
-                     overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
-                     with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
-                     to commit/stash their WIP, then manually merge.{checkout_note}"
-                ));
+                let standalone_cow_checkout =
+                    ws.checkout_mode == Some(intent_core::CheckoutMode::Cow);
+                return Some(
+                    harness.coordinator_cow_hint(uniform_isolation, standalone_cow_checkout),
+                );
             }
         }
     }
@@ -450,10 +430,25 @@ fn build_isolation_hint(
     None
 }
 
-/// Build the RTK instruction line when enabled and available.
+/// Format the RTK instruction line for the given usable subcommands. Wording
+/// owned by the given harness (H5); session-scoped assembly passes the
+/// session's pinned harness, session-less callers pass
+/// `crate::harness::latest()`.
+pub(crate) fn rtk_instruction_line(
+    harness: &'static dyn crate::harness::Harness,
+    subcommands: &[String],
+) -> String {
+    harness.rtk_instruction_line(subcommands)
+}
+
+/// Build the RTK instruction line when enabled and available, worded by
+/// `harness` (the session's pinned harness in session-scoped assembly).
 /// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
 /// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
-async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
+async fn build_rtk_instruction(
+    harness: &'static dyn crate::harness::Harness,
+    rtk_enabled: bool,
+) -> Option<String> {
     if !rtk_enabled {
         return None;
     }
@@ -470,10 +465,7 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
         return None;
     }
 
-    Some(format!(
-        "Prefix these commands with rtk for compressed, LLM-friendly output: {}",
-        status.subcommands.join(", ")
-    ))
+    Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
 /// Assemble the effective system prompt (the **internal** injection pipeline,
@@ -494,11 +486,19 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
 /// populated (tier 3 always resolves), so this returns `None` only in the
 /// unreachable case where even the bundled specialization is empty.
 ///
-/// `agent_features` (the `[agentFeatures]` toggles, read once at session
-/// creation like `rtk_enabled`) gates feature-specific prompt sections: the
-/// bundled specialization bodies via [`get_specialization_rules`], and the
-/// `## Asking the User Questions` footer block (`structuredQuestions`). With
-/// all defaults on the assembled prompt is byte-identical to the ungated one.
+/// `agent_features` (the `[agentFeatures]` toggles — the session's captured
+/// snapshot resolved by the caller via `session_agent_features`, falling back
+/// to live settings only for legacy NULL-snapshot rows) gates
+/// feature-specific prompt sections: the bundled specialization bodies via
+/// [`get_specialization_rules_for`], and the `## Asking the User Questions`
+/// footer block (`structuredQuestions`). With all defaults on the assembled
+/// prompt is byte-identical to the ungated one.
+///
+/// H2 (intent-hq/monorepo#2459): every harness-owned surface and the tier-3
+/// bundled doctrine resolve through the SESSION's stamped `harnessVersion`
+/// (via the harness registry), so an existing session keeps the exact prompt
+/// text it was created with even after the binary ships a newer doctrine set;
+/// a `None` session resolves to the latest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -512,13 +512,24 @@ pub(crate) async fn assemble_system_prompt(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
 ) -> Option<String> {
+    // The session's pinned harness + doctrine (H2): a stamped session keeps
+    // assembling the exact version it was created with; session-less calls
+    // (previews, background one-shots) resolve to the latest.
+    let entry = session_harness_entry(agent_session);
+    let harness = entry.harness;
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
     }
-    let specialization =
-        get_specialization_rules(store, workspace_path, agent_type, agent_features).await;
+    let specialization = get_specialization_rules_for(
+        entry.doctrine.instructions,
+        store,
+        workspace_path,
+        agent_type,
+        agent_features,
+    )
+    .await;
     if !specialization.trim().is_empty() {
         parts.push(specialization);
     }
@@ -528,7 +539,7 @@ pub(crate) async fn assemble_system_prompt(
     if let Some(path) = workspace_path {
         if let Some((content, source)) = load_workspace_rules(path, None) {
             if !content.trim().is_empty() {
-                parts.push(format_user_rules_for_context(&content, &source));
+                parts.push(harness.user_rules_wrapper(&content, &source));
             }
         }
     }
@@ -540,15 +551,16 @@ pub(crate) async fn assemble_system_prompt(
             if let Some(instructions) = repo_config.instructions {
                 if !instructions.trim().is_empty() {
                     let source = format!("{}/.intent/config.json", repo_path.display());
-                    parts.push(format_user_rules_for_context(&instructions, &source));
+                    parts.push(harness.user_rules_wrapper(&instructions, &source));
                 }
             }
         }
     }
     // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
-    // subcommand, append the instruction line. Placed after workspace-rules,
-    // before skills / isolation hint / specialist role.
-    if let Some(rtk_instruction) = build_rtk_instruction(rtk_enabled).await {
+    // subcommand, append the instruction line (worded by the session's pinned
+    // harness). Placed after workspace-rules, before skills / isolation hint /
+    // specialist role.
+    if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
         parts.push(rtk_instruction);
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user
@@ -582,27 +594,14 @@ pub(crate) async fn assemble_system_prompt(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        parts.push(format!(
-            "# Your Specialist Role\n\n<specialist_role>\n{bp}\n</specialist_role>\n\n\
-             The instructions in <specialist_role> define your primary function. \
-             Prioritize them above general guidance."
-        ));
+        parts.push(harness.specialist_role_section(bp));
     }
     // Commit-policy layer: one status-neutral clause, injected for every agent
     // (top-level and sub-agents alike) regardless of the auto-commit state.
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    parts.push(
-        "## Commit Policy\n\n\
-         Commit through `ws.git.commit` — never run `git commit` yourself \
-         unless the user explicitly asks for a git workflow that \
-         `ws.git.commit` cannot express (e.g. multiple scoped commits on a \
-         branch). You may commit when it makes sense for the work; the system \
-         may also automatically commit any remaining changes when your turn \
-         ends."
-            .to_string(),
-    );
+    parts.push(harness.commit_policy_clause());
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -619,9 +618,8 @@ pub(crate) async fn assemble_system_prompt(
         let reminder = specialist
             .and_then(|s| s.role_reminder.as_deref())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Follow the instructions in <specialist_role> above.");
-        parts.push(format!("## Role Reminder\n\nYou are a {name}. {reminder}"));
+            .filter(|s| !s.is_empty());
+        parts.push(harness.role_reminder_footer(name, reminder));
     }
     // Asking the User Questions + Suggested Next Steps — top-level
     // interactive agents only. Sub-agents don't own a user-facing chat turn
@@ -630,17 +628,7 @@ pub(crate) async fn assemble_system_prompt(
     // `agentFeatures.structuredQuestions` (spec audit row 8).
     if !is_sub_agent {
         if agent_features.structured_questions {
-            parts.push(
-                "## Asking the User Questions\n\n\
-                 When requirements are ambiguous or a decision needs user input, ask \
-                 structured clarifying questions with `ws.app.question.ask` via the \
-                 `workspace_api` tool instead of burying questions in prose. Call it once \
-                 per question with 2-4 options; do not add an \"Other\" option — a \
-                 free-form answer is always offered automatically. Ask all your \
-                 questions, then end the turn: questions are presented when your turn \
-                 ends, and the answers arrive in the next user message."
-                    .to_string(),
-            );
+            parts.push(harness.ask_questions_block());
         }
         // Per-session effective state for the SP-1 footer wording: a session
         // that opted out via `skipAutoCommit` (delegation/creation while the
@@ -649,34 +637,12 @@ pub(crate) async fn assemble_system_prompt(
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
-        let example_second_line = if effective_auto_commit {
-            "Check the changes in the diff view."
-        } else {
-            "Review changes before committing."
-        };
-        let auto_commit_clause = if effective_auto_commit {
-            " Auto-commit is enabled; do not include prompts about committing or reviewing changes before committing."
-        } else {
-            ""
-        };
-        parts.push(format!(
-            "## Suggested Next Steps\n\n\
-             At the end of your response, offer the user clear next actions as a \
-             `<!-- suggested-prompts ... -->` HTML comment block:\n\n\
-             ```\n\
-             <!-- suggested-prompts\n\
-             Run the tests to verify the implementation.\n\
-             {example_second_line}\n\
-             -->\n\
-             ```\n\n\
-             Write 2–4 prompts, each a short directive sentence phrased as \
-             something the user might say next.{auto_commit_clause}"
-        ));
+        parts.push(harness.suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join("\n\n---\n\n"))
+        Some(harness.join_prompt_layers(&parts))
     }
 }
 
@@ -863,9 +829,11 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -1123,6 +1091,8 @@ This is a test skill.
 
         let ts = intent_core::now_iso();
         let session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-skip"),
             workspace_id: intent_core::WorkspaceId::from("ws-skip"),
             parent_agent_id: None,
@@ -1151,12 +1121,14 @@ This is a test skill.
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),

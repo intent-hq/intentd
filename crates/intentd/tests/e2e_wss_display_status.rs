@@ -401,9 +401,11 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -732,6 +734,8 @@ async fn persisted_pr_status_only_is_pr_open_over_wss() {
 fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
     let ts = now_iso();
     intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -760,6 +764,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
@@ -770,6 +775,7 @@ fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 
@@ -901,11 +907,13 @@ async fn blocked_transition_over_wss() {
     );
 }
 
-/// Unread axis over the wire: `workspace.update { attention: "unread" }`
-/// promotes the idle base to `displayStatus: "unread"` and emits;
-/// `workspace.markSeen` retires the flag and emits the demotion back to
-/// `idle`. A `review_required` flag reads as `needs_attention` and
-/// `workspace.dismissAttention` retires it.
+/// Attention flags over the wire: the `unread` flag is not a displayStatus
+/// axis — `workspace.update { attention: "unread" }` and `workspace.markSeen`
+/// leave `displayStatus: "idle"` and emit no
+/// `workspace:displayStatus-changed`. A `review_required` flag reads as
+/// `needs_attention` and `workspace.dismissAttention` retires it; the ordered
+/// event stream (first event observed is the review_required promotion)
+/// proves the unread mutations stayed silent.
 #[tokio::test]
 async fn attention_flag_transitions_over_wss() {
     let fx = boot(StubForge::default(), false, None).await;
@@ -934,7 +942,7 @@ async fn attention_flag_transitions_over_wss() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // unread flag → unread (promotes the idle base).
+    // unread flag: no displayStatus axis — the rollup stays idle.
     wss_rpc(
         &mut rpc,
         2,
@@ -942,11 +950,6 @@ async fn attention_flag_transitions_over_wss() {
         json!({ "workspaceId": fx.ws_id.as_str(), "attention": "unread" }),
     )
     .await;
-    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
-    assert_eq!(
-        evt["data"],
-        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "unread" })
-    );
     let got = wss_rpc(
         &mut rpc,
         3,
@@ -954,9 +957,10 @@ async fn attention_flag_transitions_over_wss() {
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
-    assert_eq!(got["workspace"]["displayStatus"], "unread");
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+    assert_eq!(got["workspace"]["attention"], "unread");
 
-    // markSeen retires unread → idle.
+    // markSeen retires the flag; the rollup never moved.
     wss_rpc(
         &mut rpc,
         4,
@@ -964,13 +968,19 @@ async fn attention_flag_transitions_over_wss() {
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
-    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
-    assert_eq!(
-        evt["data"],
-        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "idle" })
-    );
+    let got = wss_rpc(
+        &mut rpc,
+        11,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "idle");
+    assert_eq!(got["workspace"]["attention"], "none");
 
-    // review_required flag → needs_attention.
+    // review_required flag → needs_attention. This is the FIRST event on the
+    // ordered subscription stream, proving the unread raise + markSeen above
+    // emitted no workspace:displayStatus-changed.
     wss_rpc(
         &mut rpc,
         5,

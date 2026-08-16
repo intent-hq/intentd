@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use git2::{Delta, DiffOptions, Oid, Patch, Repository};
+use git2::{Delta, DiffOptions, FileMode, Oid, Patch, Repository};
 use intent_core::{Error, Result};
 
 use crate::{map_git_err, SLOW_GIT_WARN_THRESHOLD};
@@ -56,6 +56,46 @@ pub struct FileDiff {
     pub old_blob: Option<String>,
     /// `None` for a deleted file (no post-image blob).
     pub new_blob: Option<String>,
+    /// True when the **old** side of the delta is a `160000` submodule
+    /// (gitlink) entry (monorepo#1739). On a gitlink side `old_blob`/`new_blob`
+    /// carry the submodule pin **commit** SHA — an object in the submodule's
+    /// odb, not a blob in this repository — so it must never be fed to
+    /// [`hunks_between`]; use [`gitlink_hunks`] with the pin-side SHAs
+    /// ([`FileDiff::gitlink_old_sha`] / [`FileDiff::gitlink_new_sha`]) instead.
+    /// Tracked per side so a gitlink↔regular-file type change never leaks the
+    /// regular side's blob OID as a pin SHA (libgit2 splits such a type change
+    /// into a delete + add delta pair, but each side is still checked).
+    pub old_is_gitlink: bool,
+    /// True when the **new** side of the delta is a `160000` gitlink entry.
+    /// See [`FileDiff::old_is_gitlink`].
+    pub new_is_gitlink: bool,
+}
+
+impl FileDiff {
+    /// Whether either side of the delta is a `160000` gitlink entry.
+    pub fn is_gitlink(&self) -> bool {
+        self.old_is_gitlink || self.new_is_gitlink
+    }
+
+    /// The old-side submodule pin SHA — `old_blob` only when that side is a
+    /// gitlink (never a regular file's blob OID).
+    pub fn gitlink_old_sha(&self) -> Option<&str> {
+        if self.old_is_gitlink {
+            self.old_blob.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// The new-side submodule pin SHA — `new_blob` only when that side is a
+    /// gitlink (never a regular file's blob OID).
+    pub fn gitlink_new_sha(&self) -> Option<&str> {
+        if self.new_is_gitlink {
+            self.new_blob.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 /// One file's summary plus its hunks, produced together by
@@ -102,6 +142,8 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
             is_binary,
             old_blob: oid_to_opt(delta.old_file().id()),
             new_blob: oid_to_opt(delta.new_file().id()),
+            old_is_gitlink: delta.old_file().mode() == FileMode::Commit,
+            new_is_gitlink: delta.new_file().mode() == FileMode::Commit,
         });
     }
     Ok(out)
@@ -161,6 +203,8 @@ pub fn diff_index_to_workdir_with_hunks(
                 is_binary,
                 old_blob: oid_to_opt(delta.old_file().id()),
                 new_blob: oid_to_opt(delta.new_file().id()),
+                old_is_gitlink: delta.old_file().mode() == FileMode::Commit,
+                new_is_gitlink: delta.new_file().mode() == FileMode::Commit,
             },
             hunks,
         });
@@ -448,9 +492,48 @@ fn diff_to_file_summaries(diff: &git2::Diff) -> Result<Vec<FileDiff>> {
             is_binary,
             old_blob: oid_to_opt(delta.old_file().id()),
             new_blob: oid_to_opt(delta.new_file().id()),
+            old_is_gitlink: delta.old_file().mode() == FileMode::Commit,
+            new_is_gitlink: delta.new_file().mode() == FileMode::Commit,
         });
     }
     Ok(out)
+}
+
+/// Synthesize the `Subproject commit <sha>` pseudo-hunk for a gitlink delta
+/// from its pin SHAs, matching what libgit2/git print for a submodule pin
+/// change in a workdir diff (monorepo#1739). The staged / committed diff
+/// paths cannot hydrate gitlink "content" via [`hunks_between`] — the pins
+/// are commit SHAs in the **submodule's** odb, not blobs in this repository —
+/// so this builds the same one-line pseudo-diff without any object lookups.
+/// Either side may be `None` (added / deleted submodule).
+pub fn gitlink_hunks(old_sha: Option<&str>, new_sha: Option<&str>) -> Vec<DiffHunk> {
+    let mut lines = Vec::new();
+    if let Some(old) = old_sha {
+        lines.push(DiffLine {
+            kind: DiffLineKind::Deletion,
+            content: format!("Subproject commit {old}\n"),
+            old_lineno: Some(1),
+            new_lineno: None,
+        });
+    }
+    if let Some(new) = new_sha {
+        lines.push(DiffLine {
+            kind: DiffLineKind::Addition,
+            content: format!("Subproject commit {new}\n"),
+            old_lineno: None,
+            new_lineno: Some(1),
+        });
+    }
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    vec![DiffHunk {
+        old_start: if old_sha.is_some() { 1 } else { 0 },
+        old_lines: u32::from(old_sha.is_some()),
+        new_start: if new_sha.is_some() { 1 } else { 0 },
+        new_lines: u32::from(new_sha.is_some()),
+        lines,
+    }]
 }
 
 /// Lazily compute hunks for a single file from its old/new blob SHAs. A `None`
@@ -591,6 +674,108 @@ mod tests {
         assert_eq!(f.additions, 2);
         assert_eq!(f.deletions, 0);
         assert!(f.old_blob.is_none());
+    }
+
+    /// A staged gitlink pin bump is marked gitlink on both sides with the pin
+    /// SHAs in the blob slots; regular files stay unmarked (monorepo#1739).
+    #[test]
+    fn staged_gitlink_bump_is_marked_gitlink() {
+        let dir = init_repo("diff-gitlink-staged");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let old_sha = "7257a190564088376227525989c4994e46082ad1";
+        let new_sha = "7908777602d4e96f13c663c8a70a617163f38413";
+        crate::testutil::commit_gitlink_bump(dir.path(), "sub", old_sha);
+        // Stage a new pin without committing: HEAD→index shows the bump.
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        let mut entry = index.get_path(Path::new("sub"), 0).unwrap();
+        entry.id = Oid::from_str(new_sha).unwrap();
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+
+        let files = diff_head_to_index(dir.path()).unwrap();
+        let sub = files.iter().find(|f| f.path == "sub").unwrap();
+        assert!(sub.old_is_gitlink && sub.new_is_gitlink);
+        assert_eq!(sub.gitlink_old_sha(), Some(old_sha));
+        assert_eq!(sub.gitlink_new_sha(), Some(new_sha));
+        assert!(files.iter().all(|f| f.path == "sub" || !f.is_gitlink()));
+    }
+
+    /// A gitlink→regular-file replacement (type change) splits into a gitlink
+    /// deletion delta plus a blob addition delta; the pin-side accessors keep
+    /// the pin SHA on the gitlink side only and never expose the file's blob
+    /// OID as a pin (monorepo#1739 review).
+    #[test]
+    fn gitlink_to_file_typechange_keeps_pin_side_only() {
+        let dir = init_repo("diff-gitlink-typechange");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let old_sha = "7257a190564088376227525989c4994e46082ad1";
+        crate::testutil::commit_gitlink_bump(dir.path(), "sub", old_sha);
+        // Replace the gitlink with a staged regular file at the same path.
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("sub")).unwrap();
+        crate::testutil::write_file(dir.path(), "sub", "now a file\n");
+        index.add_path(Path::new("sub")).unwrap();
+        index.write().unwrap();
+
+        let files = diff_head_to_index(dir.path()).unwrap();
+        let deltas: Vec<_> = files.iter().filter(|f| f.path == "sub").collect();
+        assert_eq!(deltas.len(), 2, "delete + add delta pair");
+        let del = deltas
+            .iter()
+            .find(|f| f.old_blob.is_some())
+            .expect("gitlink deletion side");
+        assert!(del.old_is_gitlink && !del.new_is_gitlink);
+        assert_eq!(del.gitlink_old_sha(), Some(old_sha));
+        assert_eq!(del.gitlink_new_sha(), None);
+        let add = deltas
+            .iter()
+            .find(|f| f.new_blob.is_some())
+            .expect("file addition side");
+        assert!(!add.is_gitlink(), "blob addition is not a gitlink delta");
+        assert_eq!(add.gitlink_old_sha(), None);
+        assert_eq!(add.gitlink_new_sha(), None);
+    }
+
+    /// `gitlink_hunks` synthesizes the one-line `Subproject commit` pseudo-diff
+    /// for modified / added / deleted pins.
+    #[test]
+    fn gitlink_hunks_synthesizes_subproject_commit_lines() {
+        let old = "7257a190564088376227525989c4994e46082ad1";
+        let new = "7908777602d4e96f13c663c8a70a617163f38413";
+        let hunks = gitlink_hunks(Some(old), Some(new));
+        assert_eq!(hunks.len(), 1);
+        let h = &hunks[0];
+        assert_eq!(
+            (h.old_start, h.old_lines, h.new_start, h.new_lines),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(h.lines.len(), 2);
+        assert_eq!(h.lines[0].kind, DiffLineKind::Deletion);
+        assert_eq!(h.lines[0].content, format!("Subproject commit {old}\n"));
+        assert_eq!(h.lines[1].kind, DiffLineKind::Addition);
+        assert_eq!(h.lines[1].content, format!("Subproject commit {new}\n"));
+
+        let added = gitlink_hunks(None, Some(new));
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            (
+                added[0].old_start,
+                added[0].old_lines,
+                added[0].new_start,
+                added[0].new_lines
+            ),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(added[0].lines.len(), 1);
+        assert_eq!(added[0].lines[0].kind, DiffLineKind::Addition);
+
+        let deleted = gitlink_hunks(Some(old), None);
+        assert_eq!(deleted[0].lines.len(), 1);
+        assert_eq!(deleted[0].lines[0].kind, DiffLineKind::Deletion);
+
+        assert!(gitlink_hunks(None, None).is_empty());
     }
 
     #[test]

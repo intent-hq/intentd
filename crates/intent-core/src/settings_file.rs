@@ -35,11 +35,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS,
-    DEFAULT_PR_MONITOR_POLL_SECONDS, DEFAULT_SERVER_MAX_OUTSTANDING_RPCS,
-    DEFAULT_STREAM_RETENTION_HOURS, DEFAULT_WAKE_RESUME_ENABLED,
-    DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS, DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS,
-    DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    DEFAULT_HOOKS_MAX_PER_AGENT, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_MAX_CONCURRENT_ADAPTERS,
+    DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS, DEFAULT_PR_MONITOR_POLL_SECONDS,
+    DEFAULT_SERVER_MAX_OUTSTANDING_RPCS, DEFAULT_STREAM_RETENTION_HOURS,
+    DEFAULT_WAKE_RESUME_ENABLED, DEFAULT_WAKE_RESUME_THRESHOLD_SECONDS,
+    DEFAULT_WORKSPACE_API_MAX_OUTPUT_CHARS, DEFAULT_WORKSPACE_API_TOON_OUTPUT,
+    MAX_CONCURRENT_ADAPTERS_LIMIT,
 };
 use crate::error::{Error, Result};
 
@@ -650,6 +651,26 @@ pub struct AgentsSettings {
     /// `agents.maxConcurrent` — concurrent agent session cap (0 = auto based
     /// on system RAM; changes apply on daemon restart; max 200).
     pub max_concurrent: u32,
+    /// `agents.memoryBudgetMb` — aggregate resident-memory budget for the
+    /// daemon's whole child-process tree, above which new agent spawns queue
+    /// behind idle-process eviction instead of starting immediately and the
+    /// periodic reap sweep drains idle agents largest-first without waiting
+    /// for a spawn or the idle TTL (monorepo#2063 level 2). Absent
+    /// (`None`, the default) = auto (budget derived from system RAM); explicit
+    /// `0` = off — preserved because config files written before the auto
+    /// default carried a literal `memoryBudgetMb = 0` meaning off, and per the
+    /// monorepo#2109 no-migration precedent their behaviour must not change;
+    /// positive = budget in MB (changes apply on daemon restart; max
+    /// 1,024,000).
+    pub memory_budget_mb: Option<u32>,
+    /// `agents.maxConcurrentAdapters` — daemon-wide cap on concurrently live
+    /// ephemeral ACP adapters (one-shot `agent.completeOnce` completions and
+    /// model probes; changes apply on daemon restart; range 1–64). Unlike
+    /// `maxConcurrent` this has no "auto" value and no unlimited setting: the
+    /// bound exists because each chain costs ~610 MB and one-shots hold no
+    /// agent slot, so removing the ceiling is exactly the failure being
+    /// fixed (monorepo#2062).
+    pub max_concurrent_adapters: u32,
     /// `agents.idleReapMinutes` — minutes before an idle agent is reaped
     /// (0 disables idle reaping).
     pub idle_reap_minutes: u32,
@@ -659,14 +680,48 @@ pub struct AgentsSettings {
     /// entries (user-origin entries stay FIFO), `off` is one turn per queued
     /// message.
     pub flush_queued_messages: FlushQueuedMessagesMode,
+    /// `agents.resumeInterruptedOnStart` — whether the daemon resumes
+    /// interrupted agents at startup when `--resume-all` is absent: `auto`
+    /// resumes only on headless hosts (no display detected), `on` always
+    /// resumes, `off` never resumes. The `--resume-all` flag forces the
+    /// sweep regardless of this setting.
+    pub resume_interrupted_on_start: ResumeInterruptedOnStart,
 }
 
 impl Default for AgentsSettings {
     fn default() -> Self {
         Self {
             max_concurrent: 0,
+            memory_budget_mb: None,
+            max_concurrent_adapters: DEFAULT_MAX_CONCURRENT_ADAPTERS,
             idle_reap_minutes: DEFAULT_IDLE_REAP_MINUTES,
             flush_queued_messages: FlushQueuedMessagesMode::All,
+            resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
+        }
+    }
+}
+
+/// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
+/// (`"auto"`, `"on"`, `"off"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeInterruptedOnStart {
+    /// Resume interrupted agents at startup only on headless hosts.
+    #[default]
+    Auto,
+    /// Always resume interrupted agents at startup.
+    On,
+    /// Never resume interrupted agents at startup.
+    Off,
+}
+
+impl ResumeInterruptedOnStart {
+    /// The wire/TOML string for this value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResumeInterruptedOnStart::Auto => "auto",
+            ResumeInterruptedOnStart::On => "on",
+            ResumeInterruptedOnStart::Off => "off",
         }
     }
 }
@@ -771,8 +826,8 @@ impl Default for HooksSettings {
 }
 
 /// `[agentFeatures]` — per-feature toggles for what agents see and may call
-/// (`agentFeatures.*`). All default **on**; changes apply to new agent
-/// sessions only.
+/// (`agentFeatures.*`). All default **on** except `taskGraph` (opt-in);
+/// changes apply to new agent sessions only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentFeaturesSettings {
@@ -810,6 +865,16 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.prMonitor` — expose centralized PR monitoring
     /// (`ws.pr.monitor` / `ws.pr.unmonitor`) to agents.
     pub pr_monitor: bool,
+    /// `agentFeatures.taskGraph` — teach agents the task-graph workflow:
+    /// batch `ws.agent.delegate({ tasks })` guidance, `dependsOn` /
+    /// `conflictsWith` relations, inline `@@@task` fence attributes, and the
+    /// "Tasks now unblocked…" wake section. Docs/prompt only — the underlying
+    /// APIs are never dispatch-denied. Prompt/help gating and unblocked-wake
+    /// teaching use the value captured when the parent session is created;
+    /// changing the live setting does not affect existing sessions' wakes.
+    /// Defaults **off** (opt-in), unlike the other toggles
+    /// (intent-hq/monorepo#2445).
+    pub task_graph: bool,
 }
 
 impl Default for AgentFeaturesSettings {
@@ -825,6 +890,7 @@ impl Default for AgentFeaturesSettings {
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
+            task_graph: false,
         }
     }
 }
@@ -1047,6 +1113,24 @@ impl SettingsFile {
                     "must be between 0 and 200, got {}",
                     self.agents.max_concurrent
                 ),
+            ));
+        }
+        if let Some(mb) = self.agents.memory_budget_mb {
+            if mb > 1_024_000 {
+                return Err(bad(
+                    "agents.memoryBudgetMb",
+                    format!("must be absent (auto), 0 (off), or between 1 and 1024000, got {mb}"),
+                ));
+            }
+        }
+        // No `0` escape hatch here (unlike maxOutstandingRpcs): an unbounded
+        // adapter spawn is the monorepo#2062 failure itself, so a hand-edited
+        // config.toml cannot boot without a ceiling.
+        let adapters = self.agents.max_concurrent_adapters;
+        if !(1..=MAX_CONCURRENT_ADAPTERS_LIMIT).contains(&adapters) {
+            return Err(bad(
+                "agents.maxConcurrentAdapters",
+                format!("must be between 1 and {MAX_CONCURRENT_ADAPTERS_LIMIT}, got {adapters}"),
             ));
         }
         let chars = self.workspace_api.max_output_chars;
@@ -1360,15 +1444,70 @@ allowIndexing = true
 level = "info"
 
 [agents]
+# What an agent subtree actually costs, and what each knob below does and does
+# not bound, is written up under "Agent process-tree memory" in
+# docs/ARCHITECTURE.md of the intent-hq/monorepo repo. Every figure quoted in
+# this table is measured (monorepo#2062, #2063, #2109).
 # Max concurrent agents -- concurrent agent session cap (0 = auto based on
-# system RAM; changes apply on daemon restart; max 200).
+# system RAM; changes apply on daemon restart; max 200). This is a concurrency
+# cap, not a memory cap: a measured agent subtree spans a 22x range (~0.66 GB
+# idle, up to 9.6 GB running a test suite), so slot count does not predict
+# memory -- idleReapMinutes and memoryBudgetMb are the memory bounds.
 maxConcurrent = 0
+# Agent memory budget (MB) -- aggregate resident memory the daemon's whole
+# child-process tree may use before it reclaims: new agent spawns queue behind
+# idle-process eviction, and a background sweep drains idle agents
+# largest-first while over budget (nothing running is ever killed; changes
+# apply on daemon restart).
+# Absent (the default, as in this file) = auto: the daemon picks the budget
+# ((RAM - 8 GB) / 2, min 4 GB). Explicit 0 = off, always. Upgrade note:
+# config files written before this key defaulted to auto carry a literal
+# `memoryBudgetMb = 0`, which stays off -- delete the line to opt into
+# auto. A positive value is the budget in MB (max 1024000). A soft
+# admission gate rather than a ceiling: measured transient overshoot of
+# 65-105% and steady state ~16% over, so budget for roughly 2x the configured
+# value as the transient. The overshoot is a fixed offset, not proportional
+# to demand -- at 1500 MB a 20-agent burst peaked the same as an 8-agent one
+# (3.06 vs 3.09 GB) where the same 20-agent burst unbounded reached 12.37 GB.
+# That 2x rule sizes the admission transient for a burst of comparable
+# agents; the gate runs at spawn only, so an already-admitted agent whose own
+# workload grows (a test suite) is never re-checked and can carry the tree
+# past the budget by itself.
+# memoryBudgetMb = 8192
+# Max concurrent adapters -- daemon-wide cap on concurrently live ephemeral ACP
+# adapters (one-shot completions and model probes). Each costs ~610 MB and
+# holds no agent slot; over-limit calls queue and fail with "adapter-busy" if
+# their own timeout expires first (1-64; changes apply on daemon restart).
+# Once a burst exceeds the cap, peak live chains equal the cap exactly and are
+# invariant to how much bigger the burst is (a smaller burst is unaffected and
+# peaks at its own size). The over-limit caller has spawned nothing, so its
+# retry is always safe.
+maxConcurrentAdapters = 6
 # Idle reap minutes -- minutes before an idle agent is reaped (0 disables idle
-# reaping).
-idleReapMinutes = 30
+# reaping). The main lever on resident memory: every agent touched inside the
+# window keeps its whole subtree alive (~0.66 GB each when idle), so a seat
+# that touches 20 agents within the window holds all 20 subtrees at once --
+# projecting to ~12 GB doing nothing, more if any of them ran a test suite.
+# Measured at a 30-minute TTL (the default before monorepo#2109): 40 procs /
+# 5.85 GB flat across 10 minutes of full idle, zero exits; the same tree at a
+# 2-minute TTL drained to 0 in 122 s. The default is now 10 minutes, so that
+# tree starts draining once the window passes instead of holding 5.85 GB for
+# another 20. Raise it to keep processes warm for longer and reclaim their
+# memory later; lower it for the reverse. Only agents idle past the TTL are
+# candidates, and the sweep
+# skips any agent reported busy when it checks. An agent is selected within
+# the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
+# memory comes back as each kill completes, so a large idle set drains over a
+# tail rather than all at once.
+idleReapMinutes = 10
 # Flush queued messages -- how the queued-message backlog is delivered when
 # an idle agent drains its queue: "all", "systemOnly", or "off".
 flushQueuedMessages = "all"
+# Resume interrupted on start -- whether the daemon resumes interrupted
+# agents at startup when --resume-all is absent: "auto" resumes only on
+# headless hosts (no display detected), "on" always resumes, "off" never
+# resumes. --resume-all forces the sweep regardless of this setting.
+resumeInterruptedOnStart = "auto"
 
 [events]
 # Stream retention hours -- hours ephemeral events are retained before the
@@ -1390,7 +1529,8 @@ toonOutput = true
 maxPerAgent = 5
 
 [agentFeatures]
-# All toggles default to on; changes apply to new agent sessions only.
+# All toggles default to on (except taskGraph, which is opt-in); changes
+# apply to new agent sessions only.
 # Background hooks -- expose background hooks (ws.hook.*) to agents.
 backgroundHooks = true
 # Host exec -- expose one-shot host command execution (ws.host.exec) to
@@ -1418,6 +1558,12 @@ stateSnapshot = true
 # PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
 # ws.pr.unmonitor) to agents.
 prMonitor = true
+# Task graph -- teach agents the task-graph workflow (batch delegate,
+# dependsOn/conflictsWith relations, @@@task fence attributes, unblocked-wake
+# hints). Docs/prompt only; the APIs themselves always work. Prompt/help and
+# wake teaching use the value captured when the parent session is created.
+# Opt-in: defaults to off.
+taskGraph = false
 
 [wakeResume]
 # Wake resume enabled -- detect host sleep/wake and resume work on wake.
@@ -1577,6 +1723,8 @@ mod tests {
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
         assert!(parsed.agent_features.pr_monitor);
+        // `taskGraph` is the one opt-in toggle: absent → off.
+        assert!(!parsed.agent_features.task_graph);
     }
 
     #[test]
@@ -1585,6 +1733,20 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("agentFeatures"), "names the table: {msg}");
         assert!(msg.contains("hostExek"), "names the bad key: {msg}");
+    }
+
+    #[test]
+    fn task_graph_defaults_off_and_opts_in() {
+        // Opt-in (intent-hq/monorepo#2445): empty file and the shipped
+        // template both resolve to off; an explicit `taskGraph = true` opts in.
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert!(!parsed.agent_features.task_graph);
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("taskGraph = false"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert!(!templated.agent_features.task_graph);
+        let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = true\n")
+            .expect("override parses");
+        assert!(parsed.agent_features.task_graph);
     }
 
     #[test]
@@ -1660,6 +1822,39 @@ mod tests {
         let err =
             SettingsFile::parse_str("[agents]\nflushQueuedMessages = \"sometimes\"\n").unwrap_err();
         assert!(err.to_string().contains("flushQueuedMessages"), "{err}");
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_accepts_variants() {
+        for (raw, expected) in [
+            ("\"auto\"", ResumeInterruptedOnStart::Auto),
+            ("\"on\"", ResumeInterruptedOnStart::On),
+            ("\"off\"", ResumeInterruptedOnStart::Off),
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[agents]\nresumeInterruptedOnStart = {raw}\n"))
+                    .expect("parses");
+            assert_eq!(parsed.agents.resume_interrupted_on_start, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_defaults_to_auto() {
+        let parsed = SettingsFile::parse_str("").expect("empty parses");
+        assert_eq!(
+            parsed.agents.resume_interrupted_on_start,
+            ResumeInterruptedOnStart::Auto
+        );
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_rejects_unknown_string() {
+        let err = SettingsFile::parse_str("[agents]\nresumeInterruptedOnStart = \"maybe\"\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("resumeInterruptedOnStart"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1837,6 +2032,9 @@ mod tests {
         file.providers.active = Some("claude-code".to_string());
         file.server.ws_api.enabled = true;
         file.agents.idle_reap_minutes = 15;
+        // An explicit 0 (off) must survive the round trip as `Some(0)`, never
+        // collapsing into the absent-key auto default.
+        file.agents.memory_budget_mb = Some(0);
         let text = toml::to_string(&file).expect("serializes");
         let back = SettingsFile::parse_str(&text).expect("re-parses");
         assert_eq!(back, file);
@@ -2094,6 +2292,96 @@ mod tests {
         );
         assert!(
             SettingsFile::parse_str("[server]\nmaxOutstandingRpcs = 100000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+    }
+
+    /// The `agents.memoryBudgetMb` parse matrix (monorepo#2063): an absent
+    /// key is auto (`None`), an explicit `0` is off (`Some(0)` — every config
+    /// file the old template wrote carries that literal, so its behaviour is
+    /// preserved), a positive value is an explicit MB budget, and the upper
+    /// bound matches what the catalog enforces.
+    #[test]
+    fn memory_budget_mb_absent_auto_zero_off_positive_explicit() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.agents.memory_budget_mb, None, "absent key = auto");
+        assert!(
+            !DEFAULT_CONFIG_TEMPLATE.contains("\nmemoryBudgetMb ="),
+            "the template for new installs must not write the key (auto)"
+        );
+
+        let off =
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 0\n").expect("explicit 0 parses");
+        assert_eq!(
+            off.agents.memory_budget_mb,
+            Some(0),
+            "explicit 0 = off, distinct from the absent-key auto"
+        );
+
+        let overridden =
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 20480\n").expect("override parses");
+        assert_eq!(overridden.agents.memory_budget_mb, Some(20_480));
+
+        let err = SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 2000000\n")
+            .expect_err("out-of-range value must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agents.memoryBudgetMb") && msg.contains("2000000"),
+            "error names the offending key and value: {msg}"
+        );
+        assert!(
+            SettingsFile::parse_str("[agents]\nmemoryBudgetMb = 1024000\n").is_ok(),
+            "the upper bound itself is legal"
+        );
+    }
+
+    /// The ephemeral-adapter bound ships enabled: an empty file and the
+    /// shipped template both resolve to the same in-range default, so a daemon
+    /// that has never been configured still has a ceiling (monorepo#2062).
+    #[test]
+    fn max_concurrent_adapters_defaults_and_template_round_trip() {
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(
+            parsed.agents.max_concurrent_adapters,
+            DEFAULT_MAX_CONCURRENT_ADAPTERS
+        );
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("maxConcurrentAdapters"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(
+            templated.agents.max_concurrent_adapters,
+            DEFAULT_MAX_CONCURRENT_ADAPTERS
+        );
+        assert!(
+            (4..=8).contains(&DEFAULT_MAX_CONCURRENT_ADAPTERS),
+            "the shipped default must stay inside the agreed 4-8 range"
+        );
+    }
+
+    /// Unlike `maxOutstandingRpcs`, this key has no `0` = unlimited escape
+    /// hatch: an unbounded adapter spawn is the failure the bound exists to
+    /// prevent, so a hand-edited file cannot reintroduce it.
+    #[test]
+    fn max_concurrent_adapters_range_is_enforced_with_no_unlimited_value() {
+        let parsed = SettingsFile::parse_str("[agents]\nmaxConcurrentAdapters = 4\n")
+            .expect("in-range override parses");
+        assert_eq!(parsed.agents.max_concurrent_adapters, 4);
+
+        for bad_value in ["0", "65"] {
+            let err = SettingsFile::parse_str(&format!(
+                "[agents]\nmaxConcurrentAdapters = {bad_value}\n"
+            ))
+            .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("agents.maxConcurrentAdapters") && msg.contains(bad_value),
+                "error names the offending key and value: {msg}"
+            );
+        }
+        assert!(
+            SettingsFile::parse_str(&format!(
+                "[agents]\nmaxConcurrentAdapters = {MAX_CONCURRENT_ADAPTERS_LIMIT}\n"
+            ))
+            .is_ok(),
             "the upper bound itself is legal"
         );
     }

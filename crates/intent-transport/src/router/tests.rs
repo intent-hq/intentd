@@ -5,12 +5,13 @@ use intent_core::{
     CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
     CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileStatus,
     GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
-    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
-    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
-    ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
+    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -57,9 +58,11 @@ fn sample_ws() -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -147,6 +150,43 @@ impl WorkspaceApi for FakeApi {
             }))
         })
     }
+    fn workspace_transfer_plan(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(intent_core::transfer::TransferPlan {
+                manifest: intent_core::transfer::TransferManifest {
+                    format_version: intent_core::transfer::TRANSFER_FORMAT_VERSION,
+                    creating_intentd_version: "0.0.0".to_string(),
+                    workspace_id: id,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    tables: vec![intent_core::transfer::TransferTableStat {
+                        name: "note".to_string(),
+                        row_count: 2,
+                        approx_bytes: 100,
+                    }],
+                    assets: vec![],
+                    attachments: vec![],
+                    git: intent_core::transfer::TransferGitSummary {
+                        has_repository: false,
+                        branch: None,
+                        dirty_files: vec![],
+                        sandbox_branches: vec![],
+                    },
+                },
+                total_size_bytes: 100,
+                db_row_bytes: 100,
+                asset_bytes: 0,
+                attachment_bytes: 0,
+                estimated_git_bundle_bytes: 0,
+                warnings: vec![],
+            })
+        })
+    }
     fn create_workspace(
         &self,
         input: WorkspaceCreate,
@@ -188,6 +228,61 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("workspace".to_string()));
             }
             Ok(())
+        })
+    }
+    fn schedule_workspace_delete(
+        &self,
+        id: WorkspaceId,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(format!("2026-01-01T00:00:{:02}Z", undo_delay_ms / 1000))
+        })
+    }
+    fn cancel_workspace_delete(&self, id: WorkspaceId) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            // "pending" has a scheduled deletion; anything else reports the
+            // race-safe non-error `false`.
+            Ok(id.as_str() == "pending")
+        })
+    }
+    fn agent_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(serde_json::json!({ "success": true }))
+        })
+    }
+    fn agent_schedule_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if agent_id.0 == "missing" {
+                return Err(Error::NotFound("agent session".to_string()));
+            }
+            Ok(format!("2026-01-01T00:00:{:02}Z", undo_delay_ms / 1000))
+        })
+    }
+    fn agent_cancel_delete(
+        &self,
+        agent_id: AgentId,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            // "agent-pending" has a scheduled deletion; anything else reports
+            // the race-safe non-error `false`.
+            Ok(agent_id.0 == "agent-pending")
         })
     }
     fn archive_workspace(
@@ -304,12 +399,18 @@ impl WorkspaceApi for FakeApi {
         input: NoteCreate,
         _idempotency_key: Option<String>,
         _caller_agent_id: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<Note>> {
+    ) -> BoxFuture<'_, Result<NoteCreateResult>> {
         Box::pin(async move {
             let mut note = sample_note(&workspace_id);
             note.id = NoteId::from("created");
             note.title = input.title;
-            Ok(note)
+            Ok(NoteCreateResult {
+                note,
+                converted_count: 0,
+                created_task_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
+            })
         })
     }
 
@@ -360,6 +461,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -382,6 +485,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.new,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -405,6 +510,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: input.content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -429,6 +536,8 @@ impl WorkspaceApi for FakeApi {
                 new_content: content,
                 converted_count: 0,
                 created_task_note_ids: vec![],
+                created_tasks: vec![],
+                warnings: vec![],
             })
         })
     }
@@ -502,6 +611,9 @@ impl WorkspaceApi for FakeApi {
                 status: "todo".to_string(),
                 task_note_id: None,
                 linked_task_note_id: None,
+                depends_on: Vec::new(),
+                conflicts_with: Vec::new(),
+                unmet_depends_on: Vec::new(),
             }])
         })
     }
@@ -698,8 +810,59 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn git_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
+    fn git_root_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
+            if workspace_id.as_str() == "missing" {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            }
+            Ok(serde_json::json!({
+                "gitRoots": [{
+                    "id": "root-1",
+                    "workspaceId": workspace_id.as_str(),
+                    "path": "/tmp/clone-a",
+                    "source": "agent",
+                    "branch": "feature",
+                }]
+            }))
+        })
+    }
+
+    fn git_root_path(
+        &self,
+        _workspace_id: WorkspaceId,
+        git_root_id: intent_core::WorkspaceGitRootId,
+    ) -> BoxFuture<'_, Result<String>> {
+        Box::pin(async move {
+            if git_root_id.as_str() == "root-1" {
+                Ok("/repo".to_string())
+            } else {
+                Err(Error::InvalidParams(format!(
+                    "Unknown git root: {git_root_id}"
+                )))
+            }
+        })
+    }
+
+    fn git_status(
+        &self,
+        workspace_id: WorkspaceId,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<GitStatus>> {
+        Box::pin(async move {
+            if let Some(id) = &git_root_id {
+                if id.as_str() != "root-1" {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                return Ok(GitStatus {
+                    branch: "root-branch".to_string(),
+                    ahead: 0,
+                    behind: 0,
+                    diverged: false,
+                    files: vec![],
+                    has_uncommitted_changes: false,
+                    has_untracked_files: false,
+                });
+            }
             if workspace_id.as_str() == "empty" {
                 return Ok(GitStatus {
                     branch: String::new(),
@@ -720,10 +883,40 @@ impl WorkspaceApi for FakeApi {
                     path: "src/a.ts".to_string(),
                     status: GitFileStatus::Modified,
                     staged: true,
+                    mode: None,
+                    old_sha: None,
+                    new_sha: None,
                 }],
                 has_uncommitted_changes: true,
                 has_untracked_files: false,
             })
+        })
+    }
+
+    fn git_commit_details(
+        &self,
+        _workspace_id: WorkspaceId,
+        commit_hash: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if let Some(id) = &git_root_id {
+                if id.as_str() != "root-1" {
+                    return Err(Error::InvalidParams(format!("Unknown git root: {id}")));
+                }
+                return Ok(serde_json::json!({
+                    "commitHash": commit_hash,
+                    "message": "root-commit",
+                    "files": ["root-only.txt"],
+                    "fileDetails": [{ "path": "root-only.txt", "additions": 1, "deletions": 0 }],
+                }));
+            }
+            Ok(serde_json::json!({
+                "commitHash": commit_hash,
+                "message": "primary-commit",
+                "files": ["src/a.ts"],
+                "fileDetails": [{ "path": "src/a.ts", "additions": 1, "deletions": 0 }],
+            }))
         })
     }
 
@@ -892,6 +1085,25 @@ impl WorkspaceApi for FakeApi {
 
     fn repo_remove(&self, path: String) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move { Ok(serde_json::json!({ "removed": path == "/src/intent" })) })
+    }
+
+    fn repo_warm_cache(&self, github_url: String) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            match github_url.as_str() {
+                "https://github.com/intent-hq/busy" => Err(Error::WarmInFlight {
+                    owner: "intent-hq".to_string(),
+                    repo: "other".to_string(),
+                }),
+                "bad-url" => Err(Error::InvalidParams(format!(
+                    "githubUrl carries no owner/repo pair: {github_url}"
+                ))),
+                _ => Ok(serde_json::json!({
+                    "started": true,
+                    "owner": "intent-hq",
+                    "repo": "intentd"
+                })),
+            }
+        })
     }
 
     fn github_repos_list(
@@ -1250,6 +1462,25 @@ impl WorkspaceApi for FakeApi {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move { Ok(Value::String(format!("{}:{path}", workspace_id.as_str()))) })
+    }
+
+    fn file_read_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        path: String,
+        offset: u64,
+        length: u64,
+        _caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // Echo the window so the wire test can assert offset/length reach the
+        // service, alongside the documented result shape.
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "content": format!("b64:{path}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
     }
 
     fn file_write(
@@ -2161,6 +2392,36 @@ fn voice_not_configured_maps_to_structured_error_data() {
     );
 }
 
+#[test]
+fn adapter_busy_maps_to_structured_error_data() {
+    // An `agent.completeOnce` that queued past its own timeout at the
+    // daemon-wide ephemeral-adapter bound (PROTOCOL §5.32, monorepo#2062)
+    // keeps -32603 but carries `error.data = { code: "adapter-busy",
+    // provider, waitedMs, limit }`, so a client tells daemon saturation apart
+    // from a slow model — and from every other one-shot failure, which stay
+    // bare `Internal` — without matching on prose.
+    let rpc = super::domain_to_rpc(intent_core::Error::AdapterBusy {
+        provider: "claude-code".to_string(),
+        waited_ms: 30_000,
+        limit: 6,
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "adapter-busy",
+            "provider": "claude-code",
+            "waitedMs": 30_000,
+            "limit": 6,
+        })
+    );
+    assert!(
+        rpc.message.contains("claude-code") && rpc.message.contains("30000ms"),
+        "human message names the provider and the wait: {}",
+        rpc.message
+    );
+}
+
 #[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
@@ -2284,6 +2545,58 @@ async fn workspace_disk_usage_missing_id_is_minus_32602() {
 async fn workspace_disk_usage_not_found_maps_to_workspace_err() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.diskUsage","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Workspace not found")
+    );
+}
+
+/// `workspace.transfer.plan` wraps the service payload as `{ plan }` with the
+/// camelCase manifest/size fields (PROTOCOL §5.1).
+#[tokio::test]
+async fn workspace_transfer_plan_returns_plan_envelope() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    let plan = &v["result"]["plan"];
+    assert_eq!(plan["manifest"]["formatVersion"], serde_json::json!(1));
+    assert_eq!(plan["manifest"]["workspaceId"], serde_json::json!("ws-1"));
+    assert_eq!(
+        plan["manifest"]["tables"][0]["rowCount"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        plan["manifest"]["git"]["hasRepository"],
+        serde_json::json!(false)
+    );
+    assert_eq!(plan["totalSizeBytes"], serde_json::json!(100));
+    assert_eq!(plan["dbRowBytes"], serde_json::json!(100));
+    assert_eq!(plan["assetBytes"], serde_json::json!(0));
+    assert_eq!(plan["estimatedGitBundleBytes"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_missing_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("Missing required parameter: workspaceId")
+    );
+}
+
+#[tokio::test]
+async fn workspace_transfer_plan_not_found_maps_to_workspace_err() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();
@@ -2445,6 +2758,153 @@ async fn workspace_delete_returns_success_true() {
     assert_eq!(v["result"]["success"], serde_json::json!(true));
 }
 
+/// `undoDelayMs: 0` (and explicit `null`) keep the immediate-delete result
+/// byte-identical (§5.1): bare `{ success: true }`, no `scheduled`/`deleteAt`.
+#[tokio::test]
+async fn workspace_delete_zero_or_null_undo_delay_is_immediate() {
+    for params in [
+        r#"{"workspaceId":"ws-1","undoDelayMs":0}"#,
+        r#"{"workspaceId":"ws-1","undoDelayMs":null}"#,
+    ] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"], serde_json::json!({ "success": true }), "{v}");
+    }
+}
+
+/// `undoDelayMs > 0` schedules the grace window (§5.1): the result carries
+/// `scheduled: true` plus the ISO `deleteAt` deadline from the API.
+#[tokio::test]
+async fn workspace_delete_with_undo_delay_returns_scheduled_shape() {
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{"workspaceId":"ws-1","undoDelayMs":15000}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "deleteAt": "2026-01-01T00:00:15Z",
+        }),
+        "{v}"
+    );
+}
+
+/// A non-integer `undoDelayMs` is `-32602` (negative numbers and strings both
+/// fail `as_u64`).
+#[tokio::test]
+async fn workspace_delete_invalid_undo_delay_is_minus_32602() {
+    for bad in [r#""soon""#, "-1", "1.5", "true"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.delete","params":{{"workspaceId":"ws-1","undoDelayMs":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "undoDelayMs={bad}: {v}");
+    }
+}
+
+/// `workspace.cancelDelete` returns `{ cancelled: bool }` (§5.1): `true` when
+/// a pending deletion was cancelled, `false` otherwise — a non-error,
+/// race-safe outcome (never `-32602`/`-32603` for "nothing pending").
+#[tokio::test]
+async fn workspace_cancel_delete_returns_cancelled_flag() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.cancelDelete","params":{"workspaceId":"pending"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "cancelled": true }), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.cancelDelete","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "cancelled": false }),
+        "{v}"
+    );
+}
+
+/// `undoDelayMs: 0` (and explicit `null`) keep the immediate agent-delete
+/// result byte-identical (§5.5): bare `{ success: true }`, no
+/// `scheduled`/`deleteAt`.
+#[tokio::test]
+async fn agent_delete_zero_or_null_undo_delay_is_immediate() {
+    for params in [
+        r#"{"agentId":"agent-1","undoDelayMs":0}"#,
+        r#"{"agentId":"agent-1","undoDelayMs":null}"#,
+        r#"{"agentId":"agent-1"}"#,
+    ] {
+        let msg =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{params}}}"#);
+        let v = call(&msg).await.unwrap();
+        assert_eq!(v["result"], serde_json::json!({ "success": true }), "{v}");
+    }
+}
+
+/// `undoDelayMs > 0` schedules the agent delete grace window (§5.5): the
+/// result carries `scheduled: true` plus the ISO `deleteAt` deadline from
+/// the API.
+#[tokio::test]
+async fn agent_delete_with_undo_delay_returns_scheduled_shape() {
+    let msg = r#"{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{"agentId":"agent-1","undoDelayMs":15000}}"#;
+    let v = call(msg).await.unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "deleteAt": "2026-01-01T00:00:15Z",
+        }),
+        "{v}"
+    );
+}
+
+/// A non-integer `undoDelayMs` on `agent.delete` is `-32602` (negative
+/// numbers and strings both fail `as_u64`).
+#[tokio::test]
+async fn agent_delete_invalid_undo_delay_is_minus_32602() {
+    for bad in [r#""soon""#, "-1", "1.5", "true"] {
+        let msg = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"agent.delete","params":{{"agentId":"agent-1","undoDelayMs":{bad}}}}}"#
+        );
+        let v = call(&msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "undoDelayMs={bad}: {v}");
+    }
+}
+
+/// `agent.cancelDelete` returns `{ cancelled: bool }` (§5.5): `true` when a
+/// pending deletion was cancelled, `false` otherwise — a non-error, race-safe
+/// outcome (never `-32602`/`-32603` for "nothing pending"). `agentId` is
+/// required.
+#[tokio::test]
+async fn agent_cancel_delete_returns_cancelled_flag() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.cancelDelete","params":{"agentId":"agent-pending"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "cancelled": true }), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.cancelDelete","params":{"agentId":"agent-1","workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "cancelled": false }),
+        "{v}"
+    );
+
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"agent.cancelDelete","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+}
+
 /// `workspace.archive` and `workspace.unarchive` return the updated
 /// `workspace` record (§5.1) — a `{success:true}` shape would force a
 /// follow-up `workspace.get` on the FE. The `archived` flag flips through
@@ -2511,6 +2971,7 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
     for method in [
         "workspace.update",
         "workspace.delete",
+        "workspace.cancelDelete",
         "workspace.archive",
         "workspace.unarchive",
         "workspace.dismissAttention",
@@ -2728,6 +3189,11 @@ async fn note_create_wraps_note_with_title() {
     .await
     .unwrap();
     assert_eq!(v["result"]["note"]["title"], serde_json::json!("Hi"));
+    // Additive conversion fields over the old `{note}` shape.
+    assert_eq!(v["result"]["convertedCount"], serde_json::json!(0));
+    assert_eq!(v["result"]["createdTaskNoteIds"], serde_json::json!([]));
+    assert_eq!(v["result"]["createdTasks"], serde_json::json!([]));
+    assert_eq!(v["result"]["warnings"], serde_json::json!([]));
 }
 
 #[tokio::test]
@@ -3412,6 +3878,152 @@ async fn git_status_missing_workspace_id_is_minus_32602() {
 }
 
 #[tokio::test]
+async fn git_status_with_git_root_id_scopes_to_root() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("root-branch"));
+}
+
+#[tokio::test]
+async fn git_status_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_root_list_returns_git_roots_envelope() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    let roots = v["result"]["gitRoots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], serde_json::json!("root-1"));
+    assert_eq!(roots[0]["branch"], serde_json::json!("feature"));
+}
+
+#[tokio::test]
+async fn git_root_list_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("workspaceId is required")
+    );
+}
+
+#[tokio::test]
+async fn git_root_list_unknown_workspace_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"gitRoot.list","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn git_branch_status_git_root_id_resolves_repo_path() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"workspaceId":"ws-1","gitRootId":"root-1","branchName":"feature"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("feature"));
+    assert_eq!(v["result"]["isCurrentBranch"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn git_branch_status_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.branchStatus","params":{"workspaceId":"ws-1","gitRootId":"nope","branchName":"feature"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    // Identical message to the other five gitRootId-scoped reads (§5.6):
+    // the domain error maps through `domain_to_rpc`, which prefixes
+    // `invalid params:` exactly like the `git.status` arm above.
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_status_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.status","params":{"workspaceId":"ws-1","gitRootId":""}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["branch"], serde_json::json!("main"));
+}
+
+#[tokio::test]
+async fn git_commit_details_with_git_root_id_scopes_to_root() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"root-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commitHash"], serde_json::json!("abc123"));
+    assert_eq!(v["result"]["message"], serde_json::json!("root-commit"));
+    assert_eq!(v["result"]["files"], serde_json::json!(["root-only.txt"]));
+}
+
+#[tokio::test]
+async fn git_commit_details_without_git_root_id_targets_primary() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
+}
+
+#[tokio::test]
+async fn git_commit_details_unknown_git_root_id_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"nope"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: Unknown git root: nope")
+    );
+}
+
+#[tokio::test]
+async fn git_commit_details_empty_git_root_id_is_treated_as_absent() {
+    // §5.6: an empty/whitespace-only `gitRootId` reads as absent — the
+    // primary-worktree behavior, not an unknown-root error.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.commitDetails","params":{"workspaceId":"ws-1","commitHash":"abc123","gitRootId":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["message"], serde_json::json!("primary-commit"));
+}
+
+#[tokio::test]
 async fn git_stage_returns_ok_and_paths() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["src/a.ts","src/b.ts"]}}"#,
@@ -3701,6 +4313,43 @@ async fn repo_remove_routes_path_and_returns_removed_flag() {
 #[tokio::test]
 async fn repo_remove_requires_path_param() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.remove","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+}
+
+// ---- repo.warmCache (PROTOCOL §5.6) ------------------------------------
+
+#[tokio::test]
+async fn repo_warm_cache_routes_url_and_returns_started_shape() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{"githubUrl":"https://github.com/intent-hq/intentd"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "started": true, "owner": "intent-hq", "repo": "intentd" })
+    );
+}
+
+#[tokio::test]
+async fn repo_warm_cache_busy_maps_to_warm_in_flight_data() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{"githubUrl":"https://github.com/intent-hq/busy"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "warm-in-flight", "owner": "intent-hq", "repo": "other" })
+    );
+}
+
+#[tokio::test]
+async fn repo_warm_cache_requires_github_url_param() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"repo.warmCache","params":{}}"#)
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602);
@@ -4323,6 +4972,17 @@ async fn file_methods_dispatch_with_exact_wire_shapes() {
     assert_eq!(v["result"], serde_json::json!("ws-1:a.txt"));
     assert!(v["result"].is_string());
 
+    // file.readChunk → { content, bytesRead, size } with offset/length routed.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a.bin","offset":64,"length":32}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:a.bin:64:32", "bytesRead": 32, "size": 1000u64 })
+    );
+
     // file.write → { ok, path, size }.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a.txt","content":"hello"}}"#,
@@ -4435,6 +5095,20 @@ async fn file_methods_require_params() {
     // file.write missing content → -32602.
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"file.write","params":{"workspaceId":"ws-1","path":"a"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+
+    // file.readChunk missing offset / length → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{"workspaceId":"ws-1","path":"a","offset":0}}"#,
     )
     .await
     .unwrap();

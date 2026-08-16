@@ -214,9 +214,11 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -267,6 +269,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
         // Agent 1: will be resumed
         let session1 = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(agent_resume.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             backend_session_id: None,
@@ -295,6 +299,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             messages: vec![],
@@ -305,6 +310,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session1)
@@ -322,6 +328,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
         // Agent 2: will be abandoned
         let session2 = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(agent_abandon.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             backend_session_id: None,
@@ -350,6 +358,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             messages: vec![],
@@ -360,6 +369,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&session2)

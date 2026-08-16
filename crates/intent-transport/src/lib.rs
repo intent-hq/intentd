@@ -22,7 +22,7 @@ pub use host::{
     EditorTarget, ExternalOpener, NoopAppPicker, OpenExternalError, OpenInEditorError,
     OsEditorLauncher, OsOpener, PickApplicationError, ResolvedEditor,
 };
-pub use host_env::{detect_display_server, detect_has_display};
+pub use host_env::{detect_display_server, detect_has_display, local_hostname};
 #[cfg(windows)]
 pub use listener::pipe_name_for_socket_path;
 pub use listener::{derive_pipe_name, serve_uds, serve_uds_with_reverse};
@@ -34,7 +34,7 @@ pub use reverse::{
 };
 pub use router::handle_message;
 pub use rpc_limit::{RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
-pub use server::{PairingSnapshot, ServerPairingInfo};
+pub use server::{collect_local_ips, PairingSnapshot, ServerPairingInfo};
 pub use tls::{cert_fingerprint, ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
 pub use ws::{WsApiServer, WsOptions};
 
@@ -53,6 +53,7 @@ pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;
 mod client;
+mod conflate;
 mod conn;
 pub mod context;
 pub mod control;
@@ -73,4 +74,5 @@ pub mod rpc_limit;
 pub mod server;
 mod subscriptions;
 pub mod tls;
+pub mod tunnel;
 pub mod ws;

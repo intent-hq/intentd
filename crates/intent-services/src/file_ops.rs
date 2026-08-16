@@ -98,10 +98,20 @@ fn node_resolve(base: &str, rel: &str) -> PathBuf {
     normalize_lexical(&combined)
 }
 
-/// TS `isWithinWorkspace`: raw string prefix of the resolved path against the
-/// workspace root (an empty root matches everything, as in JS).
+/// TS `isWithinWorkspace`, hardened to a path-boundary check: the resolved
+/// path must BE the root or sit under it across a path separator — a raw
+/// string prefix would let `/tmp/ws-escape` pass for root `/tmp/ws`. An
+/// empty root matches everything (as in JS).
 fn is_within(root: &str, full: &Path) -> bool {
-    full.to_string_lossy().starts_with(root)
+    let root = root.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        return true;
+    }
+    let full = full.to_string_lossy();
+    match full.strip_prefix(root) {
+        Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'),
+        None => false,
+    }
 }
 
 /// Workspace-relative, forward-slash form of `path` for attribution rows:
@@ -131,11 +141,81 @@ fn io_err(e: std::io::Error) -> Error {
     Error::Internal(e.to_string())
 }
 
+/// Resolve an attachment-registry `stored_path` against the canonical root
+/// with the within-workspace guard — shared by the `getAttachment` copy path
+/// and the `getAttachmentInfo` exists-probe so a tampered row can never read
+/// or probe outside the store.
+pub(crate) fn resolve_attachment_source(
+    canonical_root: &str,
+    stored_path: &str,
+) -> Result<PathBuf> {
+    resolve_within(canonical_root, stored_path)
+}
+
 /// `file.read` → bare UTF-8 string.
 pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let content = std::fs::read_to_string(&full).map_err(io_err)?;
     Ok(Value::String(content))
+}
+
+/// Maximum bytes served per `file.readChunk` call BEFORE base64 encoding.
+/// Matches the transfer chunk cap ([`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`])
+/// so the ~21.4 MiB encoded frame stays comfortably under the 40 MiB
+/// outbound cap (PROTOCOL §1.3).
+pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+
+/// `file.readChunk` → `{ content (base64), bytesRead, size }` — one
+/// offset-windowed slice of a workspace file's raw bytes, the FE-ward
+/// binary counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
+/// intent-hq/monorepo#2458). `length` is capped at
+/// [`READ_CHUNK_MAX_BYTES`] decoded (over-cap → -32602); a read at/past
+/// EOF returns an empty chunk with `bytesRead: 0`; a short window at EOF
+/// returns just the remaining bytes. Directories are rejected as -32602;
+/// a missing file surfaces as -32603 per the existing file-op convention.
+///
+/// Unlike the TS-parity CWD fallback the string `file.*` ops keep, an
+/// empty root (unknown or pathless workspace) is rejected outright:
+/// [`is_within`] treats an empty root as matching every path, so falling
+/// through would let an arbitrary `workspaceId` + absolute path turn this
+/// endpoint into an unrestricted raw-byte file reader.
+pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Result<Value> {
+    use base64::Engine as _;
+    use std::io::{Read as _, Seek as _};
+
+    if root.is_empty() {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
+    }
+    if length == 0 {
+        return Err(Error::InvalidParams("length must be positive".to_string()));
+    }
+    if length > READ_CHUNK_MAX_BYTES as u64 {
+        return Err(Error::InvalidParams(format!(
+            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
+        )));
+    }
+    let full = resolve_within(root, path)?;
+    let md = std::fs::metadata(&full).map_err(io_err)?;
+    if md.is_dir() {
+        return Err(Error::InvalidParams(format!(
+            "path is a directory — file.readChunk serves regular files: {path}"
+        )));
+    }
+    let size = md.len();
+    let len = if offset >= size {
+        0
+    } else {
+        (size - offset).min(length) as usize
+    };
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        let mut file = std::fs::File::open(&full).map_err(io_err)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(io_err)?;
+        file.read_exact(&mut buf).map_err(io_err)?;
+    }
+    let content = base64::engine::general_purpose::STANDARD.encode(&buf);
+    Ok(json!({ "content": content, "bytesRead": len, "size": size }))
 }
 
 /// `file.write` → `{ ok, path, size }` (size = UTF-16 code-unit length, matching
@@ -153,7 +233,7 @@ pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
 /// Reduce a client-supplied attachment file name to a safe basename: keep
 /// only the final path component (either separator style), then drop any
 /// remaining `..`/`.`/empty outcome. `None` when nothing usable is left.
-fn sanitize_attachment_name(file_name: &str) -> Option<String> {
+pub(crate) fn sanitize_attachment_name(file_name: &str) -> Option<String> {
     let base = file_name
         .rsplit(['/', '\\'])
         .next()
@@ -202,6 +282,47 @@ pub(crate) fn place_attachment(
     let name = sanitize_attachment_name(file_name).ok_or_else(|| {
         Error::InvalidParams(format!("invalid attachment fileName: {file_name:?}"))
     })?;
+    // Classify a doomed `sourcePath` up front (before the directory and the
+    // destination name are claimed) so the caller gets an actionable -32602
+    // instead of an opaque -32603 "Internal error" from the copy step: a
+    // dragged FOLDER is the common real-world case, alongside a vanished or
+    // unreadable file (intent-hq/monorepo#2144).
+    if let AttachmentSource::CopyFrom(src) = &source {
+        match std::fs::metadata(src) {
+            Ok(md) if md.is_dir() => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is a directory — only individual files can be attached: {}",
+                    src.display()
+                )));
+            }
+            Ok(md) if !md.is_file() => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is not a regular file: {}",
+                    src.display()
+                )));
+            }
+            // `NotADirectory`: an intermediate path component is a file
+            // (e.g. `/tmp/file/child`) — client-invalid, same as NotFound.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath does not exist: {}",
+                    src.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(Error::InvalidParams(format!(
+                    "sourcePath is not readable by the daemon (permission denied): {}",
+                    src.display()
+                )));
+            }
+            // Any other stat outcome falls through to the copy below, whose
+            // error carries the I/O detail.
+            _ => {}
+        }
+    }
     let dir = resolve_within(root, ATTACHMENTS_DIR)?;
     std::fs::create_dir_all(&dir).map_err(io_err)?;
     // Belt-and-braces exclusion: an ignore-all `.gitignore` inside the
@@ -241,9 +362,28 @@ pub(crate) fn place_attachment(
             std::fs::write(&full, bytes).map_err(io_err)?;
             bytes.len() as u64
         }
+        // The stat above classified the common cases; this residual arm
+        // covers races (file replaced/removed between stat and copy) and
+        // genuine I/O failures.
         AttachmentSource::CopyFrom(src) => std::fs::copy(src, &full).map_err(|e| {
             let _ = std::fs::remove_file(&full);
-            Error::Internal(format!("Failed to read sourcePath {}: {e}", src.display()))
+            match e.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                    Error::InvalidParams(format!("sourcePath does not exist: {}", src.display()))
+                }
+                std::io::ErrorKind::PermissionDenied => Error::InvalidParams(format!(
+                    "sourcePath is not readable by the daemon (permission denied): {}",
+                    src.display()
+                )),
+                // `fs::copy` reports a non-regular-file source (e.g. the
+                // path swapped to a directory between stat and copy) as
+                // InvalidInput.
+                std::io::ErrorKind::InvalidInput => Error::InvalidParams(format!(
+                    "sourcePath is not a regular file: {}",
+                    src.display()
+                )),
+                _ => Error::Internal(format!("failed to copy sourcePath {}: {e}", src.display())),
+            }
         })?,
     };
     let rel = format!("{ATTACHMENTS_DIR}/{chosen}");
@@ -253,6 +393,87 @@ pub(crate) fn place_attachment(
         "fileName": chosen,
         "size": size,
     }))
+}
+
+/// MCP `ws.file.getAttachment` copy op (PROTOCOL §6.8): copy a registered
+/// attachment from the CANONICAL workspace store (`canonical_root` +
+/// `record.stored_path`) into the caller's working directory (`dest_root`,
+/// which is the sandbox clone for CoW-sandboxed callers) under `dest_dir`
+/// (default [`ATTACHMENTS_DIR`] — git-ignored by construction). Returns
+/// `{ path, fileName, mimeType?, size, uploadedAt }` with `path` relative to
+/// `dest_root`. The copy is skipped when the destination already holds an
+/// identical file (same size + bytes); a partial copy is removed on failure.
+///
+/// The deleted-from-disk case is a DISTINCT error from an unknown id (which
+/// the caller maps before reaching here): the registry row exists but the
+/// stored file is gone, so the error names the original `fileName` and
+/// `uploadedAt` and instructs the model to continue without the file rather
+/// than retry.
+pub(crate) fn get_attachment(
+    canonical_root: &str,
+    dest_root: &str,
+    record: &intent_store::AttachmentRecord,
+    dest_dir: Option<&str>,
+) -> Result<Value> {
+    if canonical_root.is_empty() || dest_root.is_empty() {
+        return Err(Error::Internal(
+            "workspace has no resolved filesystem root".to_string(),
+        ));
+    }
+    // Source side: the stored path must stay inside the canonical store —
+    // a tampered registry row must never read outside it.
+    let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
+    if !src.is_file() {
+        return Err(Error::Internal(format!(
+            "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
+             longer exists on disk. Continue without this file — do not retry the download.",
+            record.file_name, record.uploaded_at
+        )));
+    }
+    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
+    let dest_dir_full = resolve_within(dest_root, dir)?;
+    std::fs::create_dir_all(&dest_dir_full).map_err(io_err)?;
+    // Keep retrieved copies out of git tracking (same ignore-all marker
+    // `place_attachment` drops), whatever directory the caller picked.
+    let marker = dest_dir_full.join(".gitignore");
+    if !marker.exists() {
+        std::fs::write(&marker, "*\n").map_err(io_err)?;
+    }
+    // resolve_within on the joined relative path guards a crafted fileName.
+    let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
+    let dest = resolve_within(dest_root, &rel)?;
+    let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
+        (Ok(s), Ok(d)) if s.len() == d.len() => {
+            // Same size — confirm contents before skipping the copy.
+            matches!(
+                (std::fs::read(&src), std::fs::read(&dest)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        }
+        _ => false,
+    };
+    if !identical {
+        std::fs::copy(&src, &dest).map_err(|e| {
+            let _ = std::fs::remove_file(&dest);
+            Error::Internal(format!(
+                "failed to copy attachment \"{}\": {e}",
+                record.file_name
+            ))
+        })?;
+    }
+    let size = std::fs::metadata(&dest)
+        .map(|m| m.len())
+        .unwrap_or_default();
+    let mut result = json!({
+        "path": rel,
+        "fileName": record.file_name,
+        "size": size,
+        "uploadedAt": record.uploaded_at,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = json!(mime);
+    }
+    Ok(result)
 }
 
 /// `file.list` → bare array of `{ name, type }`. A nonexistent path is a
@@ -748,6 +969,94 @@ mod tests {
         assert!(matches!(stat(&root, "nope"), Err(Error::Internal(_))));
     }
 
+    fn decode_chunk(v: &Value) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(v["content"].as_str().expect("content is base64 string"))
+            .expect("valid base64")
+    }
+
+    #[test]
+    fn read_chunk_serves_offset_windows_and_eof_short_read() {
+        let t = TempRoot::new();
+        let root = t.root();
+        // Binary bytes (invalid UTF-8) — exactly what `file.read` rejects.
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(std::path::Path::new(&root).join("blob.bin"), &bytes).unwrap();
+
+        // Full read in one window.
+        let full = read_chunk(&root, "blob.bin", 0, 1024).unwrap();
+        assert_eq!(full["size"], json!(256u64));
+        assert_eq!(full["bytesRead"], json!(256));
+        assert_eq!(decode_chunk(&full), bytes);
+
+        // Interior window.
+        let mid = read_chunk(&root, "blob.bin", 100, 50).unwrap();
+        assert_eq!(mid["bytesRead"], json!(50));
+        assert_eq!(decode_chunk(&mid), &bytes[100..150]);
+
+        // Short read at EOF: window extends past the end → remaining bytes.
+        let tail = read_chunk(&root, "blob.bin", 250, 50).unwrap();
+        assert_eq!(tail["bytesRead"], json!(6));
+        assert_eq!(tail["size"], json!(256u64));
+        assert_eq!(decode_chunk(&tail), &bytes[250..]);
+
+        // Offset at/past EOF: empty chunk, not an error.
+        let past = read_chunk(&root, "blob.bin", 256, 16).unwrap();
+        assert_eq!(past["bytesRead"], json!(0));
+        assert_eq!(decode_chunk(&past), Vec::<u8>::new());
+        let far = read_chunk(&root, "blob.bin", 10_000, 16).unwrap();
+        assert_eq!(far["bytesRead"], json!(0));
+    }
+
+    #[test]
+    fn read_chunk_rejects_containment_directory_cap_and_zero_length() {
+        let t = TempRoot::new();
+        let root = t.root();
+        write(&root, "a.txt", "x").unwrap();
+        mkdir(&root, "dir").unwrap();
+
+        // Containment: same ACCESS_DENIED as the other file ops.
+        match read_chunk(&root, "../escape.bin", 0, 16) {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied, got {other:?}"),
+        }
+        // Directory → -32602 naming the cause.
+        match read_chunk(&root, "dir", 0, 16) {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("directory"), "unexpected message: {m}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Over-cap length → -32602 naming the cap.
+        match read_chunk(&root, "a.txt", 0, READ_CHUNK_MAX_BYTES as u64 + 1) {
+            Err(Error::InvalidParams(m)) => {
+                assert!(
+                    m.contains(&READ_CHUNK_MAX_BYTES.to_string()),
+                    "unexpected message: {m}"
+                )
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Zero length → -32602.
+        assert!(matches!(
+            read_chunk(&root, "a.txt", 0, 0),
+            Err(Error::InvalidParams(_))
+        ));
+        // Missing file → -32603 per the existing file-op convention.
+        assert!(matches!(
+            read_chunk(&root, "missing.bin", 0, 16),
+            Err(Error::Internal(_))
+        ));
+        // Empty root (unknown/pathless workspace) → ACCESS_DENIED, never the
+        // CWD fallback: an empty root passes is_within for every path, which
+        // would make this an unrestricted raw-byte reader for absolute paths.
+        match read_chunk("", "/etc/hostname", 0, 16) {
+            Err(Error::Internal(m)) => assert_eq!(m, ACCESS_DENIED),
+            other => panic!("expected access denied for empty root, got {other:?}"),
+        }
+    }
+
     fn place_bytes(root: &str, file_name: &str, bytes: &[u8]) -> Result<Value> {
         place_attachment(root, file_name, AttachmentSource::Bytes(bytes))
     }
@@ -850,13 +1159,76 @@ mod tests {
             std::fs::read(std::path::Path::new(&root).join(".intent/attachments/src.bin")).unwrap(),
             b"copied bytes"
         );
-        // A missing source fails without leaving the claimed placeholder behind.
+        // A missing source fails as classified InvalidParams (monorepo#2144)
+        // without leaving the claimed placeholder behind.
         let missing = std::path::Path::new(&root).join("nope.bin");
         let err = place_attachment(&root, "gone.bin", AttachmentSource::CopyFrom(&missing));
-        assert!(matches!(err, Err(Error::Internal(_))));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
         assert!(!std::path::Path::new(&root)
             .join(".intent/attachments/gone.bin")
             .exists());
+    }
+
+    /// Regression (monorepo#2144): a dragged FOLDER used to fail the copy step
+    /// with an opaque -32603 "Internal error"; it must be rejected up front as
+    /// InvalidParams naming the cause, with no placeholder left behind.
+    #[test]
+    fn place_attachment_copy_from_directory_is_classified() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let subdir = std::path::Path::new(&root).join("some-folder");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let err = place_attachment(&root, "some-folder", AttachmentSource::CopyFrom(&subdir));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("directory"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        assert!(!std::path::Path::new(&root)
+            .join(".intent/attachments/some-folder")
+            .exists());
+    }
+
+    /// An intermediate path component that is a file (e.g. `/tmp/file/child`)
+    /// stats as `NotADirectory` — classified as the same client-invalid
+    /// "does not exist" as a plain missing path, never `-32603 Internal`.
+    #[test]
+    fn place_attachment_copy_from_file_intermediate_component_is_classified() {
+        let t = TempRoot::new();
+        let root = t.root();
+        let file = std::path::Path::new(&root).join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let bogus = file.join("child.txt");
+        let err = place_attachment(&root, "child.txt", AttachmentSource::CopyFrom(&bogus));
+        match err {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("does not exist"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    /// A symlink to a regular file is accepted: `fs::metadata` follows links,
+    /// matching the Finder/Explorer drag behavior for aliased files.
+    #[cfg(unix)]
+    #[test]
+    fn place_attachment_copy_from_symlink_to_file() {
+        use std::os::unix::fs::symlink;
+        let t = TempRoot::new();
+        let root = t.root();
+        let target = std::path::Path::new(&root).join("real.txt");
+        std::fs::write(&target, b"linked").unwrap();
+        let link = std::path::Path::new(&root).join("alias.txt");
+        symlink(&target, &link).unwrap();
+        let r = place_attachment(&root, "alias.txt", AttachmentSource::CopyFrom(&link)).unwrap();
+        assert_eq!(r["fileName"], json!("alias.txt"));
+        assert_eq!(r["size"], json!(6));
     }
 
     #[cfg(unix)]

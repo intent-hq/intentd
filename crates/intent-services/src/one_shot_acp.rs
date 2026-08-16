@@ -33,8 +33,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::acp_adapter::{
-    exited_detail, initialize_params, observe_exit_status, reap_child, spawn_adapter,
-    AcpAdapterCommand,
+    adapter_slots, exited_detail, initialize_params, observe_exit_status, reap_child,
+    spawn_adapter_in, AcpAdapterCommand, AdapterSlots, SpawnError,
 };
 
 /// The one-shot launch description (shared with the model probe).
@@ -44,6 +44,10 @@ pub(crate) use crate::acp_adapter::AcpAdapterCommand as OneShotCommand;
 /// `agent.completeOnce` contract (`{ available: false, reason }` vs an error).
 #[derive(Debug)]
 pub(crate) enum OneShotError {
+    /// The caller's timeout expired while queued for a slot in the daemon-wide
+    /// adapter bound — nothing was ever spawned, and no model was ever asked
+    /// (monorepo#2062).
+    QueueTimeout { waited_ms: u64, limit: u32 },
     /// The adapter process could not be spawned.
     Spawn(String),
     /// A request failed at the transport level or timed out.
@@ -64,6 +68,11 @@ pub(crate) enum OneShotError {
 impl std::fmt::Display for OneShotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OneShotError::QueueTimeout { waited_ms, limit } => write!(
+                f,
+                "timed out after {waited_ms}ms waiting for a free adapter slot \
+                 (limit {limit}); no completion was started"
+            ),
             OneShotError::Spawn(e) => write!(f, "failed to spawn adapter: {e}"),
             OneShotError::Transport(e) => write!(f, "one-shot transport failed: {e}"),
             OneShotError::Rpc(e) => write!(f, "adapter returned an error: {e}"),
@@ -77,20 +86,58 @@ impl std::fmt::Display for OneShotError {
     }
 }
 
-/// Run one ephemeral ACP completion: spawn `cmd`, drive the turn with
-/// `prompt` as a single text content block, and return the concatenated
-/// assistant text. `prompt_timeout` bounds only the `session/prompt` phase —
-/// setup uses the launch's npx-aware staged budgets. `config_option_model`,
-/// when set, is applied best-effort after `session/new` via
-/// `session/set_config_option` (a failure never fails the completion). The
-/// child is reaped before returning on every path.
+/// Run one ephemeral ACP completion: claim a slot in the daemon-wide adapter
+/// bound, spawn `cmd`, drive the turn with `prompt` as a single text content
+/// block, and return the concatenated assistant text. `prompt_timeout` bounds
+/// two independent phases: the wait for a slot, and then the
+/// `session/prompt` phase — setup uses the launch's npx-aware staged budgets,
+/// as before. `config_option_model`, when set, is applied best-effort after
+/// `session/new` via `session/set_config_option` (a failure never fails the
+/// completion). The child is reaped before returning on every path.
+///
+/// Reusing the caller's own timeout as the queue budget keeps the contract
+/// legible — you wait for a slot at most as long as you were willing to wait
+/// for a reply — and a caller that never gets one fails with
+/// [`OneShotError::QueueTimeout`], never a hang and never something a client
+/// could mistake for a slow model.
 pub(crate) async fn run_one_shot_acp(
     cmd: OneShotCommand,
     prompt: &str,
     config_option_model: Option<&str>,
     prompt_timeout: Duration,
 ) -> Result<String, OneShotError> {
-    let mut adapter = spawn_adapter(&cmd).map_err(OneShotError::Spawn)?;
+    run_one_shot_acp_in(
+        adapter_slots(),
+        cmd,
+        prompt,
+        config_option_model,
+        prompt_timeout,
+    )
+    .await
+}
+
+/// [`run_one_shot_acp`] against a caller-supplied adapter bound instead of the
+/// process-global one. Production always goes through [`run_one_shot_acp`];
+/// this seam lets a test with a deliberately short prompt budget run against a
+/// private [`AdapterSlots`], so slot pressure from sibling tests sharing the
+/// global bound cannot turn its asserted failure into a queue timeout
+/// (monorepo#2379).
+pub(crate) async fn run_one_shot_acp_in(
+    slots: &AdapterSlots,
+    cmd: OneShotCommand,
+    prompt: &str,
+    config_option_model: Option<&str>,
+    prompt_timeout: Duration,
+) -> Result<String, OneShotError> {
+    let mut adapter = spawn_adapter_in(slots, &cmd, prompt_timeout)
+        .await
+        .map_err(|e| match e {
+            SpawnError::QueueTimeout { waited, limit } => OneShotError::QueueTimeout {
+                waited_ms: waited.as_millis() as u64,
+                limit,
+            },
+            SpawnError::Spawn(detail) => OneShotError::Spawn(detail),
+        })?;
 
     let result = drive_one_shot(
         &adapter.conn,
@@ -337,13 +384,17 @@ async fn auto_respond(conn: &Connection, req: IncomingRequest) {
 /// exited before the turn completed, report the exit status plus a bounded
 /// stderr tail instead of a generic transport/timeout/empty reason. Spawn and
 /// RPC errors pass through untouched (auth detection keys off `Rpc`), as do
-/// clean exits.
+/// clean exits and a queue timeout (which never spawned a child to attribute
+/// an exit to).
 async fn attribute_early_exit(
     err: OneShotError,
     child: &mut tokio::process::Child,
     conn: &Connection,
 ) -> OneShotError {
-    if matches!(err, OneShotError::Spawn(_) | OneShotError::Rpc(_)) {
+    if matches!(
+        err,
+        OneShotError::Spawn(_) | OneShotError::Rpc(_) | OneShotError::QueueTimeout { .. }
+    ) {
         return err;
     }
     let status = observe_exit_status(child, conn).await;

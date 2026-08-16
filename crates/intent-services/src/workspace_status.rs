@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use intent_core::events::WORKSPACE_DISPLAY_STATUS_CHANGED;
+use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
 use intent_core::{
     now_iso, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
     WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
@@ -28,13 +28,14 @@ use intent_store::NewEvent;
 
 use crate::{compute_task_stats, publish_event, system_actor, Services};
 
-/// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5): the
-/// recompute-and-compare seam behind
-/// [`Services::maybe_emit_display_status_changed`]. A mutation that can move
-/// the derivation recomputes it and publishes
-/// `workspace:displayStatus-changed` only on an actual transition, so no-op
-/// recomputes never spam the bus. Seeded lazily (first recompute after a
-/// mutation, or an emit-path enrichment) — a first observation records
+/// Last-observed derived value per workspace: the recompute-and-compare seam
+/// behind [`Services::maybe_emit_display_status_changed`] (as
+/// [`DisplayStatusCache`], PROTOCOL §6.5) and
+/// [`Services::maybe_emit_waiting_changed`] (as [`WaitingStatusCache`],
+/// §5.1). A mutation that can move the derivation recomputes it and
+/// publishes the matching change event only on an actual transition, so
+/// no-op recomputes never spam the bus. Seeded lazily (first recompute after
+/// a mutation, or an emit-path enrichment) — a first observation records
 /// without emitting. In-memory only; a daemon restart re-seeds on first
 /// touch. Shared across clones (behind `Arc`) so every service handle
 /// compares against the same last-emitted value. The map is private to this
@@ -45,22 +46,35 @@ use crate::{compute_task_stats, publish_event, system_actor, Services};
 /// between, and the late write would resurrect a baseline for the deleted id
 /// (a leaked entry, and a stale comparison for an importer re-insert of the
 /// same id). Guard: `evictions` counts evictions under the same lock; writers
-/// snapshot it via [`DisplayStatusCache::generation`] *before* their store
+/// snapshot it via [`LastObservedCache::generation`] *before* their store
 /// reads and their write is dropped when the counter moved and no entry
 /// survived for the id (an entry that still exists was not evicted — or was
 /// legitimately re-seeded — so the write proceeds). A dropped write is always
 /// safe: the next transition recomputes from fresh state.
-#[derive(Default)]
-pub(crate) struct DisplayStatusCache(Mutex<CacheInner>);
+pub(crate) struct LastObservedCache<T>(Mutex<CacheInner<T>>);
 
-#[derive(Default)]
-struct CacheInner {
-    map: HashMap<WorkspaceId, WorkspaceDisplayStatus>,
+/// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5).
+pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
+
+/// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
+pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
+
+struct CacheInner<T> {
+    map: HashMap<WorkspaceId, T>,
     /// Total evictions since startup; see the eviction-race guard above.
     evictions: u64,
 }
 
-impl DisplayStatusCache {
+impl<T> Default for LastObservedCache<T> {
+    fn default() -> Self {
+        Self(Mutex::new(CacheInner {
+            map: HashMap::new(),
+            evictions: 0,
+        }))
+    }
+}
+
+impl<T: Copy + PartialEq> LastObservedCache<T> {
     /// Snapshot the eviction generation. Writers capture this *before* their
     /// store reads and pass it back to [`seed`](Self::seed) /
     /// [`record`](Self::record), which drop the write when an eviction
@@ -75,34 +89,29 @@ impl DisplayStatusCache {
     /// mutation compares against it. `generation` is the pre-read snapshot;
     /// a stale seed for an id with no surviving entry is dropped (eviction
     /// race, see the type docs). Best-effort — a poisoned lock is ignored.
-    fn seed(&self, workspace_id: &WorkspaceId, status: WorkspaceDisplayStatus, generation: u64) {
+    fn seed(&self, workspace_id: &WorkspaceId, value: T, generation: u64) {
         if let Ok(mut inner) = self.0.lock() {
             if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
                 return;
             }
-            inner.map.entry(workspace_id.clone()).or_insert(status);
+            inner.map.entry(workspace_id.clone()).or_insert(value);
         }
     }
 
-    /// Record `status` and report whether it transitioned since the last
+    /// Record `value` and report whether it transitioned since the last
     /// observation: `Some(false)` on a first observation (a seed has no
     /// baseline to transition from), `None` on a poisoned lock or when the
     /// write was dropped by the eviction-race guard (the caller skips
     /// emission). `generation` is the pre-read snapshot from
     /// [`generation`](Self::generation).
-    fn record(
-        &self,
-        workspace_id: &WorkspaceId,
-        status: WorkspaceDisplayStatus,
-        generation: u64,
-    ) -> Option<bool> {
+    fn record(&self, workspace_id: &WorkspaceId, value: T, generation: u64) -> Option<bool> {
         match self.0.lock() {
             Ok(mut inner) => {
                 if inner.evictions != generation && !inner.map.contains_key(workspace_id) {
                     return None;
                 }
-                Some(match inner.map.insert(workspace_id.clone(), status) {
-                    Some(previous) => previous != status,
+                Some(match inner.map.insert(workspace_id.clone(), value) {
+                    Some(previous) => previous != value,
                     None => false,
                 })
             }
@@ -121,6 +130,15 @@ impl DisplayStatusCache {
             inner.map.remove(workspace_id);
             inner.evictions += 1;
         }
+    }
+
+    /// Read the last-observed baseline for `workspace_id`, when one exists.
+    /// Best-effort — a poisoned lock reads as no baseline.
+    fn get(&self, workspace_id: &WorkspaceId) -> Option<T> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|inner| inner.map.get(workspace_id).copied())
     }
 
     /// Test-only visibility into whether a baseline exists for `workspace_id`.
@@ -146,6 +164,28 @@ impl Services {
     /// this baseline (a seed never emits; see
     /// [`Services::maybe_emit_display_status_changed`]).
     pub(crate) async fn enrich_display_status(&self, ws: &mut Workspace) {
+        // The orthogonal `waiting` flag rides the same emit path but is
+        // independent of the `taskStats` gate below: it is populated even
+        // when a transient notes-read failure leaves `displayStatus` absent.
+        // Served from the last-observed cache (rung 1 of the derived-field
+        // ladder: the hook/monitor/watch mutation choke points keep it
+        // current via [`Services::maybe_emit_waiting_changed`], so hot
+        // list/get reads cost one in-memory lookup, no per-row store
+        // fan-out); only a cache miss — first touch after startup — probes
+        // the store and seeds the `workspace:waiting-changed` baseline.
+        ws.waiting = match self.last_waiting_statuses.get(&ws.id) {
+            Some(waiting) => waiting,
+            None => {
+                // Pre-read generation snapshot: a `workspace.delete`
+                // eviction racing the probe must not have this seed
+                // resurrect the baseline.
+                let waiting_generation = self.last_waiting_statuses.generation();
+                let waiting = self.workspace_is_waiting(&ws.id).await;
+                self.last_waiting_statuses
+                    .seed(&ws.id, waiting, waiting_generation);
+                waiting
+            }
+        };
         if ws.task_stats.is_none() {
             return;
         }
@@ -154,16 +194,12 @@ impl Services {
         let generation = self.last_display_statuses.generation();
         // Derive from the row's own `activity` (set by every caller just
         // before enrichment) so a single response can never pair
-        // `activity: "agent_running"` with `displayStatus: "idle"`.
-        // Active background hooks and PR monitors fold into the promotion
-        // (§6.5): an idle agent still watching via a hook or a PR monitor
-        // reads as active work.
+        // `activity: "agent_running"` with `displayStatus: "idle"`. Wait
+        // signals (hooks/monitors/subscriptions) no longer fold into the
+        // promotion — they surface as the orthogonal `waiting` flag above.
         let display_status = compute_display_status(
             self.workspace_attention_signals(&ws.id, ws.attention).await,
-            ws.activity == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(&ws.id).await
-                || self.workspace_has_active_pr_monitors(&ws.id).await
-                || self.workspace_has_waiting_agent_subscriptions(&ws.id).await,
+            ws.activity == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -172,6 +208,23 @@ impl Services {
         self.last_display_statuses
             .seed(&ws.id, display_status, generation);
         ws.display_status = Some(display_status);
+    }
+
+    /// The orthogonal wait probe behind `Workspace.waiting` (§5.1): true when
+    /// the workspace has any of ACTIVE background hooks, ACTIVE PR monitors,
+    /// or waiting agent subscriptions (undelivered child completion watches
+    /// held by top-level foreground agents — agent-owned `event.subscribe`
+    /// registrations deliberately do NOT count: they watch in-workspace
+    /// activity, not an external condition, matching the documented v6.17
+    /// signal set). Short-circuits on the first live signal;
+    /// best-effort/fail-open like the probes it reuses (a store read
+    /// failure reads `false`, never wedges list/get emission).
+    pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
+        self.workspace_has_active_hooks(workspace_id).await
+            || self.workspace_has_active_pr_monitors(workspace_id).await
+            || self
+                .workspace_has_waiting_agent_subscriptions(workspace_id)
+                .await
     }
 
     /// Recompute a workspace's derived `displayStatus` and publish
@@ -207,14 +260,13 @@ impl Services {
         let signals = self
             .workspace_attention_signals(workspace_id, ws.attention)
             .await;
+        // Wait signals (hooks/monitors/subscriptions) do not fold into the
+        // promotion — they surface as the orthogonal `waiting` flag on the
+        // read paths ([`Services::workspace_is_waiting`]); only a live agent
+        // turn promotes here.
         let status = compute_display_status(
             signals,
-            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning
-                || self.workspace_has_active_hooks(workspace_id).await
-                || self.workspace_has_active_pr_monitors(workspace_id).await
-                || self
-                    .workspace_has_waiting_agent_subscriptions(workspace_id)
-                    .await,
+            self.workspace_activity(workspace_id) == WorkspaceActivity::AgentRunning,
             ws.active_pull_request.as_ref(),
             ws.pull_requests.as_deref().unwrap_or_default(),
             ws.pr_status,
@@ -235,9 +287,58 @@ impl Services {
         }
     }
 
-    /// Evict a deleted workspace's last-observed baseline (G7): called from
-    /// `workspace.delete` after the store cascade so the in-memory map does
-    /// not leak entries for the daemon's lifetime. Bumps the cache's eviction
+    /// Recompute a workspace's orthogonal `waiting` flag and publish
+    /// `workspace:waiting-changed` iff it transitioned since the last
+    /// observation (PROTOCOL §5.1 / §6.5). Called after the lifecycle transitions
+    /// that can move the derivation — hook create/dispatch/cancel/evict/
+    /// expire, PR monitor register/complete/cancel, completion-watch
+    /// register/retire/settlement/cancel — never from a polling loop. Same
+    /// contract as [`Services::maybe_emit_display_status_changed`]: the
+    /// first observation seeds without emitting, a workspace-read failure
+    /// (deleted workspace) skips the recompute entirely, and the whole path
+    /// is best-effort — the mutation's own result is the contract. The wait
+    /// probe itself fails open to `false` on store errors, which the dedup
+    /// baseline absorbs: a transient flap emits at most one pair of
+    /// transitions, and the next recompute converges on truth.
+    pub(crate) async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
+        // Chief is a fixed virtual workspace synthesized on read
+        // (`workspace.get` returns `chief_workspace()` before enrichment and
+        // `workspace.list` excludes it), so its rows can never carry
+        // `waiting` — never emit a transition its re-read cannot confirm.
+        // Chief-anchored completion watches are deliberately invisible here.
+        if workspace_id.is_chief() {
+            return;
+        }
+        // Pre-read generation snapshot: an eviction (workspace.delete)
+        // landing between the reads below and the cache write must drop
+        // this compute rather than re-insert a baseline for the deleted id
+        // (see the `LastObservedCache` docs).
+        let generation = self.last_waiting_statuses.generation();
+        // Deleted-workspace guard: the wait probes read hook/monitor rows
+        // directly, so without this read a post-delete recompute could
+        // fabricate a baseline for a gone workspace.
+        if self.store.get_workspace(workspace_id).await.is_err() {
+            return;
+        }
+        let waiting = self.workspace_is_waiting(workspace_id).await;
+        let Some(transitioned) =
+            self.last_waiting_statuses
+                .record(workspace_id, waiting, generation)
+        else {
+            return;
+        };
+        if transitioned {
+            publish_event(
+                &self.event_bus,
+                waiting_changed_event(workspace_id, waiting),
+            )
+            .await;
+        }
+    }
+
+    /// Evict a deleted workspace's last-observed baselines (G7): called from
+    /// `workspace.delete` after the store cascade so the in-memory maps do
+    /// not leak entries for the daemon's lifetime. Bumps each cache's eviction
     /// generation, so a recompute that read the workspace before the cascade
     /// drops its late write instead of resurrecting the baseline. Workspace
     /// ids are never recycled by `workspace.create` (tombstoned via
@@ -245,6 +346,7 @@ impl Services {
     /// come from such a late write — which the generation guard prevents.
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
+        self.last_waiting_statuses.evict(workspace_id);
     }
 
     /// Recompute after a spec-body write. The spec's markdown gates
@@ -276,15 +378,16 @@ impl Services {
     ///   dismissed, so a question the user walked away from keeps the
     ///   workspace flagged across the agent's later turns and daemon
     ///   restarts), or the workspace `attention` flag at `review_required`.
-    /// - `unread` — the workspace `attention` flag at `unread`.
     ///
+    /// The `unread` workspace attention flag never feeds the signals — it
+    /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
     /// the parent/subscriber (attention-retire taxonomy). The cheap metadata
     /// checks run over every candidate first, so the per-session hold reads
     /// only happen when `needs_attention` is still undecided. Best-effort: a
     /// store read failure fails open — session-derived signals read `false`
     /// (and `question_hold_active` fails open itself) so list/get emission
-    /// is never wedged; the flag-derived signals need no store read.
+    /// is never wedged; the flag-derived signal needs no store read.
     pub(crate) async fn workspace_attention_signals(
         &self,
         workspace_id: &WorkspaceId,
@@ -292,7 +395,6 @@ impl Services {
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
             needs_attention: attention == WorkspaceAttention::ReviewRequired,
-            unread: attention == WorkspaceAttention::Unread,
             ..AttentionSignals::default()
         };
         let Ok(sessions) = self.store.list_agent_session_summaries(workspace_id).await else {
@@ -331,7 +433,7 @@ impl Services {
 /// Attention-axis inputs to [`compute_display_status`], probed by
 /// [`Services::workspace_attention_signals`]. Each field is one canonical
 /// precedence rung (§6.5): `failed` > `blocked` > `needs_attention` >
-/// (running agent) > `unread` > the PR/task rollup.
+/// (running agent) > the PR/task rollup.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AttentionSignals {
     /// A top-level non-background agent is parked in `error`.
@@ -341,9 +443,6 @@ pub(crate) struct AttentionSignals {
     /// A top-level pending `discussion` request, pending structured
     /// questions, or the `review_required` workspace attention flag.
     pub(crate) needs_attention: bool,
-    /// The `unread` workspace attention flag; promotes only over the
-    /// idle/terminal bases (`idle` / `complete` / `pr_merged`).
-    pub(crate) unread: bool,
 }
 
 /// Derive a workspace's `displayStatus` (canonical precedence, spec
@@ -358,11 +457,11 @@ pub(crate) struct AttentionSignals {
 ///    the user (discussion request or pending structured questions) or the
 ///    `review_required` workspace attention flag — outranks a running agent.
 /// 3. `agent_running` → `in_progress`: a live agent always reads as active
-///    work, whatever the PR/task rollup says. Callers fold active-hook and
-///    active-PR-monitor state into this flag
-///    ([`Services::workspace_has_active_hooks`] /
-///    [`Services::workspace_has_active_pr_monitors`]) so an idle agent
-///    still watching via a background hook or a PR monitor reads the same.
+///    work, whatever the PR/task rollup says. Wait signals (active hooks,
+///    active PR monitors, waiting agent subscriptions) do NOT fold in — an
+///    idle workspace watching an external condition keeps its base rollup
+///    and surfaces the orthogonal `Workspace.waiting` flag instead
+///    ([`Services::workspace_is_waiting`]).
 /// 4. Active PR — the linked `activePullRequest` when open/draft, else the
 ///    most recently updated open/draft entry in `pullRequests` — yields
 ///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
@@ -378,12 +477,11 @@ pub(crate) struct AttentionSignals {
 /// 8. Without a running agent, a task-stage rollup (`in_progress` /
 ///    `not_started` from steps 5/7) demotes to `idle`; the PR stages and
 ///    `complete` pass through unchanged.
-/// 9. `unread` promotes an idle/terminal base — `idle` (including the
-///    demoted task stages), `complete`, or `pr_merged` — to `unread`; it
-///    never masks the active PR stages (`pr_ready`/`pr_open`).
 ///
-/// A merged PR in history never masks an open PR (step 4 scans `pullRequests`
-/// for open/draft entries) or open tasks (step 5 precedes the merged check).
+/// The dismissible `unread` workspace attention flag (§9.9) never feeds the
+/// derivation. A merged PR in history never masks an open PR (step 4 scans
+/// `pullRequests` for open/draft entries) or open tasks (step 5 precedes
+/// the merged check).
 fn compute_display_status(
     signals: AttentionSignals,
     agent_running: bool,
@@ -404,23 +502,12 @@ fn compute_display_status(
     if agent_running {
         return WorkspaceDisplayStatus::InProgress;
     }
-    let base = match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
+    match compute_base_display_status(active_pr, pull_requests, pr_status, task_stats) {
         WorkspaceDisplayStatus::InProgress | WorkspaceDisplayStatus::NotStarted => {
             WorkspaceDisplayStatus::Idle
         }
         other => other,
-    };
-    if signals.unread
-        && matches!(
-            base,
-            WorkspaceDisplayStatus::Idle
-                | WorkspaceDisplayStatus::Complete
-                | WorkspaceDisplayStatus::PrMerged
-        )
-    {
-        return WorkspaceDisplayStatus::Unread;
     }
-    base
 }
 
 /// PR/task-only precedence behind [`compute_display_status`] (steps 2–5);
@@ -508,10 +595,30 @@ fn display_status_changed_event(
     }
 }
 
+/// Build a `workspace:waiting-changed` change event with the self-sufficient
+/// payload `{ workspaceId, waiting }` (PROTOCOL §6.5 / §6.7). Private to
+/// this module: the only emitter is
+/// [`Services::maybe_emit_waiting_changed`].
+fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_WAITING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "waiting": waiting,
+        }),
+    }
+}
+
 /// Unit tests for the pure `compute_display_status` derivation (canonical
 /// precedence): failed → blocked → needs_attention → running agent →
-/// (unread over idle/terminal bases) → active/latest open PR → open tasks →
-/// merged PR → complete/not_started.
+/// active/latest open PR → open tasks → merged PR → complete/not_started.
 #[cfg(test)]
 mod display_status {
     use intent_core::{
@@ -538,13 +645,6 @@ mod display_status {
     fn blocked() -> AttentionSignals {
         AttentionSignals {
             blocked: true,
-            ..AttentionSignals::default()
-        }
-    }
-
-    fn unread() -> AttentionSignals {
-        AttentionSignals {
-            unread: true,
             ..AttentionSignals::default()
         }
     }
@@ -717,8 +817,8 @@ mod display_status {
 
     #[test]
     fn failed_and_blocked_win_over_everything_below() {
-        // failed/blocked outrank a running agent, every PR stage, every task
-        // rollup, and the unread flag.
+        // failed/blocked outrank a running agent, every PR stage, and every
+        // task rollup.
         let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         ready.mergeable = Some(true);
         for (signals, expected) in [
@@ -737,98 +837,19 @@ mod display_status {
                 compute_display_status(signals, false, None, &[], None, Some(&stats(3, 3, 0))),
                 expected
             );
-            let with_unread = AttentionSignals {
-                unread: true,
-                ..signals
-            };
-            assert_eq!(
-                compute_display_status(with_unread, false, None, &[], None, None),
-                expected
-            );
         }
     }
 
     #[test]
-    fn needs_attention_outranks_running_agent_and_unread() {
-        // Precedence boundary: needs_attention > in_progress (running agent)
-        // and needs_attention > unread.
-        let both = AttentionSignals {
-            needs_attention: true,
-            unread: true,
-            ..AttentionSignals::default()
-        };
+    fn needs_attention_outranks_running_agent() {
+        // Precedence boundary: needs_attention > in_progress (running agent).
         assert_eq!(
-            compute_display_status(both, true, None, &[], None, None),
+            compute_display_status(sig(true), true, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
         );
         assert_eq!(
-            compute_display_status(both, false, None, &[], None, None),
+            compute_display_status(sig(true), false, None, &[], None, None),
             WorkspaceDisplayStatus::NeedsAttention
-        );
-    }
-
-    #[test]
-    fn running_agent_outranks_unread() {
-        // Precedence boundary: in_progress > unread — a live agent masks the
-        // unread flag (active work, nothing "unseen" to surface yet).
-        assert_eq!(
-            compute_display_status(unread(), true, None, &[], None, None),
-            WorkspaceDisplayStatus::InProgress
-        );
-        assert_eq!(
-            compute_display_status(unread(), true, None, &[], None, Some(&stats(3, 3, 0))),
-            WorkspaceDisplayStatus::InProgress
-        );
-    }
-
-    #[test]
-    fn unread_promotes_only_idle_and_terminal_bases() {
-        // unread promotes idle (no PR/tasks), the demoted task stages,
-        // complete, and pr_merged.
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, None),
-            WorkspaceDisplayStatus::Unread
-        );
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 1, 1))),
-            WorkspaceDisplayStatus::Unread
-        );
-        assert_eq!(
-            compute_display_status(unread(), false, None, &[], None, Some(&stats(3, 3, 0))),
-            WorkspaceDisplayStatus::Unread
-        );
-        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&merged), &[], None, None),
-            WorkspaceDisplayStatus::Unread
-        );
-    }
-
-    #[test]
-    fn unread_never_masks_active_pr_stages() {
-        // unread does NOT promote over pr_open / pr_ready — an active PR
-        // stage is actionable state that outranks the blue dot.
-        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&open), &[], None, None),
-            WorkspaceDisplayStatus::PrOpen
-        );
-        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
-        ready.mergeable = Some(true);
-        assert_eq!(
-            compute_display_status(unread(), false, Some(&ready), &[], None, None),
-            WorkspaceDisplayStatus::PrReady
-        );
-        assert_eq!(
-            compute_display_status(
-                unread(),
-                false,
-                None,
-                &[],
-                Some(PullRequestStatus::Open),
-                None
-            ),
-            WorkspaceDisplayStatus::PrOpen
         );
     }
 
@@ -1159,8 +1180,8 @@ mod display_status {
 /// parent, not background, not deleted) carries a pending discussion request
 /// or pending structured questions (or the workspace flag is
 /// `review_required`); `blocked` iff one carries a pending blocker request;
-/// `failed` iff one is parked in `error`; `unread` mirrors the workspace
-/// flag. Child/background/deleted sessions never count.
+/// `failed` iff one is parked in `error`. The `unread` workspace flag never
+/// feeds the signals. Child/background/deleted sessions never count.
 #[cfg(test)]
 mod workspace_needs_attention {
     use intent_core::{
@@ -1182,6 +1203,8 @@ mod workspace_needs_attention {
     pub(super) fn mk_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -1210,6 +1233,7 @@ mod workspace_needs_attention {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -1220,6 +1244,7 @@ mod workspace_needs_attention {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -1295,19 +1320,18 @@ mod workspace_needs_attention {
 
     #[tokio::test]
     async fn workspace_attention_flag_maps_to_axes() {
-        // review_required → needs_attention; unread → unread. Both are
-        // flag-only signals: no sessions required.
+        // review_required → needs_attention (flag-only signal: no sessions
+        // required); unread feeds nothing — the flag is not a displayStatus
+        // axis.
         let (svc, ws, _tmp) = setup().await;
         let s = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
             .await;
         assert!(s.needs_attention);
-        assert!(!s.unread);
         let s = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
             .await;
-        assert!(s.unread);
-        assert!(!s.needs_attention);
+        assert_eq!(s, AttentionSignals::default());
     }
 
     #[tokio::test]
@@ -1411,9 +1435,12 @@ mod workspace_needs_attention {
             .expect("drop agent_session table");
         assert_eq!(signals(&svc, &ws).await, AttentionSignals::default());
         let s = svc
-            .workspace_attention_signals(&ws, WorkspaceAttention::Unread)
+            .workspace_attention_signals(&ws, WorkspaceAttention::ReviewRequired)
             .await;
-        assert!(s.unread, "flag-derived axes survive a store read failure");
+        assert!(
+            s.needs_attention,
+            "flag-derived axes survive a store read failure"
+        );
     }
 }
 
@@ -2525,38 +2552,47 @@ mod display_status_events {
         );
     }
 
-    /// Unread flag triggers (§6.5 step 9): `raise_attention(Unread)` (the
-    /// turn-end blue dot) promotes an idle base to `unread` and emits;
-    /// `workspace.markSeen` retires the flag and emits the demotion.
+    /// Regression: the `unread` flag is not a displayStatus axis. A turn-end
+    /// `raise_attention(Unread)` on an idle workspace and the later
+    /// `workspace.markSeen` both leave the derived rollup at `idle` — no
+    /// `workspace:displayStatus-changed` — while the flag's own
+    /// `workspace:attention-changed` events still fire on raise and clear.
     #[tokio::test]
-    async fn unread_raise_and_mark_seen_transitions_emit() {
+    async fn unread_raise_and_mark_seen_never_move_display_status() {
         let h = harness().await;
         // Seed: idle baseline (no agents, no PR, no tasks).
         h.services.maybe_emit_display_status_changed(&h.ws).await;
 
         let mut sub = subscribe(&h);
+        let mut attn_sub = h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        });
         h.services
             .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
             .await
             .expect("raise unread");
-        let ev = recv_one(&mut sub).await;
-        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_silent(&mut sub).await;
+        let ev = recv_one(&mut attn_sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "unread" })
+            json!({ "workspaceId": h.ws.0, "attention": "unread" })
         );
 
         h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
-        let ev = recv_one(&mut sub).await;
+        assert_silent(&mut sub).await;
+        let ev = recv_one(&mut attn_sub).await;
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
         );
     }
 
-    /// Unread never masks a running agent: raising the flag while the
-    /// workspace is `in_progress` recomputes to the same `in_progress`
-    /// (no transition, no event).
+    /// Raising the unread flag while the workspace is `in_progress` also
+    /// stays silent — the flag feeds no displayStatus axis regardless of
+    /// the base state.
     #[tokio::test]
     async fn unread_raise_during_active_run_stays_silent() {
         let h = harness().await;
@@ -2572,11 +2608,39 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
+    /// Regression: a terminal `complete` base with the unread flag raised
+    /// serves `displayStatus: complete` — the turn-end blue dot never masks
+    /// the real terminal state (raise and markSeen both stay silent).
+    #[tokio::test]
+    async fn unread_flag_never_masks_complete() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::Complete))
+            .await
+            .expect("insert task");
+        // Seed: complete baseline.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert_silent(&mut sub).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        ws.task_stats = Some(h.services.cheap_task_stats(&h.ws).await.expect("stats"));
+        h.services.enrich_display_status(&mut ws).await;
+        assert_eq!(ws.display_status, Some(WorkspaceDisplayStatus::Complete));
+
+        h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_silent(&mut sub).await;
+    }
+
     /// Regression (intentd#945 review): the turn-end `raise_attention(Unread)`
     /// never downgrades a persistent `review_required` flag — the raise is a
-    /// guarded no-op (no `attention-changed`, no `needs_attention → unread`
-    /// demotion), and a later `workspace.markSeen` (guarded on `unread`)
-    /// leaves the review-required attention in place.
+    /// guarded no-op (no `attention-changed`), and a later
+    /// `workspace.markSeen` (guarded on `unread`) leaves the review-required
+    /// attention in place.
     #[tokio::test]
     async fn unread_raise_never_downgrades_review_required() {
         let h = harness().await;

@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.6.7"
+version = "0.7.9"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -23,21 +23,21 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-core = { path = "../intent-core", version = "0.6.7" }
-intent-store = { path = "../intent-store", version = "0.6.7" }
-intent-services = { path = "../intent-services", version = "0.6.7" }
-intent-acp = { path = "../intent-acp", version = "0.6.7" }
-intent-providers = { path = "../intent-providers", version = "0.6.7" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.6.7" }
-intent-git = { path = "../intent-git", version = "0.6.7" }
-intent-context = { path = "../intent-context", version = "0.6.7" }
-intent-pty = { path = "../intent-pty", version = "0.6.7" }
-intent-search = { path = "../intent-search", version = "0.6.7" }
-intent-transport = { path = "../intent-transport", version = "0.6.7" }
-intent-js = { path = "../intent-js", version = "0.6.7", optional = true }
+intent-core = { path = "../intent-core", version = "0.7.9" }
+intent-store = { path = "../intent-store", version = "0.7.9" }
+intent-services = { path = "../intent-services", version = "0.7.9" }
+intent-acp = { path = "../intent-acp", version = "0.7.9" }
+intent-providers = { path = "../intent-providers", version = "0.7.9" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.7.9" }
+intent-git = { path = "../intent-git", version = "0.7.9" }
+intent-context = { path = "../intent-context", version = "0.7.9" }
+intent-pty = { path = "../intent-pty", version = "0.7.9" }
+intent-search = { path = "../intent-search", version = "0.7.9" }
+intent-transport = { path = "../intent-transport", version = "0.7.9" }
+intent-js = { path = "../intent-js", version = "0.7.9", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 
 [features]
 default = []
@@ -47,17 +47,17 @@ js-engine = ["dep:intent-js"]
 
 [dev-dependencies]
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.6.7" }
-intent-acp = { path = "../intent-acp", version = "0.6.7" }
-intent-providers = { path = "../intent-providers", version = "0.6.7" }
-intent-core = { path = "../intent-core", version = "0.6.7" }
-intent-store = { path = "../intent-store", version = "0.6.7" }
+intent-services = { path = "../intent-services", version = "0.7.9" }
+intent-acp = { path = "../intent-acp", version = "0.7.9" }
+intent-providers = { path = "../intent-providers", version = "0.7.9" }
+intent-core = { path = "../intent-core", version = "0.7.9" }
+intent-store = { path = "../intent-store", version = "0.7.9" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.6.7" }
+intent-linear = { path = "../intent-linear", version = "0.7.9" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.6.7" }
+intent-sentry = { path = "../intent-sentry", version = "0.7.9" }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
@@ -78,9 +78,13 @@ base64 = { workspace = true }
 chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
+# No-echo terminal input for `intentd settings <sensitive>` prompts
+# (termios); already in the workspace dependency tree via intent-core.
+libc = "0.2"
 
 # Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
 # headers/dylibs we can rely on either (Homebrew paths break on machines without it).

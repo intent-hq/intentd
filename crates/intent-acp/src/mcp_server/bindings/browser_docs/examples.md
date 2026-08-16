@@ -20,6 +20,78 @@ You can open local files directly using file:// URLs:
 }
 ```
 
+## Opening a Server Started on the Daemon
+
+Servers you start (via `ws.host.exec`, scripts, terminals) run on the daemon machine,
+which is not the client's machine in a remote-daemon setup. Use the `daemon.localhost`
+alias to target it explicitly — and bind `0.0.0.0` so a remote client can reach the port:
+
+```json
+// 1. Start a server on the daemon machine. Use a service-mode script (ws.script.*) or a
+//    terminal for long-running processes — ws.host.exec is one-shot and would block:
+//    ws.script.create("http-server", "python3 -m http.server 8000 --bind 0.0.0.0", "service")
+
+// 2. Open it using the daemon.localhost alias
+{
+  "actions": [
+    { "action": "openTab", "url": "http://daemon.localhost:8000" }
+  ]
+}
+// The result echoes the rewrite, e.g.:
+// { requestedUrl: "http://daemon.localhost:8000", finalUrl: "http://10.0.0.5:8000/", rewritten: true, reason: "..." }
+
+// To target an app on the user's machine instead, use client.localhost
+{
+  "actions": [
+    { "action": "navigate", "url": "http://client.localhost:5173" }
+  ]
+}
+```
+
+Bare loopback URLs (`http://localhost:3000`, `http://127.0.0.1:3000`) are assumed
+daemon-local: unchanged in a local setup, rewritten to the daemon host (with a `warning`
+in the result) in a remote setup. See topic="overview" for the full convention.
+
+## Forwarding a Daemon Port (Tunnels)
+
+When you need the port itself (curl, WebSockets, API clients) rather than a browser tab,
+forward it explicitly. On the Electron desktop client this works uniformly on every
+transport — do not branch on `backend`. (Web-browser clients cannot open a local
+listener, so there `openTunnel` fails with an explanatory error.)
+
+```json
+// Forward daemon-side port 8000 to a client-local port
+{
+  "actions": [
+    { "action": "openTunnel", "remotePort": 8000 }
+  ]
+}
+// → { remotePort: 8000, localPort: 52341, backend: "tunnel", reused: false }
+// Reach the daemon-side server at http://127.0.0.1:52341 (the returned localPort).
+
+// Inspect and clean up
+{
+  "actions": [
+    { "action": "listTunnels" }
+  ]
+}
+// → { tunnels: [{ remotePort: 8000, localPort: 52341, backend: "tunnel" }] }
+
+{
+  "actions": [
+    { "action": "closeTunnel", "remotePort": 8000 }
+  ]
+}
+// → { remotePort: 8000, closed: true }
+```
+
+Recovery: `localPort` is ephemeral — forwards are client-process state and drop on client
+restart or transport change. If a connect to a previously returned `localPort` is refused,
+or the forward is missing from `listTunnels`, just call `openTunnel` with the same
+`remotePort` again: it returns the current `localPort` (`reused: true` when the forward
+was still alive, a transparent recreate when it was not). Re-opening is the standard
+move, not an error to diagnose.
+
 ## Cleaning Up Tabs
 
 Close tabs you opened for testing/automation when you are done with them. `closeTab`

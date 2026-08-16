@@ -58,9 +58,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -111,7 +113,8 @@ async fn note_add_appends_content_at_end() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let result = services
         .add_to_note(
@@ -160,7 +163,8 @@ async fn note_edit_replaces_first_exact_match() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let result = services
         .edit_note(
@@ -208,7 +212,8 @@ async fn note_edit_lines_replaces_line_range() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let result = services
         .edit_note_lines(
@@ -262,7 +267,8 @@ async fn comment_add_anchors_to_text() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let result = services
         .comment_add(
@@ -318,7 +324,8 @@ async fn comment_list_returns_threads() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     services
         .comment_add(
@@ -369,7 +376,8 @@ async fn comment_respond_adds_reply_to_thread() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let add_result = services
         .comment_add(

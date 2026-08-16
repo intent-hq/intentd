@@ -8,19 +8,34 @@
 //! ([`crate::one_shot_acp`], which adds a `session/prompt` phase). Everything
 //! here is stage-agnostic — the stage sequencing itself lives with each
 //! caller.
+//!
+//! It also owns the daemon-wide **adapter concurrency bound**
+//! ([`AdapterSlots`], monorepo#2062). An ephemeral adapter is not a cheap
+//! child: a measured one-shot chain (npx → adapter → provider CLI) costs
+//! ~610 MB and lives up to the caller's timeout, and one-shots never enter
+//! `ProcessRegistry`, so they consume no `agents.maxConcurrent` slot. Before
+//! this bound the only ceiling was `server.maxOutstandingRpcs` (256), i.e.
+//! ~156 GB of adapters. The bound lives here, at [`spawn_adapter`], rather
+//! than at each call site because this is the single place an ephemeral
+//! adapter is born: every present and future caller is covered, and the
+//! permit's lifetime binds to the returned [`SpawnedAdapter`], so it is
+//! released exactly when the child is reaped or dropped — including on the
+//! panic and early-return paths a call-site guard would have to re-derive.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[cfg(unix)]
 use intent_acp::{descendant_pids, sweep_escaped_descendants};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification, IncomingRequest};
+use intent_core::config::DEFAULT_MAX_CONCURRENT_ADAPTERS;
 use intent_providers::enhanced_path;
 use serde_json::{json, Value};
 use tokio::io::AsyncRead;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 /// Hard cap on the setup phase (`initialize` + `session/new`) for resolved
 /// binaries (mirrors the FE's 15s outer timeout). Deliberately smaller than
@@ -47,6 +62,118 @@ const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// underlying CLI while creating the session, which alone takes ~10s even
 /// with a warm npx cache — a flat 10s budget times out right at the wire.
 const NPX_SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The daemon-wide ephemeral-adapter concurrency bound: a counting semaphore
+/// plus the limit it was built with (kept for the queue-timeout diagnostic,
+/// since a semaphore cannot report its own capacity).
+///
+/// Fair by construction — `tokio::sync::Semaphore` hands permits out in FIFO
+/// order — so a queued caller cannot be starved by later arrivals and the
+/// wait a caller observes is bounded by the runs ahead of it.
+pub(crate) struct AdapterSlots {
+    permits: Arc<Semaphore>,
+    limit: u32,
+}
+
+impl AdapterSlots {
+    /// A bound admitting `limit` concurrent adapters. `limit` is clamped to at
+    /// least 1: a zero here would wedge every adapter run forever, and the
+    /// settings schema already rejects it.
+    pub(crate) fn new(limit: u32) -> Self {
+        let limit = limit.max(1);
+        Self {
+            permits: Arc::new(Semaphore::new(limit as usize)),
+            limit,
+        }
+    }
+
+    /// The configured cap.
+    pub(crate) fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Slots currently free (test/diagnostic view).
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// Chains currently live: permits handed out and not yet returned. A permit
+    /// is taken before the child is spawned and returned when
+    /// [`SpawnedAdapter`] drops — after the reap — so this spans the whole
+    /// lifetime of every ephemeral chain, which is exactly the window the
+    /// descendant-tree sampler needs to be watching (monorepo#2107).
+    pub(crate) fn live(&self) -> usize {
+        (self.limit as usize).saturating_sub(self.permits.available_permits())
+    }
+
+    /// Claim a slot, waiting at most `wait` for one to free up. `None` means
+    /// the caller's budget expired while queued — the caller turns that into
+    /// its own distinguishable queue-timeout error rather than spawning.
+    async fn acquire(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
+        // Fast path: a free slot costs no timer and no log line.
+        if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        tracing::debug!(
+            limit = self.limit,
+            wait_ms = wait.as_millis() as u64,
+            "ephemeral adapter bound reached; queueing for a slot"
+        );
+        // `acquire_owned` only errors on a closed semaphore, which never
+        // happens here (the bound outlives every caller) — treat it like a
+        // queue timeout rather than panicking on an unreachable branch.
+        tokio::time::timeout(wait, self.permits.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+}
+
+/// The process-wide bound, installed once at daemon startup from
+/// `agents.maxConcurrentAdapters` ([`init_adapter_slots`]). Uninitialized —
+/// in tests and in embedders that never call the installer — it falls back to
+/// [`DEFAULT_MAX_CONCURRENT_ADAPTERS`], so the bound is never simply absent.
+static ADAPTER_SLOTS: OnceLock<AdapterSlots> = OnceLock::new();
+
+/// Install the daemon-wide adapter bound from settings. Returns `false` when a
+/// bound was already installed (or already lazily defaulted by an earlier
+/// spawn), leaving the existing one untouched — the setting applies on daemon
+/// restart, like `agents.maxConcurrent`.
+pub fn init_adapter_slots(limit: u32) -> bool {
+    ADAPTER_SLOTS.set(AdapterSlots::new(limit)).is_ok()
+}
+
+/// The daemon-wide bound, defaulting on first use if startup never installed
+/// one.
+pub(crate) fn adapter_slots() -> &'static AdapterSlots {
+    ADAPTER_SLOTS.get_or_init(|| AdapterSlots::new(DEFAULT_MAX_CONCURRENT_ADAPTERS))
+}
+
+/// The effective daemon-wide adapter cap. Reading it back is how a caller
+/// (notably an e2e test) sizes work to the bound actually in force, rather
+/// than to the value it asked [`init_adapter_slots`] for — which is ignored
+/// when a bound was already installed.
+pub fn adapter_slot_limit() -> u32 {
+    adapter_slots().limit()
+}
+
+/// Ephemeral adapter chains alive daemon-wide right now (monorepo#2107).
+///
+/// The `system.status` descendant-tree sampler polls this to decide whether a
+/// process-table sweep is worth its cost: a non-zero answer means a burst is in
+/// flight *now*, which is the only window in which a chain's memory can be
+/// observed at all — measured, 16 concurrent one-shots take 6.97 GB and are
+/// spawned and fully reaped inside 3.3 s.
+///
+/// Deliberately reads the bound without installing it, unlike
+/// [`adapter_slot_limit`]: a lazy default here would let a caller that runs
+/// before [`init_adapter_slots`] silently pin the shipped cap in place of the
+/// configured one. No bound installed means no adapter has ever spawned, so
+/// nothing is live.
+pub fn live_adapters() -> usize {
+    ADAPTER_SLOTS.get().map_or(0, AdapterSlots::live)
+}
 
 /// How to launch an ephemeral ACP adapter.
 pub(crate) struct AcpAdapterCommand {
@@ -167,13 +294,71 @@ pub(crate) struct SpawnedAdapter {
     pub(crate) notifications: mpsc::UnboundedReceiver<IncomingNotification>,
     /// Agent → client requests (`session/request_permission`, `fs/*`, …).
     pub(crate) requests: mpsc::UnboundedReceiver<IncomingRequest>,
+    /// This run's slot in the daemon-wide bound. Never read — held so the
+    /// slot is returned when the adapter value is dropped, which is after the
+    /// child has been reaped on every exit path.
+    _slot: OwnedSemaphorePermit,
 }
 
-/// Spawn the adapter with piped stdio, its own process group, and the
-/// enhanced PATH, and wire an ACP [`Connection`] around it. Returns the
-/// spawn-failure detail as `Err` so callers can map it onto their own error
-/// type. The child is `kill_on_drop`, so an early return still reaps it.
-pub(crate) fn spawn_adapter(cmd: &AcpAdapterCommand) -> Result<SpawnedAdapter, String> {
+/// Why an adapter could not be started.
+#[derive(Debug)]
+pub(crate) enum SpawnError {
+    /// No slot in the daemon-wide bound came free within the caller's budget:
+    /// the run never spawned anything. Distinct from every in-run timeout so
+    /// callers can report queueing pressure as itself (monorepo#2062).
+    QueueTimeout { waited: Duration, limit: u32 },
+    /// The adapter process could not be spawned.
+    Spawn(String),
+}
+
+/// Claim a slot in the daemon-wide bound (waiting at most `queue_wait`), then
+/// spawn the adapter with piped stdio, its own process group, and the
+/// enhanced PATH, and wire an ACP [`Connection`] around it. Failures come back
+/// as [`SpawnError`] so callers can map them onto their own error types. The
+/// child is `kill_on_drop`, so an early return still reaps it, and the slot
+/// rides on the returned [`SpawnedAdapter`] — released when the caller drops
+/// it after reaping, never before.
+pub(crate) async fn spawn_adapter(
+    cmd: &AcpAdapterCommand,
+    queue_wait: Duration,
+) -> Result<SpawnedAdapter, SpawnError> {
+    spawn_adapter_in(adapter_slots(), cmd, queue_wait).await
+}
+
+/// [`spawn_adapter`] against a caller-supplied bound instead of the
+/// process-global one. Production always goes through [`spawn_adapter`]; this
+/// seam exists so a test can run against a private [`AdapterSlots`] and stay
+/// insulated from slot pressure created by sibling tests sharing the global
+/// bound (monorepo#2379).
+pub(crate) async fn spawn_adapter_in(
+    slots: &AdapterSlots,
+    cmd: &AcpAdapterCommand,
+    queue_wait: Duration,
+) -> Result<SpawnedAdapter, SpawnError> {
+    let started = std::time::Instant::now();
+    let Some(slot) = slots.acquire(queue_wait).await else {
+        let waited = started.elapsed();
+        tracing::warn!(
+            limit = slots.limit(),
+            waited_ms = waited.as_millis() as u64,
+            program = %cmd.program.display(),
+            "gave up waiting for an ephemeral adapter slot"
+        );
+        return Err(SpawnError::QueueTimeout {
+            waited,
+            limit: slots.limit(),
+        });
+    };
+    spawn_admitted_adapter(cmd, slot).map_err(SpawnError::Spawn)
+}
+
+/// The spawn itself, once a slot is held. Split out so the bound and the
+/// process plumbing stay separately readable; `slot` is moved into the
+/// returned adapter and released with it.
+fn spawn_admitted_adapter(
+    cmd: &AcpAdapterCommand,
+    slot: OwnedSemaphorePermit,
+) -> Result<SpawnedAdapter, String> {
     let mut command = tokio::process::Command::new(&cmd.program);
     command
         .args(&cmd.args)
@@ -221,6 +406,7 @@ pub(crate) fn spawn_adapter(cmd: &AcpAdapterCommand) -> Result<SpawnedAdapter, S
         conn,
         notifications,
         requests,
+        _slot: slot,
     })
 }
 
@@ -354,6 +540,109 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child) {
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     #[cfg(unix)]
     sweep_escaped_descendants(&descendants).await;
+}
+
+/// Unit tests for the daemon-wide adapter bound itself (monorepo#2062).
+/// These build their own [`AdapterSlots`] rather than touching the process
+/// global, so they say nothing about — and are unaffected by — whatever the
+/// rest of the binary installed.
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    /// The bound admits exactly `limit` holders at once; the next caller waits
+    /// and is admitted the moment a permit drops (which, in the real runner,
+    /// is after the previous child has been reaped).
+    #[tokio::test]
+    async fn slots_admit_the_limit_then_queue_until_one_is_released() {
+        let slots = AdapterSlots::new(2);
+        let first = slots.acquire(Duration::from_secs(5)).await.expect("1st");
+        let second = slots.acquire(Duration::from_secs(5)).await.expect("2nd");
+        assert_eq!(slots.available(), 0, "both slots are held");
+
+        // A third caller cannot get in while both are held...
+        assert!(
+            slots.acquire(Duration::from_millis(50)).await.is_none(),
+            "third caller must not be admitted over the limit"
+        );
+        // ...but does as soon as one is returned.
+        drop(first);
+        assert!(
+            slots.acquire(Duration::from_secs(5)).await.is_some(),
+            "a released slot must admit the queued caller"
+        );
+        drop(second);
+    }
+
+    /// A queued caller waits out its whole budget before giving up — it does
+    /// not fail fast — so a burst that drains in time still completes.
+    #[tokio::test]
+    async fn queued_caller_waits_its_budget_before_giving_up() {
+        let slots = AdapterSlots::new(1);
+        let held = slots.acquire(Duration::from_secs(5)).await.expect("held");
+        let started = std::time::Instant::now();
+        assert!(slots.acquire(Duration::from_millis(300)).await.is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "gave up after {:?}, before the budget elapsed",
+            started.elapsed()
+        );
+        drop(held);
+    }
+
+    /// `live()` is what tells the `system.status` sampler a burst is in flight
+    /// (monorepo#2107), so it has to track held permits exactly: zero when the
+    /// bound is untouched, one per chain that has spawned and not been reaped,
+    /// and back to zero once they are.
+    #[tokio::test]
+    async fn live_counts_chains_that_hold_a_slot() {
+        let slots = AdapterSlots::new(4);
+        assert_eq!(slots.live(), 0, "no chain has spawned yet");
+        let first = slots.acquire(Duration::from_secs(5)).await.expect("1st");
+        let second = slots.acquire(Duration::from_secs(5)).await.expect("2nd");
+        assert_eq!(slots.live(), 2);
+        drop(first);
+        assert_eq!(slots.live(), 1, "a reaped chain stops counting");
+        drop(second);
+        assert_eq!(slots.live(), 0);
+    }
+
+    /// A zero limit would wedge every adapter run forever; the schema rejects
+    /// it, and the type refuses it as a second line of defence.
+    #[tokio::test]
+    async fn zero_limit_is_clamped_to_one_rather_than_deadlocking() {
+        let slots = AdapterSlots::new(0);
+        assert_eq!(slots.limit(), 1);
+        assert!(slots.acquire(Duration::from_millis(50)).await.is_some());
+    }
+
+    /// The global is never *absent*: an embedder that skips
+    /// [`init_adapter_slots`] gets the shipped default rather than an
+    /// unbounded spawn, and no path can leave it at zero or above the schema
+    /// ceiling.
+    ///
+    /// Deliberately asserts only the invariant, not a specific number: the
+    /// global is a `OnceLock` shared by every test in this binary, so under a
+    /// single-process runner whichever test touches it first decides its
+    /// value, and pinning `== DEFAULT` here would make the suite depend on
+    /// unspecified test ordering. The exact fallback value is pinned
+    /// deterministically instead by `settings::tests::
+    /// max_concurrent_adapters_catalog_entry_and_resolver` (resolver) and
+    /// `settings_file::tests::max_concurrent_adapters_defaults_and_template_round_trip`
+    /// (schema), neither of which touches global state.
+    #[tokio::test]
+    async fn global_bound_is_always_installed_and_in_range() {
+        let limit = adapter_slots().limit();
+        assert!(
+            limit > 0 && limit <= intent_core::config::MAX_CONCURRENT_ADAPTERS_LIMIT,
+            "the daemon-wide bound must always be a usable cap, got {limit}"
+        );
+        assert_eq!(
+            limit,
+            adapter_slot_limit(),
+            "the public accessor must report the same bound the spawner uses"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -133,7 +133,7 @@ mod tests {
     fn save_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sitter").join("config.toml");
-        for channel in [Channel::Beta, Channel::Stable] {
+        for channel in [Channel::Beta, Channel::Alpha, Channel::Stable] {
             save_channel(&path, channel).unwrap();
             assert_eq!(load_channel(&path), Some(channel));
         }
@@ -181,6 +181,13 @@ mod tests {
             resolve_channel(None, Some(Channel::Beta)),
             ResolvedChannel {
                 channel: Channel::Beta,
+                origin: ChannelOrigin::Config,
+            }
+        );
+        assert_eq!(
+            resolve_channel(None, Some(Channel::Alpha)),
+            ResolvedChannel {
+                channel: Channel::Alpha,
                 origin: ChannelOrigin::Config,
             }
         );

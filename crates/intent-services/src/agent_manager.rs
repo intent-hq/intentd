@@ -71,51 +71,62 @@ fn title_case_ascii(s: &str) -> String {
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
-/// blindly re-report the same content (duplicate parent wake).
-fn stale_redrive_note(report_timestamp: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued before you completed; your completion report \
-         was already delivered to your parent at {report_timestamp}. Only call reportToParent \
-         again if this message materially changes the outcome — do not re-send the same report."
-    )
+/// blindly re-report the same content (duplicate parent wake). Wording owned
+/// by the harness (H6).
+pub(crate) fn stale_redrive_note(report_timestamp: &str) -> String {
+    crate::harness::latest().stale_redrive_note(report_timestamp)
 }
 
 /// Stable prefix of [`stale_redrive_note`], used to keep the annotation
-/// idempotent when a stale entry is requeued and redriven again.
-const STALE_REDRIVE_NOTE_PREFIX: &str =
-    "[SYSTEM NOTE] This message was queued before you completed";
+/// idempotent when a stale entry is requeued and redriven again. Owned by
+/// the harness (H6) alongside the note wording.
+use crate::harness::v1::STALE_REDRIVE_NOTE_PREFIX;
 
-/// Deterministic system note appended to every drained queue entry so the
+/// Deterministic system note appended to a drained queue entry so the
 /// target agent knows when the message entered the queue and how long it
 /// waited before delivery. Messages delivered immediately (never queued)
-/// are NOT annotated — the note is applied only on the queue-drain paths.
-/// Coexists with the #576 stale-redrive note (both may appear).
-fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
-    )
+/// are NOT annotated — the note is applied only on the queue-drain paths,
+/// and only when the wait reached [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`]
+/// (monorepo#2353). Coexists with the #576 stale-redrive note (both may
+/// appear). Wording owned by the harness (H6).
+pub(crate) fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
+    crate::harness::latest().dequeue_wait_note(queued_at, waited)
 }
 
 /// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
 /// idempotent when an already-annotated entry is requeued and drained again
 /// (the original wait deliberately stays — a terminal-failure requeue keeps
-/// its first-delivery numbers). Distinct from [`STALE_REDRIVE_NOTE_PREFIX`]
-/// ("…queued before you completed"), so the two checks never shadow each
-/// other.
-const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+/// its first-delivery numbers). Owned by the harness (H6) alongside the note
+/// wording.
+use crate::harness::v1::DEQUEUE_WAIT_NOTE_PREFIX;
+
+/// Minimum wait (milliseconds) before a drained entry earns the dequeue-wait
+/// annotation (monorepo#2353). Incidental queue hops — e.g. a question-wizard
+/// answer converted into an enqueue + immediate drain by the #1791
+/// FIFO-restore branch — deliver within moments, and a "waited 0s" note/chip
+/// is pure noise; a sub-threshold wait is treated like an immediate delivery
+/// (no [SYSTEM NOTE], no `queueInfo` stamp). Waits at/above the threshold are
+/// annotated unchanged (PROTOCOL §5.5).
+const DEQUEUE_WAIT_ANNOTATION_MIN_MS: i128 = 5_000;
+
+/// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
+/// env override (whole milliseconds). Primarily for tests/CI — the e2e
+/// suites park entries behind short (~2s) mock busy turns and assert the
+/// annotation, so they lower the threshold instead of slowing every turn
+/// past 5s. Mirrors the `INTENTD_*_RETRY_BACKOFF_MS` override pattern.
+fn dequeue_wait_annotation_min_ms() -> i128 {
+    std::env::var("INTENTD_DEQUEUE_WAIT_MIN_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(i128::from)
+        .unwrap_or(DEQUEUE_WAIT_ANNOTATION_MIN_MS)
+}
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
 /// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
-fn format_wait_duration(secs: i64) -> String {
-    let secs = secs.max(0);
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
+/// Wording owned by the harness (H6).
+pub(crate) fn format_wait_duration(secs: i64) -> String {
+    crate::harness::latest().wait_duration(secs)
 }
 
 /// Dequeue-wait annotation: appends [`dequeue_wait_note`] to a drained
@@ -126,7 +137,10 @@ fn format_wait_duration(secs: i64) -> String {
 /// constraint — so those redrives skip the note entirely: the delivered
 /// prompt stays byte-identical to the persisted row, at the cost of no wait
 /// note for that entry. Fail open: an unparseable `queued_at` leaves the
-/// content untouched.
+/// content untouched. Threshold-gated (monorepo#2353): a wait below
+/// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] — including a negative wait from clock
+/// skew — skips both the note and the stamp, treating the sub-threshold hop
+/// like an immediate delivery.
 ///
 /// Alongside the content note, the entry's `messageMetadata` is stamped with
 /// structured queue info — `queueInfo: { queuedAt, waitedMs }` (PROTOCOL
@@ -134,7 +148,8 @@ fn format_wait_duration(secs: i64) -> String {
 /// wait for clients, riding the same metadata plumbing as the A2A sender
 /// attribution. Same guards as the note: an existing `queueInfo` is never
 /// overwritten (first-delivery numbers stay across requeues), and the
-/// persisted-entry / unparseable-`queued_at` skips above cover the stamp too.
+/// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
+/// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
         return;
@@ -147,6 +162,9 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
         return;
     };
     let elapsed = time::OffsetDateTime::now_utc() - queued;
+    if elapsed.whole_milliseconds() < dequeue_wait_annotation_min_ms() {
+        return;
+    }
     msg.content = format!(
         "{}\n\n{}",
         msg.content,
@@ -155,7 +173,8 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
             &format_wait_duration(elapsed.whole_seconds())
         )
     );
-    // Negative waits (clock skew) clamp to 0, matching the note's formatting.
+    // The threshold gate above guarantees a positive wait; the clamp stays as
+    // a belt-and-braces guard for the u64 conversion.
     let waited_ms = u64::try_from(elapsed.whole_milliseconds().max(0)).unwrap_or(u64::MAX);
     let queue_info = json!({ "queuedAt": msg.queued_at, "waitedMs": waited_ms });
     match msg.message_metadata.as_mut() {
@@ -170,6 +189,50 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
                 "dequeue-wait queueInfo stamp skipped: messageMetadata is not an object"
             );
         }
+    }
+}
+
+/// Delivery-time "tasks now unblocked" annotation (intent-hq/monorepo#2044):
+/// completion wakes stamp only the triggering task ids on their
+/// `messageMetadata` at enqueue time; THIS is where the unblocked enumeration
+/// is resolved — against task state fetched fresh as the entries are rendered
+/// for the model turn — so a wake that sat queued behind a busy parent never
+/// carries a stale snapshot. All trigger-carrying entries draining in the
+/// same batch coalesce into ONE delta computation and ONE appended section
+/// (on the LAST such entry, so the section lands after every completion it
+/// covers). Same guards as [`annotate_dequeue_wait`]: `persisted: true`
+/// requeues are never rewritten, and a content that already carries the
+/// section (terminal-failure requeue) is not annotated twice. Best-effort and
+/// advisory only — an empty delta or a snapshot error appends nothing.
+async fn annotate_unblocked_hints(
+    services: &Services,
+    agent_id: &AgentId,
+    entries: &mut [QueuedMessage],
+) {
+    use crate::agent_ops::ready_delta;
+    let candidates: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            !m.persisted
+                && !m.content.contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
+                && ready_delta::metadata_has_triggers(m.message_metadata.as_ref())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&last) = candidates.last() else {
+        return;
+    };
+    let section = services
+        .unblocked_section_for_delivery(
+            agent_id,
+            candidates
+                .iter()
+                .map(|&i| entries[i].message_metadata.as_ref()),
+        )
+        .await;
+    if let Some(section) = section {
+        entries[last].content = format!("{}\n\n{}", entries[last].content, section);
     }
 }
 
@@ -302,8 +365,8 @@ pub struct TurnOptions {
     /// entry's `turn_id`; direct sends mint one in `send_message` (before the
     /// user-row persist, so the RPC result and `agent:message` echo carry it),
     /// with [`AgentManager::spawn_worker`] as the fallback mint site.
-    /// `persist_error_and_requeue` threads it onto the requeued entry so a
-    /// retry of the same logical turn keeps the original id.
+    /// `publish_error_status_and_requeue` threads it onto the requeued entry
+    /// so a retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
     /// Who originated this delivery (question hold, PROTOCOL §5.5):
     /// `MessageOrigin::User` (FE `agent.sendMessage` / explicit user actions)
@@ -390,6 +453,23 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
     budget_gb.clamp(4, 100) as usize
 }
 
+/// Aggregate memory budget recommended for `total_memory_bytes` (monorepo#2063).
+///
+/// Reuses [`compute_process_cap`]'s 8 GB OS/other-apps reserve, then halves what
+/// is left. The halving is the whole point of the number: the slot cap spends
+/// *all* budgetable RAM assuming a 1 GB steady state per agent, but the measured
+/// per-agent subtree spans 22x (436 MB idle to 9.6 GB running the repo's own
+/// vitest suite), so the aggregate has to leave room for a tail agent on top of
+/// the steady state. On a 48 GB seat that is a 20 GB budget with a 9.6 GB tail
+/// agent's worth of slack still inside the 40 GB the slot cap already considers
+/// spendable — and the 21.5 GB tree measured in #2063 would have crossed it.
+///
+/// The recommended default: `agents.memoryBudgetMb` defaults to auto (the
+/// absent key; explicit 0 = off), and boot wiring resolves auto to this value.
+pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
+    (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
+}
+
 /// Best-effort process cap from detected system RAM, falling back to
 /// [`DEFAULT_PROCESS_CAP`] when total memory is unknown (RAM detection
 /// supports Linux and macOS; other platforms fall back to the default).
@@ -462,9 +542,20 @@ pub type KillFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Async callback for process-cap lifecycle events (queueing/resuming/eviction).
 /// Invoked by the registry when a spawn queues, resumes, or an idle process is
-/// evicted; the manager wires this to log + publish workspace events.
+/// evicted; the manager wires this to log + publish workspace events. The final
+/// parameter is the machine-readable `reason` — [`REASON_SLOTS`] or
+/// [`REASON_MEMORY_BUDGET`] — naming which admission constraint drove the event
+/// (monorepo#2063).
 pub type ProcessEventFn =
-    Arc<dyn Fn(&AgentId, &str, usize, usize) -> BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(&AgentId, &str, usize, usize, &str) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// `reason` value for `agent:process:*` events driven by the concurrency slot
+/// cap (all slots active / a slot freed).
+pub const REASON_SLOTS: &str = "slots";
+
+/// `reason` value for `agent:process:*` events driven by the aggregate memory
+/// budget (monorepo#2063).
+pub const REASON_MEMORY_BUDGET: &str = "memory-budget";
 
 struct ProcessEntry {
     last_active_ms: u64,
@@ -475,16 +566,32 @@ struct ProcessEntry {
 #[derive(Default)]
 struct RegistryInner {
     entries: HashMap<AgentId, ProcessEntry>,
-    /// Queue of waiting spawns, each carrying the agent id + oneshot channel.
-    wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>)>,
+    /// Queue of waiting spawns, each carrying the agent id + oneshot channel +
+    /// the reason it queued ([`REASON_SLOTS`] / [`REASON_MEMORY_BUDGET`]), so
+    /// the matching `agent:process:resumed` can echo it back.
+    wait_queue: Vec<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)>,
+    /// Sample id [`ProcessRegistry::budget_denies`] last corrected against.
+    /// `None` until the first sample is consulted.
+    budget_sample_seq: Option<u64>,
+    /// Signed correction to that sample for spawns admitted and processes
+    /// released since it was taken. Reset whenever a newer sample lands.
+    budget_pending_bytes: i64,
 }
 
-fn pop_waiter(inner: &mut RegistryInner) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>)> {
-    if inner.wait_queue.is_empty() {
-        None
-    } else {
-        Some(inner.wait_queue.remove(0))
+fn pop_waiter(
+    inner: &mut RegistryInner,
+) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)> {
+    // Skip senders whose receiver is gone. A memory-budget waiter re-queues
+    // after each [`BUDGET_RECHECK`] and an abandoned `acquire` future drops its
+    // receiver outright, so handing the wakeup to a dead entry would consume it
+    // and starve a waiter that is still listening.
+    while !inner.wait_queue.is_empty() {
+        let waiter = inner.wait_queue.remove(0);
+        if !waiter.1.is_closed() {
+            return Some(waiter);
+        }
     }
+    None
 }
 
 fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
@@ -492,6 +599,23 @@ fn lru_idle(inner: &RegistryInner) -> Option<(AgentId, KillFn)> {
         .entries
         .iter()
         .filter(|(_, e)| !e.is_active)
+        .min_by_key(|(_, e)| e.last_active_ms)
+        .map(|(id, e)| (id.clone(), e.kill.clone()))
+}
+
+/// LRU idle entry excluding `exclude` — the turn-start budget gate's eviction
+/// candidate list (monorepo#2063 B8): the gated agent's own process is never
+/// its own gate's victim (evicting it would only trade this gate for the spawn
+/// gate). Other admission paths — a concurrent spawn `acquire`, or another
+/// turn-start gate — select via their own candidate lists and may still evict
+/// a process parked here; its waiter then wakes via `deregister`, re-classifies
+/// as unregistered, admits, and respawns through the spawn gate (queued, never
+/// refused, message intact — the warm session is lost, not the turn).
+fn lru_idle_excluding(inner: &RegistryInner, exclude: &AgentId) -> Option<(AgentId, KillFn)> {
+    inner
+        .entries
+        .iter()
+        .filter(|(id, e)| !e.is_active && *id != exclude)
         .min_by_key(|(_, e)| e.last_active_ms)
         .map(|(id, e)| (id.clone(), e.kill.clone()))
 }
@@ -509,6 +633,34 @@ fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillF
     candidates
         .into_iter()
         .map(|(id, _, kill)| (id, kill))
+        .collect()
+}
+
+/// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
+/// attributed subtree first (Phase A attribution), ties and unattributed
+/// entries (charged 0 by the sort) falling back to least-recently-used first —
+/// so with no attribution at all the order degrades to plain LRU.
+fn idle_largest_first(
+    inner: &RegistryInner,
+    samples: &HashMap<AgentId, u64>,
+) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, u64, u64, KillFn)> = inner
+        .entries
+        .iter()
+        .filter(|(_, e)| !e.is_active)
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                samples.get(id).copied().unwrap_or(0),
+                e.last_active_ms,
+                e.kill.clone(),
+            )
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    candidates
+        .into_iter()
+        .map(|(id, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -667,6 +819,47 @@ impl BusEventSink {
     }
 }
 
+/// Source of the daemon's aggregate descendant-tree memory, implemented by the
+/// composition root's `system.status` sampler (intentd#1139) and by fakes in
+/// tests.
+pub trait TreeMemoryProbe: Send + Sync {
+    /// `(resident bytes across the whole descendant tree, monotonic sample id)`,
+    /// or `None` before the first sample lands.
+    ///
+    /// The sample id lets the registry tell a fresh reading from a repeat of the
+    /// one it already corrected for; it only has to change when the bytes are
+    /// re-measured, and never has to mean anything else.
+    fn sample(&self) -> Option<(u64, u64)>;
+
+    /// Per-agent attribution of the same tree: resident bytes bucketed by
+    /// nearest registered agent root, from the same sweep as [`Self::sample`]
+    /// (monorepo#2063 Phase A). Empty before the first sample lands and for
+    /// probes that don't attribute (the default keeps test fakes minimal).
+    fn agent_samples(&self) -> HashMap<AgentId, u64> {
+        HashMap::new()
+    }
+}
+
+/// An installed aggregate memory budget (monorepo#2063).
+struct MemoryBudget {
+    budget_bytes: u64,
+    probe: Arc<dyn TreeMemoryProbe>,
+}
+
+/// Provisional cost charged against the budget for a spawn that has been
+/// admitted but is not yet visible in a tree sample (and credited back when a
+/// process is deregistered). The measured median idle agent subtree is ~660 MB
+/// across 7 agents (436-756 MB, monorepo#2063). Without it, a burst of spawns
+/// all clear the gate against one up-to-5s-stale reading.
+const PROVISIONAL_AGENT_BYTES: u64 = 660 * 1024 * 1024;
+
+/// How long a spawn queued behind the memory budget sleeps before re-evaluating.
+/// The slot cap's waiter is woken by `deregister`/`mark_idle`, but memory can
+/// fall with no registry event at all (an agent's own child processes exit), so
+/// the memory path must also re-check on a timer or it would sleep on a wakeup
+/// that never comes.
+const BUDGET_RECHECK: Duration = Duration::from_secs(5);
+
 /// Global concurrency registry for spawned agent processes (port of
 /// `agent-process-registry`). Enforces a hard cap across all workspaces and, on
 /// [`ProcessRegistry::acquire`], evicts the least-recently-used idle process (or
@@ -677,6 +870,32 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    /// Optional aggregate memory budget, installed once by the composition root
+    /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
+    /// absent key, resolves to the recommended value; explicit 0 = off). Not
+    /// installed leaves every path below byte-for-byte identical to the
+    /// slot-cap-only behaviour.
+    memory: std::sync::OnceLock<MemoryBudget>,
+}
+
+/// Last sample plus the signed correction for admissions/releases since it was
+/// taken, saturating at 0.
+fn charged_bytes(sampled: u64, pending: i64) -> u64 {
+    if pending >= 0 {
+        sampled.saturating_add(pending as u64)
+    } else {
+        sampled.saturating_sub(pending.unsigned_abs())
+    }
+}
+
+/// Whether the aggregate budget admits one more spawn.
+///
+/// `live == 0` always admits. The tree the probe measures includes processes the
+/// registry does not own (one-shot adapter chains, model probes) and, on a busy
+/// host, is simply not something the daemon controls; without this the daemon
+/// could refuse every spawn forever and never make progress.
+fn budget_admits(charged: u64, budget_bytes: u64, live: usize) -> bool {
+    live == 0 || charged < budget_bytes
 }
 
 impl ProcessRegistry {
@@ -686,12 +905,100 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            memory: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the aggregate memory budget (monorepo#2063). Called once by the
+    /// composition root after the sampler exists; returns false if a budget was
+    /// already installed. Not a builder because the probe and the registry are
+    /// constructed in either order depending on the caller.
+    pub fn set_memory_budget(&self, budget_bytes: u64, probe: Arc<dyn TreeMemoryProbe>) -> bool {
+        self.memory
+            .set(MemoryBudget {
+                budget_bytes,
+                probe,
+            })
+            .is_ok()
+    }
+
+    /// Consult the budget under the already-held lock, refreshing the pending
+    /// correction when a newer sample has landed. Returns `Some(charged_bytes)`
+    /// when the budget denies this spawn; `None` when it admits — including when
+    /// no budget is installed and when no sample exists yet, so an unconfigured
+    /// or not-yet-sampled daemon behaves exactly as before.
+    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<u64> {
+        let budget = self.memory.get()?;
+        let (sampled, seq) = budget.probe.sample()?;
+        if inner.budget_sample_seq != Some(seq) {
+            inner.budget_sample_seq = Some(seq);
+            inner.budget_pending_bytes = 0;
+        }
+        let charged = charged_bytes(sampled, inner.budget_pending_bytes);
+        (!budget_admits(charged, budget.budget_bytes, inner.entries.len())).then_some(charged)
+    }
+
+    /// Read-only budget visibility for `system.status` (monorepo#2063):
+    /// `Some((budget_bytes, charged_bytes, queued_spawns))` when a budget is
+    /// installed, else `None`. `charged_bytes` is what admission actually
+    /// compares — the last tree sample plus the pending correction — and is
+    /// `None` until the first sample lands (the budget is inert until then,
+    /// see [`Self::budget_denies`]). A sample newer than the one the
+    /// correction was accumulated against is served uncorrected, mirroring
+    /// the reset `budget_denies` would perform — but without mutating, so a
+    /// status read never perturbs admission state. `queued_spawns` counts
+    /// live waiters (dropped receivers excluded), whether they queued on the
+    /// slot cap or the budget.
+    pub fn budget_status(&self) -> Option<(u64, Option<u64>, u64)> {
+        let budget = self.memory.get()?;
+        let inner = self.inner.lock().unwrap();
+        let charged = budget.probe.sample().map(|(sampled, seq)| {
+            if inner.budget_sample_seq == Some(seq) {
+                charged_bytes(sampled, inner.budget_pending_bytes)
+            } else {
+                sampled
+            }
+        });
+        let queued = inner
+            .wait_queue
+            .iter()
+            .filter(|(_, tx, _)| !tx.is_closed())
+            .count() as u64;
+        Some((budget.budget_bytes, charged, queued))
+    }
+
+    /// Adjust the pending correction by one agent's provisional cost: `+1` on
+    /// admission (the spawn is not in the last sample yet), `-1` on deregister
+    /// (the dead process still is). No-op when no budget is installed.
+    fn budget_adjust(&self, inner: &mut RegistryInner, agents: i64) {
+        if self.memory.get().is_some() {
+            inner.budget_pending_bytes = inner
+                .budget_pending_bytes
+                .saturating_add(agents.saturating_mul(PROVISIONAL_AGENT_BYTES as i64));
+        }
+    }
+
+    /// Credit raw `bytes` back against the pending correction, beyond what
+    /// [`Self::budget_adjust`] already credited. Used by the budget drain: a
+    /// victim's *attributed* size can dwarf the fixed provisional credit, and
+    /// without this the drain keeps killing smaller idle agents for up to a
+    /// full sample period after the real overshoot cleared. An over-credit
+    /// from stale attribution self-heals the moment a fresh sample lands
+    /// ([`Self::budget_denies`] resets the pending correction on a new seq).
+    fn budget_credit_extra_bytes(&self, bytes: u64) {
+        if bytes == 0 || self.memory.get().is_none() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.budget_pending_bytes = inner
+            .budget_pending_bytes
+            .saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     /// Attach an event callback for lifecycle events (queueing/resuming/eviction).
     /// Chainable builder; returns `Self` so the manager can wire this after
-    /// construction. The callback signature is `(agent_id, event_type, used, cap)`.
+    /// construction. The callback signature is
+    /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
         self
@@ -734,19 +1041,24 @@ impl ProcessRegistry {
             if !had {
                 return false;
             }
+            // The dead process is still inside the last tree sample; credit its
+            // provisional cost back so a spawn queued behind the budget is not
+            // held off for up to a full sample period by memory already freed.
+            self.budget_adjust(&mut inner, -1);
             pop_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx)) = resumed_agent {
+        if let Some((resumed_id, tx, reason)) = resumed_agent {
             let _ = tx.send(());
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
                 used = used,
                 cap = self.cap,
+                reason = reason,
                 "process registry: queued spawn resumed"
             );
             if let Some(ref f) = self.event_fn {
-                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
                 tokio::spawn(fut);
             }
         }
@@ -781,17 +1093,18 @@ impl ProcessRegistry {
             }
             pop_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx)) = resumed_agent {
+        if let Some((resumed_id, tx, reason)) = resumed_agent {
             let _ = tx.send(());
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
                 used = used,
                 cap = self.cap,
+                reason = reason,
                 "process registry: queued spawn resumed"
             );
             if let Some(ref f) = self.event_fn {
-                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap);
+                let fut = f(&resumed_id, "agent:process:resumed", used, self.cap, reason);
                 tokio::spawn(fut);
             }
         }
@@ -800,55 +1113,206 @@ impl ProcessRegistry {
     /// Ensure a slot is free before spawning: returns immediately under the cap,
     /// otherwise evicts the LRU idle process, or queues until one frees. Logs +
     /// emits `agent:process:queued` / `agent:process:evicted` via the event callback.
+    ///
+    /// When an aggregate memory budget is installed (monorepo#2063), being over
+    /// budget denies admission on exactly the same terms as being at the slot
+    /// cap: reclaim by evicting the LRU *idle* process, else queue. The budget
+    /// therefore never touches anything that is running — it delays a spawn and
+    /// takes back idle processes, and the agent that caused the overshoot is
+    /// never the one it acts on. That is deliberate: the measured per-agent cost
+    /// spans 22x, so a ceiling that permits a legitimate 9.6 GB test run cannot
+    /// also prevent several of them, and one that prevents them kills the work
+    /// agents exist to do. Admission is the only lever that is cheap, reversible,
+    /// and never wrong about which agent to punish.
     pub async fn acquire(&self, agent_id: &AgentId) {
         loop {
             enum Action {
                 Slot,
+                /// The `&'static str` is the reason the eviction was needed
+                /// ([`REASON_SLOTS`] / [`REASON_MEMORY_BUDGET`]).
+                Evict(AgentId, KillFn, &'static str),
+                /// The `bool` is true when the wait is on memory rather than a
+                /// slot, which needs a timed re-check rather than only a wakeup.
+                Wait(tokio::sync::oneshot::Receiver<()>, bool),
+            }
+            let action = {
+                let mut inner = self.inner.lock().unwrap();
+                let over_budget = self.budget_denies(&mut inner);
+                // Which admission constraint is binding right now. When both
+                // bind at once, the budget wins the label — matching the log
+                // discrimination below, and the budget is the constraint a
+                // freed slot alone cannot clear.
+                let reason = if over_budget.is_some() {
+                    REASON_MEMORY_BUDGET
+                } else {
+                    REASON_SLOTS
+                };
+                if inner.entries.len() < self.cap && over_budget.is_none() {
+                    // Charge the spawn now: it will not appear in a tree sample
+                    // for up to a sampling period, and a burst of spawns must not
+                    // all clear the gate against the same stale reading.
+                    self.budget_adjust(&mut inner, 1);
+                    Action::Slot
+                } else if let Some((id, kill)) = lru_idle(&inner) {
+                    Action::Evict(id, kill, reason)
+                } else {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    // Drop waiters whose receiver is gone before adding ours, so
+                    // re-queueing on the budget re-check cannot grow the queue.
+                    inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
+                    inner.wait_queue.push((agent_id.clone(), tx, reason));
+                    let used = inner.entries.len();
+                    match over_budget {
+                        Some(charged) => tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            charged_memory_bytes = charged,
+                            budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            "process registry: spawn queued (aggregate memory budget)"
+                        ),
+                        None => tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            "process registry: spawn queued (all slots active)"
+                        ),
+                    }
+                    if let Some(ref f) = self.event_fn {
+                        let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
+                        tokio::spawn(fut);
+                    }
+                    Action::Wait(rx, over_budget.is_some())
+                }
+            };
+            match action {
+                Action::Slot => return,
+                Action::Evict(id, kill, reason) => {
+                    let used = self.size();
+                    tracing::info!(
+                        evicted = %id,
+                        used = used,
+                        cap = self.cap,
+                        reason = reason,
+                        "process registry: LRU idle process evicted"
+                    );
+                    if let Some(ref f) = self.event_fn {
+                        let fut = f(&id, "agent:process:evicted", used, self.cap, reason);
+                        tokio::spawn(fut);
+                    }
+                    kill().await;
+                    self.deregister(&id);
+                }
+                Action::Wait(rx, true) => {
+                    // Memory can fall with no registry event to wake us — an
+                    // agent's own children exiting frees the tree without any
+                    // process being deregistered — so re-evaluate on a timer.
+                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                }
+                Action::Wait(rx, false) => {
+                    let _ = rx.await;
+                }
+            }
+        }
+    }
+
+    /// Turn-start budget re-check for an agent whose process is already
+    /// registered (monorepo#2063 B8): an idle agent's next turn gates on the
+    /// aggregate memory budget on the same terms as a spawn — reclaim by
+    /// evicting the LRU idle process, else queue until the budget clears —
+    /// never refused. Differences from [`Self::acquire`], all deliberate:
+    /// - The slot cap is not consulted: the process already holds its slot.
+    /// - Admission charges no provisional cost: the warm process is already
+    ///   inside the tree sample, so charging would double-count it.
+    /// - Its own idle process is never *this gate's* eviction victim: that
+    ///   would only trade this gate for the spawn gate and lose the warm
+    ///   session. Other admission paths may still reclaim it while it waits
+    ///   (see [`lru_idle_excluding`]); the turn then degrades to the spawn
+    ///   gate — still queued, never refused.
+    /// - A process marked ACTIVE admits immediately: busy agents are never
+    ///   gated mid-turn (regression-pinned).
+    ///
+    /// An unregistered agent admits immediately too — its child must spawn,
+    /// and `create_agent`'s [`Self::acquire`] is that path's gate.
+    pub async fn acquire_turn_start(&self, agent_id: &AgentId) {
+        loop {
+            enum Action {
+                Admit,
                 Evict(AgentId, KillFn),
                 Wait(tokio::sync::oneshot::Receiver<()>),
             }
             let action = {
                 let mut inner = self.inner.lock().unwrap();
-                if inner.entries.len() < self.cap {
-                    Action::Slot
-                } else if let Some((id, kill)) = lru_idle(&inner) {
-                    Action::Evict(id, kill)
+                let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
+                let over_budget = if idle_here {
+                    self.budget_denies(&mut inner)
                 } else {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    inner.wait_queue.push((agent_id.clone(), tx));
-                    let used = inner.entries.len();
-                    tracing::info!(
-                        agent = %agent_id,
-                        used = used,
-                        cap = self.cap,
-                        "process registry: spawn queued (all slots active)"
-                    );
-                    if let Some(ref f) = self.event_fn {
-                        let fut = f(agent_id, "agent:process:queued", used, self.cap);
-                        tokio::spawn(fut);
+                    None
+                };
+                if let Some(charged) = over_budget {
+                    if let Some((id, kill)) = lru_idle_excluding(&inner, agent_id) {
+                        Action::Evict(id, kill)
+                    } else {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        // Same waiter hygiene as `acquire`: drop dead receivers
+                        // before re-queueing on the timed budget re-check.
+                        inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
+                        inner
+                            .wait_queue
+                            .push((agent_id.clone(), tx, REASON_MEMORY_BUDGET));
+                        let used = inner.entries.len();
+                        tracing::info!(
+                            agent = %agent_id,
+                            used = used,
+                            cap = self.cap,
+                            charged_memory_bytes = charged,
+                            budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            "process registry: turn start queued (aggregate memory budget)"
+                        );
+                        if let Some(ref f) = self.event_fn {
+                            let fut = f(
+                                agent_id,
+                                "agent:process:queued",
+                                used,
+                                self.cap,
+                                REASON_MEMORY_BUDGET,
+                            );
+                            tokio::spawn(fut);
+                        }
+                        Action::Wait(rx)
                     }
-                    Action::Wait(rx)
+                } else {
+                    Action::Admit
                 }
             };
             match action {
-                Action::Slot => return,
+                Action::Admit => return,
                 Action::Evict(id, kill) => {
                     let used = self.size();
                     tracing::info!(
                         evicted = %id,
                         used = used,
                         cap = self.cap,
+                        reason = REASON_MEMORY_BUDGET,
                         "process registry: LRU idle process evicted"
                     );
                     if let Some(ref f) = self.event_fn {
-                        let fut = f(&id, "agent:process:evicted", used, self.cap);
+                        let fut = f(
+                            &id,
+                            "agent:process:evicted",
+                            used,
+                            self.cap,
+                            REASON_MEMORY_BUDGET,
+                        );
                         tokio::spawn(fut);
                     }
                     kill().await;
                     self.deregister(&id);
                 }
                 Action::Wait(rx) => {
-                    let _ = rx.await;
+                    // Memory can fall with no registry event to wake us (same
+                    // as the `acquire` budget wait), so re-evaluate on a timer.
+                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
                 }
             }
         }
@@ -895,12 +1359,33 @@ impl ProcessRegistry {
     }
 
     /// TTL-based idle reaping (§5.6/§6.7): evict every idle process whose last
-    /// activity is older than `ttl`, skipping any the `eligible` predicate
-    /// rejects (e.g. an agent with an in-flight prompt). Active processes and
-    /// those within the TTL are always kept. Returns the number evicted.
-    pub async fn evict_idle_older_than<F>(&self, ttl: Duration, eligible: F) -> usize
+    /// activity is older than `ttl`. Active processes and those within the TTL
+    /// are always kept. Returns the number evicted.
+    ///
+    /// Claim-before-kill (monorepo#2118): `try_claim` must atomically claim
+    /// the candidate against whatever can start work on it (the manager wires
+    /// it to check-and-claim under the same lock `try_begin` uses), and
+    /// `release` drops that claim after the kill — or immediately when the
+    /// re-validation below rejects the candidate. A plain eligibility check
+    /// here would be a TOCTOU: earlier kills in the sweep await (SIGTERM
+    /// grace + descendant sweep), so a turn could start between the check and
+    /// the kill and have its child tree killed.
+    ///
+    /// NOT cancellation-safe: dropping this future at the `kill().await`
+    /// leaks the held claim — `release` never runs for it, so `try_begin`
+    /// permanently loses for that agent and its queue never drains until
+    /// daemon restart. The reap loop task is the only production caller and
+    /// is aborted only at shutdown; a future caller must not wrap this in a
+    /// timeout/select that can drop it mid-kill.
+    pub async fn evict_idle_older_than<C, R>(
+        &self,
+        ttl: Duration,
+        try_claim: C,
+        release: R,
+    ) -> usize
     where
-        F: Fn(&AgentId) -> bool,
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(ttl.as_millis() as u64);
         let candidates = {
@@ -909,11 +1394,135 @@ impl ProcessRegistry {
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
-            if !eligible(&id) {
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock: the candidate snapshot is
+            // stale by the time earlier kills in this sweep have awaited, so
+            // the entry may have run a whole turn (fresh `last_active_ms`),
+            // be actively streaming again, or be gone. With the claim held
+            // nothing can start new work on it after this check.
+            let still_stale = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .entries
+                    .get(&id)
+                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+            };
+            if !still_stale {
+                release(&id);
                 continue;
             }
             kill().await;
             self.deregister(&id);
+            release(&id);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Budget-triggered idle drain (monorepo#2063 level 2): while the
+    /// aggregate charge is over the installed budget, evict idle processes
+    /// largest-attributed-subtree-first (Phase A attribution; LRU fallback
+    /// when attribution is unavailable), re-checking the budget before every
+    /// kill so the drain stops the moment the overshoot clears. Each
+    /// eviction credits the victim's attributed bytes (at least the
+    /// provisional cost) against the charge, so the stop condition holds
+    /// within a single sample period — not only after the next sample lands.
+    /// Unlike the
+    /// [`Self::acquire`] path this fires without a spawn attempt, and unlike
+    /// [`Self::evict_idle_older_than`] it ignores the TTL — memory pressure
+    /// is now, not in `idleReapMinutes`. No budget installed, no sample yet,
+    /// or under budget → 0 evictions, byte-for-byte the old behaviour.
+    /// Active processes are never candidates, mirroring both other paths.
+    ///
+    /// Each eviction logs + emits `agent:process:evicted` with reason
+    /// [`REASON_MEMORY_BUDGET`], matching the acquire path's budget eviction.
+    ///
+    /// Claim-before-kill (monorepo#2118): same `try_claim` / `release`
+    /// contract as [`Self::evict_idle_older_than`], including the
+    /// re-validation before each kill and the NOT-cancellation-safe caveat —
+    /// dropping this future at the `kill().await` leaks the held claim.
+    pub async fn evict_while_over_budget<C, R>(&self, try_claim: C, release: R) -> usize
+    where
+        C: Fn(&AgentId) -> bool,
+        R: Fn(&AgentId),
+    {
+        // The common case (under budget / no budget / no sample) must stay one
+        // lock + one probe read. The candidate order is snapshotted here; the
+        // per-kill re-check below only decides *whether* to keep draining.
+        let (candidates, samples) = {
+            let mut inner = self.inner.lock().unwrap();
+            if self.budget_denies(&mut inner).is_none() {
+                return 0;
+            }
+            let samples = self
+                .memory
+                .get()
+                .map(|b| b.probe.agent_samples())
+                .unwrap_or_default();
+            (idle_largest_first(&inner, &samples), samples)
+        };
+        let mut evicted = 0;
+        for (id, kill) in candidates {
+            // Stop the moment the budget clears: each eviction credits the
+            // victim's full known cost back (below), and a fresh sample may
+            // land mid-drain.
+            let still_over = {
+                let mut inner = self.inner.lock().unwrap();
+                self.budget_denies(&mut inner).is_some()
+            };
+            if !still_over {
+                break;
+            }
+            if !try_claim(&id) {
+                continue;
+            }
+            // Re-validate under the registry lock (the monorepo#2118 TOCTOU):
+            // earlier kills in this drain awaited, so the entry may be
+            // actively streaming again or gone. With the claim held nothing
+            // can start new work on it after this check.
+            let still_idle = {
+                let inner = self.inner.lock().unwrap();
+                inner.entries.get(&id).is_some_and(|e| !e.is_active)
+            };
+            if !still_idle {
+                release(&id);
+                continue;
+            }
+            let used = self.size();
+            tracing::info!(
+                evicted = %id,
+                used = used,
+                cap = self.cap,
+                reason = REASON_MEMORY_BUDGET,
+                "process registry: over-budget idle process evicted"
+            );
+            if let Some(ref f) = self.event_fn {
+                let fut = f(
+                    &id,
+                    "agent:process:evicted",
+                    used,
+                    self.cap,
+                    REASON_MEMORY_BUDGET,
+                );
+                tokio::spawn(fut);
+            }
+            kill().await;
+            self.deregister(&id);
+            // `deregister` credited the fixed provisional cost; top it up to
+            // the victim's attributed bytes when attribution knows more, so
+            // the per-kill re-check above sees the real reclaim within this
+            // sample period instead of over-draining every idle candidate
+            // (the next sample resets the correction either way).
+            self.budget_credit_extra_bytes(
+                samples
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(PROVISIONAL_AGENT_BYTES),
+            );
+            release(&id);
             evicted += 1;
         }
         evicted
@@ -1163,6 +1772,18 @@ impl Drop for TeardownFence {
     }
 }
 
+/// Why a [`AgentManager::try_begin_outcome`] claim did or did not start:
+/// `Started` claimed the slot; `Busy` lost to a turn already in flight (a
+/// prompt worker owns the slot and its receiver); `ReapClaimed` lost to the
+/// idle-reap sweep holding the agent mid-kill (monorepo#2118) — nobody owns
+/// the slot, the handle is being torn down, so no work may be handed to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TryBeginOutcome {
+    Started,
+    Busy,
+    ReapClaimed,
+}
+
 /// Central multiplexer over the ACP client + process registry (§6.8). Owns a
 /// [`HashMap<AgentId, AgentHandle>`], the [`ProcessRegistry`], and the shared
 /// [`EventSink`]/permission state the per-agent client handlers use.
@@ -1196,6 +1817,14 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents claimed by the idle-reap sweep for the duration of their kill
+    /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
+    /// busy → reap_claims, matching `try_begin`'s read), so "not busy →
+    /// claimed" is atomic against a concurrent `try_begin`: a send racing the
+    /// sweep queues instead of starting a turn whose child tree the sweep is
+    /// about to kill. Released (no `busy` lock needed) after the kill, when
+    /// the sweep kicks the queue drain for anything that parked meanwhile.
+    reap_claims: Arc<Mutex<HashSet<AgentId>>>,
     /// Workspace each in-flight agent belongs to, recorded when the agent claims
     /// its in-flight slot so the slot release can recompute the workspace's
     /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
@@ -1286,6 +1915,13 @@ pub struct AgentManager {
     /// spawns, reused while the served model matches, restarted on model
     /// switch, and killed on daemon [`AgentManager::shutdown`].
     unsloth: Arc<crate::unsloth_server::UnslothServerManager>,
+    /// Descendant-tree memory probe for read-only visibility (monorepo#2063
+    /// A2): installed unconditionally by the composition root (unlike the
+    /// budget probe on the registry, which only exists when
+    /// `agents.memoryBudgetMb` resolves to a positive value) so
+    /// `agent.diagnostics` can serve per-agent subtree attribution whether or
+    /// not a budget is configured. Absent in tests / bare wiring.
+    tree_probe: std::sync::OnceLock<Arc<dyn TreeMemoryProbe>>,
 }
 
 impl AgentManager {
@@ -1294,10 +1930,11 @@ impl AgentManager {
     pub fn new(services: Services, sink: Arc<dyn EventSink>, cap: usize) -> Self {
         // Wire the registry event function to publish process-cap lifecycle events.
         let services_clone = services.clone();
-        let event_fn: ProcessEventFn = Arc::new(move |agent_id, event_type, used, cap| {
+        let event_fn: ProcessEventFn = Arc::new(move |agent_id, event_type, used, cap, reason| {
             let services = services_clone.clone();
             let agent_id = agent_id.clone();
             let event_type = event_type.to_string();
+            let reason = reason.to_string();
             Box::pin(async move {
                 // Best-effort workspace lookup: process-cap events are global across
                 // workspaces, so when the session row is missing (mid-create or already
@@ -1316,6 +1953,7 @@ impl AgentManager {
                             "agentId": agent_id.0,
                             "used": used,
                             "cap": cap,
+                            "reason": reason,
                         }),
                     )
                     .await;
@@ -1344,6 +1982,7 @@ impl AgentManager {
             agent_config_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
@@ -1353,6 +1992,7 @@ impl AgentManager {
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
+            tree_probe: std::sync::OnceLock::new(),
         }
     }
 
@@ -1443,6 +2083,58 @@ impl AgentManager {
     /// Borrow the process registry (lifecycle / diagnostics).
     pub fn registry(&self) -> &ProcessRegistry {
         &self.registry
+    }
+
+    /// Install the descendant-tree memory probe for read-only visibility
+    /// (monorepo#2063 A2). Called once by the composition root after the
+    /// sampler exists; a second call is a no-op. Deliberately separate from
+    /// [`ProcessRegistry::set_memory_budget`]: diagnostics attribution wants
+    /// the probe even when no budget is configured.
+    pub fn set_tree_probe(&self, probe: Arc<dyn TreeMemoryProbe>) {
+        let _ = self.tree_probe.set(probe);
+    }
+
+    /// Per-agent subtree memory attribution from the installed probe
+    /// (monorepo#2063 A2), or an empty map when no probe is wired (tests /
+    /// bare wiring) or no sample has landed yet.
+    pub fn agent_memory_samples(&self) -> HashMap<AgentId, u64> {
+        self.tree_probe
+            .get()
+            .map(|p| p.agent_samples())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of `spawned child pid -> agent id` for every live handle that
+    /// owns a child process (monorepo#2063 Phase A). Handles without a known
+    /// pid (fake/transport-only handles) are omitted. The descendant-tree
+    /// sampler uses this to bucket subtree RSS by nearest registered agent
+    /// root; it is a point-in-time snapshot, so a pid may already be dead by
+    /// the time the caller walks the process table — the walk simply finds no
+    /// process for it.
+    ///
+    /// Handles whose child has already been reaped are omitted too: a dead
+    /// child's handle stays installed until the exit watcher removes it, and
+    /// in that window the OS can recycle the pid for an unrelated process —
+    /// mapping it would credit that stranger's subtree to the old agent.
+    /// `try_wait` is cheap and idempotent (tokio caches the exit status), so
+    /// this costs one non-blocking syscall per live handle. An indeterminate
+    /// `try_wait` error is treated as reaped: the pid cannot be trusted, and
+    /// its subtree falls back to the aggregate rather than a wrong bucket.
+    pub fn agent_root_pids(&self) -> HashMap<u32, AgentId> {
+        self.handles
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|(agent_id, handle)| {
+                let pid = handle.child_pid?;
+                if let Some(child) = handle._child.as_mut() {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        return None;
+                    }
+                }
+                Some((pid, agent_id.clone()))
+            })
+            .collect()
     }
 
     /// Resolve an outstanding interactive permission prompt (`agent.respondPermission`,
@@ -1584,6 +2276,13 @@ impl AgentManager {
         // flag (same snapshot semantics as the `[agentFeatures]` capture
         // below).
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+        // `[agentFeatures]` for this session: the snapshot stamped on the row
+        // at creation (`harness_features`, monorepo#2459), with a live-settings
+        // fallback for legacy pre-0096 rows. Used for both the MCP bridge and
+        // the prompt assembly below, so a respawn (model change, daemon
+        // restart) keeps the surface the session was created with — matching
+        // what `harnessFeatures` reports on the wire.
+        let agent_features = self.services.session_agent_features(&session);
 
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
@@ -1596,10 +2295,10 @@ impl AgentManager {
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
                 .with_turn_attachments(Some(self.services.turn_attachments()))
-                // `[agentFeatures]` toggles are captured here, at bridge
-                // creation, so they apply to new sessions only — a settings
-                // change never mutates a live agent's surface.
-                .with_agent_features(self.services.effective_settings().agent_features)
+                // The session's captured `[agentFeatures]` snapshot: settings
+                // changes after creation never mutate this session's surface,
+                // across respawns included.
+                .with_agent_features(agent_features.clone())
                 .with_cow_capable(cow_capable)
                 // Sub-agent bridges prune/deny `ws.app.question.*` (top-level
                 // agents only own a user-facing chat turn).
@@ -1714,13 +2413,13 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `rtk.enabled` and the `[agentFeatures]` toggles are global
-            // (non-workspace-scoped) settings, captured once here so the
-            // persisted prompt reflects the flags at session creation
-            // ("new sessions only"); auto-commit resolves per-workspace
-            // (persisted override → global `git.autoCommit` fallback, spec
-            // Diagnosis §3b) so the prompt reflects what the commit gate
-            // will actually enforce.
+            // `rtk.enabled` is a global (non-workspace-scoped) setting read
+            // live at spawn; the `[agentFeatures]` toggles come from the
+            // session's captured snapshot (`agent_features` above) so the
+            // prompt matches the surface stamped at session creation;
+            // auto-commit resolves per-workspace (persisted override → global
+            // `git.autoCommit` fallback, spec Diagnosis §3b) so the prompt
+            // reflects what the commit gate will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: `is_sub_agent` (derived from the session read
@@ -1736,7 +2435,7 @@ impl AgentManager {
                 is_sub_agent,
                 auto_commit_enabled,
                 settings.rtk.enabled,
-                &settings.agent_features,
+                &agent_features,
                 workspace.as_ref(),
                 Some(&session),
             )
@@ -3011,7 +3710,7 @@ impl AgentManager {
         if prompt.is_empty() {
             return None;
         }
-        Some(format!("<system>\n{prompt}\n</system>"))
+        Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
     /// Compute the fire-once workspace-naming instruction for the outbound
     /// prompt, or `None` when it should be omitted. Ported from the reference
@@ -3068,9 +3767,7 @@ impl AgentManager {
                 GENERIC_NAMING_TOOL_REFERENCE
             }
         };
-        Some(format!(
-            "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-        ))
+        Some(crate::harness::latest().naming_nudge(tool_ref))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3112,31 +3809,26 @@ impl AgentManager {
             }
             _ => content.to_string(),
         };
+        // Resolve each envelope layer's data (gating stays here); the
+        // harness owns the wording and the layering order.
+        //
         // Role reminder is rebuilt every turn (interval = 1, port of
         // acp-provider.ts) and prepended to the outbound prompt for specialist
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
         let body = self.build_turn_body(agent_id, &combined).await;
-        let prompt_text = match reminder {
-            Some(r) => format!("{r}\n\n{body}"),
-            None => body,
-        };
         // Fire-once workspace-naming instruction (port of
         // `agent-backend-handler.service.ts` `namingInstructions`): on the
         // first turn of an agent in a still-untitled / slug-titled workspace,
-        // prepend a `<system>` block asking the agent to set the workspace
-        // title as its first action. Never mutates the persisted user
-        // message; agent-rename half is deferred until the daemon exposes a
+        // a `<system>` block asking the agent to set the workspace title as
+        // its first action. Never mutates the persisted user message;
+        // agent-rename half is deferred until the daemon exposes a
         // `set_agent_name` tool.
         let naming = self
             .build_workspace_naming_instruction(agent_id, workspace_id)
             .await;
-        let prompt_text = match naming {
-            Some(sys) => format!("{sys}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
-        // `stdinContext` is prepended verbatim as a `Context:` block; the
+        // `stdinContext` renders verbatim as a `Context:` block; the
         // trailing separator matches the reference `acp-provider.ts` so
         // downstream consumers see the same shape whether the prompt
         // originates from the daemon or the legacy Electron main path.
@@ -3148,42 +3840,37 @@ impl AgentManager {
             Some(ctx) if !ctx.is_empty() => None,
             _ => build_stdin_context_from_context_references(options.context_references.as_ref()),
         };
-        let prompt_text = match options.stdin_context.as_deref() {
-            Some(ctx) if !ctx.is_empty() => format!("Context:\n{ctx}\n\n---\n\n{prompt_text}"),
-            _ => match synthesised.as_deref() {
-                Some(ctx) if !ctx.is_empty() => {
-                    format!("Context:\n{ctx}\n\n---\n\n{prompt_text}")
-                }
-                _ => prompt_text,
-            },
+        let stdin_context = match options.stdin_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => Some(ctx),
+            _ => synthesised.as_deref().filter(|ctx| !ctx.is_empty()),
         };
         // Per-turn agent state snapshot (`current ws.agent.snapshot() =>
         // {...}`): the outermost RECURRING per-turn decoration — before
-        // context/naming/reminder, after only the fire-once FirstTurnPrepend
-        // below. Rebuilt every turn for ALL agents (specialist and
+        // context/naming/reminder, after only the fire-once FirstTurnPrepend.
+        // Rebuilt every turn for ALL agents (specialist and
         // non-specialist, unlike the role reminder) and never persisted.
         // `agent_state_snapshot_line` reads `agentFeatures.stateSnapshot`
         // LIVE and returns `None` when the toggle is off or the snapshot is
         // trivial (all counts zero, no pending attention), leaving the
         // prompt byte-identical to pre-feature output.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
-        let prompt_text = match snapshot_line {
-            Some(line) => format!("{line}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
-        // assembled system prompt
-        // is delivered as the OUTERMOST `<system>` block on the first prompt
-        // of each fresh ACP session — before context/naming/reminder/user
-        // content. Armed by `start_session` on `session/new` (brand-new or
-        // recreate, never `session/load` resume) and consumed here so it
-        // fires exactly once per fresh session.
+        // assembled system prompt is delivered as the OUTERMOST `<system>`
+        // block on the first prompt of each fresh ACP session — before
+        // context/naming/reminder/user content. Armed by `start_session` on
+        // `session/new` (brand-new or recreate, never `session/load` resume)
+        // and consumed here so it fires exactly once per fresh session.
         let prepend = self.build_first_turn_prepend(agent_id).await;
-        let prompt_text = match prepend {
-            Some(sys) => format!("{sys}\n\n{prompt_text}"),
-            None => prompt_text,
-        };
+        let prompt_text =
+            crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
+                first_turn_prepend: prepend.as_deref(),
+                snapshot_line: snapshot_line.as_deref(),
+                stdin_context,
+                naming_nudge: naming.as_deref(),
+                role_reminder: reminder.as_deref(),
+                body: &body,
+            });
         let mut blocks = text_prompt(&prompt_text);
         append_attachment_blocks(&mut blocks, options);
         // Resolve `noteIds` to `workspace-asset://` image content blocks
@@ -3217,10 +3904,7 @@ impl AgentManager {
                             blocks.push(img);
                         }
                     }
-                    let notice = format!(
-                        "[System: {n} image(s) from the referenced note(s) are attached to this message.]",
-                        n = images.len(),
-                    );
+                    let notice = note_images_notice(images.len());
                     blocks.extend(text_prompt(&notice));
                 }
             }
@@ -3391,29 +4075,24 @@ impl AgentManager {
         redelivery: Option<crate::agent_ops::QueuedPrepend>,
         sync_store: bool,
     ) -> (bool, Option<(Child, Option<u32>)>) {
-        // Snapshot the live-turn slot BEFORE aborting the worker (the abort
-        // drops LiveTurnGuard, clearing the slot), then flush the partial
-        // in-flight assistant content AFTER the abort — same convention as
-        // the graceful-shutdown flush. A worker append already in flight at
-        // abort time can still land, but the `agent_message.id` PK keeps the
-        // outcome convergent (exactly one row; the UNIQUE collision is
-        // absorbed inside the flush). No-op when the slot is empty or was
-        // already flushed by a caller (e.g. shutdown(), which flushes before
-        // delegating here).
-        let partial_turn = self.services.live_turn(agent_id);
+        // Pin the live-turn slot BEFORE aborting the worker (the abort drops
+        // LiveTurnGuard; the pin keeps the slot published until the flush
+        // below persists the row — monorepo#2056), then flush the partial
+        // in-flight assistant content AFTER the abort — same convention as the
+        // graceful-shutdown flush. The flush re-reads the pinned slot, so an
+        // update processed in the pin→abort gap is persisted too
+        // (monorepo#2110). A worker append already in flight at abort time can
+        // still land, but the `agent_message.id` PK keeps the outcome
+        // convergent (exactly one row; the UNIQUE collision is absorbed inside
+        // the flush). No-op when the slot is empty or was already flushed by a
+        // caller (e.g. shutdown(), which flushes before delegating here).
+        self.services.pin_live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
-        if let Some(live) = partial_turn {
-            self.services
-                .flush_partial_turn_on_interruption(
-                    agent_id,
-                    live,
-                    InterruptReason::AgentStopped,
-                    None,
-                )
-                .await;
-        }
+        self.services
+            .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
+            .await;
         // Drop any pending recreate/prepend flags: the next spawn re-decides
         // resume vs recreate from scratch, so stale flags must not survive a
         // teardown (a session/load resume must not fire a stale prepend).
@@ -3425,6 +4104,12 @@ impl AgentManager {
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
+        // Same staleness terms for the streaming path's persisted terminal-
+        // error stash (monorepo#2050): the abort above may have landed between
+        // `run_prompt_turn`'s stash and the terminal-failure handler's take,
+        // and the orphaned context describes the aborted turn, not a future
+        // failure.
+        self.services.discard_pending_terminal_error(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -3518,23 +4203,27 @@ impl AgentManager {
         let Some(acp_session_id) = acp_session_id else {
             return (self.stop_with_redelivery_arm(agent_id, reason).await, None);
         };
-        // Snapshot the live-turn slot BEFORE aborting the worker: the abort
-        // drops the worker future and with it the LiveTurnGuard, which clears
-        // the slot — reading after the abort would race that drop and
-        // frequently lose the partial content. The busy flag is snapshotted
-        // alongside (before `end_turn` below releases it) for the zero-output
-        // stop-redelivery arm at the bottom of this method.
-        let partial_turn = self.services.live_turn(agent_id);
+        // Pin the live-turn slot BEFORE aborting the worker: the abort drops
+        // the worker future and with it the LiveTurnGuard, so an UNPINNED slot
+        // read after the abort would race that drop and frequently lose the
+        // partial content. The pin keeps the slot published to `chat.subscribe`
+        // until the flush below persists the row (monorepo#2056) and lets that
+        // flush read the slot as it stands rather than a clone taken here
+        // (monorepo#2110). The busy flag is snapshotted alongside (before
+        // `end_turn` below releases it) for the zero-output stop-redelivery
+        // arm at the bottom of this method.
+        self.services.pin_live_turn(agent_id);
         let turn_in_flight = self.is_busy(agent_id);
-        let had_output = partial_turn
-            .as_ref()
-            .map(|live| !live.blocks.is_empty())
-            .unwrap_or(false);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
+        // The abort may have landed between the streaming path's terminal-
+        // error stash and the handler's take (monorepo#2050); the orphaned
+        // context describes the aborted turn, so it must not survive into a
+        // later failure's settle.
+        self.services.discard_pending_terminal_error(agent_id);
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row, stamped with the interruption reason (+ sender
         // attribution on preemption). Runs AFTER the abort (a worker append
@@ -3550,22 +4239,20 @@ impl AgentManager {
         // the STAB-114 phantom-row-free zero-output preemption; the
         // combined-delivery re-queue check in `preempt_busy_turn` excludes
         // this row by id).
-        let interrupted_text_blocks = partial_turn
-            .as_ref()
-            .map(|live| crate::agent_session::text_block_strings(&live.blocks))
-            .unwrap_or_default();
-        let interrupted_message_id = match partial_turn {
-            Some(live) => {
-                self.services
-                    .flush_partial_turn_on_interruption(
-                        agent_id,
-                        live,
-                        reason,
-                        interrupted_by.as_ref(),
-                    )
-                    .await
-            }
-            None => None,
+        let flushed = self
+            .services
+            .flush_pinned_turn_on_interruption(agent_id, reason, interrupted_by.as_ref())
+            .await;
+        // `None` means nothing was pinned — no turn in flight, hence no output.
+        // A pinned slot cannot vanish before the flush: `LiveTurnGuard::drop`
+        // and the normal turn-end clear both leave a pinned slot to the flush
+        // that owns it, so a turn that ends in the abort gap is still read here
+        // as it really ended (monorepo#2110) — including the zero-output
+        // completion that persists no row of its own and must therefore still
+        // produce the marker row and arm the redelivery below.
+        let (interrupted_message_id, interrupted_text_blocks, had_output) = match flushed {
+            Some(f) => (f.message_id, f.text_blocks, f.had_output),
+            None => (None, Vec::new(), false),
         };
         // Zero-output user stop (intent-hq/monorepo#1757): the cancelled
         // provider turn dropped the stopped message before producing any
@@ -3928,21 +4615,101 @@ impl AgentManager {
     /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
     /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
+        self.try_begin_outcome(agent_id, workspace_id, true).await == TryBeginOutcome::Started
+    }
+
+    /// [`AgentManager::try_begin`] with the loss reason: callers that behave
+    /// differently on "a prompt worker owns the slot" (safe to hand work to)
+    /// versus "the idle-reap sweep holds the agent mid-kill" (nobody owns the
+    /// slot; the handle is being torn down) need the distinction decided under
+    /// the SAME `busy`-lock acquisition as the claim itself — re-probing after
+    /// a `bool` loss would race the claim's release (monorepo#2118 review).
+    ///
+    /// `auto_unarchive` gates the #1216 auto-unarchive on a `Started` claim:
+    /// every normal turn start passes `true`. The worker's end-of-turn raced
+    /// re-claim passes `false` — its pre-claim archived gate is inherently
+    /// check-then-act, so an archive persisting between that row read and
+    /// this claim would otherwise be flipped straight back to Active by the
+    /// claim itself; suppressing the flip lets the caller re-check the row
+    /// while HOLDING the slot and park instead (monorepo#2513, PR #1244
+    /// review).
+    async fn try_begin_outcome(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        auto_unarchive: bool,
+    ) -> TryBeginOutcome {
         // Insert into `agent_ws` while still holding the `busy` lock
         // (busy → agent_ws order, matching `list_busy`) so a concurrent
         // `list_busy` never observes a busy agent without its workspace.
-        let claimed = {
+        let outcome = {
             let mut busy = self.busy.lock().unwrap();
-            let claimed = busy.insert(agent_id.clone());
-            if claimed {
+            // An agent claimed by the idle-reap sweep (monorepo#2118) counts
+            // as busy: the sweep is about to (or is mid-way through) killing
+            // its child tree, so starting a turn now would hand that turn's
+            // fresh children to the kill. The caller's queue fallback parks
+            // the message; the sweep kicks the drain after releasing.
+            let outcome = if busy.contains(agent_id) {
+                TryBeginOutcome::Busy
+            } else if self.reap_claims.lock().unwrap().contains(agent_id) {
+                TryBeginOutcome::ReapClaimed
+            } else {
+                TryBeginOutcome::Started
+            };
+            if outcome == TryBeginOutcome::Started {
+                // Drop a live-turn slot that outlived its turn BEFORE the claim
+                // becomes visible (monorepo#2104). A slot can survive its turn:
+                // when `flush_partial_turn_on_interruption` hits a non-UNIQUE
+                // store error it deliberately keeps the slot as the only copy of
+                // the streamed content. This turn's worker replaces the slot only
+                // in `begin_live_turn`, which is many awaits away — the user row
+                // INSERT, the task spawn, the ACP session setup — so without this
+                // clear the pair (busy = true, slot = the PREVIOUS turn's content)
+                // would be readable for that whole window, and `chat_snapshot`
+                // would serve stale content labelled `isStreaming: true`.
+                //
+                // Ordering is the point: clearing under the `busy` lock and
+                // BEFORE publishing the claim means any reader that observes
+                // `busy == true` is guaranteed to observe the stale slot already
+                // gone (`chat_snapshot` reads busy first for exactly this
+                // reason). Lock order is busy → live_turns, consistent with the
+                // busy → agent_ws invariant above; nothing acquires `live_turns`
+                // and then `busy`.
+                //
+                // A slot whose teardown flush is still IN FLIGHT is left alone:
+                // that flush re-reads it at flush time (monorepo#2110), and
+                // `interrupt_inner` pins without a busy claim, so a stop against
+                // an idle agent can have a flush in flight while this claim
+                // wins. Clearing there would drop the content and make the flush
+                // misread the vanished slot as "the worker persisted the full
+                // row". A flush that already GAVE UP is not coming back, so the
+                // slot it kept is cleared like any other orphan.
+                self.services
+                    .clear_live_turn_unless_flush_in_flight(agent_id);
+                busy.insert(agent_id.clone());
                 self.agent_ws
                     .lock()
                     .unwrap()
                     .insert(agent_id.clone(), workspace_id.clone());
             }
-            claimed
+            outcome
         };
-        if claimed {
+        if outcome == TryBeginOutcome::Started {
+            // A real turn is starting: if the workspace is Archived, flip it
+            // back to Active and emit the stamped §6.5 delta (auto-unarchive
+            // on agent activity). Runs BEFORE the activity/status emits so
+            // subscribers see the workspace Active by the time the turn's
+            // own events arrive. Best-effort: never blocks the turn. The
+            // enqueue paths (archived gates in `try_drain_queue` /
+            // `deliver_wake_message`) are untouched — only a claimed slot
+            // triggers this. Suppressed (`auto_unarchive = false`) only by
+            // the worker's raced re-claim, whose own post-claim archived
+            // re-check parks instead of un-archiving (monorepo#2513).
+            if auto_unarchive {
+                self.services
+                    .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                    .await;
+            }
             self.services.agent_activity_begin(workspace_id).await;
             // Clear stop_reason when starting a new turn: successful turns leave it cleared.
             self.persist_status_with_stop_reason(
@@ -3954,7 +4721,7 @@ impl AgentManager {
             )
             .await;
         }
-        claimed
+        outcome
     }
 
     /// Release the in-flight slot without persisting agent status (used when
@@ -4475,6 +5242,29 @@ impl AgentManager {
             return Ok(result);
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
+        // Delivery-time unblocked hints (monorepo#2044), direct-send arm: an
+        // idle target delivers the wake immediately, so delivery time is NOW
+        // — compute the section here so an unqueued completion wake carries
+        // it too. Queued deliveries get theirs at drain time instead.
+        let content = if crate::agent_ops::ready_delta::metadata_has_triggers(
+            options.message_metadata.as_ref(),
+        ) && !content
+            .contains(crate::agent_ops::ready_delta::UNBLOCKED_SECTION_PREFIX)
+        {
+            match self
+                .services
+                .unblocked_section_for_delivery(
+                    &agent_id,
+                    std::iter::once(options.message_metadata.as_ref()),
+                )
+                .await
+            {
+                Some(section) => format!("{content}\n\n{section}"),
+                None => content,
+            }
+        } else {
+            content
+        };
         // Mint the turn correlation id (monorepo#1022) BEFORE the persist so
         // the user-row `agent:message` echo, the RPC result, and the turn
         // worker (via `options`) all carry the SAME id. `spawn_worker` keeps
@@ -4784,6 +5574,9 @@ impl AgentManager {
         // Dequeue-wait note: same placement contract — the persisted row and
         // the provider prompt both carry the enqueue time + wait.
         annotate_dequeue_wait(&mut next);
+        // Delivery-time unblocked hints (monorepo#2044): resolved NOW, at
+        // render time, from the trigger ids the wake stamped at enqueue.
+        annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut next)).await;
         // Drain-start signal (monorepo#1022): the entry just flipped to
         // in-flight; its `turnId` covers redrives that skip the user-row
         // append below. Emitted AFTER the stale-redrive annotation so the
@@ -4927,6 +5720,9 @@ impl AgentManager {
         // Dequeue-wait note: parity with the drain paths — the "send now"
         // delivery tells the target when the entry was enqueued.
         annotate_dequeue_wait(&mut entry);
+        // Delivery-time unblocked hints (monorepo#2044): parity with the
+        // drain paths — resolved at render time.
+        annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut entry)).await;
         // Publish the shrunk snapshot (write-through persist inside) so
         // clients see the entry leave the queue before the turn starts.
         self.services
@@ -5602,19 +6398,37 @@ impl AgentManager {
             _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
-        // instead of interleaving. On the rare loss (a send claimed the slot
-        // between the busy check and here), the first notification is already
-        // consumed, so still stream it as an implicit turn — but with a ZERO
-        // settle window, handing the receiver straight back to the blocked
-        // prompt worker — and leave every slot-owner duty (registry
-        // active/idle marks, slot release, idle emit, queue drain) to the
-        // prompt turn that won the slot: marking idle here would flag the
-        // process eviction-eligible (and pop a spawn waiter) mid-prompt-turn.
-        if !self.try_begin(agent_id, workspace_id).await {
-            self.services
-                .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, Duration::ZERO)
-                .await;
-            return true;
+        // instead of interleaving. On the rare loss to a PROMPT turn (a send
+        // claimed the slot between the busy check and here), the first
+        // notification is already consumed, so still stream it as an implicit
+        // turn — but with a ZERO settle window, handing the receiver straight
+        // back to the blocked prompt worker — and leave every slot-owner duty
+        // (registry active/idle marks, slot release, idle emit, queue drain)
+        // to the prompt turn that won the slot: marking idle here would flag
+        // the process eviction-eligible (and pop a spawn waiter)
+        // mid-prompt-turn.
+        match self.try_begin_outcome(agent_id, workspace_id, true).await {
+            TryBeginOutcome::Started => {}
+            TryBeginOutcome::Busy => {
+                self.services
+                    .run_harness_wake_turn(
+                        &mut guard,
+                        first,
+                        agent_id,
+                        workspace_id,
+                        Duration::ZERO,
+                    )
+                    .await;
+                return true;
+            }
+            // A loss to the idle-reap sweep is NOT a prompt worker owning the
+            // slot: the sweep holds the agent mid-kill (monorepo#2118), so
+            // driving a harness wake turn here would run unowned concurrent
+            // work against the handle being torn down. Drop the consumed
+            // notification instead — it is the tail of the dying child's
+            // output and would have died with the handle's buffer had the
+            // kill won the race to it.
+            TryBeginOutcome::ReapClaimed => return true,
         }
         self.registry.mark_active(agent_id);
         // Drive the turn in its own task registered in `workers`, so
@@ -5720,10 +6534,14 @@ impl AgentManager {
         self.persist_retry_status(&agent_id, workspace_id, next_status)
             .await?;
 
-        // Abort any in-flight worker task and release the in-flight slot
+        // Abort any in-flight worker task and release the in-flight slot.
+        // Any terminal-error context the aborted worker's streaming path
+        // stashed (monorepo#2050) is stale on the same terms as the streak
+        // cleared above — retry is the clean-slate escape hatch.
         if let Some(worker) = self.workers.lock().unwrap().remove(&agent_id) {
             worker.abort();
         }
+        self.services.discard_pending_terminal_error(&agent_id);
         self.release_in_flight_slot(&agent_id).await;
 
         // Tear down any stale child handle (use kill_child_only to avoid
@@ -5970,6 +6788,16 @@ impl AgentManager {
         // the common case for every turn after the first.
         self.services.await_sandbox_provisioning(agent_id).await;
         let mut session = self.services.store.get_agent_session(agent_id).await?;
+        // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
+        // row still carrying harness_features = NULL gets its snapshot
+        // materialized at this activation choke point — every turn (first
+        // spawn, resume, respawn, wake) funnels through here. One-time and
+        // idempotent; a no-op for stamped rows. (`session` stays mutable:
+        // the per-agent-isolation provisioning below persists sandbox
+        // fields onto it inline.)
+        self.services
+            .materialize_legacy_harness_features(&mut session)
+            .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         // Per-agent isolation execution environments: every agent in the
         // workspace — top-level `agent.create` included, not just delegates —
@@ -6265,11 +7093,14 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
-            // Snapshot the live-turn slot BEFORE aborting the worker: the abort
-            // drops the worker future and with it the LiveTurnGuard, which
-            // clears the slot — reading after the abort would race that drop
-            // and frequently lose the partial content.
-            let partial_turn = self.services.live_turn(id);
+            // Pin the live-turn slot BEFORE aborting the worker: the abort
+            // drops the worker future and with it the LiveTurnGuard, so an
+            // UNPINNED slot read after the abort would race that drop and
+            // frequently lose the partial content. The pin both keeps the slot
+            // published to `chat.subscribe` until the flush below persists the
+            // row (monorepo#2056) and lets that flush re-read the slot as it
+            // stands (monorepo#2110).
+            self.services.pin_live_turn(id);
             // Abort the turn worker BEFORE flushing so it cannot race the
             // partial flush by persisting the full turn under the same minted
             // message id (which would leave the transcript stuck on the partial
@@ -6279,19 +7110,12 @@ impl AgentManager {
                 worker.abort();
             }
             // Best-effort: persist any partial in-flight assistant content from
-            // the snapshot so the transcript keeps the streamed-so-far output
-            // across the restart. Runs before the status guards below so a
-            // degenerate status read/encode failure never drops the content.
-            if let Some(live) = partial_turn {
-                self.services
-                    .flush_partial_turn_on_interruption(
-                        id,
-                        live,
-                        InterruptReason::DaemonShutdown,
-                        None,
-                    )
-                    .await;
-            }
+            // the pinned slot so the transcript keeps the streamed-so-far
+            // output across the restart. Runs before the status guards below so
+            // a degenerate status read/encode failure never drops the content.
+            self.services
+                .flush_pinned_turn_on_interruption(id, InterruptReason::DaemonShutdown, None)
+                .await;
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -6382,11 +7206,98 @@ impl AgentManager {
     /// activity is older than `ttl`, skipping any with an in-flight prompt (a
     /// live turn loop in `busy`). Active streaming agents are protected by the
     /// registry's `is_active` flag. Returns the number reaped.
-    pub async fn reap_idle_older_than(&self, ttl: Duration) -> usize {
-        let busy = self.busy.clone();
-        self.registry
-            .evict_idle_older_than(ttl, move |id| !busy.lock().unwrap().contains(id))
-            .await
+    ///
+    /// Claim-before-kill (monorepo#2118): instead of a bare busy check, each
+    /// candidate is CLAIMED into `reap_claims` under the `busy` lock (the
+    /// same lock `try_begin` claims under), so no turn can start between the
+    /// eligibility check and the `kill().await` — a send racing the sweep
+    /// loses `try_begin` and parks its message on the queue instead. After
+    /// the sweep, any released agent with a ready queue gets a drain kick so
+    /// a message that parked behind the claim starts a fresh turn (the agent
+    /// respawns on demand) rather than stranding until the next queue event.
+    pub async fn reap_idle_older_than(self: &Arc<Self>, ttl: Duration) -> usize {
+        let (try_claim, release, released) = self.reap_claim_fns();
+        let reaped = self
+            .registry
+            .evict_idle_older_than(ttl, try_claim, release)
+            .await;
+        self.kick_released(released).await;
+        reaped
+    }
+
+    /// Budget-triggered idle reap (monorepo#2063 level 2): while the aggregate
+    /// charge is over the installed budget, evict idle agents
+    /// largest-attributed-subtree-first (Phase A attribution; LRU fallback
+    /// when attribution is unavailable) — without waiting for the TTL or for
+    /// a spawn attempt. No budget / no sample / under budget → no-op. Same
+    /// claim-before-kill semantics (monorepo#2118) and post-sweep drain kick
+    /// as [`Self::reap_idle_older_than`]. Returns the number reaped.
+    pub async fn reap_over_budget(self: &Arc<Self>) -> usize {
+        let (try_claim, release, released) = self.reap_claim_fns();
+        let reaped = self
+            .registry
+            .evict_while_over_budget(try_claim, release)
+            .await;
+        self.kick_released(released).await;
+        reaped
+    }
+
+    /// The claim-before-kill wiring (monorepo#2118) shared by every reap
+    /// sweep: `try_claim` check-and-claims into `reap_claims` under the
+    /// `busy` lock, `release` drops the claim and records the id for the
+    /// post-sweep drain kick ([`Self::kick_released`]).
+    #[allow(clippy::type_complexity)]
+    fn reap_claim_fns(
+        &self,
+    ) -> (
+        impl Fn(&AgentId) -> bool,
+        impl Fn(&AgentId),
+        Arc<Mutex<Vec<AgentId>>>,
+    ) {
+        let released: Arc<Mutex<Vec<AgentId>>> = Arc::new(Mutex::new(Vec::new()));
+        let try_claim = {
+            let busy = self.busy.clone();
+            let claims = self.reap_claims.clone();
+            move |id: &AgentId| {
+                // Lock order busy → reap_claims, matching `try_begin`, so
+                // "not busy → claimed" is atomic against a concurrent claim.
+                // The insert result IS the claim: `false` (already present)
+                // means an overlapping sweep holds this id — treating that as
+                // a win would let its release drop the shared claim while
+                // this sweep's kill is still in flight, reopening the window.
+                let busy = busy.lock().unwrap();
+                if busy.contains(id) {
+                    return false;
+                }
+                claims.lock().unwrap().insert(id.clone())
+            }
+        };
+        let release = {
+            let claims = self.reap_claims.clone();
+            let released = released.clone();
+            move |id: &AgentId| {
+                claims.lock().unwrap().remove(id);
+                released.lock().unwrap().push(id.clone());
+            }
+        };
+        (try_claim, release, released)
+    }
+
+    /// Drain kick for messages that parked behind a claim: with the claim
+    /// released, a ready queue would otherwise sit unworked until the next
+    /// external queue event (PROTOCOL §5.5 "never sits unworked").
+    async fn kick_released(self: &Arc<Self>, released: Arc<Mutex<Vec<AgentId>>>) {
+        let released = std::mem::take(&mut *released.lock().unwrap());
+        for id in released {
+            if !self.services.has_ready_to_send(&id) {
+                continue;
+            }
+            if let Ok(session) = self.services.store.get_agent_session(&id).await {
+                Arc::clone(self)
+                    .try_drain_queue(id, session.workspace_id)
+                    .await;
+            }
+        }
     }
 
     /// Tear down only the agent's child process + handle, without touching the
@@ -6932,15 +7843,49 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
-/// Push one `resource` content block per well-formed
-/// `{ data, mimeType, fileName }` entry.
+/// The system notice appended after note-referenced images are inlined
+/// (Fidelity B, PROTOCOL §5.5). Wording owned by the harness (H6).
+pub(crate) fn note_images_notice(n: usize) -> String {
+    crate::harness::latest().note_images_notice(n)
+}
+
+/// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
+/// `ws.file.getAttachment` retrieval instruction — the file bytes never ride
+/// the prompt for reference blocks. Wording owned by the harness (H6).
+pub(crate) fn attachment_reference_notice(
+    name: &str,
+    mime: Option<&str>,
+    size: Option<u64>,
+    id: &str,
+) -> String {
+    crate::harness::latest().attachment_reference_notice(name, mime, size, id)
+}
+
+/// Push one content block per well-formed file entry: inline
+/// `{ data, mimeType, fileName }` entries become `resource` blocks carrying
+/// the blob; attachment-reference `{ attachmentId, fileName }` entries
+/// (PROTOCOL §5.5) become a `text` attachment notice naming the metadata and
+/// directing the model to `ws.file.getAttachment(attachmentId)` — the file
+/// bytes never ride the prompt for reference blocks.
 fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>) {
     if let Some(files) = file_blocks.and_then(Value::as_array) {
         for file in files {
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+            let attachment_id = file
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if let (Some(id), Some(name)) = (attachment_id, name) {
+                let size = file.get("size").and_then(Value::as_u64);
+                let text = attachment_reference_notice(name, mime, size, id);
+                if let Ok(block) =
+                    serde_json::from_value::<ContentBlock>(json!({ "type": "text", "text": text }))
+                {
+                    blocks.push(block);
+                }
+            } else if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(json!({
                     "type": "resource",
                     "resource": {
@@ -7034,22 +7979,14 @@ fn session_provider_id(session: &AgentSession, configured_default: Option<&str>)
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP
 /// tool naming convention is unknown (or its workspace-MCP wiring hasn't
-/// landed yet).
-const GENERIC_NAMING_TOOL_REFERENCE: &str =
-    "the `set_workspace_title` tool from the workspace MCP server";
+/// landed yet). Wording owned by the harness (H5).
+pub(crate) use crate::harness::v1::GENERIC_NAMING_TOOL_REFERENCE;
 
 /// Provider-correct spelling of the workspace-MCP rename tool for the naming
-/// nudge. Providers affix the MCP server name differently: auggie exposes
-/// `<tool>_<server>` (trailing suffix → `set_workspace_title_workspace-mcp`),
-/// opencode exposes `<server>_<tool>` (leading prefix →
-/// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
-/// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
-fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
-    match provider_id {
-        "auggie" => "the `set_workspace_title_workspace-mcp` tool",
-        "opencode" => "the `workspace-mcp_set_workspace_title` tool",
-        _ => GENERIC_NAMING_TOOL_REFERENCE,
-    }
+/// nudge (e.g. auggie → `set_workspace_title_workspace-mcp`, opencode →
+/// `workspace-mcp_set_workspace_title`). Wording owned by the harness (H5).
+pub(crate) fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
+    crate::harness::latest().naming_tool_reference(provider_id)
 }
 
 /// Resolve everything needed to spawn (or respawn) this
@@ -7402,6 +8339,16 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
+        // about to go active re-checks the aggregate budget like a spawn
+        // would — queued behind eviction, never refused. Sits at the top of
+        // the loop, BEFORE `run_turn` marks the process active, so every
+        // turn (initial send and each queue-drain handoff) gates while the
+        // agent is still idle — and never mid-turn, where the process is
+        // marked active and `acquire_turn_start` admits immediately. An
+        // unregistered agent also admits immediately: its spawn below goes
+        // through `create_agent`'s `acquire`, the existing gate.
+        mgr.registry.acquire_turn_start(&agent_id).await;
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
                 // Clear any persisted completion report at the start of this turn
@@ -7638,6 +8585,22 @@ async fn run_message_worker(
                                 error = %e,
                                 "prompt idle timeout — consecutive-timeout cap spent, failing terminally"
                             );
+                            // Durable-before-observable (monorepo#2050): persist
+                            // Error + stop_reason and stash it BEFORE this branch
+                            // emits its own `agent:failed`, so a client reading
+                            // `agent.get`/`agent.getSession` on that event sees the
+                            // persisted Error. `handle_terminal_turn_failure` below
+                            // reuses the stash (streak recorded / status written
+                            // exactly once, monorepo#840).
+                            let persist = persist_terminal_error_status(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &e.to_string(),
+                            )
+                            .await;
+                            mgr.services
+                                .stash_pending_terminal_error(&agent_id, persist);
                             let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
                             if let Some(tid) = options.turn_id.as_deref() {
                                 data["turnId"] = json!(tid);
@@ -7777,6 +8740,74 @@ async fn run_message_worker(
                 break 'outer;
             }
         }
+        // Archived-workspace gate (intent-hq/monorepo#2513): the archive
+        // sweep keeps pending queues persisted and the enqueue paths
+        // (`try_drain_queue` / `deliver_wake_message`) park messages while
+        // the workspace is archived — but this end-of-turn drain used to
+        // bypass that gate. A wake parked mid-turn (e.g. the hook-cancel
+        // notice from an archive initiated by this agent's own hook) was
+        // popped at turn end: the pre-release arm ran a stray turn in the
+        // archived workspace, and the post-release raced re-check re-claimed
+        // the slot via `try_begin`, whose auto-unarchive (#1216) flipped the
+        // freshly archived workspace straight back to Active. Mirror the
+        // `try_drain_queue` gate here: when the workspace is archived at
+        // turn end, leave everything parked (unarchive kicks the drain for
+        // every parked queue) and exit the worker. Chief is virtual and
+        // never archived, so skip the row read; fail open on a lookup error
+        // — the gate only parks affirmatively-archived workspaces. The
+        // redelivery call mirrors the empty-queue exit arm below (no-op
+        // unless the queue is empty and an interim-skipped idle is marked).
+        if !workspace_id.is_chief() {
+            match mgr.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    tracing::debug!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        "worker end-of-turn drain parked: workspace is archived"
+                    );
+                    // Deregister BEFORE releasing the slot (the wake-listener
+                    // teardown order): while the slot is held no concurrent
+                    // drain can claim it and register a replacement worker,
+                    // so this provably removes only this worker's own entry.
+                    // `break 'outer` would instead reach the shared post-loop
+                    // `clear_worker` AFTER the release — an unarchive-kicked
+                    // drain can spawn (and register) a replacement in that
+                    // gap, and the late clear would deregister the
+                    // replacement, leaving it running but unreachable by
+                    // interrupt/stop (PR #1244 review). Returning also skips
+                    // the turn-end attention raise: the queue parked, the
+                    // agent did not finish its work.
+                    mgr.clear_worker(&agent_id);
+                    mgr.end_turn(&agent_id).await;
+                    mgr.services
+                        .redeliver_completion_after_queue_mutation(&agent_id)
+                        .await;
+                    // Close the unarchive strand window (PR #1244 review): an
+                    // unarchive that persisted between this gate's row read
+                    // and the `end_turn` above had its drain kick bounce off
+                    // this worker's still-held slot — leaving ready entries
+                    // parked in a now-Active workspace with nothing to kick
+                    // them. Re-kick now that the slot is released: the kick
+                    // self-gates (still archived → parks again; unarchived in
+                    // the window → drains), and an unarchive persisting after
+                    // ITS row read finds the slot free, so its own kick
+                    // proceeds — the window is closed from both sides.
+                    mgr.clone()
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "worker end-of-turn drain: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Question hold (PROTOCOL §5.5): questions may still be pending —
         // asked by the turn that just ended, or by an earlier turn the hold
         // has kept armed since — so draining the next AUTOMATIC queued
@@ -7851,6 +8882,10 @@ async fn run_message_worker(
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Delivery-time unblocked hints (monorepo#2044): resolved at
+            // render time, same placement as the single-entry drain arm.
+            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
+                .await;
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
@@ -7962,7 +8997,61 @@ async fn run_message_worker(
                 .await;
             break 'outer;
         };
-        if mgr.try_begin(&agent_id, &workspace_id).await {
+        if mgr.try_begin_outcome(&agent_id, &workspace_id, false).await == TryBeginOutcome::Started
+        {
+            // Archived re-check on the raced pop (intent-hq/monorepo#2513):
+            // the popped entry can be a wake parked by the archived gates
+            // AFTER the gate at the top of this drain ran — e.g. the
+            // hook-cancel notice from `workspace.archive`'s post-persist
+            // tail, enqueued exactly in this arm's race window. Running that
+            // wake would flip the workspace the wake was parked FOR straight
+            // back to Active — publishing the archive delta and then
+            // un-archiving, so a client that saw the delta reads `archived:
+            // false`. The check runs AFTER the slot re-claim, under the held
+            // slot (a pre-claim read is check-then-act: an archive
+            // persisting between the read and the claim would be flipped
+            // back by the claim's own #1216 auto-unarchive — PR #1244
+            // review), which is why the claim above SUPPRESSES the
+            // auto-unarchive: this read decides instead. Archived → hand the
+            // batch back, deregister, release the slot, and re-kick the
+            // self-gating drain (same closure as the pre-release arm: an
+            // unarchive whose kick bounced off this still-held slot — or
+            // whose `has_ready_to_send` probe ran while the batch sat in the
+            // local `raced`, invisible to it — is covered by our own kick
+            // against the now-requeued entries). Not archived → fall through
+            // to the turn with nothing to unarchive; fail open on a lookup
+            // error, matching the auto-unarchive's own error path (turn
+            // proceeds, workspace stays as-is).
+            if !workspace_id.is_chief() {
+                match mgr.services.store.get_workspace(&workspace_id).await {
+                    Ok(ws) if ws.archived => {
+                        tracing::debug!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            "worker raced re-check parked: workspace is archived"
+                        );
+                        mgr.services.requeue_front_batch(&agent_id, raced);
+                        // Deregister BEFORE releasing the slot, then return —
+                        // same teardown order and rationale as the
+                        // pre-release archived arm above.
+                        mgr.clear_worker(&agent_id);
+                        mgr.end_turn(&agent_id).await;
+                        mgr.clone()
+                            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                            .await;
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %agent_id,
+                            workspace = %workspace_id.as_str(),
+                            error = %e,
+                            "worker raced re-check: workspace archived-state lookup failed; proceeding"
+                        );
+                    }
+                }
+            }
             // A multi-entry raced pop (hold + `all` above) is already the
             // complete ready batch in stored order — run it as one combined
             // turn directly; folding or reordering here would break the
@@ -8055,6 +9144,10 @@ async fn run_message_worker(
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Delivery-time unblocked hints (monorepo#2044): same contract
+            // as the pre-release drain arm.
+            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
+                .await;
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
@@ -8233,6 +9326,11 @@ async fn prepare_flush_turn(
         annotate_dequeue_wait(entry);
         stale_flags.push(stale);
     }
+    // Delivery-time unblocked hints (monorepo#2044): all completion wakes in
+    // this batch coalesce into ONE fresh delta, appended to the last
+    // trigger-carrying entry. Runs before the row persists (same placement
+    // contract as the annotations above).
+    annotate_unblocked_hints(&mgr.services, agent_id, &mut entries).await;
     // Drain-start signal (monorepo#1022): one event for the combined turn,
     // keyed on the head entry (its `turn_id` IS the turn's id below).
     mgr.services
@@ -8724,36 +9822,46 @@ async fn publish_terminal_failure_events(
         .await;
 }
 
-/// Persist `AgentStatus::Error` (emitting `agent:status-changed`) and requeue
-/// the failed message to the front of the queue so `agent.retry` — or a future
-/// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
-/// turn-failure paths. The `error_text` argument is persisted into
-/// `agent_session.stop_reason` (stamping `stop_reason_timestamp`) and included
-/// in the `agent:status-changed` event's `stopReason` / `stopReasonTimestamp`
-/// fields (durable-before-observable). `persisted` reports whether the failed
-/// turn's user row durably reached the transcript (STAB-51). A system-role
-/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
-/// the InterruptionNotice shape, §5.35) is appended best-effort for each
-/// DISTINCT terminal failure — a repeat of the identical failure text with
-/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
-/// fresh redrive of the same message that fails again the same way) skips
-/// the append so the transcript never stacks duplicate cards. `agent.retry`
-/// clears the streak (the deliberate quarantine escape hatch), so a failure
-/// with the SAME text immediately after a retry still gets its own card —
-/// the user acted and it failed again, which is new information.
-async fn persist_error_and_requeue(
-    mgr: &AgentManager,
+/// Durable slice of the terminal-failure path (monorepo#2009): record the
+/// identical-failure streak and complete the `status = Error` + `stop_reason`
+/// store write WITHOUT touching the event bus. Every terminal-failure handler
+/// awaits this BEFORE publishing the terminal `agent:failed` +
+/// `agent:stream:end` pair (durable-before-observable), so a client that
+/// reads `agent.get`/`agent.getSession` upon observing either event is
+/// guaranteed the persisted Error. Returns the context the observable half
+/// ([`publish_error_status_and_requeue`]) needs to emit the matching events.
+pub(crate) struct PersistedTerminalError {
+    /// The failure text persisted into `agent_session.stop_reason`.
+    error_text: String,
+    /// Identical-failure streak AFTER recording this failure (monorepo#840).
+    streak: u32,
+    /// Whether the failure classifies the session as corrupted/poisoned
+    /// (monorepo#940), surfaced as `sessionCorrupted` on the wire.
+    session_corrupted: bool,
+    /// Timestamp persisted as `stop_reason_timestamp` alongside the status.
+    ts: String,
+    /// Whether the store write landed; `agent:status-changed` is only
+    /// emitted for a durable write.
+    status_persisted: bool,
+}
+
+/// Durable slice of the terminal-failure path, over the bare [`Services`]
+/// handle (monorepo#2050): the streaming path ([`Services::run_prompt_turn`])
+/// has no [`AgentManager`], but the persist touches only the services surface,
+/// so it can run there too — ahead of the streaming path's own terminal
+/// emits — and the resulting [`PersistedTerminalError`] is handed to the worker
+/// via [`Services::stash_pending_terminal_error`]. The `&AgentManager` entry
+/// point [`persist_terminal_error_status`] delegates here.
+pub(crate) async fn persist_terminal_error_status_via_services(
+    services: &Services,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
-    content: &str,
-    options: &TurnOptions,
-    persisted: bool,
     error_text: &str,
-) {
+) -> PersistedTerminalError {
     // monorepo#840: record the identical-failure streak BEFORE persisting so
     // `session_poisoned` sees a consistent (status, streak) pair as soon as
     // the Error status lands.
-    let streak = mgr.services.record_terminal_failure(agent_id, error_text);
+    let streak = services.record_terminal_failure(agent_id, error_text);
     // monorepo#940: the same classification that quarantines the session
     // (`session_poisoned`) is surfaced on the wire as `sessionCorrupted` so
     // clients get a structured "retry will recreate" signal, not just the raw
@@ -8767,12 +9875,12 @@ async fn persist_error_and_requeue(
             "session classified as poisoned; deliveries will park in the queue until agent.retry or a fresh agent (monorepo#840)"
         );
     }
-    // Persist agent status as Error WITH stop_reason and emit agent:status-changed.
-    // Durable-before-observable: the store write completes BEFORE the event is published,
-    // so subscribers see the canonical field immediately via agent.get/getSession.
+    // Persist agent status as Error WITH stop_reason. Durable-before-observable
+    // (monorepo#2009): this write completes BEFORE any terminal event reaches
+    // the bus, so subscribers see the canonical fields immediately via
+    // agent.get/getSession.
     let ts = now_iso();
-    if let Err(e) = mgr
-        .services
+    let status_persisted = match services
         .store
         .set_agent_session_status(
             workspace_id,
@@ -8784,8 +9892,71 @@ async fn persist_error_and_requeue(
         )
         .await
     {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
-    } else {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
+            false
+        }
+    };
+    PersistedTerminalError {
+        error_text: error_text.to_string(),
+        streak,
+        session_corrupted,
+        ts,
+        status_persisted,
+    }
+}
+
+/// `&AgentManager` entry point for the durable terminal-error persist; thin
+/// delegate to [`persist_terminal_error_status_via_services`].
+async fn persist_terminal_error_status(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    error_text: &str,
+) -> PersistedTerminalError {
+    persist_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, error_text)
+        .await
+}
+
+/// Observable half of the terminal-failure path: emit `agent:status-changed`
+/// for the Error persisted by [`persist_terminal_error_status`] and requeue
+/// the failed message to the front of the queue so `agent.retry` — or a
+/// future `agent.sendMessage` — can redrive it. Shared by the terminal spawn-
+/// and turn-failure paths; runs AFTER the terminal `agent:failed` +
+/// `agent:stream:end` pair so the wire order (`agent:failed` →
+/// `agent:stream:end` → `agent:status-changed` → `agent:queue:updated`) is
+/// unchanged by the monorepo#2009 persist reorder. The persisted `error_text`
+/// is included in the `agent:status-changed` event's `stopReason` /
+/// `stopReasonTimestamp` fields. `persisted` reports whether the failed
+/// turn's user row durably reached the transcript (STAB-51). A system-role
+/// transcript notice carrying the error text (`meta.kind = "turn-failure"`,
+/// the InterruptionNotice shape, §5.35) is appended best-effort for each
+/// DISTINCT terminal failure — a repeat of the identical failure text with
+/// no intervening `agent.retry` or successful turn (streak > 1, e.g. a
+/// fresh redrive of the same message that fails again the same way) skips
+/// the append so the transcript never stacks duplicate cards. `agent.retry`
+/// clears the streak (the deliberate quarantine escape hatch), so a failure
+/// with the SAME text immediately after a retry still gets its own card —
+/// the user acted and it failed again, which is new information.
+async fn publish_error_status_and_requeue(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    persisted: bool,
+    error: PersistedTerminalError,
+) {
+    let PersistedTerminalError {
+        error_text,
+        streak,
+        session_corrupted,
+        ts,
+        status_persisted,
+    } = error;
+    let error_text = error_text.as_str();
+    if status_persisted {
         // Emit agent:status-changed with stopReason + stopReasonTimestamp so live
         // subscribers get the canonical fields (the timestamp matches the value
         // persisted alongside stop_reason by `set_agent_session_status`).
@@ -8916,10 +10087,39 @@ async fn persist_error_and_requeue(
     }
 }
 
-/// Handle terminal spawn failure after all retries are exhausted. Publishes
-/// terminal `agent:failed` and `agent:stream:end` events, persists the agent
-/// status as `Error` with the error text into `stop_reason`, requeues the
-/// failed message to the front of the queue, and stops draining further messages.
+/// Single-call composition of [`persist_terminal_error_status`] +
+/// [`publish_error_status_and_requeue`] — the exact production halves in
+/// production order, minus the terminal `agent:failed`/`agent:stream:end`
+/// pair the handlers publish in between. Kept for the unit suite, which
+/// exercises the persist + requeue contract without the terminal pair.
+#[cfg(test)]
+async fn persist_error_and_requeue(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+    persisted: bool,
+    error_text: &str,
+) {
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, error_text).await;
+    publish_error_status_and_requeue(
+        mgr,
+        agent_id,
+        workspace_id,
+        content,
+        options,
+        persisted,
+        persist,
+    )
+    .await;
+}
+
+/// Handle terminal spawn failure after all retries are exhausted. Persists
+/// the agent status as `Error` with the error text into `stop_reason`
+/// (durable-before-observable, monorepo#2009), publishes terminal
+/// `agent:failed` and `agent:stream:end` events, requeues the failed message
+/// to the front of the queue, and stops draining further messages.
 async fn handle_terminal_spawn_failure(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -8930,6 +10130,10 @@ async fn handle_terminal_spawn_failure(
     error: &Error,
 ) {
     let error_text = error.to_string();
+    // Durable-before-observable (monorepo#2009): the Error + stop_reason store
+    // write completes before the terminal pair reaches the bus, so a client
+    // reading agent.getSession on agent:stream:end sees the persisted `error`.
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
     publish_terminal_failure_events(
         mgr,
         agent_id,
@@ -8938,14 +10142,14 @@ async fn handle_terminal_spawn_failure(
         options.turn_id.as_deref(),
     )
     .await;
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         persisted,
-        &error_text,
+        persist,
     )
     .await;
 }
@@ -8965,6 +10169,9 @@ async fn handle_drain_persist_failure(
 ) {
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
     tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
+    // Durable-before-observable (monorepo#2009): persist Error + stop_reason
+    // before the terminal pair reaches the bus.
+    let persist = persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await;
     publish_terminal_failure_events(
         mgr,
         agent_id,
@@ -8973,14 +10180,14 @@ async fn handle_drain_persist_failure(
         options.turn_id.as_deref(),
     )
     .await;
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         false,
-        &error_text,
+        persist,
     )
     .await;
 }
@@ -9003,7 +10210,7 @@ const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// spec's only sanctioned cancel-error shape is code `-32800` (the message is
 /// free text there too). The "cancelled" substring heuristic remains for
 /// non-RPC renderings, which carry no data suffix.
-fn prompt_cancellation_error(err: &Error) -> bool {
+pub(crate) fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
     };
@@ -9149,27 +10356,23 @@ fn idle_timeout_turn_streamed(err: &Error) -> bool {
 /// Render the warn-and-continue message injected after an idle timeout. The
 /// window is the ACTUAL configured value ([`intent_acp::session::prompt_idle_timeout`],
 /// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
-/// literal.
-fn idle_timeout_warning_text(window: std::time::Duration) -> String {
+/// literal. Wording owned by the harness (H6); the caller renders the
+/// seconds value (integer form for whole windows, float otherwise).
+pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     let secs = window.as_secs_f64();
     let rendered = if secs.fract() == 0.0 {
         window.as_secs().to_string()
     } else {
         secs.to_string()
     };
-    format!(
-        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
-         and was interrupted. If you were waiting on something external, schedule a \
-         `ws.hook.schedule` background hook to watch the condition and end your turn instead \
-         of blocking — the hook's wake message resumes you. Assess where you left off and \
-         continue the work."
-    )
+    crate::harness::latest().idle_timeout_warning(&rendered)
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
-/// cancel): tear down the dead child, ensure the terminal `agent:failed` +
-/// `agent:stream:end` pair reached the bus, persist `AgentStatus::Error` with
-/// the error text into `stop_reason`, and requeue the message for `agent.retry`.
+/// cancel): tear down the dead child, persist `AgentStatus::Error` with the
+/// error text into `stop_reason` (durable-before-observable, monorepo#2009),
+/// ensure the terminal `agent:failed` + `agent:stream:end` pair reached the
+/// bus, and requeue the message for `agent.retry`.
 /// Mirrors [`handle_terminal_spawn_failure`] but does NOT auto-retry inline —
 /// the prompt may have been partially processed, so redriving it is a user
 /// decision (the STAB-6 Retry surface).
@@ -9187,6 +10390,22 @@ async fn handle_terminal_turn_failure(
     mgr.kill_child_only(agent_id).await;
 
     let error_text = error.to_string();
+    // Durable-before-observable (monorepo#2009/#2050): persist Error +
+    // stop_reason before the terminal pair (when this path still owes it)
+    // reaches the bus. The streaming path (`run_prompt_turn`) that already
+    // emitted the pair also already persisted (durable-before-observable there
+    // too) and stashed the context — reuse it so the identical-failure streak
+    // (monorepo#840) is recorded exactly once and the Error status is not
+    // written twice. Fall back to persisting here when no stash exists (the
+    // pre-#2050 path: a `?`-propagated store error, or the idle-timeout-cap
+    // branch before its own persist). The stash is consumed only when its
+    // error text matches THIS failure — a self-validating guard on top of the
+    // teardown-path discards: a stale context (however it survived) must not
+    // skip the new failure's own persist or mis-describe it on the wire.
+    let persist = match mgr.services.take_pending_terminal_error(agent_id) {
+        Some(precomputed) if precomputed.error_text == error_text => precomputed,
+        _ => persist_terminal_error_status(mgr, agent_id, workspace_id, &error_text).await,
+    };
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(
             mgr,
@@ -9197,14 +10416,14 @@ async fn handle_terminal_turn_failure(
         )
         .await;
     }
-    persist_error_and_requeue(
+    publish_error_status_and_requeue(
         mgr,
         agent_id,
         workspace_id,
         content,
         options,
         persisted,
-        &error_text,
+        persist,
     )
     .await;
 }
@@ -9268,9 +10487,11 @@ mod role_reminder_tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -9281,6 +10502,8 @@ mod role_reminder_tests {
     ) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
             parent_agent_id: None,
@@ -9309,6 +10532,7 @@ mod role_reminder_tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -9319,6 +10543,7 @@ mod role_reminder_tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -10036,7 +11261,7 @@ mod dead_child_respawn_tests {
     /// and unset the behavior knobs so a spawned child can't inherit
     /// exit-inducing behavior leaked by a concurrently guarded test (the
     /// guard also holds `ENV_LOCK`, serializing all env-mutating tests).
-    fn mock_env(script: &str) -> EnvGuard {
+    pub(super) fn mock_env(script: &str) -> EnvGuard {
         EnvGuard::apply(&[
             ("MOCK_AGENT_SCRIPT_PATH", Some(script)),
             ("MOCK_AGENT_BEHAVIOR", None),
@@ -10046,7 +11271,7 @@ mod dead_child_respawn_tests {
 
     /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
     /// reused here so the respawn fall-through spawns a real child.
-    fn mock_agent_script() -> String {
+    pub(super) fn mock_agent_script() -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
             .canonicalize()
@@ -10168,6 +11393,495 @@ mod dead_child_respawn_tests {
         }
         mgr.stop(&agent_id).await;
     }
+
+    /// `agent_root_pids` maps each handle's spawned child pid to its agent id
+    /// (monorepo#2063 Phase A) and omits handles with no known pid — the
+    /// descendant-tree sampler must not bucket under a root it cannot place
+    /// in the process table.
+    #[tokio::test]
+    async fn agent_root_pids_maps_child_pids_and_skips_pidless_handles() {
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+
+        // A live child whose pid is known: it must appear in the map.
+        let with_pid = AgentId::from("agent-root-pid");
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeping child");
+        let pid = child.id().expect("live child has a pid");
+        let _ends_a = install_fake_handle(&mgr, &with_pid, Some(child));
+
+        // A transport-only handle with no child process: omitted.
+        let pidless = AgentId::from("agent-no-pid");
+        let _ends_b = install_fake_handle(&mgr, &pidless, None);
+
+        let roots = mgr.agent_root_pids();
+        assert_eq!(roots.get(&pid), Some(&with_pid));
+        assert_eq!(roots.len(), 1, "pidless handle contributes no entry");
+
+        mgr.stop(&with_pid).await;
+        mgr.stop(&pidless).await;
+    }
+
+    /// A handle whose child has already exited must drop out of the map even
+    /// while the handle itself is still installed (the exit watcher removes
+    /// it only on its next poll): in that window the OS can recycle the pid
+    /// for an unrelated process, and mapping it would credit that stranger's
+    /// subtree to the dead agent.
+    #[tokio::test]
+    async fn agent_root_pids_omits_handles_whose_child_was_reaped() {
+        let (mgr, _seeded, _db) = manager_with(None, None).await;
+
+        let agent_id = AgentId::from("agent-reaped-root");
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        assert!(child.id().is_some(), "unreaped child still reports a pid");
+        let _ends = install_fake_handle(&mgr, &agent_id, Some(child));
+
+        // The child exits on its own; once `try_wait` observes that, the
+        // mapping must be gone. Poll up to a deadline — the exit is quick
+        // but not synchronous with the spawn returning.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mgr.agent_root_pids().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reaped child stayed in agent_root_pids"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            mgr.handles.lock().unwrap().contains_key(&agent_id),
+            "only the mapping drops out; the handle awaits the exit watcher"
+        );
+        mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod legacy_feature_freeze_tests {
+    //! Lazy legacy feature freeze (intent-hq/monorepo#2459, H2 scope
+    //! addition): a pre-0096 session whose `harness_features` is NULL gets
+    //! its snapshot materialized at its first activation
+    //! (`ensure_started`), one-time and idempotent; before activation the
+    //! row keeps the read-time live projection, and the legacy
+    //! `task_graph_enabled` pin folds into the frozen snapshot.
+
+    use super::dead_child_respawn_tests::{install_fake_handle, mock_agent_script, mock_env};
+    use super::role_reminder_tests::{session, workspace};
+    use super::*;
+    use crate::events::EventBus;
+    use intent_store::Store;
+
+    /// Manager over a temp store with a settings registry wired (so tests
+    /// can flip `agentFeatures.*`) and NO seeded session — each test seeds
+    /// its own legacy-shaped row.
+    async fn registry_manager() -> (AgentManager, tempfile::TempDir, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-freeze-");
+        let path = db_dir.path().join("store.db");
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from("ws-1")))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (AgentManager::new(services, sink, 4), db_dir, config_dir)
+    }
+
+    /// Seed a legacy (pre-0096-shaped) session: `harness_features` NULL,
+    /// provider `mock` with a cached acp id so activation takes the
+    /// live-child reuse path, and the given legacy taskGraph pin (0095).
+    async fn seed_legacy_session(mgr: &AgentManager, agent_id: &AgentId, task_graph_pin: bool) {
+        let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some("acp-legacy".to_string());
+        assert!(s.harness_features.is_none(), "seed must be legacy-shaped");
+        mgr.services
+            .store
+            .insert_agent_session_with_task_graph(&s, task_graph_pin)
+            .await
+            .unwrap();
+    }
+
+    fn toggle_host_exec(mgr: &AgentManager, value: bool) {
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.hostExec".to_string(),
+                serde_json::json!(value),
+            )])
+            .expect("apply toggle");
+    }
+
+    /// Activate `agent_id` through the choke point: a live fake handle +
+    /// cached acp id means `ensure_started` reuses the session (no real
+    /// spawn), but the freeze — which runs right after the session read —
+    /// still fires.
+    async fn activate(mgr: &AgentManager, agent_id: &AgentId) {
+        let acp = mgr
+            .ensure_started(agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("activation succeeds via live-child reuse");
+        assert_eq!(acp, "acp-legacy");
+    }
+
+    /// The persisted `harness_features` column for `agent_id` (raw row read,
+    /// no service-layer projection).
+    async fn stored_features(mgr: &AgentManager, agent_id: &AgentId) -> Option<serde_json::Value> {
+        mgr.services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .expect("session exists")
+            .harness_features
+    }
+
+    /// (1) Activation freezes the flag values current at that moment;
+    /// subsequent settings toggles no longer affect the session.
+    #[tokio::test]
+    async fn legacy_session_freezes_features_at_first_activation() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-1");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        toggle_host_exec(&mgr, false);
+        activate(&mgr, &agent_id).await;
+
+        let frozen = stored_features(&mgr, &agent_id)
+            .await
+            .expect("activation materialized the snapshot");
+        assert_eq!(frozen["hostExec"], serde_json::json!(false));
+
+        // A later toggle affects neither the persisted snapshot nor the
+        // resolved features.
+        toggle_host_exec(&mgr, true);
+        let after = stored_features(&mgr, &agent_id).await.expect("still set");
+        assert_eq!(
+            after, frozen,
+            "settings toggle must not rewrite the snapshot"
+        );
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(
+            !mgr.services.session_agent_features(&session).host_exec,
+            "resolved features read the frozen snapshot, not the live setting"
+        );
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (2) A legacy session with a taskGraph pin freezes the PINNED value,
+    /// not the live setting.
+    #[tokio::test]
+    async fn legacy_task_graph_pin_wins_over_live_setting() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-2");
+        // Pin ON while the live setting stays OFF (the default).
+        seed_legacy_session(&mgr, &agent_id, true).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(
+            !mgr.services.effective_settings().agent_features.task_graph,
+            "live taskGraph setting is off (default)"
+        );
+
+        activate(&mgr, &agent_id).await;
+
+        let frozen = stored_features(&mgr, &agent_id)
+            .await
+            .expect("activation materialized the snapshot");
+        assert_eq!(
+            frozen["taskGraph"],
+            serde_json::json!(true),
+            "the legacy pin wins over the live setting"
+        );
+        // The fold matches the COALESCE read path.
+        assert!(mgr
+            .services
+            .store
+            .get_agent_session_task_graph_enabled(&agent_id)
+            .await
+            .unwrap());
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (3) A not-yet-activated legacy session still follows live settings on
+    /// read, and its row stays NULL.
+    #[tokio::test]
+    async fn unactivated_legacy_session_keeps_live_projection() {
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-3");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+
+        toggle_host_exec(&mgr, false);
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(session.harness_features.is_none(), "row stays NULL");
+        assert!(!mgr.services.session_agent_features(&session).host_exec);
+
+        toggle_host_exec(&mgr, true);
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(session.harness_features.is_none(), "row still NULL");
+        assert!(
+            mgr.services.session_agent_features(&session).host_exec,
+            "pre-activation reads keep following live settings"
+        );
+    }
+
+    /// (4) The freeze is idempotent: a second activation (with different
+    /// live settings) does not rewrite the persisted snapshot.
+    #[tokio::test]
+    async fn second_activation_does_not_rewrite_snapshot() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-4");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        toggle_host_exec(&mgr, false);
+        activate(&mgr, &agent_id).await;
+        let first = stored_features(&mgr, &agent_id)
+            .await
+            .expect("first activation materialized the snapshot");
+
+        toggle_host_exec(&mgr, true);
+        activate(&mgr, &agent_id).await;
+        let second = stored_features(&mgr, &agent_id).await.expect("still set");
+        assert_eq!(
+            second, first,
+            "second activation must not rewrite the snapshot"
+        );
+        mgr.stop(&agent_id).await;
+    }
+
+    /// New (post-0096) sessions are untouched: their creation-time snapshot
+    /// is never overwritten by the activation path.
+    #[tokio::test]
+    async fn stamped_session_is_a_no_op() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-5");
+        let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some("acp-legacy".to_string());
+        s.harness_features = Some(serde_json::json!({ "hostExec": false }));
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        activate(&mgr, &agent_id).await;
+        assert_eq!(
+            stored_features(&mgr, &agent_id).await,
+            Some(serde_json::json!({ "hostExec": false })),
+            "a stamped row is never rewritten"
+        );
+        mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod v1_turn_envelope_goldens {
+    //! Composed turn-envelope goldens (harness-versioning H0,
+    //! intent-hq/monorepo#2459): byte-exact pins of the FULL prompt
+    //! [`AgentManager::build_turn_prompt`] emits with every decoration
+    //! stacked, for specialist + non-specialist and first-turn +
+    //! steady-state. Complements the per-surface literals in
+    //! `crate::v1_goldens`. The snapshot line carries a live timestamp, so
+    //! it is validated by shape and stripped before the byte comparison.
+
+    use super::role_reminder_tests::{manager_with, session, workspace};
+    use super::*;
+
+    /// First text block's text from a built prompt.
+    fn prompt_text(prompt: &[ContentBlock]) -> String {
+        serde_json::to_value(prompt).unwrap()[0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Split off a leading snapshot line (when present): validate its shape
+    /// and return the remaining prompt bytes.
+    fn strip_snapshot_line(text: &str) -> String {
+        let Some(rest) = text.strip_prefix("current ws.agent.snapshot() => ") else {
+            return text.to_string();
+        };
+        let (json_line, remainder) = rest.split_once("\n\n").expect("snapshot separator");
+        let v: serde_json::Value = serde_json::from_str(json_line).expect("snapshot JSON");
+        assert!(v.get("time").is_some(), "snapshot always carries time");
+        remainder.to_string()
+    }
+
+    /// Non-specialist steady state: ZERO decorations — the prompt is the
+    /// user content, byte-identical.
+    #[tokio::test]
+    async fn golden_envelope_plain_steady_state() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "just the message",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "just the message");
+    }
+
+    /// Specialist steady state: role reminder + body only.
+    #[tokio::test]
+    async fn golden_envelope_specialist_steady_state() {
+        let dir = crate::tests::test_tempdir("intentd-envgold-");
+        std::fs::write(
+            dir.path().join("implementor.md"),
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        )
+        .unwrap();
+        let (mgr, agent_id, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "fix the bug",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(
+            text,
+            "[Role Reminder: You are a Implementor. Stay in scope.]\n\nfix the bug"
+        );
+    }
+
+    /// Fully decorated first turn: FirstTurnPrepend + snapshot line +
+    /// Context block + naming nudge + role reminder + body, in that exact
+    /// composition order with `\n\n` joins.
+    #[tokio::test]
+    async fn golden_envelope_first_turn_fully_decorated() {
+        let dir = crate::tests::test_tempdir("intentd-envgold-");
+        std::fs::write(
+            dir.path().join("implementor.md"),
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        )
+        .unwrap();
+        let (mgr, _seeded, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        // Untitled workspace + auggie-modeled agent → deterministic naming
+        // nudge with the auggie tool spelling.
+        let ws = WorkspaceId::from("ws-untitled");
+        let mut w = workspace(&ws);
+        w.title = String::new();
+        mgr.services.store.insert_workspace(&w).await.unwrap();
+        let agent_id = AgentId::from("agent-env");
+        let mut s = session(&agent_id, &ws, Some("implementor"));
+        s.model = Some("auggie:sonnet4.5".to_string());
+        s.system_prompt = Some("SP body".to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        // Arm the §18.1 prepend fallback (mock has no native SP mechanism)
+        // and make the snapshot non-trivial (one queued message).
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        mgr.services
+            .enqueue_message(&agent_id, "pending".into(), None, None, None, None, false);
+        let options = TurnOptions {
+            stdin_context: Some("repo: demo".to_string()),
+            ..Default::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "start the task", &options)
+                .await,
+        );
+        // Outermost: the fire-once <system> prepend.
+        let rest = text
+            .strip_prefix("<system>\nSP body\n</system>\n\n")
+            .expect("first-turn prepend outermost");
+        // Then the (live-timestamped) snapshot line.
+        let rest = strip_snapshot_line(rest);
+        assert_eq!(
+            rest,
+            "Context:\nrepo: demo\n\n---\n\n\
+             <system>\n\
+             This workspace needs a title. As your first action, call the \
+             `set_workspace_title_workspace-mcp` tool with a short 3–5 word sentence-case \
+             title describing the task. This can be called in parallel with \
+             information-gathering.\n\
+             </system>\n\n\
+             [Role Reminder: You are a Implementor. Stay in scope.]\n\n\
+             start the task"
+        );
+        // Steady state on the same session: prepend consumed, naming nudge
+        // suppressed after an assistant reply, reminder + snapshot remain.
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "on it" }]),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &ws, "continue", &TurnOptions::default())
+                .await,
+        );
+        let rest = strip_snapshot_line(&text);
+        assert_eq!(
+            rest,
+            "[Role Reminder: You are a Implementor. Stay in scope.]\n\ncontinue"
+        );
+    }
+
+    /// Combined interrupt delivery (monorepo#1014): the preempted text rides
+    /// ahead of the interrupt content inside the same body.
+    #[tokio::test]
+    async fn golden_envelope_prepend_content_composition() {
+        let (mgr, agent_id, _db) = manager_with(None, None).await;
+        let options = TurnOptions {
+            prepend_content: Some("original message".to_string()),
+            ..Default::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "interrupt message",
+                &options,
+            )
+            .await,
+        );
+        assert_eq!(text, "original message\n\ninterrupt message");
+    }
 }
 
 #[cfg(test)]
@@ -10249,6 +11963,8 @@ mod uniform_isolation_tests {
     ) -> Workspace {
         let ts = now_iso();
         Workspace {
+            pending_delete_at: None,
+            waiting: false,
             id: id.clone(),
             title: "Uniform ISO WS".to_string(),
             branch: "main".to_string(),
@@ -11570,9 +13286,11 @@ mod agent_retry_tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
             task_stats: None,
         }
     }
@@ -11580,6 +13298,8 @@ mod agent_retry_tests {
     fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -11608,6 +13328,7 @@ mod agent_retry_tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -11618,6 +13339,7 @@ mod agent_retry_tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 

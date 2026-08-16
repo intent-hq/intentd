@@ -14,17 +14,26 @@ use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
 const NOTE_COLUMNS: &str = "id, workspace_id, title, content, content_type, tags, is_pinned, \
     is_archived, is_default, parent_id, visibility, task_json, created_at, rev, updated_at";
 
+/// Serialize `metadata.task` for the `task_json` column, stripping the
+/// computed `unmet_depends_on` projection so it is never persisted
+/// (monorepo#1979) — readers recompute it from `depends_on` + task statuses.
+pub(crate) fn encode_task_json(task: &intent_core::TaskMetadata) -> Result<String> {
+    let mut stored = task.clone();
+    stored.unmet_depends_on = Vec::new();
+    serde_json::to_string(&stored)
+        .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))
+}
+
 impl Store {
     /// Insert a note row. `metadata.task` is stored opaquely as `task_json` TEXT.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = match &note.metadata.task {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
-            ),
-            None => None,
-        };
+        let task_json = note
+            .metadata
+            .task
+            .as_ref()
+            .map(encode_task_json)
+            .transpose()?;
         let sql =
             format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         sqlx::query(&sql)
@@ -121,13 +130,12 @@ impl Store {
         expected_version: Option<i64>,
     ) -> Result<()> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = match &note.metadata.task {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
-            ),
-            None => None,
-        };
+        let task_json = note
+            .metadata
+            .task
+            .as_ref()
+            .map(encode_task_json)
+            .transpose()?;
         let mut sql = String::from(
             "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
              is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \

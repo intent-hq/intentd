@@ -52,12 +52,69 @@ pub struct SystemStatus {
     pub version: String,
     /// Uptime in seconds since daemon start.
     pub uptime_seconds: u64,
+    /// Non-loopback IPv4 addresses the host is reachable on (same source as
+    /// `server.pairingInfo` — `collect_local_ips`), so an authenticated remote
+    /// client can discover alternative routes to the daemon.
+    pub local_ips: Vec<String>,
+    /// Local OS hostname (same source as `server.pairingInfo`).
+    pub hostname: String,
     /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
     /// full core, so values may exceed 100 on multi-core hosts. The first
     /// sample after startup may legitimately read 0.
     pub cpu_percent: f32,
     /// Resident memory of the daemon process, in bytes.
     pub memory_bytes: u64,
+    /// Number of OS processes in the daemon's descendant tree — every agent
+    /// provider CLI plus whatever it spawns (ACP adapters, MCP bridges, the
+    /// tool children an agent runs), the Unsloth server, and `host.exec`
+    /// children. `None` until the background sampler has taken its first
+    /// sample, or on platforms where the tree cannot be walked.
+    pub child_processes: Option<usize>,
+    /// Aggregate resident memory of [`Self::child_processes`], in bytes. This
+    /// is the daemon's *real* memory footprint from the OS's point of view —
+    /// [`Self::memory_bytes`] covers only the daemon binary itself, which is a
+    /// small fraction of it once agents are live. `None` alongside
+    /// `child_processes`.
+    pub child_memory_bytes: Option<u64>,
+    /// High-water mark of the daemon's descendant-tree memory since daemon
+    /// start. The instantaneous value is not enough on its own: quick-action
+    /// and model-probe adapters live for seconds, and by the time a debug
+    /// bundle is captured any overshoot has drained back to baseline. `None`
+    /// alongside `child_processes`.
+    ///
+    /// Sampled more often than [`Self::child_memory_bytes`], so it can exceed
+    /// any value that field ever published: the tree is swept every 500 ms
+    /// while an ephemeral adapter chain is live, against the 5 s baseline the
+    /// published sample keeps (monorepo#2107). Bursts are short and steep
+    /// enough that the baseline alone missed them almost entirely — measured,
+    /// a 16-chain burst peaking at 6.97 GB reported 0.01 GB.
+    pub child_memory_peak_bytes: Option<u64>,
+    /// The installed aggregate agent memory budget in bytes
+    /// (`agents.memoryBudgetMb`, monorepo#2063). `None` when the budget is
+    /// off. The three budget fields are presence-detected on the wire —
+    /// omitted when `None`, never null — unlike the child-tree sample fields
+    /// above, which are null until the first sample.
+    pub agent_memory_budget_bytes: Option<u64>,
+    /// The bytes admission actually compares against the budget: the last
+    /// descendant-tree sample plus the provisional correction for spawns
+    /// admitted / processes released since it was taken. `None` when the
+    /// budget is off, and also while the budget is on but no sample has
+    /// landed yet (the budget is inert until then).
+    pub agent_memory_charged_bytes: Option<u64>,
+    /// Spawns currently queued behind the admission gate (slot cap or memory
+    /// budget). `None` when the budget is off.
+    pub queued_spawns: Option<u64>,
+    /// Available bytes on the volume containing the daemon's resolved
+    /// workspaces root. `None` until the background disk sampler lands its
+    /// first sample, or when no mounted volume matches the root (e.g. an
+    /// empty disks list in a locked-down container, or an unmounted drive
+    /// letter on Windows — a merely not-yet-created root still matches its
+    /// would-be volume). Presence-detected on the wire — omitted when `None`,
+    /// never null or 0.
+    pub workspaces_disk_available_bytes: Option<u64>,
+    /// Total bytes of the volume containing the workspaces root. `None`
+    /// alongside `workspaces_disk_available_bytes`.
+    pub workspaces_disk_total_bytes: Option<u64>,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -170,6 +227,11 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
 
 /// Render a [`SystemStatus`] to the `system.status` result JSON. `is_local`
 /// reflects the serving transport (UDS ⇒ `local`, WSS ⇒ `remote`, §12.3).
+///
+/// The aggregate-budget fields (`agentMemoryBudgetBytes`,
+/// `agentMemoryChargedBytes`, `queuedSpawns`; monorepo#2063) are
+/// presence-detected: omitted when the budget is off, never null — unlike the
+/// child-tree sample fields, which are always present and null until sampled.
 pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     let mut transports = Vec::new();
     if status.uds {
@@ -178,7 +240,7 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     if status.tcp {
         transports.push("tcp");
     }
-    json!({
+    let mut v = json!({
         "running": true,
         "listenMode": status.listen_mode,
         "transports": transports,
@@ -190,7 +252,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "uptimeSeconds": status.uptime_seconds,
         "cpuPercent": status.cpu_percent,
         "memoryBytes": status.memory_bytes,
+        "childProcesses": status.child_processes,
+        "childMemoryBytes": status.child_memory_bytes,
+        "childMemoryPeakBytes": status.child_memory_peak_bytes,
         "fingerprint": status.fingerprint,
+        "localIps": status.local_ips,
+        "hostname": status.hostname,
         "protocolVersion": PROTOCOL_VERSION,
         "host": {
             "os": status.os,
@@ -198,7 +265,24 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             "hasDisplay": status.has_display,
             "locality": if is_local { "local" } else { "remote" },
         },
-    })
+    });
+    let obj = v.as_object_mut().expect("status_json literal is an object");
+    if let Some(budget) = status.agent_memory_budget_bytes {
+        obj.insert("agentMemoryBudgetBytes".into(), budget.into());
+    }
+    if let Some(charged) = status.agent_memory_charged_bytes {
+        obj.insert("agentMemoryChargedBytes".into(), charged.into());
+    }
+    if let Some(queued) = status.queued_spawns {
+        obj.insert("queuedSpawns".into(), queued.into());
+    }
+    if let Some(avail) = status.workspaces_disk_available_bytes {
+        obj.insert("workspacesDiskAvailableBytes".into(), avail.into());
+    }
+    if let Some(total) = status.workspaces_disk_total_bytes {
+        obj.insert("workspacesDiskTotalBytes".into(), total.into());
+    }
+    v
 }
 
 /// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only

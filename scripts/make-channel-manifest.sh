@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Build a channel manifest (stable.json / beta.json) for an intentd release.
+# Build a channel manifest (stable.json / beta.json / alpha.json) for an
+# intentd release.
 #
 # Usage: make-channel-manifest.sh <tag> <channel> <output-file>
 #
-# <channel> is "stable" or "beta". The caller decides the routing: CI writes
-# beta.json for every release (publish-channel-manifest.yml) and stable.json
-# when a release is promoted (promote-stable.yml).
+# <channel> is "stable", "beta", or "alpha". The caller decides the routing:
+# CI writes alpha.json for every release (publish-channel-manifest.yml),
+# beta.json when a release is promoted to beta (promote-beta.yml), and
+# stable.json when a release is promoted to stable (promote-stable.yml).
 #
 # Reads the GitHub Release for <tag> (via `gh`), pairs every platform archive
 # (intentd-<target>.tar.xz / .tar.gz / .zip) with its .sha256 sidecar, and writes
@@ -19,7 +21,7 @@
 # Manifest schema (schema version 1):
 # {
 #   "schema": 1,
-#   "channel": "stable" | "beta",
+#   "channel": "stable" | "beta" | "alpha",
 #   "version": "0.1.0",
 #   "tag": "v0.1.0",
 #   "published_at": "2026-07-21T00:00:00Z",
@@ -40,8 +42,8 @@ OUT="${3:?$usage}"
 REPO="${GITHUB_REPOSITORY:-intent-hq/intentd}"
 ASSET_REPO="${ASSET_REPO:-$REPO}"
 
-if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
-  echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
+if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" && "$CHANNEL" != "alpha" ]]; then
+  echo "error: channel must be 'stable', 'beta', or 'alpha', got: $CHANNEL" >&2
   exit 1
 fi
 # Leading v is optional to match dist's tag parsing (release tags are vX.Y.Z;

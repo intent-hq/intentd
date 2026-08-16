@@ -166,9 +166,11 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -266,6 +268,8 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     // under parallel-test load, flipping `agents[0]` (monorepo#967).
     let mk_agent =
         |id: &str, name: &str, specialist: Option<&str>, created_at: &str| AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -294,6 +298,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: created_at.to_string(),
@@ -304,6 +309,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -1349,6 +1355,8 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
             vec!["criterion one".into()],
             Some("M".into()),
             None,
+            None,
+            None,
         )
         .await
         .expect("markAsTask");
@@ -1399,12 +1407,15 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
     assert_eq!(mine.subtasks[0].status, "not_started");
 }
 
-/// `task.list` returns the workspace's spec-linked task notes projected into the
-/// `WorkspaceTask` shape (`{ id, title, status, updatedAt }`), including
-/// cancelled, and excluding the spec, non-task notes, non-children, and
-/// non-spec-linked task notes. `task.get` returns a single task note in the same
-/// shape; unknown / cross-workspace ids surface `NotFound` and non-task notes
-/// surface an `Internal` error.
+/// `task.list` returns ALL of the workspace's task notes (any note with task
+/// metadata except the spec itself — direct spec children, subtasks, and
+/// unlinked tasks alike, including cancelled) projected into the
+/// `WorkspaceTask` shape, each flagged with `specLinked` (true iff the id
+/// appears in the spec body's task links). The spec and non-task notes are
+/// excluded; `stats` stays the spec-linked direct-child rollup. `task.get`
+/// returns a single task note in the same shape (with `specLinked` computed
+/// from the spec body); unknown / cross-workspace ids surface `NotFound` and
+/// non-task notes surface an `Internal` error.
 #[tokio::test]
 async fn task_list_and_get_project_workspace_tasks() {
     use intent_core::{TaskMetadata, TaskStatus};
@@ -1414,7 +1425,8 @@ async fn task_list_and_get_project_workspace_tasks() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
 
-    // Spec links three task notes; a fourth task note is unlinked (excluded).
+    // Spec links three task notes; a fourth task note is unlinked (still
+    // returned, `specLinked: false`).
     let spec = note(
         &ws,
         "spec",
@@ -1445,11 +1457,15 @@ async fn task_list_and_get_project_workspace_tasks() {
         .insert_note(&mk_task("task-c", "Gamma", TaskStatus::Cancelled))
         .await
         .unwrap();
-    // Unlinked task note (spec has links, so excluded).
+    // Unlinked task note (returned with `specLinked: false`).
     store
         .insert_note(&mk_task("task-x", "Orphan", TaskStatus::NotStarted))
         .await
         .unwrap();
+    // Subtask (child of task-a, not the spec — returned, `specLinked: false`).
+    let mut sub = mk_task("task-sub", "Subtask", TaskStatus::NotStarted);
+    sub.parent_id = Some(NoteId::from("task-a"));
+    store.insert_note(&sub).await.unwrap();
     // Non-task child of spec (excluded — no task metadata).
     let mut plain = note(&ws, "plain", "body");
     plain.parent_id = Some(NoteId::from("spec"));
@@ -1457,14 +1473,37 @@ async fn task_list_and_get_project_workspace_tasks() {
 
     let svc = Services::new(store);
 
-    // task.list returns the three spec-linked task notes (cancelled included)
-    // plus the workspace-wide stats aggregate (full set, mirrors the FE
-    // `computeTaskStats`: total excludes cancelled, completed counts complete,
-    // inProgress counts in_progress + review_required).
+    // task.list returns every task note (cancelled, unlinked, and subtask
+    // included) with the `specLinked` flag, plus the stats aggregate — still
+    // the spec-linked direct-child rollup (mirrors the FE `computeTaskStats`:
+    // total excludes cancelled, completed counts complete, inProgress counts
+    // in_progress + review_required), untouched by the widened membership.
     let result = svc.task_list(ws.clone(), None).await.expect("task.list");
-    assert_eq!(result.tasks.len(), 3);
+    assert_eq!(result.tasks.len(), 5);
     let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
-    assert_eq!(ids, vec!["task-a", "task-b", "task-c"]);
+    assert_eq!(
+        ids,
+        vec!["task-a", "task-b", "task-c", "task-x", "task-sub"]
+    );
+    let linked: Vec<bool> = result.tasks.iter().map(|t| t.spec_linked).collect();
+    assert_eq!(linked, vec![true, true, true, false, false]);
+    // `parentId` rides along so subtasks are distinguishable from top-level
+    // tasks without a note.list read.
+    let parents: Vec<Option<&str>> = result
+        .tasks
+        .iter()
+        .map(|t| t.parent_id.as_ref().map(|p| p.as_str()))
+        .collect();
+    assert_eq!(
+        parents,
+        vec![
+            Some("spec"),
+            Some("spec"),
+            Some("spec"),
+            Some("spec"),
+            Some("task-a")
+        ]
+    );
     let alpha = &result.tasks[0];
     assert_eq!(alpha.title, "Alpha");
     assert_eq!(alpha.status, TaskStatus::InProgress);
@@ -1491,7 +1530,8 @@ async fn task_list_and_get_project_workspace_tasks() {
         .await
         .is_err());
 
-    // task.get returns a single task note in the WorkspaceTask shape.
+    // task.get returns a single task note in the WorkspaceTask shape, with
+    // `specLinked` computed from the spec body.
     let got = svc
         .task_get(ws.clone(), NoteId::from("task-a"))
         .await
@@ -1499,6 +1539,12 @@ async fn task_list_and_get_project_workspace_tasks() {
     assert_eq!(got.id.as_str(), "task-a");
     assert_eq!(got.title, "Alpha");
     assert_eq!(got.status, TaskStatus::InProgress);
+    assert!(got.spec_linked);
+    let got_x = svc
+        .task_get(ws.clone(), NoteId::from("task-x"))
+        .await
+        .expect("task.get unlinked");
+    assert!(!got_x.spec_linked);
 
     // Unknown id → NotFound; non-task note → Internal "Note is not a task".
     assert!(matches!(
@@ -1506,6 +1552,572 @@ async fn task_list_and_get_project_workspace_tasks() {
         Err(Error::NotFound(_))
     ));
     assert!(svc.task_get(ws, NoteId::from("plain")).await.is_err());
+}
+
+/// When the spec body has no task links, `task.list` still returns every task
+/// note in the workspace — all flagged `specLinked: false`.
+#[tokio::test]
+async fn task_list_no_spec_links_returns_all_tasks_unlinked() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    store
+        .insert_note(&note(&ws, "spec", "No task links here."))
+        .await
+        .expect("spec");
+    for (id, parent) in [("task-a", "spec"), ("task-sub", "task-a")] {
+        let mut tn = note(&ws, id, "body");
+        tn.parent_id = Some(NoteId::from(parent));
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        store.insert_note(&tn).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+    let result = svc.task_list(ws, None).await.expect("task.list");
+    let ids: Vec<&str> = result.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, vec!["task-a", "task-sub"]);
+    assert!(result.tasks.iter().all(|t| !t.spec_linked));
+    // Deliberate asymmetry: the stats fallback still counts direct spec
+    // children when the spec has no task links (task-a; task-sub is a
+    // subtask), even though every row above reports specLinked: false.
+    assert_eq!(result.stats.total, 1);
+    assert_eq!(result.stats.completed, 0);
+    assert_eq!(result.stats.in_progress, 0);
+}
+
+/// `task.setRelations` round-trips `dependsOn`/`conflictsWith` (deduped),
+/// validates ids (self-edges, non-task notes), rejects dependency cycles with
+/// the cycle path named, and the computed `unmetDependsOn` surfaces in
+/// `task.list` / `task.get` / `task.getMyTask`. `task.markAsTask` accepts the
+/// same relation params with identical validation.
+#[tokio::test]
+async fn task_set_relations_validates_cycles_and_projects_unmet_deps() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let spec = note(
+        &ws,
+        "spec",
+        "- [A](intent://local/task/task-a)\n- [B](intent://local/task/task-b)\n\
+         - [C](intent://local/task/task-c)",
+    );
+    store.insert_note(&spec).await.expect("spec");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = title.to_string();
+        tn.parent_id = Some(NoteId::from("spec"));
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", "Alpha", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", "Beta", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", "Gamma", TaskStatus::NotStarted))
+        .await
+        .unwrap();
+    let mut plain = note(&ws, "plain", "body");
+    plain.parent_id = Some(NoteId::from("spec"));
+    store.insert_note(&plain).await.unwrap();
+
+    let svc = Services::new(store);
+
+    // Round-trip with dedup: c dependsOn [a, b, a] → [a, b].
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-c"),
+            Some(vec![
+                NoteId::from("task-a"),
+                NoteId::from("task-b"),
+                NoteId::from("task-a"),
+            ]),
+            Some(vec![NoteId::from("task-b")]),
+        )
+        .await
+        .expect("setRelations");
+    assert!(r.ok);
+    let dep_ids: Vec<&str> = r.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(dep_ids, vec!["task-a", "task-b"]);
+    assert_eq!(r.conflicts_with[0].as_str(), "task-b");
+
+    // Persisted on the note's TaskMetadata; unmetDependsOn excludes complete
+    // deps (a) and keeps in-progress deps (b).
+    let mine = svc
+        .get_my_task(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("getMyTask");
+    assert_eq!(mine.task_metadata.depends_on.len(), 2);
+    assert_eq!(mine.task_metadata.conflicts_with.len(), 1);
+    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // task.list projects the same fields.
+    let listed = svc.task_list(ws.clone(), None).await.expect("task.list");
+    let c = listed
+        .tasks
+        .iter()
+        .find(|t| t.id.as_str() == "task-c")
+        .expect("task-c row");
+    assert_eq!(c.depends_on.len(), 2);
+    let unmet: Vec<&str> = c.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // task.get projects them too; task-c has dependsOn edges, so this
+    // exercises the deps-path specLinked branch (spec read via list_notes).
+    let got = svc
+        .task_get(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("task.get");
+    let unmet: Vec<&str> = got.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+    assert!(got.spec_linked);
+
+    // Omitted field is kept; `[]` clears.
+    let r = svc
+        .task_set_relations(ws.clone(), NoteId::from("task-c"), None, Some(vec![]))
+        .await
+        .expect("setRelations keep/clear");
+    assert_eq!(r.depends_on.len(), 2, "omitted dependsOn kept");
+    assert!(r.conflicts_with.is_empty(), "conflictsWith cleared");
+
+    // Self-edge rejected.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-c"),
+            Some(vec![NoteId::from("task-c")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot reference the task itself"));
+
+    // Non-task id rejected (both a plain note and a missing note).
+    for bad in ["plain", "ghost"] {
+        let err = svc
+            .task_set_relations(
+                ws.clone(),
+                NoteId::from("task-c"),
+                Some(vec![NoteId::from(bad)]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a task note"),
+            "expected not-a-task error for {bad}: {err}"
+        );
+    }
+
+    // Cycle rejected with the cycle named: c → b (existing edge b → c is
+    // written first), then b dependsOn c closes b → c → b.
+    svc.task_set_relations(
+        ws.clone(),
+        NoteId::from("task-c"),
+        Some(vec![NoteId::from("task-b")]),
+        None,
+    )
+    .await
+    .expect("c dependsOn b");
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-b"),
+            Some(vec![NoteId::from("task-c")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cycle"), "cycle named: {msg}");
+    assert!(
+        msg.contains("task-b -> task-c -> task-b"),
+        "cycle path named: {msg}"
+    );
+
+    // markAsTask carries the same relation params + validation.
+    let err = svc
+        .mark_as_task(
+            ws.clone(),
+            NoteId::from("task-b"),
+            "in_progress".into(),
+            vec![],
+            None,
+            Some(vec![NoteId::from("task-c")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cycle"));
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "in_progress".into(),
+        vec![],
+        None,
+        Some(vec![NoteId::from("task-a")]),
+        Some(vec![NoteId::from("task-c")]),
+        None,
+    )
+    .await
+    .expect("markAsTask with relations");
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b");
+    assert_eq!(b.task_metadata.depends_on[0].as_str(), "task-a");
+    assert_eq!(b.task_metadata.conflicts_with[0].as_str(), "task-c");
+    assert!(b.unmet_depends_on.is_empty(), "complete dep is met");
+
+    // Re-marking at the SAME status with omitted relation params keeps the
+    // existing relations (regression: the same-status arm rebuilds metadata
+    // from scratch and must carry them over).
+    svc.mark_as_task(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "in_progress".into(),
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("same-status re-mark");
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after re-mark");
+    assert_eq!(
+        b.task_metadata.depends_on[0].as_str(),
+        "task-a",
+        "same-status re-mark must keep dependsOn"
+    );
+    assert_eq!(
+        b.task_metadata.conflicts_with[0].as_str(),
+        "task-c",
+        "same-status re-mark must keep conflictsWith"
+    );
+
+    // No-op setRelations (identical lists) skips the store write: rev is
+    // unchanged.
+    let rev_before = b.rev;
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("task-b"),
+            Some(vec![NoteId::from("task-a")]),
+            None,
+        )
+        .await
+        .expect("no-op setRelations");
+    assert!(r.ok);
+    let b = svc
+        .get_my_task(ws.clone(), NoteId::from("task-b"))
+        .await
+        .expect("getMyTask b after no-op");
+    assert_eq!(b.rev, rev_before, "no-op setRelations must not bump rev");
+
+    // setRelations on a non-task note is rejected.
+    let err = svc
+        .task_set_relations(ws, NoteId::from("plain"), Some(vec![]), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a task"));
+}
+
+/// `dependsOn` edges onto tree ancestors/descendants are rejected
+/// (monorepo#1982): a child dependsOn its parent — the permanent mutual
+/// readiness block (the parent waits on the child via the tree rule, the
+/// child on the parent via the edge) — can no longer be written, in either
+/// direction, through `task.setRelations` or `task.markAsTask`. Ancestry
+/// chains crossing non-task notes are caught too; sibling edges stay valid.
+#[tokio::test]
+async fn task_relations_reject_tree_ancestor_and_descendant_edges() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    // Tree: parent (task) → child (task), parent → mid (NON-task) →
+    // grandchild (task), parent → sibling (task).
+    let mk_task = |id: &str, parent: &str| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = id.to_string();
+        tn.parent_id = Some(NoteId::from(parent));
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::NotStarted,
+            ..Default::default()
+        });
+        tn
+    };
+    store.insert_note(&note(&ws, "root", "body")).await.unwrap();
+    store.insert_note(&mk_task("parent", "root")).await.unwrap();
+    store
+        .insert_note(&mk_task("child", "parent"))
+        .await
+        .unwrap();
+    let mut mid = note(&ws, "mid", "body");
+    mid.parent_id = Some(NoteId::from("parent"));
+    store.insert_note(&mid).await.unwrap();
+    store
+        .insert_note(&mk_task("grandchild", "mid"))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("sibling", "parent"))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store);
+
+    // child dependsOn parent → ancestor rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("parent")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("tree ancestor"), "ancestor rejection: {msg}");
+    assert!(
+        msg.contains("parent is an ancestor of child"),
+        "relationship named: {msg}"
+    );
+
+    // parent dependsOn child → descendant rejection, relationship named.
+    let err = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("parent"),
+            Some(vec![NoteId::from("child")]),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tree descendant"),
+        "descendant rejection: {msg}"
+    );
+    assert!(
+        msg.contains("child is a descendant of parent"),
+        "relationship named: {msg}"
+    );
+
+    // The ancestry chain crossing a NON-task note (parent → mid →
+    // grandchild) is caught in both directions.
+    for (src, dep) in [("grandchild", "parent"), ("parent", "grandchild")] {
+        let err = svc
+            .task_set_relations(
+                ws.clone(),
+                NoteId::from(src),
+                Some(vec![NoteId::from(dep)]),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("tree"),
+            "chain via non-task note rejected ({src} dependsOn {dep}): {err}"
+        );
+    }
+
+    // markAsTask enforces the same check.
+    let err = svc
+        .mark_as_task(
+            ws.clone(),
+            NoteId::from("child"),
+            "not_started".into(),
+            vec![],
+            None,
+            Some(vec![NoteId::from("parent")]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("tree ancestor"),
+        "markAsTask ancestor rejection: {err}"
+    );
+
+    // Sibling and cross-subtree edges remain valid.
+    let r = svc
+        .task_set_relations(
+            ws.clone(),
+            NoteId::from("child"),
+            Some(vec![NoteId::from("sibling"), NoteId::from("grandchild")]),
+            None,
+        )
+        .await
+        .expect("sibling/cross-subtree edges still valid");
+    assert!(r.ok);
+
+    // The rejected writes persisted nothing.
+    let p = svc
+        .get_my_task(ws, NoteId::from("parent"))
+        .await
+        .expect("getMyTask parent");
+    assert!(p.task_metadata.depends_on.is_empty());
+}
+
+/// monorepo#1979: note-shaped reads project the computed `unmetDependsOn`
+/// onto `metadata.task` — `note.get` / `note.list` carry the same unmet
+/// subset as the `task.list` projection, the field tracks dependency status
+/// changes, is omitted when empty (additive wire shape), and is never
+/// persisted into `task_json`.
+#[tokio::test]
+async fn note_reads_project_unmet_depends_on() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+
+    let mk_task = |id: &str, title: &str, status: TaskStatus| {
+        let mut tn = note(&ws, id, "body");
+        tn.title = title.to_string();
+        tn.metadata.task = Some(TaskMetadata {
+            status,
+            ..Default::default()
+        });
+        tn
+    };
+    store
+        .insert_note(&mk_task("task-a", "Alpha", TaskStatus::Complete))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-b", "Beta", TaskStatus::InProgress))
+        .await
+        .unwrap();
+    store
+        .insert_note(&mk_task("task-c", "Gamma", TaskStatus::NotStarted))
+        .await
+        .unwrap();
+
+    let svc = Services::new(store.clone());
+    svc.task_set_relations(
+        ws.clone(),
+        NoteId::from("task-c"),
+        Some(vec![NoteId::from("task-a"), NoteId::from("task-b")]),
+        None,
+    )
+    .await
+    .expect("setRelations");
+
+    // note.get: the complete dep (a) is met, the in-progress dep (b) is not.
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c");
+    let task = c.metadata.task.as_ref().expect("task metadata");
+    let unmet: Vec<&str> = task.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec!["task-b"]);
+
+    // note.list: same projection; dep-less task rows omit the field on the
+    // wire (empty vec → skip_serializing_if).
+    let notes = svc.list_notes(&ws).await.expect("list");
+    let row_c = notes.iter().find(|n| n.id.as_str() == "task-c").unwrap();
+    assert_eq!(
+        row_c.metadata.task.as_ref().unwrap().unmet_depends_on,
+        vec![NoteId::from("task-b")]
+    );
+    let row_b = notes.iter().find(|n| n.id.as_str() == "task-b").unwrap();
+    let b_json = serde_json::to_value(row_b).unwrap();
+    assert!(
+        b_json["metadata"]["task"].get("unmetDependsOn").is_none(),
+        "dep-less task omits unmetDependsOn: {b_json}"
+    );
+
+    // The projection is computed, not persisted: the raw store row is clean.
+    let raw = store.get_note(&ws, &NoteId::from("task-c")).await.unwrap();
+    assert!(raw.metadata.task.unwrap().unmet_depends_on.is_empty());
+
+    // Completing dep b empties c's projection (omitted on the wire).
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("complete b");
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c after b complete");
+    assert!(c
+        .metadata
+        .task
+        .as_ref()
+        .unwrap()
+        .unmet_depends_on
+        .is_empty());
+    let c_json = serde_json::to_value(&c).unwrap();
+    assert!(c_json["metadata"]["task"].get("unmetDependsOn").is_none());
+
+    // Cancelling dep b makes it unmet again (cancelled = unmet).
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from("task-b"),
+        "cancelled".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("cancel b");
+    let c = svc
+        .get_note(ws.clone(), NoteId::from("task-c"))
+        .await
+        .expect("get c after b cancelled");
+    assert_eq!(
+        c.metadata.task.unwrap().unmet_depends_on,
+        vec![NoteId::from("task-b")]
+    );
+
+    // Deleting the complete dep a makes it unmet too (missing = unmet).
+    svc.delete_note(ws.clone(), NoteId::from("task-a"), None)
+        .await
+        .expect("delete a");
+    let c = svc
+        .get_note(ws, NoteId::from("task-c"))
+        .await
+        .expect("get c after a deleted");
+    assert_eq!(
+        c.metadata.task.unwrap().unmet_depends_on,
+        vec![NoteId::from("task-a"), NoteId::from("task-b")]
+    );
 }
 
 #[tokio::test]
@@ -1516,6 +2128,8 @@ async fn assign_agent_validates_and_starts_task() {
         id.clone(),
         "not_started".into(),
         vec![],
+        None,
+        None,
         None,
         None,
     )
@@ -1670,6 +2284,384 @@ async fn convert_blocks_creates_children_idempotently() {
 }
 
 // ---------------------------------------------------------------------------
+// Relation seeding at conversion time (monorepo#2018 T2): `@@@task` header
+// attributes `key=`/`dependsOn=`/`conflictsWith=`/`effort=` resolve and seed
+// relations during `convert_task_blocks`. Resolution order: sibling block
+// `key=` → sibling block exact (trimmed) title → existing task-note id.
+// Conversion never fails on bad relations — each skipped edge/attribute adds
+// one warning; blocks always convert and unaffected relations still apply.
+// ---------------------------------------------------------------------------
+
+/// Fetch the task metadata of a created child by title.
+async fn child_task_meta(
+    svc: &Services,
+    ws: &WorkspaceId,
+    created: &[String],
+    title: &str,
+) -> intent_core::TaskMetadata {
+    for id in created {
+        let n = svc
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("child note");
+        if n.title == title {
+            return n.metadata.task.expect("child is a task");
+        }
+    }
+    panic!("no created child titled {title:?}");
+}
+
+/// Map a created child's title → its note id string.
+async fn child_id_by_title(
+    svc: &Services,
+    ws: &WorkspaceId,
+    created: &[String],
+    title: &str,
+) -> String {
+    for id in created {
+        let n = svc
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("child note");
+        if n.title == title {
+            return id.clone();
+        }
+    }
+    panic!("no created child titled {title:?}");
+}
+
+#[tokio::test]
+async fn convert_blocks_seeds_relations_by_key_and_title_and_effort() {
+    // `key=` reference, exact-title reference, `conflictsWith`, and `effort=`
+    // all seed in one conversion pass with zero warnings. Header values are
+    // whitespace-separated bare tokens, so title references are single words.
+    let content = "@@@task key=api effort=2h\n# Backend\nbody\n@@@\n\
+                   @@@task\n# Frontend\nbody\n@@@\n\
+                   @@@task dependsOn=api conflictsWith=Frontend\n# Wiring\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+
+    let api_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Backend").await;
+    let api_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Backend").await;
+    assert_eq!(api_meta.estimated_effort.as_deref(), Some("2h"));
+    let fe_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Frontend").await;
+
+    let ui_meta = child_task_meta(&svc, &ws, &r.created_note_ids, "Wiring").await;
+    let deps: Vec<&str> = ui_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![api_id.as_str()], "dependsOn resolved via key=");
+    let conflicts: Vec<&str> = ui_meta.conflicts_with.iter().map(|d| d.as_str()).collect();
+    assert_eq!(
+        conflicts,
+        vec![fe_id.as_str()],
+        "conflictsWith resolved via exact title"
+    );
+
+    // The seeded edge projects into readiness: "Wiring" has an unmet dep.
+    let ui_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Wiring").await;
+    let mine = svc
+        .get_my_task(ws.clone(), NoteId::from(ui_id.as_str()))
+        .await
+        .expect("getMyTask");
+    let unmet: Vec<&str> = mine.unmet_depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(unmet, vec![api_id.as_str()]);
+}
+
+#[tokio::test]
+async fn convert_blocks_key_takes_precedence_over_title() {
+    // A sibling declares key=Target while another sibling is TITLED "Target".
+    // The reference "Target" must resolve to the key owner, not the title.
+    let content = "@@@task key=Target\n# Key Owner\nbody\n@@@\n\
+                   @@@task\n# Target\nbody\n@@@\n\
+                   @@@task dependsOn=Target\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+    let key_owner = child_id_by_title(&svc, &ws, &r.created_note_ids, "Key Owner").await;
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![key_owner.as_str()]);
+}
+
+#[tokio::test]
+async fn convert_blocks_resolves_existing_task_note_ids() {
+    // A value matching no sibling key/title resolves against an existing
+    // task-note id in the workspace; a same-shaped id on a NON-task note
+    // does not resolve and warns.
+    use intent_core::{TaskMetadata, TaskStatus};
+    let content = "@@@task dependsOn=pre-task,plain-note\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut pre = note(&ws, "pre-task", "body");
+    pre.title = "Pre-existing".to_string();
+    pre.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store.insert_note(&pre).await.expect("pre-task");
+    svc.store
+        .insert_note(&note(&ws, "plain-note", "body"))
+        .await
+        .expect("plain-note");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    let deps: Vec<&str> = consumer.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec!["pre-task"], "existing task-note id resolves");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Consumer\"")
+            && r.warnings[0].contains("dependsOn")
+            && r.warnings[0].contains("plain-note"),
+        "warning names block and reference: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_unknown_reference_and_still_converts() {
+    let content = "@@@task key=a dependsOn=nope\n# Alpha\nbody\n@@@\n\
+                   @@@task dependsOn=a\n# Beta\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    // Both blocks convert; the bad edge is skipped, the good one applies.
+    assert_eq!(r.converted_count, 2);
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Alpha\" (key=a)") && r.warnings[0].contains("\"nope\""),
+        "warning names block (title+key) and reference: {}",
+        r.warnings[0]
+    );
+    let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    assert!(alpha.depends_on.is_empty());
+    let alpha_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
+    let deps: Vec<&str> = beta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(
+        deps,
+        vec![alpha_id.as_str()],
+        "valid sibling edge still applies"
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_ambiguous_duplicate_key() {
+    // Two distinct blocks declare the same key → a reference to it is
+    // ambiguous: warn and skip.
+    let content = "@@@task key=dup\n# First\nbody\n@@@\n\
+                   @@@task key=dup\n# Second\nbody\n@@@\n\
+                   @@@task dependsOn=dup\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 3);
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    assert!(consumer.depends_on.is_empty(), "ambiguous edge skipped");
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("\"Consumer\"") && w.contains("ambiguous") && w.contains("dup")),
+        "ambiguity warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_ambiguous_duplicate_title() {
+    // Two sibling blocks share a title. The reuse map collapses them onto one
+    // child note, but the duplicated declaration still makes a title
+    // reference ambiguous: warn and skip rather than guess.
+    let content = "@@@task\n# Dup\nbody\n@@@\n\
+                   @@@task\n# Dup\nmore\n@@@\n\
+                   @@@task dependsOn=Dup\n# Consumer\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 2, "duplicate titles reuse one child");
+    let consumer = child_task_meta(&svc, &ws, &r.created_note_ids, "Consumer").await;
+    assert!(consumer.depends_on.is_empty(), "ambiguous edge skipped");
+    assert!(
+        r.warnings.iter().any(|w| w.contains("\"Consumer\"")
+            && w.contains("ambiguous")
+            && w.contains("share that title")),
+        "title ambiguity warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
+    // The converting note is itself a task note; a block's dependsOn names it
+    // by id. The reference resolves via the existing-task-note-id step, then
+    // the tree-ancestry validator rejects the edge (the converting note is
+    // the created child's parent) with a warning naming the block.
+    use intent_core::{TaskMetadata, TaskStatus};
+    let content = "@@@task dependsOn=n1\n# Child\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut parent = svc.get_note(ws.clone(), id.clone()).await.expect("parent");
+    parent.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store.update_note(&parent).await.expect("mark as task");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    let child = child_task_meta(&svc, &ws, &r.created_note_ids, "Child").await;
+    assert!(child.depends_on.is_empty(), "ancestor edge skipped");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Child\"")
+            && r.warnings[0].contains("\"n1\"")
+            && r.warnings[0].contains("ancestor"),
+        "ancestor warning names block and reference: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_effort_dropped_for_reused_child() {
+    // Idempotent-reuse path: a same-titled child already exists, so the
+    // block's `effort=` never overwrites the existing note's estimate — but
+    // the explicitly written attribute surfaces as a warning, not silently.
+    let content = "@@@task effort=3h\n# Build API\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let mut existing = note(&ws, "pre-child", "body");
+    existing.title = "Build API".to_string();
+    existing.parent_id = Some(id.clone());
+    svc.store.insert_note(&existing).await.expect("pre-child");
+
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 0, "existing child reused, none created");
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Build API\"") && r.warnings[0].contains("effort= ignored"),
+        "effort-drop warning names the block: {}",
+        r.warnings[0]
+    );
+    let reused = svc
+        .get_note(ws.clone(), NoteId::from("pre-child"))
+        .await
+        .expect("reused child");
+    assert!(
+        reused
+            .metadata
+            .task
+            .is_none_or(|t| t.estimated_effort.is_none()),
+        "existing estimate untouched"
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_warns_on_validator_rejected_edges() {
+    // Self-edge (block depends on its own key) and a cycle (A→B after B→A)
+    // are rejected by the validators with distinct warnings; the blocks
+    // still convert and the first (acyclic) edge still applies.
+    let content = "@@@task key=a dependsOn=b\n# Alpha\nbody\n@@@\n\
+                   @@@task key=b dependsOn=a,b\n# Beta\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 2);
+    // Alpha→Beta seeded first (declaration order); Beta→Alpha then closes a
+    // cycle and Beta→Beta is a self-edge — both rejected.
+    let beta_id = child_id_by_title(&svc, &ws, &r.created_note_ids, "Beta").await;
+    let alpha = child_task_meta(&svc, &ws, &r.created_note_ids, "Alpha").await;
+    let deps: Vec<&str> = alpha.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![beta_id.as_str()], "acyclic edge applies");
+    let beta = child_task_meta(&svc, &ws, &r.created_note_ids, "Beta").await;
+    assert!(beta.depends_on.is_empty(), "rejected edges skipped");
+    assert_eq!(r.warnings.len(), 2, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("\"Beta\" (key=b)") && w.contains("cycle") && w.contains("\"a\"")),
+        "cycle warning names block and reference: {:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("\"Beta\" (key=b)")
+            && w.contains("\"b\"")
+            && w.contains("cannot reference the task itself")),
+        "self-edge warning present: {:?}",
+        r.warnings
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_surfaces_header_parse_issues_as_warnings() {
+    // T1 header parse issues (unknown attribute) ride the conversion result
+    // as warnings; the block still converts.
+    let content = "@@@task key=a priority=high\n# Alpha\nbody\n@@@";
+    let (_tmp, svc, ws, id) = setup(content).await;
+    let r = svc
+        .convert_task_blocks(ws.clone(), id.clone(), None)
+        .await
+        .expect("convertBlocks");
+    assert_eq!(r.converted_count, 1);
+    assert_eq!(r.warnings.len(), 1, "warnings: {:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("\"Alpha\" (key=a)")
+            && r.warnings[0].contains("unknown attribute `priority`"),
+        "parse issue names the block: {}",
+        r.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn convert_blocks_auto_convert_surfaces_relations_via_note_write() {
+    // The post-write auto-conversion path (note.setContent) shares the op:
+    // relations seed there too, and the write itself still succeeds.
+    let (_tmp, svc, ws, id) = setup("plain").await;
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "@@@task key=x effort=1d\n# X\nbody\n@@@\n\
+         @@@task dependsOn=x\n# Y\nbody\n@@@"
+            .into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("setContent");
+    let all = svc.store.list_notes(&ws).await.expect("list");
+    let x = all.iter().find(|n| n.title == "X").expect("child X");
+    let y = all.iter().find(|n| n.title == "Y").expect("child Y");
+    let x_meta = x.metadata.task.as_ref().expect("X task");
+    assert_eq!(x_meta.estimated_effort.as_deref(), Some("1d"));
+    let y_meta = y.metadata.task.as_ref().expect("Y task");
+    let deps: Vec<&str> = y_meta.depends_on.iter().map(|d| d.as_str()).collect();
+    assert_eq!(deps, vec![x.id.as_str()]);
+}
+
+// ---------------------------------------------------------------------------
 // Version-author attribution: `capture_note_version` stamps a `NoteVersionAuthor`
 // resolved from the caller. Reference parity with `notes.service.ts` L518-555:
 // `Some(agent_id)` → `{id, name: session.name, type: "agent"}` (name falls
@@ -1711,6 +2703,8 @@ async fn note_add_stamps_agent_author_with_session_name() {
     let (_tmp, svc, ws, id) = setup("body").await;
     let agent_id = AgentId::from("agent-writer");
     let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: agent_id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -1739,6 +2733,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: now_iso(),
@@ -1749,6 +2744,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -1811,9 +2807,10 @@ async fn note_add_falls_back_to_agent_id_when_session_missing() {
 // method that mutates a note's content invokes `convert_task_blocks` when the
 // resulting content contains a `@@@task` fence. `note.add` / `note.edit` /
 // `note.editLines` / `note.setContent` surface the conversion counts +
-// fence-free content in their result payloads; `note.create` / `note.update`
-// return the refetched `Note` (fence-free content, fresh rev/updated_at)
-// without count fields.
+// fence-free content in their result payloads; `note.create` carries the
+// same conversion fields alongside the refetched note; `note.update` returns
+// the refetched `Note` (fence-free content, fresh rev/updated_at) without
+// count fields.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1824,7 +2821,7 @@ async fn create_note_with_task_block_auto_converts() {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let svc = Services::new(store);
 
-    let created = svc
+    let result = svc
         .create_note(
             ws.clone(),
             NoteCreate {
@@ -1838,6 +2835,18 @@ async fn create_note_with_task_block_auto_converts() {
         )
         .await
         .expect("create");
+    // The result carries the conversion outcome (parity with the four
+    // content-write ops).
+    assert_eq!(result.converted_count, 1);
+    assert_eq!(result.created_task_note_ids.len(), 1);
+    assert_eq!(result.created_tasks.len(), 1);
+    assert_eq!(result.created_tasks[0].title, "Child One");
+    assert_eq!(
+        result.created_tasks[0].note_id,
+        result.created_task_note_ids[0]
+    );
+    assert!(result.warnings.is_empty(), "no warnings expected");
+    let created = result.note;
     assert!(!created.content.contains("@@@task"));
     assert!(created
         .content
@@ -3877,6 +4886,8 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
     let agent = AgentId::from("agent-sub-guard");
     svc.store()
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -3906,6 +4917,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stats: None,
@@ -3915,6 +4927,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         })
         .await
         .expect("insert agent session");
@@ -4091,7 +5104,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("create");
+            .expect("create")
+            .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(
@@ -4122,7 +5136,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("first create");
+            .expect("first create")
+            .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
 
@@ -4142,7 +5157,8 @@ mod change_event_parity {
                 None,
             )
             .await
-            .expect("replay create");
+            .expect("replay create")
+            .note;
         assert_eq!(second.id.0, first.id.0, "replay returns the original note");
 
         // No second event is published (the replay short-circuits before mutate).
@@ -4165,12 +5181,14 @@ mod change_event_parity {
             .services
             .create_note(h.ws.clone(), mk(), None, None)
             .await
-            .expect("first create");
+            .expect("first create")
+            .note;
         let b = h
             .services
             .create_note(h.ws.clone(), mk(), None, None)
             .await
-            .expect("second create");
+            .expect("second create")
+            .note;
         assert_ne!(
             a.id.0, b.id.0,
             "missing key must not dedupe — both creates run"
@@ -4221,6 +5239,8 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         // A live session so provenance resolves the display name.
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-prov"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -4249,6 +5269,7 @@ mod change_event_parity {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -4259,6 +5280,7 @@ mod change_event_parity {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -4322,6 +5344,8 @@ mod change_event_parity {
                 vec![],
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .expect("markAsTask");
@@ -4358,6 +5382,8 @@ mod change_event_parity {
                 n.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 None,
             )
@@ -4398,6 +5424,8 @@ mod change_event_parity {
                 n.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 None,
             )
@@ -4446,6 +5474,8 @@ mod change_event_parity {
         );
         h.store.insert_note(&n).await.expect("insert note");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-conv"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -4474,6 +5504,7 @@ mod change_event_parity {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -4484,6 +5515,7 @@ mod change_event_parity {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -4506,6 +5538,57 @@ mod change_event_parity {
             created[0]["actor"],
             json!({ "type": "agent", "id": "agent-conv", "name": "Conv" })
         );
+    }
+
+    /// Relation seeding at conversion time (monorepo#2018 T2) goes through
+    /// the same validated writer as `task.setRelations`, so a seeded
+    /// `dependsOn` edge emits the §6.5 pair: `note:updated` for the child
+    /// whose metadata changed, then `task:ready-tasks-changed` with the
+    /// `relations-changed` trigger naming that child.
+    #[tokio::test]
+    async fn convert_blocks_relation_seeding_emits_ready_tasks_changed() {
+        let h = harness().await;
+        let n = note(
+            &h.ws,
+            "parent-rel",
+            "@@@task key=a\n# Alpha\nbody\n@@@\n@@@task dependsOn=a\n# Beta\nbody\n@@@",
+        );
+        h.store.insert_note(&n).await.expect("insert note");
+        let mut sub = subscribe(&h);
+        let r = h
+            .services
+            .convert_task_blocks(h.ws.clone(), n.id.clone(), None)
+            .await
+            .expect("convertBlocks");
+        assert!(r.warnings.is_empty(), "warnings: {:?}", r.warnings);
+        let beta_id = {
+            let mut found = None;
+            for id in &r.created_note_ids {
+                let child = h
+                    .services
+                    .get_note(h.ws.clone(), intent_core::NoteId::from(id.as_str()))
+                    .await
+                    .expect("child");
+                if child.title == "Beta" {
+                    found = Some(id.clone());
+                }
+            }
+            found.expect("Beta created")
+        };
+        let events = drain_events(&mut sub).await;
+        let ready = of_type(&events, "task:ready-tasks-changed");
+        assert_eq!(ready.len(), 1, "one relations-changed recompute");
+        assert_envelope(ready[0], &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ready[0]["data"]["triggeredBy"]["noteId"], beta_id);
+        assert_eq!(
+            ready[0]["data"]["triggeredBy"]["reason"],
+            "relations-changed"
+        );
+        // Beta gained an unmet dep on Alpha, so it is not in the ready set.
+        let ready_ids = ready[0]["data"]["readyTaskIds"]
+            .as_array()
+            .expect("readyTaskIds array");
+        assert!(!ready_ids.iter().any(|v| v == beta_id.as_str()));
     }
 
     #[tokio::test]
@@ -4544,6 +5627,8 @@ mod change_event_parity {
         let plain = note(&h.ws, "plain-agent", "body");
         h.store.insert_note(&plain).await.expect("insert note");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-task"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -4572,6 +5657,7 @@ mod change_event_parity {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -4582,6 +5668,7 @@ mod change_event_parity {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -4598,6 +5685,8 @@ mod change_event_parity {
                 plain.id.clone(),
                 "not_started".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 caller.clone(),
             )
@@ -4617,6 +5706,8 @@ mod change_event_parity {
                 plain.id.clone(),
                 "in_progress".to_string(),
                 vec![],
+                None,
+                None,
                 None,
                 caller.clone(),
             )
@@ -4695,6 +5786,531 @@ mod change_event_parity {
         assert_eq!(ev["data"]["triggeredBy"]["previousStatus"], "not_started");
         assert_eq!(ev["data"]["triggeredBy"]["newStatus"], "complete");
         assert!(ev["data"]["computedAt"].is_string());
+    }
+
+    /// Readiness generalization over `dependsOn` edges (spec §2.2,
+    /// monorepo#1974): ready = children complete AND all dependsOn complete.
+    /// Cross-subtree regression: a task depending on two sibling-subtree
+    /// tasks is not ready until BOTH complete; a cancelled dep never
+    /// satisfies its edge.
+    #[tokio::test]
+    async fn ready_tasks_respect_depends_on_edges() {
+        let h = harness().await;
+        // Two sibling subtrees: parent-a → dep-a, parent-b → dep-b, plus a
+        // root-level task `gated` with dependsOn [dep-a, dep-b]. Distinct
+        // createdAt stamps keep the sibling sort (peerOrder, then createdAt)
+        // deterministic.
+        let mk = |id: &str, parent: Option<&str>, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent-a", None, vec![], 0),
+            mk("dep-a", Some("parent-a"), vec![], 1),
+            mk("parent-b", None, vec![], 2),
+            mk("dep-b", Some("parent-b"), vec![], 3),
+            mk("gated", None, vec!["dep-a", "dep-b"], 4),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Complete dep-a: dep-b is still not_started, so `gated` stays out of
+        // the ready set (its dependsOn is only partially satisfied).
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("complete dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        // Leaves-first post-order: parent-a (child complete → ready), then
+        // dep-b (leaf → ready). `gated` is NOT ready — dep-b is incomplete —
+        // and parent-b is blocked by its incomplete child dep-b.
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-a", "dep-b"]));
+        // The dep transition moves `gated`'s computed unmetDependsOn, so its
+        // note is re-announced for subscriber refetch (monorepo#1979).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // Complete dep-b: both dependsOn edges are now satisfied, so `gated`
+        // joins the ready set.
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-b"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("complete dep-b");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(
+            ev["data"]["readyTaskIds"],
+            json!(["parent-a", "parent-b", "gated"])
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // Cancelled deps do NOT satisfy edges: cancelling dep-a (complete →
+        // cancelled) makes `gated` un-ready again (and parent-a too — a
+        // cancelled child is not `complete`).
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "cancelled".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("cancel dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent-b"]));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // A transition that does NOT cross the complete boundary (cancelled →
+        // in_progress) leaves dependents' unmetDependsOn unchanged, so no
+        // dependent re-announce fires: the next boundary-crossing transition's
+        // `task:status-changed` follows the ready-set event directly.
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("restart dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                intent_core::NoteId::from("dep-a"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("re-complete dep-a");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:status-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+
+        // Deleting a *complete* dep also moves dependents' unmetDependsOn
+        // (missing = unmet), so the dependent is re-announced after the
+        // `note:deleted` (monorepo#1979). The deleted note is depended on, so
+        // the ready-set recompute (monorepo#1981) lands in between.
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep-b"), None)
+            .await
+            .expect("delete dep-b");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        assert_eq!(ev["data"]["noteId"], json!("dep-b"));
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep-b", "reason": "note-deleted" })
+        );
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(ev["data"]["noteId"], json!("gated"));
+    }
+
+    /// monorepo#1981: a `task.setRelations` write that changes `dependsOn`
+    /// recomputes + emits `task:ready-tasks-changed` with the additive
+    /// `triggeredBy: { noteId, reason: "relations-changed" }` variant (no
+    /// status fields). Adding an edge un-readies a task; clearing it readies
+    /// the task again; a conflictsWith-only write does not emit.
+    #[tokio::test]
+    async fn set_relations_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [mk("task-a", 0), mk("task-b", 1)] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Adding a dependsOn edge onto incomplete task-a un-readies task-b.
+        let mut sub = subscribe(&h);
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                Some(vec![intent_core::NoteId::from("task-a")]),
+                None,
+            )
+            .await
+            .expect("setRelations add edge");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "task-b", "reason": "relations-changed" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
+
+        // Clearing the edge readies task-b again.
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                Some(vec![]),
+                None,
+            )
+            .await
+            .expect("setRelations clear edge");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a", "task-b"]));
+        assert_eq!(ev["data"]["triggeredBy"]["reason"], "relations-changed");
+
+        // A conflictsWith-only change emits note:updated but NO ready-set
+        // recompute (dependsOn unchanged → readiness predicate unchanged).
+        h.services
+            .task_set_relations(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                None,
+                Some(vec![intent_core::NoteId::from("task-a")]),
+            )
+            .await
+            .expect("setRelations conflicts only");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
+    /// monorepo#1981: a same-status `task.markAsTask` re-mark that replaces
+    /// `dependsOn` takes the same `relations-changed` recompute as
+    /// `task.setRelations` (no status-shaped emission runs on that arm). A
+    /// same-status re-mark with omitted relation params emits no recompute.
+    #[tokio::test]
+    async fn same_status_remark_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status: TaskStatus::NotStarted,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [mk("task-a", 0), mk("task-b", 1)] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Same-status re-mark that adds a dependsOn edge onto incomplete
+        // task-a → task-b drops out of the ready set, announced with the
+        // `relations-changed` trigger.
+        let mut sub = subscribe(&h);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                Some(vec![intent_core::NoteId::from("task-a")]),
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark with deps");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["task-a"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "task-b", "reason": "relations-changed" })
+        );
+
+        // Same-status re-mark with omitted relation params keeps the deps →
+        // note:updated only, no recompute.
+        let events_before = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events_before, "task:ready-tasks-changed").len(), 0);
+        h.services
+            .mark_as_task(
+                h.ws.clone(),
+                intent_core::NoteId::from("task-b"),
+                "not_started".to_string(),
+                vec![],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("same-status re-mark without deps");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:updated").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+    }
+
+    /// monorepo#1981: deleting a task note that other tasks dependOn
+    /// recomputes + emits `task:ready-tasks-changed` with
+    /// `triggeredBy: { noteId, reason: "note-deleted" }` — a dangling edge
+    /// counts as unmet, so deleting a `complete` dep un-readies its
+    /// dependents. Deleting a **ready** task itself also moves the set
+    /// (monorepo#2006), while a delete that provably cannot move it (a
+    /// terminal task nobody depends on) still emits no recompute.
+    #[tokio::test]
+    async fn deleting_depended_on_note_recomputes_ready_set() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("dep", TaskStatus::Complete, vec![], 0),
+            mk("gated", TaskStatus::NotStarted, vec!["dep"], 1),
+            mk("loner", TaskStatus::NotStarted, vec![], 2),
+            mk("done-loner", TaskStatus::Complete, vec![], 3),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        // Deleting `done-loner` (terminal, no dependents, no children) cannot
+        // move the ready set → note:deleted only, no recompute.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("done-loner"), None)
+            .await
+            .expect("delete done-loner");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+
+        // Deleting `loner` (nobody depends on it, but it IS in the ready set)
+        // → its id silently leaving the set is announced (monorepo#2006).
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("loner"), None)
+            .await
+            .expect("delete loner");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["gated"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "loner", "reason": "note-deleted" })
+        );
+
+        // Deleting `dep` (complete, satisfied gated's edge) → the dangling
+        // edge is unmet, so `gated` drops out of the ready set.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep"), None)
+            .await
+            .expect("delete dep");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!([]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep", "reason": "note-deleted" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
+    }
+
+    /// Pins the #1981 always-emit arm: deleting a depended-on note emits a
+    /// recompute EVEN WHEN the ready set is unchanged — here `gated` is held
+    /// back by a second incomplete dep both before and after, so the set is
+    /// `[other]` throughout, yet the dangling-edge announcement still fires.
+    #[tokio::test]
+    async fn deleting_depended_on_note_emits_even_when_set_unchanged() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, deps: Vec<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                depends_on: deps.into_iter().map(intent_core::NoteId::from).collect(),
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("dep", TaskStatus::Complete, vec![], 0),
+            mk("holdback", TaskStatus::NotStarted, vec![], 1),
+            mk("gated", TaskStatus::NotStarted, vec!["dep", "holdback"], 2),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+        // Ready set before: ["holdback"]. After deleting `dep` its dangling
+        // edge is unmet, but `gated` was already blocked by the incomplete
+        // `holdback` dep, so the set stays ["holdback"] — only the
+        // `depended_on` arm can produce this emit.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("dep"), None)
+            .await
+            .expect("delete dep");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["holdback"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "dep", "reason": "note-deleted" })
+        );
+    }
+
+    /// monorepo#2006: deleting the last incomplete task child of a parent
+    /// satisfies the tree rule (all task children `complete`), so the parent
+    /// ENTERS the ready set — announced with the `note-deleted` trigger and
+    /// the parent present in `readyTaskIds`. Deleting a plain (non-task) note
+    /// never emits a recompute.
+    #[tokio::test]
+    async fn deleting_last_incomplete_child_readies_parent() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent", TaskStatus::NotStarted, None, 0),
+            mk("done-child", TaskStatus::Complete, Some("parent"), 1),
+            mk("open-child", TaskStatus::InProgress, Some("parent"), 2),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+        h.store
+            .insert_note(&note(&h.ws, "plain", "not a task"))
+            .await
+            .expect("insert plain note");
+
+        // Deleting a plain note → note:deleted only, no recompute.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("plain"), None)
+            .await
+            .expect("delete plain");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
+
+        // Deleting `open-child` (the last incomplete child) both removes it
+        // from the ready set and readies `parent`.
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("open-child"), None)
+            .await
+            .expect("delete open-child");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:deleted");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "task:ready-tasks-changed");
+        assert_eq!(ev["data"]["readyTaskIds"], json!(["parent"]));
+        assert_eq!(
+            ev["data"]["triggeredBy"],
+            json!({ "noteId": "open-child", "reason": "note-deleted" })
+        );
+        assert!(ev["data"]["computedAt"].is_string());
+    }
+
+    /// Regression (intentd#1121 review): deleting a NON-ready parent whose
+    /// incomplete child is (and stays) ready must NOT emit a recompute — the
+    /// ready set is `{child}` before and after. The store's
+    /// `note_parent_set_null_on_delete` trigger clears the child's
+    /// `parent_id`, so reconstructing the pre-delete tree from post-delete
+    /// rows made the parent look childless/ready and fired a spurious emit;
+    /// the pre-delete snapshot comparison avoids that.
+    #[tokio::test]
+    async fn deleting_non_ready_parent_with_ready_child_emits_no_recompute() {
+        let h = harness().await;
+        let mk = |id: &str, status: TaskStatus, parent: Option<&str>, seq: usize| {
+            let mut n = note(&h.ws, id, "body");
+            n.created_at = format!("2026-01-01T00:00:0{seq}.000Z");
+            n.parent_id = parent.map(intent_core::NoteId::from);
+            n.metadata.task = Some(TaskMetadata {
+                status,
+                ..Default::default()
+            });
+            n
+        };
+        for n in [
+            mk("parent", TaskStatus::NotStarted, None, 0),
+            mk("child", TaskStatus::InProgress, Some("parent"), 1),
+        ] {
+            h.store.insert_note(&n).await.expect("insert note");
+        }
+
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), intent_core::NoteId::from("parent"), None)
+            .await
+            .expect("delete parent");
+        let events = drain_events(&mut sub).await;
+        assert_eq!(of_type(&events, "note:deleted").len(), 1);
+        assert_eq!(of_type(&events, "task:ready-tasks-changed").len(), 0);
     }
 
     #[tokio::test]
@@ -4987,6 +6603,177 @@ mod change_event_parity {
         assert!(
             quiet.is_err(),
             "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
+        );
+    }
+
+    /// Minimal agent session row for the auto-unarchive stamp tests.
+    fn auto_unarchive_session(agent_id: &AgentId, ws: &WorkspaceId, name: &str) -> AgentSession {
+        AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: name.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+        }
+    }
+
+    /// A turn starting in an Archived workspace auto-unarchives it: the row
+    /// flips to Active and ONE `workspace:updated` delta fires carrying the
+    /// additive `autoUnarchive: { reason: "agent_activity", agentId,
+    /// agentName }` stamp alongside the standard unarchive delta fields
+    /// (§6.5). Manual unarchive coverage (no stamp) is the exact-equality
+    /// assertion in `unarchive_workspace_emits_workspace_updated_once`.
+    #[tokio::test]
+    async fn auto_unarchive_on_turn_start_emits_stamped_delta() {
+        use intent_core::WorkspaceStatus;
+        let h = harness().await;
+        let mut ws = workspace(&h.ws);
+        ws.status = WorkspaceStatus::Archived;
+        ws.archived = true;
+        ws.archived_at = Some(intent_core::now_iso());
+        h.store.update_workspace(&ws).await.expect("archive row");
+        let agent_id = AgentId::from("agent-auto-unarchive");
+        h.store
+            .insert_agent_session(&auto_unarchive_session(&agent_id, &h.ws, "Builder"))
+            .await
+            .expect("insert session");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"],
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": false,
+                    "status": "Active",
+                    "archivedAt": null,
+                    "autoUnarchive": {
+                        "reason": "agent_activity",
+                        "agentId": agent_id.0,
+                        "agentName": "Builder",
+                    },
+                }
+            })
+        );
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "auto-unarchive must publish exactly one event, got extra: {quiet:?}"
+        );
+        let row = h.store.get_workspace(&h.ws).await.expect("row");
+        assert!(!row.archived, "row flipped to Active");
+        assert_eq!(row.status, WorkspaceStatus::Active);
+        assert!(row.archived_at.is_none(), "archivedAt cleared");
+    }
+
+    /// A turn starting in a NON-archived workspace is a no-op: no event, no
+    /// row write — the turn-start hot path costs one point read only.
+    #[tokio::test]
+    async fn auto_unarchive_noop_when_workspace_active() {
+        let h = harness().await;
+        let agent_id = AgentId::from("agent-noop");
+        let before = h.store.get_workspace(&h.ws).await.expect("row");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "active workspace must emit nothing, got: {quiet:?}"
+        );
+        let after = h.store.get_workspace(&h.ws).await.expect("row");
+        assert_eq!(
+            before.updated_at, after.updated_at,
+            "no row write on the active-workspace path"
+        );
+    }
+
+    /// Best-effort contract: a workspace read failure (missing row) must
+    /// return cleanly — no panic, no event — so the turn proceeds.
+    #[tokio::test]
+    async fn auto_unarchive_swallows_workspace_read_failure() {
+        let h = harness().await;
+        let agent_id = AgentId::from("agent-fail");
+        let missing = WorkspaceId::from("ws-does-not-exist");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&missing, &agent_id)
+            .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(
+            quiet.is_err(),
+            "failed read must emit nothing, got: {quiet:?}"
+        );
+    }
+
+    /// The agent-name lookup is display-only: an archived workspace whose
+    /// triggering agent has no session row still unarchives, with
+    /// `agentName: null` in the stamp.
+    #[tokio::test]
+    async fn auto_unarchive_stamps_null_name_when_session_missing() {
+        use intent_core::WorkspaceStatus;
+        let h = harness().await;
+        let mut ws = workspace(&h.ws);
+        ws.status = WorkspaceStatus::Archived;
+        ws.archived = true;
+        ws.archived_at = Some(intent_core::now_iso());
+        h.store.update_workspace(&ws).await.expect("archive row");
+        let agent_id = AgentId::from("agent-no-row");
+        let mut sub = subscribe(&h);
+        h.services
+            .auto_unarchive_on_turn_start(&h.ws, &agent_id)
+            .await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"]["autoUnarchive"],
+            json!({
+                "reason": "agent_activity",
+                "agentId": agent_id.0,
+                "agentName": null,
+            })
         );
     }
 
@@ -5836,13 +7623,18 @@ mod change_event_parity {
             .await
             .expect("first create")
             .workspace;
-        // The first create publishes `workspace:created` and the spec seed's
-        // `note:created`; drain both before checking replay is silent.
+        // The first create publishes `workspace:created`, the spec seed's
+        // `note:created`, and the setup stage's `workspace:setup:completed`
+        // (no worktree → no script); drain all three before checking replay
+        // is silent.
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "workspace:created");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &first.id.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &first.id.0, "workspace:setup:completed");
+        assert_eq!(ev["data"]["ranScript"], json!(false));
 
         // Replay with the same key but different input still returns the
         // original workspace (the body is never re-executed).
@@ -6100,6 +7892,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         let spec_before = h
             .store
@@ -6153,6 +7946,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (initial seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         // Drop the spec straight through the store to simulate a corrupt /
         // manually-cleared workspace.
@@ -6574,6 +8368,7 @@ mod change_event_parity {
             .workspace;
         let _ = recv_one(&mut sub).await; // workspace:created
         let _ = recv_one(&mut sub).await; // note:created (seed)
+        let _ = recv_one(&mut sub).await; // workspace:setup:completed (no worktree)
 
         let stray_id = NoteId::new();
         let stray = Note {
@@ -6698,6 +8493,8 @@ mod mcp_callback {
             .expect("note");
         let agent_id = AgentId::from_string("agent-mcp-writer");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -6726,6 +8523,7 @@ mod mcp_callback {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -6736,6 +8534,7 @@ mod mcp_callback {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -7176,6 +8975,9 @@ mod pr {
         /// without the signals (the trait default `Unsupported`), exercising
         /// the degraded checklist path.
         merge_signals: Option<MergeRequirementSignals>,
+        /// PR number whose `get_pr` pends forever (hung-connection
+        /// regression, intent-hq/monorepo#1988 lineage).
+        hang_get_pr: Option<u64>,
     }
 
     fn sample_pr() -> PullRequest {
@@ -7336,6 +9138,10 @@ mod pr {
             })
         }
         async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+            if self.hang_get_pr == Some(number) {
+                // A TCP connection that went dark: the future never resolves.
+                std::future::pending::<()>().await;
+            }
             if self.missing_pr == Some(number) {
                 return Err(ScError::NotFound("no such PR".into()));
             }
@@ -8908,6 +10714,66 @@ mod pr {
         }
     }
 
+    /// Regression for intent-hq/monorepo#2094 (intent-hq/monorepo#1988
+    /// lineage): a forge fetch that pends forever (a TCP connection gone
+    /// dark) must not wedge the PR-refresh sweep. The per-workspace timeout
+    /// maps the hang to the existing log-and-continue error path — the hung
+    /// workspace is skipped untouched — and the sweep proceeds to refresh
+    /// the remaining workspaces.
+    #[tokio::test]
+    async fn a_hung_fetch_times_out_and_the_sweep_still_refreshes_other_workspaces() {
+        let forge = StubForge {
+            discover: true,
+            hang_get_pr: Some(42),
+            ..Default::default()
+        };
+        // The hung workspace is inserted FIRST so the sweep (created_at
+        // order) hits the hang before the healthy workspace — forward
+        // progress past the hang is exactly what the test proves. It is
+        // linked to PR #42, whose `get_pr` pends forever; the healthy
+        // workspace is unlinked and discovers via `list_prs`, which stays
+        // responsive.
+        let (_t, svc, hung_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        // 500 ms, not lower: unlike the monitor-sweep precedent this budget
+        // also bounds the HEALTHY workspace's whole refresh (SQLite writes +
+        // event publish), so leave headroom for a saturated CI machine. The
+        // hung future pends forever, so any compressed value proves the same
+        // thing — runtime just scales with the timeout.
+        let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(500));
+        let healthy_id = WorkspaceId::new();
+        let mut healthy = workspace(&healthy_id);
+        healthy.branch = "feature".to_string();
+        healthy.repository_owner = Some("o".into());
+        healthy.repository_name = Some("r".into());
+        healthy.updated_at = now_iso();
+        svc.store().insert_workspace(&healthy).await.expect("ws2");
+
+        svc.refresh_all_workspace_prs(0).await;
+
+        // The hung workspace was skipped untouched: no status persisted, no
+        // event emitted.
+        let hung_after = svc.store().get_workspace(&hung_id).await.unwrap();
+        assert_eq!(hung_after.pr_number, Some(42));
+        assert_eq!(hung_after.pr_status, None, "hung refresh persisted nothing");
+        let hung_evs = svc.store().events_by_workspace(&hung_id, 10).await.unwrap();
+        assert!(hung_evs.is_empty(), "no event for the hung workspace");
+
+        // The sweep proceeded past the hang: the healthy workspace was
+        // discovered and linked.
+        let healthy_after = svc.store().get_workspace(&healthy_id).await.unwrap();
+        assert_eq!(healthy_after.pr_number, Some(42));
+        assert_eq!(
+            healthy_after.pr_status,
+            Some(intent_core::PullRequestStatus::Open)
+        );
+        let evs = svc
+            .store()
+            .events_by_type(&healthy_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* orchestration (§5.18): the commit→push→create-PR
     // pipeline against a real worktree + local bare remote, then mergePR via the
@@ -9329,6 +11195,477 @@ mod pr {
         assert_eq!(r["isResolved"], true);
         let ur = svc.github_unresolve_thread("RT1".into()).await.unwrap();
         assert_eq!(ur["isResolved"], false);
+    }
+
+    // ------------------------------------------------------------------------
+    // Git-root sweep (monorepo#2053): submodule auto-registration, auto-prune,
+    // and per-root PR refresh against the stubbed forge (no network).
+    // ------------------------------------------------------------------------
+
+    /// Self-cleaning temp git repository whose unborn HEAD points at `branch`
+    /// (`current_branch_at` reads the symbolic target, so no commit is needed).
+    struct SweepRepo {
+        dir: PathBuf,
+    }
+
+    impl SweepRepo {
+        fn init(branch: &str, origin: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = git2::Repository::init(&dir).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            if let Some(url) = origin {
+                repo.remote("origin", url).unwrap();
+            }
+            Self { dir }
+        }
+    }
+
+    impl Drop for SweepRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Bus-wired service plus a seeded workspace whose worktree is `worktree`.
+    /// The bus persists `gitRoot:*` events to the durable log we assert on.
+    async fn sweep_setup(worktree: &std::path::Path) -> (TempDb, Services, intent_core::Workspace) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        (tmp, svc, ws)
+    }
+
+    /// Build an unlinked `WorkspaceGitRoot` row at `dir` (canonicalized, so it
+    /// matches the sweep's path keying).
+    fn sweep_root(
+        ws_id: &WorkspaceId,
+        dir: &std::path::Path,
+        owner_repo: Option<(&str, &str)>,
+    ) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: std::fs::canonicalize(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: owner_repo.map(|(o, _)| o.to_string()),
+            repo_name: owner_repo.map(|(_, n)| n.to_string()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// The sweep auto-registers the worktree's initialized submodules as
+    /// `source: "auto"` roots with owner/name detected from `origin`, prunes
+    /// roots whose directory is gone, and is idempotent on re-run.
+    #[tokio::test]
+    async fn sweep_auto_registers_submodules_and_prunes_missing_roots() {
+        let parent = SweepRepo::init("main", None);
+        let sub_dir = parent.dir.join("packages").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let sub = git2::Repository::init(&sub_dir).unwrap();
+        sub.remote("origin", "https://github.com/o/r.git").unwrap();
+        std::fs::write(
+            parent.dir.join(".gitmodules"),
+            "[submodule \"packages/sub\"]\n\tpath = packages/sub\n\turl = https://github.com/o/r.git\n",
+        )
+        .unwrap();
+
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Seed a root whose directory no longer exists (auto-prune target).
+        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone = sweep_root(&ws.id, &gone_dir, None);
+        svc.store().upsert_workspace_git_root(&gone).await.unwrap();
+        std::fs::remove_dir_all(&gone_dir).unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let root = &roots[0];
+        assert_eq!(root.source, intent_core::WorkspaceGitRootSource::Auto);
+        assert!(root.path.ends_with("sub"), "{}", root.path);
+        assert_eq!(root.repo_owner.as_deref(), Some("o"));
+        assert_eq!(root.repo_name.as_deref(), Some("r"));
+
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].data["gitRoot"]["source"], "auto");
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 1);
+        assert_eq!(unregistered[0].data["gitRootId"], gone.id.as_str());
+
+        // Re-sweeping is idempotent: the tracked submodule is not re-upserted
+        // (no `gitRoot:registered`/`gitRoot:updated` churn).
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        let registered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:registered", 10)
+            .await
+            .unwrap();
+        assert_eq!(registered.len(), 1);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 0);
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+    }
+
+    /// Commit an empty tree in `dir` so its HEAD resolves to a SHA, returning
+    /// the commit SHA (SweepRepo repos have an unborn HEAD by default).
+    fn sweep_commit(dir: &std::path::Path) -> String {
+        let repo = git2::Repository::open(dir).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap()
+            .to_string()
+    }
+
+    /// The sweep best-effort-backfills a NULL `registered_commit_sha` with
+    /// the root's CURRENT HEAD (emitting `gitRoot:updated`), never
+    /// overwrites a set value, and leaves an unreadable-HEAD root NULL for
+    /// the next pass (no churn).
+    #[tokio::test]
+    async fn sweep_backfills_null_registered_commit_sha() {
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Root A: HEAD resolvable, NULL sha → stamped on the next pass.
+        let with_head = SweepRepo::init("main", None);
+        let head_sha = sweep_commit(&with_head.dir);
+        let root_a = sweep_root(&ws.id, &with_head.dir, None);
+        svc.store()
+            .upsert_workspace_git_root(&root_a)
+            .await
+            .unwrap();
+        // Root B: unborn HEAD, NULL sha → stays NULL (fail-soft, no event).
+        let unborn = SweepRepo::init("main", None);
+        let root_b = sweep_root(&ws.id, &unborn.dir, None);
+        svc.store()
+            .upsert_workspace_git_root(&root_b)
+            .await
+            .unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let a = svc
+            .store()
+            .get_workspace_git_root(&root_a.id)
+            .await
+            .unwrap();
+        assert_eq!(a.registered_commit_sha.as_deref(), Some(head_sha.as_str()));
+        let b = svc
+            .store()
+            .get_workspace_git_root(&root_b.id)
+            .await
+            .unwrap();
+        assert_eq!(b.registered_commit_sha, None, "unreadable HEAD stays NULL");
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "one backfill stamp event");
+        assert_eq!(updated[0].data["gitRoot"]["registeredCommitSha"], head_sha);
+
+        // HEAD moves; a re-sweep never overwrites the stamped value and
+        // emits no further backfill event.
+        std::fs::write(with_head.dir.join("x.txt"), "x\n").unwrap();
+        {
+            let repo = git2::Repository::open(&with_head.dir).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("x.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "move", &tree, &[&parent])
+                .unwrap();
+        }
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        let a = svc
+            .store()
+            .get_workspace_git_root(&root_a.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.registered_commit_sha.as_deref(),
+            Some(head_sha.as_str()),
+            "stamped SHA immutable across sweeps"
+        );
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "no re-stamp churn");
+    }
+
+    /// The sweep's local steps run without a SourceControl provider: the
+    /// commit-sha backfill still stamps a NULL row when `sc` is `None`
+    /// (unconfigured credentials must not strand pre-migration rows).
+    #[tokio::test]
+    async fn sweep_backfill_runs_without_source_control() {
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        let with_head = SweepRepo::init("main", None);
+        let head_sha = sweep_commit(&with_head.dir);
+        let root = sweep_root(&ws.id, &with_head.dir, None);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        svc.sweep_workspace_git_roots(&ws, None).await;
+
+        let stamped = svc.store().get_workspace_git_root(&root.id).await.unwrap();
+        assert_eq!(
+            stamped.registered_commit_sha.as_deref(),
+            Some(head_sha.as_str()),
+            "backfill must not require a forge provider"
+        );
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1, "one backfill stamp event");
+    }
+
+    /// The sweep's submodule auto-detect stamps the submodule's HEAD on the
+    /// freshly registered root.
+    #[tokio::test]
+    async fn sweep_auto_register_stamps_registered_commit_sha() {
+        let parent = SweepRepo::init("main", None);
+        let sub_dir = parent.dir.join("packages").join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        git2::Repository::init(&sub_dir).unwrap();
+        let sub_head = sweep_commit(&sub_dir);
+        std::fs::write(
+            parent.dir.join(".gitmodules"),
+            "[submodule \"packages/sub\"]\n\tpath = packages/sub\n\turl = https://github.com/o/r.git\n",
+        )
+        .unwrap();
+
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        assert_eq!(
+            roots[0].registered_commit_sha.as_deref(),
+            Some(sub_head.as_str()),
+            "auto-detect stamps the submodule HEAD"
+        );
+    }
+
+    /// Auto-prune fires only on a genuine path-gone (`NotFound` /
+    /// `NotADirectory`): a transient stat failure of any other kind
+    /// (`PermissionDenied` here, standing in for EIO on a flaky mount) must
+    /// never delete an agent-registered root with its attribution and PR
+    /// history — the sweep logs and skips it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_does_not_prune_root_on_transient_stat_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let parent = SweepRepo::init("main", None);
+        let (_t, svc, ws) = sweep_setup(&parent.dir).await;
+
+        // Root at guard/repo where `guard` is later made unsearchable, so a
+        // stat of the root's path fails with PermissionDenied, not NotFound.
+        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let repo_dir = guard.join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let root = sweep_root(&ws.id, &repo_dir, None);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&root.path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&guard);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1, "root must survive the transient error");
+        assert_eq!(roots[0].id, root.id);
+        let unregistered = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:unregistered", 10)
+            .await
+            .unwrap();
+        assert_eq!(unregistered.len(), 0, "no prune event");
+    }
+
+    /// An unlinked root with a detected repo discovers an open PR by its
+    /// current branch (emitting `gitRoot:updated`); a re-sweep with identical
+    /// forge state is a no-op.
+    #[tokio::test]
+    async fn sweep_links_root_pr_by_branch_discovery() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            discover: true,
+            ..Default::default()
+        });
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        assert_eq!(roots.len(), 1);
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
+
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].data["gitRoot"]["prNumber"], 42);
+
+        // Identical forge state on the next sweep: no new event.
+        svc.sweep_workspace_git_roots(&ws, Some(&sc)).await;
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A root without a detected GitHub repo is skipped before any forge call.
+    #[tokio::test]
+    async fn root_refresh_skips_without_detected_repo() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", None);
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let root = sweep_root(&ws.id, &secondary.dir, None);
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Skipped);
+    }
+
+    /// A linked root whose current branch positively mismatches the PR head
+    /// clears the stale link (root analogue of the workspace unlink path).
+    #[tokio::test]
+    async fn root_refresh_unlinks_on_positive_branch_mismatch() {
+        let primary = SweepRepo::init("main", None);
+        // Root repo is on "main"; the linked PR #42's head is "feature".
+        let secondary = SweepRepo::init("main", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
+        let outcome = svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, None);
+        assert_eq!(after.pr_url, None);
+        assert_eq!(after.pr_status, None);
+        let updated = svc
+            .store()
+            .events_by_type(&ws.id, "gitRoot:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+    }
+
+    /// A linked PR fetched as merged stays recorded in `pull_requests` and the
+    /// root relinks to a newer open PR on the same branch.
+    #[tokio::test]
+    async fn root_refresh_relinks_after_linked_pr_merges() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            open_pr_number: Some(77),
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let after = &roots[0];
+        assert_eq!(after.pr_number, Some(77));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/77")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+        assert!(list.iter().any(|p| p.number == 77));
     }
 }
 
@@ -10553,7 +12890,10 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         // Page size 1 → newest commit only, with a token for the older page.
-        let page1 = svc.git_commits(ws_id.clone(), Some(1), None).await.unwrap();
+        let page1 = svc
+            .git_commits(ws_id.clone(), Some(1), None, None)
+            .await
+            .unwrap();
         let items = page1["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         let head = &items[0];
@@ -10569,7 +12909,7 @@ mod file_tracking {
 
         // Following the token yields the older (seed) commit, then no more.
         let page2 = svc
-            .git_commits(ws_id, Some(1), Some(token.to_string()))
+            .git_commits(ws_id, Some(1), Some(token.to_string()), None)
             .await
             .unwrap();
         let items2 = page2["items"].as_array().unwrap();
@@ -10590,7 +12930,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("new.txt"), "hi\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let changes = svc.git_changes(ws_id).await.unwrap();
+        let changes = svc.git_changes(ws_id, None).await.unwrap();
         let arr = changes.as_array().unwrap();
         let seed = arr.iter().find(|c| c["path"] == "seed.txt").unwrap();
         assert_eq!(seed["status"], serde_json::json!("M"));
@@ -10608,7 +12948,7 @@ mod file_tracking {
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
         let arr = diffs.as_array().unwrap();
         let f = arr.iter().find(|d| d["path"] == "seed.txt").unwrap();
         let hunks = f["hunks"].as_array().unwrap();
@@ -10642,13 +12982,54 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["path"], serde_json::json!("seed.txt"));
         assert!(!arr[0]["hunks"].as_array().unwrap().is_empty());
+    }
+
+    /// `git.diffs` (staged) on a submodule pin bump synthesizes the
+    /// `Subproject commit <sha>` pseudo-hunk instead of failing to hydrate the
+    /// pin SHAs as blobs (monorepo#1739).
+    #[tokio::test]
+    async fn git_diffs_staged_gitlink_synthesizes_subproject_hunk() {
+        let repo = init_git_repo();
+        let child = init_git_repo();
+        add_submodule(&repo.dir, &child.dir, "sub");
+        // Stage a pin bump: point the gitlink at a different (synthetic) sha.
+        let new_sha = "7908777602d4e96f13c663c8a70a617163f38413";
+        let old_sha = {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            let mut entry = idx.get_path(std::path::Path::new("sub"), 0).unwrap();
+            let old = entry.id.to_string();
+            entry.id = git2::Oid::from_str(new_sha).unwrap();
+            idx.add(&entry).unwrap();
+            idx.write().unwrap();
+            old
+        };
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc.git_diffs(ws_id, None, true, None, None).await.unwrap();
+        let arr = diffs.as_array().unwrap();
+        let f = arr.iter().find(|d| d["path"] == "sub").unwrap();
+        let hunks = f["hunks"].as_array().unwrap();
+        assert_eq!(hunks.len(), 1);
+        let lines = hunks[0]["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "Deletion");
+        assert_eq!(
+            lines[0]["content"],
+            serde_json::json!(format!("Subproject commit {old_sha}\n"))
+        );
+        assert_eq!(lines[1]["type"], "Addition");
+        assert_eq!(
+            lines[1]["content"],
+            serde_json::json!(format!("Subproject commit {new_sha}\n"))
+        );
     }
 
     /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
@@ -10693,7 +13074,7 @@ mod file_tracking {
         let first = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The leader is inside the walk (flight registered, probe parked).
         wait_until("leader to enter the walk", || {
@@ -10704,10 +13085,10 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         // The identical call joined the in-flight walk as a follower.
-        let key = (ws_id.clone(), None, false, None);
+        let key = (ws_id.clone(), None, false, None, None);
         wait_until("second call to join as follower", || {
             svc.git_diffs_waiters(&key) == 1
         })
@@ -10754,13 +13135,13 @@ mod file_tracking {
         let unstaged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, false, None).await }
+            async move { svc.git_diffs(ws, None, false, None, None).await }
         });
         wait_until("first walk", || walks.load(Ordering::SeqCst) == 1).await;
         let staged = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, None, true, None).await }
+            async move { svc.git_diffs(ws, None, true, None, None).await }
         });
         // The non-identical request must start its own walk while the first
         // is still parked.
@@ -10805,7 +13186,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         // The leader is inside the scan (flight registered, probe parked).
         wait_until("leader to enter the scan", || {
@@ -10817,7 +13198,7 @@ mod file_tracking {
             .map(|_| {
                 let svc = svc.clone();
                 let ws = ws_id.clone();
-                tokio::spawn(async move { svc.git_status(ws).await })
+                tokio::spawn(async move { svc.git_status(ws, None).await })
             })
             .collect();
         wait_until("followers to join the in-flight scan", || {
@@ -10866,7 +13247,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -10986,12 +13367,12 @@ mod file_tracking {
 
         let first = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_a).await }
+            async move { svc.git_status(ws_a, None).await }
         });
         wait_until("first scan", || scans.load(Ordering::SeqCst) == 1).await;
         let second = tokio::spawn({
             let svc = svc.clone();
-            async move { svc.git_status(ws_b).await }
+            async move { svc.git_status(ws_b, None).await }
         });
         // The other worktree must start its own scan while the first is parked.
         wait_until("second independent scan", || {
@@ -11026,8 +13407,8 @@ mod file_tracking {
             })
         });
 
-        assert!(svc.git_status(ws_id.clone()).await.is_err());
-        assert!(svc.git_status(ws_id).await.is_err());
+        assert!(svc.git_status(ws_id.clone(), None).await.is_err());
+        assert!(svc.git_status(ws_id, None).await.is_err());
         assert_eq!(scans.load(Ordering::SeqCst), 2, "each caller retried");
     }
 
@@ -11059,7 +13440,7 @@ mod file_tracking {
         let status = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -11068,7 +13449,7 @@ mod file_tracking {
         let changes = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_changes(ws).await }
+            async move { svc.git_changes(ws, None).await }
         });
         wait_until("git.changes to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -11116,7 +13497,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -11125,7 +13506,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -11176,7 +13557,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -11185,7 +13566,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the in-flight scan", || {
             svc.git_status_waiters(&repo.dir) == 1
@@ -11224,17 +13605,17 @@ mod file_tracking {
             })
         });
 
-        let first = svc.git_status(ws_id.clone()).await.unwrap();
+        let first = svc.git_status(ws_id.clone(), None).await.unwrap();
         for _ in 0..4 {
             assert_eq!(
-                svc.git_status(ws_id.clone()).await.unwrap(),
+                svc.git_status(ws_id.clone(), None).await.unwrap(),
                 first,
                 "cached reads return the same status"
             );
         }
         assert_eq!(scans.load(Ordering::SeqCst), 1, "only the first read scans");
         // The other scan-backed reads serve the same entry.
-        svc.git_changes(ws_id.clone()).await.unwrap();
+        svc.git_changes(ws_id.clone(), None).await.unwrap();
         svc.accept_changes_get_status(ws_id).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
@@ -11262,7 +13643,7 @@ mod file_tracking {
             })
         });
 
-        let before = svc.git_status(ws_id.clone()).await.unwrap();
+        let before = svc.git_status(ws_id.clone(), None).await.unwrap();
         assert!(
             before.files.iter().any(|f| !f.staged),
             "the edit starts unstaged"
@@ -11270,7 +13651,7 @@ mod file_tracking {
         svc.git_stage(ws_id.clone(), serde_json::json!(["seed.txt"]))
             .await
             .unwrap();
-        let after = svc.git_status(ws_id).await.unwrap();
+        let after = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -11303,7 +13684,7 @@ mod file_tracking {
             });
 
         assert!(svc
-            .git_status(ws_id.clone())
+            .git_status(ws_id.clone(), None)
             .await
             .unwrap()
             .files
@@ -11311,7 +13692,7 @@ mod file_tracking {
         // Out-of-band edit: no `file:*` event, no daemon mutation.
         std::fs::write(repo.dir.join("seed.txt"), "seed\nadded\n").unwrap();
         assert!(
-            svc.git_status(ws_id.clone())
+            svc.git_status(ws_id.clone(), None)
                 .await
                 .unwrap()
                 .files
@@ -11321,7 +13702,7 @@ mod file_tracking {
         assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let expired = svc.git_status(ws_id).await.unwrap();
+        let expired = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -11360,7 +13741,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -11373,7 +13754,7 @@ mod file_tracking {
         release.store(true, Ordering::SeqCst);
         leader.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -11412,7 +13793,7 @@ mod file_tracking {
         let leader = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("leader to enter the scan", || {
             scans.load(Ordering::SeqCst) == 1
@@ -11427,7 +13808,7 @@ mod file_tracking {
         let follower = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_status(ws).await }
+            async move { svc.git_status(ws, None).await }
         });
         wait_until("follower to join the flight", || {
             svc.git_status_waiters(&repo.dir) > 0
@@ -11438,7 +13819,7 @@ mod file_tracking {
         leader.await.unwrap().unwrap();
         follower.await.unwrap().unwrap();
 
-        let next = svc.git_status(ws_id).await.unwrap();
+        let next = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
             2,
@@ -11456,20 +13837,22 @@ mod file_tracking {
     async fn git_reads_empty_for_non_repo_workspace() {
         let (_t, svc, ws) = ft_setup().await;
         assert_eq!(
-            svc.git_changes(ws.clone()).await.unwrap(),
+            svc.git_changes(ws.clone(), None).await.unwrap(),
             serde_json::json!([])
         );
         assert_eq!(
-            svc.git_diffs(ws.clone(), None, false, None).await.unwrap(),
+            svc.git_diffs(ws.clone(), None, false, None, None)
+                .await
+                .unwrap(),
             serde_json::json!([])
         );
-        let commits = svc.git_commits(ws.clone(), None, None).await.unwrap();
+        let commits = svc.git_commits(ws.clone(), None, None, None).await.unwrap();
         assert_eq!(commits["items"], serde_json::json!([]));
         assert_eq!(commits["nextToken"], serde_json::Value::Null);
         // git.commitDetails degrades to an empty envelope (graceful) — same as
         // the other git reads — when the workspace has no worktree.
         let details = svc
-            .git_commit_details(ws, "deadbeef".to_string())
+            .git_commit_details(ws, "deadbeef".to_string(), None)
             .await
             .unwrap();
         assert_eq!(details["commitHash"], "deadbeef");
@@ -11512,7 +13895,10 @@ mod file_tracking {
             .to_string();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let details = svc.git_commit_details(ws_id, head.clone()).await.unwrap();
+        let details = svc
+            .git_commit_details(ws_id, head.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(details["commitHash"], head);
         assert_eq!(details["author"], "Test");
         assert_eq!(details["authorEmail"], "test@example.com");
@@ -11539,6 +13925,7 @@ mod file_tracking {
             .git_commit_details(
                 ws_id,
                 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                None,
             )
             .await
             .unwrap();
@@ -11548,6 +13935,617 @@ mod file_tracking {
         );
         assert_eq!(details["files"], serde_json::json!([]));
         assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// Build a `WorkspaceGitRoot` row for the given workspace + path
+    /// (monorepo#2053 read-surface tests).
+    fn git_root_row(ws_id: &WorkspaceId, path: &std::path::Path) -> intent_core::WorkspaceGitRoot {
+        let ts = now_iso();
+        intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: ws_id.clone(),
+            path: path.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: None,
+            repo_name: None,
+            registered_by_agent_ids: vec![AgentId("agent-1".into())],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    /// `gitRoot.list` returns every registered root for the workspace with a
+    /// live-read `branch` grafted on, and an empty list when none are
+    /// registered (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_list_returns_registered_roots_with_branch() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let empty = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(empty["gitRoots"], serde_json::json!([]));
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        let listed = svc.git_root_list(ws_id.clone()).await.unwrap();
+        let roots = listed["gitRoots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["id"], root.id.as_str());
+        assert_eq!(roots[0]["path"], root.path);
+        assert_eq!(roots[0]["source"], "agent");
+        assert_eq!(
+            roots[0]["registeredByAgentIds"],
+            serde_json::json!(["agent-1"])
+        );
+        assert!(
+            roots[0]["branch"].is_string(),
+            "live-read branch grafted on: {:?}",
+            roots[0]
+        );
+        // Presence-detected: a NULL registered_commit_sha is OMITTED from the
+        // wire row (never null).
+        assert!(
+            !roots[0]
+                .as_object()
+                .unwrap()
+                .contains_key("registeredCommitSha"),
+            "NULL sha omitted from the wire: {:?}",
+            roots[0]
+        );
+
+        // A stamped SHA is carried on the wire row.
+        let ts = now_iso();
+        svc.store()
+            .backfill_workspace_git_root_commit_sha(&root.id, "deadbeef", &ts)
+            .await
+            .unwrap();
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"][0]["registeredCommitSha"], "deadbeef");
+    }
+
+    /// `gitRoot.list` on an unknown workspace is `NotFound` (router → -32602).
+    #[tokio::test]
+    async fn git_root_list_unknown_workspace_is_not_found() {
+        let repo = init_git_repo();
+        let (_t, svc, _ws) = svc_with_repo(&repo).await;
+        let err = svc.git_root_list(WorkspaceId::new()).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// A `gitRootId` on the workspace-scoped reads targets the registered
+    /// root's path instead of the workspace worktree (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_scoped_to_registered_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        std::fs::write(secondary.dir.join("root-only.txt"), "hi\n").unwrap();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // git.status against the secondary root sees its untracked file...
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            status.files.iter().any(|f| f.path == "root-only.txt"),
+            "{status:?}"
+        );
+        // ...while the primary-worktree scan (no gitRootId) does not.
+        let primary_status = svc.git_status(ws_id.clone(), None).await.unwrap();
+        assert!(
+            !primary_status
+                .files
+                .iter()
+                .any(|f| f.path == "root-only.txt"),
+            "{primary_status:?}"
+        );
+
+        // git.changes projects the same root-scoped file list.
+        let changes = svc
+            .git_changes(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(changes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "root-only.txt"));
+
+        // git.commits walks the secondary root's history.
+        let commits = svc
+            .git_commits(ws_id.clone(), None, None, Some(root.id.clone()))
+            .await
+            .unwrap();
+        let items = commits["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("seed commit"));
+
+        // git.commitDetails resolves hashes in the secondary root's odb. Land
+        // a commit unique to the secondary root first — the deterministic
+        // fixture gives both repos an identical seed-commit hash.
+        let secondary_head = {
+            let r = Repository::open(&secondary.dir).unwrap();
+            std::fs::write(secondary.dir.join("extra.txt"), "extra\n").unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("extra.txt")).unwrap();
+            idx.write().unwrap();
+            let tree_oid = idx.write_tree().unwrap();
+            let tree = r.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = r
+                .head()
+                .unwrap()
+                .target()
+                .and_then(|oid| r.find_commit(oid).ok())
+                .unwrap();
+            r.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "secondary-only",
+                &tree,
+                &[&parent],
+            )
+            .unwrap()
+            .to_string()
+        };
+        let details = svc
+            .git_commit_details(ws_id.clone(), secondary_head.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], secondary_head);
+        assert_eq!(details["message"], "secondary-only");
+        assert!(details["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "extra.txt"));
+        // ...while the primary worktree cannot resolve that hash (empty
+        // envelope, not an error).
+        let unscoped = svc
+            .git_commit_details(ws_id.clone(), secondary_head.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(unscoped["files"], serde_json::json!([]));
+
+        // git.showFile reads blobs at the secondary root's HEAD.
+        let shown = svc
+            .git_show_file(
+                ws_id,
+                "seed.txt".to_string(),
+                "HEAD".to_string(),
+                Some(root.id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown["content"], "seed\n");
+    }
+
+    /// An unknown `gitRootId` — or one registered to a different workspace —
+    /// is `InvalidParams` (-32602), not an empty fallback (monorepo#2053).
+    #[tokio::test]
+    async fn git_reads_unknown_or_foreign_git_root_id_is_invalid_params() {
+        let repo = init_git_repo();
+        let other_repo = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        // Unknown id.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // A root registered to a *different* workspace.
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        let foreign = git_root_row(&other_ws, &other_repo.dir);
+        svc.store()
+            .upsert_workspace_git_root(&foreign)
+            .await
+            .unwrap();
+        let err = svc
+            .git_changes(ws_id.clone(), Some(foreign.id.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // git.commitDetails follows the same policy (never an empty fallback);
+        // the foreign id exercises the foreign-root half here (the remote
+        // test below covers the unknown-id half for commitDetails).
+        let err = svc
+            .git_commit_details(ws_id, "deadbeef".to_string(), Some(foreign.id.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+    }
+
+    /// On a remote workspace the git reads still validate `gitRootId` before
+    /// the remote early-return: an unknown id is `InvalidParams` (-32602),
+    /// while a valid id degrades to the same empty result the primary gets
+    /// (monorepo#2053 review).
+    #[tokio::test]
+    async fn git_reads_remote_workspace_still_validates_git_root_id() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        ws.is_remote = true;
+        store.insert_workspace(&ws).await.unwrap();
+        let svc = Services::new(store);
+        let root = git_root_row(&ws_id, &secondary.dir);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+
+        // Unknown id → -32602 even though the workspace is remote.
+        let err = svc
+            .git_status(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        let err = svc
+            .git_changes(ws_id.clone(), Some(intent_core::WorkspaceGitRootId::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+        let err = svc
+            .git_commit_details(
+                ws_id.clone(),
+                "deadbeef".to_string(),
+                Some(intent_core::WorkspaceGitRootId::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Valid id → the remote empty fallback, not an error.
+        let status = svc
+            .git_status(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert!(status.files.is_empty(), "{status:?}");
+        let changes = svc
+            .git_changes(ws_id.clone(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(changes, serde_json::json!([]));
+        let details = svc
+            .git_commit_details(ws_id, "deadbeef".to_string(), Some(root.id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(details["commitHash"], "deadbeef");
+        assert_eq!(details["fileDetails"], serde_json::json!([]));
+    }
+
+    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
+    /// optional user and numeric port) alongside https and scp-like remotes,
+    /// and keeps the strict `github.com` host check for all three
+    /// (monorepo#2053 review).
+    #[test]
+    fn parse_github_owner_repo_handles_ssh_url_form() {
+        let parse = Services::parse_github_owner_repo;
+        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
+
+        // ssh:// forms.
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
+        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
+
+        // Strict host check on ssh:// too.
+        assert_eq!(
+            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
+        // A non-numeric "port" stays part of the host and is rejected.
+        assert_eq!(
+            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(
+            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
+            None
+        );
+        // No owner/repo path.
+        assert_eq!(parse("ssh://git@github.com"), None);
+        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
+
+        // The existing https and scp-like forms still parse.
+        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
+        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
+        assert_eq!(
+            parse("https://github.com.evil.com/intent-hq/intentd.git"),
+            None
+        );
+        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
+    }
+
+    /// `register_git_root` emits `gitRoot:registered` on first registration
+    /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
+    /// `gitRoot:unregistered` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_unregister_emit_events() {
+        let repo = init_git_repo();
+        let secondary = init_git_repo();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_id = WorkspaceId::new();
+        let mut ws = workspace(&ws_id);
+        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
+        store.insert_workspace(&ws).await.unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(ws_id.0.clone()),
+            ..Default::default()
+        });
+
+        let root = git_root_row(&ws_id, &secondary.dir);
+        let stored = svc.register_git_root(&root).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("registered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:registered");
+        assert_eq!(batch[0].data["gitRoot"]["id"], stored.id.as_str());
+
+        // Re-registering the same path merges and emits `gitRoot:updated`.
+        let mut again = git_root_row(&ws_id, &secondary.dir);
+        again.registered_by_agent_ids = vec![AgentId("agent-2".into())];
+        let merged = svc.register_git_root(&again).await.unwrap();
+        assert_eq!(merged.id, stored.id, "merged into the existing row");
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("updated event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:updated");
+        assert_eq!(
+            batch[0].data["gitRoot"]["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+
+        svc.unregister_git_root(&stored.id).await.unwrap();
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("unregistered event")
+            .unwrap();
+        assert_eq!(batch[0].event_type, "gitRoot:unregistered");
+        assert_eq!(batch[0].data["gitRootId"], stored.id.as_str());
+        assert_eq!(batch[0].data["path"], stored.path);
+
+        // Unregistering an unknown id is NotFound.
+        let err = svc.unregister_git_root(&stored.id).await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `ws.git.registerRoot` registers a secondary repo: the path is
+    /// canonicalized, the row is `source: "agent"` with the caller
+    /// attributed, owner/name are detected from a GitHub `origin` remote,
+    /// and the returned wire row carries the live-read `branch`.
+    /// Re-registration is idempotent and appends the new caller
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_registers_secondary_root() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        {
+            let r = Repository::open(&secondary.dir).unwrap();
+            r.remote("origin", "git@github.com:intent-hq/intentd.git")
+                .unwrap();
+        }
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row["source"], "agent");
+        assert_eq!(row["workspaceId"], ws_id.0);
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&secondary.dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(row["repoOwner"], "intent-hq");
+        assert_eq!(row["repoName"], "intentd");
+        assert_eq!(row["registeredByAgentIds"], serde_json::json!(["agent-1"]));
+        assert!(row["branch"].is_string(), "live-read branch: {row:?}");
+        // Registration stamps the root's HEAD at that moment.
+        let head = Repository::open(&secondary.dir)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(row["registeredCommitSha"], head);
+
+        // Idempotent by canonical path — a second caller merges in; the
+        // stamped SHA is preserved even though HEAD has moved since.
+        commit_file(&secondary.dir, "more.txt", "more\n", "second commit");
+        let again = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-2".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again["id"], row["id"], "merged into the existing row");
+        assert_eq!(
+            again["registeredByAgentIds"],
+            serde_json::json!(["agent-1", "agent-2"])
+        );
+        assert_eq!(
+            again["registeredCommitSha"], head,
+            "re-registration preserves the first-registered SHA"
+        );
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"].as_array().unwrap().len(), 1);
+    }
+
+    /// A RELATIVE `ws.git.registerRoot` path resolves against the workspace
+    /// worktree — not the daemon's cwd — so an agent whose cwd is the
+    /// worktree can register `vendor/lib` directly; the same relative
+    /// spelling unregisters it (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_resolves_relative_path_against_worktree() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+
+        // A nested repo inside the worktree, registered by relative path.
+        let nested = primary.dir.join("vendor").join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        Repository::init(&nested).unwrap();
+
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                "vendor/lib".into(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row["path"],
+            std::fs::canonicalize(&nested)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "resolved against the worktree, not the daemon cwd"
+        );
+
+        // The same relative spelling unregisters the root.
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), "vendor/lib".into())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        let listed = svc.git_root_list(ws_id).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+    }
+
+    /// `ws.git.registerRoot` validation: a missing path, a non-repo
+    /// directory, and the workspace's own primary root are all
+    /// `InvalidParams`; an unknown workspace is `NotFound` (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_register_rejects_invalid_paths() {
+        let primary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let agent = AgentId("agent-1".into());
+
+        // Nonexistent path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "/nonexistent/xyz".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Empty path.
+        let err = svc
+            .git_root_register(ws_id.clone(), "  ".into(), agent.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Directory without a `.git` entry.
+        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                plain.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_dir_all(&plain);
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // The workspace's own primary root is tracked implicitly.
+        let err = svc
+            .git_root_register(
+                ws_id.clone(),
+                primary.dir.to_string_lossy().into_owned(),
+                agent.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
+
+        // Unknown workspace.
+        let secondary = init_git_repo();
+        let err = svc
+            .git_root_register(
+                WorkspaceId::new(),
+                secondary.dir.to_string_lossy().into_owned(),
+                agent,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
+    }
+
+    /// `ws.git.unregisterRoot` removes the root registered for the path
+    /// (canonicalized, so the registering spelling resolves) and returns
+    /// `{ ok, gitRootId, path }`; an unregistered path is `NotFound`
+    /// (monorepo#2053).
+    #[tokio::test]
+    async fn git_root_unregister_removes_by_path() {
+        let primary = init_git_repo();
+        let secondary = init_git_repo();
+        let (_t, svc, ws_id) = svc_with_repo(&primary).await;
+        let row = svc
+            .git_root_register(
+                ws_id.clone(),
+                secondary.dir.to_string_lossy().into_owned(),
+                AgentId("agent-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let removed = svc
+            .git_root_unregister(ws_id.clone(), secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["gitRootId"], row["id"]);
+        assert_eq!(removed["path"], row["path"]);
+        let listed = svc.git_root_list(ws_id.clone()).await.unwrap();
+        assert_eq!(listed["gitRoots"], serde_json::json!([]));
+
+        // A path with no registered root is NotFound.
+        let err = svc
+            .git_root_unregister(ws_id, secondary.dir.to_string_lossy().into_owned())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound(_)), "{err:?}");
     }
 
     /// `git.diffs` with `commitHash` returns the commit's per-file hunks vs
@@ -11583,7 +14581,13 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["seed.txt".to_string()]), false, Some(head))
+            .git_diffs(
+                ws_id,
+                Some(vec!["seed.txt".to_string()]),
+                false,
+                Some(head),
+                None,
+            )
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -11669,7 +14673,7 @@ mod file_tracking {
         let repo = seed_mixed_worktree();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
-        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+        let diffs = svc.git_diffs(ws_id, None, false, None, None).await.unwrap();
 
         // Legacy two-pass reference: one full scan for the file list, then
         // one scan per file for its hunks (binary → empty hunks).
@@ -11711,11 +14715,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
-            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["b.txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = narrowed.as_array().unwrap();
@@ -11739,7 +14743,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let narrowed = svc
@@ -11747,6 +14751,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["b.txt".to_string(), "new.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -11774,11 +14779,11 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let full = svc
-            .git_diffs(ws_id.clone(), None, false, None)
+            .git_diffs(ws_id.clone(), None, false, None, None)
             .await
             .unwrap();
         let empty_paths = svc
-            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None)
+            .git_diffs(ws_id.clone(), Some(Vec::new()), false, None, None)
             .await
             .unwrap();
         assert_eq!(empty_paths, full);
@@ -11788,6 +14793,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["no-such-file.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -11819,6 +14825,7 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string(), "third.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -11840,7 +14847,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), false, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -11867,7 +14874,7 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let diffs = svc
-            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None)
+            .git_diffs(ws_id, Some(vec!["a[1].txt".to_string()]), true, None, None)
             .await
             .unwrap();
         let arr = diffs.as_array().unwrap();
@@ -11886,12 +14893,18 @@ mod file_tracking {
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
         let relative = svc
-            .git_diffs(ws_id.clone(), Some(vec!["b.txt".to_string()]), false, None)
+            .git_diffs(
+                ws_id.clone(),
+                Some(vec!["b.txt".to_string()]),
+                false,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let abs = repo.dir.join("b.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None)
+            .git_diffs(ws_id.clone(), Some(vec![abs]), false, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative, "absolute form narrows like relative");
@@ -11906,12 +14919,13 @@ mod file_tracking {
                 Some(vec!["seed.txt".to_string()]),
                 true,
                 None,
+                None,
             )
             .await
             .unwrap();
         let abs = repo.dir.join("seed.txt").to_string_lossy().into_owned();
         let absolute = svc
-            .git_diffs(ws_id, Some(vec![abs]), true, None)
+            .git_diffs(ws_id, Some(vec![abs]), true, None, None)
             .await
             .unwrap();
         assert_eq!(absolute, relative);
@@ -11930,6 +14944,7 @@ mod file_tracking {
                 ws_id,
                 Some(vec!["/no/such/root/b.txt".to_string()]),
                 false,
+                None,
                 None,
             )
             .await
@@ -11966,7 +14981,7 @@ mod file_tracking {
             let svc = svc.clone();
             let ws = ws_id.clone();
             async move {
-                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None)
+                svc.git_diffs(ws, Some(vec!["seed.txt".to_string()]), false, None, None)
                     .await
             }
         });
@@ -11979,7 +14994,7 @@ mod file_tracking {
         let second = tokio::spawn({
             let svc = svc.clone();
             let ws = ws_id.clone();
-            async move { svc.git_diffs(ws, Some(vec![abs]), false, None).await }
+            async move { svc.git_diffs(ws, Some(vec![abs]), false, None, None).await }
         });
         // The absolute request normalized onto the relative request's key and
         // joined the in-flight walk as a follower.
@@ -11987,6 +15002,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("absolute request to join as follower", || {
@@ -12036,6 +15052,7 @@ mod file_tracking {
                     Some(vec!["seed.txt".to_string(), "other.txt".to_string()]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -12058,6 +15075,7 @@ mod file_tracking {
                     ]),
                     false,
                     None,
+                    None,
                 )
                 .await
             }
@@ -12068,6 +15086,7 @@ mod file_tracking {
             ws_id.clone(),
             Some(vec!["other.txt".to_string(), "seed.txt".to_string()]),
             false,
+            None,
             None,
         );
         wait_until("reordered request to join as follower", || {
@@ -12802,6 +15821,8 @@ mod search_adapters {
         let id = AgentId::from(agent);
         let ts = intent_core::now_iso();
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -12830,6 +15851,7 @@ mod search_adapters {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -12840,6 +15862,7 @@ mod search_adapters {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -14661,13 +17684,17 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Create a mock agent session with sandbox fields
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -14696,12 +17723,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: Some("sandbox-123".into()),
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -14799,13 +17828,17 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true),
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-coordinator"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -14834,12 +17867,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -14928,12 +17963,16 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -14962,12 +18001,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -15052,12 +18093,16 @@ mod rules {
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15086,12 +18131,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -15175,13 +18222,17 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15210,12 +18261,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: None,
             sandbox_path: None, // NO sandbox — explicit "shared" override!
             sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -15303,13 +18356,17 @@ mod rules {
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15338,12 +18395,14 @@ mod rules {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             sandbox_id: Some("sandbox-explicit".into()),
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -15396,6 +18455,8 @@ mod rules {
         };
 
         let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
@@ -15439,6 +18500,10 @@ mod rules {
         };
 
         let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15546,6 +18611,8 @@ mod rules {
         // false — the old direct-mode-only predicate never fired here even
         // though delegates ARE sandboxed (agent_ops is_standalone_checkout).
         let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
@@ -15589,6 +18656,10 @@ mod rules {
         };
 
         let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
             id: intent_core::AgentId::from("agent-coordinator"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15798,6 +18869,8 @@ mod rules {
 
         // microVM workspace
         let workspace = intent_core::Workspace {
+            pending_delete_at: None,
+            waiting: false,
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
@@ -15843,6 +18916,10 @@ mod rules {
         // microVM agents also carry sandbox fields (host-side CoW clone the VM
         // mounts); the microVM hint must still win over the CoW implementor hint.
         let agent_session = intent_core::AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -15958,6 +19035,7 @@ mod known_repo {
     async fn one_time_sync_upserts_repos_from_workspaces() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
         // Explicit name + owner.
         store
             .insert_workspace(&ws_with_repo(
@@ -15984,7 +19062,10 @@ mod known_repo {
             .await
             .expect("ws3");
 
-        sync_repos_from_workspaces(&store).await.expect("sync");
+        let roots = vec![ws_root.path().to_path_buf()];
+        sync_repos_from_workspaces(&store, &roots)
+            .await
+            .expect("sync");
 
         let repos = store.list_known_repos().await.expect("list");
         assert_eq!(repos.len(), 2, "only repos with a repository_path sync");
@@ -15996,8 +19077,130 @@ mod known_repo {
         assert_eq!(by_path["/home/me/other-repo"].owner, None);
 
         // Re-running the sync is idempotent on path (no duplicate rows).
-        sync_repos_from_workspaces(&store).await.expect("resync");
+        sync_repos_from_workspaces(&store, &roots)
+            .await
+            .expect("resync");
         assert_eq!(store.list_known_repos().await.expect("list").len(), 2);
+    }
+
+    /// Workspace-owned checkouts never enter the registry
+    /// (intent-hq/monorepo#2227): a standalone checkout
+    /// (`repository_path == worktree_path`) and any path under a workspaces
+    /// root are both skipped; genuine user repos still sync.
+    #[tokio::test]
+    async fn sync_skips_workspace_owned_checkouts() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        // Standalone checkout OUTSIDE the current roots (e.g. a former
+        // worktrees location): repository_path == worktree_path.
+        let standalone = "/old/worktrees/ws-a/monorepo";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(standalone.to_string()),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(standalone),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("standalone ws");
+        // Checkout under the workspaces root, no worktree_path (e.g. a
+        // materialized import).
+        let under_root = ws_root.path().join("ws-b").join("monorepo");
+        store
+            .insert_workspace(&ws_with_repo(
+                &WorkspaceId::new(),
+                Some(&under_root.to_string_lossy()),
+                Some("monorepo"),
+                None,
+            ))
+            .await
+            .expect("under-root ws");
+        // Genuine user repo with a daemon-provisioned worktree.
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(
+                    ws_root
+                        .path()
+                        .join("ws-c")
+                        .join("monorepo")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some("/home/me/Developer/monorepo"),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("user ws");
+
+        sync_repos_from_workspaces(&store, &[ws_root.path().to_path_buf()])
+            .await
+            .expect("sync");
+
+        let repos = store.list_known_repos().await.expect("list");
+        assert_eq!(
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/home/me/Developer/monorepo"],
+            "only the user repo syncs"
+        );
+    }
+
+    /// Pre-existing polluted registries self-heal on sync
+    /// (intent-hq/monorepo#2227): rows under a workspaces root (including
+    /// leftovers whose workspace was deleted) and rows matching a live
+    /// standalone checkout are removed; user repos survive.
+    #[tokio::test]
+    async fn sync_sweeps_workspace_owned_rows_from_registry() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        // Live standalone workspace outside the roots.
+        let standalone = "/old/worktrees/ws-a/monorepo";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(standalone.to_string()),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(standalone),
+                    Some("monorepo"),
+                    None,
+                )
+            })
+            .await
+            .expect("standalone ws");
+        // Pollution: the standalone checkout, an under-root leftover with no
+        // surviving workspace row, and a genuine user repo.
+        let leftover = ws_root.path().join("ws-gone").join("monorepo");
+        store
+            .upsert_known_repo(standalone, "monorepo", None)
+            .await
+            .expect("seed standalone row");
+        store
+            .upsert_known_repo(&leftover.to_string_lossy(), "monorepo", None)
+            .await
+            .expect("seed leftover row");
+        store
+            .upsert_known_repo("/home/me/Developer/monorepo", "monorepo", Some("intent-hq"))
+            .await
+            .expect("seed user row");
+
+        sync_repos_from_workspaces(&store, &[ws_root.path().to_path_buf()])
+            .await
+            .expect("sync");
+
+        let repos = store.list_known_repos().await.expect("list");
+        assert_eq!(
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/home/me/Developer/monorepo"],
+            "workspace-owned rows swept, user repo untouched"
+        );
     }
 
     #[tokio::test]
@@ -16027,6 +19230,117 @@ mod known_repo {
         assert_eq!(repos[0]["owner"], "intent-hq");
         assert!(repos[0]["addedAt"].is_string());
         assert!(repos[0]["lastUsedAt"].is_string());
+    }
+
+    /// The `workspace.create` registration hook never registers
+    /// daemon-provisioned paths (intent-hq/monorepo#2227): a `repositoryPath`
+    /// under the workspaces root, a standalone checkout
+    /// (`repository_path == worktree_path`), and the `ws.path` fallback
+    /// pointing under the root are all skipped.
+    #[tokio::test]
+    async fn create_workspace_skips_registry_for_workspace_owned_paths() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        // repositoryPath under the workspaces root (non-git → provisioning is
+        // skipped and the path reaches the hook unchanged).
+        let under_root = ws_root.path().join("ws-x").join("monorepo");
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(under_root.to_string_lossy().to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create under root");
+
+        // Standalone checkout outside the roots: repository_path IS the
+        // caller-supplied worktree_path.
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some("/old/worktrees/ws-y/monorepo".to_string()),
+                worktree_path: Some("/old/worktrees/ws-y/monorepo".to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create standalone");
+
+        // No repositoryPath; the `ws.path` fallback points under the root.
+        svc.create_workspace(
+            WorkspaceCreate {
+                path: Some(
+                    ws_root
+                        .path()
+                        .join("ws-z")
+                        .join("repo")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create path fallback");
+
+        assert_eq!(
+            store.list_known_repos().await.expect("list"),
+            vec![],
+            "no workspace-owned path is registered"
+        );
+    }
+
+    /// With a configured `workspace.worktreesLocation` the hook checks BOTH
+    /// roots: a `repositoryPath` under the **boot root** (e.g. a stale
+    /// checkout created before the setting changed) is skipped too, not just
+    /// paths under the create-time resolved parent (intent-hq/monorepo#2227).
+    #[tokio::test]
+    async fn create_workspace_skips_registry_for_boot_root_paths_with_custom_location() {
+        use crate::SettingsRegistry;
+        use std::sync::Arc;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let custom = tempfile::tempdir().expect("custom location");
+        let cfg_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            SettingsRegistry::load(cfg_dir.path().join("config.toml")).expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.worktreesLocation".to_string(),
+                serde_json::json!(custom.path().join("worktrees").to_string_lossy()),
+            )])
+            .expect("apply worktreesLocation");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(registry);
+
+        let under_boot = ws_root.path().join("ws-old").join("monorepo");
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(under_boot.to_string_lossy().to_string()),
+                repository_name: Some("monorepo".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create under boot root");
+
+        assert_eq!(
+            store.list_known_repos().await.expect("list"),
+            vec![],
+            "boot-root path skipped even when worktreesLocation is configured"
+        );
     }
 
     /// `workspace.create` derives `repository_name` from the local
@@ -16434,9 +19748,11 @@ mod known_repo {
             diff_summary: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -17021,6 +20337,10 @@ mod worktree_provisioning {
 
         let agent_id = AgentId::new();
         let session = AgentSession {
+            file_blocks: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            pending_delete_at: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -19182,6 +22502,324 @@ mod worktree_provisioning {
     }
 }
 
+/// Setup lifecycle events (§6.5): `workspace:setup:started` fires iff an
+/// effective setup script was resolved and a spawn will be attempted; exactly
+/// one `workspace:setup:completed` fires per logical create on every terminal
+/// path — script exit (`ranScript: true` + `exitCode`), no script, skipped
+/// isolation, no worktree — and `workspace.duplicate` (which never runs a
+/// setup script) completes immediately with `ranScript: false`.
+mod setup_lifecycle_events {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::TempDb;
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a git repo with one commit; returns (guard, head branch).
+    fn seed_repo(prefix: &str) -> (TempDir, String) {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        (dir, branch)
+    }
+
+    async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_event_bus(bus.clone());
+        (svc, bus, tmp)
+    }
+
+    /// Subscribe to only the setup lifecycle events (the setup terminal's
+    /// `terminal:*` stream and the create's other events stay out of scope).
+    fn subscribe_setup(bus: &EventBus) -> Subscription {
+        bus.subscribe(SubscriptionFilter {
+            event_types: vec!["workspace:setup:*".to_string()],
+            ..Default::default()
+        })
+    }
+
+    /// Receive one setup event (generous timeout: script paths cross a PTY
+    /// spawn + reap poll), serialized to wire JSON.
+    async fn recv_setup(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(20), sub.recv())
+            .await
+            .expect("setup event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event per delivery");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_quiet(sub: &mut Subscription) {
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
+    }
+
+    /// Script runs to a zero exit: `started` then `completed` with
+    /// `ranScript: true` and `exitCode: 0`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_success_emits_started_then_completed_exit_zero() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-ok-repo");
+        let root = unique_dir("intentd-setupev-ok-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 0".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:started");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"], json!({ "workspaceId": ws.id.0 }));
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"]["workspaceId"], ws.id.0);
+        assert_eq!(ev["data"]["ranScript"], json!(true));
+        assert_eq!(ev["data"]["exitCode"], json!(0));
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// Script exits non-zero: `completed` still fires once, carrying the
+    /// script's real exit code — a failing setup script never fails the
+    /// create and never suppresses the lifecycle terminal event.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_failure_emits_completed_with_nonzero_exit_code() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-fail-repo");
+        let root = unique_dir("intentd-setupev-fail-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    setup_script: Some("exit 7".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:started");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["data"]["ranScript"], json!(true));
+        assert_eq!(ev["data"]["exitCode"], json!(7));
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// Worktree provisioned but no effective script anywhere (no explicit
+    /// param, no repo config, no legacy row): no `started`, exactly one
+    /// `completed` with `ranScript: false` and no `exitCode` key.
+    #[tokio::test]
+    async fn no_script_emits_completed_only() {
+        let (repo_dir, head_branch) = seed_repo("intentd-setupev-noscript-repo");
+        let root = unique_dir("intentd-setupev-noscript-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false }),
+            "no exitCode key when no script ran"
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// `skipIsolation` opts out of the setup stage entirely — even with an
+    /// explicit `setupScript` in the request, no `started` fires and the
+    /// lifecycle completes immediately with `ranScript: false`.
+    #[tokio::test]
+    async fn skip_isolation_emits_completed_without_running_script() {
+        let root = unique_dir("intentd-setupev-skip-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+        let mut sub = subscribe_setup(&bus);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Skip isolation".to_string()),
+                    skip_isolation: Some(true),
+                    setup_script: Some("exit 0".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// `workspace.duplicate` runs no setup script: exactly one immediate
+    /// `completed { ranScript: false }` under the duplicate's id, no `started`.
+    #[tokio::test]
+    async fn duplicate_emits_immediate_completed() {
+        let root = unique_dir("intentd-setupev-dup-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        // Subscribe after the create so its own `completed` is out of scope.
+        let mut sub = subscribe_setup(&bus);
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], dup.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": dup.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+
+    /// `publish_workspace_created` (the out-of-`Services` insert path used by
+    /// the legacy importer) pairs its `workspace:created` with an immediate
+    /// `completed { ranScript: false }` — imports run no setup stage, so the
+    /// watcher registry must not hold their watcher start until the backstop.
+    #[tokio::test]
+    async fn publish_workspace_created_emits_immediate_completed() {
+        let root = unique_dir("intentd-setupev-legacy-root");
+        let (svc, bus, _tmp) = services(root.0.clone()).await;
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Imported".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // Subscribe after the create so only the re-publish is in scope.
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![
+                "workspace:created".to_string(),
+                "workspace:setup:*".to_string(),
+            ],
+            ..Default::default()
+        });
+        crate::publish_workspace_created(&bus, &ws).await;
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:created");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+
+        let ev = recv_setup(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:setup:completed");
+        assert_eq!(ev["workspaceId"], ws.id.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": ws.id.0, "ranScript": false })
+        );
+
+        assert_quiet(&mut sub).await;
+    }
+}
+
 mod file_ops_service {
     use super::*;
 
@@ -19269,18 +22907,23 @@ mod file_ops_service {
                 "big.har".to_string(),
                 Some(format!("data:application/json;base64,{b64}")),
                 None,
+                Some("application/json".to_string()),
             )
             .await
             .expect("place");
+        assert_eq!(placed["ok"], serde_json::json!(true));
         assert_eq!(
-            placed,
-            serde_json::json!({
-                "ok": true,
-                "path": ".intent/attachments/big.har",
-                "fileName": "big.har",
-                "size": 14
-            })
+            placed["path"],
+            serde_json::json!(".intent/attachments/big.har")
         );
+        assert_eq!(placed["fileName"], serde_json::json!("big.har"));
+        assert_eq!(placed["size"], serde_json::json!(14));
+        // Additive registry fields (PROTOCOL §5.9): a daemon-minted UUID,
+        // the recorded mimeType, and the upload timestamp.
+        let attachment_id = placed["attachmentId"].as_str().expect("attachmentId");
+        assert!(uuid::Uuid::parse_str(attachment_id).is_ok());
+        assert_eq!(placed["mimeType"], serde_json::json!("application/json"));
+        assert!(placed["uploadedAt"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(
             std::fs::read(dir.join(".intent/attachments/big.har")).unwrap(),
             b"attached bytes"
@@ -19305,9 +22948,12 @@ mod file_ops_service {
                 "config.json".to_string(),
                 Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
                 None,
+                None,
             )
             .await
             .expect("place config.json");
+        // Absent mimeType stays absent on the wire (presence-detected).
+        assert!(cfg.get("mimeType").is_none());
         assert_eq!(
             cfg["path"],
             serde_json::json!(".intent/attachments/config.json")
@@ -19325,6 +22971,7 @@ mod file_ops_service {
                 "big.har".to_string(),
                 None,
                 Some(src.to_string_lossy().into_owned()),
+                None,
             )
             .await
             .expect("place from sourcePath");
@@ -19342,11 +22989,271 @@ mod file_ops_service {
             (None, Some("relative/path.txt".to_string())),
         ] {
             let res = svc
-                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path)
+                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path, None)
                 .await;
             assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `file.getAttachmentInfo` (PROTOCOL §5.9): serves the registry row with
+    /// `exists` reflecting the file on disk; unknown ids are `NotFound`; a
+    /// deleted stored file flips `exists` to false without erroring.
+    #[tokio::test]
+    async fn file_get_attachment_info_found_missing_deleted() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir = std::env::temp_dir().join(format!("intentd-attinfo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "notes.txt".to_string(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"hello")),
+                None,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("place");
+        let id = placed["attachmentId"].as_str().unwrap().to_string();
+
+        let info = svc
+            .file_get_attachment_info(id.clone())
+            .await
+            .expect("info");
+        assert_eq!(info["attachmentId"], serde_json::json!(id));
+        assert_eq!(info["fileName"], serde_json::json!("notes.txt"));
+        assert_eq!(info["mimeType"], serde_json::json!("text/plain"));
+        assert_eq!(info["size"], serde_json::json!(5));
+        assert_eq!(
+            info["path"],
+            serde_json::json!(".intent/attachments/notes.txt")
+        );
+        assert_eq!(info["exists"], serde_json::json!(true));
+
+        // Unknown id → NotFound naming the id.
+        let missing = svc.file_get_attachment_info("bogus-id".to_string()).await;
+        assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+
+        // Delete the stored file: the row survives, `exists` flips to false.
+        std::fs::remove_file(dir.join(".intent/attachments/notes.txt")).unwrap();
+        let info2 = svc.file_get_attachment_info(id).await.expect("info 2");
+        assert_eq!(info2["exists"], serde_json::json!(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ws.file.getAttachment` backing op: copies the registered file into
+    /// the caller's working directory (canonical here), skips identical
+    /// re-copies, and keeps the two failure modes distinct — unknown id vs.
+    /// registry row whose stored file was deleted from disk (the latter names
+    /// the fileName + uploadedAt and instructs the model to proceed without
+    /// the file).
+    #[tokio::test]
+    async fn file_get_attachment_copies_and_distinguishes_errors() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir = std::env::temp_dir().join(format!("intentd-attget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new(store);
+
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "spec.pdf".to_string(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"pdf bytes")),
+                None,
+                Some("application/pdf".to_string()),
+            )
+            .await
+            .expect("place");
+        let id = placed["attachmentId"].as_str().unwrap().to_string();
+
+        // Copy into a custom destination directory (canonical caller: no
+        // caller_agent_id → dest root == canonical root).
+        let got = svc
+            .file_get_attachment(
+                ws.clone(),
+                id.clone(),
+                None,
+                Some("tmp/downloads".to_string()),
+            )
+            .await
+            .expect("get");
+        assert_eq!(got["path"], serde_json::json!("tmp/downloads/spec.pdf"));
+        assert_eq!(got["fileName"], serde_json::json!("spec.pdf"));
+        assert_eq!(got["mimeType"], serde_json::json!("application/pdf"));
+        assert_eq!(got["size"], serde_json::json!(9));
+        assert_eq!(
+            std::fs::read(dir.join("tmp/downloads/spec.pdf")).unwrap(),
+            b"pdf bytes"
+        );
+        // The destination directory is kept out of git via an ignore-all marker.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tmp/downloads/.gitignore")).unwrap(),
+            "*\n"
+        );
+
+        // Identical re-fetch succeeds (copy skipped) and default destDir works.
+        let again = svc
+            .file_get_attachment(ws.clone(), id.clone(), None, None)
+            .await
+            .expect("get again");
+        assert_eq!(
+            again["path"],
+            serde_json::json!(".intent/attachments/spec.pdf")
+        );
+
+        // Unknown id → NotFound ("unknown attachment id").
+        let missing = svc
+            .file_get_attachment(ws.clone(), "nope".to_string(), None, None)
+            .await;
+        match missing {
+            Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // Deleted-from-disk → a DISTINCT error naming fileName + uploadedAt
+        // and telling the model to continue without the file.
+        std::fs::remove_file(dir.join(".intent/attachments/spec.pdf")).unwrap();
+        let deleted = svc
+            .file_get_attachment(ws.clone(), id, None, Some("elsewhere".to_string()))
+            .await;
+        match deleted {
+            Err(Error::Internal(msg)) => {
+                assert!(msg.contains("deleted"), "{msg}");
+                assert!(msg.contains("spec.pdf"), "{msg}");
+                assert!(
+                    msg.contains(placed["uploadedAt"].as_str().unwrap()),
+                    "{msg}"
+                );
+                assert!(msg.contains("Continue without this file"), "{msg}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+        // No partial copy left behind.
+        assert!(!dir.join("elsewhere/spec.pdf").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Containment: a tampered registry row (escaping `stored_path` or
+    /// `file_name`) must be rejected by the within-root guard — the copy path
+    /// never reads outside the canonical store or writes outside the caller
+    /// root, and the `getAttachmentInfo` exists-probe never leaks existence
+    /// of host paths. Cross-workspace ids read as unknown.
+    #[tokio::test]
+    async fn file_get_attachment_rejects_tampered_rows_and_cross_workspace() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir = std::env::temp_dir().join(format!("intentd-atttamper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+
+        // A file OUTSIDE the workspace root that a tampered row points at.
+        let outside = dir.parent().unwrap().join(format!(
+            "intentd-atttamper-outside-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, b"secret").unwrap();
+
+        let escaping = intent_store::AttachmentRecord {
+            id: "att-escape".to_string(),
+            workspace_id: ws.clone(),
+            file_name: "outside.txt".to_string(),
+            mime_type: None,
+            size: 6,
+            uploaded_at: "2026-08-12T00:00:00Z".to_string(),
+            stored_path: format!("../{}", outside.file_name().unwrap().to_string_lossy()),
+        };
+        store.insert_attachment(&escaping).await.expect("insert");
+        // Escaping file_name on an in-root stored path (three levels up from
+        // the default `.intent/attachments/` destination → outside the root).
+        let bad_name = intent_store::AttachmentRecord {
+            id: "att-badname".to_string(),
+            file_name: "../../../evil.txt".to_string(),
+            stored_path: ".intent/attachments/ok.txt".to_string(),
+            ..escaping.clone()
+        };
+        store.insert_attachment(&bad_name).await.expect("insert 2");
+        std::fs::create_dir_all(dir.join(".intent/attachments")).unwrap();
+        std::fs::write(dir.join(".intent/attachments/ok.txt"), b"ok").unwrap();
+
+        let svc = Services::new(store);
+
+        // Copy path: escaping stored_path → ACCESS_DENIED, file untouched.
+        let got = svc
+            .file_get_attachment(ws.clone(), "att-escape".to_string(), None, None)
+            .await;
+        assert!(matches!(got, Err(Error::Internal(_))), "{got:?}");
+        // Exists-probe: same guard — the row reads as not-existing rather
+        // than probing the host path (which IS on disk).
+        let info = svc
+            .file_get_attachment_info("att-escape".to_string())
+            .await
+            .expect("info");
+        assert_eq!(info["exists"], serde_json::json!(false));
+
+        // Copy path: escaping file_name → ACCESS_DENIED, nothing written
+        // outside the root.
+        let got2 = svc
+            .file_get_attachment(ws.clone(), "att-badname".to_string(), None, None)
+            .await;
+        assert!(matches!(got2, Err(Error::Internal(_))), "{got2:?}");
+        assert!(!dir.parent().unwrap().join("evil.txt").exists());
+
+        // Sibling-prefix escape: with root `<parent>/<name>`, a destDir of
+        // `../<name>-escape` resolves to a SIBLING sharing the root's string
+        // prefix — the boundary-aware is_within must still reject it.
+        let sibling_dir = format!("../{}-escape", dir.file_name().unwrap().to_string_lossy());
+        let sib = svc
+            .file_get_attachment(
+                ws.clone(),
+                "att-badname".to_string(),
+                None,
+                Some(sibling_dir.clone()),
+            )
+            .await;
+        assert!(matches!(sib, Err(Error::Internal(_))), "{sib:?}");
+        let sibling_path = dir.parent().unwrap().join(format!(
+            "{}-escape",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!sibling_path.exists());
+
+        // Cross-workspace: a valid row read under a DIFFERENT workspace id
+        // reads as an unknown attachment id.
+        let other_ws = WorkspaceId::new();
+        let cross = svc
+            .file_get_attachment(other_ws, "att-badname".to_string(), None, None)
+            .await;
+        match cross {
+            Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19411,6 +23318,8 @@ mod file_ops_service {
         // Create agent
         let agent_id = AgentId::new();
         let agent = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -19439,6 +23348,7 @@ mod file_ops_service {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -19449,6 +23359,7 @@ mod file_ops_service {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         };
         store
             .insert_agent_session(&agent)
@@ -19512,6 +23423,43 @@ mod file_ops_service {
             "User directory must remain untouched: {:?}",
             user_file
         );
+
+        // ws.file.getAttachment for a SANDBOXED caller: the source is the
+        // CANONICAL store (attachments never exist in the clone), the copy
+        // lands in the caller's sandbox, and the canonical checkout gains no
+        // new copy (PROTOCOL §6.8).
+        {
+            use base64::Engine as _;
+            let placed = svc
+                .file_place_attachment(
+                    ws_id.clone(),
+                    "brief.md".to_string(),
+                    Some(base64::engine::general_purpose::STANDARD.encode(b"# brief")),
+                    None,
+                    None,
+                )
+                .await
+                .expect("place attachment");
+            let att_id = placed["attachmentId"].as_str().unwrap().to_string();
+            // The placement landed canonically, not in the sandbox.
+            assert!(user_dir.join(".intent/attachments/brief.md").exists());
+            assert!(!sandbox_path.join(".intent/attachments/brief.md").exists());
+
+            let got = svc
+                .file_get_attachment(ws_id.clone(), att_id, Some(agent_id.clone()), None)
+                .await
+                .expect("get attachment via sandboxed caller");
+            assert_eq!(
+                got["path"],
+                serde_json::json!(".intent/attachments/brief.md")
+            );
+            let sandbox_copy = sandbox_path.join(".intent/attachments/brief.md");
+            assert!(
+                sandbox_copy.exists(),
+                "copy must land in the sandbox: {sandbox_copy:?}"
+            );
+            assert_eq!(fs::read(&sandbox_copy).unwrap(), b"# brief");
+        }
 
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
@@ -20399,6 +24347,8 @@ mod heal_stale_agent_sessions {
     fn mk_session(ws: &WorkspaceId, id: &str, status: AgentStatus) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -20430,6 +24380,7 @@ mod heal_stale_agent_sessions {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -20440,6 +24391,7 @@ mod heal_stale_agent_sessions {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -22026,6 +25978,217 @@ mod clone_orchestration {
     }
 }
 
+/// `repo.warmCache` (PROTOCOL §5.6): opportunistic background refresh of the
+/// daemon repo cache with a global single-flight — accept one warm, reject a
+/// second while in flight with `WarmInFlight`, clear the flag on completion.
+mod repo_warm_cache {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use intent_core::{Error, WorkspaceApi};
+    use intent_store::Store;
+
+    use super::TempDb;
+    use crate::Services;
+
+    /// Drop guard removing a temp directory tree.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_dir(prefix: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    /// Init a small git repo with one commit; returns the guard.
+    fn seed_repo(prefix: &str) -> TempDir {
+        let dir = unique_dir(prefix);
+        let repo = git2::Repository::init(&dir.0).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Tester").unwrap();
+            cfg.set_str("user.email", "t@e.dev").unwrap();
+        }
+        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    async fn services_with_root(root: &TempDir) -> (Services, TempDb) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        (svc, tmp)
+    }
+
+    /// Await the warm's detached completion: poll until the cache slot for
+    /// `owner/repo` exists AND a follow-up warm is accepted (flag cleared).
+    async fn wait_for_warm_completion(svc: &Services, root: &std::path::Path, url: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match svc.repo_warm_cache(url.to_string()).await {
+                Ok(v) => {
+                    let cache = root
+                        .join(".repo-cache")
+                        .join(v["owner"].as_str().unwrap())
+                        .join(v["repo"].as_str().unwrap());
+                    // The accepted re-warm proves the flag cleared; the
+                    // populated cache proves the first ensure ran.
+                    assert!(cache.join(".git").exists(), "repo cache populated");
+                    return;
+                }
+                Err(Error::WarmInFlight { .. }) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "warm did not complete in time"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("unexpected warm error: {e}"),
+            }
+        }
+    }
+
+    /// Happy path: the warm is accepted, returns `{ started, owner, repo }`
+    /// immediately, populates the cache in the background, and clears the
+    /// in-flight flag so a later warm is accepted again.
+    #[tokio::test]
+    async fn warm_starts_populates_cache_and_clears_flag() {
+        let source = seed_repo("intentd-warm-src");
+        let root = unique_dir("intentd-warm-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let v = svc
+            .repo_warm_cache(url.clone())
+            .await
+            .expect("warm accepted");
+        assert_eq!(v["started"], serde_json::json!(true));
+        let owner = v["owner"].as_str().expect("owner in result").to_string();
+        let repo = v["repo"].as_str().expect("repo in result").to_string();
+        assert_eq!(
+            repo,
+            source.0.file_name().unwrap().to_str().unwrap(),
+            "repo derived from the URL"
+        );
+        assert!(!owner.is_empty(), "owner derived from the URL");
+
+        wait_for_warm_completion(&svc, &root.0, &url).await;
+    }
+
+    /// Busy: while a warm is in flight (its ensure parked behind the held
+    /// per-repo cache lock), a second call — same repo or any other — is
+    /// rejected with `WarmInFlight` naming the repo being warmed.
+    /// Multi-thread flavor: the test thread blocks on the held-signal recv
+    /// while the lock holder runs on the blocking pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_warm_rejected_while_in_flight() {
+        let source = seed_repo("intentd-warm-busy-src");
+        let root = unique_dir("intentd-warm-busy-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        let url = format!("file://{}", source.0.to_string_lossy());
+        let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
+        let cache_path = root.0.join(".repo-cache").join(&owner).join(&repo);
+
+        // Park the warm's ensure behind the per-repo cache lock so the
+        // in-flight window is deterministic.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let lock_holder = tokio::spawn(async move {
+            intent_git::repo_cache::with_cache_lock_blocking(&cache_path, move || {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let v = svc
+            .repo_warm_cache(url.clone())
+            .await
+            .expect("warm accepted");
+        assert_eq!(v["started"], serde_json::json!(true));
+
+        match svc.repo_warm_cache(url.clone()).await {
+            Err(Error::WarmInFlight {
+                owner: busy_owner,
+                repo: busy_repo,
+            }) => {
+                assert_eq!(busy_owner, owner, "busy error names the warming owner");
+                assert_eq!(busy_repo, repo, "busy error names the warming repo");
+            }
+            other => panic!("expected WarmInFlight, got {other:?}"),
+        }
+
+        release_tx.send(()).unwrap();
+        lock_holder.await.unwrap().unwrap();
+        wait_for_warm_completion(&svc, &root.0, &url).await;
+    }
+
+    /// A URL whose owner/repo segments would be rejected by the cache ensure
+    /// (path escapes like `..`) is `-32602` up front and never claims the
+    /// single-flight slot — a malformed request cannot block valid warms.
+    #[tokio::test]
+    async fn traversal_segments_rejected_before_claiming_slot() {
+        let source = seed_repo("intentd-warm-trav-src");
+        let root = unique_dir("intentd-warm-trav-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        match svc
+            .repo_warm_cache("https://github.com/../repo".to_string())
+            .await
+        {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("owner"), "names the bad segment: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // The rejected call left the slot free: a valid warm is accepted.
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.repo_warm_cache(url)
+            .await
+            .expect("valid warm accepted after the rejected one");
+    }
+
+    /// A URL with no owner/repo pair is rejected with `-32602` and never
+    /// claims the single-flight slot.
+    #[tokio::test]
+    async fn invalid_url_is_invalid_params() {
+        let source = seed_repo("intentd-warm-inv-src");
+        let root = unique_dir("intentd-warm-inv-root");
+        let (svc, _db) = services_with_root(&root).await;
+
+        match svc.repo_warm_cache("not-a-repo-url".to_string()).await {
+            Err(Error::InvalidParams(msg)) => {
+                assert!(msg.contains("owner/repo"), "actionable message: {msg}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // The rejected call left the slot free: a valid warm is accepted.
+        let url = format!("file://{}", source.0.to_string_lossy());
+        svc.repo_warm_cache(url)
+            .await
+            .expect("valid warm accepted after the rejected one");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A6 verifier hooks: surgical mutations schedule line-attribution recompute;
 // composition-root sweeper spawns as an abortable task.
@@ -22272,6 +26435,8 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     let sess1 = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-1"),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -22302,17 +26467,21 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         is_background: false,
         metadata: None,
     };
 
     let sess2 = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-2"),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -22343,12 +26512,14 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         is_background: false,
         metadata: None,
     };
@@ -22433,6 +26604,8 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     let ts = now_iso();
 
     let sess = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-a"),
         workspace_id: ws1.clone(),
         parent_agent_id: None,
@@ -22463,12 +26636,14 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         is_background: false,
         metadata: None,
     };
@@ -22666,6 +26841,56 @@ mod last_activity_events {
         assert_eq!(ev["type"], expected_type);
     }
 
+    /// Bounded poll for the debounced derivation to persist a `lastActivity`
+    /// on the harness workspace. A fixed sleep races the debounce timer,
+    /// which routinely fires well past its nominal window on loaded runners
+    /// (monorepo#2585).
+    async fn wait_for_persisted_last_activity(h: &Harness) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(persisted) = h
+                .store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+            {
+                return persisted;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounce persisted a lastActivity (within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Bounded poll for the harness workspace's debounce task to finish (it
+    /// removes itself from the debouncers map on completion). Unlike
+    /// `wait_for_persisted_last_activity`, this also covers derivations that
+    /// are expected to be no-ops — nothing is persisted or emitted to observe
+    /// — so an assertion that follows genuinely runs after the derivation
+    /// instead of racing it behind a fixed sleep (monorepo#2585).
+    async fn wait_for_debounce_settled(h: &Harness) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = h
+                .services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !pending {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounce task settled (within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// After `raise_attention` (which bumps workspace.updated_at), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
@@ -22720,9 +26945,9 @@ mod last_activity_events {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
-        // Dismiss: attention-changed (plus the displayStatus demotion for
-        // the retired unread flag, §6.5) — no updated_at bump, so no
-        // debounced workspace:updated { lastActivity } follows.
+        // Dismiss: attention-changed — no updated_at bump, so no debounced
+        // workspace:updated { lastActivity } follows. (The unread flag is
+        // not a displayStatus axis, §6.5, so no demotion emits either.)
         h.services
             .dismiss_attention(h.ws.clone())
             .await
@@ -22836,8 +27061,10 @@ mod last_activity_events {
             .await
             .expect("raise");
 
-        // Wait for the debounce window to fire and derive.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait for the debounce window to fire and derive (bounded poll: the
+        // timer fires late under CI load, monorepo#2585). The store column
+        // itself carries the derived value (survives restart).
+        let persisted = wait_for_persisted_last_activity(&h).await;
 
         let expected = h
             .store
@@ -22846,16 +27073,9 @@ mod last_activity_events {
             .expect("reload")
             .updated_at;
 
-        // The store column itself carries the derived value (survives restart).
-        let persisted = h
-            .store
-            .get_workspace(&h.ws)
-            .await
-            .expect("reload")
-            .last_activity;
         assert_eq!(
-            persisted.as_deref(),
-            Some(expected.as_str()),
+            persisted.as_str(),
+            expected.as_str(),
             "derived lastActivity must be persisted to the workspace column"
         );
 
@@ -22885,19 +27105,13 @@ mod last_activity_events {
         let h = harness().await;
 
         // Let the debounce derive and persist first, so the guard below runs
-        // against a column the services layer actually wrote.
+        // against a column the services layer actually wrote (bounded poll:
+        // a fixed sleep races the debounce timer under CI load, monorepo#2585).
         h.services
             .raise_attention(&h.ws, WorkspaceAttention::Unread)
             .await
             .expect("raise");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let persisted = h
-            .store
-            .get_workspace(&h.ws)
-            .await
-            .expect("reload")
-            .last_activity
-            .expect("debounce persisted a lastActivity");
+        let persisted = wait_for_persisted_last_activity(&h).await;
 
         // Store guard: a stale write is declined and the column holds.
         assert!(!h
@@ -22932,7 +27146,10 @@ mod last_activity_events {
             .raise_attention(&h.ws, WorkspaceAttention::ReviewRequired)
             .await
             .expect("raise again");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The no-op derivation persists and emits nothing, so wait for the
+        // debounce task itself to settle — a fixed sleep would leave this
+        // assertion vacuous whenever the timer fires late (monorepo#2585).
+        wait_for_debounce_settled(&h).await;
         assert_eq!(
             h.store
                 .get_workspace(&h.ws)
@@ -23317,6 +27534,8 @@ mod last_activity_events {
 
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -23346,6 +27565,7 @@ mod last_activity_events {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stats: None,
@@ -23355,6 +27575,7 @@ mod last_activity_events {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -23573,6 +27794,8 @@ mod turn_end_unread_gate {
 
     pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -23602,6 +27825,7 @@ mod turn_end_unread_gate {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stats: None,
@@ -23611,6 +27835,7 @@ mod turn_end_unread_gate {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -23975,6 +28200,8 @@ mod turn_token_usage {
 
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId, model: &str) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -24004,6 +28231,7 @@ mod turn_token_usage {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             stats: None,
@@ -24013,6 +28241,7 @@ mod turn_token_usage {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -25173,6 +29402,41 @@ mod worktrees_location {
         assert!(got.is_dir(), "expanded location is created");
     }
 
+    /// The side-effect-free mirror used by the `system.status` workspaces-disk
+    /// sampler tracks `resolve_workspaces_parent` precedence: a non-empty
+    /// absolute location wins unless the root is startup-pinned; empty /
+    /// pinned / relative (invalid) forms fall through to the default root —
+    /// and it never creates directories.
+    #[test]
+    fn provisioning_parent_mirror_tracks_create_precedence() {
+        use crate::try_workspaces_provisioning_parent;
+        let custom = tempfile::tempdir().expect("custom root");
+        let nested = custom.path().join("nested").join("worktrees");
+        let nested_str = nested.to_string_lossy().to_string();
+
+        // Non-empty absolute setting, no pin → the location, NOT created.
+        let got =
+            try_workspaces_provisioning_parent(false, &nested_str).expect("location resolves");
+        assert_eq!(got, nested, "setting wins over default root");
+        assert!(!nested.exists(), "mirror never creates directories");
+
+        // Startup pin → the default root even when the setting is set.
+        let fallback = crate::try_default_workspaces_root();
+        assert_eq!(
+            try_workspaces_provisioning_parent(true, &nested_str),
+            fallback,
+            "startup pin keeps precedence"
+        );
+        // Empty / whitespace / relative (create would error) → default root.
+        for loc in ["", "   ", "relative/dir"] {
+            assert_eq!(
+                try_workspaces_provisioning_parent(false, loc),
+                fallback,
+                "`{loc}` falls back to the default root"
+            );
+        }
+    }
+
     /// End-to-end through `workspace.create`: with the setting present the
     /// workspace lands under the configured location (metadata file proves
     /// the resolved parent); cleared back to empty, the next create falls
@@ -25364,6 +29628,1038 @@ mod worktrees_location {
         assert!(
             !ws_dir.exists(),
             "delete removes <location>/<id>/ under the custom worktrees location"
+        );
+    }
+}
+
+/// Delete grace window (§5.1): `schedule_workspace_delete` /
+/// `cancel_workspace_delete` semantics — schedule→commit, schedule→cancel,
+/// cancel-after-commit race, idempotent re-schedule, immediate-delete-while-
+/// pending, restart drop, and the `pendingDeleteAt` row projection.
+mod delete_grace_window {
+    use std::time::Duration;
+
+    use intent_core::{Error, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    /// Bounded poll until the workspace row is gone (the timer commit is
+    /// asynchronous).
+    async fn wait_deleted(h: &Harness) {
+        for _ in 0..100 {
+            if matches!(
+                h.services.get_workspace(h.ws.clone()).await,
+                Err(Error::NotFound(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("scheduled delete did not commit within the poll budget");
+    }
+
+    /// Schedule → deadline expiry commits the delete through the existing
+    /// cascade, and `pendingDeleteAt` projects on list/get while pending.
+    /// The projections are asserted under a comfortably long window (then
+    /// cancelled), and the deadline commit is exercised by a separate short
+    /// re-schedule — so no assertion ever races a sub-second timer.
+    #[tokio::test]
+    async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
+        let h = harness().await;
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        assert!(!delete_at.is_empty(), "ISO deadline returned");
+
+        // Row still served while pending, carrying the deadline.
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+        let listed = h.services.list_workspaces(false).await.expect("list");
+        let row = listed.iter().find(|w| w.id == h.ws).expect("row listed");
+        assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+
+        // Cancel the long window, then re-schedule short and let the timer
+        // commit — only eventual deletion is asserted past this point.
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "long window cancelled before the short re-schedule"
+        );
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 50)
+            .await
+            .expect("re-schedule short");
+        wait_deleted(&h).await;
+    }
+
+    /// Schedule → cancel restores the entity: the timer never commits and
+    /// `pendingDeleteAt` disappears from the projection.
+    #[tokio::test]
+    async fn cancel_within_window_keeps_workspace() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        assert!(cancelled, "a pending deletion was cancelled");
+
+        let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+        assert_eq!(got.pending_delete_at, None, "projection cleared");
+
+        // A second cancel observes nothing pending — race-safe non-error.
+        let again = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel again");
+        assert!(!again, "nothing pending on the second cancel");
+    }
+
+    /// Cancel-after-commit race: once the timer fired and the delete
+    /// committed, cancel reports `false` (non-error) — never an error.
+    #[tokio::test]
+    async fn cancel_after_commit_is_false_not_error() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 50)
+            .await
+            .expect("schedule");
+        wait_deleted(&h).await;
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel after commit is not an error");
+        assert!(!cancelled, "already committed → cancelled: false");
+    }
+
+    /// Re-scheduling while pending is idempotent: the original deadline is
+    /// returned, not a new one.
+    #[tokio::test]
+    async fn reschedule_while_pending_returns_existing_deadline() {
+        let h = harness().await;
+        let first = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let second = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 1)
+            .await
+            .expect("re-schedule");
+        assert_eq!(first, second, "idempotent re-schedule keeps the deadline");
+
+        // The 1ms re-schedule must NOT have armed a second timer: the row
+        // survives well past 1ms because the original 60s window still owns
+        // the deletion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            h.services.get_workspace(h.ws.clone()).await.is_ok(),
+            "original window still pending; no second timer fired"
+        );
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "single pending entry cancelled"
+        );
+    }
+
+    /// An immediate delete while pending cancels the timer and commits now.
+    #[tokio::test]
+    async fn immediate_delete_while_pending_commits_now() {
+        let h = harness().await;
+        h.services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("immediate delete");
+        assert!(
+            matches!(
+                h.services.get_workspace(h.ws.clone()).await,
+                Err(Error::NotFound(_))
+            ),
+            "row deleted immediately"
+        );
+        let cancelled = h
+            .services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        assert!(
+            !cancelled,
+            "pending entry superseded by the immediate delete"
+        );
+    }
+
+    /// Restart semantics: pending deletions are in-memory only — a fresh
+    /// `Services` over the same store sees no pending deletion and the
+    /// workspace survives.
+    #[tokio::test]
+    async fn restart_drops_pending_deletion() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        svc.schedule_workspace_delete(ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        drop(svc);
+
+        // "Restarted" daemon: fresh Services over the same store.
+        let svc2 = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let got = svc2.get_workspace(ws.clone()).await.expect("survives");
+        assert_eq!(got.pending_delete_at, None, "pending state dropped");
+        assert!(
+            !svc2
+                .cancel_workspace_delete(ws)
+                .await
+                .expect("cancel on fresh daemon"),
+            "nothing pending after restart"
+        );
+    }
+
+    /// Scheduling for an unknown workspace is the standard `NotFound`.
+    #[tokio::test]
+    async fn schedule_unknown_workspace_is_not_found() {
+        let h = harness().await;
+        let missing = WorkspaceId::new();
+        assert!(matches!(
+            h.services.schedule_workspace_delete(missing, 15_000).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// The grace-window events: `workspace:delete-scheduled` carries
+    /// `{ workspaceId, deleteAt }`, `workspace:delete-cancelled` carries
+    /// `{ workspaceId }` (§6.5 self-sufficient payloads).
+    #[tokio::test]
+    async fn schedule_and_cancel_emit_events() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 60_000)
+            .await
+            .expect("schedule");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("scheduled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "workspace:delete-scheduled");
+        assert_eq!(
+            ev["data"],
+            serde_json::json!({ "workspaceId": h.ws.0, "deleteAt": delete_at })
+        );
+
+        h.services
+            .cancel_workspace_delete(h.ws.clone())
+            .await
+            .expect("cancel");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("cancelled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "workspace:delete-cancelled");
+        assert_eq!(ev["data"], serde_json::json!({ "workspaceId": h.ws.0 }));
+    }
+
+    /// The caller-supplied delay is clamped to the 60s cap: the returned
+    /// deadline is at most ~60s out, never hours.
+    #[tokio::test]
+    async fn undo_delay_is_clamped_to_cap() {
+        let h = harness().await;
+        let delete_at = h
+            .services
+            .schedule_workspace_delete(h.ws.clone(), 3_600_000)
+            .await
+            .expect("schedule");
+        let deadline = intent_core::parse_iso(&delete_at).expect("valid ISO deadline");
+        let max = time::OffsetDateTime::now_utc() + time::Duration::seconds(61);
+        assert!(deadline <= max, "deadline clamped to the 60s cap");
+        assert!(
+            h.services
+                .cancel_workspace_delete(h.ws.clone())
+                .await
+                .expect("cancel"),
+            "cleanup"
+        );
+    }
+
+    /// Registry-level atomicity: the idempotent re-schedule check runs
+    /// under the registry lock — a second schedule for the same key returns
+    /// the existing deadline and never runs its spawn, so concurrent
+    /// schedules cannot arm competing timers.
+    #[tokio::test]
+    async fn registry_schedule_is_atomically_idempotent() {
+        let reg = crate::delete_grace::PendingDeletes::default();
+        let first = reg.schedule(
+            "k".to_string(),
+            "2026-01-01T00:00:00.000Z".to_string(),
+            |_| tokio::spawn(async {}),
+        );
+        assert_eq!(first, None, "first schedule arms the entry");
+        let second = reg.schedule(
+            "k".to_string(),
+            "2026-02-02T00:00:00.000Z".to_string(),
+            |_| panic!("spawn must not run while an entry is already pending"),
+        );
+        assert_eq!(
+            second.as_deref(),
+            Some("2026-01-01T00:00:00.000Z"),
+            "loser gets the winner's deadline back"
+        );
+        assert_eq!(
+            reg.deadline("k").as_deref(),
+            Some("2026-01-01T00:00:00.000Z"),
+            "original entry untouched"
+        );
+        assert!(reg.cancel("k"), "single pending entry");
+    }
+}
+
+/// Agent delete grace window (§5.5): `agent_schedule_delete_op` /
+/// `agent_cancel_delete_op` semantics — schedule→commit, schedule→cancel,
+/// cancel-after-commit race, `pendingDeleteAt` projections, the agent keeps
+/// running during the window, and workspace-delete supersession.
+mod agent_delete_grace_window {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, AgentId, AgentSession, AgentStatus, Error, WorkspaceApi, WorkspaceId,
+    };
+    use intent_store::Store;
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services};
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+        agent: AgentId,
+    }
+
+    fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
+        let ts = now_iso();
+        AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let agent = AgentId::from("agent-grace-1");
+        store
+            .insert_agent_session(&session(&ws, agent.0.as_str()))
+            .await
+            .expect("session");
+        let bus = EventBus::new(store.clone());
+        let ws_root = WorkspacesRoot::new();
+        let services = Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            services,
+            bus,
+            ws,
+            agent,
+        }
+    }
+
+    /// Bounded poll until the session row is gone (the timer commit is
+    /// asynchronous).
+    async fn wait_deleted(h: &Harness) {
+        for _ in 0..100 {
+            if matches!(
+                h.services.agent_get_op(h.agent.clone(), None).await,
+                Err(Error::NotFound(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("scheduled agent delete did not commit within the poll budget");
+    }
+
+    /// Schedule → deadline expiry commits the delete through the ordinary
+    /// `agent_delete_op` cascade, and while pending the session stays fully
+    /// served — status untouched (the agent is NOT stopped) with
+    /// `pendingDeleteAt` on all three projections (list/get/getSession).
+    /// The projections are asserted under a comfortably long window (then
+    /// cancelled), and the deadline commit is exercised by a separate short
+    /// re-schedule — so no assertion ever races a sub-second timer.
+    #[tokio::test]
+    async fn schedule_commits_on_deadline_and_projects_pending_delete_at() {
+        let h = harness().await;
+        let delete_at = h
+            .services
+            .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 60_000)
+            .await
+            .expect("schedule");
+        assert!(!delete_at.is_empty(), "ISO deadline returned");
+
+        // Row still served while pending, carrying the deadline; the
+        // session's own state is untouched (scheduling does not stop the
+        // agent).
+        let got = h
+            .services
+            .agent_get_op(h.agent.clone(), Some(h.ws.clone()))
+            .await
+            .expect("get");
+        assert_eq!(got.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+        assert_eq!(got.status, AgentStatus::Idle, "status untouched");
+        let listed = h.services.agent_list_op(h.ws.clone()).await.expect("list");
+        let row = listed.iter().find(|a| a.id == h.agent).expect("row listed");
+        assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
+        let session = h
+            .services
+            .agent_get_session_op(h.agent.clone())
+            .await
+            .expect("getSession");
+        assert_eq!(
+            session.pending_delete_at.as_deref(),
+            Some(delete_at.as_str())
+        );
+
+        // Cancel the long window, then re-schedule short and let the timer
+        // commit — only eventual deletion is asserted past this point.
+        assert!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), None)
+                .await
+                .expect("cancel"),
+            "long window cancelled before the short re-schedule"
+        );
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 50)
+            .await
+            .expect("re-schedule short");
+        wait_deleted(&h).await;
+    }
+
+    /// Schedule → cancel keeps the session: the timer never commits and
+    /// `pendingDeleteAt` disappears from the projections.
+    #[tokio::test]
+    async fn cancel_within_window_keeps_agent() {
+        let h = harness().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        let cancelled = h
+            .services
+            .agent_cancel_delete_op(h.agent.clone(), None)
+            .await
+            .expect("cancel");
+        assert!(cancelled, "a pending deletion was cancelled");
+
+        let got = h
+            .services
+            .agent_get_op(h.agent.clone(), None)
+            .await
+            .expect("get");
+        assert_eq!(got.pending_delete_at, None, "projection cleared");
+
+        // A second cancel observes nothing pending — race-safe non-error.
+        let again = h
+            .services
+            .agent_cancel_delete_op(h.agent.clone(), None)
+            .await
+            .expect("cancel again");
+        assert!(!again, "nothing pending on the second cancel");
+    }
+
+    /// Cancel-after-commit race: once the timer fired and the delete
+    /// committed, cancel reports `false` (non-error) — never an error.
+    #[tokio::test]
+    async fn cancel_after_commit_is_false_not_error() {
+        let h = harness().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 50)
+            .await
+            .expect("schedule");
+        wait_deleted(&h).await;
+        let cancelled = h
+            .services
+            .agent_cancel_delete_op(h.agent.clone(), None)
+            .await
+            .expect("cancel after commit is not an error");
+        assert!(!cancelled, "already committed → cancelled: false");
+    }
+
+    /// Re-scheduling while pending is idempotent: the original deadline is
+    /// returned and no second timer is armed.
+    #[tokio::test]
+    async fn reschedule_while_pending_returns_existing_deadline() {
+        let h = harness().await;
+        let first = h
+            .services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        let second = h
+            .services
+            .agent_schedule_delete_op(h.agent.clone(), None, 1)
+            .await
+            .expect("re-schedule");
+        assert_eq!(first, second, "idempotent re-schedule keeps the deadline");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            h.services.agent_get_op(h.agent.clone(), None).await.is_ok(),
+            "original window still pending; no second timer fired"
+        );
+        assert!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), None)
+                .await
+                .expect("cancel"),
+            "single pending entry cancelled"
+        );
+    }
+
+    /// An immediate delete while pending supersedes the timer and commits
+    /// now.
+    #[tokio::test]
+    async fn immediate_delete_while_pending_commits_now() {
+        let h = harness().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        h.services
+            .agent_delete_op(h.agent.clone(), None)
+            .await
+            .expect("immediate delete");
+        assert!(
+            matches!(
+                h.services.agent_get_op(h.agent.clone(), None).await,
+                Err(Error::NotFound(_))
+            ),
+            "row deleted immediately"
+        );
+        let cancelled = h
+            .services
+            .agent_cancel_delete_op(h.agent.clone(), None)
+            .await
+            .expect("cancel");
+        assert!(
+            !cancelled,
+            "pending entry superseded by the immediate delete"
+        );
+    }
+
+    /// Scheduling for an unknown agent is the standard `NotFound`, and a
+    /// caller-declared workspace mismatch is rejected the same way
+    /// `agent_delete_op` rejects cross-workspace bare-id probes.
+    #[tokio::test]
+    async fn schedule_unknown_or_cross_workspace_is_not_found() {
+        let h = harness().await;
+        assert!(matches!(
+            h.services
+                .agent_schedule_delete_op(AgentId::from("agent-missing"), None, 15_000)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            h.services
+                .agent_schedule_delete_op(h.agent.clone(), Some(WorkspaceId::new()), 15_000)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(
+            h.services
+                .agent_get_op(h.agent.clone(), None)
+                .await
+                .expect("survives")
+                .pending_delete_at,
+            None,
+            "no window armed by the rejected schedules"
+        );
+    }
+
+    /// The grace-window events: `agent:delete-scheduled` carries
+    /// `{ agentId, workspaceId, deleteAt }`, `agent:delete-cancelled` carries
+    /// `{ agentId, workspaceId }` (§6.5 self-sufficient payloads).
+    #[tokio::test]
+    async fn schedule_and_cancel_emit_events() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+
+        let delete_at = h
+            .services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("scheduled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "agent:delete-scheduled");
+        assert_eq!(
+            ev["data"],
+            serde_json::json!({
+                "agentId": h.agent.0,
+                "workspaceId": h.ws.0,
+                "deleteAt": delete_at,
+            })
+        );
+
+        h.services
+            .agent_cancel_delete_op(h.agent.clone(), None)
+            .await
+            .expect("cancel");
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("cancelled event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).expect("serialize");
+        assert_eq!(ev["type"], "agent:delete-cancelled");
+        assert_eq!(
+            ev["data"],
+            serde_json::json!({ "agentId": h.agent.0, "workspaceId": h.ws.0 })
+        );
+    }
+
+    /// Restart semantics: pending agent deletions are in-memory only — a
+    /// fresh `Services` over the same store sees no pending deletion and the
+    /// session survives.
+    #[tokio::test]
+    async fn restart_drops_pending_deletion() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let agent = AgentId::from("agent-restart");
+        store
+            .insert_agent_session(&session(&ws, agent.0.as_str()))
+            .await
+            .expect("session");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+        svc.agent_schedule_delete_op(agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        drop(svc);
+
+        // "Restarted" daemon: fresh Services over the same store.
+        let svc2 = Services::new(store).with_workspaces_root(ws_root.path().to_path_buf());
+        let got = svc2
+            .agent_get_op(agent.clone(), None)
+            .await
+            .expect("survives");
+        assert_eq!(got.pending_delete_at, None, "pending state dropped");
+        assert!(
+            !svc2
+                .agent_cancel_delete_op(agent, None)
+                .await
+                .expect("cancel on fresh daemon"),
+            "nothing pending after restart"
+        );
+    }
+
+    /// Cascade interaction (§5.5): deleting the workspace — here an immediate
+    /// delete while an agent grace window is running — supersedes the pending
+    /// agent deletion. The session dies with the workspace cascade
+    /// (`agent:deleted`), the agent timer never fires on its own, and no
+    /// `agent:delete-cancelled` is emitted.
+    #[tokio::test]
+    async fn workspace_delete_supersedes_pending_agent_deletes() {
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(crate::SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        });
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        // Drain the schedule event so the assertions below start clean.
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("scheduled event delivered");
+
+        h.services
+            .delete_workspace(h.ws.clone())
+            .await
+            .expect("workspace delete");
+        assert!(
+            matches!(
+                h.services.agent_get_op(h.agent.clone(), None).await,
+                Err(Error::NotFound(_))
+            ),
+            "session died with the workspace cascade"
+        );
+        // The pending agent entry was aborted by the cascade: a late cancel
+        // reports the race-safe `false` and emits nothing.
+        assert!(
+            !h.services
+                .agent_cancel_delete_op(h.agent.clone(), Some(h.ws.clone()))
+                .await
+                .expect("late cancel"),
+            "pending agent delete superseded by the workspace delete"
+        );
+        // The cascade emits `agent:deleted` + `workspace:deleted`; no
+        // `agent:delete-cancelled` sneaks in.
+        let mut seen = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+        {
+            for ev in batch {
+                seen.push(serde_json::to_value(&ev).expect("serialize"));
+            }
+        }
+        assert!(
+            seen.iter().any(|e| e["type"] == "agent:deleted"),
+            "agent:deleted emitted by the cascade: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| e["type"] == "workspace:deleted"),
+            "workspace:deleted emitted by the cascade: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| e["type"] == "agent:delete-cancelled"),
+            "supersession emits no per-agent cancel event: {seen:?}"
+        );
+    }
+
+    /// Scope guard: a caller-declared workspace mismatch on
+    /// `agent.cancelDelete` is rejected as `NotFound` BEFORE touching the
+    /// registry — the pending deletion survives and a correctly scoped
+    /// cancel still works afterward.
+    #[tokio::test]
+    async fn cross_workspace_cancel_is_not_found_and_keeps_window() {
+        let h = harness().await;
+        h.services
+            .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
+            .await
+            .expect("schedule");
+        assert!(matches!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), Some(WorkspaceId::new()))
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let got = h
+            .services
+            .agent_get_op(h.agent.clone(), None)
+            .await
+            .expect("get");
+        assert!(
+            got.pending_delete_at.is_some(),
+            "window survives the rejected cross-workspace cancel"
+        );
+        assert!(
+            h.services
+                .agent_cancel_delete_op(h.agent.clone(), Some(h.ws.clone()))
+                .await
+                .expect("scoped cancel"),
+            "correctly scoped cancel succeeds"
+        );
+    }
+}
+
+/// Harness versioning (intent-hq/monorepo#2459): session creation stamps
+/// `CURRENT_HARNESS_VERSION` + the effective agentFeatures snapshot, children
+/// mint the latest version regardless of the creator's pin, and legacy rows
+/// project the current settings on read.
+mod harness_versioning {
+    use super::*;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    async fn create_agent(
+        svc: &Services,
+        ws: &WorkspaceId,
+        parent: Option<AgentId>,
+    ) -> serde_json::Value {
+        svc.agent_create_op(
+            ws.clone(),
+            Some("Harness".into()),
+            None,
+            None,
+            parent,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create agent")
+    }
+
+    /// New sessions stamp the current harness version and the full
+    /// agentFeatures snapshot at creation; both persist and surface on the
+    /// `agent.create` wire projection.
+    #[tokio::test]
+    async fn create_stamps_current_version_and_features_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let agent = &created["agent"];
+        assert_eq!(
+            agent["harnessVersion"],
+            intent_core::CURRENT_HARNESS_VERSION,
+            "wire projection carries the stamped version"
+        );
+        let features = agent["harnessFeatures"]
+            .as_object()
+            .expect("wire projection carries the captured snapshot");
+        // The snapshot is the camelCase wire form of AgentFeaturesSettings —
+        // spot-check the defaults (taskGraph opt-in off, the rest on).
+        assert_eq!(features["taskGraph"], false);
+        assert_eq!(features["backgroundHooks"], true);
+
+        // Persisted, not projected: the row itself carries the stamp.
+        let id = AgentId::from(agent["id"].as_str().unwrap());
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        assert_eq!(
+            session.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
+        let persisted = session.harness_features.expect("persisted snapshot");
+        assert_eq!(persisted["taskGraph"], serde_json::json!(false));
+    }
+
+    /// Delegation mints LATEST, never inherits: a child created by a parent
+    /// pinned to an older harness version still stamps the current constant —
+    /// the stamp depends only on creation time, never on the creator.
+    #[tokio::test]
+    async fn child_session_mints_latest_never_inherits_parent_pin() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        // Age the parent's pin to a version that is NOT the current constant
+        // (simulating a session created by an older daemon).
+        sqlx::query("UPDATE agent_session SET harness_version = '0.9-legacy' WHERE id = ?")
+            .bind(&parent_id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("age parent pin");
+        assert_eq!(
+            svc.store()
+                .get_agent_session(&parent_id)
+                .await
+                .expect("parent")
+                .harness_version,
+            "0.9-legacy"
+        );
+
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(
+            child["agent"]["harnessVersion"],
+            intent_core::CURRENT_HARNESS_VERSION,
+            "child stamps the current constant, not the parent's 0.9-legacy pin"
+        );
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let session = svc.store().get_agent_session(&child_id).await.expect("get");
+        assert_eq!(
+            session.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
+        assert!(
+            session.harness_features.is_some(),
+            "child snapshot captured"
+        );
+    }
+
+    /// Legacy rows (pre-0096, NULL snapshot) read back version "1.0" and the
+    /// wire projections overlay the CURRENT settings as the features value —
+    /// without persisting anything.
+    #[tokio::test]
+    async fn legacy_rows_project_current_settings_on_read() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        // Simulate a pre-feature row: backfilled version, NULL snapshot.
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '1.0', harness_features = NULL \
+             WHERE id = ?",
+        )
+        .bind(&id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("null out snapshot");
+
+        // agent.get projection: current settings overlaid.
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(lite.harness_version, "1.0");
+        let features = lite.harness_features.expect("projected from settings");
+        assert_eq!(features["taskGraph"], serde_json::json!(false));
+
+        // agent.getSession: same overlay.
+        let full = svc
+            .agent_get_session_op(id.clone())
+            .await
+            .expect("getSession");
+        assert!(full.harness_features.is_some());
+
+        // Never persisted: the row still carries NULL.
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT harness_features FROM agent_session WHERE id = ?")
+                .bind(&id.0)
+                .fetch_one(svc.store().read_pool())
+                .await
+                .expect("raw read");
+        assert_eq!(raw, None, "projection never writes the snapshot back");
+    }
+
+    /// The runtime surface follows the persisted snapshot, not live settings:
+    /// `session_agent_features` (the respawn read used for the MCP bridge and
+    /// prompt assembly) decodes `harness_features` when present — so a
+    /// settings change after creation never alters an existing session's
+    /// tools — and falls back to the live effective settings only for legacy
+    /// NULL-snapshot rows.
+    #[tokio::test]
+    async fn respawn_features_follow_persisted_snapshot_not_live_settings() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+        // Pin the persisted snapshot to a non-default shape (hostExec off —
+        // live default is on).
+        let mut pinned =
+            serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
+                .unwrap();
+        pinned["hostExec"] = serde_json::json!(false);
+        sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
+            .bind(pinned.to_string())
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("pin snapshot");
+
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let features = svc.session_agent_features(&session);
+        assert!(
+            !features.host_exec,
+            "respawn read follows the persisted snapshot (hostExec off), not live settings"
+        );
+        assert!(
+            svc.effective_settings().agent_features.host_exec,
+            "live settings still default hostExec on — the snapshot diverged deliberately"
+        );
+
+        // Legacy NULL-snapshot rows fall back to the live settings.
+        sqlx::query("UPDATE agent_session SET harness_features = NULL WHERE id = ?")
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("null out snapshot");
+        let legacy = svc.store().get_agent_session(&id).await.expect("get");
+        assert_eq!(
+            svc.session_agent_features(&legacy),
+            svc.effective_settings().agent_features,
+            "legacy rows fall back to live effective settings"
         );
     }
 }

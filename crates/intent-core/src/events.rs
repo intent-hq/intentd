@@ -31,6 +31,14 @@ pub const AGENT_MESSAGE: &str = "agent:message";
 // Agent interaction events (agent-to-agent communication).
 pub const AGENT_CREATED: &str = "agent:created";
 pub const AGENT_DELETED: &str = "agent:deleted";
+// Delete grace window (PROTOCOL §5.5): an `agent.delete` with
+// `undoDelayMs > 0` schedules an in-memory pending deletion instead of
+// committing immediately. Self-sufficient payloads: `delete-scheduled`
+// carries `{ agentId, workspaceId, deleteAt }` (the ISO commit deadline)
+// and `delete-cancelled` carries `{ agentId, workspaceId }` so clients
+// flip the pending state without a follow-up read.
+pub const AGENT_DELETE_SCHEDULED: &str = "agent:delete-scheduled";
+pub const AGENT_DELETE_CANCELLED: &str = "agent:delete-cancelled";
 pub const AGENT_RESTORED: &str = "agent:restored";
 pub const AGENT_RENAMED: &str = "agent:renamed";
 pub const AGENT_UPDATED: &str = "agent:updated";
@@ -102,11 +110,13 @@ pub const AGENT_QUEUE_PROCESSING_CANCELLED: &str = "agent:queue:processing-cance
 pub const AGENT_QUEUE_STALE_MESSAGE: &str = "agent:queue:stale-message";
 
 // Agent process-registry lifecycle events (new in intentd; PROTOCOL §6.5). Emitted
-// by the daemon-internal `ProcessRegistry` when a spawn queues for a concurrency
-// slot (all slots active), when a queued spawn resumes (a slot freed), and when
-// the registry evicts the LRU idle process. Self-sufficient payloads carry
-// `{ agentId, used, cap }` so a client can render the cap-saturation state without
-// polling. Mirrors the TS reference `agent-process-registry.ts` logging.
+// by the daemon-internal `ProcessRegistry` when a spawn queues for admission
+// (all slots active, or the aggregate memory budget is exceeded — monorepo#2063),
+// when a queued spawn resumes, and when the registry evicts the LRU idle process.
+// Self-sufficient payloads carry `{ agentId, used, cap, reason }` — `reason` is
+// `"slots"` or `"memory-budget"`, naming the admission constraint that drove the
+// event — so a client can render the saturation state without polling. Mirrors
+// the TS reference `agent-process-registry.ts` logging.
 pub const AGENT_PROCESS_QUEUED: &str = "agent:process:queued";
 pub const AGENT_PROCESS_RESUMED: &str = "agent:process:resumed";
 pub const AGENT_PROCESS_EVICTED: &str = "agent:process:evicted";
@@ -161,6 +171,18 @@ pub const GIT_PULL: &str = "git:pull";
 pub const GIT_BRANCH: &str = "git:branch";
 pub const GIT_MERGE: &str = "git:merge";
 
+// Workspace-git-root events (multi git root tracking,
+// intent-hq/monorepo#2053). Emitted when a secondary git root is registered
+// for a workspace, when a registered root's row changes (re-registration
+// attribution merge, PR-field refresh), and when a root is unregistered or
+// auto-pruned. Self-sufficient payloads: `gitRoot:registered` /
+// `gitRoot:updated` carry `{ workspaceId, gitRoot }` (the full wire
+// `WorkspaceGitRoot` row); `gitRoot:unregistered` carries
+// `{ workspaceId, gitRootId, path }`.
+pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
+pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
+pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
@@ -206,11 +228,12 @@ pub const TERMINAL_CWD: &str = "terminal:cwd";
 
 // Script streaming family (new in intentd; PROTOCOL §5.8/§6.5). Scripts run on
 // the unified PTY host (§12); the daemon fans live script output to subscribers
-// as `script:output` (base64 `chunk`) and publishes runtime/state transitions
-// (start, exit, auto-restart, URL detection) as `script:state`. Both payloads
-// are self-sufficient and carry the `scriptId`.
+// as `script:output` (base64 `chunk`), publishes runtime/state transitions
+// (start, exit, auto-restart, URL detection) as `script:state`, and definition
+// mutations as `script:changed`. All payloads carry the `scriptId`.
 pub const SCRIPT_OUTPUT: &str = "script:output";
 pub const SCRIPT_STATE: &str = "script:state";
+pub const SCRIPT_CHANGED: &str = "script:changed";
 
 // Background-hook lifecycle events (new in intentd). Emitted by the hook
 // scheduler on lifecycle transitions: `hook:scheduled` (schedule accepted),
@@ -251,8 +274,26 @@ pub const BUILD_COMPLETED: &str = "build:completed";
 pub const WORKSPACE_CREATED: &str = "workspace:created";
 pub const WORKSPACE_UPDATED: &str = "workspace:updated";
 pub const WORKSPACE_DELETED: &str = "workspace:deleted";
+// Delete grace window (PROTOCOL §5.1): a `workspace.delete` with
+// `undoDelayMs > 0` schedules an in-memory pending deletion instead of
+// committing immediately. Self-sufficient payloads: `delete-scheduled`
+// carries `{ workspaceId, deleteAt }` (the ISO commit deadline) and
+// `delete-cancelled` carries `{ workspaceId }` so clients flip the pending
+// state without a follow-up read.
+pub const WORKSPACE_DELETE_SCHEDULED: &str = "workspace:delete-scheduled";
+pub const WORKSPACE_DELETE_CANCELLED: &str = "workspace:delete-cancelled";
 pub const WORKSPACE_OPENED: &str = "workspace:opened";
 pub const WORKSPACE_CLOSED: &str = "workspace:closed";
+// Setup-script lifecycle of the `workspace.create` setup stage (PROTOCOL
+// §6.5). `workspace:setup:started` `{ workspaceId }` fires when an effective
+// setup script was resolved and a spawn will be attempted;
+// `workspace:setup:completed` `{ workspaceId, ranScript, exitCode? }` fires
+// exactly once per logical create on every terminal path (no script, spawn
+// failure, script exit) — including create paths that never reach the setup
+// stage (`skipWorktree`, no worktree) and `workspace.duplicate`, which runs
+// no setup. Idempotent replays publish nothing (same as `workspace:created`).
+pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
+pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
 pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // Workspace status-change family (new in intentd; PROTOCOL §6.5). Self-sufficient
 // payloads carry the new derived value so the FE flips the green/blue dot with no
@@ -267,6 +308,13 @@ pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
 // derivation; the self-sufficient payload `{ workspaceId, displayStatus }`
 // updates the workspace card badge with no follow-up fetch.
 pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-changed";
+// Orthogonal `Workspace.waiting` flag transition (PROTOCOL §5.1 / §6.5):
+// recomputed
+// and compared after the hook / PR-monitor / completion-watch lifecycle
+// transitions that can move the derivation; the self-sufficient payload
+// `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
+// no follow-up fetch.
+pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -276,6 +324,16 @@ pub const WORKSPACE_TOKEN_USAGE_CHANGED: &str = "workspace:tokenUsage-changed";
 // `{ workspaceId, items: ContextItem[] }` carries the new authoritative list
 // so subscribers refresh without a follow-up `workspace.getContext`.
 pub const WORKSPACE_CONTEXT_CHANGED: &str = "workspace:context-changed";
+// Workspace transfer/export lifecycle (PROTOCOL §5.1 / §6.5), emitted by the
+// source-side `workspace.export.*` build task. Self-sufficient payloads:
+// `progress` carries `{ workspaceId, exportId, stage, bytesWritten? }`,
+// `ready` carries `{ workspaceId, exportId, manifest, archiveSizeBytes,
+// archiveSha256, maxChunkBytes, totalChunks }` (everything the FE hands to
+// `workspace.import.begin` on the target), and `failed` carries
+// `{ workspaceId, exportId, reason }`.
+pub const WORKSPACE_TRANSFER_PROGRESS: &str = "workspace:transfer:progress";
+pub const WORKSPACE_TRANSFER_READY: &str = "workspace:transfer:ready";
+pub const WORKSPACE_TRANSFER_FAILED: &str = "workspace:transfer:failed";
 
 // Spec / goal events.
 pub const SPEC_UPDATED: &str = "spec:updated";
@@ -425,6 +483,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_MESSAGE,
     AGENT_CREATED,
     AGENT_DELETED,
+    AGENT_DELETE_SCHEDULED,
+    AGENT_DELETE_CANCELLED,
     AGENT_RESTORED,
     AGENT_RENAMED,
     AGENT_UPDATED,
@@ -466,6 +526,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_PULL,
     GIT_BRANCH,
     GIT_MERGE,
+    GIT_ROOT_REGISTERED,
+    GIT_ROOT_UPDATED,
+    GIT_ROOT_UNREGISTERED,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
@@ -482,6 +545,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TERMINAL_CWD,
     SCRIPT_OUTPUT,
     SCRIPT_STATE,
+    SCRIPT_CHANGED,
     HOOK_SCHEDULED,
     HOOK_RUN_STARTED,
     HOOK_RUN_COMPLETED,
@@ -501,14 +565,22 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_CREATED,
     WORKSPACE_UPDATED,
     WORKSPACE_DELETED,
+    WORKSPACE_DELETE_SCHEDULED,
+    WORKSPACE_DELETE_CANCELLED,
     WORKSPACE_OPENED,
     WORKSPACE_CLOSED,
+    WORKSPACE_SETUP_STARTED,
+    WORKSPACE_SETUP_COMPLETED,
     WORKSPACE_ACTIVITY,
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
+    WORKSPACE_WAITING_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
+    WORKSPACE_TRANSFER_PROGRESS,
+    WORKSPACE_TRANSFER_READY,
+    WORKSPACE_TRANSFER_FAILED,
     SPEC_UPDATED,
     GOAL_UPDATED,
     COMMENT_ADDED,

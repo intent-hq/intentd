@@ -221,6 +221,22 @@ struct Transcript {
     usage_cost: Option<UsageCost>,
 }
 
+/// The block indices one [`Transcript::record_tool`] call materialized. The
+/// `agent:tool:call` event carries the ids derived from them (§7.1
+/// `resultBlockId` / `proposalBlockIds`) so the live `chat.subscribe` delta
+/// path stamps the REAL persisted ids on its synthesized `tool_result` /
+/// proposal-resource blocks instead of predicting `tool_use index + 1` —
+/// a prediction that collides with an interleaved text block or a parallel
+/// call's `tool_use` (monorepo#2029).
+struct RecordedToolBlocks {
+    /// Index of the `tool_use` block (the block the event is enriched against).
+    use_index: usize,
+    /// Index of the `tool_result` block, once the call completed WITH output.
+    result_index: Option<usize>,
+    /// Indices of the standalone proposal-resource blocks, in attach order.
+    proposal_indices: Vec<usize>,
+}
+
 impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
@@ -300,9 +316,12 @@ impl Transcript {
     /// (§7.1), a standalone proposal-resource block is additionally appended
     /// right after the `tool_result` (the resource stays in
     /// `tool_result.output` too). Returns
-    /// `Some(index)` of the `tool_use` block (the block the `agent:tool:call`
-    /// event is enriched against), or `None` when the update was dropped —
-    /// callers must skip event publishing for dropped updates.
+    /// `Some(`[`RecordedToolBlocks`]`)` naming every block index this update
+    /// materialized — the `tool_use` block the `agent:tool:call` event is
+    /// enriched against plus the real `tool_result` / proposal-resource
+    /// indices the event carries so the live delta path never has to guess
+    /// them — or `None` when the update was dropped; callers must skip event
+    /// publishing for dropped updates.
     ///
     /// STAB-124: a first-sight update whose derived name is empty is DROPPED
     /// (returns `None`, nothing recorded). This is the stale shape a cancelled
@@ -316,7 +335,11 @@ impl Transcript {
     /// completed call, if any. On a registry hit the batch is attached
     /// directly and echo parsing is skipped; otherwise the legacy
     /// lift/wrap-repair fallback inspects the echoed output.
-    fn record_tool(&mut self, tc: &MappedToolCall, registered: Vec<Value>) -> Option<usize> {
+    fn record_tool(
+        &mut self,
+        tc: &MappedToolCall,
+        registered: Vec<Value>,
+    ) -> Option<RecordedToolBlocks> {
         let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
             Some(&i) => {
                 let block = &mut self.blocks[i];
@@ -374,12 +397,15 @@ impl Transcript {
                 index
             }
         };
+        let mut result_index = None;
+        let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
         if completed {
             if let Some(output) = &tc.output {
                 let is_error = tc.status == "error";
                 match self.tool_result_index.get(&tc.tool_call_id) {
                     Some(&ri) => {
+                        result_index = Some(ri);
                         if let Some(obj) = self.blocks[ri].as_object_mut() {
                             obj.insert("output".to_string(), output.clone());
                             obj.insert("is_error".to_string(), Value::Bool(is_error));
@@ -398,6 +424,7 @@ impl Transcript {
                         }));
                         self.tool_result_index
                             .insert(tc.tool_call_id.clone(), rindex);
+                        result_index = Some(rindex);
                     }
                 }
                 // §7.1: attach the standalone resource block(s) so the FE can
@@ -432,6 +459,7 @@ impl Transcript {
                                 let id = self.block_id(pi);
                                 self.blocks[pi] =
                                     crate::tool_block::build_proposal_resource_block(&id, &item);
+                                proposal_indices.push(pi);
                             }
                             None => {
                                 self.flush_text();
@@ -444,13 +472,18 @@ impl Transcript {
                                 if i == 0 {
                                     self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                                 }
+                                proposal_indices.push(pindex);
                             }
                         }
                     }
                 }
             }
         }
-        Some(use_index)
+        Some(RecordedToolBlocks {
+            use_index,
+            result_index,
+            proposal_indices,
+        })
     }
 
     /// The recorded tool name for a known `toolCallId` (from its `tool_use`
@@ -538,6 +571,46 @@ pub(crate) struct LiveTurn {
     /// live-turn slot so the throttle resets with the slot on stream
     /// end/failure/abort — the next turn's first activity is immediate again.
     pub(crate) last_activity_emit: Option<std::time::Instant>,
+    /// Pinned by [`pin_live_turn`](Services::pin_live_turn) on the teardown
+    /// paths (monorepo#2056): the slot stays published across the
+    /// `worker.abort()` → [`flush_partial_turn_on_interruption`] gap instead of
+    /// vanishing with the [`LiveTurnGuard`] drop, so a `chat.subscribe`
+    /// snapshot landing in that gap — busy still `true`, the interrupted row
+    /// not yet durable — can still reconstruct the partial turn. Cleared with
+    /// the slot itself by the flush.
+    pub(crate) flush_pending: bool,
+    /// Set when the owning flush RAN and could not persist (a genuine store
+    /// error), so it deliberately kept the slot as the only copy of the content
+    /// (monorepo#2104). The pin stays set — [`LiveTurnGuard::drop`] and
+    /// [`clear_unpinned_live_turn`](Services::clear_unpinned_live_turn) must
+    /// still leave that content alone, and a later teardown re-pins and gets a
+    /// second chance at persisting it. What this flag adds is the distinction
+    /// those two consumers do not need but
+    /// [`AgentManager::try_begin`](crate::agent_manager::AgentManager) does:
+    /// "a flush is IN FLIGHT and will settle this slot" (pinned, not abandoned)
+    /// versus "no one is coming for it" (abandoned). A new turn's claim clears
+    /// the latter, because an abandoned slot outliving its turn into the next
+    /// one is exactly the stale content monorepo#2138 gets gilded as streaming.
+    /// Reset by [`pin_live_turn`](Services::pin_live_turn): a fresh pin means a
+    /// fresh flush attempt is in flight.
+    pub(crate) flush_failed: bool,
+}
+
+/// What [`flush_pinned_turn_on_interruption`](Services::flush_pinned_turn_on_interruption)
+/// persisted, derived from the slot AS OF FLUSH TIME (monorepo#2110) so the
+/// interrupt path's downstream decisions agree with the durable row instead of
+/// with a pre-abort clone.
+pub(crate) struct FlushedTurn {
+    /// Id of the interrupted assistant row this flush appended — `None` when
+    /// nothing was appended (the worker's own full row won the `agent_message.id`
+    /// UNIQUE collision, or the store errored).
+    pub(crate) message_id: Option<String>,
+    /// Whether the flushed slot carried any blocks — the zero-output test the
+    /// stop-redelivery arm (intent-hq/monorepo#1757) keys off.
+    pub(crate) had_output: bool,
+    /// The flushed content's `type: "text"` block strings, for the terminal
+    /// `agent:stream:end` live-preview fields.
+    pub(crate) text_blocks: Vec<String>,
 }
 
 /// Machine-readable cause of a turn interruption, stamped as
@@ -638,6 +711,14 @@ pub(crate) type TurnBookkeeping = Arc<Mutex<HashMap<AgentId, tokio::task::JoinHa
 /// the interrupt/abort path, where the worker future is dropped before
 /// `stream:end` is reached. Without it an aborted turn would leave a stale
 /// in-flight message in the snapshot forever.
+///
+/// One exception (monorepo#2056): a slot pinned by
+/// [`pin_live_turn`](Services::pin_live_turn) survives the drop, because the
+/// teardown path that pinned it is about to persist the same content via
+/// [`flush_partial_turn_on_interruption`](Services::flush_partial_turn_on_interruption)
+/// — which clears the slot itself. That hands the slot's lifetime to the flush
+/// and closes the window in which the content was neither published nor
+/// durable.
 pub(crate) struct LiveTurnGuard<'a> {
     live_turns: &'a LiveTurns,
     agent_id: AgentId,
@@ -646,6 +727,12 @@ pub(crate) struct LiveTurnGuard<'a> {
 impl Drop for LiveTurnGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut slots) = self.live_turns.lock() {
+            // A pinned slot is owned by the in-progress interrupt flush; the
+            // orphan case the guard exists for (no flush coming — panic, plain
+            // abort) is unpinned and still cleared here.
+            if slots.get(&self.agent_id).is_some_and(|s| s.flush_pending) {
+                return;
+            }
             slots.remove(&self.agent_id);
         }
     }
@@ -1045,6 +1132,8 @@ impl Services {
                     final_text_block_open,
                     last_activity_at: now_iso(),
                     last_activity_emit: None,
+                    flush_pending: false,
+                    flush_failed: false,
                 },
             );
         }
@@ -1063,11 +1152,81 @@ impl Services {
         }
     }
 
-    /// Clear an agent's live-turn slot (happy-path turn end + test seam). The
+    /// Clear an agent's live-turn slot unconditionally — the interrupt flush's
+    /// own release (it owns the pin it clears) and the test seam. The
     /// [`LiveTurnGuard`] also clears on drop for the interrupt/abort path.
     pub fn clear_live_turn(&self, agent_id: &AgentId) {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.remove(agent_id);
+        }
+    }
+
+    /// Clear an agent's live-turn slot at a NORMAL turn end, leaving a pinned
+    /// slot alone — the same rule [`LiveTurnGuard::drop`] applies, for the same
+    /// reason: a pinned slot belongs to the teardown flush that is about to
+    /// persist it.
+    ///
+    /// Without this the pin's invariant had a hole (monorepo#2110 review): a
+    /// turn completing normally in the pin→flush gap unpublished the slot, and
+    /// because `run_prompt_turn` persists an assistant row only for a turn that
+    /// produced blocks, a ZERO-OUTPUT completion left nothing at all behind —
+    /// no durable row and no slot. The teardown flush then had no content to
+    /// record, costing the interruption both its marker row and (via
+    /// `had_output`) the zero-output stop-redelivery arm. Holding the pinned
+    /// slot means the flush always sees the turn as it really ended: empty
+    /// blocks flush as the marker row, and a completion that DID persist a full
+    /// row is absorbed by the flush's `agent_message.id` UNIQUE collision path.
+    pub(crate) fn clear_unpinned_live_turn(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if slots.get(agent_id).is_some_and(|s| s.flush_pending) {
+                return;
+            }
+            slots.remove(agent_id);
+        }
+    }
+
+    /// Clear an agent's live-turn slot at a new turn's CLAIM (monorepo#2138),
+    /// leaving alone only a slot whose owning flush is still in flight.
+    ///
+    /// A slot can outlive its turn — a flush that hit a genuine store error
+    /// keeps it as the only copy of the content — and if it survives into the
+    /// next turn, the window between the claim and that turn's
+    /// [`begin_live_turn`](Self::begin_live_turn) serves the PREVIOUS turn's
+    /// content as `isStreaming: true`. Clearing it with the claim closes that.
+    ///
+    /// The exception is narrower than [`clear_unpinned_live_turn`]'s: an
+    /// in-flight teardown flush owns its pinned slot and re-reads it at flush
+    /// time (monorepo#2110), so clearing it under that flush would silently drop
+    /// the content AND make the flush read the slot as vanished — which it
+    /// interprets as "the worker already persisted the full row". `interrupt_inner`
+    /// pins without a busy claim (a stop against an IDLE agent), so that
+    /// interleaving is reachable. But a flush that already gave up is NOT
+    /// coming back for the slot, so an abandoned slot is cleared like any other
+    /// orphan — otherwise the deliberate flush-failure keep, the very case
+    /// monorepo#2104 exists to make visible, would sail into the next turn and
+    /// be gilded as streaming again.
+    pub(crate) fn clear_live_turn_unless_flush_in_flight(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if slots
+                .get(agent_id)
+                .is_some_and(|s| s.flush_pending && !s.flush_failed)
+            {
+                return;
+            }
+            slots.remove(agent_id);
+        }
+    }
+
+    /// Record that the owning flush ran and could not persist, so the slot it
+    /// deliberately kept is no longer waiting on anything — see
+    /// [`LiveTurn::flush_failed`] and
+    /// [`clear_live_turn_unless_flush_in_flight`](Self::clear_live_turn_unless_flush_in_flight).
+    /// Leaves the pin and the content untouched.
+    fn mark_live_turn_flush_failed(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.flush_failed = true;
+            }
         }
     }
 
@@ -1100,6 +1259,41 @@ impl Services {
         self.live_turns.lock().ok()?.get(agent_id).cloned()
     }
 
+    /// Pin an agent's in-flight turn slot (monorepo#2056): the
+    /// [`LiveTurnGuard`] drop that follows `worker.abort()` leaves a pinned
+    /// slot published, so the partial content stays visible to `chat.subscribe`
+    /// until [`flush_pinned_turn_on_interruption`](Self::flush_pinned_turn_on_interruption)
+    /// makes it durable (that flush clears the slot, releasing the pin).
+    /// Without the pin the content is neither published nor persisted for the
+    /// width of the interrupt flush's INSERT, and a snapshot taken there drops
+    /// the whole partial turn — permanently, since nothing re-publishes it.
+    ///
+    /// Callers are exactly the three teardown paths (keep-alive interrupt,
+    /// hard stop, graceful shutdown), which pin immediately BEFORE aborting
+    /// the worker and flush AFTER it. Deliberately returns NOTHING (monorepo#2110):
+    /// the flush re-reads the slot — which the pin guarantees is still there,
+    /// against both the [`LiveTurnGuard`] drop and a normal turn end (see
+    /// [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn)) — so a
+    /// `session/update` processed in the pin→abort gap is persisted rather than
+    /// trimmed off a stale pre-abort clone. A no-op when no turn is in flight;
+    /// the flush's `None` says so on its own. Pinning is idempotent and never
+    /// outlives the turn: the next turn's [`begin_live_turn`](Self::begin_live_turn)
+    /// replaces the slot wholesale.
+    pub(crate) fn pin_live_turn(&self, agent_id: &AgentId) {
+        if let Ok(mut slots) = self.live_turns.lock() {
+            if let Some(slot) = slots.get_mut(agent_id) {
+                slot.flush_pending = true;
+                // A fresh pin means a fresh flush attempt is in flight, so an
+                // earlier give-up no longer describes this slot: re-pinning a
+                // slot a previous flush abandoned (a later teardown, e.g.
+                // shutdown, reaching the same stranded content) gives it a real
+                // second chance at persisting, and must not leave it looking
+                // abandoned to `try_begin` in the meantime.
+                slot.flush_failed = false;
+            }
+        }
+    }
+
     /// Read just the text of the live-turn slot's `type: "text"` blocks
     /// (plus the slot's final-text-block-open flag) without cloning the full
     /// slot — the `AgentLite` preview overlay only needs the text strings, so
@@ -1126,6 +1320,50 @@ impl Services {
             .map(|live| live.last_activity_at.clone())
     }
 
+    /// Flush the CURRENT content of an agent's pinned live-turn slot — the
+    /// teardown paths' entry point into
+    /// [`flush_partial_turn_on_interruption`](Self::flush_partial_turn_on_interruption).
+    ///
+    /// The slot is re-read HERE, after `worker.abort()`, rather than taken from
+    /// the clone [`pin_live_turn`](Self::pin_live_turn) used to hold
+    /// (monorepo#2110). The abort does not stop the notification already being
+    /// routed, so a `session/update` processed between the pin and the worker's
+    /// cancellation used to be trimmed out of the durable row — after it had
+    /// already been broadcast to every subscriber, leaving the transcript short
+    /// of what clients saw stream. The pin is what makes re-reading safe: a
+    /// pinned slot survives the [`LiveTurnGuard`] drop, so it is still there to
+    /// read.
+    ///
+    /// `None` means nothing was pinned — no turn in flight. A pinned slot
+    /// cannot vanish before this flush ([`LiveTurnGuard::drop`] and the normal
+    /// turn-end clear both leave it to the flush that owns it), and the
+    /// `flush_pending` filter below keeps this flush off a slot it does NOT
+    /// own: the next turn's [`begin_live_turn`](Self::begin_live_turn) landing
+    /// in the pin→flush window replaces the slot wholesale (unpinned), and
+    /// persisting THAT content here would record a live turn as interrupted
+    /// under its freshly minted id — poisoning the id the worker's own append
+    /// still needs.
+    pub(crate) async fn flush_pinned_turn_on_interruption(
+        &self,
+        agent_id: &AgentId,
+        reason: InterruptReason,
+        interrupted_by: Option<&InterruptedBy>,
+    ) -> Option<FlushedTurn> {
+        let live = self.live_turn(agent_id).filter(|live| live.flush_pending)?;
+        // Derived before the flush consumes the blocks; `text_block_strings`
+        // copies only the text, leaving mid-turn tool payloads uncloned.
+        let had_output = !live.blocks.is_empty();
+        let text_blocks = text_block_strings(&live.blocks);
+        let message_id = self
+            .flush_partial_turn_on_interruption(agent_id, live, reason, interrupted_by, true)
+            .await;
+        Some(FlushedTurn {
+            message_id,
+            had_output,
+            text_blocks,
+        })
+    }
+
     /// Best-effort flush of an agent's partial in-flight assistant content at
     /// interruption-capture time (graceful shutdown, INT-41 follow-up): persist
     /// the caller-captured live-turn snapshot as a normal `assistant` row tagged
@@ -1134,14 +1372,19 @@ impl Services {
     /// is kept as a redundant tag) so the transcript keeps the streamed-so-far
     /// output across the restart. Reuses the turn's minted `message_id` (CS-0
     /// D1) so persisted block ids `{messageId}:{index}` match what streamed.
-    /// The caller snapshots the slot via [`live_turn`](Self::live_turn) BEFORE
-    /// aborting the turn worker (the abort drops [`LiveTurnGuard`], clearing
-    /// the slot) and flushes AFTER the abort so the worker cannot race the
-    /// append; if the worker already persisted the full turn, the append
-    /// collides on the UNIQUE id and is logged at debug (benign — the full row
-    /// won; the stale slot, if any, is cleared). Errors are logged and
-    /// swallowed: this must never block shutdown or the interrupted_agent row
-    /// insert.
+    /// The teardown paths reach this through
+    /// [`flush_pinned_turn_on_interruption`](Self::flush_pinned_turn_on_interruption),
+    /// which supplies the pinned slot's content as of flush time; the suspend
+    /// enrollment path (which owns the turn and has no worker to abort) passes
+    /// its content directly. The teardown convention is pin BEFORE aborting the
+    /// turn worker, flush AFTER the abort so the worker cannot race the append;
+    /// the pin keeps the slot published across that gap (monorepo#2056) and this
+    /// flush owns releasing it. If the worker already persisted the full turn,
+    /// the append collides on the UNIQUE id and is logged at debug (benign —
+    /// the full row won; the stale slot, if any, is cleared). Errors are logged
+    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// row insert. On a genuine store error the slot is deliberately KEPT (pin
+    /// and all) as the only remaining copy of the content.
     ///
     /// The row also carries a machine-readable `interruptReason` (plus
     /// `interruptedBy` sender attribution for message preemption) so the FE
@@ -1159,12 +1402,19 @@ impl Services {
     /// Returns the persisted interrupted row's message id (`Some` only when
     /// this flush appended the row), so the interrupt path can carry
     /// `messageId` on the terminal `agent:stream:end`.
+    /// `owns_slot` says whose slot this flush may release: the teardown flush
+    /// owns the pin it is flushing and clears unconditionally; the suspend
+    /// enrollment flushes caller-held content and must NOT release a pin a
+    /// concurrent teardown holds on the agent's slot — clearing it would cost
+    /// that teardown's flush the true `had_output` (the same monorepo#2110
+    /// zero-output flip, resurfacing through this side door).
     pub(crate) async fn flush_partial_turn_on_interruption(
         &self,
         agent_id: &AgentId,
         live: LiveTurn,
         reason: InterruptReason,
         interrupted_by: Option<&InterruptedBy>,
+        owns_slot: bool,
     ) -> Option<String> {
         let mut metadata = json!({
             "interrupted": true,
@@ -1199,7 +1449,11 @@ impl Services {
                 if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                     self.invalidate_agent_list_cache(&session.workspace_id);
                 }
-                self.clear_live_turn(agent_id);
+                if owns_slot {
+                    self.clear_live_turn(agent_id);
+                } else {
+                    self.clear_unpinned_live_turn(agent_id);
+                }
                 Some(live.message_id)
             }
             // Only the `agent_message.id` violation means "the worker already
@@ -1210,8 +1464,13 @@ impl Services {
                 if e.to_string()
                     .contains("UNIQUE constraint failed: agent_message.id") =>
             {
-                // The durable full row exists — drop the now-stale overlay too.
-                self.clear_live_turn(agent_id);
+                // The durable full row exists — drop the now-stale overlay too
+                // (same ownership rule as the success arm).
+                if owns_slot {
+                    self.clear_live_turn(agent_id);
+                } else {
+                    self.clear_unpinned_live_turn(agent_id);
+                }
                 tracing::debug!(
                     agent = %agent_id,
                     error = %e,
@@ -1225,6 +1484,21 @@ impl Services {
                     error = %e,
                     "failed to flush partial in-flight assistant content at interruption capture"
                 );
+                // The slot is KEPT (pin and all) as the only copy of the
+                // content, but this flush is over — nothing is coming to settle
+                // it. Record that, so the one consumer that needs to tell
+                // "a flush will settle this" from "no one is coming" — a new
+                // turn's `try_begin` claim — can clear it rather than let it
+                // outlive its turn and be gilded as streaming (monorepo#2138).
+                // The pin itself stays set: `LiveTurnGuard::drop` and the normal
+                // turn-end clear must still leave this content alone, and a
+                // later teardown re-pins it for a second attempt. Only the
+                // owning flush may say this; the suspend path (`owns_slot =
+                // false`) is flushing caller-held content and must not
+                // characterize a pin a concurrent teardown holds.
+                if owns_slot {
+                    self.mark_live_turn_flush_failed(agent_id);
+                }
                 None
             }
         }
@@ -1798,14 +2072,31 @@ impl Services {
                 )
                 .await;
         }
-        if !blocks.is_empty() {
+        // Abnormal finish reason (PROTOCOL §7): a turn that resolved with a
+        // non-`end_turn` stop reason (`refusal`, `max_tokens`,
+        // `max_turn_requests`, …) is durably tagged on the assistant row so
+        // clients can render the ending after a reload. Normal endings
+        // (`end_turn` / `stream_complete`) stay metadata-free — no noise on
+        // the common path. A zero-output abnormal turn still persists an
+        // empty marker row (mirroring the §7.2 pre-first-token interrupt
+        // marker): `agent:idle` / `agent:stream:end` are ephemeral, so the
+        // row is the only durable record of the ending.
+        let abnormal_finish_reason = result
+            .as_ref()
+            .ok()
+            .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
+            .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
+        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
+            let row_metadata = abnormal_finish_reason
+                .as_ref()
+                .map(|reason| json!({ "finishReason": reason }));
             self.store
                 .append_agent_message_with_id(
                     agent_id,
                     &message_id,
                     "assistant",
                     &Value::Array(blocks),
-                    None,
+                    row_metadata.as_ref(),
                     &now_iso(),
                 )
                 .await?;
@@ -1834,8 +2125,10 @@ impl Services {
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
-        // remains as the abort-path fallback.
-        self.clear_live_turn(agent_id);
+        // remains as the abort-path fallback. A PINNED slot is left for the
+        // teardown flush that owns it (monorepo#2110) — see
+        // [`clear_unpinned_live_turn`](Self::clear_unpinned_live_turn).
+        self.clear_unpinned_live_turn(agent_id);
         // Turn-end usage bookkeeping, detached (monorepo#738): the global
         // usage-stats recording (fold this turn's token delta + run counters
         // into the current UTC hour bucket of `usage_stats_hourly`) and the
@@ -1905,6 +2198,39 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
+        // Durable-before-observable for the streaming terminal-failure path
+        // (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error
+        // is terminal, and this function emits its own terminal
+        // `agent:stream:end` + `agent:failed` below. Persist `status = error` +
+        // `stop_reason` FIRST — ahead of those emits — and stash the persisted
+        // context so the turn worker's `handle_terminal_turn_failure` reuses it
+        // (recording the identical-failure streak and writing the Error status
+        // EXACTLY once, monorepo#840). Excluded and left to their existing
+        // handling: the pre-output transport failure (suppressed for a possible
+        // silent redrive) and the idle timeout (warn-and-continue; the worker
+        // owns the warn/terminal decision and its own persist). A benign
+        // provider-resolved cancel (JSON-RPC `-32800`, or a "cancelled"
+        // message) is NOT persisted as an Error — it is the expected outcome of
+        // a concurrent stop/cancel — classified here with the SAME predicate
+        // the worker's benign check uses so the two verdicts cannot drift. The
+        // wrapped text matches the ordinary error the final `map_err` returns
+        // below, so the persisted `stop_reason` is byte-identical to what the
+        // worker would have written.
+        if let Err(e) = &result {
+            if !pre_output_transport_failure && !prompt_idle_timeout {
+                let wrapped = Error::Internal(format!("session/prompt failed: {e}"));
+                if !crate::agent_manager::prompt_cancellation_error(&wrapped) {
+                    let persist = crate::agent_manager::persist_terminal_error_status_via_services(
+                        self,
+                        agent_id,
+                        workspace_id,
+                        &wrapped.to_string(),
+                    )
+                    .await;
+                    self.stash_pending_terminal_error(agent_id, persist);
+                }
+            }
+        }
         // Exactly ONE terminal stream:end — complete and error both map here
         // (§7), EXCEPT a pre-output transport failure (monorepo#764): the
         // worker either redrives the prompt (the redriven attempt emits the
@@ -1928,6 +2254,11 @@ impl Services {
             // the logical turn it closes, same contract as `agent:failed`.
             if let Some(tid) = turn_id {
                 end_data["turnId"] = json!(tid);
+            }
+            // Abnormal finish reason: same value tagged on the persisted
+            // assistant row above — omitted on normal endings, never `null`.
+            if let Some(reason) = &abnormal_finish_reason {
+                end_data["finishReason"] = reason.clone();
             }
             // Final live-preview values (same fields as the throttled
             // activity frames) so a client tracking the preview push-style
@@ -2093,13 +2424,18 @@ impl Services {
         let preview_text_blocks = text_block_strings(&blocks);
         // Persist the partial turn tagged as suspend-interrupted. Reuses the
         // shared interrupt-flush path so the persisted row carries the
-        // `interruptReason` metadata (and clears the live-turn slot).
+        // `interruptReason` metadata (and clears the live-turn slot — but only
+        // an UNPINNED one: this path flushes caller-held content, it does not
+        // own the agent's slot, and a pin there belongs to a concurrent
+        // teardown whose flush absorbs the resulting UNIQUE collision).
         let live = LiveTurn {
             message_id,
             blocks,
             final_text_block_open: false,
             last_activity_at: now_iso(),
             last_activity_emit: None,
+            flush_pending: false,
+            flush_failed: false,
         };
         let interrupted_message_id = self
             .flush_partial_turn_on_interruption(
@@ -2107,6 +2443,7 @@ impl Services {
                 live,
                 InterruptReason::SystemSuspend,
                 None,
+                false,
             )
             .await;
         // Capture the session's running status for restore-on-resume, serialized
@@ -2324,7 +2661,8 @@ impl Services {
         if message_persisted && questions_persisted {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
-        self.clear_live_turn(agent_id);
+        // Pin-respecting, same as the prompt-turn end above (monorepo#2110).
+        self.clear_unpinned_live_turn(agent_id);
         let mut end_data = json!({ "agentId": agent_id.0 });
         if message_persisted {
             end_data["messageId"] = json!(message_id);
@@ -2744,9 +3082,10 @@ impl Services {
                 // D6: accumulate tool_use/tool_result blocks into the transcript
                 // so they persist (and reach `agent.getConversation`). A dropped
                 // update (STAB-124: anonymous first sight) publishes no event.
-                let Some(block_index) = transcript.record_tool(&tc, registered.clone()) else {
+                let Some(recorded) = transcript.record_tool(&tc, registered.clone()) else {
                     return true;
                 };
+                let block_index = recorded.use_index;
                 // On a known toolCallId the transcript block is the
                 // authoritative MERGED state — publish its name/title/kind/
                 // input so a sparse (e.g. status-only) update doesn't wipe
@@ -2792,6 +3131,27 @@ impl Services {
                 });
                 if let Some(output) = tc.output {
                     data["output"] = output;
+                }
+                // §7.1 (monorepo#2029): carry the REAL ids of the blocks this
+                // update just materialized. The live `chat.subscribe` mapper
+                // used to predict them as `tool_use index + 1`, which collides
+                // with an interleaved text block or a parallel call's
+                // `tool_use` and clobbers it on every id-keyed client until
+                // the terminal reconcile heals it. Present only when the
+                // block exists (a `started`/output-less update materializes
+                // no result block, so both fields stay absent).
+                if let Some(rindex) = recorded.result_index {
+                    data["resultBlockIndex"] = json!(rindex);
+                    data["resultBlockId"] = json!(transcript.block_id(rindex));
+                }
+                if !recorded.proposal_indices.is_empty() {
+                    data["proposalBlockIds"] = Value::Array(
+                        recorded
+                            .proposal_indices
+                            .iter()
+                            .map(|&i| Value::String(transcript.block_id(i)))
+                            .collect(),
+                    );
                 }
                 // Carry the claimed canonical batch on the event so the live
                 // `chat.subscribe` delta path attaches the SAME blocks the

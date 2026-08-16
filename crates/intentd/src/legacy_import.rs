@@ -12,10 +12,17 @@
 //! imports them anyway (the recovery path for a wiped DB).
 //!
 //! Two entry points share this module:
-//! - [`maybe_import_on_first_boot`] — fired by `intentd serve` only when the
-//!   SQLite DB file did not exist before open AND no
-//!   [`LEGACY_IMPORT_MARKER_KEY`] setting is present. It never fails startup;
-//!   the marker is written only on successful completion.
+//! - The first-boot hook in `intentd serve`: [`decide_first_boot_import`]
+//!   makes the eligibility decision synchronously at startup (fresh DB or a
+//!   [`LEGACY_IMPORT_PENDING_MARKER_KEY`] left by an interrupted run, and no
+//!   [`LEGACY_IMPORT_MARKER_KEY`] completion marker), then
+//!   [`run_first_boot_import`] runs in a spawned background task so startup
+//!   never waits on it. It never fails the daemon; completion is best-effort —
+//!   the completion marker is written even when individual workspaces failed
+//!   (failures are logged and summarized under
+//!   [`LEGACY_IMPORT_FAILURES_KEY`], with `intentd import-legacy --force` as
+//!   the manual retry path) — and the pending marker persisted before the run
+//!   starts makes a killed import resume on the next boot.
 //! - `intentd import-legacy [--root <dir>] [--dry-run] [--force]`
 //!   (`cmd_import_legacy` in `main.rs`).
 //!
@@ -44,6 +51,13 @@
 //! `repos.known`, both write-only-when-absent (an existing non-empty setting
 //! is never clobbered) and `changeHistory` filtered to workspace ids that
 //! were imported or already exist in the DB.
+//!
+//! The run stays low-impact next to a live daemon: all blocking filesystem
+//! work (root/directory scans, manifest/note/comment/transcript reads, asset
+//! copies) runs on tokio's blocking pool via [`run_blocking`], never on the
+//! async runtime workers, and [`run`] yields to the scheduler between
+//! workspaces so concurrent RPC traffic is not starved. Store writes remain
+//! short per-workspace transactions.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -54,6 +68,7 @@ use intent_core::{
     CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId,
     NoteMetadata, NoteVisibility, TaskMetadata, Workspace,
 };
+use intent_services::{publish_workspace_created, EventBus};
 use intent_store::Store;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -61,6 +76,26 @@ use serde_json::{json, Map, Value};
 /// Settings-table marker written after a successful non-dry-run import so the
 /// first-boot hook never re-runs. Value: a JSON string RFC-3339 timestamp.
 pub const LEGACY_IMPORT_MARKER_KEY: &str = "import.legacyCompletedAt";
+
+/// Settings-table marker written when a first-boot import run begins and
+/// cleared by [`write_completion_marker`]. A boot that finds it (with no
+/// completion marker) resumes the interrupted import — even when the DB file
+/// already existed — relying on the importer's idempotency (rows already in
+/// the DB are skipped, daemon-managed manifests are skipped). Value: a JSON
+/// string RFC-3339 timestamp.
+pub const LEGACY_IMPORT_PENDING_MARKER_KEY: &str = "import.legacyStartedAt";
+
+/// Settings-table row holding a compact summary of the workspaces that failed
+/// to import in the most recent completed run (written by
+/// [`persist_failure_summary`]; cleared when a run finishes with no failures).
+/// Value: JSON `{"at", "total", "failures": [{"id", "dir", "reason"}, …]}`,
+/// capped at [`FAILURE_SUMMARY_CAP`] entries. The documented manual retry
+/// path is `intentd import-legacy --force`.
+pub const LEGACY_IMPORT_FAILURES_KEY: &str = "import.legacyFailures";
+
+/// Cap on the entries embedded in [`LEGACY_IMPORT_FAILURES_KEY`]; `total`
+/// always carries the uncapped count.
+const FAILURE_SUMMARY_CAP: usize = 50;
 
 /// Legacy-only `workspace.json` fields intentd does not model — dropped on
 /// import (the FE `WorkspaceSchema` extras written next to the §9.1 fields).
@@ -80,7 +115,7 @@ const MANAGED_BY_INTENTD: &str = "intentd";
 const MANAGED_SKIP_REASON: &str = "daemon-managed manifest";
 
 /// Inputs for one import run.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// Legacy roots to scan, in priority order (first occurrence of an id wins).
     pub roots: Vec<PathBuf>,
@@ -94,6 +129,24 @@ pub struct Options {
     /// Legacy Electron app-level dir holding `config.json` /
     /// `repo-registry.json`. `None` disables the app-level blob import.
     pub app_dir: Option<PathBuf>,
+    /// Event bus for `workspace:created` publishes on freshly inserted rows,
+    /// so live subscribers (FE clients, the `WatcherRegistry`) learn about
+    /// workspaces the importer writes directly through `Store`. `None`
+    /// (the CLI path, tests) disables event emission.
+    pub event_bus: Option<EventBus>,
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Options")
+            .field("roots", &self.roots)
+            .field("dry_run", &self.dry_run)
+            .field("force", &self.force)
+            .field("assets_root", &self.assets_root)
+            .field("app_dir", &self.app_dir)
+            .field("event_bus", &self.event_bus.is_some())
+            .finish()
+    }
 }
 
 /// Outcome for one candidate workspace directory.
@@ -225,6 +278,24 @@ pub struct WorkspaceReport {
     pub assets: AssetCounts,
 }
 
+impl WorkspaceReport {
+    fn new(id: impl Into<String>, dir: &Path, outcome: Outcome) -> Self {
+        Self {
+            id: id.into(),
+            dir: dir.to_path_buf(),
+            outcome,
+            notes: NoteCounts::default(),
+            comments: CommentCounts::default(),
+            agents: AgentCounts::default(),
+            assets: AssetCounts::default(),
+        }
+    }
+
+    fn skipped(id: impl Into<String>, dir: &Path, reason: impl Into<String>) -> Self {
+        Self::new(id, dir, Outcome::Skipped(reason.into()))
+    }
+}
+
 /// Full report of one run: one entry per candidate workspace directory, plus
 /// the once-per-run app-level blob outcome (`None` when no app dir was
 /// configured or the run was a dry-run).
@@ -248,7 +319,10 @@ impl Report {
         self.count(|o| matches!(o, Outcome::Skipped(_)))
     }
 
-    /// Whether any non-operational workspace skip should block the completion marker.
+    /// Whether any non-operational workspace skip occurred. The CLI and RPC
+    /// entry points withhold their completion-marker rewrite on these; the
+    /// first-boot hook writes its marker regardless (best-effort) and
+    /// persists the failure summary instead.
     pub fn has_compatibility_failures(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(
@@ -256,6 +330,23 @@ impl Report {
                 Outcome::Skipped(reason) if !is_operational_skip(reason)
             )
         })
+    }
+
+    /// Entries whose skip represents an import failure (data did not land),
+    /// as opposed to a benign/expected skip — the set logged and persisted to
+    /// [`LEGACY_IMPORT_FAILURES_KEY`] by the first-boot hook. Unlike
+    /// [`Report::has_compatibility_failures`], store-write failures count:
+    /// the summary reports everything a manual retry could recover.
+    pub fn failures(&self) -> Vec<(&WorkspaceReport, &str)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.outcome {
+                Outcome::Skipped(reason) if !is_benign_skip(reason) => {
+                    Some((entry, reason.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Total note rows inserted across all workspaces.
@@ -294,15 +385,7 @@ impl Report {
     }
 
     fn skip(&mut self, id: impl Into<String>, dir: &Path, reason: impl Into<String>) {
-        self.entries.push(WorkspaceReport {
-            id: id.into(),
-            dir: dir.to_path_buf(),
-            outcome: Outcome::Skipped(reason.into()),
-            notes: NoteCounts::default(),
-            comments: CommentCounts::default(),
-            agents: AgentCounts::default(),
-            assets: AssetCounts::default(),
-        });
+        self.entries.push(WorkspaceReport::skipped(id, dir, reason));
     }
 }
 
@@ -312,6 +395,18 @@ fn is_operational_skip(reason: &str) -> bool {
         || reason.starts_with("update failed:")
         || reason.starts_with("insert failed:")
         || reason.starts_with("lookup failed:")
+}
+
+/// Skips that are an expected part of normal operation — nothing failed and a
+/// retry would change nothing — and therefore stay out of the persisted
+/// failure summary. Narrower than [`is_operational_skip`]: store-write
+/// failures are operational (they never block the CLI/RPC completion-marker
+/// rewrite) but still belong in the failure summary.
+fn is_benign_skip(reason: &str) -> bool {
+    reason == "already in DB"
+        || reason == MANAGED_SKIP_REASON
+        || reason == "duplicate id already found under an earlier root"
+        || reason == "virtual workspace id"
 }
 
 impl fmt::Display for Report {
@@ -467,35 +562,111 @@ pub fn default_app_dir() -> Option<PathBuf> {
     Some(base.config_dir().join("intent"))
 }
 
+/// E2E test seam: while the file named by this env var exists, [`run`] pauses
+/// before importing each workspace. Lets the in-flight responsiveness e2e
+/// (`tests/uds_legacy_import.rs`) hold the first-boot import mid-run
+/// deterministically while it drives RPCs over the live socket, then release
+/// it by deleting the file. Unset (the normal case) is a no-op.
+const TEST_IMPORT_HOLD_FILE_ENV: &str = "INTENTD_TEST_LEGACY_IMPORT_HOLD_FILE";
+
 /// Scan `opts.roots` in order and import every legacy workspace found. Missing
 /// or unreadable roots are skipped silently (the default roots may simply not
 /// exist); per-workspace problems are soft and reported as [`Outcome::Skipped`].
-/// The run is read-only toward the source directories. App-level blobs import
-/// once at the end (non-dry-run only, when `opts.app_dir` is set).
+/// Each workspace imports inside its own spawned task, so parse/IO/store
+/// errors AND panics in one workspace's unit become a logged skip and the run
+/// continues with the next workspace. The run is read-only toward the source
+/// directories. App-level blobs import once at the end (non-dry-run only,
+/// when `opts.app_dir` is set).
 pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
     let mut report = Report {
         dry_run: opts.dry_run,
         ..Report::default()
     };
+    let test_hold_file: Option<PathBuf> = std::env::var_os(TEST_IMPORT_HOLD_FILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
     let mut seen: HashSet<String> = HashSet::new();
     for root in &opts.roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
+        // Candidate discovery (directory scan + manifest stat) is blocking
+        // filesystem work — run it off the async runtime.
+        let candidates: Vec<(PathBuf, PathBuf)> = {
+            let root = root.clone();
+            run_blocking(move || {
+                let Ok(entries) = std::fs::read_dir(&root) else {
+                    return Vec::new();
+                };
+                // `DirEntry::file_type()` does not follow symlinks, so a
+                // symlinked directory pointing outside the legacy root is
+                // never a candidate.
+                let mut dirs: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .collect();
+                dirs.sort();
+                dirs.into_iter()
+                    .filter_map(|dir| {
+                        let manifest = dir.join(".workspace").join("workspace.json");
+                        is_regular_file(&manifest).then_some((dir, manifest))
+                    })
+                    .collect()
+            })
+            .await
         };
-        // `DirEntry::file_type()` does not follow symlinks, so a symlinked
-        // directory pointing outside the legacy root is never a candidate.
-        let mut dirs: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .map(|e| e.path())
-            .collect();
-        dirs.sort();
-        for dir in dirs {
-            let manifest = dir.join(".workspace").join("workspace.json");
-            if !is_regular_file(&manifest) {
-                continue;
+        for (dir, manifest) in candidates {
+            // Test seam (see [`TEST_IMPORT_HOLD_FILE_ENV`]): pause here while
+            // the hold file exists, keeping the run in flight without
+            // importing further workspaces.
+            if let Some(hold) = &test_hold_file {
+                while hold.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
             }
-            import_one(store, &dir, &manifest, opts, &mut seen, &mut report).await;
+            // Task-join isolation: the whole per-workspace unit (manifest
+            // handling, store writes, extras) runs in its own spawned task,
+            // so even a panic is contained — it surfaces as a `JoinError`
+            // and becomes a skip entry instead of aborting the run.
+            let task = {
+                let store = store.clone();
+                let opts = opts.clone();
+                let seen = seen.clone();
+                let dir = dir.clone();
+                let manifest = manifest.clone();
+                tokio::spawn(async move { import_one(&store, &dir, &manifest, &opts, &seen).await })
+            };
+            match task.await {
+                Ok((claimed, entry)) => {
+                    if let Some(id) = claimed {
+                        seen.insert(id);
+                    }
+                    report.entries.push(entry);
+                }
+                // A panicked unit never returns `claimed`, so its id is not
+                // recorded as seen — a same-id dir under a later root gets a
+                // fresh attempt instead of a duplicate skip (harmless: the
+                // importer is idempotent, so it is effectively a free retry).
+                Err(e) => {
+                    let dir_id = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let reason = if e.is_panic() {
+                        format!("import panicked: {}", panic_message(e.into_panic()))
+                    } else {
+                        "import task cancelled".to_string()
+                    };
+                    tracing::warn!(
+                        id = %dir_id,
+                        dir = %dir.display(),
+                        %reason,
+                        "legacy workspace import failed; continuing with the next workspace"
+                    );
+                    report.skip(dir_id, &dir, reason);
+                }
+            }
+            // Yield between workspaces so a long import run never starves
+            // live RPC traffic sharing the runtime.
+            tokio::task::yield_now().await;
         }
     }
     if !opts.dry_run {
@@ -512,6 +683,18 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
     Ok(report)
 }
 
+/// Best-effort human-readable panic payload (`panic!` carries `&str` or
+/// `String` in practice).
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// True when `path` is a regular file WITHOUT following symlinks
 /// (`symlink_metadata`). The per-workspace importers use this instead of
 /// `Path::is_file()` so a hostile symlink under `.workspace/` can never pull
@@ -519,6 +702,46 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
 /// root.
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Run a blocking closure on tokio's blocking pool so filesystem work never
+/// occupies an async runtime worker. Panics are re-raised on the awaiting
+/// task, so the per-workspace task-join isolation in [`run`] still turns
+/// them into logged skips.
+async fn run_blocking<T, F>(f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("blocking import task cancelled: {e}"),
+    }
+}
+
+/// `std::fs::read_to_string` off the async runtime.
+async fn read_file_blocking(path: PathBuf) -> std::io::Result<String> {
+    run_blocking(move || std::fs::read_to_string(&path)).await
+}
+
+/// Scan `dir` off the async runtime and return its sorted entries that pass
+/// `keep`. `None` when the directory cannot be read (a missing dir is a soft
+/// no-op for every importer).
+async fn scan_dir_blocking<F>(dir: PathBuf, keep: F) -> Option<Vec<PathBuf>>
+where
+    F: Fn(&Path) -> bool + Send + 'static,
+{
+    run_blocking(move || {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| keep(p))
+            .collect();
+        files.sort();
+        Some(files)
+    })
+    .await
 }
 
 /// True when `id` is exactly one normal path component: no `/` or `\`
@@ -537,39 +760,65 @@ fn id_is_single_path_component(id: &str) -> bool {
     )
 }
 
-/// Import one candidate workspace directory, appending its outcome to `report`.
+/// Test-only injected panic — lets tests prove the task-join isolation in
+/// [`run`] turns a panicking per-workspace unit into a logged skip.
+#[cfg(test)]
+fn maybe_injected_test_panic(obj: &Map<String, Value>) {
+    if obj.contains_key("__testPanic") {
+        panic!("injected test panic");
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_injected_test_panic(_obj: &Map<String, Value>) {}
+
+/// Import one candidate workspace directory, returning the id to record as
+/// seen (`Some` once the manifest id passed the duplicate check — later
+/// roots then report duplicates instead of re-importing) plus the report
+/// entry. Runs inside its own spawned task (see [`run`]) so a panic anywhere
+/// in here is contained to this workspace.
 async fn import_one(
     store: &Store,
     dir: &Path,
     manifest: &Path,
     opts: &Options,
-    seen: &mut HashSet<String>,
-    report: &mut Report,
-) {
+    seen: &HashSet<String>,
+) -> (Option<String>, WorkspaceReport) {
     // The legacy layout names the workspace dir after its id; used as the
     // report id when the manifest is unusable.
     let dir_id = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let text = match std::fs::read_to_string(manifest) {
+    let text = match read_file_blocking(manifest.to_path_buf()).await {
         Ok(t) => t,
         Err(e) => {
-            report.skip(dir_id, dir, format!("cannot read workspace.json: {e}"));
-            return;
+            return (
+                None,
+                WorkspaceReport::skipped(dir_id, dir, format!("cannot read workspace.json: {e}")),
+            );
         }
     };
     let mut obj = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(o)) => o,
         Ok(_) => {
-            report.skip(dir_id, dir, "workspace.json is not a JSON object");
-            return;
+            return (
+                None,
+                WorkspaceReport::skipped(dir_id, dir, "workspace.json is not a JSON object"),
+            );
         }
         Err(e) => {
-            report.skip(dir_id, dir, format!("invalid JSON in workspace.json: {e}"));
-            return;
+            return (
+                None,
+                WorkspaceReport::skipped(
+                    dir_id,
+                    dir,
+                    format!("invalid JSON in workspace.json: {e}"),
+                ),
+            );
         }
     };
+    maybe_injected_test_panic(&obj);
     // Prefer the manifest id; fall back to the directory name.
     let id = match obj.get("id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -578,13 +827,17 @@ async fn import_one(
             dir_id.clone()
         }
         _ => {
-            report.skip(dir_id, dir, "workspace.json has no id");
-            return;
+            return (
+                None,
+                WorkspaceReport::skipped(dir_id, dir, "workspace.json has no id"),
+            );
         }
     };
     if id == intent_core::CHIEF_WORKSPACE_ID {
-        report.skip(id, dir, "virtual workspace id");
-        return;
+        return (
+            None,
+            WorkspaceReport::skipped(id, dir, "virtual workspace id"),
+        );
     }
     // Reject ids that are not a single normal path component: the id is used
     // verbatim as a DB key, in `workspace-asset://<wsId>/<assetId>` URLs
@@ -592,27 +845,34 @@ async fn import_one(
     // `../…`/absolute/multi-segment id could otherwise write outside
     // `<data_dir>/assets/`.
     if !id_is_single_path_component(&id) {
-        report.skip(id, dir, "workspace id is not a plain path segment");
-        return;
+        return (
+            None,
+            WorkspaceReport::skipped(id, dir, "workspace id is not a plain path segment"),
+        );
     }
-    if !seen.insert(id.clone()) {
-        report.skip(id, dir, "duplicate id already found under an earlier root");
-        return;
+    if seen.contains(&id) {
+        return (
+            None,
+            WorkspaceReport::skipped(id, dir, "duplicate id already found under an earlier root"),
+        );
     }
+    // Past the duplicate check the id counts as seen regardless of outcome.
+    let claimed = Some(id.clone());
     // Manifests intentd wrote itself (`workspace.create` / `.duplicate`) mark
     // live daemon-managed workspaces — a fresh daemon sharing the workspaces
     // root must never adopt them. `--force` remains the wiped-DB recovery path.
     if !opts.force && obj.get(MANAGED_BY_FIELD).and_then(Value::as_str) == Some(MANAGED_BY_INTENTD)
     {
-        report.skip(id, dir, MANAGED_SKIP_REASON);
-        return;
+        return (
+            claimed,
+            WorkspaceReport::skipped(id, dir, MANAGED_SKIP_REASON),
+        );
     }
-    let ws = match workspace_from_legacy_json(obj) {
+    // `workspace_from_legacy_json` stats the recorded worktree path — run it
+    // off the runtime with the rest of the filesystem work.
+    let ws = match run_blocking(move || workspace_from_legacy_json(obj)).await {
         Ok(ws) => ws,
-        Err(reason) => {
-            report.skip(id, dir, reason);
-            return;
-        }
+        Err(reason) => return (claimed, WorkspaceReport::skipped(id, dir, reason)),
     };
     let outcome = match store.get_workspace(&ws.id).await {
         Ok(_) if !opts.force => Outcome::Skipped("already in DB".to_string()),
@@ -639,19 +899,20 @@ async fn import_one(
         Err(e) => Outcome::Skipped(format!("lookup failed: {e}")),
     };
     let landed = matches!(outcome, Outcome::Imported | Outcome::Updated);
-    let mut entry = WorkspaceReport {
-        id,
-        dir: dir.to_path_buf(),
-        outcome,
-        notes: NoteCounts::default(),
-        comments: CommentCounts::default(),
-        agents: AgentCounts::default(),
-        assets: AssetCounts::default(),
-    };
+    // A freshly inserted row (not a `--force` overwrite of an existing one)
+    // is a new workspace as far as live subscribers are concerned: publish
+    // `workspace:created` so connected clients refresh their lists and the
+    // `WatcherRegistry` registers the workspace's watch roots at runtime.
+    if matches!(outcome, Outcome::Imported) && !opts.dry_run {
+        if let Some(bus) = &opts.event_bus {
+            publish_workspace_created(bus, &ws).await;
+        }
+    }
+    let mut entry = WorkspaceReport::new(id, dir, outcome);
     if landed && !opts.dry_run {
         import_workspace_extras(store, &ws, dir, opts.assets_root.as_deref(), &mut entry).await;
     }
-    report.entries.push(entry);
+    (claimed, entry)
 }
 
 /// Extension seam for the per-workspace importers: called once per
@@ -670,7 +931,12 @@ async fn import_workspace_extras(
     entry.comments = import_workspace_comments(store, workspace, legacy_dir).await;
     entry.agents = import_workspace_agents(store, workspace, legacy_dir).await;
     if let Some(root) = assets_root {
-        entry.assets = import_workspace_assets(workspace, legacy_dir, root);
+        // Pure filesystem work (scan + copy) — run the whole copy off the
+        // async runtime.
+        let ws = workspace.clone();
+        let dir = legacy_dir.to_path_buf();
+        let root = root.to_path_buf();
+        entry.assets = run_blocking(move || import_workspace_assets(&ws, &dir, &root)).await;
     }
 }
 
@@ -739,26 +1005,23 @@ async fn import_workspace_notes(
 ) -> NoteCounts {
     let mut counts = NoteCounts::default();
     let notes_dir = legacy_dir.join(".workspace").join("notes");
-    let Ok(entries) = std::fs::read_dir(&notes_dir) else {
+    let Some(files) = scan_dir_blocking(notes_dir, |p: &Path| {
+        is_regular_file(p)
+            && p.extension().is_some_and(|ext| ext == "md")
+            && !p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+    })
+    .await
+    else {
         return counts; // no notes dir — nothing to import
     };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            is_regular_file(p)
-                && p.extension().is_some_and(|ext| ext == "md")
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        })
-        .collect();
-    files.sort();
     for path in files {
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = match std::fs::read_to_string(&path) {
+        let text = match read_file_blocking(path.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "legacy note unreadable; skipping");
@@ -901,18 +1164,15 @@ async fn import_workspace_comments(
 ) -> CommentCounts {
     let mut counts = CommentCounts::default();
     let meta_dir = legacy_dir.join(".workspace").join("notes").join(".meta");
-    let Ok(entries) = std::fs::read_dir(&meta_dir) else {
+    let Some(files) = scan_dir_blocking(meta_dir, |p: &Path| {
+        is_regular_file(p)
+            && p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(LEGACY_COMMENTS_SUFFIX))
+    })
+    .await
+    else {
         return counts; // no .meta dir — nothing to import
     };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            is_regular_file(p)
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().ends_with(LEGACY_COMMENTS_SUFFIX))
-        })
-        .collect();
-    files.sort();
     for path in files {
         let name = path
             .file_name()
@@ -932,7 +1192,7 @@ async fn import_workspace_comments(
                 continue;
             }
         }
-        let text = match std::fs::read_to_string(&path) {
+        let text = match read_file_blocking(path.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "legacy comments file unreadable; skipping");
@@ -1166,22 +1426,19 @@ async fn import_workspace_agents(
 ) -> AgentCounts {
     let mut counts = AgentCounts::default();
     let agents_dir = legacy_dir.join(".workspace").join("agents");
-    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
-        return counts; // no agents dir — nothing to import
-    };
     // Sidecar artifacts (`*.json.checksum`, `*.json.corrupted.{ts}`, backups,
     // `.health-check`) fail the extension/dotfile filter and are ignored.
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            is_regular_file(p)
-                && p.extension().is_some_and(|ext| ext == "json")
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        })
-        .collect();
-    files.sort();
+    let Some(files) = scan_dir_blocking(agents_dir, |p: &Path| {
+        is_regular_file(p)
+            && p.extension().is_some_and(|ext| ext == "json")
+            && !p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+    })
+    .await
+    else {
+        return counts; // no agents dir — nothing to import
+    };
     if files.is_empty() {
         return counts;
     }
@@ -1214,7 +1471,7 @@ async fn import_workspace_agents(
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let text = match std::fs::read_to_string(&path) {
+        let text = match read_file_blocking(path.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "legacy agent file unreadable; skipping");
@@ -1423,6 +1680,13 @@ fn session_from_legacy_json(
     metadata.insert("legacyImport".to_string(), Value::Object(legacy_import));
 
     let session = AgentSession {
+        // Imported sessions predate harness stamping, so they get the same
+        // backfill values migration 0096 gives pre-existing rows: literal
+        // "1.0" (NOT the current constant — a future bump must not relabel
+        // legacy imports) and a NULL features snapshot (projections overlay
+        // current settings on read).
+        harness_version: "1.0".to_string(),
+        harness_features: None,
         id,
         workspace_id: workspace.id.clone(),
         parent_agent_id,
@@ -1451,6 +1715,7 @@ fn session_from_legacy_json(
         initial_message,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
@@ -1459,6 +1724,7 @@ fn session_from_legacy_json(
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
         created_at,
         updated_at,
     };
@@ -1633,17 +1899,24 @@ fn setting_is_empty(raw: Option<&str>) -> bool {
 /// Read `<dir>/<name>` as a JSON object, distinguishing "file absent" (`None`,
 /// silently fine — the legacy store may simply never have been created) from
 /// "present but unreadable/malformed" (`Err`, counted as a failure).
-fn read_json_object(dir: &Path, name: &str) -> Result<Option<Map<String, Value>>, String> {
+async fn read_json_object(
+    dir: &Path,
+    name: &'static str,
+) -> Result<Option<Map<String, Value>>, String> {
     let path = dir.join(name);
-    if !is_regular_file(&path) {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {name}: {e}"))?;
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(o)) => Ok(Some(o)),
-        Ok(_) => Err(format!("{name} is not a JSON object")),
-        Err(e) => Err(format!("invalid JSON in {name}: {e}")),
-    }
+    run_blocking(move || {
+        if !is_regular_file(&path) {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {name}: {e}"))?;
+        match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(o)) => Ok(Some(o)),
+            Ok(_) => Err(format!("{name} is not a JSON object")),
+            Err(e) => Err(format!("invalid JSON in {name}: {e}")),
+        }
+    })
+    .await
 }
 
 /// Import the app-level electron-store blobs once per run:
@@ -1662,7 +1935,7 @@ async fn import_app_settings(
     let mut counts = AppSettingCounts::default();
 
     // repos.known ← repo-registry.json `knownRepos`
-    match read_json_object(app_dir, "repo-registry.json") {
+    match read_json_object(app_dir, "repo-registry.json").await {
         Ok(Some(obj)) => {
             if let Some(Value::Array(repos)) = obj.get("knownRepos") {
                 if !repos.is_empty() {
@@ -1696,7 +1969,7 @@ async fn import_app_settings(
     }
 
     // workspace.changeHistory ← config.json `changeHistory`
-    match read_json_object(app_dir, "config.json") {
+    match read_json_object(app_dir, "config.json").await {
         Ok(Some(obj)) => {
             if let Some(Value::Object(history)) = obj.get("changeHistory") {
                 if !history.is_empty() {
@@ -1751,54 +2024,157 @@ async fn import_app_settings(
 }
 
 /// Write the [`LEGACY_IMPORT_MARKER_KEY`] settings row (a JSON string
-/// timestamp) recording that a full import completed successfully.
+/// timestamp) recording that a full import completed successfully, and clear
+/// any [`LEGACY_IMPORT_PENDING_MARKER_KEY`] left by a first-boot run.
+/// Pending-marker cleanup is best-effort: the first-boot gating checks the
+/// completion marker first, so a stale pending marker is harmless.
 pub async fn write_completion_marker(store: &Store) -> anyhow::Result<()> {
     store
         .set_setting(LEGACY_IMPORT_MARKER_KEY, &json!(now_iso()).to_string())
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if let Err(e) = store.delete_setting(LEGACY_IMPORT_PENDING_MARKER_KEY).await {
+        tracing::warn!(error = %e, "legacy import pending marker cleanup failed");
+    }
+    Ok(())
 }
 
-/// First-boot hook for `intentd serve`: run the import only when the DB file
-/// did not exist before `Store::open` AND no completion marker is set. Runs
-/// after migrations (inside `Store::open`) and before any transport serves
-/// RPCs. Never fails startup — every failure is logged and swallowed; the
-/// marker is written only when the run completes without manifest compatibility
-/// failures.
+/// Persist a compact summary of `report`'s failures (see
+/// [`Report::failures`]) under [`LEGACY_IMPORT_FAILURES_KEY`] — or clear the
+/// row when the run had none, so a clean re-run (e.g. `intentd import-legacy
+/// --force`) erases stale failure records. Best-effort: a settings write
+/// failure is logged and swallowed.
+pub async fn persist_failure_summary(store: &Store, report: &Report) {
+    let failures = report.failures();
+    if failures.is_empty() {
+        if let Err(e) = store.delete_setting(LEGACY_IMPORT_FAILURES_KEY).await {
+            tracing::warn!(error = %e, "legacy import failure summary cleanup failed");
+        }
+        return;
+    }
+    let entries: Vec<Value> = failures
+        .iter()
+        .take(FAILURE_SUMMARY_CAP)
+        .map(|(entry, reason)| {
+            json!({
+                "id": entry.id,
+                "dir": entry.dir.display().to_string(),
+                "reason": reason,
+            })
+        })
+        .collect();
+    let summary = json!({
+        "at": now_iso(),
+        "total": failures.len(),
+        "failures": entries,
+    });
+    if let Err(e) = store
+        .set_setting(LEGACY_IMPORT_FAILURES_KEY, &summary.to_string())
+        .await
+    {
+        tracing::warn!(error = %e, "legacy import failure summary write failed");
+    }
+}
+
+/// Outcome of [`decide_first_boot_import`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstBootDecision {
+    /// Fresh DB with no markers: import (the pending marker was just written).
+    Start,
+    /// A pending marker from an interrupted run: resume the import.
+    Resume,
+    /// Nothing to do (completion marker present, pre-existing DB with no
+    /// pending marker, empty roots, or a marker read failed).
+    Skip,
+}
+
+/// Synchronous first-boot eligibility decision for `intentd serve`, made at
+/// startup before any transport comes up. Cheap (two settings reads); the
+/// import itself is [`run_first_boot_import`], which the caller runs in a
+/// spawned background task so startup never waits on it.
 ///
-/// Empty `roots` (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the hermetic test
-/// harness) disables the hook entirely: it returns before reading the marker
-/// or touching the app-level dir, and writes nothing.
-///
-/// Note on startup cost: this runs to completion inline (blocking `std::fs`
-/// on the async runtime) before any transport serves, so a very large legacy
-/// tree delays first boot proportionally. Accepted tradeoff for a one-time
-/// first-boot migration — it can never fail startup, only slow the very
-/// first one.
-pub async fn maybe_import_on_first_boot(
+/// Rules, in order:
+/// - Empty `roots` (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the hermetic
+///   test harness) disable the hook entirely — nothing is read or written.
+/// - A completion marker means a prior run finished: skip.
+/// - A pending marker means a prior run was interrupted (crash, kill,
+///   shutdown abort): resume, even when the DB file pre-existed this boot.
+/// - Otherwise import only on a truly fresh DB, persisting the pending
+///   marker BEFORE the run starts so a kill at any point resumes on the next
+///   boot. A failed pending-marker write is logged and the import still runs
+///   (only resumability is lost).
+pub async fn decide_first_boot_import(
     store: &Store,
     db_existed: bool,
-    roots: Vec<PathBuf>,
-    assets_root: Option<PathBuf>,
-    app_dir: Option<PathBuf>,
-) {
-    if db_existed || roots.is_empty() {
-        return;
+    roots: &[PathBuf],
+) -> FirstBootDecision {
+    if roots.is_empty() {
+        return FirstBootDecision::Skip;
     }
     match store.get_setting(LEGACY_IMPORT_MARKER_KEY).await {
         Ok(None) => {}
-        Ok(Some(_)) => return,
+        Ok(Some(_)) => return FirstBootDecision::Skip,
         Err(e) => {
             tracing::warn!(error = %e, "legacy import marker read failed; skipping import");
-            return;
+            return FirstBootDecision::Skip;
         }
     }
+    match store.get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY).await {
+        Ok(Some(_)) => return FirstBootDecision::Resume,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "legacy import pending marker read failed; skipping import");
+            return FirstBootDecision::Skip;
+        }
+    }
+    if db_existed {
+        return FirstBootDecision::Skip;
+    }
+    if let Err(e) = store
+        .set_setting(
+            LEGACY_IMPORT_PENDING_MARKER_KEY,
+            &json!(now_iso()).to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "legacy import pending marker write failed; import will not resume if interrupted");
+    }
+    FirstBootDecision::Start
+}
+
+/// First-boot import body for `intentd serve` — the background half of the
+/// hook gated by [`decide_first_boot_import`]. Runs in a spawned task
+/// concurrently with the transports coming up, so a large legacy tree never
+/// delays startup; an interrupt at any point (crash, kill, shutdown abort)
+/// leaves the pending marker in place and the next boot resumes (idempotent:
+/// rows already in the DB are skipped). Never fails the daemon — every
+/// failure is logged and swallowed. Completion is best-effort: once the run
+/// itself completes, the completion marker is written (and the pending
+/// marker cleared) even when individual workspaces failed — a single bad
+/// workspace must never wedge the hook into a permanent boot-time retry
+/// loop. Failed entries are logged with reasons and summarized under
+/// [`LEGACY_IMPORT_FAILURES_KEY`]; `intentd import-legacy --force` is the
+/// documented manual retry path. Only a run-level error (the scan itself
+/// failed) withholds the marker so the next boot retries.
+pub async fn run_first_boot_import(
+    store: &Store,
+    roots: Vec<PathBuf>,
+    assets_root: Option<PathBuf>,
+    app_dir: Option<PathBuf>,
+    event_bus: Option<EventBus>,
+    resumed: bool,
+) {
+    tracing::info!(
+        resumed,
+        "first-boot legacy workspace import starting in the background"
+    );
     let opts = Options {
         roots,
         dry_run: false,
         force: false,
         assets_root,
         app_dir,
+        event_bus,
     };
     match run(store, &opts).await {
         Ok(report) => {
@@ -1815,16 +2191,57 @@ pub async fn maybe_import_on_first_boot(
             for entry in &report.entries {
                 tracing::info!(id = %entry.id, outcome = ?entry.outcome, "legacy workspace");
             }
-            if report.has_compatibility_failures() {
+            let failures = report.failures();
+            if !failures.is_empty() {
+                for (entry, reason) in &failures {
+                    tracing::warn!(
+                        id = %entry.id,
+                        dir = %entry.dir.display(),
+                        %reason,
+                        "legacy workspace failed to import"
+                    );
+                }
                 tracing::warn!(
-                    "first-boot legacy workspace import had compatibility failures; completion marker not written"
+                    failed = failures.len(),
+                    "first-boot legacy workspace import completed with failures; completion marker written anyway (best-effort) — retry manually with `intentd import-legacy --force`"
                 );
-            } else if let Err(e) = write_completion_marker(store).await {
+            }
+            persist_failure_summary(store, &report).await;
+            if let Err(e) = write_completion_marker(store).await {
                 tracing::warn!(error = %e, "legacy import marker write failed");
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "first-boot legacy workspace import failed; daemon continues");
+            tracing::warn!(error = %e, "first-boot legacy workspace import failed; daemon continues (the next boot retries)");
+        }
+    }
+}
+
+/// Convenience composition of [`decide_first_boot_import`] +
+/// [`run_first_boot_import`], awaiting the import inline. Used by tests;
+/// `intentd serve` calls the two halves separately so the decision is
+/// synchronous at startup while the import runs in a spawned background
+/// task.
+#[cfg(test)]
+pub async fn maybe_import_on_first_boot(
+    store: &Store,
+    db_existed: bool,
+    roots: Vec<PathBuf>,
+    assets_root: Option<PathBuf>,
+    app_dir: Option<PathBuf>,
+) {
+    match decide_first_boot_import(store, db_existed, &roots).await {
+        FirstBootDecision::Skip => {}
+        decision => {
+            run_first_boot_import(
+                store,
+                roots,
+                assets_root,
+                app_dir,
+                None,
+                decision == FirstBootDecision::Resume,
+            )
+            .await
         }
     }
 }
@@ -1962,6 +2379,48 @@ mod tests {
             .await
             .unwrap();
         assert!(b.archived);
+    }
+
+    /// `workspace:created` is published once per freshly inserted row (and
+    /// only then: a re-run that skips existing rows publishes nothing).
+    #[tokio::test]
+    async fn publishes_workspace_created_only_for_fresh_inserts() {
+        let (root, _root_g) = temp_root("created-events");
+        write_legacy_workspace(&root, "ws-evt", json!({}));
+        let (store, _db_g) = open_store().await;
+        let bus = EventBus::new(store.clone());
+        let mut sub = bus.subscribe(intent_services::SubscriptionFilter {
+            event_types: vec!["workspace:created".to_string()],
+            ..Default::default()
+        });
+        let mut options = opts(vec![root.clone()]);
+        options.event_bus = Some(bus.clone());
+
+        let report = run(&store, &options).await.unwrap();
+        assert_eq!(report.imported(), 1, "{report}");
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("workspace:created not published")
+            .expect("subscription closed");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].event_type, "workspace:created");
+        assert_eq!(batch[0].workspace_id.as_str(), "ws-evt");
+        assert_eq!(batch[0].data["workspaceId"], "ws-evt");
+        assert!(
+            batch[0].data["workspace"].is_object(),
+            "{:?}",
+            batch[0].data
+        );
+
+        // Idempotent re-run: the row exists, so no second event.
+        let second = run(&store, &options).await.unwrap();
+        assert_eq!(second.skipped(), 1, "{second}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), sub.recv())
+                .await
+                .is_err(),
+            "skip must not publish workspace:created"
+        );
     }
 
     #[tokio::test]
@@ -2179,7 +2638,8 @@ mod tests {
         write_legacy_workspace(&root, "ws-boot", json!({}));
         let (store, _db_g) = open_store().await;
 
-        // Fresh DB, no marker → import runs and the marker is written.
+        // Fresh DB, no marker → import runs and the completion marker is
+        // written; the pending marker written at start is cleared.
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
         let marker = store.get_setting(LEGACY_IMPORT_MARKER_KEY).await.unwrap();
@@ -2187,6 +2647,11 @@ mod tests {
             marker.is_some_and(|m| m.starts_with('"')),
             "JSON string marker"
         );
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
 
         // Marker present → the hook is a no-op even on a "fresh" DB signal.
         write_legacy_workspace(&root, "ws-later", json!({}));
@@ -2194,8 +2659,13 @@ mod tests {
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
     }
 
+    /// Best-effort completion: a workspace whose manifest fails to parse
+    /// does not withhold the marker — the good workspace lands, the failure
+    /// is summarized under [`LEGACY_IMPORT_FAILURES_KEY`], and the pending
+    /// marker is cleared so the hook never wedges into a boot-time retry
+    /// loop.
     #[tokio::test]
-    async fn first_boot_hook_does_not_write_marker_after_parse_failure() {
+    async fn first_boot_hook_writes_marker_despite_parse_failure() {
         let (root, _root_g) = temp_root("boot-parse-failure");
         write_legacy_workspace(&root, "ws-good", json!({}));
         write_legacy_workspace(&root, "ws-bad", json!({"setupScript": 42}));
@@ -2206,6 +2676,155 @@ mod tests {
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
         assert!(store
             .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        // The failure summary names the bad workspace with its reason.
+        let summary: Value = serde_json::from_str(
+            &store
+                .get_setting(LEGACY_IMPORT_FAILURES_KEY)
+                .await
+                .unwrap()
+                .expect("failure summary persisted"),
+        )
+        .unwrap();
+        assert_eq!(summary["total"], 1, "{summary}");
+        assert!(summary["at"].is_string(), "{summary}");
+        let failures = summary["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{summary}");
+        assert_eq!(failures[0]["id"], "ws-bad", "{summary}");
+        assert!(
+            failures[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("setupScript")
+                || !failures[0]["reason"].as_str().unwrap().is_empty(),
+            "{summary}"
+        );
+
+        // Marker present → later boots are a no-op (no retry loop).
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
+    }
+
+    /// Task-join isolation: a workspace whose import panics becomes a logged
+    /// skip; later workspaces still import and the first-boot marker is
+    /// still written.
+    #[tokio::test]
+    async fn panicking_workspace_does_not_abort_the_run() {
+        let (root, _root_g) = temp_root("panic-isolation");
+        write_legacy_workspace(&root, "ws-a-panics", json!({"__testPanic": true}));
+        write_legacy_workspace(&root, "ws-b-good", json!({}));
+        let (store, _db_g) = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        assert_eq!(report.imported(), 1, "{report}");
+        assert_eq!(report.skipped(), 1, "{report}");
+        assert!(report.entries.iter().any(|entry| {
+            entry.id == "ws-a-panics"
+                && matches!(&entry.outcome, Outcome::Skipped(reason) if reason.contains("import panicked"))
+        }), "{report}");
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.id == "ws-b-good" && entry.outcome == Outcome::Imported));
+        assert!(store
+            .get_workspace(&WorkspaceId::from("ws-b-good"))
+            .await
+            .is_ok());
+    }
+
+    /// The first-boot hook completes despite a panicking workspace: the
+    /// marker is written and the panic lands in the failure summary.
+    #[tokio::test]
+    async fn first_boot_hook_survives_panicking_workspace_and_writes_marker() {
+        let (root, _root_g) = temp_root("boot-panic");
+        write_legacy_workspace(&root, "ws-panics", json!({"__testPanic": true}));
+        write_legacy_workspace(&root, "ws-survives", json!({}));
+        let (store, _db_g) = open_store().await;
+
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
+
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        let summary: Value = serde_json::from_str(
+            &store
+                .get_setting(LEGACY_IMPORT_FAILURES_KEY)
+                .await
+                .unwrap()
+                .expect("failure summary persisted"),
+        )
+        .unwrap();
+        assert_eq!(summary["total"], 1, "{summary}");
+        assert_eq!(summary["failures"][0]["id"], "ws-panics", "{summary}");
+        assert!(
+            summary["failures"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("import panicked"),
+            "{summary}"
+        );
+    }
+
+    /// A clean run clears a stale failure summary (the documented
+    /// `import-legacy --force` retry path ends with an empty row).
+    #[tokio::test]
+    async fn clean_run_clears_stale_failure_summary() {
+        let (root, _root_g) = temp_root("summary-clear");
+        write_legacy_workspace(&root, "ws-flaky", json!({"setupScript": 42}));
+        let (store, _db_g) = open_store().await;
+
+        let first = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        persist_failure_summary(&store, &first).await;
+        assert!(store
+            .get_setting(LEGACY_IMPORT_FAILURES_KEY)
+            .await
+            .unwrap()
+            .is_some());
+
+        write_legacy_workspace(&root, "ws-flaky", json!({}));
+        let second = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        persist_failure_summary(&store, &second).await;
+        assert!(store
+            .get_setting(LEGACY_IMPORT_FAILURES_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Benign skips (already in DB, managed manifests, duplicates, virtual
+    /// id) stay out of the failure summary; store-write failures would be
+    /// included (see [`Report::failures`]).
+    #[tokio::test]
+    async fn failure_summary_excludes_benign_skips() {
+        let (root, _root_g) = temp_root("summary-benign");
+        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-existing", json!({}));
+        let (store, _db_g) = open_store().await;
+
+        // Seed ws-existing so the run reports it "already in DB".
+        run(&store, &opts(vec![root.clone()])).await.unwrap();
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        assert!(report.failures().is_empty(), "{report}");
+        persist_failure_summary(&store, &report).await;
+        assert!(store
+            .get_setting(LEGACY_IMPORT_FAILURES_KEY)
             .await
             .unwrap()
             .is_none());
@@ -2308,13 +2927,89 @@ mod tests {
         write_legacy_workspace(&root, "ws-pre", json!({}));
         let (store, _db_g) = open_store().await;
 
-        maybe_import_on_first_boot(&store, true, vec![root.clone()], None, None).await;
-        assert!(store.list_workspaces(true).await.unwrap().is_empty());
+        // Pre-existing DB, no pending marker → never imports, and no marker
+        // (pending or completion) is written — across repeated boots.
+        for _ in 0..2 {
+            assert_eq!(
+                decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
+                FirstBootDecision::Skip
+            );
+            maybe_import_on_first_boot(&store, true, vec![root.clone()], None, None).await;
+            assert!(store.list_workspaces(true).await.unwrap().is_empty());
+            assert!(store
+                .get_setting(LEGACY_IMPORT_MARKER_KEY)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store
+                .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    /// A daemon killed mid-import leaves the pending marker behind; the next
+    /// boot resumes the run even though the DB file now pre-exists, skipping
+    /// rows the interrupted run already imported.
+    #[tokio::test]
+    async fn killed_mid_import_resumes_on_next_boot() {
+        let (root, _root_g) = temp_root("boot-resume");
+        write_legacy_workspace(&root, "ws-a", json!({}));
+        let (store, _db_g) = open_store().await;
+
+        // First boot: fresh DB → Start, and the pending marker is persisted
+        // before the run begins.
+        assert_eq!(
+            decide_first_boot_import(&store, false, std::slice::from_ref(&root)).await,
+            FirstBootDecision::Start
+        );
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Simulate a kill mid-import: only ws-a made it into the DB before
+        // the task was aborted — no completion marker was written. ws-b is
+        // written afterwards to stand in for the part of the legacy tree the
+        // interrupted run never reached.
+        run(&store, &opts(vec![root.clone()])).await.unwrap();
+        write_legacy_workspace(&root, "ws-b", json!({}));
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
         assert!(store
             .get_setting(LEGACY_IMPORT_MARKER_KEY)
             .await
             .unwrap()
             .is_none());
+
+        // Second boot: DB pre-exists but the pending marker is set → Resume.
+        assert_eq!(
+            decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
+            FirstBootDecision::Resume
+        );
+        run_first_boot_import(&store, vec![root.clone()], None, None, None, true).await;
+
+        // Both workspaces present (ws-a was skipped as already in DB), the
+        // completion marker is written, and the pending marker is cleared.
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 2);
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_PENDING_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Third boot: completion marker present → Skip, even with pending-era
+        // history behind it.
+        assert_eq!(
+            decide_first_boot_import(&store, true, std::slice::from_ref(&root)).await,
+            FirstBootDecision::Skip
+        );
     }
 
     /// Empty roots fully disable the hook: no app-dir read, no marker write —
@@ -2871,6 +3566,11 @@ mod tests {
         assert!(session.is_background);
         assert_eq!(session.created_at, "2025-06-01T00:00:00Z");
         assert_eq!(session.updated_at, "2025-06-02T00:00:00Z");
+        // Imported sessions predate harness stamping: literal "1.0" (pinned
+        // even if CURRENT_HARNESS_VERSION bumps) + NULL snapshot, exactly like
+        // migration 0096's backfill of pre-existing rows.
+        assert_eq!(session.harness_version, "1.0");
+        assert_eq!(session.harness_features, None);
         // Metadata behavior fields lifted to columns.
         assert_eq!(session.specialist, Some("implementor".to_string()));
         assert_eq!(session.task_note_id, Some(NoteId::from("task-1")));

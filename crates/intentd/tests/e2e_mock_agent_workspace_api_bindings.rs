@@ -64,9 +64,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -124,7 +126,8 @@ async fn task_bindings_update_status_and_get() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     let agent_val = services
         .agent_create(
@@ -263,7 +266,8 @@ async fn comment_bindings_add_and_list() {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
 
     let agent_val = services
         .agent_create(

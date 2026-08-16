@@ -462,6 +462,89 @@ fn connect_with_prompt_result(
     (conn, note_rx, agent)
 }
 
+/// [`connect_with`] whose mock HOLDS the `session/prompt` response until the
+/// caller fires the returned release sender — freezing the turn mid-flight so
+/// a test can act in the window where the live-turn slot is open (e.g. pin it
+/// the way the teardown paths do) before the real turn end runs.
+fn connect_gated_prompt(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_gated_mock_agent(c2a_agent, a2c_agent, updates, release_rx);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent, release_tx)
+}
+
+/// Mock agent for [`connect_gated_prompt`]: streams `updates` on
+/// `session/prompt`, then awaits the release signal before answering
+/// `end_turn`; other methods answer like the standard mock.
+fn spawn_gated_mock_agent<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        let mut release = Some(release);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                write.flush().await.unwrap();
+                if let Some(release) = release.take() {
+                    let _ = release.await;
+                }
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
 /// Mock agent whose `session/new` / `session/load` responses carry a
 /// caller-supplied payload (e.g. `configOptions` for the D13 effective-model
 /// resolution); other methods answer like the standard mock.
@@ -582,15 +665,19 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
 fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: agent_id.clone(),
         workspace_id: workspace_id.clone(),
         parent_agent_id: None,
@@ -619,6 +706,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         created_at: ts.clone(),
@@ -629,6 +717,7 @@ fn new_session(agent_id: &AgentId, workspace_id: &WorkspaceId) -> AgentSession {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     }
 }
 
@@ -859,6 +948,149 @@ async fn prompt_turn_streams_events_and_accumulates() {
         end.data["lastAgentResponse"],
         json!("Hello world"),
         "terminal stream:end carries the final preview from the full turn text"
+    );
+    // Normal `end_turn` endings stay metadata-free: no `finishReason` on the
+    // terminal stream:end and no metadata on the persisted assistant row.
+    assert!(
+        end.data.get("finishReason").is_none(),
+        "finishReason omitted on a normal end_turn ending"
+    );
+    assert!(
+        messages[0].metadata.is_none(),
+        "no row metadata on a normal end_turn ending"
+    );
+}
+
+/// Abnormal turn endings (PROTOCOL §7): a turn resolving with a non-`end_turn`
+/// stop reason (here `refusal`) persists `metadata.finishReason` on the turn's
+/// assistant row — durable across reload — and the terminal `agent:stream:end`
+/// carries the same `finishReason` so live clients render it without a
+/// transcript re-fetch. The turn still completes normally (`agent:idle`, no
+/// `agent:failed`).
+#[tokio::test]
+async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(prompt_updates(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The assistant row carries the durable finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the same finishReason live.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+
+    // The turn is a completion, not a failure: `agent:idle` fires (its
+    // `finishReason` is the existing lifecycle field) and `agent:failed`
+    // never does.
+    let idle = events
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .expect("agent:idle");
+    assert_eq!(idle.data["finishReason"], json!("refusal"));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
+    );
+}
+
+/// A ZERO-OUTPUT abnormal ending (PROTOCOL §7.3): the prompt resolves with an
+/// abnormal stop reason before emitting a single `session/update`. Because
+/// `agent:idle` / `agent:stream:end` are ephemeral, the turn must still
+/// persist an empty marker row (`contentBlocks: []`) tagged with
+/// `metadata.finishReason` so the ending survives a reload — mirroring the
+/// §7.2 pre-first-token interrupt marker row.
+#[tokio::test]
+async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_result(Vec::new(), json!({ "stopReason": "refusal" }));
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("refusal"));
+
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:idle") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+
+    // The empty marker row is persisted: no content blocks, but the durable
+    // finishReason tag.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, json!([]));
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("row metadata")["finishReason"],
+        json!("refusal")
+    );
+
+    // The terminal stream:end carries the finishReason and the marker row's id.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("terminal stream:end");
+    assert_eq!(end.data["finishReason"], json!("refusal"));
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "an abnormal stop reason is a completion, not a failure"
     );
 }
 
@@ -2730,6 +2962,214 @@ fn connect_with_prompt_rpc_error(
     (conn, note_rx, agent)
 }
 
+/// Mock agent whose `session/prompt` resolves with a JSON-RPC ERROR object
+/// carrying an explicit `code` (and message) — used to force a specific
+/// classifier-shaped `AcpError::Rpc`, e.g. the benign `-32800`
+/// request-cancelled code (monorepo#2050 streaming benign-cancel path).
+fn spawn_mock_agent_with_prompt_rpc_error_code<R, W>(
+    read: R,
+    write: W,
+    code: i64,
+    error_message: String,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if method == "session/prompt" {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": code, "message": error_message },
+                });
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" => json!({ "sessionId": ACP_SID }),
+                "session/load" => json!({}),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against a mock whose `session/prompt` fails with a JSON-RPC
+/// error carrying an explicit `code` + `message`.
+fn connect_with_prompt_rpc_error_code(
+    code: i64,
+    error_message: &str,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent_with_prompt_rpc_error_code(
+        c2a_agent,
+        a2c_agent,
+        code,
+        error_message.to_string(),
+    );
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
+/// Durable-before-observable on the STREAMING terminal-failure path
+/// (monorepo#2050): an ordinary mid-turn `session/prompt failed:` error is
+/// emitted by `run_prompt_turn` itself (terminal `agent:stream:end` +
+/// `agent:failed`). The `status = error` + `stop_reason` store write must land
+/// BEFORE either event reaches the bus, so a client reading `agent.getSession`
+/// upon observing `agent:failed` is guaranteed the persisted Error. Runs
+/// `run_prompt_turn` on its own task and reads the store the moment
+/// `agent:failed` arrives — with the persist ordered first the read
+/// deterministically sees `error`. Analogous to the manager-side
+/// `terminal_failure_persists_error_before_publishing_events`.
+#[tokio::test]
+async fn streaming_terminal_failure_persists_error_before_publishing_events() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, note_rx, _agent) = connect_with_prompt_rpc_error(Vec::new(), "backend exploded");
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let handle = {
+        let (services, agent_id, workspace_id) =
+            (services.clone(), agent_id.clone(), workspace_id.clone());
+        tokio::spawn(async move {
+            let mut note_rx = note_rx;
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    None,
+                )
+                .await
+                .expect_err("an ordinary prompt error fails the turn")
+        })
+    };
+
+    // Read the store the moment agent:failed lands: the persisted Error must
+    // already be visible.
+    'observed: loop {
+        let batch = timeout(Duration::from_secs(10), sub.recv())
+            .await
+            .expect("agent:failed within 10s")
+            .expect("bus open");
+        for event in batch {
+            if event.event_type == "agent:failed" {
+                break 'observed;
+            }
+        }
+    }
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "status is durably error when agent:failed is observable (monorepo#2050)"
+    );
+    assert!(
+        stored
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("backend exploded")),
+        "stop_reason persisted alongside the status: {:?}",
+        stored.stop_reason
+    );
+
+    let err = handle.await.unwrap();
+    assert!(
+        matches!(&err, intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")),
+        "ordinary terminal error keeps the wrapper: {err}"
+    );
+    // The persisted context was stashed for the turn worker to reuse (so the
+    // failure streak / Error status are written exactly once, not twice).
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "streaming path stashed the persisted terminal error for the worker"
+    );
+}
+
+/// A benign provider-resolved cancel (JSON-RPC `-32800` request-cancelled) on
+/// the streaming path must NOT persist an Error status (monorepo#2050): it is
+/// the expected outcome of a concurrent stop/cancel, classified benign by the
+/// same predicate the worker uses. `run_prompt_turn` still emits its terminal
+/// `agent:failed` (the worker suppresses the terminal-failure path), but no
+/// Error is persisted and nothing is stashed for the worker.
+#[tokio::test]
+async fn streaming_benign_cancel_does_not_persist_error() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) =
+        connect_with_prompt_rpc_error_code(-32800, "request cancelled");
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("a cancel still returns Err");
+    assert!(
+        crate::agent_manager::prompt_cancellation_error(&err),
+        "the -32800 cancel classifies benign: {err}"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_ne!(
+        stored.status,
+        AgentStatus::Error,
+        "a benign cancel must not park the session in Error (monorepo#2050)"
+    );
+    assert!(
+        stored.stop_reason.is_none(),
+        "no error stop_reason for a benign cancel: {:?}",
+        stored.stop_reason
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_none(),
+        "nothing stashed for a benign cancel"
+    );
+}
+
 /// Injectable [`SuspendOverlapQuery`](crate::SuspendOverlapQuery) for the
 /// sleep-resume enrollment tests: reports a fixed overlap answer regardless of
 /// the queried window.
@@ -4215,6 +4655,507 @@ async fn activity_throttle_leading_edge_window_and_reset() {
     );
 }
 
+/// The partial blocks a mid-turn interrupt has streamed so far.
+fn partial_blocks() -> Vec<Value> {
+    vec![json!({ "id": "m1:0", "type": "text", "text": "I'll run " })]
+}
+
+/// monorepo#2056 — the interrupt teardown's abort→flush gap must not unpublish
+/// the in-flight turn. `pin_live_turn` (called before `worker.abort()`) makes
+/// the slot survive the `LiveTurnGuard` drop the abort triggers, so
+/// `agent_live_turn` — the `chat.subscribe` snapshot's in-flight source — keeps
+/// serving the streamed-so-far content until the flush persists it. Without the
+/// pin the content is neither published nor durable for the width of that
+/// INSERT, and a snapshot taken there drops the whole partial turn.
+#[tokio::test]
+async fn pinned_live_turn_survives_the_guard_drop_until_the_interrupt_flush_clears_it() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let blocks = partial_blocks();
+
+    {
+        // Mid-turn: the worker holds the guard, the slot carries the partial
+        // content.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", blocks.clone());
+        // The teardown path pins the slot, then aborts the worker — which
+        // drops the guard, as this scope end does.
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
+    }
+
+    // The window: the guard has dropped and the interrupted row is not durable
+    // yet — the pin keeps the slot published, so a snapshot landing here still
+    // reconstructs the partial turn.
+    assert_eq!(
+        services.agent_live_turn(agent_id.clone()),
+        Some(json!({ "messageId": "m1", "contentBlocks": blocks })),
+        "the pinned slot stays published across the abort→flush gap"
+    );
+
+    // The flush lands: the row is durable and the slot (pin included) clears,
+    // so later snapshots serve the persisted row alone — no duplicate overlay.
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "the flush releases the pin with the slot"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "m1");
+    assert_eq!(messages[0].content, json!(blocks));
+}
+
+/// The other half of the monorepo#2056 contract: an UNPINNED slot still clears
+/// on the guard drop. A turn that dies with no teardown flush behind it (worker
+/// panic, a plain abort) leaves no orphan slot, so no phantom in-flight message
+/// can be merged into a later snapshot — the reason the guard exists.
+#[tokio::test]
+async fn unpinned_live_turn_slot_still_clears_on_the_guard_drop() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    {
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", partial_blocks());
+        assert!(
+            services.agent_live_turn(agent_id.clone()).is_some(),
+            "the turn is published while it streams"
+        );
+    }
+    assert!(
+        services.live_turn(&agent_id).is_none(),
+        "an unpinned slot is cleared by the guard drop"
+    );
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "…so no orphan overlay survives the aborted turn"
+    );
+}
+
+/// The pin is released on the flush's collision path too: when the worker
+/// already persisted the full turn under the minted id, the flush's append
+/// loses on the `agent_message.id` UNIQUE constraint and drops the now-stale
+/// slot. Otherwise the pin would keep a superseded partial overlay published
+/// for the rest of the turn's absence.
+#[tokio::test]
+async fn interrupt_flush_releases_the_pin_when_the_worker_already_persisted_the_turn() {
+    use intent_core::WorkspaceApi;
+
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    let full_blocks = json!([
+        { "id": "m1:0", "type": "text", "text": "I'll run the tests." }
+    ]);
+
+    {
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services.set_live_turn(&agent_id, "m1", partial_blocks());
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
+    }
+    // The aborted worker's own append won the race: the full row is durable.
+    services
+        .store
+        .append_agent_message_with_id(
+            &agent_id,
+            "m1",
+            "assistant",
+            &full_blocks,
+            None,
+            &intent_core::now_iso(),
+        )
+        .await
+        .expect("worker append");
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::AgentStopped, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert!(
+        flushed.message_id.is_none(),
+        "the durable full row won the collision"
+    );
+    assert!(
+        services.agent_live_turn(agent_id.clone()).is_none(),
+        "the collision path releases the pin with the stale slot"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1, "exactly one row survives the race");
+    assert_eq!(messages[0].content, full_blocks, "the full row is intact");
+}
+
+/// monorepo#2110 — the flush persists the slot AS OF FLUSH TIME, not the clone
+/// the teardown path used to take before `worker.abort()`. The abort cannot
+/// recall a `session/update` already being routed, so a final chunk can land
+/// after the pin: flushing the pre-abort clone trimmed it out of the durable
+/// row even though every subscriber had already been sent it, leaving the
+/// reloaded transcript short of what clients watched stream.
+#[tokio::test]
+async fn interrupt_flush_persists_the_update_routed_after_the_pin() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    let chunk = |text: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text } }
+        }),
+    };
+
+    {
+        // Mid-turn: the worker holds the guard and streams the first chunk.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        services
+            .route_notification(
+                &chunk("I'll run "),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        // The teardown path pins the slot…
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
+        // …and the notification already in flight is routed in the pin→abort
+        // gap: broadcast to every subscriber AND folded into the live slot.
+        services
+            .route_notification(
+                &chunk("the tests.\n"),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+        // Scope end = the `worker.abort()` that drops the LiveTurnGuard.
+    }
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert_eq!(flushed.message_id.as_deref(), Some("m1"));
+    assert!(flushed.had_output, "the flushed slot carried blocks");
+    assert_eq!(
+        flushed.text_blocks,
+        vec!["I'll run the tests.\n".to_string()],
+        "the terminal preview reads the flush-time content too"
+    );
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].content,
+        json!([{ "id": "m1:0", "type": "text", "text": "I'll run the tests.\n" }]),
+        "the durable row carries the chunk routed after the pin, \
+         not the pre-abort clone's \"I'll run \""
+    );
+}
+
+/// monorepo#2110 review — a ZERO-OUTPUT normal completion landing in the
+/// abort gap must not look like a turn that produced output.
+///
+/// `run_prompt_turn` persists an assistant row only when the turn produced
+/// blocks (`if !blocks.is_empty()`), but its turn-end slot clear is
+/// unconditional. So a turn that completes normally having streamed nothing
+/// writes NO row and drops the slot. If the teardown path treats every
+/// vanished-but-pinned slot as "the worker persisted a full row", a user stop
+/// racing that completion loses both halves of the zero-output contract: no
+/// interrupted marker row for the FE to anchor the Stopped indicator on, and
+/// no prompt-only stop-redelivery armed for the next turn (#1757) — the
+/// stopped prompt is silently dropped.
+///
+/// The pin is what prevents it: a pinned slot survives the turn-end clear
+/// exactly as it survives the `LiveTurnGuard` drop, so the flush still finds
+/// it, still records the empty-blocks marker row, and still reports
+/// `had_output: false`.
+#[tokio::test]
+async fn zero_output_completion_in_the_abort_gap_still_flushes_a_marker_row() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    {
+        // Mid-turn: a slot is open but nothing has streamed into it yet.
+        let _guard = services.begin_live_turn(&agent_id, "m1");
+        // The teardown path pins the slot…
+        assert!(
+            services.live_turn(&agent_id).is_some(),
+            "slot open mid-turn"
+        );
+        services.pin_live_turn(&agent_id);
+        // …and in the pin→abort gap the turn completes normally with zero
+        // blocks: `run_prompt_turn` persists nothing and clears the slot.
+        services.clear_unpinned_live_turn(&agent_id);
+    }
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pin keeps the slot alive through a zero-output turn end");
+    assert!(
+        !flushed.had_output,
+        "a zero-block turn produced no output — the stop-redelivery arm depends on this"
+    );
+    assert_eq!(
+        flushed.message_id.as_deref(),
+        Some("m1"),
+        "the interrupted marker row is still recorded"
+    );
+
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1, "exactly the marker row");
+    assert_eq!(messages[0].content, json!([]), "empty blocks, as flushed");
+    assert_eq!(
+        messages[0].metadata.as_ref().expect("metadata")["interrupted"],
+        json!(true)
+    );
+}
+
+/// monorepo#2110 — the REAL prompt-turn end must leave a pinned slot to the
+/// teardown flush, not just the `clear_unpinned_live_turn` helper the
+/// simulation above calls directly. Drives `run_prompt_turn` against a mock
+/// whose `session/prompt` response is held open, pins in that window (as the
+/// teardown paths do before `worker.abort()`), then releases the turn to
+/// complete normally with zero output: `run_prompt_turn` persists no row and
+/// its turn-end clear runs for real — the pinned slot must survive it for the
+/// flush that owns it.
+#[tokio::test]
+async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flush() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release) = connect_gated_prompt(Vec::new());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    None,
+                )
+                .await
+        })
+    };
+    // The slot opens at turn start; the gate holds the turn there.
+    timeout(Duration::from_secs(2), async {
+        while services.live_turn(&agent_id).is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the turn opens its live slot");
+    // The teardown path pins…
+    services.pin_live_turn(&agent_id);
+    // …and the turn completes normally with zero blocks.
+    release.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("prompt turn ok");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let slot = services
+        .live_turn(&agent_id)
+        .expect("the real turn-end clear leaves the pinned slot to the teardown flush");
+    assert!(slot.flush_pending, "the pin survives the turn end");
+    assert!(slot.blocks.is_empty(), "zero-output turn");
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot is still there to flush");
+    assert!(!flushed.had_output, "a zero-block turn produced no output");
+    assert!(
+        flushed.message_id.is_some(),
+        "the interrupted marker row is recorded"
+    );
+}
+
+/// The teardown flush only owns a PINNED slot. An unpinned slot present at
+/// flush time is not this teardown's turn — it is the NEXT turn's, begun in
+/// the pin→flush window (`begin_live_turn` replaces the slot wholesale,
+/// unpinned) — and flushing it would persist a live turn as interrupted under
+/// its freshly minted id, poisoning the id the worker's own append still
+/// needs. The flush must leave it untouched and report nothing pinned.
+#[tokio::test]
+async fn interrupt_flush_leaves_an_unpinned_slot_alone() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+    // The next turn's slot: begun after the teardown's pinned slot was
+    // replaced — never pinned by this teardown.
+    services.set_live_turn(&agent_id, "m2", partial_blocks());
+
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await;
+    assert!(
+        flushed.is_none(),
+        "an unpinned slot is not this flush's to persist"
+    );
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the live turn's slot stays published"
+    );
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert!(
+        messages.is_empty(),
+        "no interrupted row was recorded for the live turn"
+    );
+}
+
+/// monorepo#2140 — the suspend-enrollment flush must not release a pin a
+/// concurrent teardown holds. It flushes caller-held content (its synthetic
+/// turn never enters the slots map), so its slot clear is pin-respecting: the
+/// pinned slot survives to the teardown's flush, which absorbs the
+/// `agent_message.id` UNIQUE collision with the enrollment's row and keeps the
+/// slot-derived `had_output` — instead of reading `None` as "no turn in
+/// flight" and arming a zero-output stop-redelivery for a turn that DID
+/// produce output.
+#[tokio::test]
+async fn suspend_enrollment_flush_leaves_a_foreign_pin_to_its_teardown() {
+    let (_tmp, services, _bus, agent_id, _ws) = setup().await;
+
+    // A teardown pinned the in-flight slot…
+    services.set_live_turn(&agent_id, "m1", partial_blocks());
+    services.pin_live_turn(&agent_id);
+    // …and in the abort gap the worker classifies a suspend interrupt and
+    // flushes its caller-held content (the enroll path: `owns_slot: false`).
+    let live = super::LiveTurn {
+        message_id: "m1".to_string(),
+        blocks: partial_blocks(),
+        final_text_block_open: false,
+        last_activity_at: "2026-01-01T00:00:00Z".to_string(),
+        last_activity_emit: None,
+        flush_pending: false,
+        flush_failed: false,
+    };
+    let enrolled = services
+        .flush_partial_turn_on_interruption(
+            &agent_id,
+            live,
+            super::InterruptReason::SystemSuspend,
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(
+        enrolled.as_deref(),
+        Some("m1"),
+        "the enrollment row is durable"
+    );
+    assert!(
+        services
+            .live_turn(&agent_id)
+            .is_some_and(|l| l.flush_pending),
+        "the enrollment flush leaves the foreign pin in place"
+    );
+
+    // The teardown's own flush still finds its pinned slot: the UNIQUE
+    // collision with the enrollment row is absorbed and `had_output` keeps
+    // the truth — the turn produced output, so no stop-redelivery.
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot survived to its owner");
+    assert!(
+        flushed.message_id.is_none(),
+        "the enrollment row won the collision"
+    );
+    assert!(flushed.had_output, "the turn really did produce output");
+    assert!(
+        services.live_turn(&agent_id).is_none(),
+        "the owning flush releases the pin"
+    );
+}
+
+/// The abandoned mark must not widen either pin-respecting clear
+/// ([`LiveTurn::flush_failed`]'s contract): the aborted worker's
+/// [`LiveTurnGuard`] drop can run AFTER the flush gave up — `worker.abort()`
+/// cancels at the next await point, unordered against the interrupt path's
+/// flush — and both it and the normal turn-end clear key on `flush_pending`
+/// alone. A slot that is pinned AND abandoned is the only copy of the
+/// content, so both must leave it; only a new turn's claim may reap it
+/// (`try_begin_drops_a_slot_whose_flush_already_gave_up`).
+#[tokio::test]
+async fn abandoned_slot_survives_guard_drop_and_turn_end_clear() {
+    let (_tmp, services, _bus, _seeded, _ws) = setup().await;
+    // Deliberately NOT the seeded agent: no agent_session row, so the flush's
+    // INSERT fails the `agent_message.agent_id` foreign key — the genuine
+    // store error that drives the give-up arm.
+    let agent_id = AgentId::from("agent-abandoned");
+
+    let guard = services.begin_live_turn(&agent_id, "m-abandoned");
+    services.set_live_turn(&agent_id, "m-abandoned", partial_blocks());
+    services.pin_live_turn(&agent_id);
+    let flushed = services
+        .flush_pinned_turn_on_interruption(&agent_id, super::InterruptReason::UserStop, None)
+        .await
+        .expect("the pinned slot was there to flush");
+    assert!(
+        flushed.message_id.is_none(),
+        "precondition: the store rejected the append, so nothing was persisted"
+    );
+    assert!(
+        services
+            .live_turn(&agent_id)
+            .is_some_and(|s| s.flush_pending && s.flush_failed),
+        "precondition: the give-up arm kept the slot pinned and marked it abandoned"
+    );
+
+    // The aborted worker's delayed guard drop…
+    drop(guard);
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the guard drop leaves an abandoned slot alone — it is the only copy of the content"
+    );
+
+    // …and a turn end reaching the pin-respecting clear.
+    services.clear_unpinned_live_turn(&agent_id);
+    assert!(
+        services.live_turn(&agent_id).is_some(),
+        "the turn-end clear leaves an abandoned slot alone too"
+    );
+}
+
 /// A tool-ONLY turn keeps ticking (monorepo#1414): a turn that streams three
 /// tool calls and no assistant text still emits `agent:stream:activity`, each
 /// ping carrying `lastToolUse { name, status }` for the call just recorded.
@@ -4574,4 +5515,476 @@ async fn thought_text_is_absent_from_text_block_extraction() {
         vec![json!({ "type": "thinking", "id": "m2:0", "text": "only reasoning" })],
         "the live-turn snapshot carries the in-flight thinking block"
     );
+}
+
+// --- Group-tag-bearing turns (monorepo#2029 audit) -------------------------
+
+/// The FE opens a `<group:Name>` display section on the text block carrying the
+/// tag and swallows every LATER block in the message, so the daemon's ordering
+/// invariant is load-bearing for grouping: the text block that opened the group
+/// must sit at an index BEFORE the tool blocks it should contain, on BOTH the
+/// mid-turn snapshot path ([`Transcript::snapshot_blocks`], what a
+/// `chat.subscribe` arriving mid-turn reconstructs the in-flight message from)
+/// and the persisted path ([`Transcript::into_blocks`]) — with block ids stable
+/// (`{messageId}:{index}`, never renumbered) as the turn grows.
+///
+/// Drives the real shape: a group-opening text chunk (split mid-tag, as it
+/// streams) → `tool_call` → `tool_call_update(completed)` → more text → two
+/// more tool calls, asserting the invariant after EVERY step.
+#[tokio::test]
+async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persist() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    const GROUP_TEXT: &str =
+        "<group:Prepping>\nI'll set the workspace title and dig into the debug bundle.";
+
+    let tool_note = |id: &str, title: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": title, "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+    let done_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    };
+
+    // Index 0 must stay the group-opening text block for the whole turn, and
+    // every tool block must land after it.
+    let assert_group_invariant = |blocks: &[Value], step: &str| {
+        assert_eq!(
+            blocks[0]["type"], "text",
+            "{step}: block 0 is the group-opening text block: {blocks:?}"
+        );
+        assert_eq!(
+            blocks[0]["id"], "m1:0",
+            "{step}: the group-opening block keeps its id"
+        );
+        assert_eq!(
+            blocks[0]["text"], GROUP_TEXT,
+            "{step}: the group tag + header text is intact"
+        );
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                block["id"],
+                json!(format!("m1:{index}")),
+                "{step}: block ids stay {{messageId}}:{{index}}"
+            );
+            if matches!(
+                block["type"].as_str(),
+                Some("tool_use") | Some("tool_result")
+            ) {
+                assert!(index > 0, "{step}: no tool block precedes the group open");
+            }
+        }
+    };
+
+    // The live-turn slot (the `chat.subscribe` mid-turn reconstruction source)
+    // must carry exactly the snapshot the transcript reports.
+    let assert_slot_matches = |step: &str, expected: &[Value]| {
+        let live = services.live_turn(&agent_id).expect("live turn slot open");
+        assert_eq!(
+            live.blocks, expected,
+            "{step}: the live-turn slot mirrors snapshot_blocks()"
+        );
+    };
+
+    // Step 1 — the group-opening text, streamed split across the `>` so the
+    // tag itself spans two chunks (they coalesce onto one block).
+    for chunk in ["<group:Prep", "ping>\nI'll set the workspace title "] {
+        services
+            .route_notification(
+                &message_note(chunk),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    services
+        .route_notification(
+            &message_note("and dig into the debug bundle."),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let snap = transcript.snapshot_blocks();
+    assert_eq!(
+        snap,
+        vec![json!({ "type": "text", "id": "m1:0", "text": GROUP_TEXT })],
+        "the pending chunk buffer surfaces as the block index it will flush into"
+    );
+    assert_group_invariant(&snap, "after group-opening text");
+    assert_slot_matches("after group-opening text", &snap);
+
+    // Step 2 — first tool call: flushes the open text block at index 0 and
+    // appends `tool_use` at index 1.
+    services
+        .route_notification(
+            &tool_note("t1", "bash: title"),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["text", "tool_use"]);
+    assert_group_invariant(&snap, "after first tool_call");
+    assert_slot_matches("after first tool_call", &snap);
+
+    // Step 3 — completion appends the `tool_result`; the text block does not move.
+    services
+        .route_notification(&done_note("t1"), &agent_id, &workspace_id, &mut transcript)
+        .await;
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["text", "tool_use", "tool_result"]);
+    assert_group_invariant(&snap, "after tool_call_update(completed)");
+    assert_slot_matches("after tool_call_update(completed)", &snap);
+
+    // Step 4 — more text lands in a NEW block after the tool blocks (the group
+    // opened at index 0 still spans everything after it).
+    services
+        .route_notification(
+            &message_note("Now reading the bundle."),
+            &agent_id,
+            &workspace_id,
+            &mut transcript,
+        )
+        .await;
+    // Step 5 — two more tool calls after that text.
+    for (id, title) in [("t2", "view: bundle.json"), ("t3", "bash: grep")] {
+        services
+            .route_notification(
+                &tool_note(id, title),
+                &agent_id,
+                &workspace_id,
+                &mut transcript,
+            )
+            .await;
+    }
+    let snap = transcript.snapshot_blocks();
+    let types: Vec<&str> = snap.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "text",
+            "tool_use",
+            "tool_result",
+            "text",
+            "tool_use",
+            "tool_use"
+        ],
+        "blocks accumulate in stream order"
+    );
+    assert_group_invariant(&snap, "after trailing text + tool calls");
+    assert_slot_matches("after trailing text + tool calls", &snap);
+
+    // The live `chat:stream:delta` / `agent:tool:call` block identities agree
+    // with the snapshot positions: the group-opening chunks all name `m1:0`,
+    // and every tool event names a strictly later index.
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let group_deltas: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.event_type == "chat:stream:delta" && e.data["blockIndex"] == json!(0))
+        .collect();
+    assert_eq!(
+        group_deltas.len(),
+        3,
+        "the three group-opening chunks coalesce onto block 0"
+    );
+    for d in &group_deltas {
+        assert_eq!(d.data["blockId"], json!("m1:0"));
+        assert_eq!(d.data["blockType"], json!("text"));
+    }
+    for e in events.iter().filter(|e| e.event_type == "agent:tool:call") {
+        assert!(
+            e.data["blockIndex"].as_u64().unwrap() > 0,
+            "no tool event claims the group-opening block index: {:?}",
+            e.data
+        );
+    }
+
+    // The persisted block sequence matches the last snapshot exactly — the
+    // delta-accumulated, snapshot-reconstructed, and persisted views agree.
+    let persisted = transcript.into_blocks();
+    assert_eq!(
+        persisted, snap,
+        "into_blocks() equals the final snapshot_blocks()"
+    );
+    assert_group_invariant(&persisted, "persisted");
+}
+
+/// PARALLEL tools (Claude Code fires several before any completes) push a
+/// completion's `tool_result` to the CURRENT end of the block list — NOT to its
+/// `tool_use` index + 1 — because a later call's `tool_use` already took that
+/// slot. Pins the transcript-side indices the `chat.subscribe` forwarder must
+/// reproduce live; it no longer predicts them (monorepo#2029), it reads the
+/// real ids off the event — see
+/// [`tool_call_events_carry_real_result_block_ids_for_parallel_completions`].
+/// The group-opening text block at index 0 is unaffected either way.
+#[tokio::test]
+async fn interleaved_tool_completions_append_results_at_the_current_end() {
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    let tool_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": "bash: x", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    };
+    let done_note = |id: &str| IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    };
+
+    for note in [
+        message_note("<group:Prepping>\nHeader."),
+        tool_note("t1"),
+        tool_note("t2"),
+        done_note("t1"),
+        done_note("t2"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| {
+            (
+                b["type"].as_str().unwrap(),
+                b["id"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("tool_use", "m1:2"),
+            ("tool_result", "m1:3"),
+            ("tool_result", "m1:4"),
+        ],
+        "t1's result lands at index 3 (the end), not at its tool_use index + 1"
+    );
+    assert_eq!(blocks[3]["tool_use_id"], json!("t1"));
+    assert_eq!(blocks[4]["tool_use_id"], json!("t2"));
+}
+
+/// monorepo#2029: the `agent:tool:call` event names the REAL `tool_result`
+/// block id (`resultBlockId`), so the live `chat.subscribe` delta path never
+/// has to predict it. Shape (a): assistant text INTERLEAVES between a call and
+/// its completion, so the durable transcript flushes that text into the index
+/// the old `tool_use + 1` prediction would have claimed — the prediction landed
+/// on a legitimate `text` block (the one that can carry a `<group:Name>`
+/// opener) and clobbered it on every id-keyed client until `stream:end`.
+#[tokio::test]
+async fn tool_call_event_carries_the_real_result_block_id_when_text_interleaves() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        message_note("I'll run the tests. "),
+        tool_call_note("t1"),
+        message_note("<group:Setup>\nChecking output. "),
+        tool_done_note("t1"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| (b["type"].as_str().unwrap(), b["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("text", "m1:2"),
+            ("tool_result", "m1:3"),
+        ],
+        "the interleaved text owns m1:2; the real result is m1:3"
+    );
+
+    let events = drain_tool_call_events(&mut sub).await;
+    assert_result_ids_match_transcript(&events, &blocks);
+    let completed = events
+        .iter()
+        .find(|e| e.data["status"] == json!("completed"))
+        .expect("a completed agent:tool:call event");
+    assert_eq!(completed.data["blockId"], json!("m1:1"));
+    assert_eq!(
+        completed.data["resultBlockId"],
+        json!("m1:3"),
+        "the event names the real result id, NOT the tool_use index + 1 (m1:2)"
+    );
+    assert_eq!(completed.data["resultBlockIndex"], json!(3));
+    let started = events
+        .iter()
+        .find(|e| e.data["status"] != json!("completed"))
+        .expect("a started agent:tool:call event");
+    assert!(
+        started.data.get("resultBlockId").is_none(),
+        "a call with no result block yet carries no resultBlockId: {:?}",
+        started.data
+    );
+}
+
+/// monorepo#2029, shape (b): PARALLEL calls (Claude Code's normal mode). Both
+/// `tool_use` blocks land before either result, so `tool_use + 1` named the
+/// SECOND call's `tool_use` — live, t2's tool row was overwritten by t1's
+/// result. Each completion event now names the result id its own block took.
+#[tokio::test]
+async fn tool_call_events_carry_real_result_block_ids_for_parallel_completions() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let mut transcript = super::Transcript::new("m1".to_string());
+    services.set_live_turn(&agent_id, "m1", Vec::new());
+
+    for note in [
+        message_note("Running both. "),
+        tool_call_note("t1"),
+        tool_call_note("t2"),
+        tool_done_note("t1"),
+        tool_done_note("t2"),
+    ] {
+        services
+            .route_notification(&note, &agent_id, &workspace_id, &mut transcript)
+            .await;
+    }
+
+    let blocks = transcript.into_blocks();
+    let shape: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| (b["type"].as_str().unwrap(), b["id"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("text", "m1:0"),
+            ("tool_use", "m1:1"),
+            ("tool_use", "m1:2"),
+            ("tool_result", "m1:3"),
+            ("tool_result", "m1:4"),
+        ]
+    );
+
+    let events = drain_tool_call_events(&mut sub).await;
+    assert_result_ids_match_transcript(&events, &blocks);
+    let result_id_for = |tool_call_id: &str| -> Value {
+        events
+            .iter()
+            .find(|e| {
+                e.data["toolCallId"] == json!(tool_call_id)
+                    && e.data["status"] == json!("completed")
+            })
+            .expect("completion event")
+            .data["resultBlockId"]
+            .clone()
+    };
+    assert_eq!(
+        result_id_for("t1"),
+        json!("m1:3"),
+        "t1's result is m1:3 — m1:2 belongs to t2's tool_use"
+    );
+    assert_eq!(result_id_for("t2"), json!("m1:4"));
+}
+
+fn tool_call_note(id: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": id,
+                "title": "bash: x", "kind": "execute", "status": "in_progress",
+                "rawInput": { "cmd": "x" } }
+        }),
+    }
+}
+
+fn tool_done_note(id: &str) -> IncomingNotification {
+    IncomingNotification {
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }),
+    }
+}
+
+async fn drain_tool_call_events(sub: &mut crate::Subscription) -> Vec<Event> {
+    let mut events: Vec<Event> = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    events.retain(|e| e.event_type == "agent:tool:call");
+    assert!(!events.is_empty(), "the turn published tool call events");
+    events
+}
+
+/// Every id an `agent:tool:call` event carries resolves to the block of the
+/// matching type in the DURABLE transcript — the live/persisted parity the
+/// `chat.subscribe` mapper relies on now that it stamps these ids verbatim.
+fn assert_result_ids_match_transcript(events: &[Event], blocks: &[Value]) {
+    for e in events {
+        let block_id = e.data["blockId"].as_str().expect("blockId");
+        let use_block = blocks
+            .iter()
+            .find(|b| b["id"] == json!(block_id))
+            .unwrap_or_else(|| panic!("blockId {block_id} exists in the transcript"));
+        assert_eq!(use_block["type"], json!("tool_use"));
+        assert_eq!(use_block["toolCallId"], e.data["toolCallId"]);
+        let Some(result_id) = e.data.get("resultBlockId").and_then(Value::as_str) else {
+            continue;
+        };
+        let result_block = blocks
+            .iter()
+            .find(|b| b["id"] == json!(result_id))
+            .unwrap_or_else(|| panic!("resultBlockId {result_id} exists in the transcript"));
+        assert_eq!(
+            result_block["type"],
+            json!("tool_result"),
+            "resultBlockId {result_id} names a tool_result, not {:?}",
+            result_block["type"]
+        );
+        assert_eq!(
+            result_block["tool_use_id"], e.data["toolCallId"],
+            "resultBlockId {result_id} names THIS call's result"
+        );
+    }
 }

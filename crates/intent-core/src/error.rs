@@ -83,6 +83,16 @@ pub enum Error {
     #[error("internal error: {detail}")]
     VoiceNotConfigured { detail: String },
 
+    /// A `git.showFile` path resolves to a non-blob tree entry (a `160000`
+    /// gitlink / submodule pin, or a `040000` tree), so there is no file
+    /// content to return. Surfaces as `-32602` with machine-readable
+    /// `error.data = { code: "not-a-file", path, mode }` so clients can route
+    /// gitlink entries to a dedicated presentation instead of matching on an
+    /// opaque "Internal error" (monorepo#1739). `mode` is the octal tree-entry
+    /// mode string (e.g. `"160000"`).
+    #[error("invalid params: path is not a file at this ref: {path} (mode {mode})")]
+    NotAFile { path: String, mode: String },
+
     /// The TCP (WSS) listener is not running, so `pairing.getInfo` has no
     /// port to embed in the pairing payload. Surfaces as `-32603` with the
     /// same human message as the previous `Unsupported` shape plus
@@ -94,6 +104,34 @@ pub enum Error {
          errors, e.g. port already in use) before pairing"
     )]
     ListenerDown,
+
+    /// A `repo.warmCache` request was rejected because an opportunistic warm
+    /// is already in flight (global single-flight — at most one warm
+    /// daemon-wide). Surfaces as `-32603` with machine-readable
+    /// `error.data = { code: "warm-in-flight", owner, repo }` naming the repo
+    /// currently being warmed, so clients key off `error.data.code` instead
+    /// of prose. Deliberately not queued: the caller fires and forgets.
+    #[error("repo cache warm already in flight for {owner}/{repo}")]
+    WarmInFlight { owner: String, repo: String },
+
+    /// An `agent.completeOnce` call gave up waiting for a slot in the
+    /// daemon-wide ephemeral-adapter bound (`agents.maxConcurrentAdapters`):
+    /// the daemon was already running its full complement of adapter chains
+    /// and the caller's own `timeoutMs` elapsed while queued. Surfaces as
+    /// `-32603` with machine-readable
+    /// `error.data = { code: "adapter-busy", provider, waitedMs, limit }` so a
+    /// client can distinguish "the daemon is saturated, retry later" from "the
+    /// model was slow" without matching on prose (monorepo#2062). Nothing was
+    /// spawned and no model was asked, so a retry is always safe.
+    #[error(
+        "no free adapter slot for {provider} after {waited_ms}ms \
+         (agents.maxConcurrentAdapters = {limit})"
+    )]
+    AdapterBusy {
+        provider: String,
+        waited_ms: u64,
+        limit: u32,
+    },
 }
 
 /// Machine-readable category for a failed clone/provisioning step, surfaced
@@ -148,7 +186,8 @@ impl Error {
             Error::InvalidParams(_)
             | Error::NotFound(_)
             | Error::InvalidInput(_)
-            | Error::BaseRefUnresolvable { .. } => -32602,
+            | Error::BaseRefUnresolvable { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -160,7 +199,11 @@ impl Error {
                 | CloneErrorCategory::Network
                 | CloneErrorCategory::Other => -32603,
             },
-            Error::Internal(_) | Error::VoiceNotConfigured { .. } | Error::ListenerDown => -32603,
+            Error::Internal(_)
+            | Error::VoiceNotConfigured { .. }
+            | Error::ListenerDown
+            | Error::WarmInFlight { .. }
+            | Error::AdapterBusy { .. } => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
             Error::ExecutionEnvironmentUnavailable { .. } => -32602,

@@ -77,7 +77,10 @@ const HOOK_LOG_MAX_BYTES: usize = 8 * 1024;
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wake messages; longer captures are head-truncated to the most recent tail.
-const HOOK_WAKE_LOGS_CAP: usize = 2048;
+/// Owned by the harness (H6) alongside the section wording; re-exposed here
+/// for the byte-exact truncation tests.
+#[cfg(test)]
+const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 
 /// Cap (in bytes) on a run's JSON-serialized carry-over state. An oversized
 /// `state` is dropped (the previous state is kept) with a warning line
@@ -355,11 +358,8 @@ fn parse_state(v: &Value, logs: &mut Option<String>) -> StateUpdate {
     }
     let serialized = state.to_string();
     if serialized.len() > HOOK_STATE_MAX_BYTES {
-        let warning = format!(
-            "[hook state dropped: {} bytes exceeds the {HOOK_STATE_MAX_BYTES}-byte cap; \
-             previous state kept]",
-            serialized.len()
-        );
+        let warning = crate::harness::latest()
+            .hook_state_dropped_warning(serialized.len(), HOOK_STATE_MAX_BYTES);
         let combined = match logs.take() {
             Some(l) => format!("{l}\n{warning}"),
             None => warning,
@@ -387,24 +387,9 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// Append a run's captured console output to a wake message as a
 /// `[hook logs]` section, head-truncated to [`HOOK_WAKE_LOGS_CAP`] chars so a
 /// log-heavy run cannot flood the owner's queue. No-op when the run logged
-/// nothing.
-fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
-    let Some(logs) = logs.filter(|l| !l.is_empty()) else {
-        return message.to_string();
-    };
-    if logs.chars().count() <= HOOK_WAKE_LOGS_CAP {
-        return format!("{message}\n\n[hook logs]\n{logs}");
-    }
-    let start = logs
-        .char_indices()
-        .rev()
-        .nth(HOOK_WAKE_LOGS_CAP - 1)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    format!(
-        "{message}\n\n[hook logs]\n[earlier log lines truncated]\n{}",
-        &logs[start..]
-    )
+/// nothing. Wording and truncation owned by the harness (H6).
+pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
+    crate::harness::latest().hook_wake_logs_section(message, logs)
 }
 
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
@@ -597,8 +582,10 @@ impl Services {
                         .await;
                     self.spawn_hook_task(hook.clone());
                     // A newly persisted active hook can promote the derived
-                    // displayStatus to `in_progress` (§6.5).
+                    // displayStatus to `in_progress` (§6.5) and raise the
+                    // orthogonal `waiting` flag (§5.1).
                     self.maybe_emit_display_status_changed(workspace_id).await;
+                    self.maybe_emit_waiting_changed(workspace_id).await;
                     return Ok(json!({ "hook": hook, "dispatched": true }));
                 }
                 hook.state = HookState::Dispatched;
@@ -609,8 +596,10 @@ impl Services {
                 self.wake_hook_owner(&hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, &hook, None).await;
                 // Hook settled terminal: recompute the derived displayStatus
-                // (§6.5) — best-effort, transition-only emission.
+                // (§6.5) and the orthogonal `waiting` flag (§5.1) —
+                // best-effort, transition-only emission.
                 self.maybe_emit_display_status_changed(workspace_id).await;
+                self.maybe_emit_waiting_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": true }))
             }
             RunOutcome::Continue { logs, state } => {
@@ -638,8 +627,10 @@ impl Services {
                     .await;
                 self.spawn_hook_task(hook.clone());
                 // A newly persisted active hook can promote the derived
-                // displayStatus to `in_progress` (§6.5).
+                // displayStatus to `in_progress` (§6.5) and raise the
+                // orthogonal `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(workspace_id).await;
+                self.maybe_emit_waiting_changed(workspace_id).await;
                 Ok(json!({ "hook": hook, "dispatched": false }))
             }
         }
@@ -724,16 +715,22 @@ impl Services {
     }
 
     /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
-    /// the `displayStatus` promotion signal (§6.5): an idle agent still
-    /// watching via a background hook reads as active work. Best-effort: a
-    /// store read failure is logged and fails open to `false` (mirrors
+    /// a `Workspace.waiting` signal (§5.1, via
+    /// [`Services::workspace_is_waiting`]): an idle agent still watching via
+    /// a background hook reads as waiting, without promoting the
+    /// `displayStatus` rollup. SQL-side count-only aggregate — no row
+    /// hydration and no dependence on how many terminal rows the workspace
+    /// accumulated. Best-effort: a store read failure is logged
+    /// and fails open to `false` (mirrors
     /// [`Services::workspace_attention_signals`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
-        match self.store.list_hooks_by_workspace(workspace_id).await {
-            Ok(hooks) => hooks
-                .iter()
-                .any(|h| matches!(h.state, HookState::Scheduled | HookState::Running)),
+        match self
+            .store
+            .count_active_hooks_by_workspace(workspace_id)
+            .await
+        {
+            Ok(n) => n > 0,
             Err(e) => {
                 tracing::warn!(
                     workspace = %workspace_id.0,
@@ -800,8 +797,8 @@ impl Services {
         // owner-side cancel delivers no wake.
         let notice = caller
             .is_none()
-            .then_some("This hook was cancelled from the app.");
-        let hook = self.cancel_active_hook(hook, notice).await?;
+            .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
+        let hook = self.cancel_active_hook(hook, notice.as_deref()).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
@@ -828,9 +825,11 @@ impl Services {
             None => self.resettle_owner_after_hook_terminal(&hook).await,
         }
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) — best-effort, transition-only emission.
+        // (§6.5) and drop the orthogonal `waiting` flag (§5.1) —
+        // best-effort, transition-only emission.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
+        self.maybe_emit_waiting_changed(&hook.workspace_id).await;
         Ok(hook)
     }
 
@@ -866,7 +865,7 @@ impl Services {
             if let Err(e) = self
                 .cancel_active_hook(
                     hook,
-                    Some("This hook was cancelled because its workspace was archived."),
+                    Some(&crate::harness::latest().hook_cancelled_workspace_archived_notice()),
                 )
                 .await
             {
@@ -973,6 +972,9 @@ impl Services {
                 hook.state = HookState::Cancelled;
                 hook.next_run_at = None;
                 self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
+                // The pruned row may have been the workspace's last wait
+                // signal (§5.1).
+                self.maybe_emit_waiting_changed(&hook.workspace_id).await;
                 continue;
             }
             // Expired while the daemon was down: expire at boot (owner
@@ -1128,9 +1130,7 @@ impl Services {
                         .update_hook_last_logs(&hook.hook_id, logs.as_deref())
                         .await?;
                     self.persist_hook_state(hook, state).await?;
-                    self.store
-                        .update_hook_state(&hook.hook_id, HookState::Expired)
-                        .await?;
+                    self.store.expire_hook(&hook.hook_id).await?;
                     hook.state = HookState::Expired;
                     hook.last_run_at = Some(last_run_at);
                     hook.next_run_at = None;
@@ -1195,9 +1195,7 @@ impl Services {
                     // before emitting.
                     let expired = is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms());
                     if expired {
-                        self.store
-                            .update_hook_state(&hook.hook_id, HookState::Expired)
-                            .await?;
+                        self.store.expire_hook(&hook.hook_id).await?;
                         hook.state = HookState::Expired;
                         hook.next_run_at = None;
                     } else {
@@ -1240,9 +1238,10 @@ impl Services {
                 self.wake_hook_owner(hook, &message, "dispatched").await;
                 self.emit_hook_event(HOOK_DISPATCHED, hook, None).await;
                 // The last active hook settling can demote the derived
-                // displayStatus (§6.5).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
+                self.maybe_emit_waiting_changed(&hook.workspace_id).await;
                 Ok(false)
             }
             RunOutcome::Failed { error, logs } => {
@@ -1272,19 +1271,18 @@ impl Services {
                 hook.run_count += 1;
                 hook.last_error = Some(error.clone());
                 self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-                let notice = format!(
-                    "Your background hook \"{}\" was evicted after a failed run: {error}",
-                    hook.name
-                );
+                let notice =
+                    crate::harness::latest().hook_evicted_failed_run_notice(&hook.name, &error);
                 let notice = match logs {
                     RunLogs::Captured(ref l) => with_wake_logs(&notice, l.as_deref()),
                     RunLogs::Lost => notice,
                 };
                 self.wake_hook_owner(hook, &notice, "evicted").await;
                 // The last active hook settling can demote the derived
-                // displayStatus (§6.5).
+                // displayStatus (§6.5) and drop the `waiting` flag (§5.1).
                 self.maybe_emit_display_status_changed(&hook.workspace_id)
                     .await;
+                self.maybe_emit_waiting_changed(&hook.workspace_id).await;
                 Ok(false)
             }
         }
@@ -1315,7 +1313,7 @@ impl Services {
     /// loop: without this the row can sit in `running`/`scheduled` with no
     /// live task behind it. Every step here is itself best-effort (the store
     /// may still be failing) — log and move on rather than propagate.
-    async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
+    pub(crate) async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
         let error = format!("scheduler stopped after a store error: {cause}");
         tracing::warn!(hook = %hook.hook_id.0, error = %error, "evicting hook after store error");
         if let Err(e) = self
@@ -1336,15 +1334,15 @@ impl Services {
         hook.next_run_at = None;
         hook.last_error = Some(error.clone());
         self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-        let notice = format!(
-            "Your background hook \"{}\" was evicted after an internal error: {error}",
-            hook.name
-        );
+        let notice =
+            crate::harness::latest().hook_evicted_internal_error_notice(&hook.name, &error);
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) — best-effort like everything else on this path.
+        // (§6.5) and drop the `waiting` flag (§5.1) — best-effort like
+        // everything else on this path.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
+        self.maybe_emit_waiting_changed(&hook.workspace_id).await;
     }
 
     /// Expire an active hook whose TTL deadline has passed and no run is in
@@ -1362,15 +1360,8 @@ impl Services {
                 tracing::warn!(hook = %hook.hook_id.0, error = %e, "expiry state re-read failed");
             }
         }
-        if let Err(e) = self
-            .store
-            .update_hook_state(&hook.hook_id, HookState::Expired)
-            .await
-        {
-            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expired state");
-        }
-        if let Err(e) = self.store.update_hook_next_run(&hook.hook_id, None).await {
-            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to clear hook nextRunAt");
+        if let Err(e) = self.store.expire_hook(&hook.hook_id).await {
+            tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expiry");
         }
         hook.state = HookState::Expired;
         hook.next_run_at = None;
@@ -1387,33 +1378,20 @@ impl Services {
     /// runs AND dispatches instead of "without a dispatch".
     async fn finish_expiry(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let plural = |n: i64| if n == 1 { "" } else { "s" };
-        let tally = if hook.perpetual {
-            format!(
-                "{} run{}, {} dispatch{}",
-                hook.run_count,
-                plural(hook.run_count),
-                hook.dispatch_count,
-                if hook.dispatch_count == 1 { "" } else { "es" }
-            )
-        } else {
-            format!(
-                "{} run{} completed without a dispatch",
-                hook.run_count,
-                plural(hook.run_count)
-            )
-        };
-        let notice = format!(
-            "Your background hook \"{}\" expired after reaching its TTL ({tally}). Schedule a \
-             new hook via ws.hook.schedule if the condition is still worth watching.",
-            hook.name,
+        let notice = crate::harness::latest().hook_expired_notice(
+            &hook.name,
+            hook.perpetual,
+            hook.run_count,
+            hook.dispatch_count,
         );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
         // The last active hook settling can demote the derived displayStatus
-        // (§6.5) — best-effort, transition-only emission.
+        // (§6.5) and drop the `waiting` flag (§5.1) — best-effort,
+        // transition-only emission.
         self.maybe_emit_display_status_changed(&hook.workspace_id)
             .await;
+        self.maybe_emit_waiting_changed(&hook.workspace_id).await;
     }
 
     /// Idle-visibility deferral backstop: after a hook reaches a terminal
@@ -1470,29 +1448,16 @@ impl Services {
         if reason == "dispatched" {
             metadata["hookStillActive"] = json!(dispatch_still_active);
         }
+        let harness = crate::harness::latest();
         let state_note = match reason {
-            "dispatched" if dispatch_still_active => Some(format!(
-                "[This hook remains active until {} — cancel via ws.hook.cancel \
-                 when no longer needed.]",
-                hook.expires_at.as_deref().unwrap_or("its TTL elapses")
-            )),
-            "dispatched" => Some(
-                "[This hook is now retired and will not run again — reschedule via \
-                 ws.hook.schedule if still needed.]"
-                    .to_string(),
-            ),
-            "evicted" => Some(
-                "[This hook will not run again. Schedule a new hook via \
-                 ws.hook.schedule if the condition is still worth watching.]"
-                    .to_string(),
-            ),
+            "dispatched" if dispatch_still_active => {
+                Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
+            }
+            "dispatched" => Some(harness.hook_dispatch_retired_note()),
+            "evicted" => Some(harness.hook_evicted_state_note()),
             _ => None,
         };
-        let mut content = format!("[Background hook \"{}\"] {message}", hook.name);
-        if let Some(note) = state_note {
-            content.push_str("\n\n");
-            content.push_str(&note);
-        }
+        let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
         if let Err(e) = self
             .deliver_wake_message(
                 &hook.workspace_id,
@@ -1626,9 +1591,11 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         }
     }
 
@@ -1655,6 +1622,8 @@ mod tests {
 
     fn agent(ws: &WorkspaceId, id: &str) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -1683,6 +1652,7 @@ mod tests {
             initial_message: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: false,
             metadata: None,
             created_at: now_iso(),
@@ -1693,6 +1663,7 @@ mod tests {
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
         }
     }
 
@@ -2814,11 +2785,12 @@ mod tests {
             .collect()
     }
 
-    /// An active (`scheduled`) hook promotes the derived `displayStatus` to
-    /// `in_progress` on the list/get enrichment path even with the owner
-    /// idle; the promotion drops back to `idle` once the hook settles.
+    /// An active (`scheduled`) hook sets the orthogonal `waiting` flag on
+    /// the list/get enrichment path without promoting the derived
+    /// `displayStatus` — the base rollup (`idle` here) is served as-is; the
+    /// flag drops once the hook settles.
     #[tokio::test]
-    async fn active_hook_promotes_display_status_to_in_progress() {
+    async fn active_hook_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         assert!(!svc.workspace_has_active_hooks(&ws).await);
         let out = svc
@@ -2837,31 +2809,35 @@ mod tests {
         assert!(svc.workspace_has_active_hooks(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
+        assert!(
+            row.waiting,
+            "idle owner with an active hook must read waiting"
+        );
         assert_eq!(
             row.display_status,
-            Some(intent_core::WorkspaceDisplayStatus::InProgress),
-            "idle owner with an active hook must read in_progress"
+            Some(intent_core::WorkspaceDisplayStatus::Idle),
+            "an active hook never promotes the displayStatus rollup"
         );
 
-        // Settle the hook: the promotion lapses and the base rollup runs.
+        // Settle the hook: the waiting flag lapses; the rollup is unchanged.
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
         assert!(!svc.workspace_has_active_hooks(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
+        assert!(!row.waiting, "terminal hooks never read waiting");
         assert_eq!(
             row.display_status,
             Some(intent_core::WorkspaceDisplayStatus::Idle),
-            "terminal hooks never promote"
         );
     }
 
-    /// `needs_attention` (step 0) still outranks the hook promotion: a
-    /// top-level agent with a pending attention request wins over its own
-    /// active hook.
+    /// `needs_attention` (step 0) coexists with the hook wait signal: a
+    /// top-level agent with a pending attention request serves
+    /// `needs_attention` while the active hook sets `waiting`.
     #[tokio::test]
-    async fn needs_attention_outranks_hook_promotion() {
+    async fn needs_attention_coexists_with_hook_waiting() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         svc.hook_schedule_op(
             &ws,
@@ -2884,14 +2860,15 @@ mod tests {
             row.display_status,
             Some(intent_core::WorkspaceDisplayStatus::NeedsAttention),
         );
+        assert!(row.waiting, "the wait flag is orthogonal to attention");
     }
 
-    /// Hook lifecycle transitions emit `workspace:displayStatus-changed`
-    /// exactly once per transition: schedule promotes (idle → in_progress),
-    /// settle demotes (in_progress → idle) — for both the synchronous cancel
-    /// path and the spawned-task dispatch path.
+    /// Hook lifecycle transitions no longer move the derived `displayStatus`
+    /// (the wait signal is the orthogonal `waiting` flag): neither schedule,
+    /// nor cancel, nor the spawned-task dispatch settle path emits
+    /// `workspace:displayStatus-changed`.
     #[tokio::test]
-    async fn hook_transitions_emit_display_status_changed_once() {
+    async fn hook_transitions_never_emit_display_status_changed() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
         // Seed the last-observed baseline (a seed never emits).
         svc.maybe_emit_display_status_changed(&ws).await;
@@ -2910,23 +2887,20 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
         // Re-running the recompute without a transition emits nothing.
         svc.maybe_emit_display_status_changed(&ws).await;
-        assert_eq!(display_status_events(&svc, &ws).await, vec!["in_progress"]);
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle"]
-        );
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
 
-        // The spawned-task dispatch settle path emits too. The script polls
-        // a note: schedule-time validation sees "wait" and continues; the
-        // test flips it to "go" and `runNow` drives the dispatch.
+        // The spawned-task dispatch settle path is silent too. The script
+        // polls a note: schedule-time validation sees "wait" and continues;
+        // the test flips it to "go" and `runNow` drives the dispatch.
         let mut probe = note(&ws, "gate-note", "wait");
         svc.store().insert_note(&probe).await.unwrap();
         let out = svc
@@ -2946,25 +2920,132 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert_eq!(
-            display_status_events(&svc, &ws).await,
-            vec!["in_progress", "idle", "in_progress"]
-        );
         probe.content = "go".to_string();
         svc.store().update_note(&probe).await.unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
+        // The settled dispatch drops the waiting flag without any
+        // displayStatus transition.
         let deadline = std::time::Instant::now() + POLL_DEADLINE;
         loop {
-            let evs = display_status_events(&svc, &ws).await;
-            if evs == vec!["in_progress", "idle", "in_progress", "idle"] {
+            if !svc.workspace_is_waiting(&ws).await {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "dispatch settle never demoted; events = {evs:?}"
+                "dispatch settle never dropped the waiting flag"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(display_status_events(&svc, &ws).await, Vec::<String>::new());
+    }
+
+    /// Persisted `workspace:waiting-changed` payload flags for a workspace,
+    /// oldest-first.
+    async fn waiting_events(svc: &Services, ws: &WorkspaceId) -> Vec<bool> {
+        let mut evs = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![intent_core::events::WORKSPACE_WAITING_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query waiting events");
+        evs.reverse();
+        evs.into_iter()
+            .map(|e| e.data["waiting"].as_bool().unwrap())
+            .collect()
+    }
+
+    /// Hook lifecycle transitions emit `workspace:waiting-changed` exactly
+    /// once per actual transition with the self-sufficient
+    /// `{ workspaceId, waiting }` payload: schedule raises the flag, a no-op
+    /// recompute stays silent, and cancel drops it.
+    #[tokio::test]
+    async fn hook_transitions_emit_waiting_changed_on_transition_only() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        // Seed the last-observed baseline (a seed never emits).
+        svc.maybe_emit_waiting_changed(&ws).await;
+        assert_eq!(waiting_events(&svc, &ws).await, Vec::<bool>::new());
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true]);
+        // The payload is self-sufficient: it names the workspace too.
+        let evs = svc
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_types: vec![intent_core::events::WORKSPACE_WAITING_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs[0].data["workspaceId"], json!(ws.as_str()));
+
+        // Re-running the recompute without a transition emits nothing.
+        svc.maybe_emit_waiting_changed(&ws).await;
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true]);
+
+        svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
+            .await
+            .expect("cancel");
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true, false]);
+    }
+
+    /// A hook expiring at its TTL drops the workspace's last wait signal, so
+    /// the expiry path emits the `waiting: false` transition.
+    #[tokio::test]
+    async fn hook_expiry_emits_waiting_changed() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let skew = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let svc = svc.with_hook_clock_skew(skew.clone());
+        svc.maybe_emit_waiting_changed(&ws).await;
+
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                    "ttlMs": 60_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert_eq!(waiting_events(&svc, &ws).await, vec![true]);
+
+        // Push "now" past the deadline; the next run expires the hook.
+        skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
+        svc.hook_run_now_op(&ws, &hook.hook_id)
+            .await
+            .expect("runNow");
+        wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        loop {
+            if waiting_events(&svc, &ws).await == vec![true, false] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expiry never emitted the waiting:false transition"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -3639,15 +3720,17 @@ mod tests {
     #[tokio::test]
     async fn hook_expires_during_sleep_and_wakes_owner() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Deadline 300ms out, inter-run delay 10s: the scheduler's expiry arm
-        // must win the select and expire the hook without another run.
+        // Deadline 3s out (wide enough that a loaded host cannot burn
+        // through it between insert and rehydrate — monorepo#1358), inter-run
+        // delay 10 minutes: the scheduler's expiry arm must win the select
+        // and expire the hook without another run.
         let hook = Hook {
             hook_id: HookId::new(),
             workspace_id: ws.clone(),
             agent_id: owner.clone(),
             name: "short-ttl".to_string(),
             code: "return { dispatch: false };".to_string(),
-            delay_ms: 10_000,
+            delay_ms: 600_000,
             state: HookState::Scheduled,
             created_at: now_iso(),
             last_run_at: None,
@@ -3656,7 +3739,7 @@ mod tests {
             last_error: None,
             last_logs: None,
             last_state: None,
-            expires_at: Some(next_run_at_iso(300)),
+            expires_at: Some(next_run_at_iso(3_000)),
             perpetual: false,
             dispatch_count: 0,
         };

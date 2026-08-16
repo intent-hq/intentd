@@ -144,7 +144,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — git.commit = attributed commit helper
+  ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.host.* — host.exec = one-shot host command exec
@@ -170,12 +170,12 @@ API:
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
   ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
-  ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
+  ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink, convertedCount, createdTaskNoteIds, createdTasks, warnings }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. `@@@task` blocks in the content auto-convert into linked task notes, and the result carries the conversion's `createdTasks` + `warnings` like the content-write ops. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
   ws.note.list(tag?) → [{ id, title, tags, ... }]  // List notes. Optional tag filter narrows results.
   ws.note.listTasks(id) → [{ text, status, taskNoteId, linkedTaskNoteId, lineNumber, ... }]  // Faster than `read()` when you only need checkbox/task IDs. Use `taskNoteId` for delegation; `linkedTaskNoteId` is a backward-compatible alias.
   ws.note.readAsset(asset) → { assetId, mimeType, data, sizeKb }  // `asset` can be an asset ID or `workspace-asset://...` URL. Image assets (PNG, JPEG, GIF, WebP) are returned as native image content blocks (the model sees the image directly); non-image assets return the JSON object.
   ws.note.setContent(id, content, confirmReplacement?) → { ... }  // ⚠️ FULL REPLACEMENT: replaces the entire note. Prefer `add()` / `edit()` / `editLines()` unless you intentionally want to overwrite everything.
-    If the new content is much shorter, call again with `confirmReplacement=true`. ```task blocks auto-convert into linked task notes.```
+    If the new content is much shorter, call again with `confirmReplacement=true`. `@@@task` blocks auto-convert into linked task notes; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`.
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
     `position` can be `"end"` (default), `"start"`, or `"after:## Heading"` such as `"after:## Phase 1"`.
   ws.note.edit(id, { old, new }) → { ... }  // Surgical text replacement. `old` must match EXACTLY, including whitespace and line breaks; only the first occurrence is replaced.
@@ -198,8 +198,10 @@ API:
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
-  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort.
-  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
+  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
+  ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle or reference a tree ancestor/descendant of the task are rejected with the offending path/relationship named.
+  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds, createdTasks, warnings }  // Convert `@@@task` blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion. The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.
+    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.
 
@@ -213,11 +215,12 @@ API:
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
-    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
+    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -241,6 +244,9 @@ API:
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
+  ws.git.registerRoot(path) → { id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }  // Register a secondary git repository (submodule checkout, sibling clone) for the workspace's git root tracking. `path` must be an existing git repo root (has a `.git` entry); a relative path resolves against the workspace worktree, and the result is canonicalized and may live anywhere on the host. The workspace's own primary root is rejected (tracked implicitly). Idempotent by canonical path — re-registering merges attribution and upgrades an auto-detected row to `source: "agent"`.
+  ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path (relative paths resolve against the workspace worktree). Errors when no root is registered for the path.
+  ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
@@ -288,6 +294,7 @@ API:
   ws.file.delete(path) → { ok, path, deleted }  // Deletes a file. Directories must use other tooling.
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
+  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
   ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?` and `rulesKnown`.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
@@ -347,7 +354,7 @@ Namespaces (index — full signatures in API below):
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks (reference/cli/patch/agent-action)
   ws.agent.* — create/delegate/message/watch agents
-  ws.git.* — git.commit = attributed commit helper
+  ws.git.* — attributed commits + secondary git root registry
   ws.event.* — activity queries + event subscriptions
   ws.script.* — saved build/test/service scripts
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
@@ -395,12 +402,12 @@ API:
   ws.app.workspaces.open(id, { openInNewWindow? }?) → { ok, queued }  // Chief workspace only. Opens a workspace through workspace-operations-saga. Pass `{ openInNewWindow: true }` to open in a new window.
 
   ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
-  ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
+  ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink, convertedCount, createdTaskNoteIds, createdTasks, warnings }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. `@@@task` blocks in the content auto-convert into linked task notes, and the result carries the conversion's `createdTasks` + `warnings` like the content-write ops. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
   ws.note.list(tag?) → [{ id, title, tags, ... }]  // List notes. Optional tag filter narrows results.
   ws.note.listTasks(id) → [{ text, status, taskNoteId, linkedTaskNoteId, lineNumber, ... }]  // Faster than `read()` when you only need checkbox/task IDs. Use `taskNoteId` for delegation; `linkedTaskNoteId` is a backward-compatible alias.
   ws.note.readAsset(asset) → { assetId, mimeType, data, sizeKb }  // `asset` can be an asset ID or `workspace-asset://...` URL. Image assets (PNG, JPEG, GIF, WebP) are returned as native image content blocks (the model sees the image directly); non-image assets return the JSON object.
   ws.note.setContent(id, content, confirmReplacement?) → { ... }  // ⚠️ FULL REPLACEMENT: replaces the entire note. Prefer `add()` / `edit()` / `editLines()` unless you intentionally want to overwrite everything.
-    If the new content is much shorter, call again with `confirmReplacement=true`. ```task blocks auto-convert into linked task notes.```
+    If the new content is much shorter, call again with `confirmReplacement=true`. `@@@task` blocks auto-convert into linked task notes; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`.
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
     `position` can be `"end"` (default), `"start"`, or `"after:## Heading"` such as `"after:## Phase 1"`.
   ws.note.edit(id, { old, new }) → { ... }  // Surgical text replacement. `old` must match EXACTLY, including whitespace and line breaks; only the first occurrence is replaced.
@@ -423,8 +430,10 @@ API:
   ws.task.update(noteId, line, { text?, status?, expected? }) → { ok, lineNumber, ... }  // Atomically edit only one checkbox line, preserving the rest of the note. Prefer this over `note.setContent()` for task edits.
     `line` is the 1-based task line number from `note.read()`. `status`: `"done"`, `"todo"`, or `"in-progress"`. `expected` enables conflict detection if another agent may have changed the task.
   ws.task.getMyTask(taskNoteId) → task  // Reads a task note with metadata, dependencies, and acceptance criteria.
-  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort.
-  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds }  // Convert ```task blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion.
+  ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? }) → { ... }  // Convert a note into a task note. `acceptanceCriteria` may be an array or JSON string; `effort` maps to estimated effort; `dependsOn`/`conflictsWith` seed task relations (validated like `setRelations`).
+  ws.task.setRelations(noteId, { dependsOn?, conflictsWith? }) → { ok, noteId, dependsOn, conflictsWith }  // Replace a task's relation lists (arrays of task note ids). Omitted field → kept; `[]` → cleared. `dependsOn` writes that close a dependency cycle or reference a tree ancestor/descendant of the task are rejected with the offending path/relationship named.
+  ws.task.convertBlocks(noteId) → { convertedCount, createdNoteIds, createdTasks, warnings }  // Convert `@@@task` blocks into linked task notes. Note updates already auto-convert them; use this for manual re-conversion. The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.
+    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.
   ws.task.createPrerequisite(dependentNoteId, title, { content?, status? }) → { ... }  // Adds a prerequisite task dependency.
   ws.task.assignAgent(noteId, agentId) → { ok, noteId, agentId }  // Assign an existing agent to a task note. `agentId` must be `agent-{uuid}`; to create and assign in one step, use `ws.agent.create(..., { taskNoteId: noteId })`.
 
@@ -438,11 +447,12 @@ API:
     You can override specialist defaults with `model`, `reasoningEffort`, or `behaviorPrompt`. A `reasoningEffort` the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
-  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
-    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`.
+  ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources?, tasks? }) → { ok, text?, ... }  // Delegate an existing task to a new agent. Prefer `taskNoteId` from `intent://local/task/{id}`; otherwise pass `noteId` + exact `taskText` from a checkbox.
+    Delegation starts immediately and auto-subscribes you to completion events. `waitMode`: `"immediate"` wakes after each agent, `"after_all"` wakes after the whole group. Example: `taskNoteId: "abc-123"`. Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.
     `reasoningEffort` sets the child's reasoning level (e.g. `"low"` / `"medium"` / `"high"`); omit it to inherit the chosen model option's effort, else the specialist's own default. A level the resolved model does not support is rejected with the list of valid values.
     Pass `mergeOnTurnEnd: false` to keep a sandboxed agent's sandbox unmerged when its turn ends — inspect it and merge later (fan out several sandboxed agents, then pick); default true auto-merges on completion.
     Pass `vmResources: { vcpus?, memMib? }` to size a microVM-sandboxed agent's VM (vcpus 1-16, memMib >= 128); missing fields fall back to the `sandbox.microvm` settings. Accepted and ignored outside microVM workspaces.
+    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.
   ws.agent.send(agentId, message, priority?) → { ok, agentId, ... }  // Send a message to another agent. `priority="interrupt"` stops the target mid-response and delivers the message immediately.
   ws.agent.sendToTask(taskNoteId, message, priority?) → { ok, taskNoteId, ... }  // Follow up with the agent assigned to a task note; more convenient than `send()` when you only know the task note ID. `priority="interrupt"` also stops mid-response.
   ws.agent.subscribe(eventTypes, { excludeSelf?, batchWindow? }) → { subscriptionId, ... }  // Compatibility alias for `ws.event.subscribe()`. `eventTypes` must be an array.
@@ -464,6 +474,9 @@ API:
   ws.git.commit(message, { files?, userRequested? }) → { ok, hash, files, fileCount }  // The commit helper. Auto-stages only your changes and is mainly for explicit user-requested checkpoint commits.
     If workspace auto-commit is disabled, set `userRequested=true` to confirm the user asked for the commit.
     For status/stage/diff/merge-check and every other git read or write, run the plain `git` CLI instead.
+  ws.git.registerRoot(path) → { id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }  // Register a secondary git repository (submodule checkout, sibling clone) for the workspace's git root tracking. `path` must be an existing git repo root (has a `.git` entry); a relative path resolves against the workspace worktree, and the result is canonicalized and may live anywhere on the host. The workspace's own primary root is rejected (tracked implicitly). Idempotent by canonical path — re-registering merges attribution and upgrades an auto-detected row to `source: "agent"`.
+  ws.git.unregisterRoot(path) → { ok, gitRootId, path }  // Remove a registered secondary git root by path (relative paths resolve against the workspace worktree). Errors when no root is registered for the path.
+  ws.git.listRoots() → [{ id, workspaceId, path, source, repoOwner?, repoName?, branch?, ... }]  // List the workspace's registered secondary git roots; `branch` is read live per call.
 
   ws.event.agentActivity(agentId?, minutesAgo?) → [events]  // With `agentId`, narrows to that agent; otherwise returns recent activity window.
   ws.event.workspaceSummary(minutesAgo?) → summary  // Aggregated workspace activity summary.
@@ -509,6 +522,7 @@ API:
   ws.file.delete(path) → { ok, path, deleted }  // Deletes a file. Directories must use other tooling.
   ws.file.mkdir(path) → { ok, path, created?|existed? }  // Creates a directory inside the workspace.
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
+  ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
   ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist right now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (with `failingRequired` / `pendingRequired` named, `requiredKnown` false when the host did not report which checks are required), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?` and `rulesKnown`.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
@@ -652,6 +666,24 @@ const PR_MONITOR_SNAPSHOT_XREF_LINE: &str = "    This is the SAME enriched objec
 const PR_MONITOR_ONLY_METHODS: &str = "These are the only `ws.pr.*` methods.";
 const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 
+/// Task-graph teaching scrubbed from the assembled description when
+/// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
+/// `delegate({ tasks })` is never dispatch-denied, so this never joins
+/// [`gated_prefixes`]. Four scrubs, each guarded verbatim by unit tests:
+/// the `tasks?` param of the `ws.agent.delegate` signature, the
+/// unblocked-wake advisory sentence on its first continuation line, its
+/// whole "Batch form:" continuation line, the `@@@task` fence-attribute
+/// clause of `ws.note.setContent`, and the fence-attribute grammar of
+/// `ws.task.convertBlocks` (rewritten to name only the result shape).
+const TASK_GRAPH_DELEGATE_PARAMS: &str = ", tasks? })";
+const TASK_GRAPH_DELEGATE_PARAMS_OFF: &str = " })";
+const TASK_GRAPH_UNBLOCKED_WAKE_XREF: &str = " Completion wakes may carry an advisory `Tasks now unblocked by this completion: …` (or `by these completions:` when coalesced) section naming tasks that just became startable (computed fresh at delivery time); nothing auto-starts — delegate the ones you want started.";
+const TASK_GRAPH_BATCH_FORM_LINE: &str = "    Batch form: each `tasks` entry is a bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }` (per-task overrides of the call's top-level defaults). Every listed task is classified and only the eligible subset starts — tasks with unmet `dependsOn` are `held:blocked-on-deps`, tasks whose `conflictsWith` overlaps the running/starting set are `held:conflict` (delegate a held task individually to force it past the hold), and already-running/complete/cancelled tasks are `skipped` (re-calling with the same list is idempotent). Startable tasks are admitted in effort-weighted critical-path priority order (task `estimatedEffort` strings are parsed; unparseable/missing default to 30 min), so a conflict is resolved in favor of the task heading the longest remaining dependent chain, not the one listed first. `agentInstructions` and `force` are rejected alongside `tasks` (each started task's first message resolves from its own task note; occupied tasks classify as `skipped`). The result enumerates every task with disposition + reason and an `unlockPlan` naming what becomes startable at settlement; when any requested chain carries an explicit estimate the plan also carries `criticalPathMinutes` (~N min of serial work remaining on the critical path; spans the requested tasks and their downstream dependents only — incomplete upstream deps outside the request are not counted, and the number reflects only estimated chains, so it can understate when an unestimated chain is longer). Rows for tasks the graph does not cover — no `dependsOn`/`conflictsWith` of their own and not referenced by any other requested task's relations — classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones.\n";
+const TASK_GRAPH_SETCONTENT_XREF: &str = "; the fence line takes optional `key=` / `dependsOn=` / `conflictsWith=` / `effort=` attributes (see `ws.task.convertBlocks`), and every content-write result (`add` / `edit` / `editLines` / `setContent`) carries the conversion's `createdTasks` + `warnings`";
+const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR: &str = " The fence line takes optional attributes — `@@@task key=api dependsOn=a,b conflictsWith=c effort=2h` — bare tokens, comma-separated lists, whitespace-tolerant; `dependsOn`/`conflictsWith` values resolve against sibling block `key=`s, then exact sibling titles, then existing task-note ids, and `effort` seeds the estimated effort.\n    Conversion never fails on bad attributes: blocks always convert, and unresolvable/ambiguous references or rejected edges (cycle, tree ancestor/descendant) are skipped with a warning naming the block and reference. `createdTasks` is `[{ key?, title, noteId }]` in block order; check `warnings` after converting.";
+const TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR_OFF: &str =
+    " `createdTasks` is `[{ key?, title, noteId }]` in block order; `warnings` names skipped relation references.";
+
 /// The `[agentFeatures]` settings path whose toggle is off and gates `method`
 /// (the `host({ method })` frame name, e.g. `hook.list`), or `None` when the
 /// method is not feature-gated or its toggle is on. The dispatch-deny layer
@@ -684,9 +716,10 @@ pub(super) fn denied_feature(
 /// `[agentFeatures]` (a method line and its indented continuation lines drop
 /// together; doubled blank lines left by a removed namespace paragraph
 /// collapse to one), then scrubbing the sandbox doc clauses when the
-/// workspace is not CoW-capable. With every toggle on and `cow_capable` —
-/// the default — this returns the static const unchanged, so the
-/// all-defaults description is byte-identical to today's by construction.
+/// workspace is not CoW-capable. With every toggle on — including the opt-in
+/// `taskGraph` — and `cow_capable`, this returns the static const unchanged,
+/// so the every-gate-open description is byte-identical to today's by
+/// construction.
 pub fn workspace_api_description(
     is_chief: bool,
     features: &AgentFeaturesSettings,
@@ -698,7 +731,7 @@ pub fn workspace_api_description(
         WORKSPACE_API_DESCRIPTION
     };
     let gated = gated_prefixes(features);
-    if gated.is_empty() && cow_capable {
+    if gated.is_empty() && cow_capable && features.task_graph {
         return Cow::Borrowed(base);
     }
     // Method doc lines sit at exactly two spaces of indentation
@@ -773,6 +806,26 @@ pub fn workspace_api_description(
             .replacen(PR_MONITOR_HOOK_XREF, "", 1)
             .replacen(PR_MONITOR_SNAPSHOT_XREF_LINE, "", 1)
             .replacen(PR_MONITOR_ONLY_METHODS, PR_MONITOR_ONLY_METHODS_OFF, 1);
+    }
+    // Teaching scrub for `taskGraph` (intent-hq/monorepo#2445): docs only —
+    // the APIs stay dispatchable — so the batch-delegate params, batch-form
+    // line, unblocked-wake advisory, and fence-attribute grammar disappear
+    // from the description without joining `gated_prefixes`.
+    if !features.task_graph {
+        out = out
+            .replacen(
+                TASK_GRAPH_DELEGATE_PARAMS,
+                TASK_GRAPH_DELEGATE_PARAMS_OFF,
+                1,
+            )
+            .replacen(TASK_GRAPH_UNBLOCKED_WAKE_XREF, "", 1)
+            .replacen(TASK_GRAPH_BATCH_FORM_LINE, "", 1)
+            .replacen(TASK_GRAPH_SETCONTENT_XREF, "", 1)
+            .replacen(
+                TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
+                TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR_OFF,
+                1,
+            );
     }
     Cow::Owned(out)
 }
@@ -1028,8 +1081,9 @@ mod tests {
         MicrovmSpawnHints, SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
         HOOK_HOST_EXEC_INDEX_XREF, PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL,
         PR_MONITOR_INDEX_XREF, PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE,
-        REPORT_TO_PARENT_ATTENTION_XREF, WORKSPACE_API_DESCRIPTION,
-        WORKSPACE_API_DESCRIPTION_CHIEF,
+        REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
+        TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
+        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
     };
     use std::collections::HashSet;
 
@@ -1373,8 +1427,10 @@ mod tests {
     #[test]
     fn namespace_index_fits_within_truncation_budget() {
         const BUDGET: usize = 2000;
-        let mut feature_sets: Vec<(String, AgentFeaturesSettings)> =
-            vec![("all-defaults".into(), AgentFeaturesSettings::default())];
+        let mut feature_sets: Vec<(String, AgentFeaturesSettings)> = vec![
+            ("all-defaults".into(), AgentFeaturesSettings::default()),
+            ("all-gates-open".into(), all_gates_open()),
+        ];
         for (i, (prefixes, disable)) in feature_cases().into_iter().enumerate() {
             let mut features = AgentFeaturesSettings::default();
             disable(&mut features);
@@ -1393,6 +1449,7 @@ mod tests {
                 attention_requests: false,
                 state_snapshot: false,
                 pr_monitor: false,
+                task_graph: false,
             },
         ));
         for is_chief in [false, true] {
@@ -1466,10 +1523,11 @@ mod tests {
     }
 
     // help_namespace returns every namespace's doc segment verbatim from the
-    // assembled description, for every index namespace in both variants.
+    // assembled description, for every index namespace in both variants
+    // (every gate open, so the assembly is the static const).
     #[test]
     fn help_namespace_returns_verbatim_doc_segments() {
-        let features = AgentFeaturesSettings::default();
+        let features = all_gates_open();
         for (is_chief, desc) in [
             (false, WORKSPACE_API_DESCRIPTION),
             (true, WORKSPACE_API_DESCRIPTION_CHIEF),
@@ -1598,11 +1656,20 @@ mod tests {
         ]
     }
 
-    // Hard requirement: with every toggle on (the default), the assembled
-    // description IS the static const — byte-identical, both variants.
+    // Every gate open: the defaults plus the opt-in `taskGraph`.
+    fn all_gates_open() -> AgentFeaturesSettings {
+        AgentFeaturesSettings {
+            task_graph: true,
+            ..AgentFeaturesSettings::default()
+        }
+    }
+
+    // Hard requirement: with every gate open (the defaults plus the opt-in
+    // `taskGraph`), the assembled description IS the static const —
+    // byte-identical, both variants.
     #[test]
-    fn all_defaults_description_is_byte_identical() {
-        let features = AgentFeaturesSettings::default();
+    fn all_gates_open_description_is_byte_identical() {
+        let features = all_gates_open();
         let base = workspace_api_description(false, &features, true);
         assert!(
             matches!(base, Cow::Borrowed(_)),
@@ -1615,6 +1682,112 @@ mod tests {
             "all-on must not reassemble"
         );
         assert_eq!(&*chief, WORKSPACE_API_DESCRIPTION_CHIEF);
+    }
+
+    // Guard: every task-graph teaching needle the scrub rewrites still
+    // matches both description variants verbatim, so the `replacen` scrubs
+    // cannot silently become no-ops.
+    #[test]
+    fn task_graph_needles_match_both_variants() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            for needle in [
+                TASK_GRAPH_DELEGATE_PARAMS,
+                TASK_GRAPH_UNBLOCKED_WAKE_XREF,
+                TASK_GRAPH_BATCH_FORM_LINE,
+                TASK_GRAPH_SETCONTENT_XREF,
+                TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR,
+            ] {
+                assert!(
+                    desc.contains(needle),
+                    "task-graph needle missing: {needle:?}"
+                );
+            }
+        }
+    }
+
+    // `taskGraph` on: the delegate docs are advisory (intent-hq/monorepo#2457)
+    // — the batch form stays documented factually with per-task option
+    // entries, no `greedy` param, and no "re-call delegate" doctrine.
+    #[test]
+    fn task_graph_on_delegate_docs_are_advisory() {
+        for desc in [WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF] {
+            assert!(!desc.contains("re-call delegate"));
+            assert!(!desc.contains("greedy"));
+            assert!(desc.contains("nothing auto-starts — delegate the ones you want started."));
+            assert!(desc.contains(
+                "bare taskNoteId or `{ taskNoteId, specialist?, model?, reasoningEffort? }`"
+            ));
+            assert!(desc.contains("delegate a held task individually to force it past the hold"));
+            // Relation-less annotation (monorepo#2457 part 3): the batch form
+            // documents `relationsUnknown` on uncovered rows.
+            assert!(desc.contains(
+                "classify exactly as before (the flag never changes a disposition) but carry `relationsUnknown: true`, and the summary counts the started ones"
+            ));
+        }
+    }
+
+    // `taskGraph` off (the default) scrubs the teaching text — batch-delegate
+    // params/line, unblocked-wake advisory, fence-attribute grammar — while
+    // every method line survives (docs-only gate: nothing joins
+    // `gated_prefixes`, so no method is pruned or denied).
+    #[test]
+    fn task_graph_off_scrubs_teaching_but_keeps_methods() {
+        let features = AgentFeaturesSettings::default();
+        assert!(!features.task_graph, "taskGraph must be opt-in");
+        for is_chief in [false, true] {
+            let pruned = workspace_api_description(is_chief, &features, true);
+            for gone in [
+                "skipAutoCommit?, tasks?",
+                "Batch form:",
+                "unlockPlan",
+                "criticalPathMinutes",
+                "relationsUnknown",
+                "Tasks now unblocked",
+                "dependsOn=",
+                "conflictsWith=",
+                "key=api",
+            ] {
+                assert!(
+                    !pruned.contains(gone),
+                    "chief={is_chief}: `{gone}` survived taskGraph off"
+                );
+            }
+            // The delegate signature keeps its non-batch params, and every
+            // task/note method — the setRelations/markAsTask relation params
+            // included (non-goal: older relation APIs stay documented) —
+            // survives untouched.
+            for kept in [
+                "ws.agent.delegate({ taskNoteId?, noteId?, taskText?, agentInstructions?, specialist?, model?, reasoningEffort?, behaviorPrompt?, waitMode?, skipAutoCommit?, mergeOnTurnEnd?, vmResources? })",
+                "ws.task.convertBlocks(noteId)",
+                "ws.task.setRelations(noteId, { dependsOn?, conflictsWith? })",
+                "ws.task.markAsTask(noteId, status, { acceptanceCriteria?, effort?, dependsOn?, conflictsWith? })",
+                "ws.note.setContent(id, content, confirmReplacement?)",
+                "`@@@task` blocks auto-convert into linked task notes",
+            ] {
+                assert!(
+                    pruned.contains(kept),
+                    "chief={is_chief}: `{kept}` was wrongly scrubbed"
+                );
+            }
+            // No dangling separators at the scrub seams.
+            assert!(
+                !pruned.contains("\n\n\n"),
+                "chief={is_chief}: blank-line gap"
+            );
+        }
+    }
+
+    // `taskGraph` is docs-only: it must never join the dispatch-deny table.
+    #[test]
+    fn task_graph_off_never_denies_dispatch() {
+        let features = AgentFeaturesSettings::default();
+        for method in ["agent.delegate", "task.convertBlocks", "task.setRelations"] {
+            assert_eq!(
+                denied_feature(&features, method),
+                None,
+                "{method} must stay dispatchable with taskGraph off"
+            );
+        }
     }
 
     // Disabling one feature removes exactly its own doc lines: no method
@@ -1679,6 +1852,7 @@ mod tests {
             attention_requests: false,
             state_snapshot: false,
             pr_monitor: false,
+            task_graph: false,
         };
         for is_chief in [false, true] {
             let pruned = workspace_api_description(is_chief, &features, true);
@@ -1715,7 +1889,7 @@ mod tests {
     fn rich_chat_blocks_does_not_affect_description() {
         let features = AgentFeaturesSettings {
             rich_chat_blocks: false,
-            ..AgentFeaturesSettings::default()
+            ..all_gates_open()
         };
         assert_eq!(
             &*workspace_api_description(false, &features, true),
@@ -1952,6 +2126,7 @@ mod tests {
             attention_requests: false,
             state_snapshot: false,
             pr_monitor: false,
+            task_graph: false,
         };
         assert_eq!(
             denied_feature(&all_off, "hook.schedule"),
@@ -2055,10 +2230,10 @@ mod tests {
 
     // Hard requirement: with no specialist carrying options (the default),
     // the injected description IS the plain assembly — byte-identical, and
-    // still `Cow::Borrowed` in the all-defaults case.
+    // still `Cow::Borrowed` in the every-gate-open case.
     #[test]
     fn no_model_options_keeps_description_byte_identical() {
-        let features = AgentFeaturesSettings::default();
+        let features = all_gates_open();
         for is_chief in [false, true] {
             let got =
                 workspace_api_description_with_model_options(is_chief, &features, true, &[], None);
@@ -2234,7 +2409,7 @@ mod tests {
     // byte-identical to the plain assembly.
     #[test]
     fn no_microvm_hints_keeps_description_byte_identical() {
-        let features = AgentFeaturesSettings::default();
+        let features = all_gates_open();
         for is_chief in [false, true] {
             let got =
                 workspace_api_description_with_model_options(is_chief, &features, true, &[], None);

@@ -267,9 +267,11 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -302,13 +304,16 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     services
         .mark_as_task(
             ws.clone(),
             note.id.clone(),
             "not_started".into(),
             vec![],
+            None,
+            None,
             None,
             None,
         )

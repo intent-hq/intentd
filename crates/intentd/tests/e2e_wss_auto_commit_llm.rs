@@ -1,12 +1,15 @@
 //! WSS end-to-end for LLM-generated auto-commit messages (LNI-1 §9.1).
 //!
 //! Boots a real `intentd serve` (WSS listener enabled via config) with a fake auggie binary that
-//! emits a deterministic `<<<COMMIT_MESSAGE>>>` reply. Drives an agent turn
-//! that writes a file over WSS, waits for `agent:idle`, then asserts via
-//! `git.commits` that the resulting auto-commit message is the generated one
-//! with `Agent-Id:`/`Linked-Note-Id:` trailers intact. Also asserts the
-//! fallback: with auggie absent/failing, the commit still lands with the
-//! deterministic subject (taskTitle → agentName → "Agent changes").
+//! emits a deterministic `{"subject": ..., "body": ...}` JSON reply. Drives an
+//! agent turn that writes a file over WSS, waits for `agent:idle`, then asserts
+//! via `git.commits` that the resulting auto-commit message is the generated
+//! one with `Agent-Id:`/`Linked-Note-Id:` trailers intact, and via the raw
+//! `git log` message that the body (escaped `\n` in the JSON reply) composes
+//! as subject + blank line + body with the trailers appended after the body.
+//! Also asserts the fallback: with auggie absent/failing, the commit still
+//! lands with the deterministic subject (taskTitle → agentName → "Agent
+//! changes").
 //!
 //! Gated on `node` + the mock ACP agent script; skips cleanly otherwise.
 
@@ -59,15 +62,14 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-/// Create a fake auggie binary that emits the given commit message wrapped in tags.
-fn fake_auggie(message: &str) -> PathBuf {
+/// Create a fake auggie binary that emits the given JSON reply verbatim.
+/// `printf '%s'` keeps the reply byte-literal, so `\n` escapes inside JSON
+/// strings survive to the parser instead of becoming real newlines.
+fn fake_auggie(reply_json: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("intentd-e2e-auggie-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("auggie");
-    let script = format!(
-        "#!/bin/sh\ncat > /dev/null\nprintf '<<<COMMIT_MESSAGE>>>\\n{}\\n<<</COMMIT_MESSAGE>>>'\n",
-        message
-    );
+    let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{reply_json}'\n");
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     bin
@@ -341,9 +343,11 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the
@@ -368,9 +372,13 @@ async fn auto_commit_uses_generated_message_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let auggie_bin = fake_auggie("feat: add new feature via LLM");
+    // Subject + multi-line body reply: newlines inside the JSON string arrive
+    // as `\n` escapes, per the commit-message.md contract.
+    let auggie_bin = fake_auggie(
+        r#"{"subject": "feat: add new feature via LLM", "body": "Adds the feature via the LLM path.\n\n- covers body composition"}"#,
+    );
     let auggie_dir = auggie_bin.parent().unwrap().to_path_buf();
-    let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, Some(&auggie_bin)).await;
+    let (ws_id, repo_dir) = seed_workspace_with_repo(&data_dir, Some(&auggie_bin)).await;
 
     // Mock agent behavior: write a file via the ACP fs/write_text_file client
     // service (the real attribution pipeline) then return (triggers agent:idle).
@@ -542,6 +550,18 @@ async fn auto_commit_uses_generated_message_over_wss() {
         head["linkedNoteId"].as_str(),
         Some(&task_note_id[..]),
         "Linked-Note-Id trailer parsed: {head}"
+    );
+
+    // `git.commits` carries only the summary line; assert the full raw
+    // message to prove the body survives the service-to-commit path: subject
+    // + blank line + body, with attribution trailers appended after the body.
+    let full_message = run_git(&["log", "-1", "--format=%B"], &repo_dir);
+    let expected = format!(
+        "feat: add new feature via LLM\n\nAdds the feature via the LLM path.\n\n- covers body composition\n\nAgent-Id: {agent_id}\nLinked-Note-Id: {task_note_id}"
+    );
+    assert_eq!(
+        full_message, expected,
+        "subject + body + trailers compose in order: {full_message}"
     );
 }
 

@@ -27,33 +27,87 @@ use intent_core::settings_file::AgentFeaturesSettings;
 use std::borrow::Cow;
 
 macro_rules! instr {
-    ($name:literal) => {
-        include_str!(concat!("../resources/agent-instructions/", $name, ".md"))
+    ($ver:literal, $name:literal) => {
+        include_str!(concat!(
+            "../resources/agent-instructions/",
+            $ver,
+            "/",
+            $name,
+            ".md"
+        ))
     };
 }
 
-const CHAT: &str = instr!("chat");
-const COMMON: &str = instr!("common");
-const DEBUG: &str = instr!("debug");
-const WORKSPACE: &str = instr!("workspace");
-const TASK_BREAKDOWN: &str = instr!("task-breakdown");
-const TASK_DEBUG: &str = instr!("task-debug");
-const TASK_FOCUSED: &str = instr!("task-focused");
-const TASK_LOOP: &str = instr!("task-loop");
-const RALPH_LOOP: &str = instr!("ralph-loop");
-const WORKSPACE_AGENT: &str = instr!("workspace-agent");
-const NOTES_SYSTEM_GUIDE: &str = instr!("notes-system-guide");
-const CODE_REVIEW: &str = instr!("code-review");
-const CODE_WALKTHROUGH: &str = instr!("code-walkthrough");
-const COMMIT_MESSAGE: &str = instr!("commit-message");
-const PR_DESCRIPTION: &str = instr!("pr-description");
+const CHAT: &str = instr!("v1", "chat");
+const COMMON: &str = instr!("v1", "common");
+const DEBUG: &str = instr!("v1", "debug");
+const WORKSPACE: &str = instr!("v1", "workspace");
+const TASK_BREAKDOWN: &str = instr!("v1", "task-breakdown");
+const TASK_DEBUG: &str = instr!("v1", "task-debug");
+const TASK_FOCUSED: &str = instr!("v1", "task-focused");
+const TASK_LOOP: &str = instr!("v1", "task-loop");
+const RALPH_LOOP: &str = instr!("v1", "ralph-loop");
+const WORKSPACE_AGENT: &str = instr!("v1", "workspace-agent");
+const NOTES_SYSTEM_GUIDE: &str = instr!("v1", "notes-system-guide");
+const CODE_REVIEW: &str = instr!("v1", "code-review");
+const CODE_WALKTHROUGH: &str = instr!("v1", "code-walkthrough");
+const COMMIT_MESSAGE: &str = instr!("v1", "commit-message");
+const PR_DESCRIPTION: &str = instr!("v1", "pr-description");
 
 // `setup-script-generator` selects its body by host platform at build time,
 // mirroring the reference's `process.platform === 'win32'` runtime switch.
 #[cfg(windows)]
-const SETUP_SCRIPT_GENERATOR: &str = instr!("setup-script-generator.powershell");
+const SETUP_SCRIPT_GENERATOR: &str = instr!("v1", "setup-script-generator.powershell");
 #[cfg(not(windows))]
-const SETUP_SCRIPT_GENERATOR: &str = instr!("setup-script-generator.bash");
+const SETUP_SCRIPT_GENERATOR: &str = instr!("v1", "setup-script-generator.bash");
+
+/// One harness version's bundled instruction set: every body the
+/// [`get_instruction_with_common_for`] composition can resolve. Each version
+/// keeps its markdown under `resources/agent-instructions/<ver>/` and exposes
+/// a static like [`V1`]; the version's `harness::HarnessEntry` doctrine points
+/// at it, so prompt assembly resolves the SESSION's pinned set instead of the
+/// live latest. Adding a version = a new directory + a new static + a
+/// registry entry (H2, intent-hq/monorepo#2459).
+pub(crate) struct InstructionSet {
+    pub chat: &'static str,
+    pub common: &'static str,
+    pub debug: &'static str,
+    pub workspace: &'static str,
+    pub setup_script_generator: &'static str,
+    pub task_breakdown: &'static str,
+    pub task_debug: &'static str,
+    pub task_focused: &'static str,
+    pub task_loop: &'static str,
+    pub ralph_loop: &'static str,
+    pub workspace_agent: &'static str,
+    pub notes_system_guide: &'static str,
+    pub code_review: &'static str,
+    pub code_walkthrough: &'static str,
+    pub commit_message: &'static str,
+    pub pr_description: &'static str,
+}
+
+/// The v1 instruction set (`resources/agent-instructions/v1/`): today's text,
+/// byte-identical to the pre-versioned layout (pinned by
+/// `v1_goldens::golden_bundled_doctrine_hashes`).
+pub(crate) static V1: InstructionSet = InstructionSet {
+    chat: CHAT,
+    common: COMMON,
+    debug: DEBUG,
+    workspace: WORKSPACE,
+    setup_script_generator: SETUP_SCRIPT_GENERATOR,
+    task_breakdown: TASK_BREAKDOWN,
+    task_debug: TASK_DEBUG,
+    task_focused: TASK_FOCUSED,
+    task_loop: TASK_LOOP,
+    ralph_loop: RALPH_LOOP,
+    workspace_agent: WORKSPACE_AGENT,
+    notes_system_guide: NOTES_SYSTEM_GUIDE,
+    code_review: CODE_REVIEW,
+    code_walkthrough: CODE_WALKTHROUGH,
+    commit_message: COMMIT_MESSAGE,
+    pr_description: PR_DESCRIPTION,
+};
 
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
@@ -73,35 +127,39 @@ fn is_non_interactive_background(agent_type: &str) -> bool {
     )
 }
 
-/// Resolve a bundled instruction body by id (port of `getInstructionById`,
-/// including the `fix`/`review`/`walkthrough` aliases). Unknown ids return
-/// `Some(workspace)` when `fallback_to_workspace`, else `None` (the reference
-/// throws in that case).
-fn get_instruction_by_id(id: &str, fallback_to_workspace: bool) -> Option<&'static str> {
+/// Resolve a bundled instruction body by id from `set` (port of
+/// `getInstructionById`, including the `fix`/`review`/`walkthrough` aliases).
+/// Unknown ids return `Some(set.workspace)` when `fallback_to_workspace`,
+/// else `None` (the reference throws in that case).
+fn get_instruction_by_id(
+    set: &'static InstructionSet,
+    id: &str,
+    fallback_to_workspace: bool,
+) -> Option<&'static str> {
     let found = match id {
-        "chat" => CHAT,
-        "common" => COMMON,
-        "debug" => DEBUG,
-        "workspace" => WORKSPACE,
-        "setup-script-generator" => SETUP_SCRIPT_GENERATOR,
-        "task-breakdown" => TASK_BREAKDOWN,
-        "task-debug" => TASK_DEBUG,
-        "task-focused" => TASK_FOCUSED,
-        "task-loop" => TASK_LOOP,
-        "ralph-loop" => RALPH_LOOP,
-        "workspace-agent" => WORKSPACE_AGENT,
-        "notes-system-guide" => NOTES_SYSTEM_GUIDE,
-        "code-review" => CODE_REVIEW,
-        "code-walkthrough" => CODE_WALKTHROUGH,
-        "commit-message" => COMMIT_MESSAGE,
-        "pr-description" => PR_DESCRIPTION,
+        "chat" => set.chat,
+        "common" => set.common,
+        "debug" => set.debug,
+        "workspace" => set.workspace,
+        "setup-script-generator" => set.setup_script_generator,
+        "task-breakdown" => set.task_breakdown,
+        "task-debug" => set.task_debug,
+        "task-focused" => set.task_focused,
+        "task-loop" => set.task_loop,
+        "ralph-loop" => set.ralph_loop,
+        "workspace-agent" => set.workspace_agent,
+        "notes-system-guide" => set.notes_system_guide,
+        "code-review" => set.code_review,
+        "code-walkthrough" => set.code_walkthrough,
+        "commit-message" => set.commit_message,
+        "pr-description" => set.pr_description,
         // Aliases for common agent types.
-        "fix" => DEBUG,
-        "review" => CODE_REVIEW,
-        "walkthrough" => CODE_WALKTHROUGH,
+        "fix" => set.debug,
+        "review" => set.code_review,
+        "walkthrough" => set.code_walkthrough,
         _ => {
             return if fallback_to_workspace {
-                Some(WORKSPACE)
+                Some(set.workspace)
             } else {
                 None
             };
@@ -142,15 +200,52 @@ fn remove_section(text: &str, heading: &str) -> String {
 /// that this text still matches the bundled body verbatim).
 const WAITING_HOST_EXEC_SENTENCE: &str = " For fields the snapshot does not carry, run `gh api repos/{owner}/{repo}/pulls/{n}` via `ws.host.exec` instead.";
 
+/// Start/end markers of common.md's "Task relations during delegation"
+/// subsection — the advisory task-graph teaching (intent-hq/monorepo#2457,
+/// reworked from the intentd#1116/#1147 batch-delegation doctrine) — removed
+/// when `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). It is an
+/// H3 inside "## Delegating Tasks" followed by plain section text, so
+/// [`remove_section`]'s H2 scan cannot express it; instead the text from the
+/// heading through the blank line before the "Keep delegated tasks visible"
+/// paragraph is cut by marker (unit tests guard both markers verbatim).
+const COMMON_TASK_RELATIONS_START: &str = "### Task relations during delegation";
+const COMMON_TASK_RELATIONS_END: &str = "Keep delegated tasks visible in the note";
+
+/// Remove the text between `start` (inclusive) and `end` (exclusive) markers.
+/// No-op unless both markers are present in order.
+fn remove_between(text: &str, start: &str, end: &str) -> String {
+    let Some(s) = text.find(start) else {
+        return text.to_string();
+    };
+    match text[s..].find(end) {
+        Some(e) => format!("{}{}", &text[..s], &text[s + e..]),
+        None => text.to_string(),
+    }
+}
+
 /// The `common` body with feature-gated sections omitted (spec audit rows 1,
 /// 7, and 8): `backgroundHooks` gates "Waiting on External Conditions",
 /// `richChatBlocks` gates "Rich Chat Rendering", `attentionRequests` gates
-/// "Raising Attention". When `hostExec` is off but the Waiting section
-/// survives, the `ws.host.exec` fallback sentence of its "Cross-repo PRs"
-/// bullet is scrubbed. With all defaults on this borrows the bundled body
-/// untouched (byte-identical prompts).
-fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
-    let mut body = Cow::Borrowed(COMMON);
+/// "Raising Attention", and `taskGraph` gates the "Task relations during
+/// delegation" subsection (dispositions, `unlockPlan`, unblocked-wake
+/// guidance). When `hostExec` is off but the Waiting section survives, the
+/// `ws.host.exec` fallback sentence of its "Cross-repo PRs" bullet is
+/// scrubbed. With every gate open (`taskGraph` opted in) this borrows the
+/// bundled body untouched (byte-identical prompts). The markers are pinned to
+/// the v1 text by unit tests; on a future set where one is absent the gate is
+/// a no-op (that version's gating adds its own markers).
+fn gated_common(
+    set: &'static InstructionSet,
+    features: &AgentFeaturesSettings,
+) -> Cow<'static, str> {
+    let mut body = Cow::Borrowed(set.common);
+    if !features.task_graph {
+        body = Cow::Owned(remove_between(
+            &body,
+            COMMON_TASK_RELATIONS_START,
+            COMMON_TASK_RELATIONS_END,
+        ));
+    }
     if !features.attention_requests {
         body = Cow::Owned(remove_section(&body, "Raising Attention"));
     }
@@ -165,6 +260,50 @@ fn gated_common(features: &AgentFeaturesSettings) -> Cow<'static, str> {
     body
 }
 
+/// Markers of the task-graph teaching in `task-breakdown.md` (from
+/// intentd#1116/#1135), removed when `agentFeatures.taskGraph` is off
+/// (intent-hq/monorepo#2445): the "Contract-First Splitting" and "Declaring
+/// Task Relations" H3 blocks run back-to-back and end at the next H2, and
+/// three inline mentions (the `dependsOn=` decomposition clause and the two
+/// fence-attribute lines of the Document Update Format example, which sit in
+/// a tab-indented block) are rewritten to their pre-attribute wording. Unit
+/// tests guard every needle verbatim.
+const BREAKDOWN_RELATIONS_START: &str = "### Contract-First Splitting";
+const BREAKDOWN_RELATIONS_END: &str = "## Breakdown Process";
+const BREAKDOWN_DEPENDS_ON_CLAUSE: &str =
+    " and declare the ordering as `dependsOn=` attributes on the task blocks";
+const BREAKDOWN_EXAMPLE_HEADER: &str = "\tExample (two subtasks, ordered with an inline relation):";
+const BREAKDOWN_EXAMPLE_HEADER_OFF: &str = "\tExample (two subtasks):";
+const BREAKDOWN_EXAMPLE_KEY_LINE: &str = "\t@@@task key=research";
+const BREAKDOWN_EXAMPLE_DEPENDS_LINE: &str = "\t@@@task dependsOn=research";
+const BREAKDOWN_EXAMPLE_PLAIN_LINE: &str = "\t@@@task";
+
+/// The `task-breakdown` body with the task-graph teaching omitted when
+/// `agentFeatures.taskGraph` is off; borrows the bundled body untouched when
+/// the toggle is on.
+fn gated_task_breakdown(
+    set: &'static InstructionSet,
+    features: &AgentFeaturesSettings,
+) -> Cow<'static, str> {
+    if features.task_graph {
+        return Cow::Borrowed(set.task_breakdown);
+    }
+    let body = remove_between(
+        set.task_breakdown,
+        BREAKDOWN_RELATIONS_START,
+        BREAKDOWN_RELATIONS_END,
+    )
+    .replacen(BREAKDOWN_DEPENDS_ON_CLAUSE, "", 1)
+    .replacen(BREAKDOWN_EXAMPLE_HEADER, BREAKDOWN_EXAMPLE_HEADER_OFF, 1)
+    .replacen(BREAKDOWN_EXAMPLE_KEY_LINE, BREAKDOWN_EXAMPLE_PLAIN_LINE, 1)
+    .replacen(
+        BREAKDOWN_EXAMPLE_DEPENDS_LINE,
+        BREAKDOWN_EXAMPLE_PLAIN_LINE,
+        1,
+    );
+    Cow::Owned(body)
+}
+
 /// The dev-server guideline in `workspace-agent.md` gated by
 /// `agentFeatures.scripts` (spec audit row 3).
 const WORKSPACE_AGENT_SCRIPTS_GUIDELINE: &str =
@@ -174,40 +313,66 @@ const WORKSPACE_AGENT_SCRIPTS_GUIDELINE: &str =
 /// gates guideline 8 ("Use script tools for dev servers"); when scripts stay
 /// on but `terminalAccess` is off, the guideline's incidental terminal mention
 /// is dropped. With all defaults on this borrows the bundled body untouched.
-fn gated_workspace_agent(features: &AgentFeaturesSettings) -> Cow<'static, str> {
+fn gated_workspace_agent(
+    set: &'static InstructionSet,
+    features: &AgentFeaturesSettings,
+) -> Cow<'static, str> {
     if !features.scripts {
-        Cow::Owned(WORKSPACE_AGENT.replacen(WORKSPACE_AGENT_SCRIPTS_GUIDELINE, "", 1))
+        Cow::Owned(
+            set.workspace_agent
+                .replacen(WORKSPACE_AGENT_SCRIPTS_GUIDELINE, "", 1),
+        )
     } else if !features.terminal_access {
-        Cow::Owned(WORKSPACE_AGENT.replacen(
+        Cow::Owned(set.workspace_agent.replacen(
             "instead of terminal/launch-process",
             "instead of launch-process",
             1,
         ))
     } else {
-        Cow::Borrowed(WORKSPACE_AGENT)
+        Cow::Borrowed(set.workspace_agent)
     }
 }
 
-/// Compose the bundled specialization rules for `agent_type` (port of
-/// `getInstructionWithCommon`): common → workspace → specific, with the
+/// [`get_instruction_with_common_for`] over the LATEST instruction set.
+/// Test-only convenience (byte-pin goldens, unit tests): every production
+/// caller has a session in scope and resolves the session's pinned set via
+/// the harness registry instead (prompt assembly, and the commit-message
+/// background body in `auto_commit.rs`).
+#[cfg(test)]
+pub(crate) fn get_instruction_with_common(
+    agent_type: &str,
+    features: &AgentFeaturesSettings,
+) -> String {
+    get_instruction_with_common_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        agent_type,
+        features,
+    )
+}
+
+/// Compose the bundled specialization rules for `agent_type` from `set` (port
+/// of `getInstructionWithCommon`): common → workspace → specific, with the
 /// `common`/`workspace`/utility/non-interactive special cases. Unknown ids fall
 /// back to the `workspace` body via [`get_instruction_by_id`]. Feature-gated
 /// sections (per `[agentFeatures]`, captured at session creation) are omitted
 /// from the bundled bodies; with all defaults on the output is byte-identical
 /// to the ungated composition.
-pub(crate) fn get_instruction_with_common(
+pub(crate) fn get_instruction_with_common_for(
+    set: &'static InstructionSet,
     agent_type: &str,
     features: &AgentFeaturesSettings,
 ) -> String {
     let specific: Cow<'static, str> = if agent_type == "workspace-agent" {
-        gated_workspace_agent(features)
+        gated_workspace_agent(set, features)
+    } else if agent_type == "task-breakdown" {
+        gated_task_breakdown(set, features)
     } else {
-        Cow::Borrowed(get_instruction_by_id(agent_type, true).unwrap_or(WORKSPACE))
+        Cow::Borrowed(get_instruction_by_id(set, agent_type, true).unwrap_or(set.workspace))
     };
     if agent_type == "common" {
-        return gated_common(features).into_owned();
+        return gated_common(set, features).into_owned();
     }
-    let common = gated_common(features);
+    let common = gated_common(set, features);
     if agent_type == "workspace" {
         return format!("{common}\n\n---\n\n{specific}");
     }
@@ -217,7 +382,8 @@ pub(crate) fn get_instruction_with_common(
     if is_utility_agent(agent_type) {
         return format!("{common}\n\n---\n\n{specific}");
     }
-    format!("{common}\n\n---\n\n{WORKSPACE}\n\n---\n\n{specific}")
+    let workspace = set.workspace;
+    format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{specific}")
 }
 
 #[cfg(test)]
@@ -228,14 +394,23 @@ mod tests {
         AgentFeaturesSettings::default()
     }
 
+    /// Every gate open: the defaults plus the opt-in `taskGraph`, so gated
+    /// bodies are byte-identical to the bundled sources.
+    fn all_on() -> AgentFeaturesSettings {
+        AgentFeaturesSettings {
+            task_graph: true,
+            ..AgentFeaturesSettings::default()
+        }
+    }
+
     #[test]
     fn common_only_is_not_self_wrapped() {
-        assert_eq!(get_instruction_with_common("common", &defaults()), COMMON);
+        assert_eq!(get_instruction_with_common("common", &all_on()), COMMON);
     }
 
     #[test]
     fn workspace_gets_common_prepended_once() {
-        let out = get_instruction_with_common("workspace", &defaults());
+        let out = get_instruction_with_common("workspace", &all_on());
         assert_eq!(out, format!("{COMMON}\n\n---\n\n{WORKSPACE}"));
     }
 
@@ -273,7 +448,7 @@ mod tests {
 
     #[test]
     fn workspace_agent_gets_common_workspace_specific() {
-        let out = get_instruction_with_common("task-loop", &defaults());
+        let out = get_instruction_with_common("task-loop", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{TASK_LOOP}")
@@ -283,7 +458,7 @@ mod tests {
     #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
         // The spawn default agent type is unknown → fallbackToWorkspace.
-        let out = get_instruction_with_common("interactive", &defaults());
+        let out = get_instruction_with_common("interactive", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{WORKSPACE}")
@@ -292,7 +467,7 @@ mod tests {
 
     #[test]
     fn fix_alias_resolves_to_debug() {
-        let out = get_instruction_with_common("fix", &defaults());
+        let out = get_instruction_with_common("fix", &all_on());
         assert_eq!(
             out,
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{DEBUG}")
@@ -305,11 +480,11 @@ mod tests {
         // membership checks use the raw id ("review"/"walkthrough"), which are not
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
-            get_instruction_with_common("review", &defaults()),
+            get_instruction_with_common("review", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
-            get_instruction_with_common("walkthrough", &defaults()),
+            get_instruction_with_common("walkthrough", &all_on()),
             format!("{COMMON}\n\n---\n\n{WORKSPACE}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }
@@ -317,12 +492,82 @@ mod tests {
     // --- [agentFeatures] prompt gating ---
 
     #[test]
-    fn defaults_keep_gated_bodies_borrowed_and_byte_identical() {
-        let d = defaults();
-        assert!(matches!(gated_common(&d), Cow::Borrowed(_)));
-        assert!(matches!(gated_workspace_agent(&d), Cow::Borrowed(_)));
-        assert_eq!(gated_common(&d).as_ref(), COMMON);
-        assert_eq!(gated_workspace_agent(&d).as_ref(), WORKSPACE_AGENT);
+    fn all_on_keeps_gated_bodies_borrowed_and_byte_identical() {
+        let a = all_on();
+        assert!(matches!(gated_common(&V1, &a), Cow::Borrowed(_)));
+        assert!(matches!(gated_workspace_agent(&V1, &a), Cow::Borrowed(_)));
+        assert!(matches!(gated_task_breakdown(&V1, &a), Cow::Borrowed(_)));
+        assert_eq!(gated_common(&V1, &a).as_ref(), COMMON);
+        assert_eq!(gated_workspace_agent(&V1, &a).as_ref(), WORKSPACE_AGENT);
+        assert_eq!(gated_task_breakdown(&V1, &a).as_ref(), TASK_BREAKDOWN);
+    }
+
+    #[test]
+    fn task_graph_off_removes_task_relations_from_common() {
+        // Guards: the markers still match the bundled body verbatim.
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_START));
+        assert!(COMMON.contains(COMMON_TASK_RELATIONS_END));
+        // Default features have `taskGraph` off (opt-in).
+        let common = gated_common(&V1, &defaults());
+        assert!(!common.contains("### Task relations during delegation"));
+        assert!(!common.contains("unlockPlan"));
+        assert!(!common.contains("Tasks now unblocked"));
+        // Single-task delegation guidance and the surrounding section survive
+        // with a clean seam (the pre-teaching layout).
+        assert!(common.contains("## Delegating Tasks"));
+        assert!(common.contains(
+            "waitMode: \"after_all\" })\n```\n\nKeep delegated tasks visible in the note"
+        ));
+    }
+
+    #[test]
+    fn task_graph_on_common_teaching_is_advisory_not_doctrine() {
+        // Flag ON: the advisory subsection is present…
+        let common = gated_common(&V1, &all_on());
+        assert!(common.contains("### Task relations during delegation"));
+        assert!(common.contains("**Holds are advisory, not final.**"));
+        // …and none of the batch-delegation doctrine phrases remain
+        // (intent-hq/monorepo#2445 regression, reworked per monorepo#2457).
+        for gone in [
+            "preferred for multi-task plans",
+            "remaining list",
+            "tasks: [\"t1\", \"t2\", \"t3\"]",
+            "Re-call delegate",
+            "re-call",
+            "greedy",
+        ] {
+            assert!(!common.contains(gone), "doctrine phrase survived: {gone:?}");
+        }
+    }
+
+    #[test]
+    fn task_graph_off_removes_relations_teaching_from_task_breakdown() {
+        // Guards: every needle still matches the bundled body verbatim.
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_RELATIONS_START));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_RELATIONS_END));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_DEPENDS_ON_CLAUSE));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_HEADER));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_KEY_LINE));
+        assert!(TASK_BREAKDOWN.contains(BREAKDOWN_EXAMPLE_DEPENDS_LINE));
+        let body = gated_task_breakdown(&V1, &defaults());
+        assert!(!body.contains("### Contract-First Splitting"));
+        assert!(!body.contains("### Declaring Task Relations"));
+        assert!(!body.contains("dependsOn"));
+        assert!(!body.contains("conflictsWith"));
+        assert!(!body.contains("key=research"));
+        assert!(!body.contains("effort="));
+        // Neighboring content survives with a clean seam, and the example
+        // reverts to plain `@@@task` fences.
+        assert!(body.contains("- \"Add single line comment\"\n\n## Breakdown Process"));
+        assert!(body.contains("\tExample (two subtasks):"));
+        assert!(body.contains("\t@@@task\n\t# Research existing patterns"));
+        assert!(body.contains("\t@@@task\n\t# Implement validation"));
+        assert!(body.contains("- Order subtasks by dependencies (what needs to happen first)\n"));
+        // The ungated convertBlocks materialization rule survives.
+        assert!(body.contains("ws.task.convertBlocks(\"spec\")"));
+        // Composition routes task-breakdown through the gate.
+        let out = get_instruction_with_common("task-breakdown", &defaults());
+        assert!(!out.contains("### Declaring Task Relations"));
     }
 
     #[test]
@@ -348,7 +593,7 @@ mod tests {
             host_exec: false,
             ..defaults()
         };
-        let common = gated_common(&features);
+        let common = gated_common(&V1, &features);
         assert!(common.contains("## Waiting on External Conditions"));
         assert!(!common.contains("ws.host.exec"));
         // The bullet survives, still leading with the snapshot override…
@@ -364,7 +609,7 @@ mod tests {
             rich_chat_blocks: false,
             ..defaults()
         };
-        let common = gated_common(&features);
+        let common = gated_common(&V1, &features);
         assert!(!common.contains("## Rich Chat Rendering"));
         assert!(!common.contains("mermaid"));
         // The section is last in common.md: the body ends cleanly after the
@@ -400,7 +645,7 @@ mod tests {
             attention_requests: false,
             ..defaults()
         };
-        let common = gated_common(&features);
+        let common = gated_common(&V1, &features);
         assert!(!common.contains("## Waiting on External Conditions"));
         assert!(!common.contains("## Rich Chat Rendering"));
         assert!(!common.contains("## Raising Attention"));

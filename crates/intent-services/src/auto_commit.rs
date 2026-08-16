@@ -17,7 +17,7 @@ use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
 use intent_git::commit::CLEAN_TREE_ERROR;
 
 use crate::events::SubscriptionFilter;
-use crate::instructions::get_instruction_with_common;
+use crate::instructions::get_instruction_with_common_for;
 use crate::Services;
 
 /// Subject-line cap for auto-commit fallback messages (TS
@@ -42,10 +42,8 @@ const RECENT_COMMITS_LIMIT: usize = 10;
 /// back. Tests compress it via [`crate::Services::with_auto_commit_timeout_ms`].
 const GENERATION_TIMEOUT_MS: u64 = 30_000;
 
-/// Opening tag that wraps the LLM-generated commit message.
-const COMMIT_MESSAGE_OPEN_TAG: &str = "<<<COMMIT_MESSAGE>>>";
-/// Closing tag that wraps the LLM-generated commit message.
-const COMMIT_MESSAGE_CLOSE_TAG: &str = "<<</COMMIT_MESSAGE>>>";
+/// Cap on the raw LLM output logged (at debug level) when parsing fails.
+const RAW_OUTPUT_LOG_CAP_CHARS: usize = 500;
 
 /// Whether the `agent:idle` `finishReason` is a normal turn-end we should
 /// auto-commit on. Anything outside this allowlist (or missing) is treated as
@@ -109,15 +107,39 @@ fn build_message_prompt(
     parts.join("\n")
 }
 
-/// Parse the LLM output for the commit message wrapped in
-/// `<<<COMMIT_MESSAGE>>>` tags. Returns `None` when the output is
-/// unparseable, empty, or the tags are missing.
-fn parse_commit_message(output: &str) -> Option<String> {
-    let start = output.find(COMMIT_MESSAGE_OPEN_TAG)?;
-    let after_open = start + COMMIT_MESSAGE_OPEN_TAG.len();
-    let end = output[after_open..].find(COMMIT_MESSAGE_CLOSE_TAG)?;
-    let message = output[after_open..after_open + end].trim();
-    (!message.is_empty()).then(|| message.to_string())
+/// Deserialized shape of the model's JSON reply (the `commit-message.md`
+/// output contract): a required subject plus an optional body.
+#[derive(serde::Deserialize)]
+struct CommitMessageReply {
+    subject: String,
+    body: Option<String>,
+}
+
+/// Parse the LLM output for the `{"subject", "body"?}` JSON object requested
+/// by `commit-message.md`. Tolerates surrounding prose and code fences by
+/// attempting a deserialize at each `{` until one parses with a non-empty
+/// subject (trailing text after the object is ignored; a parseable candidate
+/// with a blank subject is skipped like a malformed one). Returns the
+/// composed message — `subject`, or `subject\n\nbody` when a non-empty body
+/// is present — or `None` when no candidate yields a non-empty subject.
+fn parse_commit_message_json(output: &str) -> Option<String> {
+    for (idx, _) in output.match_indices('{') {
+        let mut stream =
+            serde_json::Deserializer::from_str(&output[idx..]).into_iter::<CommitMessageReply>();
+        if let Some(Ok(reply)) = stream.next() {
+            let subject = reply.subject.trim();
+            if subject.is_empty() {
+                continue;
+            }
+            let body = reply.body.as_deref().map(str::trim).unwrap_or("");
+            return Some(if body.is_empty() {
+                subject.to_string()
+            } else {
+                format!("{subject}\n\n{body}")
+            });
+        }
+    }
+    None
 }
 
 impl Services {
@@ -391,7 +413,12 @@ impl Services {
         );
         // `commit-message` is a non-interactive background body with no
         // feature-gated sections, so default flags are always correct here.
-        let system_prompt = get_instruction_with_common(
+        // Pinned to the session's stamped harness version (H2): the
+        // background body tracks the doctrine the owning session runs on.
+        let system_prompt = get_instruction_with_common_for(
+            crate::harness::resolve_entry(&session.harness_version)
+                .doctrine
+                .instructions,
             "commit-message",
             &intent_core::settings_file::AgentFeaturesSettings::default(),
         );
@@ -413,7 +440,7 @@ impl Services {
         match result {
             Ok(value) => {
                 let text = value["text"].as_str().unwrap_or("");
-                match parse_commit_message(text) {
+                match parse_commit_message_json(text) {
                     Some(msg) => {
                         tracing::debug!(
                             workspace = %session.workspace_id.0,
@@ -424,7 +451,13 @@ impl Services {
                     None => {
                         tracing::warn!(
                             workspace = %session.workspace_id.0,
-                            "generate_auto_commit_message: unparseable output (missing tags or empty)"
+                            "generate_auto_commit_message: unparseable output (no JSON object with a non-empty subject)"
+                        );
+                        let raw: String = text.chars().take(RAW_OUTPUT_LOG_CAP_CHARS).collect();
+                        tracing::debug!(
+                            workspace = %session.workspace_id.0,
+                            raw = %raw,
+                            "generate_auto_commit_message: unparseable raw output (truncated)"
                         );
                         None
                     }

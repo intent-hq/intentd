@@ -33,6 +33,7 @@ pub mod settings_file;
 pub mod slug;
 pub mod tilde;
 pub mod traits;
+pub mod transfer;
 pub mod turn_attachments;
 
 pub use agent_configs::{
@@ -43,15 +44,21 @@ pub use agent_logs::{
     sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
 };
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
-pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
+pub use clock::{
+    iso_from_unix_secs, iso_minutes_ago, iso_ms_from_now, now_epoch_ms, now_iso, parse_iso,
+};
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
-pub use ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceId, CHIEF_WORKSPACE_ID};
+pub use ids::{
+    AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
+    CHIEF_WORKSPACE_ID,
+};
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
+pub use model::CURRENT_HARNESS_VERSION;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
@@ -62,16 +69,17 @@ pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    AnchorContext, AuthorType, CheckoutMode, Client, Comment, CommentAddResult, CommentAnchor,
-    CommentAnchorType, CommentDeleteResult, CommentGetThreadResult, CommentListResult,
-    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
-    CommentStatus, CommentThread, CommentThreadSummary, CommentType, CommentWire, ContentType,
-    ContextItem, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, ExecutionEnvironmentRepoConfig, FileActivity,
-    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitPullResult, GitStatus, GuestImageRef, Hook, HookState, KnownRepo,
-    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
-    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput,
+    AnchorContext, AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
+    CommentType, CommentWire, ContentType, ContextItem, CreatedTaskEntry, DiskUsageBreakdownEntry,
+    Draft, Event, EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
+    ExecutionEnvironmentRepoConfig, FileActivity, FileStatus, GitAgentCommitResult,
+    GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus, GitMergeConflicts, GitPullResult,
+    GitStatus, GuestImageRef, Hook, HookState, KnownRepo, LineAttributionAuthor,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
     NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
@@ -80,13 +88,14 @@ pub use model::{
     ScriptCreateParams, ScriptMode, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
     SetupScriptGeneratedBy, SuggestionDiff, TaskAgentLink, TaskAssignAgentResult,
     TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
-    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace, WorkspaceActivity,
-    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, TokenUsageTotals, TopChangedFile, UsageCost, VmResources, Workspace,
+    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiffSummary,
     WorkspaceDiffSummaryFile, WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceGitRoot, WorkspaceGitRootSource, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
+    WorkspaceUpdate,
 };
 pub use path_utils::prewarm_login_shell_path;
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};

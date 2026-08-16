@@ -10,7 +10,7 @@ use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
     NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceUpdate,
+    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
 };
 use serde_json::{json, Map, Value};
 use tracing::Instrument;
@@ -115,6 +115,46 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: "Internal error".to_string(),
             data: Some(json!({ "code": "voice-no-api-key", "detail": detail })),
+        },
+        // `git.showFile` on a non-blob tree entry (gitlink / tree): -32602
+        // with machine-readable `data = { code: "not-a-file", path, mode }`
+        // so clients can route submodule pins to a dedicated presentation
+        // instead of matching on prose (monorepo#1739).
+        ref e @ Error::NotAFile { ref path, ref mode } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "not-a-file", "path": path, "mode": mode })),
+        },
+        // Opportunistic warm rejected because one is already in flight:
+        // -32603 with machine-readable `data = { code: "warm-in-flight",
+        // owner, repo }` naming the repo currently being warmed, so the FE
+        // can stay silent without matching on prose.
+        ref e @ Error::WarmInFlight {
+            ref owner,
+            ref repo,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "warm-in-flight", "owner": owner, "repo": repo })),
+        },
+        // `agent.completeOnce` queued past its own timeout at the daemon-wide
+        // ephemeral-adapter bound: -32603 with machine-readable
+        // `data = { code: "adapter-busy", provider, waitedMs, limit }` so a
+        // client tells daemon saturation apart from a slow model — and knows
+        // the retry is safe, since nothing was spawned (monorepo#2062).
+        ref e @ Error::AdapterBusy {
+            ref provider,
+            waited_ms,
+            limit,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "adapter-busy",
+                "provider": provider,
+                "waitedMs": waited_ms,
+                "limit": limit,
+            })),
         },
         // -32602 discriminator (monorepo#1320): `data.code` distinguishes a
         // nonexistent entity from bad request params; messages are unchanged.
@@ -296,6 +336,11 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
     if is_notification {
         return None;
     }
+    // The log-only large-frame warning for outbound responses lives in
+    // `panic_guard::guard_frame` (the chokepoint covering fast-path responses
+    // that bypass this dispatcher, e.g. `host.exec`). The `-32010`
+    // replacement below hands a small error frame to that check, so an
+    // oversized response is never double-warned on top of its `error!`.
     Some(match result {
         Ok(v) => {
             let frame = success_string(echo_id.clone(), v);
@@ -371,8 +416,33 @@ async fn dispatch(
         }
         "workspace.delete" => {
             let id = require_workspace_id(params)?;
-            api.delete_workspace(id).await.map_err(workspace_err)?;
-            Ok(json!({ "success": true }))
+            // Delete grace window (§5.1): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .schedule_workspace_delete(id, undo_delay_ms)
+                    .await
+                    .map_err(workspace_err)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                api.delete_workspace(id).await.map_err(workspace_err)?;
+                Ok(json!({ "success": true }))
+            }
+        }
+        "workspace.cancelDelete" => {
+            let id = require_workspace_id(params)?;
+            let cancelled = api
+                .cancel_workspace_delete(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "cancelled": cancelled }))
         }
         "workspace.archive" => {
             let id = require_workspace_id(params)?;
@@ -391,6 +461,70 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let result = api.workspace_disk_usage(id).await.map_err(workspace_err)?;
             Ok(result)
+        }
+        "workspace.transfer.plan" => {
+            let id = require_workspace_id(params)?;
+            let plan = api
+                .workspace_transfer_plan(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "plan": plan }))
+        }
+        "workspace.import.begin" => {
+            let manifest = params
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_params("manifest is required"))?;
+            let archive_size_bytes = require_u64(params, "archiveSizeBytes")?;
+            let archive_sha256 = require_str_param(params, "archiveSha256")?;
+            api.workspace_import_begin(manifest, archive_size_bytes, archive_sha256)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.chunk" => {
+            let import_id = require_str_param(params, "importId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.workspace_import_chunk(import_id, seq, data)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.commit" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_commit(import_id)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.import.abort" => {
+            let import_id = require_str_param(params, "importId")?;
+            api.workspace_import_abort(import_id)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.export.start" => {
+            let id = require_workspace_id(params)?;
+            api.workspace_export_start(id).await.map_err(workspace_err)
+        }
+        "workspace.export.read" => {
+            let export_id = require_str_param(params, "exportId")?;
+            let seq = require_u64(params, "seq")?;
+            api.workspace_export_read(export_id, seq)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.export.finalize" => {
+            let export_id = require_str_param(params, "exportId")?;
+            let archive_source = opt_bool_strict(params, "archiveSource")?.unwrap_or(false);
+            let final_status_message = opt_str(params, "finalStatusMessage");
+            api.workspace_export_finalize(export_id, archive_source, final_status_message)
+                .await
+                .map_err(workspace_err)
+        }
+        "workspace.export.abort" => {
+            let export_id = require_str_param(params, "exportId")?;
+            api.workspace_export_abort(export_id)
+                .await
+                .map_err(workspace_err)
         }
         "workspace.dismissAttention" => {
             let id = require_workspace_id(params)?;
@@ -595,11 +729,13 @@ async fn dispatch(
             // Transport (UDS + WSS) is the user-originated JSON-RPC path; no
             // caller-agent context is threaded here, so note-version author
             // resolves to the user. Agent writes come through MCP bindings.
-            let note = api
+            // Result is `{note, convertedCount, createdTaskNoteIds,
+            // createdTasks, warnings}` — additive over the old `{note}` shape.
+            let result = api
                 .create_note(ws, input, idempotency_key, None)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(json!({ "note": note }))
+            to_result_value(&result)
         }
         "note.update" => {
             let ws = require_ws_note(params)?;
@@ -830,8 +966,30 @@ async fn dispatch(
             let status = require_str_param(params, "status")?;
             let acceptance_criteria = normalize_acceptance_criteria(params);
             let effort = opt_str(params, "effort");
+            let depends_on = opt_note_id_array(params, "dependsOn");
+            let conflicts_with = opt_note_id_array(params, "conflictsWith");
             let result = api
-                .mark_as_task(ws, note_id, status, acceptance_criteria, effort, None)
+                .mark_as_task(
+                    ws,
+                    note_id,
+                    status,
+                    acceptance_criteria,
+                    effort,
+                    depends_on,
+                    conflicts_with,
+                    None,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "task.setRelations" => {
+            let ws = require_ws_note(params)?;
+            let note_id = require_note_id(params)?;
+            let depends_on = opt_note_id_array(params, "dependsOn");
+            let conflicts_with = opt_note_id_array(params, "conflictsWith");
+            let result = api
+                .task_set_relations(ws, note_id, depends_on, conflicts_with)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1205,6 +1363,7 @@ async fn dispatch(
                 workspace_context: opt_value(params, "workspaceContext"),
                 context_references: opt_value(params, "contextReferences"),
                 image_blocks: opt_value(params, "imageBlocks"),
+                file_blocks: opt_value(params, "fileBlocks"),
                 is_background: opt_bool(params, "isBackground"),
                 name_explicitly_set,
             };
@@ -1582,11 +1741,37 @@ async fn dispatch(
         "agent.delete" => {
             let agent_id = require_agent_id(params)?;
             let ws = opt_workspace_id(params);
-            let result = api
-                .agent_delete(agent_id, ws)
+            // Delete grace window (§5.5): `undoDelayMs > 0` schedules an
+            // in-memory pending deletion instead of committing now. Absent
+            // or 0 keeps the immediate-delete behavior byte-identical.
+            let undo_delay_ms = match params.get("undoDelayMs") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v.as_u64().ok_or_else(|| {
+                    invalid_params("Invalid parameter: undoDelayMs must be a non-negative integer")
+                })?,
+            };
+            if undo_delay_ms > 0 {
+                let delete_at = api
+                    .agent_schedule_delete(agent_id, ws, undo_delay_ms)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(json!({ "success": true, "scheduled": true, "deleteAt": delete_at }))
+            } else {
+                let result = api
+                    .agent_delete(agent_id, ws)
+                    .await
+                    .map_err(domain_to_rpc)?;
+                Ok(result)
+            }
+        }
+        "agent.cancelDelete" => {
+            let agent_id = require_agent_id(params)?;
+            let ws = opt_workspace_id(params);
+            let cancelled = api
+                .agent_cancel_delete(agent_id, ws)
                 .await
                 .map_err(domain_to_rpc)?;
-            Ok(result)
+            Ok(json!({ "cancelled": cancelled }))
         }
         "agent.retry" => {
             let agent_id = require_agent_id(params)?;
@@ -1844,8 +2029,22 @@ async fn dispatch(
         }
         "git.status" => {
             let ws = require_ws_note(params)?;
-            let status = api.git_status(ws).await.map_err(domain_to_rpc)?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // scan to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
+            let status = api
+                .git_status(ws, git_root_id)
+                .await
+                .map_err(domain_to_rpc)?;
             to_result_value(&status)
+        }
+        "gitRoot.list" => {
+            // Every registered git root for a workspace (agent-registered and
+            // auto-detected) as `{ gitRoots: [...] }`, each row carrying a
+            // live-read `branch` (monorepo#2053). Missing workspace → -32602.
+            let ws = require_ws_note(params)?;
+            let r = api.git_root_list(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
         }
         "git.getConfig" => {
             let ws = require_ws_note(params)?;
@@ -1974,7 +2173,25 @@ async fn dispatch(
             }
         }
         "git.branchStatus" => {
-            let repo_path = require_str_param(params, "repoPath")?;
+            // §5.6 extension (monorepo#2053): `workspaceId` + `gitRootId` may
+            // stand in for `repoPath` — the registered root resolves to its
+            // path (unknown/foreign id → -32602). `repoPath` wins when both
+            // are supplied so existing callers are byte-identical.
+            let repo_path = match opt_str(params, "repoPath") {
+                Some(p) => p,
+                None => match opt_git_root_id(params) {
+                    Some(id) => {
+                        let ws = require_ws_note(params)?;
+                        // An unknown/foreign id maps through `domain_to_rpc`
+                        // like the other five scoped reads, so all six carry
+                        // the identical `invalid params: Unknown git root: X`
+                        // message (§5.6).
+                        api.git_root_path(ws, id).await.map_err(domain_to_rpc)?
+                    }
+                    // Neither supplied: the pre-existing missing-param error.
+                    None => return Err(require_str_param(params, "repoPath").unwrap_err()),
+                },
+            };
             let branch_name = require_str_param(params, "branchName")?;
             match api.git_branch_status(repo_path, branch_name).await {
                 Ok(status) => to_result_value(&status),
@@ -2010,6 +2227,18 @@ async fn dispatch(
             // `{ removed: bool }` (false when the path was not registered).
             let path = require_str_param(params, "path")?;
             let r = api.repo_remove(path).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "repo.warmCache" => {
+            // Opportunistic background refresh of the repo cache for one
+            // GitHub repo; returns `{ started: true, owner, repo }`
+            // immediately. A warm already in flight is rejected with the
+            // `warm-in-flight` busy error (PROTOCOL §5.6).
+            let github_url = require_str_param(params, "githubUrl")?;
+            let r = api
+                .repo_warm_cache(github_url)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         "git.clone" => {
@@ -2065,7 +2294,13 @@ async fn dispatch(
         }
         "git.changes" => {
             let ws = require_ws_note(params)?;
-            let r = api.git_changes(ws).await.map_err(domain_to_rpc)?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // scan to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
+            let r = api
+                .git_changes(ws, git_root_id)
+                .await
+                .map_err(domain_to_rpc)?;
             Ok(r)
         }
         // `git.diff` is accepted as an alias for the wire-canonical `git.diffs`.
@@ -2086,8 +2321,11 @@ async fn dispatch(
             // §5.6 extension: when `commitHash` is set the result is the hunks
             // for `<commitHash>^..<commitHash>` and `staged` is ignored.
             let commit_hash = opt_str(params, "commitHash");
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // walk to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_diffs(ws, paths, staged, commit_hash)
+                .git_diffs(ws, paths, staged, commit_hash, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2095,8 +2333,11 @@ async fn dispatch(
         "git.commitDetails" => {
             let ws = require_ws_note(params)?;
             let commit_hash = require_str_param(params, "commitHash")?;
+            // §5.6 extension (monorepo#2477): optional `gitRootId` scopes the
+            // read to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_commit_details(ws, commit_hash)
+                .git_commit_details(ws, commit_hash, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2108,8 +2349,11 @@ async fn dispatch(
             // limit }); fall back to top-level `limit`/`nextToken` for parity
             // with the other paginated reads.
             let (limit, page_token) = parse_page_params(params);
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // walk to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_commits(ws, limit, page_token)
+                .git_commits(ws, limit, page_token, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2118,8 +2362,11 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let file_path = require_str_param(params, "filePath")?;
             let git_ref = require_str_param(params, "ref")?;
+            // §5.6 extension (monorepo#2053): optional `gitRootId` scopes the
+            // read to a registered git root; an unknown/foreign id is -32602.
+            let git_root_id = opt_git_root_id(params);
             let r = api
-                .git_show_file(ws, file_path, git_ref)
+                .git_show_file(ws, file_path, git_ref, git_root_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2968,6 +3215,15 @@ async fn dispatch(
             let path = require_str_param(params, "path")?;
             api.file_read(ws, path, None).await.map_err(domain_to_rpc)
         }
+        "file.readChunk" => {
+            let ws = require_ws_note(params)?;
+            let path = require_str_param(params, "path")?;
+            let offset = require_u64(params, "offset")?;
+            let length = require_u64(params, "length")?;
+            api.file_read_chunk(ws, path, offset, length, None)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "file.write" => {
             let ws = require_ws_note(params)?;
             let path = require_str_param(params, "path")?;
@@ -3024,7 +3280,44 @@ async fn dispatch(
             let file_name = require_str_param(params, "fileName")?;
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
-            api.file_place_attachment(ws, file_name, data, source_path)
+            let mime_type = opt_str(params, "mimeType");
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.getAttachmentInfo" => {
+            let attachment_id = require_str_param(params, "attachmentId")?;
+            api.file_get_attachment_info(attachment_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.begin" => {
+            let ws = require_ws_note(params)?;
+            let file_name = require_str_param(params, "fileName")?;
+            let size_bytes = require_u64(params, "sizeBytes")?;
+            let sha256 = require_str_param(params, "sha256")?;
+            let mime_type = opt_str(params, "mimeType");
+            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.chunk" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            let seq = require_u64(params, "seq")?;
+            let data = require_str_param(params, "data")?;
+            api.file_attachment_upload_chunk(upload_id, seq, data)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.commit" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_commit(upload_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "file.attachmentUpload.abort" => {
+            let upload_id = require_str_param(params, "uploadId")?;
+            api.file_attachment_upload_abort(upload_id)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -3193,9 +3486,14 @@ async fn dispatch(
         "prMonitor.flush" => {
             let ws = require_ws_note(params)?;
             let monitor_id = require_str_param(params, "monitorId")?;
-            api.pr_monitor_flush_pending(ws, intent_core::PrMonitorId::from(monitor_id.as_str()))
-                .await
-                .map_err(domain_to_rpc)
+            let check = opt_bool_strict(params, "check")?.unwrap_or(false);
+            api.pr_monitor_flush_pending(
+                ws,
+                intent_core::PrMonitorId::from(monitor_id.as_str()),
+                check,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "rules.list" => {
             // Optional workspaceId: present → include the workspace's read-only
@@ -3539,6 +3837,13 @@ fn opt_nonempty_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     opt_str(params, name).filter(|s| !s.trim().is_empty())
 }
 
+/// Optional `gitRootId` param on the `git.*` reads (§5.6 extension,
+/// monorepo#2053). Empty/whitespace-only values are treated as absent so a
+/// client sending `gitRootId: ""` gets the primary-worktree behavior.
+fn opt_git_root_id(params: &Map<String, Value>) -> Option<WorkspaceGitRootId> {
+    opt_nonempty_str(params, "gitRootId").map(WorkspaceGitRootId::from)
+}
+
 /// Parse the `items` array from `workspace.updateContext` into a
 /// `Vec<ContextItem>`. The daemon treats each item as an opaque JSON blob
 /// authored by the FE (`ContextItem` union in
@@ -3611,6 +3916,12 @@ fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>>
             .map(str::to_string)
             .collect()
     })
+}
+
+/// Optional note-id-array param — `opt_str_array` mapped into `NoteId`s. Used
+/// for the `task.setRelations` / `task.markAsTask` relation lists.
+fn opt_note_id_array(params: &Map<String, Value>, name: &str) -> Option<Vec<NoteId>> {
+    opt_str_array(params, name).map(|ids| ids.into_iter().map(NoteId::from).collect())
 }
 
 /// Strict optional string-array param: absent/null → `Ok(None)`; an array of

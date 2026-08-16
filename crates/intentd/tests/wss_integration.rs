@@ -329,6 +329,47 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
+/// Send a `chat.subscribe` frame over a fresh WSS connection, wait for both
+/// the `{ subscriptionId }` response (matched on `id`) and the seq-0
+/// `subscription.push` snapshot, and return the snapshot object (§7.1).
+async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str, id: i64) -> Value {
+    let mut ws = connect_ws(port, cfg).await;
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("chat.subscribe frame timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == id {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let sub_resp = sub_resp.unwrap();
+    assert!(
+        sub_resp["result"]["subscriptionId"].as_str().is_some(),
+        "chat.subscribe returns subscriptionId: {sub_resp}"
+    );
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    snap["params"]["snapshot"].clone()
+}
+
 /// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
 /// `client_id` binding from `client.hello` persists across them (§16).
 async fn wss_session(port: u16, cfg: Arc<ClientConfig>, frames: Vec<String>) -> Vec<Value> {
@@ -757,6 +798,9 @@ async fn wss_oversized_message_terminates_connection() {
 /// Agent ids are server-assigned: `agent.create` rejects a client-supplied
 /// `agentId` with `-32602` ("server-assigned"), and a create without the
 /// field mints an `agent-{uuid}` id that `agent.get` resolves (PROTOCOL §5.5).
+/// The created/resolved `AgentLite` payloads also carry the harness stamp
+/// (`harnessVersion` = current constant, `harnessFeatures` = the captured
+/// agentFeatures snapshot) over the real wire (intent-hq/monorepo#2459).
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
@@ -805,6 +849,35 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
             .is_some_and(|tail| uuid::Uuid::parse_str(tail).is_ok()),
         "server mints agent-{{uuid}}: {created}"
     );
+    // Harness stamp on the create response (monorepo#2459): the wire carries
+    // the current version constant and the full captured agentFeatures
+    // snapshot in camelCase.
+    assert_eq!(
+        created["result"]["agent"]["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.create response carries harnessVersion: {created}"
+    );
+    let features = &created["result"]["agent"]["harnessFeatures"];
+    assert!(
+        features.is_object(),
+        "agent.create response carries the harnessFeatures snapshot: {created}"
+    );
+    for key in [
+        "backgroundHooks",
+        "hostExec",
+        "scripts",
+        "terminalAccess",
+        "browserAutomation",
+        "richChatBlocks",
+        "structuredQuestions",
+        "attentionRequests",
+        "stateSnapshot",
+    ] {
+        assert!(
+            features[key].is_boolean(),
+            "harnessFeatures.{key} must be a boolean toggle: {created}"
+        );
+    }
     let get_frame = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
     );
@@ -813,6 +886,37 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
         got["result"]["agent"]["id"].as_str(),
         Some(minted.as_str()),
         "agent.get at the server-minted id must resolve: {got}"
+    );
+    // The stamp survives the read path too (agent.get projects the persisted
+    // row, not the create-time in-memory value).
+    assert_eq!(
+        got["result"]["agent"]["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.get response carries harnessVersion: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["harnessFeatures"], *features,
+        "agent.get returns the same persisted harnessFeatures snapshot: {got}"
+    );
+    // agent.list projects the same stamp on its AgentLite rows.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(minted.as_str()))
+        .expect("minted agent in list");
+    assert_eq!(
+        row["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.list rows carry harnessVersion: {listed}"
+    );
+    assert_eq!(
+        row["harnessFeatures"], *features,
+        "agent.list rows carry the persisted harnessFeatures snapshot: {listed}"
     );
 
     srv.ws.stop().await;
@@ -1058,6 +1162,140 @@ async fn wss_agent_diagnostics_reports_queue_snapshots() {
     srv.ws.stop().await;
 }
 
+/// intent-hq/monorepo#1897 over the real WSS wire: a ready-to-send queue
+/// entry older than the stale-queue threshold on an idle agent surfaces as a
+/// `stale-queue-entry` stuck-risk in the `agent.diagnostics` response —
+/// `stuckRisks` names the agent and oldest entry, `summary.stuckRisks` counts
+/// it, and the `text` rendering mentions it. The stale entry is seeded via
+/// the durable queue snapshot + rehydration path (the same path a daemon
+/// restart uses), so the wire read reflects the live in-memory queue.
+#[tokio::test]
+async fn wss_agent_diagnostics_flags_stale_queue_entry() {
+    let dir = test_tempdir("intentd-wss-stalequeue-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    // Keep a concrete handle (Services is Clone over shared internals) so the
+    // test can rehydrate the seeded queue into the same live registry the
+    // WSS listener serves from.
+    let services_handle = services.clone();
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let mut opts = WsOptions {
+        base_port: 0,
+        ..WsOptions::default()
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = server.start().await.expect("start");
+
+    let created_ws = wss_call(
+        port,
+        cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Stale Queue"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Stale Queue Target"}}}}"#
+    );
+    let created = wss_call(port, cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+
+    // Seed one backdated and one fresh ready-to-send entry through the
+    // durable snapshot, then rehydrate into the live in-memory registry.
+    let stale_at = "2020-01-01T00:00:00Z";
+    let fresh_at = now_iso();
+    let row = |id: &str, position: i64, queued_at: &str| intent_store::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position,
+        payload: serde_json::json!({
+            "id": id,
+            "content": "undelivered wake",
+            "queuedAt": queued_at,
+        }),
+        created_at: queued_at.into(),
+        turn_id: id.into(),
+    };
+    store
+        .replace_agent_queue(
+            &agent,
+            &[
+                row("qmsg-stale", 0, stale_at),
+                row("qmsg-fresh", 1, &fresh_at),
+            ],
+        )
+        .await
+        .expect("seed queue");
+    let rehydrated = services_handle
+        .rehydrate_agent_queues()
+        .await
+        .expect("rehydrate queues");
+    assert_eq!(rehydrated, 2, "both seeded entries rehydrated");
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(port, cfg.clone(), &diag_frame).await;
+    assert_eq!(diag["jsonrpc"], Value::String("2.0".into()), "{diag}");
+    assert_eq!(diag["id"], Value::from(3), "{diag}");
+    let d = &diag["result"]["diagnostics"];
+    let risks = d["stuckRisks"].as_array().expect("stuckRisks array");
+    let risk = risks
+        .iter()
+        .find(|r| r["type"] == serde_json::json!("stale-queue-entry"))
+        .expect("stale-queue-entry risk on the wire");
+    assert_eq!(risk["severity"], Value::String("warning".into()), "{risk}");
+    assert_eq!(risk["agentId"], Value::String(agent_id.clone()), "{risk}");
+    assert_eq!(
+        risk["entryId"],
+        Value::String("qmsg-stale".into()),
+        "{risk}"
+    );
+    assert_eq!(
+        risk["count"],
+        Value::from(1),
+        "fresh entry excluded: {risk}"
+    );
+    assert!(
+        risk["ageMs"].as_i64().expect("ageMs") > 5 * 60 * 1000,
+        "{risk}"
+    );
+    assert_eq!(
+        d["summary"]["stuckRisks"],
+        Value::from(risks.len()),
+        "summary counts the risks: {d}"
+    );
+    let text = diag["result"]["text"].as_str().expect("text");
+    assert!(text.contains("stale-queue-entry"), "text: {text}");
+
+    server.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
@@ -1198,7 +1436,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1348,7 +1586,7 @@ async fn wss_agent_set_model_provider_id_param() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -1530,7 +1768,7 @@ async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
     // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
     // version key must match each provider's current one ("" — no pin).
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2246,7 +2484,7 @@ async fn wss_agent_delegate_persists_reasoning_effort() {
 async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_levels() {
     let dir = test_tempdir("intentd-wss-create-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -2344,7 +2582,7 @@ async fn wss_agent_create_validates_reasoning_effort_against_cached_effort_level
 async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     let dir = test_tempdir("intentd-wss-settings-effort-");
     let cache = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -3525,7 +3763,7 @@ async fn wss_models_list_legacy_old_entry_served_and_forced_failure_stale() {
             .unwrap_or(0)
     };
     let last_good = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "entries": {
             "auggie": {
                 "versionKey": "",
@@ -3965,6 +4203,163 @@ async fn wss_agent_complete_once_acp_adapter_failure_is_internal_error() {
     assert_eq!(resp["error"]["code"], -32603);
     let data = resp["error"]["data"].as_str().unwrap_or_default();
     assert!(data.starts_with("codex: "), "unexpected data: {data}");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued_calls_complete() {
+    // The daemon-wide ephemeral-adapter bound over the real wire (§5.32,
+    // monorepo#2062). With the bound saturated by parked adapters, a call
+    // whose own `timeoutMs` expires while queued comes back as -32603 with
+    // OBJECT-shaped `error.data` — `{ code: "adapter-busy", provider,
+    // waitedMs, limit }` — which is what distinguishes queueing pressure from
+    // every other completeOnce failure on this method, all of which carry a
+    // bare STRING `data` (see the adapter-failure test above). The parked
+    // callers then finish normally: the bound queues work, it does not shed
+    // it.
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping adapter-busy e2e: node not on PATH");
+        return;
+    }
+    // Adapters that hold their slot for ~10s before answering the turn, so the
+    // bound is saturated for a wide, non-racy window. The wrapper records one
+    // line per adapter actually launched: the assertions below count it rather
+    // than inferring from the response which branch ran, so a queue timeout
+    // that quietly spawned (or a `-32603` arriving from some unrelated
+    // failure) cannot pass as a bound that held.
+    use std::os::unix::fs::PermissionsExt;
+    let adapter_dir = test_tempdir("intentd-wss-acp-busy-");
+    let spawn_log = adapter_dir.path().join("spawns.log");
+    let bin = adapter_dir.path().join("codex-acp");
+    let fixture = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho $$ >> {log:?}\n\
+             MOCK_AGENT_BEHAVIOR='{{\"firstTurnDelayMs\":10000,\"response\":\"🤖\\nparked-reply\"}}' \
+             exec node {fixture:?} \"$@\"\n",
+            log = spawn_log.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawned_count = || -> usize {
+        std::fs::read_to_string(&spawn_log)
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    };
+    let spawned = |what: &str| -> usize {
+        let n = spawned_count();
+        eprintln!("adapter-busy e2e: {what}: {n} adapter(s) launched");
+        n
+    };
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("providers.active", serde_json::json!("codex"));
+    srv.set_setting(
+        "providers.paths",
+        serde_json::json!({ "codex": bin.to_string_lossy() }),
+    );
+
+    // The bound is a process-global installed once; ask for 1 and fill
+    // whatever is actually in force, so this holds under any test runner.
+    intent_services::init_adapter_slots(1);
+    let limit = intent_services::adapter_slot_limit() as usize;
+
+    let parked: Vec<_> = (0..limit)
+        .map(|i| {
+            let (port, cfg) = (srv.port, srv.cfg.clone());
+            tokio::spawn(async move {
+                wss_call(
+                    port,
+                    cfg,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"method":"agent.completeOnce","params":{{"prompt":"park","timeoutMs":30000}}}}"#,
+                        600 + i
+                    ),
+                )
+                .await
+            })
+        })
+        .collect();
+    // Wait for the bound to be OBSERVABLY saturated rather than sleeping a
+    // guessed interval: provider discovery before the spawn takes seconds on
+    // some hosts, and a fixed sleep would probe the queue before the parked
+    // calls hold their slots — the probe would then measure nothing and the
+    // test would pass or fail on timing luck.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while spawned_count() < limit && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if spawned("bound saturated") != limit {
+        // Name the actual failure instead of just "0 != 1": a parked call that
+        // never launched an adapter has an answer (a gate/unavailable result,
+        // or an error), and that answer is the diagnosis.
+        let mut outcomes = Vec::new();
+        for run in parked {
+            outcomes.push(
+                match tokio::time::timeout(std::time::Duration::from_secs(5), run).await {
+                    Ok(Ok(v)) => v.to_string(),
+                    Ok(Err(e)) => format!("<join error: {e}>"),
+                    Err(_) => "<still in flight>".to_string(),
+                },
+            );
+        }
+        panic!(
+            "the parked calls launched {} of {limit} adapters, so the queue was \
+             never saturated and the probe below would measure nothing; parked \
+             call outcomes: {outcomes:?}",
+            spawned_count()
+        );
+    }
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":50,"method":"agent.completeOnce","params":{"prompt":"slug","timeoutMs":500}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 50);
+    assert_eq!(
+        resp["error"]["code"], -32603,
+        "a queue timeout is an error, not a result: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["data"]["code"], "adapter-busy",
+        "machine-readable discriminator so clients never match on prose: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["provider"], "codex");
+    assert_eq!(resp["error"]["data"]["limit"], limit as u64);
+    assert!(
+        resp["error"]["data"]["waitedMs"].as_u64().unwrap_or(0) >= 400,
+        "the caller waited out its own budget before giving up: {resp}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("codex"),
+        "human message names the provider: {resp}"
+    );
+    // The point of the bound: the rejected call spawned NOTHING, which is also
+    // why retrying it is safe.
+    assert_eq!(
+        spawned("after the adapter-busy rejection"),
+        limit,
+        "a queue-timed-out call must not have launched an adapter: {resp}"
+    );
+
+    // Everything that held a slot still completes — queued, not shed.
+    for (i, run) in parked.into_iter().enumerate() {
+        let r = run.await.expect("parked call joins");
+        assert_eq!(
+            r["result"]["text"], "parked-reply",
+            "parked one-shot #{i} must complete normally: {r}"
+        );
+    }
     srv.ws.stop().await;
 }
 
@@ -4517,9 +4912,11 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -4545,18 +4942,22 @@ fn fixture_note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-/// `task.list` over the real WSS wire returns `{ tasks, stats }` and the
-/// `stats` aggregate mirrors the FE `computeTaskStats` (`task-stats.ts`)
-/// classification: `total` excludes `cancelled`, `completed` counts `complete`,
-/// and `inProgress` counts `in_progress` + `review_required`. The optional
-/// `status` filter narrows `tasks` only — `stats` stays the unfiltered rollup
-/// so the FE renders the progress bar verbatim regardless of the active filter
-/// (PROTOCOL §5.4).
+/// `task.list` over the real WSS wire returns `{ tasks, stats }`: `tasks`
+/// membership is workspace-wide (every task note except the spec — direct
+/// spec children, subtasks, and unlinked tasks alike), each row carrying the
+/// `specLinked` flag (true iff the id appears in the spec body's
+/// `intent://local/task/{id}` links), while the `stats` aggregate stays the
+/// spec-linked direct-child rollup mirroring the FE `computeTaskStats`
+/// (`task-stats.ts`) classification: `total` excludes `cancelled`,
+/// `completed` counts `complete`, and `inProgress` counts `in_progress` +
+/// `review_required`. The optional `status` filter narrows `tasks` only —
+/// `stats` stays the unfiltered rollup so the FE renders the progress bar
+/// verbatim regardless of the active filter (PROTOCOL §5.4).
 #[tokio::test]
 async fn wss_task_list_emits_stats_aggregate() {
     let srv = start(WsOptions::default()).await;
 
-    // Seed a workspace + spec note + four task notes directly through the
+    // Seed a workspace + spec note + task notes directly through the
     // shared store — `note.create` mints a fresh `NoteId`, so the spec note
     // (which must have id == "spec") can only be created out-of-band.
     let ws = WorkspaceId::new();
@@ -4585,18 +4986,27 @@ async fn wss_task_list_emits_stats_aggregate() {
         });
         n
     };
+    // An unlinked task and a subtask (child of task-a) — both returned with
+    // `specLinked: false`, both excluded from the spec-linked `stats` rollup.
+    let mut orphan = mk_task("task-x", "Orphan", TaskStatus::NotStarted);
+    orphan.parent_id = None;
+    let mut sub = mk_task("task-sub", "Subtask", TaskStatus::InProgress);
+    sub.parent_id = Some(NoteId::from("task-a"));
     for n in [
         mk_task("task-a", "Alpha", TaskStatus::InProgress),
         mk_task("task-b", "Beta", TaskStatus::Complete),
         mk_task("task-c", "Gamma", TaskStatus::ReviewRequired),
         mk_task("task-d", "Delta", TaskStatus::Cancelled),
+        orphan,
+        sub,
     ] {
         srv.store.insert_note(&n).await.expect("insert task note");
     }
 
-    // Unfiltered: returns the four spec-linked tasks (cancelled included) and
-    // a `stats` rollup where `total` excludes the cancelled task and
-    // `inProgress` counts both in_progress + review_required.
+    // Unfiltered: returns all six task notes (cancelled, unlinked, and
+    // subtask included) and a `stats` rollup over the spec-linked set only,
+    // where `total` excludes the cancelled task and `inProgress` counts both
+    // in_progress + review_required.
     let req = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"task.list","params":{{"workspaceId":"{}"}}}}"#,
         ws.0
@@ -4619,7 +5029,10 @@ async fn wss_task_list_emits_stats_aggregate() {
         .map(|t| t["id"].as_str().expect("task id"))
         .collect();
     task_ids.sort_unstable();
-    assert_eq!(task_ids, vec!["task-a", "task-b", "task-c", "task-d"]);
+    assert_eq!(
+        task_ids,
+        vec!["task-a", "task-b", "task-c", "task-d", "task-sub", "task-x"]
+    );
     let by_id: std::collections::HashMap<&str, &Value> = tasks
         .iter()
         .map(|t| (t["id"].as_str().unwrap(), t))
@@ -4630,13 +5043,30 @@ async fn wss_task_list_emits_stats_aggregate() {
     assert_eq!(by_id["task-c"]["status"], "review_required");
     assert_eq!(by_id["task-d"]["status"], "cancelled");
     assert!(by_id["task-a"]["updatedAt"].is_string());
+    // `specLinked` is always serialized: true for spec-linked ids, false for
+    // the unlinked task and the subtask.
+    for id in ["task-a", "task-b", "task-c", "task-d"] {
+        assert_eq!(by_id[id]["specLinked"], true, "{id} is spec-linked");
+    }
+    for id in ["task-x", "task-sub"] {
+        assert_eq!(by_id[id]["specLinked"], false, "{id} is not spec-linked");
+    }
+    // `parentId` rides along (omitted when the note has no parent), so the
+    // subtask is distinguishable from the unlinked top-level task.
+    assert_eq!(by_id["task-a"]["parentId"], "spec");
+    assert_eq!(by_id["task-sub"]["parentId"], "task-a");
+    assert!(
+        by_id["task-x"].get("parentId").is_none(),
+        "parentId omitted for parentless notes: {}",
+        by_id["task-x"]
+    );
 
     let stats = &result["stats"];
     assert_eq!(stats["total"], 3, "total excludes cancelled: {stats}");
     assert_eq!(stats["completed"], 1, "completed = 1 complete: {stats}");
     assert_eq!(
         stats["inProgress"], 2,
-        "inProgress = in_progress + review_required: {stats}"
+        "inProgress = spec-linked in_progress + review_required: {stats}"
     );
     // Only the documented fields cross the wire (camelCase, no `tasks` array).
     let stats_keys: Vec<&str> = stats
@@ -5085,6 +5515,235 @@ async fn wss_git_commit_details_round_trip() {
         srv.cfg.clone(),
         &format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// `gitRoot.list` + the `gitRootId` param on the git reads over WSS
+/// (monorepo#2053): a registered secondary git root (a nested repo inside the
+/// workspace worktree) appears in `gitRoot.list` with its live-read branch,
+/// `git.status`/`git.changes` scoped by `gitRootId` target the nested repo
+/// instead of the workspace worktree, and an unknown `gitRootId` is `-32602`.
+#[tokio::test]
+async fn wss_git_root_list_and_scoped_reads_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed the primary repo with one commit and a nested repo inside it.
+    let repo_dir = test_tempdir("intentd-wssgitroot-");
+    let repo = repo_dir.path().to_path_buf();
+    let nested = repo.join("vendor/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let git = |dir: &std::path::PathBuf, args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    for dir in [&repo, &nested] {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(dir, &["add", "seed.txt"]);
+        git(dir, &["commit", "-q", "-m", "seed"]);
+    }
+    // A second commit unique to the nested repo — the identically-seeded
+    // repos can otherwise produce colliding seed-commit hashes, which would
+    // defeat the scoped-vs-unscoped `git.commitDetails` proof below.
+    std::fs::write(nested.join("nested-second.txt"), "nested\n").unwrap();
+    git(&nested, &["add", "nested-second.txt"]);
+    git(&nested, &["commit", "-q", "-m", "nested-second"]);
+    // An untracked file only the nested repo can see.
+    std::fs::write(nested.join("root-only.txt"), "hi\n").unwrap();
+
+    // Create a workspace pointing at the primary repo.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitRoot WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // No roots registered yet → empty list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["gitRoots"], serde_json::json!([]));
+
+    // Register the nested repo as a git root directly through the store (the
+    // agent-facing `ws.git.registerRoot` MCP binding lands separately).
+    let ts = now_iso();
+    let root = intent_core::WorkspaceGitRoot {
+        id: intent_core::WorkspaceGitRootId::new(),
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        path: nested.to_string_lossy().into_owned(),
+        source: intent_core::WorkspaceGitRootSource::Agent,
+        repo_owner: None,
+        repo_name: None,
+        registered_by_agent_ids: vec![intent_core::AgentId::from("agent-1")],
+        registered_commit_sha: Some("feedfacefeedfacefeedfacefeedfacefeedface".into()),
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: None,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    srv.store
+        .upsert_workspace_git_root(&root)
+        .await
+        .expect("register root");
+
+    // gitRoot.list returns the root with its live-read branch + attribution.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"gitRoot.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let roots = resp["result"]["gitRoots"].as_array().expect("gitRoots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["id"], root.id.as_str());
+    assert_eq!(roots[0]["path"], root.path);
+    assert_eq!(roots[0]["source"], "agent");
+    assert_eq!(
+        roots[0]["registeredByAgentIds"],
+        serde_json::json!(["agent-1"])
+    );
+    assert_eq!(
+        roots[0]["registeredCommitSha"],
+        "feedfacefeedfacefeedfacefeedfacefeedface"
+    );
+    assert!(
+        roots[0]["branch"].as_str().is_some_and(|b| !b.is_empty()),
+        "live-read branch present: {:?}",
+        roots[0]
+    );
+
+    // git.status scoped by gitRootId sees the nested repo's untracked file.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    assert!(
+        files.iter().any(|f| f["path"] == "root-only.txt"),
+        "nested repo scan: {files:?}"
+    );
+
+    // git.changes scoped by gitRootId projects the same nested file list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"git.changes","params":{{"workspaceId":"{ws_id}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(changes.iter().any(|c| c["path"] == "root-only.txt"));
+
+    // The unscoped reads still target the primary worktree.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let changes = resp["result"].as_array().expect("changes array");
+    assert!(
+        !changes.iter().any(|c| c["path"] == "root-only.txt"),
+        "primary scan unaffected: {changes:?}"
+    );
+
+    // Unknown gitRootId → -32602 (PROTOCOL §9).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.status","params":{{"workspaceId":"{ws_id}","gitRootId":"nope"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+
+    // git.commitDetails scoped by gitRootId resolves hashes in the nested
+    // repo's odb (monorepo#2477).
+    let nested_head = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&nested)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"{}"}}}}"#,
+            root.id.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["commitHash"],
+        Value::from(nested_head.clone())
+    );
+    assert_eq!(resp["result"]["message"], "nested-second");
+    assert_eq!(
+        resp["result"]["files"],
+        serde_json::json!(["nested-second.txt"])
+    );
+
+    // The unscoped read cannot resolve the nested repo's hash — the empty
+    // envelope, not an error.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["files"], serde_json::json!([]));
+
+    // Unknown gitRootId on git.commitDetails → -32602 (never an empty fallback).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"git.commitDetails","params":{{"workspaceId":"{ws_id}","commitHash":"{nested_head}","gitRootId":"nope"}}}}"#
         ),
     )
     .await;
@@ -6083,6 +6742,16 @@ async fn wss_git_show_file_round_trip() {
     std::fs::write(repo.join("seed.txt"), "seed\nadded\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "second"]);
+    // Commit a gitlink (submodule pin) via plumbing — the pin commit need not
+    // exist in this odb, exactly like a real submodule bump (monorepo#1739).
+    let pin_sha = "7257a190564088376227525989c4994e46082ad1";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{pin_sha},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
 
     let create_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS showFile WS","worktreePath":"{}","path":"{}"}}}}"#,
@@ -6095,7 +6764,8 @@ async fn wss_git_show_file_round_trip() {
         .expect("ws id")
         .to_string();
 
-    // Content at HEAD and at the parent revision.
+    // Content at HEAD and at an earlier revision (HEAD~2 — before the
+    // "second" edit; HEAD^ is the gitlink-less "second" commit).
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -6109,7 +6779,7 @@ async fn wss_git_show_file_round_trip() {
         srv.port,
         srv.cfg.clone(),
         &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD^"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"seed.txt","ref":"HEAD~2"}}}}"#
         ),
     )
     .await;
@@ -6125,6 +6795,22 @@ async fn wss_git_show_file_round_trip() {
     )
     .await;
     assert_eq!(resp["result"]["content"], "");
+
+    // Gitlink (submodule pin) path → typed -32602 with
+    // `data = { code: "not-a-file", path, mode }` (monorepo#1739).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"git.showFile","params":{{"workspaceId":"{ws_id}","filePath":"sub","ref":"HEAD"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(
+        resp["error"]["data"],
+        serde_json::json!({ "code": "not-a-file", "path": "sub", "mode": "160000" })
+    );
 
     // Unresolvable ref → -32603; missing ref param → -32602 (PROTOCOL §9).
     let resp = wss_call(
@@ -6145,6 +6831,141 @@ async fn wss_git_show_file_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+}
+
+/// Gitlink (submodule) wire shapes over WSS (monorepo#1739): `git.status`
+/// carries the additive `mode`/`oldSha`/`newSha` fields on the gitlink entry
+/// only, `git.changes` mirrors the same list, and `git.diffs` emits the
+/// synthesized one-line `Subproject commit <sha>` pseudo-hunk for the staged
+/// pin change.
+#[tokio::test]
+async fn wss_git_gitlink_status_and_diffs_wire_shape() {
+    let srv = start(WsOptions::default()).await;
+
+    let repo_dir = test_tempdir("intentd-wssgl-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    // Commit a gitlink pin, then stage a bump to a new pin (both via
+    // plumbing — the pin commits need not exist in this odb).
+    let old_pin = "7257a190564088376227525989c4994e46082ad1";
+    let new_pin = "7908777602d4e96f13c663c8a70a617163f38413";
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{old_pin},sub"),
+    ]);
+    git(&["commit", "-q", "-m", "add gitlink"]);
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{new_pin},sub"),
+    ]);
+    // A plain unstaged edit alongside, to assert regular files stay bare.
+    std::fs::write(repo.join("seed.txt"), "seed\nedited\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS gitlink WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // git.status: the gitlink entry carries mode/oldSha/newSha; the regular
+    // file entry omits all three (additive, backward-compatible).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.status","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files");
+    let sub = files
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .expect("gitlink entry");
+    assert_eq!(sub["status"], "M");
+    assert_eq!(sub["staged"], true);
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+    let seed = files
+        .iter()
+        .find(|f| f["path"] == "seed.txt")
+        .expect("regular entry");
+    for k in ["mode", "oldSha", "newSha"] {
+        assert!(seed.get(k).is_none(), "regular file must omit {k}");
+    }
+
+    // git.changes mirrors the same list.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.changes","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let sub = resp["result"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .find(|f| f["path"] == "sub")
+        .cloned()
+        .expect("gitlink entry");
+    assert_eq!(sub["mode"], "160000");
+    assert_eq!(sub["oldSha"], old_pin);
+    assert_eq!(sub["newSha"], new_pin);
+
+    // git.diffs (staged): the gitlink delta yields the synthesized
+    // `Subproject commit <sha>` pseudo-hunk.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","staged":true,"path":"sub"}}}}"#
+        ),
+    )
+    .await;
+    let entries = resp["result"].as_array().expect("diff entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["path"], "sub");
+    let hunks = entries[0]["hunks"].as_array().expect("hunks");
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(
+        hunks[0],
+        serde_json::json!({
+            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1,
+            "lines": [
+                { "type": "Deletion", "content": format!("Subproject commit {old_pin}\n"), "oldNumber": 1 },
+                { "type": "Addition", "content": format!("Subproject commit {new_pin}\n"), "newNumber": 1 },
+            ],
+        })
+    );
 
     srv.ws.stop().await;
 }
@@ -6496,7 +7317,8 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
 /// `agent.list` / `agent.get` (metadata + last-rows projection), a full
 /// `agent.getConversation` multi-page `nextToken` walk plus the
 /// `aroundMessageId` seek (centered page, `prevToken` walk newer, `-32602`
-/// on an unknown id), and the `chat.subscribe` seq-0 snapshot, all against
+/// on an unknown id), and the `chat.subscribe` seq-0 snapshot (standard,
+/// resumed via `sinceMessageId`, and the unknown-id fallback), all against
 /// one seeded 120-message session. Then the hydration regression at the wire
 /// level: with every row OLDER than the newest bounded page corrupted to
 /// non-JSON (which errors any path that decodes it — `agent.getSession`
@@ -6533,7 +7355,10 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let agent = AgentId::from(agent_id.as_str());
 
     // Seed a 120-message transcript — well past the 50-message default page.
+    // Capture the id at seq 100 (inside the bounded newest page 70..=119) for
+    // the `chat.subscribe` resume path below.
     let mut newest_message_id = String::new();
+    let mut seq_100_message_id = String::new();
     for i in 0..120 {
         let (role, text) = if i % 2 == 0 {
             ("user", format!("prompt {i}"))
@@ -6551,6 +7376,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
             .await
             .expect("append message")
             .id;
+        if i == 100 {
+            seq_100_message_id = newest_message_id.clone();
+        }
     }
 
     // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
@@ -6866,7 +7694,64 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         snapshot["nextToken"].as_str().is_some(),
         "truncated snapshot carries the older-pages cursor"
     );
+    assert!(
+        snapshot.get("resumed").is_none(),
+        "no sinceMessageId: snapshot carries no resumed key: {snapshot}"
+    );
     drop(sub);
+
+    // chat.subscribe resume (PROTOCOL §7.1): `sinceMessageId` inside the
+    // bounded page yields only the messages AFTER it, `resumed: true`, and no
+    // older-pages cursor (the client already holds everything up to the id).
+    let resumed = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"{seq_100_message_id}"}}}}"#
+        ),
+        40,
+    )
+    .await;
+    let msgs = resumed["messages"].as_array().expect("resumed messages");
+    assert_eq!(
+        msgs.len(),
+        19,
+        "only rows after seq 100 (101..=119): {resumed}"
+    );
+    assert_eq!(msgs[0]["seq"], 101);
+    assert_eq!(msgs[18]["seq"], 119);
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["truncated"], false);
+    assert!(resumed["nextToken"].is_null(), "no gap cursor: {resumed}");
+    assert_eq!(
+        resumed["totalMessages"], 120,
+        "totalMessages stays the transcript-wide count"
+    );
+
+    // An unknown / pruned sinceMessageId falls back to the standard full
+    // bounded page with `resumed: false` — the client must rehydrate.
+    let fallback = chat_subscribe_snapshot(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":41,"method":"chat.subscribe","params":{{"agentId":"{agent_id}","sinceMessageId":"msg-nope"}}}}"#
+        ),
+        41,
+    )
+    .await;
+    let msgs = fallback["messages"].as_array().expect("fallback messages");
+    assert_eq!(
+        msgs.len(),
+        50,
+        "full bounded page on unknown id: {fallback}"
+    );
+    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(fallback["resumed"], false);
+    assert_eq!(fallback["truncated"], true);
+    assert!(
+        fallback["nextToken"].as_str().is_some(),
+        "fallback keeps the older-pages cursor"
+    );
 
     // Hydration regression: corrupt every row OLDER than the newest bounded
     // page — any path that fetches/decodes them now fails hard.
@@ -6961,6 +7846,8 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     let ws_c = WorkspaceId::new();
     let ts = now_iso();
     let seed = |id: &str, ws: &WorkspaceId, name: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId(id.to_string()),
         workspace_id: ws.clone(),
         backend_session_id: None,
@@ -6989,6 +7876,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         initial_message: None,
         context_references: None,
         image_blocks: None,
+        file_blocks: None,
         is_background: false,
         metadata: None,
         messages: vec![],
@@ -6999,6 +7887,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
+        pending_delete_at: None,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),
@@ -7234,6 +8123,151 @@ async fn wss_error_data_code_discriminates_not_found_from_invalid_params() {
     srv.ws.stop().await;
 }
 
+/// `workspace.transfer.plan` over the real WSS transport (PROTOCOL §5.1):
+/// the result carries `{ plan }` with the versioned manifest (formatVersion,
+/// creatingIntentdVersion, tables with rowCount/approxBytes, assets, git
+/// summary) and the size breakdown summing to `totalSizeBytes`; `event` is
+/// never listed; a repo holding an untracked nested git repo surfaces the
+/// `nested-repos-skipped` warning naming the dir (and no spurious
+/// `uncommitted-changes`); unknown workspace ids map to
+/// `-32602 Workspace not found`.
+#[tokio::test]
+async fn wss_workspace_transfer_plan_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Transfer"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.transfer.plan","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+    assert_eq!(resp["id"], 2, "envelope: {resp}");
+    let plan = &resp["result"]["plan"];
+    let manifest = &plan["manifest"];
+    assert_eq!(manifest["formatVersion"], 1, "{resp}");
+    assert!(
+        manifest["creatingIntentdVersion"].is_string(),
+        "manifest records the creating daemon version: {resp}"
+    );
+    assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
+    let tables = manifest["tables"].as_array().expect("tables array");
+    assert!(
+        tables.iter().any(|t| t["name"] == "workspace"
+            && t["rowCount"] == 1
+            && t["approxBytes"].as_i64().unwrap_or(0) > 0),
+        "workspace row is counted with a byte estimate: {resp}"
+    );
+    assert!(
+        tables.iter().all(|t| t["name"] != "event"),
+        "event log is excluded from the manifest: {resp}"
+    );
+    assert!(manifest["assets"].is_array(), "{resp}");
+    assert!(manifest["attachments"].is_array(), "{resp}");
+    assert!(manifest["git"]["hasRepository"].is_boolean(), "{resp}");
+    let total = plan["totalSizeBytes"].as_u64().expect("total");
+    let db = plan["dbRowBytes"].as_u64().expect("db");
+    let assets = plan["assetBytes"].as_u64().expect("assets");
+    let attachments = plan["attachmentBytes"].as_u64().expect("attachments");
+    let bundle = plan["estimatedGitBundleBytes"].as_u64().expect("bundle");
+    assert_eq!(
+        total,
+        db + assets + attachments + bundle,
+        "size breakdown sums: {resp}"
+    );
+    assert!(plan["warnings"].is_array(), "{resp}");
+
+    // A git-backed workspace whose repo holds an untracked nested git repo:
+    // the plan's warnings carry the `nested-repos-skipped` code naming the
+    // directory, and the nested dir never shows up in `dirtyFiles`.
+    let repo_dir = test_tempdir("intentd-wss-transfer-nested-");
+    let repo = repo_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    let nested = repo.join(".import-wt");
+    std::fs::create_dir_all(&nested).unwrap();
+    let ok = std::process::Command::new("git")
+        .current_dir(&nested)
+        .args(["init", "-q", "-b", "main"])
+        .status()
+        .expect("run git")
+        .success();
+    assert!(ok, "nested git init failed");
+    std::fs::write(nested.join("inner.txt"), "inner\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.create","params":{{"title":"WSS Transfer Nested","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let nested_ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.transfer.plan","params":{{"workspaceId":"{nested_ws_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let plan = &resp["result"]["plan"];
+    assert_eq!(plan["manifest"]["git"]["hasRepository"], true, "{resp}");
+    assert_eq!(
+        plan["manifest"]["git"]["dirtyFiles"],
+        serde_json::json!([]),
+        "nested repo dir must not appear as a dirty file: {resp}"
+    );
+    let warnings = plan["warnings"].as_array().expect("warnings array");
+    let nested_warn = warnings
+        .iter()
+        .find(|w| w["code"] == "nested-repos-skipped")
+        .unwrap_or_else(|| panic!("nested-repos-skipped warning missing: {resp}"));
+    assert!(
+        nested_warn["message"]
+            .as_str()
+            .expect("message string")
+            .contains(".import-wt"),
+        "warning names the skipped dir: {resp}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w["code"] == "uncommitted-changes"),
+        "nested repo alone is not an uncommitted change: {resp}"
+    );
+
+    // Unknown workspace → the standard workspace-not-found mapping.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"workspace.transfer.plan","params":{"workspaceId":"missing"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert_eq!(resp["error"]["message"], "Workspace not found", "{resp}");
+
+    srv.ws.stop().await;
+}
+
 /// `file.placeAttachment` over the real WSS wire (PROTOCOL §5.9,
 /// monorepo#1948): a base64 payload lands in the workspace's
 /// `.intent/attachments/` directory and the response carries the
@@ -7256,21 +8290,39 @@ async fn wss_file_place_attachment_round_trip() {
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(b"oversized attachment bytes");
     let frame = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}"}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"trace.har","data":"{b64}","mimeType":"application/json"}}}}"#,
         ws.0
     );
     let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
     assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
     assert_eq!(resp["id"], 1, "envelope: {resp}");
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true), "{resp}");
     assert_eq!(
-        resp["result"],
-        serde_json::json!({
-            "ok": true,
-            "path": ".intent/attachments/trace.har",
-            "fileName": "trace.har",
-            "size": 26
-        }),
-        "result: {resp}"
+        resp["result"]["path"],
+        serde_json::json!(".intent/attachments/trace.har"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["fileName"],
+        serde_json::json!("trace.har"),
+        "{resp}"
+    );
+    assert_eq!(resp["result"]["size"], serde_json::json!(26), "{resp}");
+    // v6.12 additive attachment-registry fields.
+    let attachment_id = resp["result"]["attachmentId"]
+        .as_str()
+        .expect("attachmentId")
+        .to_string();
+    assert_eq!(
+        resp["result"]["mimeType"],
+        serde_json::json!("application/json"),
+        "{resp}"
+    );
+    assert!(
+        resp["result"]["uploadedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{resp}"
     );
     assert_eq!(
         std::fs::read(root.join(".intent/attachments/trace.har")).expect("placed file"),
@@ -7302,6 +8354,1161 @@ async fn wss_file_place_attachment_round_trip() {
     let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
     assert_eq!(resp3["error"]["code"].as_i64(), Some(-32602), "{resp3}");
 
+    // `sourcePath` classification over the wire (monorepo#2144): a directory
+    // source is the documented -32602 with the reason in the message, not a
+    // -32603 Internal.
+    let dir_source = root.join("some-dir");
+    std::fs::create_dir_all(&dir_source).expect("mkdir dir source");
+    let frame_dir = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"some-dir","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(dir_source.to_string_lossy())
+    );
+    let resp_dir = wss_call(srv.port, srv.cfg.clone(), &frame_dir).await;
+    assert_eq!(
+        resp_dir["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_dir}"
+    );
+    assert!(
+        resp_dir["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath is a directory")),
+        "{resp_dir}"
+    );
+
+    // A missing source is equally -32602 ("does not exist").
+    let frame_missing = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.placeAttachment","params":{{"workspaceId":"{}","fileName":"gone.txt","sourcePath":{}}}}}"#,
+        ws.0,
+        serde_json::json!(root.join("gone.txt").to_string_lossy())
+    );
+    let resp_missing = wss_call(srv.port, srv.cfg.clone(), &frame_missing).await;
+    assert_eq!(
+        resp_missing["error"]["code"].as_i64(),
+        Some(-32602),
+        "{resp_missing}"
+    );
+    assert!(
+        resp_missing["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sourcePath does not exist")),
+        "{resp_missing}"
+    );
+
+    // `file.getAttachmentInfo` (v6.12) serves the registry row with `exists`.
+    let frame4 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.getAttachmentInfo","params":{{"attachmentId":"{attachment_id}"}}}}"#
+    );
+    let resp4 = wss_call(srv.port, srv.cfg.clone(), &frame4).await;
+    assert_eq!(
+        resp4["result"]["attachmentId"],
+        serde_json::json!(attachment_id),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["fileName"],
+        serde_json::json!("trace.har"),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["path"],
+        serde_json::json!(".intent/attachments/trace.har"),
+        "{resp4}"
+    );
+    assert_eq!(
+        resp4["result"]["exists"],
+        serde_json::json!(true),
+        "{resp4}"
+    );
+
+    // Unknown attachment id → -32602 ("unknown attachment id").
+    let frame5 = r#"{"jsonrpc":"2.0","id":5,"method":"file.getAttachmentInfo","params":{"attachmentId":"nope"}}"#;
+    let resp5 = wss_call(srv.port, srv.cfg.clone(), frame5).await;
+    assert_eq!(resp5["error"]["code"].as_i64(), Some(-32602), "{resp5}");
+    assert!(
+        resp5["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown attachment id")),
+        "{resp5}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// `file.readChunk` over the real WSS wire (PROTOCOL §5.9, v6.18,
+/// monorepo#2458): raw bytes of a binary workspace file are served as
+/// offset-windowed base64 chunks `{ content, bytesRead, size }` and
+/// reassemble byte-identically; a window past EOF is an empty chunk; a
+/// directory and an over-cap `length` are the documented `-32602`; and a
+/// traversal path is rejected by the containment guard (`-32603`).
+#[tokio::test]
+async fn wss_file_read_chunk_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-readchunk-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    // Binary payload (invalid UTF-8 — `file.read` would fail on it).
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("blob.bin"), &payload).expect("write blob");
+
+    // Reassemble the file in two windows and verify byte identity.
+    let frame1 = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":1024}}}}"#,
+        ws.0
+    );
+    let resp1 = wss_call(srv.port, srv.cfg.clone(), &frame1).await;
+    assert_eq!(resp1["jsonrpc"], "2.0", "envelope: {resp1}");
+    assert_eq!(resp1["id"], 1, "envelope: {resp1}");
+    assert_eq!(
+        resp1["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp1}"
+    );
+    assert_eq!(
+        resp1["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp1}"
+    );
+    let mut assembled = base64::engine::general_purpose::STANDARD
+        .decode(resp1["result"]["content"].as_str().expect("content"))
+        .expect("valid base64");
+
+    let frame2 = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":1024,"length":4096}}}}"#,
+        ws.0
+    );
+    let resp2 = wss_call(srv.port, srv.cfg.clone(), &frame2).await;
+    // Short read at EOF: only the remaining bytes come back.
+    assert_eq!(
+        resp2["result"]["bytesRead"],
+        serde_json::json!(1024),
+        "{resp2}"
+    );
+    assembled.extend(
+        base64::engine::general_purpose::STANDARD
+            .decode(resp2["result"]["content"].as_str().expect("content"))
+            .expect("valid base64"),
+    );
+    assert_eq!(assembled, payload, "reassembled bytes differ");
+
+    // Window at/past EOF → empty chunk, not an error.
+    let frame3 = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":2048,"length":16}}}}"#,
+        ws.0
+    );
+    let resp3 = wss_call(srv.port, srv.cfg.clone(), &frame3).await;
+    assert_eq!(
+        resp3["result"]["bytesRead"],
+        serde_json::json!(0),
+        "{resp3}"
+    );
+    assert_eq!(resp3["result"]["content"], serde_json::json!(""), "{resp3}");
+    assert_eq!(
+        resp3["result"]["size"],
+        serde_json::json!(2048u64),
+        "{resp3}"
+    );
+
+    // Directory → -32602 naming the cause.
+    std::fs::create_dir_all(root.join("subdir")).expect("mkdir");
+    let frame4 = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"subdir","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp4 = wss_call(srv.port, srv.cfg.clone(), &frame4).await;
+    assert_eq!(resp4["error"]["code"].as_i64(), Some(-32602), "{resp4}");
+    assert!(
+        resp4["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("directory")),
+        "{resp4}"
+    );
+
+    // Over-cap length (> 16 MiB decoded) → -32602.
+    let frame5 = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"blob.bin","offset":0,"length":16777217}}}}"#,
+        ws.0
+    );
+    let resp5 = wss_call(srv.port, srv.cfg.clone(), &frame5).await;
+    assert_eq!(resp5["error"]["code"].as_i64(), Some(-32602), "{resp5}");
+
+    // Containment guard: a traversal path is rejected (-32603, same as the
+    // other file ops).
+    let frame6 = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.readChunk","params":{{"workspaceId":"{}","path":"../escape.bin","offset":0,"length":16}}}}"#,
+        ws.0
+    );
+    let resp6 = wss_call(srv.port, srv.cfg.clone(), &frame6).await;
+    assert_eq!(resp6["error"]["code"].as_i64(), Some(-32603), "{resp6}");
+
+    srv.ws.stop().await;
+}
+
+/// `file.attachmentUpload.begin` / `.chunk` / `.commit` / `.abort` (§5.9,
+/// v6.16): the staged chunked attachment upload lifecycle over the real WSS
+/// transport. A two-chunk payload is staged and committed; the commit result
+/// is byte-shape-identical to a successful `file.placeAttachment` result
+/// (registry fields included) and the reassembled bytes land under
+/// `.intent/attachments/`. An unknown uploadId is the documented -32602, the
+/// 5th concurrent per-workspace begin is the documented -32602 naming the
+/// cap (monorepo#2275), and `abort` retires a pending session idempotently.
+#[tokio::test]
+async fn wss_file_attachment_upload_round_trip() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    let ws = WorkspaceId::new();
+    let dir = test_tempdir("intentd-wss-attup-");
+    let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+    let mut w = fixture_workspace(&ws);
+    w.worktree_path = Some(root.to_string_lossy().into_owned());
+    srv.store.insert_workspace(&w).await.expect("insert ws");
+
+    let payload: Vec<u8> = (0u32..50_000).flat_map(|i| i.to_le_bytes()).collect();
+    let sha = format!("{:x}", Sha256::digest(&payload));
+    let mid = payload.len() / 2;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    // begin → { uploadId, maxChunkBytes }.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"big.bin","sizeBytes":{},"sha256":"{sha}","mimeType":"application/octet-stream"}}}}"#,
+        ws.0,
+        payload.len()
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let upload_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    assert_eq!(
+        resp["result"]["maxChunkBytes"].as_u64(),
+        Some(16 * 1024 * 1024),
+        "{resp}"
+    );
+
+    // Two chunks; receivedBytes accumulates.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":0,"data":"{}"}}}}"#,
+        b64(&payload[..mid])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["seq"].as_u64(), Some(0), "{resp}");
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(mid as u64),
+        "{resp}"
+    );
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":1,"data":"{}"}}}}"#,
+        b64(&payload[mid..])
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["receivedBytes"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+
+    // commit → byte-shape-identical to a placeAttachment success.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"file.attachmentUpload.commit","params":{{"uploadId":"{upload_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["ok"], serde_json::json!(true), "{resp}");
+    assert_eq!(
+        resp["result"]["path"],
+        serde_json::json!(".intent/attachments/big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["fileName"],
+        serde_json::json!("big.bin"),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["result"]["size"].as_u64(),
+        Some(payload.len() as u64),
+        "{resp}"
+    );
+    assert!(resp["result"]["attachmentId"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["mimeType"],
+        serde_json::json!("application/octet-stream"),
+        "{resp}"
+    );
+    assert!(
+        resp["result"]["uploadedAt"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{resp}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".intent/attachments/big.bin")).expect("placed file"),
+        payload
+    );
+
+    // The settled uploadId is unknown now → -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"file.attachmentUpload.chunk","params":{{"uploadId":"{upload_id}","seq":2,"data":"{}"}}}}"#,
+        b64(b"late")
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no attachment upload in progress")),
+        "{resp}"
+    );
+
+    // Per-workspace session cap (monorepo#2275): the 5th live begin is the
+    // documented -32602 naming the cap, and settling a session (abort)
+    // frees the slot.
+    let mut cap_ids = Vec::new();
+    for i in 0..4 {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":40,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"cap-{i}.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+            ws.0
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        cap_ids.push(
+            resp["result"]["uploadId"]
+                .as_str()
+                .expect("uploadId")
+                .to_string(),
+        );
+    }
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":41,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"fifth.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("attachment uploads in progress") && m.contains("max 4")),
+        "{resp}"
+    );
+    for (i, cap_id) in cap_ids.iter().enumerate() {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{cap_id}"}}}}"#
+        );
+        let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+        assert_eq!(
+            resp["result"]["aborted"],
+            serde_json::json!(true),
+            "abort {i}: {resp}"
+        );
+    }
+
+    // abort retires a pending session; a second abort is the idempotent
+    // non-error (`aborted: false`).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"file.attachmentUpload.begin","params":{{"workspaceId":"{}","fileName":"other.bin","sizeBytes":4,"sha256":"{sha}"}}}}"#,
+        ws.0
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let abort_id = resp["result"]["uploadId"]
+        .as_str()
+        .expect("uploadId")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["result"]["aborted"], serde_json::json!(true), "{resp}");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"file.attachmentUpload.abort","params":{{"uploadId":"{abort_id}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        resp["result"]["aborted"],
+        serde_json::json!(false),
+        "{resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.import.begin` / `.chunk` / `.commit` / `.abort` (§5.1): the
+/// staged, atomic import lifecycle over the real WSS transport. A fixture
+/// zip archive (manifest + rows) is uploaded in two chunks and committed;
+/// the imported workspace only appears in `workspace.list` after commit,
+/// with the import transforms applied, and the commit's `workspace:created`
+/// event reaches an `events.subscribe` subscriber. A version-mismatched
+/// manifest is rejected by `begin` naming both versions, and `abort` retires
+/// a pending session idempotently.
+#[tokio::test]
+async fn wss_workspace_import_lifecycle() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = "ws-wss-imported";
+    let t = "2026-08-11T00:00:00Z";
+
+    // Manifest must carry the exact intentd version (workspace-synchronized
+    // crate versions make CARGO_PKG_VERSION valid here).
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "workspaceId": ws_id,
+        "createdAt": t,
+        "tables": [],
+        "assets": [],
+        "git": { "hasRepository": false, "dirtyFiles": [], "sandboxBranches": [] }
+    });
+
+    // Fixture archive: manifest.json + rows/{workspace,agent_session}.jsonl.
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut buf);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("manifest.json", options).expect("manifest");
+    zip.write_all(manifest.to_string().as_bytes())
+        .expect("manifest bytes");
+    zip.start_file("rows/workspace.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": ws_id, "title": "WSS Imported", "branch": "main",
+                "status": "Active", "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("workspace row");
+    zip.start_file("rows/agent_session.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": "agent-wss-import", "workspace_id": ws_id, "name": "A",
+                "status": "active", "is_active": 1, "acp_session_id": "acp-stale",
+                "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("session row");
+    zip.finish().expect("zip");
+    let archive = buf.into_inner();
+    let sha = format!("{:x}", Sha256::digest(&archive));
+
+    // begin → { importId, maxChunkBytes }.
+    let begin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{},"archiveSha256":"{sha}"}}}}"#,
+            archive.len()
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    assert!(begin["result"]["maxChunkBytes"].as_u64().unwrap() > 0);
+
+    // Not visible before commit.
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        !list["result"]["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .any(|w| w["id"] == ws_id),
+        "workspace must not be listed before commit"
+    );
+
+    // Two chunks; seq 0 retried idempotently.
+    let mid = archive.len() / 2;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    for (id, seq, part) in [
+        (3, 0, &archive[..mid]),
+        (4, 1, &archive[mid..]),
+        (5, 0, &archive[..mid]),
+    ] {
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":{seq},"data":"{}"}}}}"#,
+                b64(part)
+            ),
+        )
+        .await;
+        assert_eq!(resp["result"]["seq"], seq, "{resp}");
+    }
+
+    // Subscribe BEFORE commit so the `workspace:created` notification the
+    // commit publishes (§6.5) is delivered to this connection.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            r#"{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{"eventTypes":["workspace:created","workspace:setup:completed"]}}"#
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub = loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // commit → workspace live with transforms applied.
+    let committed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+    assert_eq!(
+        committed["result"]["interruptedAgents"],
+        serde_json::json!(["agent-wss-import"]),
+        "in-flight agent surfaced as interrupted: {committed}"
+    );
+    assert!(committed["result"]["importedRows"].as_u64().unwrap() >= 2);
+
+    // The commit's `workspace:created` event reaches the subscriber (§6.3).
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:created"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:created after import commit");
+    assert_eq!(evt["workspaceId"], ws_id, "{evt}");
+
+    // Imports run no setup stage, so the commit pairs `workspace:created`
+    // with an immediate `workspace:setup:completed { ranScript: false }` —
+    // the watcher registry must not defer this workspace to the backstop.
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:setup:completed"
+                        && v["params"]["event"]["workspaceId"] == ws_id
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:setup:completed after import commit");
+    assert_eq!(
+        evt["data"],
+        serde_json::json!({ "workspaceId": ws_id, "ranScript": false }),
+        "{evt}"
+    );
+
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"workspace.list","params":{}}"#,
+    )
+    .await;
+    assert!(
+        list["result"]["workspaces"]
+            .as_array()
+            .expect("workspaces")
+            .iter()
+            .any(|w| w["id"] == ws_id),
+        "workspace listed after commit"
+    );
+    let interrupted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":8,"method":"agent.listInterrupted","params":{}}"#,
+    )
+    .await;
+    assert!(
+        interrupted["result"]["agents"]
+            .as_array()
+            .expect("interrupted agents")
+            .iter()
+            .any(|r| r["agentId"] == "agent-wss-import"),
+        "imported in-flight agent offered for resumption: {interrupted}"
+    );
+
+    // Version mismatch → -32602 naming both versions.
+    let mut wrong = manifest.clone();
+    wrong["creatingIntentdVersion"] = serde_json::json!("0.0.1-elsewhere");
+    wrong["workspaceId"] = serde_json::json!("ws-other");
+    let rejected = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"workspace.import.begin","params":{{"manifest":{wrong},"archiveSizeBytes":10,"archiveSha256":"{sha}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "{rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().expect("message");
+    assert!(
+        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        "error names both versions: {msg}"
+    );
+
+    // abort: pending session → true, retired/unknown → false (idempotent).
+    let mut ok = manifest.clone();
+    ok["workspaceId"] = serde_json::json!("ws-abortable");
+    let begun = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"workspace.import.begin","params":{{"manifest":{ok},"archiveSizeBytes":10,"archiveSha256":"{sha}"}}}}"#
+        ),
+    )
+    .await;
+    let abort_id = begun["result"]["importId"].as_str().expect("importId");
+    let aborted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"workspace.import.abort","params":{{"importId":"{abort_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(aborted["result"]["aborted"], true, "{aborted}");
+    let again = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"workspace.import.abort","params":{{"importId":"{abort_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(again["result"]["aborted"], false, "{again}");
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.export.start` / `.read` / `.finalize` / `.abort` (§5.1): the
+/// source-side export lifecycle over the real WSS transport. A subscriber
+/// receives the `workspace:transfer:progress` and `:ready` events (§6.5)
+/// carrying the manifest + checksum; chunked reads reassemble to the exact
+/// archive bytes (checksum-verified — the same contract the FE relies on to
+/// relay into `workspace.import.begin`); finalize applies the final status
+/// message + archives the source; a second export session is then started
+/// and aborted idempotently.
+#[tokio::test]
+async fn wss_workspace_export_lifecycle() {
+    use base64::Engine as _;
+
+    let srv = start(WsOptions::default()).await;
+
+    // Repo-less source workspace (skips the bundler, so no `git` needed).
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Export Source"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+
+    // Subscribe BEFORE start so this connection sees the build's events.
+    let mut sub_ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub_ws
+        .send(Message::Text(
+            format!(
+                r#"{{"jsonrpc":"2.0","id":100,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:progress","workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws_id}"}}}}"#
+            )
+            .into(),
+        ))
+        .await
+        .expect("send subscribe");
+    let sub = loop {
+        match sub_ws.next().await {
+            Some(Ok(Message::Text(text))) => {
+                break serde_json::from_str::<Value>(&text).expect("json")
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // start → { exportId, maxChunkBytes } immediately.
+    let started = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.export.start","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export_id = started["result"]["exportId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("exportId: {started}"))
+        .to_string();
+    assert!(started["result"]["maxChunkBytes"].as_u64().unwrap() > 0);
+
+    // The subscriber sees ≥1 progress event and then the ready event whose
+    // payload carries everything workspace.import.begin needs.
+    let (saw_progress, ready) = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut saw_progress = false;
+        loop {
+            match sub_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] != "events.event" {
+                        continue;
+                    }
+                    let event = &v["params"]["event"];
+                    match event["type"].as_str() {
+                        Some("workspace:transfer:progress") => {
+                            assert_eq!(event["data"]["exportId"], export_id.as_str(), "{event}");
+                            assert!(event["data"]["stage"].is_string(), "{event}");
+                            saw_progress = true;
+                        }
+                        Some("workspace:transfer:ready") => {
+                            return (saw_progress, event.clone());
+                        }
+                        Some("workspace:transfer:failed") => {
+                            panic!("export failed: {event}");
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub_ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:transfer:ready");
+    assert!(saw_progress, "at least one progress event before ready");
+    let data = &ready["data"];
+    assert_eq!(data["exportId"], export_id.as_str(), "{ready}");
+    assert_eq!(data["manifest"]["workspaceId"], ws_id.as_str(), "{ready}");
+    let size = data["archiveSizeBytes"].as_u64().expect("size");
+    let sha = data["archiveSha256"].as_str().expect("sha").to_string();
+    let total_chunks = data["totalChunks"].as_u64().expect("totalChunks");
+    assert!(size > 0 && total_chunks >= 1);
+
+    // Chunked reads reassemble to the exact archive; seq 0 re-read is
+    // idempotent and an out-of-range seq is rejected with -32602.
+    let mut archive = Vec::new();
+    for seq in 0..total_chunks {
+        let chunk = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{seq}}}}}"#,
+                10 + seq
+            ),
+        )
+        .await;
+        assert_eq!(chunk["result"]["totalChunks"], total_chunks, "{chunk}");
+        archive.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(chunk["result"]["data"].as_str().expect("data"))
+                .expect("base64"),
+        );
+    }
+    assert_eq!(archive.len() as u64, size);
+    assert_eq!(format!("{:x}", Sha256::digest(&archive)), sha);
+    let reread = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":0}}}}"#
+        ),
+    )
+    .await;
+    assert!(reread["result"]["data"].is_string(), "{reread}");
+    let out_of_range = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":{total_chunks}}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(out_of_range["error"]["code"].as_i64(), Some(-32602));
+
+    // finalize with archiveSource + finalStatusMessage.
+    let finalized = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":32,"method":"workspace.export.finalize","params":{{"exportId":"{export_id}","archiveSource":true,"finalStatusMessage":"Transferred via WSS e2e"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(finalized["result"]["finalized"], true, "{finalized}");
+    assert_eq!(
+        finalized["result"]["workspace"]["status"], "Archived",
+        "{finalized}"
+    );
+    assert_eq!(
+        finalized["result"]["workspace"]["statusMessage"], "Transferred via WSS e2e",
+        "{finalized}"
+    );
+    // The session is retired: further reads are NotFound (-32603 internal
+    // taxonomy is not used here — NotFound maps to -32602 per §9).
+    let gone = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":33,"method":"workspace.export.read","params":{{"exportId":"{export_id}","seq":0}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(gone["error"]["code"], -32602, "read after finalize: {gone}");
+    assert_eq!(
+        gone["error"]["data"]["code"], "not-found",
+        "read after finalize: {gone}"
+    );
+
+    // abort: ready session → true; retired/unknown → false (idempotent).
+    // (A Building session stays registered until the build task observes
+    // the abort flag, so wait for :ready to make the second abort's `false`
+    // deterministic.)
+    let ws2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":40,"method":"workspace.create","params":{"title":"WSS Export Abort"}}"#,
+    )
+    .await;
+    let ws2_id = ws2["result"]["workspace"]["id"].as_str().expect("id");
+    let mut sub2 = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub2.send(Message::Text(
+        format!(
+            r#"{{"jsonrpc":"2.0","id":101,"method":"events.subscribe","params":{{"eventTypes":["workspace:transfer:ready","workspace:transfer:failed"],"workspaceId":"{ws2_id}"}}}}"#
+        )
+        .into(),
+    ))
+    .await
+    .expect("send subscribe 2");
+    loop {
+        match sub2.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json");
+                if v.get("id") == Some(&serde_json::json!(101)) {
+                    break;
+                }
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let started2 = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":41,"method":"workspace.export.start","params":{{"workspaceId":"{ws2_id}"}}}}"#
+        ),
+    )
+    .await;
+    let export2 = started2["result"]["exportId"].as_str().expect("exportId");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match sub2.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:transfer:ready"
+                    {
+                        return;
+                    }
+                    if v["params"]["event"]["type"] == "workspace:transfer:failed" {
+                        panic!("second export failed: {v}");
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = sub2.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for second export's ready event");
+    let aborted = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":42,"method":"workspace.export.abort","params":{{"exportId":"{export2}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(aborted["result"]["aborted"], true, "{aborted}");
+    let again = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":43,"method":"workspace.export.abort","params":{{"exportId":"{export2}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(again["result"]["aborted"], false, "{again}");
+    // The aborted workspace is intact and still Active.
+    let get = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":44,"method":"workspace.get","params":{{"workspaceId":"{ws2_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(get["result"]["workspace"]["status"], "Active", "{get}");
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.import.commit` with a git payload over the real WSS transport
+/// (§5.1): the archive carries `git/repo.bundle` + `git/refs.json` built by
+/// the export bundler from a dirty source repo. Commit materializes the
+/// checkout under the daemon's workspaces root (WIP snapshot unwound — the
+/// dirty file restored, not committed), rewrites the stored workspace row
+/// (`repositoryPath` → the checkout, `worktreePath` cleared, `checkoutMode`
+/// direct) — WITHOUT registering the workspace-owned checkout in
+/// `known_repo` (intent-hq/monorepo#2227). Skips when `git` is unavailable
+/// on PATH (the bundler shells out to it).
+#[tokio::test]
+async fn wss_workspace_import_commit_materializes_git() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping WSS git import E2E: git not available");
+        return;
+    }
+
+    let srv = start(WsOptions::default()).await;
+    let ws_id = "ws-wss-git-imported";
+    let t = "2026-08-11T00:00:00Z";
+
+    // Source repo: one commit on `main` plus an untracked file, so the
+    // bundle carries a WIP snapshot the import must unwind.
+    let src = test_tempdir("intentd-wss-import-git-src-");
+    let repo = src.path().join("source-repo");
+    {
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "Tester")
+                .env("GIT_AUTHOR_EMAIL", "t@e.dev")
+                .env("GIT_COMMITTER_NAME", "Tester")
+                .env("GIT_COMMITTER_EMAIL", "t@e.dev")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("seed file");
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "chore: init"]);
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").expect("wip file");
+    }
+
+    // Bundle the source exactly as the export orchestrator would.
+    let mut src_ws = fixture_workspace(&WorkspaceId(ws_id.to_string()));
+    src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
+    src_ws.repository_name = Some("test-repo".to_string());
+    let staging = src.path().join("staging");
+    let (bundle_path, refs) =
+        intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+            .expect("bundle");
+    assert!(
+        refs.workspace_wip_commit_sha.is_some(),
+        "source was dirty: {refs:?}"
+    );
+
+    let manifest = serde_json::json!({
+        "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
+        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "workspaceId": ws_id,
+        "createdAt": t,
+        "tables": [],
+        "assets": [],
+        "git": { "hasRepository": true, "dirtyFiles": [], "sandboxBranches": [] }
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut buf);
+    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("manifest.json", options).expect("manifest");
+    zip.write_all(manifest.to_string().as_bytes())
+        .expect("manifest bytes");
+    zip.start_file("rows/workspace.jsonl", options)
+        .expect("rows");
+    zip.write_all(
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "id": ws_id, "title": "WSS Git Imported", "branch": "main",
+                "status": "Active",
+                "repository_path": repo.to_string_lossy(),
+                "repository_name": "test-repo",
+                "created_at": t, "updated_at": t
+            })
+        )
+        .as_bytes(),
+    )
+    .expect("workspace row");
+    zip.start_file("git/repo.bundle", options).expect("bundle");
+    zip.write_all(&std::fs::read(&bundle_path).expect("bundle bytes"))
+        .expect("bundle write");
+    zip.start_file("git/refs.json", options).expect("refs");
+    zip.write_all(serde_json::to_string(&refs).expect("refs json").as_bytes())
+        .expect("refs write");
+    zip.finish().expect("zip");
+    let archive = buf.into_inner();
+    let sha = format!("{:x}", Sha256::digest(&archive));
+
+    // begin → chunk → commit over the wire.
+    let begin = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.import.begin","params":{{"manifest":{manifest},"archiveSizeBytes":{},"archiveSha256":"{sha}"}}}}"#,
+            archive.len()
+        ),
+    )
+    .await;
+    let import_id = begin["result"]["importId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("importId: {begin}"))
+        .to_string();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&archive);
+    let chunk = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.import.chunk","params":{{"importId":"{import_id}","seq":0,"data":"{b64}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(chunk["result"]["seq"], 0, "{chunk}");
+    let committed = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.import.commit","params":{{"importId":"{import_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(committed["result"]["workspace"]["id"], ws_id, "{committed}");
+
+    // The result's workspace payload carries the materialized checkout
+    // (PROTOCOL §5.1: the workspace envelope after import transforms).
+    let ws_payload = &committed["result"]["workspace"];
+    let checkout = srv
+        ._dir
+        .path()
+        .join("workspaces")
+        .join(ws_id)
+        .join("test-repo");
+    assert_eq!(
+        ws_payload["repositoryPath"].as_str(),
+        checkout.to_str(),
+        "{committed}"
+    );
+    assert!(ws_payload["worktreePath"].is_null(), "{committed}");
+    assert_eq!(ws_payload["checkoutMode"], "direct", "{committed}");
+
+    // On disk: checkout exists with the WIP snapshot unwound — the dirty
+    // file restored as uncommitted work.
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("README.md")).expect("committed file"),
+        "hello\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("wip.txt")).expect("wip file restored"),
+        "uncommitted\n"
+    );
+
+    // The materialized checkout is workspace-owned storage under the
+    // workspaces root and stays out of known_repo (intent-hq/monorepo#2227).
+    assert_eq!(
+        srv.store.list_known_repos().await.expect("known repos"),
+        vec![],
+        "materialized checkout is not registered in known_repo"
+    );
+
     srv.ws.stop().await;
 }
 
@@ -7315,4 +9522,302 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("addr")
         .port()
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7692 permessage-deflate negotiation on the WSS listener (monorepo#1971).
+// ---------------------------------------------------------------------------
+
+/// A transparent [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] wrapper
+/// that counts the bytes crossing the underlying socket in each direction.
+/// Installed on the raw TCP stream *beneath* TLS, so the counts reflect real
+/// on-the-wire traffic (TLS records included).
+struct CountingStream<S> {
+    inner: S,
+    read: Arc<std::sync::atomic::AtomicUsize>,
+    written: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            self.read.fetch_add(
+                buf.filled().len() - before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.written
+                .fetch_add(*n, std::sync::atomic::Ordering::Relaxed);
+        }
+        poll
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Byte counters for one instrumented connection: (bytes read, bytes written)
+/// at the TCP layer.
+type WireCounters = (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+/// An instrumented authenticated WSS connection: TCP → [`CountingStream`] →
+/// pinned TLS → WebSocket upgrade, optionally offering permessage-deflate.
+/// Returns the socket, the handshake response (for `Sec-WebSocket-Extensions`
+/// assertions), and the wire counters.
+async fn connect_ws_counting(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    offer_deflate: bool,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<CountingStream<TcpStream>>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+    WireCounters,
+) {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.expect("tcp");
+    let _ = tcp.set_nodelay(true);
+    let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = CountingStream {
+        inner: tcp,
+        read: read.clone(),
+        written: written.clone(),
+    };
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, counted)
+        .await
+        .expect("tls connect");
+    let mut ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    if offer_deflate {
+        ws_config.extensions.permessage_deflate = Some(
+            tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig::default(),
+        );
+    }
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, resp) = tokio_tungstenite::client_async_with_config(url, tls, Some(ws_config))
+        .await
+        .expect("ws upgrade");
+    (ws, resp, (read, written))
+}
+
+/// Drive several JSON-RPC frames over an already-open socket, returning one
+/// parsed response per frame (same shape as [`wss_session`], generic over the
+/// instrumented stream).
+async fn drive_frames<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    frames: Vec<String>,
+) -> Vec<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = Vec::new();
+    for frame in frames {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    out.push(serde_json::from_str(&text).expect("json"));
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    out
+}
+
+/// One draft round-trip carrying `payload` over an instrumented connection:
+/// `client.hello` → `workspace.create` → `drafts.set` → `drafts.get`. Returns
+/// the text echoed back by `drafts.get`.
+async fn draft_round_trip<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    client_id: &str,
+    payload: &str,
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = drive_frames(
+        ws,
+        vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"client.hello","params":{{"clientId":"{client_id}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.create","params":{{"title":"Deflate {client_id}"}}}}"#
+            ),
+        ],
+    )
+    .await;
+    let ws_id = resp[1]["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let set = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "drafts.set",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate", "text": payload }
+    });
+    let get = serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "drafts.get",
+        "params": { "workspaceId": ws_id, "agentId": "agent-deflate" }
+    });
+    let resp = drive_frames(ws, vec![set.to_string(), get.to_string()]).await;
+    assert_eq!(resp[0]["result"]["ok"], true, "drafts.set: {}", resp[0]);
+    resp[1]["result"]["text"]
+        .as_str()
+        .expect("draft text")
+        .to_string()
+}
+
+/// E2E (monorepo#1971): a client offering `permessage-deflate` negotiates
+/// compression on the real WSS transport — the 101 response echoes the agreed
+/// extension and a highly compressible JSON payload is measurably smaller on
+/// the wire than the same payload over a non-offering control connection,
+/// which itself sees no `Sec-WebSocket-Extensions` header and identical
+/// payload semantics (today's behavior).
+#[tokio::test]
+async fn wss_deflate_negotiation_compresses_on_the_wire() {
+    let srv = start(WsOptions::default()).await;
+    // ~128 KiB of highly compressible text, well past any handshake noise.
+    let payload = "intentd permessage-deflate ".repeat(5000);
+
+    // Deflate-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), true).await;
+    let agreed = resp
+        .headers()
+        .get("sec-websocket-extensions")
+        .expect("server echoes the negotiated extension")
+        .to_str()
+        .expect("ascii header");
+    assert!(
+        agreed.starts_with("permessage-deflate"),
+        "negotiated header names the extension: {agreed}"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-deflate", &payload).await;
+    assert_eq!(
+        echoed, payload,
+        "payload survives the compressed round-trip intact"
+    );
+    let _ = ws.close(None).await;
+    let deflate_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let deflate_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Control: identical session over a non-offering connection.
+    let (mut ws, resp, (read, written)) =
+        connect_ws_counting(srv.port, srv.cfg.clone(), false).await;
+    assert!(
+        resp.headers().get("sec-websocket-extensions").is_none(),
+        "no offer ⇒ no Sec-WebSocket-Extensions in the 101 response"
+    );
+    let echoed = draft_round_trip(&mut ws, "cli-plain", &payload).await;
+    assert_eq!(echoed, payload, "control round-trip intact");
+    let _ = ws.close(None).await;
+    let plain_read = read.load(std::sync::atomic::Ordering::Relaxed);
+    let plain_written = written.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The compressible payload dominates both directions (~128 KiB each way
+    // uncompressed); compression must shrink the wire traffic dramatically.
+    // "< half" is a deliberately loose bound — in practice it is >90% smaller.
+    assert!(
+        deflate_read < plain_read / 2,
+        "server→client traffic compressed: deflate={deflate_read}B plain={plain_read}B"
+    );
+    assert!(
+        deflate_written < plain_written / 2,
+        "client→server traffic compressed: deflate={deflate_written}B plain={plain_written}B"
+    );
+    srv.ws.stop().await;
+}
+
+/// E2E control (monorepo#1971): a client that offers an unacceptable
+/// extension set is declined per RFC 7692 §7 — no `Sec-WebSocket-Extensions`
+/// in the 101 response — and gets a clean uncompressed connection with a
+/// working JSON-RPC round-trip, byte-identical behavior to a client that
+/// never offered.
+#[tokio::test]
+async fn wss_unacceptable_extension_offer_declines_to_plain_connection() {
+    let srv = start(WsOptions::default()).await;
+
+    // Hand-rolled upgrade with an offer the server must decline (unknown
+    // parameter, RFC 7692 §7). `tls_connect` + raw HTTP keeps the client free
+    // to send an arbitrary header the fork's client API would never produce.
+    let mut tls = tls_connect(srv.port, srv.cfg.clone()).await;
+    let req = format!(
+        "GET /ws?token={TOKEN} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; parameter-from-the-future=3\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await.expect("write upgrade");
+    tls.flush().await.expect("flush");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(
+            tls.read(&mut byte).await.expect("read head") == 1,
+            "connection closed before 101 head"
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "declined offer still upgrades: {head}"
+    );
+    assert!(
+        !head
+            .to_ascii_lowercase()
+            .contains("sec-websocket-extensions"),
+        "declined offer ⇒ no extensions header in the 101 response: {head}"
+    );
+
+    // The upgraded socket is a plain uncompressed WebSocket: a JSON-RPC
+    // round-trip behaves exactly as today.
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        tls,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await;
+    let resp = drive_frames(
+        &mut ws,
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{}}"#.to_string()],
+    )
+    .await;
+    assert!(
+        resp[0]["result"]["workspaces"].is_array(),
+        "plain round-trip works after the declined offer: {}",
+        resp[0]
+    );
+    let _ = ws.close(None).await;
+    srv.ws.stop().await;
 }

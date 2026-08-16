@@ -6,7 +6,7 @@
 //! volta, asdf, etc.) so that tools and their dependencies can be discovered.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -445,6 +445,17 @@ pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathB
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
+fn nvm_node_version(path: &Path) -> Option<(u64, u64, u64, bool)> {
+    let version = path.file_name()?.to_str()?.strip_prefix('v')?;
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    let is_stable = !version.contains('-');
+    (parts.next().is_none()).then_some((major, minor, patch, is_stable))
+}
+
 /// Injectable core - accepts the home directory and a function that returns
 /// login-shell dirs, so tests can avoid spawning the real shell.
 fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) -> Vec<PathBuf>
@@ -490,12 +501,21 @@ where
         }
     }
 
-    // Add all nvm-managed node versions
+    // Prefer the newest installed nvm Node. read_dir order is unspecified and
+    // often put an older installation first, which made first-match discovery
+    // report an obsolete Node even when a current version was installed.
     if let Some(home) = home {
         let nvm_dir = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
-            for entry in entries.flatten() {
-                push_dir(&mut dirs, &mut seen, entry.path().join("bin"));
+            let mut version_dirs: Vec<PathBuf> =
+                entries.flatten().map(|entry| entry.path()).collect();
+            version_dirs.sort_by(|a, b| {
+                nvm_node_version(b)
+                    .cmp(&nvm_node_version(a))
+                    .then_with(|| b.file_name().cmp(&a.file_name()))
+            });
+            for version_dir in version_dirs {
+                push_dir(&mut dirs, &mut seen, version_dir.join("bin"));
             }
         }
     }
@@ -506,6 +526,55 @@ where
     }
 
     dirs
+}
+
+/// Extensions Windows can actually run for a discovered entry point
+/// (`CreateProcess` / `cmd.exe`-runnable), in resolution-preference order.
+///
+/// This is the single Windows runnable-extension policy shared by every
+/// binary-discovery site: provider discovery in `intent-providers`, auggie
+/// discovery in `intent-context`, and `host.findBinary` in `intent-transport`.
+pub const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
+
+/// True when `path` carries a Windows-runnable executable extension
+/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
+pub fn has_windows_exec_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            WINDOWS_EXEC_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+        })
+}
+
+/// True when `p` is a file that is executable (unix checks the exec bit;
+/// Windows requires a runnable executable extension — `CreateProcess` cannot
+/// run a bare extensionless file, so its mere existence is not enough).
+pub fn is_executable_file(p: &Path) -> bool {
+    is_executable_file_for(p, cfg!(windows))
+}
+
+/// [`is_executable_file`] parametrized on the platform (test seam — Windows
+/// CI is disabled, so the Windows arm is unit-tested on POSIX).
+pub fn is_executable_file_for(p: &Path, is_windows: bool) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    if is_windows {
+        return has_windows_exec_extension(p);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -527,8 +596,39 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Serializes every fake-shell test's script write + shell spawn.
+    ///
+    /// Under parallel test runs, a sibling test's `fork` can inherit the
+    /// still-open write fd of another test's script (CLOEXEC only closes it
+    /// at `exec`), so exec'ing that just-written script intermittently fails
+    /// with ETXTBSY and the capture silently degrades to empty
+    /// (intent-hq/monorepo#1968).
+    #[cfg(unix)]
+    static FAKE_SHELL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn lock_fake_shell() -> std::sync::MutexGuard<'static, ()> {
+        FAKE_SHELL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Write the fake shell script and run the capture under the shared
+    /// lock, so no other test's fork can race this script's write + exec.
+    #[cfg(unix)]
+    fn write_and_capture(path: &std::path::Path, content: &str) -> LoginShellCapture {
+        let _guard = lock_fake_shell();
+        write_fake_shell(path, content);
+        capture_login_shell_with(Some(path.to_str().unwrap()))
+    }
+
     #[test]
     fn enhanced_path_dirs_includes_current_path() {
+        // Hold the fake-shell lock: this can be the first caller of the
+        // LOGIN_SHELL_CAPTURE OnceLock, whose lazy init forks the real
+        // login shell and must not overlap a sibling's script write.
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         // Should at least include the directories from current PATH
         assert!(!dirs.is_empty());
@@ -536,6 +636,9 @@ mod tests {
 
     #[test]
     fn enhanced_path_dirs_deduplicates() {
+        // Hold the fake-shell lock: may lazily init LOGIN_SHELL_CAPTURE (forks)
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         let mut seen = HashSet::new();
         for dir in &dirs {
@@ -550,6 +653,9 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn enhanced_path_dirs_includes_common_unix_dirs() {
+        // Hold the fake-shell lock: may lazily init LOGIN_SHELL_CAPTURE (forks)
+        #[cfg(unix)]
+        let _guard = lock_fake_shell();
         let dirs = enhanced_path_dirs();
         let dir_strs: Vec<String> = dirs
             .iter()
@@ -581,12 +687,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_test_{pid}_{nanos}.sh"));
 
         // Script responds to -ilc with sentinel-wrapped PATH
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/custom/bin:/other/bin__INTENT_PATH_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         let dirs = capture.dirs;
@@ -598,6 +702,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn capture_login_shell_path_with_invalid_shell_degrades_silently() {
+        // Locked too: this spawn's fork must not overlap a sibling's script write
+        let _guard = lock_fake_shell();
         let capture = capture_login_shell_with(Some("/nonexistent/shell"));
         assert!(capture.dirs.is_empty());
         assert!(capture.credential_env.is_empty());
@@ -698,7 +804,7 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn enriched_tool_dirs_scans_every_nvm_node_version() {
+    fn enriched_tool_dirs_scans_every_nvm_node_version_newest_first() {
         let unique = format!(
             "intent-path-utils-nvm-{}-{}",
             std::process::id(),
@@ -709,14 +815,25 @@ mod tests {
         );
         let home = std::env::temp_dir().join(unique);
         let v20_bin = home.join(".nvm/versions/node/v20.19.0/bin");
+        let v24_rc_bin = home.join(".nvm/versions/node/v24.5.0-rc.1/bin");
         let v24_bin = home.join(".nvm/versions/node/v24.5.0/bin");
         std::fs::create_dir_all(&v20_bin).unwrap();
+        std::fs::create_dir_all(&v24_rc_bin).unwrap();
         std::fs::create_dir_all(&v24_bin).unwrap();
 
         let dirs = enriched_tool_dirs_impl(Some(&home), || &[]);
 
         assert!(dirs.contains(&v20_bin));
+        assert!(dirs.contains(&v24_rc_bin));
         assert!(dirs.contains(&v24_bin));
+        let v20_position = dirs.iter().position(|dir| dir == &v20_bin).unwrap();
+        let v24_rc_position = dirs.iter().position(|dir| dir == &v24_rc_bin).unwrap();
+        let v24_position = dirs.iter().position(|dir| dir == &v24_bin).unwrap();
+        assert!(v24_position < v20_position, "newest nvm Node must be first");
+        assert!(
+            v24_position < v24_rc_position,
+            "stable nvm Node must sort ahead of a matching prerelease"
+        );
         assert!(dirs.contains(&home.join(".local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
         std::fs::remove_dir_all(&home).unwrap();
@@ -737,12 +854,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_noise_{pid}_{nanos}.sh"));
 
         // Script prints noise before and after the sentinel-wrapped PATH
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  echo 'Loading nvm...'\n  echo 'nvm initialized'\n  printf '__INTENT_PATH_S__/noise/bin:/test/bin__INTENT_PATH_E__'\n  echo 'Shell ready'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2);
@@ -765,12 +881,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_no_sentinel_{pid}_{nanos}.sh"));
 
         // Script outputs PATH without sentinels
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '/missing/bin:/sentinels/bin'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert!(
@@ -794,12 +909,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_fallback_{pid}_{nanos}.sh"));
 
         // Script fails on -ilc but succeeds on -lc
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  exit 1\nelif [ \"$1\" = \"-lc\" ]; then\n  printf '__INTENT_PATH_S__/fallback/bin:/backup/bin__INTENT_PATH_E__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should fall back to -lc when -ilc fails");
@@ -822,12 +936,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_multi_{pid}_{nanos}.sh"));
 
         // Script outputs sentinels multiple times
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/first/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__/last/bin:/final/bin__INTENT_PATH_E__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(dirs.len(), 2, "Should use last sentinel occurrence");
@@ -850,12 +963,11 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_trailing_{pid}_{nanos}.sh"));
 
         // Script outputs a complete pair followed by a bare start sentinel
-        write_fake_shell(
+        let dirs = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/valid/bin__INTENT_PATH_E__'\n  printf '__INTENT_PATH_S__'\nfi\n",
-        );
-
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        )
+        .dirs;
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -887,10 +999,8 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n",
             noise
         );
-        write_fake_shell(&fake_shell, &script);
-
         let start = std::time::Instant::now();
-        let dirs = capture_login_shell_with(Some(fake_shell.to_str().unwrap())).dirs;
+        let dirs = write_and_capture(&fake_shell, &script).dirs;
         let elapsed = start.elapsed();
         fs::remove_file(&fake_shell).ok();
 
@@ -963,12 +1073,10 @@ mod tests {
 
         // Script emits PATH sentinels plus a NUL-separated env payload with
         // an exact-name var, a prefix var, and a non-allow-listed var
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'ANTHROPIC_API_KEY=test-exact\\0AUGGIE_TOKEN=test-prefix\\0NOT_ALLOWED=dropped\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/env/bin")]);
@@ -1005,12 +1113,10 @@ mod tests {
 
         // An env *value* containing the literal PATH end sentinel must not
         // re-anchor the PATH extraction into the env payload.
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/real/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_EVIL=/fake/bin__INTENT_PATH_E__\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/real/bin")]);
@@ -1034,12 +1140,10 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_env_nl_{pid}_{nanos}.sh"));
 
         // Value contains a newline; NUL separation must keep it intact
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/env/bin__INTENT_PATH_E__'\n  printf '__INTENT_ENV_S__'\n  printf 'CODEX_MULTI=line1\\nline2\\0HF_TOKEN=test-hf\\0'\n  printf '__INTENT_ENV_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -1069,18 +1173,91 @@ mod tests {
         let fake_shell = temp_dir.join(format!("fake_shell_env_none_{pid}_{nanos}.sh"));
 
         // PATH sentinels only — env sentinels absent
-        write_fake_shell(
+        let capture = write_and_capture(
             &fake_shell,
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '__INTENT_PATH_S__/only/bin__INTENT_PATH_E__'\nfi\n",
         );
-
-        let capture = capture_login_shell_with(Some(fake_shell.to_str().unwrap()));
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(capture.dirs, vec![PathBuf::from("/only/bin")]);
         assert!(
             capture.credential_env.is_empty(),
             "Missing env sentinels should degrade to an empty map"
+        );
+    }
+
+    /// A fresh RAII temp directory for `tag` under the system temp root. The
+    /// returned guard removes the dir on drop (including on panic); set
+    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
+        let mut dir = tempfile::Builder::new()
+            .prefix(&format!("intent-core-{tag}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
+            dir.disable_cleanup(true);
+        }
+        dir
+    }
+
+    #[test]
+    fn has_windows_exec_extension_only_matches_runnable_exts() {
+        assert!(has_windows_exec_extension(Path::new("tool.exe")));
+        assert!(has_windows_exec_extension(Path::new("tool.cmd")));
+        assert!(has_windows_exec_extension(Path::new("tool.bat")));
+        // Case-insensitive, matching Windows filename semantics.
+        assert!(has_windows_exec_extension(Path::new("tool.EXE")));
+        assert!(has_windows_exec_extension(Path::new("tool.Cmd")));
+        assert!(!has_windows_exec_extension(Path::new("tool")));
+        assert!(!has_windows_exec_extension(Path::new("tool.ps1")));
+        assert!(!has_windows_exec_extension(Path::new("tool.txt")));
+    }
+
+    #[test]
+    fn is_executable_file_windows_requires_runnable_extension() {
+        let dir = unique_temp_dir("win-exec");
+        let bare = dir.path().join("tool");
+        let cmd = dir.path().join("tool.cmd");
+        let exe_upper = dir.path().join("tool.EXE");
+        std::fs::write(&bare, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&cmd, "@echo off\r\n").unwrap();
+        std::fs::write(&exe_upper, "MZ").unwrap();
+        assert!(
+            !is_executable_file_for(&bare, true),
+            "an extensionless file is not runnable on Windows"
+        );
+        assert!(is_executable_file_for(&cmd, true));
+        assert!(
+            is_executable_file_for(&exe_upper, true),
+            "extension matching must be case-insensitive"
+        );
+        assert!(!is_executable_file_for(
+            &dir.path().join("missing.exe"),
+            true
+        ));
+        assert!(
+            !is_executable_file_for(dir.path(), true),
+            "directories never resolve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_posix_requires_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("posix-exec");
+        let plain = dir.path().join("tool");
+        std::fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            !is_executable_file_for(&plain, false),
+            "a file without the exec bit is not executable on POSIX"
+        );
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file_for(&plain, false));
+        assert!(!is_executable_file_for(&dir.path().join("missing"), false));
+        assert!(
+            !is_executable_file_for(dir.path(), false),
+            "directories never resolve"
         );
     }
 }

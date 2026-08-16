@@ -172,13 +172,12 @@ impl Store {
     /// error.
     pub async fn update_note_with_comment(&self, note: &Note, c: &Comment) -> Result<i64> {
         let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
-        let task_json = match &note.metadata.task {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
-            ),
-            None => None,
-        };
+        let task_json = note
+            .metadata
+            .task
+            .as_ref()
+            .map(crate::note_repo::encode_task_json)
+            .transpose()?;
         let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
 
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the

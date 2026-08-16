@@ -10,6 +10,18 @@
 //! tear them down. Each watcher keeps its own debounce/fingerprint semantics;
 //! the registry only routes lifecycle transitions.
 //!
+//! `workspace:created` registration is DEFERRED until the create flow's setup
+//! stage finishes: the pending root is held until `workspace:setup:completed`
+//! arrives for the workspace, and only then do the file watcher, git-metadata
+//! watcher, and skills/specialists registrations start. No watcher exists
+//! during the setup window, so setup-script churn is naturally dropped — never
+//! published, never persisted (no buffering). Creates without a setup script
+//! publish `completed { ranScript: false }` immediately, so their deferral is
+//! just the event round-trip. A backstop starts the watchers anyway (with a
+//! WARN) if no completion is observed within [`SETUP_COMPLETION_BACKSTOP`] —
+//! a setup script running longer than that emits its remaining churn.
+//! Boot-time seeding and `workspace:opened` start immediately as before.
+//!
 //! Archive/unarchive is a fifth transition. §6.5 has no `workspace:archived`,
 //! so `archive_workspace`/`unarchive_workspace` publish `workspace:updated`
 //! with an `archived` boolean in the delta; the registry subscribes to that
@@ -23,12 +35,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::events::{
-    WORKSPACE_CLOSED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_OPENED, WORKSPACE_UPDATED,
+    WORKSPACE_CLOSED, WORKSPACE_CREATED, WORKSPACE_DELETED, WORKSPACE_OPENED,
+    WORKSPACE_SETUP_COMPLETED, WORKSPACE_UPDATED,
 };
 use intent_core::{Event, WorkspaceApi, WorkspaceId};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
@@ -38,6 +53,20 @@ use super::shared_watch::SharedWatchHub;
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
+
+/// How long a created workspace's deferred watcher start waits for
+/// `workspace:setup:completed` before starting anyway (with a WARN). Bounds
+/// the deferral when the completion is never observed (missed event, daemon
+/// race, hung script) so file events are never silenced indefinitely.
+const SETUP_COMPLETION_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// A created workspace whose watcher start is deferred until its setup stage
+/// completes: the root resolved from the `workspace:created` payload plus the
+/// backstop deadline.
+struct PendingSetup {
+    path: PathBuf,
+    deadline: Instant,
+}
 
 /// Coordinates the watcher families against the live workspace set.
 /// Dropping the registry tears down the lifecycle task and every watcher it
@@ -71,6 +100,17 @@ impl WatcherRegistry {
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
     ) -> Self {
+        Self::start_with_backstop(bus, services, refresher, SETUP_COMPLETION_BACKSTOP).await
+    }
+
+    /// [`Self::start`] with an explicit setup-completion backstop, so tests
+    /// can exercise the backstop without waiting out the production window.
+    async fn start_with_backstop(
+        bus: EventBus,
+        services: Arc<dyn WorkspaceApi>,
+        refresher: Arc<GitStatusRefresher>,
+        setup_backstop: Duration,
+    ) -> Self {
         // Subscribe BEFORE taking the workspace snapshot: subscription
         // delivery is live-only, so a lifecycle event published between the
         // snapshot and the subscribe would never be observed. A workspace
@@ -83,6 +123,7 @@ impl WatcherRegistry {
                 WORKSPACE_DELETED.to_string(),
                 WORKSPACE_CLOSED.to_string(),
                 WORKSPACE_UPDATED.to_string(),
+                WORKSPACE_SETUP_COMPLETED.to_string(),
             ],
             ..SubscriptionFilter::default()
         });
@@ -152,6 +193,7 @@ impl WatcherRegistry {
             git_watchers,
             skills,
             specialists,
+            setup_backstop,
         ));
         Self {
             task,
@@ -292,16 +334,106 @@ async fn lifecycle_loop(
     mut git_watchers: HashMap<WorkspaceId, GitMetadataWatcher>,
     skills: SkillsWatcher,
     specialists: SpecialistsWatcher,
+    setup_backstop: Duration,
 ) {
-    while let Some(batch) = sub.recv().await {
+    // Created workspaces awaiting `workspace:setup:completed` before their
+    // watchers start. The loop sleeps toward the earliest deadline; a
+    // deadline reached without a completion starts the watchers anyway.
+    let mut pending: HashMap<WorkspaceId, PendingSetup> = HashMap::new();
+    loop {
+        let batch = match pending.values().map(|p| p.deadline).min() {
+            None => match sub.recv().await {
+                Some(batch) => batch,
+                None => return,
+            },
+            Some(deadline) => tokio::select! {
+                batch = sub.recv() => match batch {
+                    Some(batch) => batch,
+                    None => return,
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let now = Instant::now();
+                    let expired: Vec<WorkspaceId> = pending
+                        .iter()
+                        .filter(|(_, p)| p.deadline <= now)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for ws_id in expired {
+                        let p = pending.remove(&ws_id).expect("expired entry present");
+                        tracing::warn!(
+                            workspace = %ws_id,
+                            "workspace setup completion not observed within {}s; starting watchers anyway",
+                            setup_backstop.as_secs(),
+                        );
+                        start_watches(
+                            &hub,
+                            &common_watches,
+                            &bus,
+                            &refresher,
+                            &mut file_watchers,
+                            &mut git_watchers,
+                            &ws_id,
+                            &p.path,
+                            " (setup completion backstop)",
+                        );
+                        skills.add_workspace(ws_id.clone(), p.path.clone());
+                        specialists.add_workspace(ws_id, p.path);
+                    }
+                    continue;
+                }
+            },
+        };
         for ev in batch {
             let ws_id = ev.workspace_id.clone();
             match ev.event_type.as_str() {
-                WORKSPACE_CREATED | WORKSPACE_OPENED => {
+                // Deferred start: hold the pending root until the create
+                // flow's setup stage completes (see the module docs). No
+                // watcher exists during the setup window, so setup churn is
+                // naturally dropped.
+                WORKSPACE_CREATED => {
                     let Some(path) = resolve_path(&ev, services.as_ref()).await else {
                         tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
                         continue;
                     };
+                    tracing::info!(workspace = %ws_id, path = %path.display(), "deferring watcher start until workspace setup completes");
+                    pending.insert(
+                        ws_id,
+                        PendingSetup {
+                            path,
+                            deadline: Instant::now() + setup_backstop,
+                        },
+                    );
+                }
+                WORKSPACE_SETUP_COMPLETED => {
+                    // Only meaningful for a deferred create; a completion for
+                    // an already-watched (or unknown) workspace is ignored.
+                    let Some(p) = pending.remove(&ws_id) else {
+                        continue;
+                    };
+                    start_watches(
+                        &hub,
+                        &common_watches,
+                        &bus,
+                        &refresher,
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        &p.path,
+                        " (setup completed)",
+                    );
+                    skills.add_workspace(ws_id.clone(), p.path.clone());
+                    specialists.add_workspace(ws_id, p.path);
+                }
+                WORKSPACE_OPENED => {
+                    let Some(path) = resolve_path(&ev, services.as_ref()).await else {
+                        tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
+                        continue;
+                    };
+                    // An open during the setup window supersedes the deferral
+                    // (the user is in the workspace; watch it now) — clear
+                    // the pending entry so the backstop cannot restart the
+                    // watches later and reopen a brief event-loss window.
+                    pending.remove(&ws_id);
                     start_watches(
                         &hub,
                         &common_watches,
@@ -317,6 +449,9 @@ async fn lifecycle_loop(
                     specialists.add_workspace(ws_id, path);
                 }
                 WORKSPACE_DELETED | WORKSPACE_CLOSED => {
+                    if pending.remove(&ws_id).is_some() {
+                        tracing::info!(workspace = %ws_id, "discarding deferred watcher start (runtime deregistration)");
+                    }
                     stop_watches(
                         &mut file_watchers,
                         &mut git_watchers,
@@ -332,6 +467,9 @@ async fn lifecycle_loop(
                 // ignored before any path resolution.
                 WORKSPACE_UPDATED => match archived_delta(&ev) {
                     Some(true) => {
+                        if pending.remove(&ws_id).is_some() {
+                            tracing::info!(workspace = %ws_id, "discarding deferred watcher start (workspace archived)");
+                        }
                         stop_watches(
                             &mut file_watchers,
                             &mut git_watchers,
@@ -555,6 +693,18 @@ mod tests {
         ev
     }
 
+    /// A `workspace:setup:completed` event shaped like the create-flow
+    /// publisher in `lib.rs`: id-only payload plus the `ranScript` flag (the
+    /// registry keys off the workspace id alone).
+    fn setup_completed_event(ws: &Workspace, ran_script: bool) -> NewEvent {
+        let mut ev = lifecycle_event(WORKSPACE_SETUP_COMPLETED, ws, false);
+        ev.data = serde_json::json!({
+            "workspaceId": ws.id.as_str(),
+            "ranScript": ran_script,
+        });
+        ev
+    }
+
     async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {
         let db = TempDb::new();
         let store = Store::open(&db.path).await.expect("open store");
@@ -591,12 +741,22 @@ mod tests {
 
     /// Start a registry with its own refresher (the production wiring shape).
     async fn start_registry(bus: &EventBus, api: Arc<dyn WorkspaceApi>) -> WatcherRegistry {
+        start_registry_with_backstop(bus, api, SETUP_COMPLETION_BACKSTOP).await
+    }
+
+    /// [`start_registry`] with an explicit setup-completion backstop, for the
+    /// tests that exercise the backstop path without the production window.
+    async fn start_registry_with_backstop(
+        bus: &EventBus,
+        api: Arc<dyn WorkspaceApi>,
+        backstop: Duration,
+    ) -> WatcherRegistry {
         let refresher = Arc::new(GitStatusRefresher::start(
             bus.clone(),
             api.clone(),
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        WatcherRegistry::start(bus.clone(), api, refresher).await
+        WatcherRegistry::start_with_backstop(bus.clone(), api, refresher, backstop).await
     }
 
     /// Wait until `root` is watched-and-established (`want = true`) or absent
@@ -690,12 +850,16 @@ mod tests {
         // Nothing is watched yet: the boot seed is empty.
 
         // Register a workspace at runtime via `workspace:created` (payload
-        // carries the workspace row per §6.7).
+        // carries the workspace row per §6.7). Watcher start is deferred
+        // until the setup stage completes, so publish the completion too.
         let root = TempDir::new("dynamic");
         let ws = test_workspace("ws-dynamic", &root.path);
         bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
             .await
             .expect("publish created");
+        bus.publish(&setup_completed_event(&ws, true))
+            .await
+            .expect("publish setup completed");
         wait_for_root(&_registry, &root.path, true).await;
 
         std::fs::write(root.path.join("after-create.txt"), "hi").expect("write file");
@@ -716,6 +880,157 @@ mod tests {
         assert!(
             ev.is_none(),
             "deregistered workspace must stop emitting file events, got {ev:?}"
+        );
+    }
+
+    /// The deferral core (setup gating): `workspace:created` must NOT start
+    /// any watcher — setup-window file churn is dropped, never published —
+    /// and `workspace:setup:completed` starts the watchers, after which
+    /// events flow normally.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn created_workspace_defers_watching_until_setup_completes() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
+
+        let _registry = start_registry(&bus, api).await;
+
+        let root = TempDir::new("setup-deferred");
+        let ws = test_workspace("ws-setup-deferred", &root.path);
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+
+        // Setup window: the root must not even be registered with the hub,
+        // and churn under it must publish nothing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            _registry.root_established(&root.path).is_none(),
+            "created workspace must not be watched while setup is pending"
+        );
+        std::fs::write(root.path.join("during-setup.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
+        assert!(
+            ev.is_none(),
+            "setup-window file churn must be dropped, got {ev:?}"
+        );
+
+        // Completion starts the watchers; events flow from here on.
+        bus.publish(&setup_completed_event(&ws, true))
+            .await
+            .expect("publish setup completed");
+        wait_for_root(&_registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("after-setup.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "workspace must emit file events after setup completes"
+        );
+    }
+
+    /// No-script creates publish `completed { ranScript: false }` right after
+    /// `workspace:created`, so the deferral is just the event round-trip:
+    /// watchers start promptly and events flow.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_script_completion_starts_watching_promptly() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
+
+        let _registry = start_registry(&bus, api).await;
+
+        let root = TempDir::new("no-script");
+        let ws = test_workspace("ws-no-script", &root.path);
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+        bus.publish(&setup_completed_event(&ws, false))
+            .await
+            .expect("publish setup completed");
+        wait_for_root(&_registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("no-script.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "no-script create must start watching on the immediate completion"
+        );
+    }
+
+    /// Backstop: when `workspace:setup:completed` is never observed (missed
+    /// event, hung script), the watchers must start anyway once the backstop
+    /// elapses.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn backstop_starts_watchers_when_setup_completion_never_arrives() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
+
+        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+
+        let root = TempDir::new("backstop");
+        let ws = test_workspace("ws-backstop", &root.path);
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+        // No completion published: the backstop alone must start the watch.
+        wait_for_root(&_registry, &root.path, true).await;
+
+        std::fs::write(root.path.join("after-backstop.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, LIVENESS).await;
+        assert!(
+            ev.is_some(),
+            "backstop must start watchers when setup completion never arrives"
+        );
+    }
+
+    /// A delete during the setup window discards the pending entry: neither
+    /// the (late) completion nor the backstop may start watchers for it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn delete_while_pending_discards_the_deferred_start() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(Vec::new()));
+
+        let _registry = start_registry_with_backstop(&bus, api, Duration::from_millis(500)).await;
+
+        let root = TempDir::new("delete-pending");
+        let ws = test_workspace("ws-delete-pending", &root.path);
+        bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
+            .await
+            .expect("publish created");
+        bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
+            .await
+            .expect("publish deleted");
+        // A straggler completion after the delete must be a no-op too.
+        bus.publish(&setup_completed_event(&ws, true))
+            .await
+            .expect("publish setup completed");
+
+        // Ride out the backstop window: nothing may have started.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            _registry.root_established(&root.path).is_none(),
+            "deleted-while-pending workspace must never be watched"
+        );
+        std::fs::write(root.path.join("never.txt"), "hi").expect("write file");
+        let ev = next_file_event(&mut sub, &ws.id, Duration::from_secs(2)).await;
+        assert!(
+            ev.is_none(),
+            "deleted-while-pending workspace must not emit file events, got {ev:?}"
         );
     }
 
@@ -964,6 +1279,57 @@ mod tests {
         );
     }
 
+    /// Deterministically settle every in-flight refresh for the workspace
+    /// under test before a negative probe, by flushing the shared
+    /// [`GitStatusRefresher`] pipeline with a marker workspace
+    /// (monorepo#2012). A fixed quiet-gap drain is a race: a refresh from
+    /// earlier churn traverses FSEvents delivery, the 1s debounce, and a
+    /// blocking-pool recompute, and under load its `changes:git-status` can
+    /// publish arbitrarily later than any fixed gap.
+    ///
+    /// One round = trigger the (unwatched, non-repo) marker workspace and
+    /// await its status event, noting whether any non-marker event arrived
+    /// before it. The refresh loop is sequential and the bus broadcasts a
+    /// single publisher's events in order, so a marker event bounds every
+    /// publish enqueued before its own — EXCEPT a workspace refresh due in
+    /// the same debounce batch, which can be processed (and published) after
+    /// the marker's (per-batch HashMap order), and a straggler trigger that
+    /// raced in just after the marker's. Both stragglers surface during the
+    /// NEXT round, so the pipeline is settled once two consecutive rounds
+    /// observe nothing but their marker. Panics if settlement never happens
+    /// within `LIVENESS` — a real leak, not slowness.
+    async fn flush_refresher(
+        refresher: &GitStatusRefresher,
+        sub: &mut super::super::bus::Subscription,
+        marker_id: &WorkspaceId,
+    ) {
+        let deadline = Instant::now() + LIVENESS;
+        let mut clean_rounds = 0;
+        while clean_rounds < 2 {
+            refresher.trigger(marker_id.clone());
+            let mut clean = true;
+            'round: loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "refresher never settled within LIVENESS"
+                );
+                match timeout(remaining, sub.recv()).await {
+                    Ok(Some(batch)) => {
+                        for ev in batch {
+                            if &ev.workspace_id == marker_id {
+                                break 'round;
+                            }
+                            clean = false;
+                        }
+                    }
+                    _ => panic!("marker status event never arrived"),
+                }
+            }
+            clean_rounds = if clean { clean_rounds + 1 } else { 0 };
+        }
+    }
+
     /// Archive/unarchive lifecycle against the refcounted common-dir registry
     /// (monorepo#1663): archiving a linked-worktree workspace deregisters it
     /// from the shared common-dir watch (last one out tears the watch down)
@@ -1008,9 +1374,33 @@ mod tests {
 
         let mut ws = test_workspace("ws-wt-archived", &wt_path);
         ws.worktree_path = ws.path.clone();
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let api = Arc::new(FakeApi::new(vec![ws.clone()]));
 
-        let registry = start_registry(&bus, api).await;
+        // The refresher is built explicitly (rather than via `start_registry`)
+        // so the flushes below can inject marker triggers into the same
+        // debounced pipeline the common-dir watch feeds.
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            Arc::clone(&api) as Arc<dyn WorkspaceApi>,
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        let registry = WatcherRegistry::start(
+            bus.clone(),
+            Arc::clone(&api) as Arc<dyn WorkspaceApi>,
+            Arc::clone(&refresher),
+        )
+        .await;
+
+        // Marker workspace for the refresher flushes: pushed AFTER the
+        // registry snapshot so it is never watched, but resolvable via the
+        // api so a marker trigger recomputes (non-repo worktree → minimal
+        // status) and publishes a `changes:git-status` event for it.
+        let marker_root = TempDir::new("wt-arch-flush");
+        let mut marker = test_workspace("ws-wt-arch-flush", &marker_root.path);
+        marker.worktree_path = marker.path.clone();
+        let marker_id = marker.id.clone();
+        api.workspaces.lock().unwrap().push(marker);
+
         wait_for_root(&registry, &wt_path, true).await;
         assert_eq!(
             registry.common_dir_watch_count(),
@@ -1021,10 +1411,15 @@ mod tests {
         // Confirm the common-dir watch actually delivers BEFORE archiving —
         // the while-archived absence assertion below would otherwise pass
         // vacuously against a watch that never worked. Retried for the same
-        // delivery-start race as the other real-watcher tests.
+        // delivery-start race as the other real-watcher tests; attempt count
+        // sized so the total confirmation budget (attempts x 1500ms) reaches
+        // `LIVENESS` — a pure-liveness bound (monorepo#1630), where a fixed
+        // 20-attempt budget gave up under full parallel test load
+        // (monorepo#2012).
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let attempts = LIVENESS.as_millis() / 1500;
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("pre-archive-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
@@ -1036,10 +1431,6 @@ mod tests {
             ev.is_some(),
             "common-dir ref change must refresh the worktree workspace before archiving"
         );
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
 
         // Archive: the watcher drop must deregister the workspace — it was
         // the only rider, so the shared watch tears down entirely.
@@ -1050,11 +1441,12 @@ mod tests {
         wait_for_common_dir_watch_count(&registry, 0).await;
 
         // A common-dir ref change while archived must not trigger anything.
-        // Drain whatever the archive transition itself had in flight first.
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
+        // The watch is gone (count 0), so no NEW triggers can arrive for the
+        // workspace — but refreshes from the pre-archive branch churn can
+        // still be in flight and publish arbitrarily late under load
+        // (monorepo#2012). Settle them deterministically before asserting
+        // absence; a fixed quiet-gap drain here is a race, not a guarantee.
+        flush_refresher(&refresher, &mut status_sub, &marker_id).await;
         repo.branch("while-archived", &head_commit, true).unwrap();
         let ev = next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2)).await;
         assert!(
@@ -1068,17 +1460,18 @@ mod tests {
             .expect("publish unarchived");
         wait_for_root(&registry, &wt_path, true).await;
         wait_for_common_dir_watch_count(&registry, 1).await;
-        // Drain the unarchive catch-up refresh so it cannot masquerade as the
-        // watch-driven event asserted below.
-        while next_status_event(&mut status_sub, &ws.id, Duration::from_secs(2))
-            .await
-            .is_some()
-        {}
+        // Settle the unarchive catch-up refresh deterministically so it
+        // cannot masquerade as the watch-driven event asserted below.
+        flush_refresher(&refresher, &mut status_sub, &marker_id).await;
 
         // Common-dir ref changes trigger again. Retried for the same
-        // delivery-start race as the other real-watcher tests.
+        // delivery-start race as the other real-watcher tests, with the same
+        // liveness-sized attempt budget as the pre-archive confirmation — the
+        // re-created shared watch's registration and delivery start both lag
+        // under load, and the fixed 20-attempt budget is what flaked in
+        // monorepo#2012.
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("after-unarchive-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
@@ -1143,12 +1536,16 @@ mod tests {
         wait_for_common_dir_watch_count(&registry, 1).await;
 
         // Replace the watcher: a buffered `workspace:created` repeating the
-        // startup snapshot. The new watcher registers on the shared entry
-        // first; HashMap::insert then drops the old watcher, whose guard drop
-        // must NOT deregister the fresh registration.
+        // startup snapshot (held pending until its setup completion arrives).
+        // The new watcher registers on the shared entry first;
+        // HashMap::insert then drops the old watcher, whose guard drop must
+        // NOT deregister the fresh registration.
         bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
             .await
             .expect("publish repeated created");
+        bus.publish(&setup_completed_event(&ws, true))
+            .await
+            .expect("publish setup completed");
         wait_for_root(&registry, &wt_path, true).await;
         wait_for_common_dir_watch_count(&registry, 1).await;
         // Drain any refresh in flight from the transition itself.
@@ -1159,10 +1556,13 @@ mod tests {
 
         // Common-dir ref changes must still trigger for the workspace.
         // Retried for the same delivery-start race as the other real-watcher
-        // tests.
+        // tests; attempt count sized so the total confirmation budget
+        // (attempts x 1500ms) reaches `LIVENESS` — a pure-liveness bound
+        // (monorepo#1630, flaked as a fixed budget in monorepo#2012).
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        let attempts = LIVENESS.as_millis() / 1500;
         let mut ev = None;
-        for i in 0..20 {
+        for i in 0..attempts {
             repo.branch(&format!("post-replace-{i}"), &head_commit, true)
                 .unwrap();
             ev = next_status_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
@@ -1319,6 +1719,9 @@ mod tests {
         bus.publish(&lifecycle_event(WORKSPACE_CREATED, &ws, true))
             .await
             .expect("publish created");
+        bus.publish(&setup_completed_event(&ws, true))
+            .await
+            .expect("publish setup completed");
         wait_for_root(&_registry, &root.path, true).await;
 
         // External `git checkout`-style HEAD rewrite → debounced refresh.

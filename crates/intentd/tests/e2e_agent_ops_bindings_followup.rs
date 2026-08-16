@@ -59,9 +59,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -158,7 +160,8 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark it as a task
     services
@@ -167,6 +170,8 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )
@@ -276,7 +281,8 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark it as a task
     services
@@ -285,6 +291,8 @@ async fn agent_wake_or_create_creates_for_unassigned_task() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )
@@ -368,7 +376,8 @@ async fn agent_delegate_creates_new_agent_for_task() {
             None,
         )
         .await
-        .expect("create task note");
+        .expect("create task note")
+        .note;
 
     // Mark as task
     services
@@ -377,6 +386,8 @@ async fn agent_delegate_creates_new_agent_for_task() {
             task_note.id.clone(),
             "not_started".to_string(),
             vec![],
+            None,
+            None,
             None,
             None,
         )

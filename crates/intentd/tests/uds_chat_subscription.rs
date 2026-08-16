@@ -566,7 +566,8 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 2,
+            "resultBlockId": format!("{mid}:2"),
         }),
     )
     .await;
@@ -806,7 +807,8 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 2,
+            "resultBlockId": format!("{mid}:2"),
         }),
     )
     .await;
@@ -891,13 +893,17 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
-/// Iter#1c heal-gate regression: a live-turn slot whose worker is gone (mid-turn
-/// crash, or a race between abort and the slot's `LiveTurnGuard` drop) MUST NOT
-/// produce a phantom in-flight "streaming" message in the seq-0 snapshot. The
-/// gate is [`WorkspaceApi::agent_is_busy`]: without a claim, `chat_snapshot`
-/// returns only the durable conversation page.
+/// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
+/// superseding the Iter#1c heal-gate assertion this test used to make (that a
+/// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
+/// encoded was to labelling orphan content "streaming", not to showing it: a
+/// mid-turn crash or a flush that failed and kept the slot leaves real streamed
+/// output in the daemon that no snapshot could otherwise ever show. So the slot
+/// is merged and `agent_is_busy` only decides the flag — over the wire, the
+/// orphan arrives as a NON-streaming message, and the STAB-125 turn-liveness
+/// fields stay gated on the busy claim, so nothing claims a turn is in flight.
 #[tokio::test]
-async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
+async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
         setup_with_bus().await;
     let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
@@ -937,8 +943,8 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
         .await
         .expect("append user message");
 
-    // A lingering live-turn slot with NO busy claim — the orphan shape this fix
-    // guards against. `chat_snapshot` must NOT merge it.
+    // A lingering live-turn slot with NO busy claim — the orphan shape: real
+    // streamed content the daemon still holds, with nothing coming for it.
     let mid = Uuid::now_v7().to_string();
     services.set_live_turn(
         &agent,
@@ -962,27 +968,41 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(
-        snap["params"]["snapshot"]["totalMessages"], 1,
-        "the orphan live-turn slot must not inflate totalMessages"
+        snap["params"]["snapshot"]["totalMessages"], 2,
+        "the orphan slot's content is served, and counted so seq stays contiguous"
     );
     let messages = snap["params"]["snapshot"]["messages"]
         .as_array()
         .cloned()
         .expect("snapshot messages");
-    assert_eq!(messages.len(), 1, "only the persisted user message");
+    assert_eq!(
+        messages.len(),
+        2,
+        "the user message plus the orphan content"
+    );
     assert_eq!(messages[0]["id"], user_id.as_str());
     assert!(
         messages[0].get("isStreaming").is_none()
             || messages[0]["isStreaming"] == Value::Bool(false),
         "no streaming flag on the durable user message"
     );
+    assert_eq!(messages[1]["id"], mid.as_str());
+    assert_eq!(
+        messages[1]["contentBlocks"][0]["text"], "I'll run ",
+        "…with the streamed-so-far blocks intact: {snap}"
+    );
+    assert_eq!(
+        messages[1]["isStreaming"],
+        Value::Bool(false),
+        "an orphaned slot must never claim to be streaming: {snap}"
+    );
     // STAB-125: the orphan slot must not report a phantom in-flight turn
-    // either — liveness is gated on the busy claim like the merge above.
+    // either — liveness stays gated on the busy claim.
     assert_eq!(snap["params"]["snapshot"]["turnInFlight"], false);
     assert!(snap["params"]["snapshot"]["lastStreamActivityAt"].is_null());
 
-    // Claiming the busy slot now restores the merge: re-subscribing on a fresh
-    // connection sees the in-flight assistant message exactly as before.
+    // Claiming the busy slot flips the SAME merged message to streaming:
+    // re-subscribing on a fresh connection sees it flagged in-flight.
     services.set_test_busy(&agent, true);
     let (sub2_read, mut sub2_write) = connect_retry(&socket).await.into_split();
     let mut sub2_reader = tokio::io::BufReader::new(sub2_read);
@@ -1215,19 +1235,21 @@ async fn chat_subscription_coexists_with_events_firehose() {
     let _ = server.await;
 }
 
-/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call so the
-/// live mapper's optimistic block layout diverges from the durable transcript,
-/// forcing the terminal reconcile to emit a NON-EMPTY `removedIds`. Two distinct
-/// self-heal paths are exercised at once: (1) the mispredicted `tool_result`
-/// index — the live mapper appends the result right after the `tool_use`
-/// (`{mid}:2`), but the persisted transcript flushed the interleaved text into
-/// `{mid}:2` and placed the real `tool_result` at `{mid}:3`, so `{mid}:2` heals
-/// from `tool_result` back to `text` via an `updated` entity; and (2) a trailing
-/// partial text block (`{mid}:4`) the model streamed live but the durable turn
-/// dropped — it exists in no persisted block, so reconcile lists it in
-/// `removedIds`. The assertion is the reconciliation invariant: the seq-0
-/// snapshot reduced with every delta (HONORING `removedIds`) equals a fresh
-/// `agent.getConversation` snapshot, and the terminal `removedIds` is non-empty.
+/// CS-5 orphan self-heal: a turn where TEXT INTERLEAVES AFTER a tool call and a
+/// trailing partial text block (`{mid}:4`) the model streamed live but the
+/// durable turn dropped — it exists in no persisted block, so the terminal
+/// reconcile lists it in a NON-EMPTY `removedIds`. The assertion is the
+/// reconciliation invariant: the seq-0 snapshot reduced with every delta
+/// (HONORING `removedIds`) equals a fresh `agent.getConversation` snapshot, and
+/// the terminal `removedIds` is non-empty.
+///
+/// The `tool_result` id is NOT part of the divergence any more (monorepo#2029):
+/// the completion event carries the real `resultBlockId` (`{mid}:3`, what
+/// `record_tool` assigned after flushing the interleaved text into `{mid}:2`),
+/// so the live mapper stamps it verbatim instead of predicting `tool_use + 1`
+/// and clobbering the interleaved text block for the rest of the turn. This
+/// test asserts that too — `{mid}:2` must never be emitted as a `tool_result` —
+/// while still exercising the genuine-orphan self-heal path via `{mid}:4`.
 #[tokio::test]
 async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
     let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
@@ -1328,9 +1350,9 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         chunk(2, "Checking output. "),
     )
     .await;
-    // 4) Tool completes WITH output: the mapper appends the predicted tool_result
-    //    right after the tool_use ({mid}:2), MISPREDICTING the index (it overwrites
-    //    the interleaved text block at {mid}:2 live).
+    // 4) Tool completes WITH output. The event carries the REAL result id the
+    //    durable transcript assigned ({mid}:3 — the interleaved text took
+    //    {mid}:2), so the mapper stamps it instead of predicting {mid}:2.
     publish_stream(
         &bus,
         &ws_id,
@@ -1340,7 +1362,8 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
             "agentId": agent_id, "toolName": "run_tests", "toolKind": "terminal",
             "toolCallId": "call_abc", "input": { "path": "." }, "status": "completed",
             "output": "12 passed", "messageId": mid, "blockIndex": 1,
-            "blockId": format!("{mid}:1"),
+            "blockId": format!("{mid}:1"), "resultBlockIndex": 3,
+            "resultBlockId": format!("{mid}:3"),
         }),
     )
     .await;
@@ -1391,6 +1414,19 @@ async fn chat_delta_orphaned_block_reconciles_via_nonempty_removed_ids() {
         let frame = read_json(&mut sub_reader).await;
         assert_eq!(frame["params"]["kind"], "delta");
         let delta = frame["params"]["delta"].clone();
+        // monorepo#2029: no live delta may stamp a `tool_result` onto the
+        // interleaved text block's id — the completion event named the real
+        // {mid}:3 and the mapper must not derive {mid}:2 from the tool_use.
+        for key in ["added", "updated"] {
+            for entity in delta[key].as_array().into_iter().flatten() {
+                let block = &entity["block"];
+                assert!(
+                    !(block["id"] == json!(format!("{mid}:2"))
+                        && block["type"] == json!("tool_result")),
+                    "the interleaved text block {{mid}}:2 is never overwritten live: {entity}"
+                );
+            }
+        }
         let terminal = is_terminal_delta(&delta);
         if terminal {
             terminal_removed = delta["removedIds"]

@@ -293,6 +293,11 @@ async fn delegate_resolves_configured_default_provider_over_wss() {
     )
     .await;
     let agent_id = delegate_result["agentId"].as_str().expect("agentId");
+    assert_eq!(
+        delegate_result["provider"].as_str(),
+        Some("mock"),
+        "delegate result surfaces the resolved provider over the wire (PROTOCOL §5.5): {delegate_result}"
+    );
 
     let get_result = wss_rpc(
         &mut ws,

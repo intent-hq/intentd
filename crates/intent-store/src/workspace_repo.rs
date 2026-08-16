@@ -162,6 +162,37 @@ impl Store {
         Ok(())
     }
 
+    /// Scoped PR-linkage write: set ONLY the PR columns (`pr_number`,
+    /// `pr_url`, `pr_status`, `active_pull_request`, `pull_requests`) plus
+    /// `updated_at` — never a full-row replace, so a PR refresh whose
+    /// workspace read predates a concurrent mutation (archive, title edit,
+    /// relink) can never clobber the other columns (same scoped-update
+    /// discipline as [`Self::set_workspace_attention`] /
+    /// [`Self::update_workspace_token_usage`]). The PR columns themselves are
+    /// last-writer-wins by design — refreshes are idempotent against the
+    /// forge and the next sweep converges. `NotFound` when the workspace
+    /// does not exist.
+    pub async fn update_workspace_pr_linkage(&self, ws: &Workspace) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
+             active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
+        )
+        .bind(ws.pr_number.map(|n| n as i64))
+        .bind(&ws.pr_url)
+        .bind(pr_status_to_db(ws)?)
+        .bind(active_pr_to_db(ws)?)
+        .bind(pull_requests_to_db(ws)?)
+        .bind(&ws.updated_at)
+        .bind(&ws.id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update workspace pr linkage failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {}", ws.id)));
+        }
+        Ok(())
+    }
+
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
     /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
     /// per-session usage rows and the stored workspace `token_usage`, invoke
@@ -681,6 +712,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        waiting: false,
         token_usage,
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
@@ -688,5 +720,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         execution_environment,
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,
+        pending_delete_at: None,
     })
 }

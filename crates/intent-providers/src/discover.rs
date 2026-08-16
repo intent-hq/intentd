@@ -9,6 +9,10 @@
 
 use std::path::PathBuf;
 
+use intent_core::path_utils::{
+    has_windows_exec_extension, is_executable_file, is_executable_file_for, WINDOWS_EXEC_EXTENSIONS,
+};
+
 use crate::config::{ProviderConfig, ACP_PROVIDERS};
 
 /// Availability of one configured provider.
@@ -81,22 +85,6 @@ pub struct NpxStatus {
 
 /// Platform `PATH` list separator.
 const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
-
-/// Extensions Windows can actually run for a provider entry point
-/// (`CreateProcess` / `cmd.exe`-runnable), in resolution-preference order.
-const WINDOWS_EXEC_EXTENSIONS: [&str; 3] = ["exe", "cmd", "bat"];
-
-/// True when `path` carries a Windows-runnable executable extension
-/// (`.exe`/`.cmd`/`.bat`, case-insensitive).
-fn has_windows_exec_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            WINDOWS_EXEC_EXTENSIONS
-                .iter()
-                .any(|e| ext.eq_ignore_ascii_case(e))
-        })
-}
 
 /// Candidate filenames to try when resolving a command in a directory.
 /// POSIX uses the bare name. Windows probes only runnable entry points
@@ -545,35 +533,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-}
-
-/// True when `p` is a file that is executable (unix checks the exec bit;
-/// Windows requires a runnable executable extension — `CreateProcess` cannot
-/// run a bare extensionless file, so its mere existence is not enough).
-fn is_executable_file(p: &std::path::Path) -> bool {
-    is_executable_file_for(p, cfg!(windows))
-}
-
-/// [`is_executable_file`] parametrized on the platform (test seam — Windows
-/// CI is disabled, so the Windows arm is unit-tested on POSIX).
-fn is_executable_file_for(p: &std::path::Path, is_windows: bool) -> bool {
-    if !p.is_file() {
-        return false;
-    }
-    if is_windows {
-        return has_windows_exec_extension(p);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// Find the first executable for `command` by scanning enhanced PATH directories

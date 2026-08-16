@@ -74,9 +74,11 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -224,7 +226,8 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
                 None,
             )
             .await
-            .expect("create note");
+            .expect("create note")
+            .note;
         note.id.0
     };
 

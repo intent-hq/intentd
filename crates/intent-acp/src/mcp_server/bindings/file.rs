@@ -22,6 +22,8 @@ pub(crate) const PRELUDE: &str = r#"
         mkdir: (path) => host({ method: 'file.mkdir', args: { path } }),
         rename: (oldPath, newPath) =>
             host({ method: 'file.rename', args: { oldPath, newPath } }),
+        getAttachment: (attachmentId, destDir) =>
+            host({ method: 'file.getAttachment', args: { attachmentId, destDir } }),
     };
 "#;
 
@@ -77,6 +79,17 @@ pub(crate) async fn dispatch(
             let new_path = req_str(args, "newPath")
                 .map_err(|_| "Both oldPath and newPath are required".to_string())?;
             api.file_rename(ws.clone(), old_path, new_path, caller)
+                .await
+                .map_err(map_err)
+        }
+        "getAttachment" => {
+            // Copy a registered attachment from the canonical store into the
+            // CALLER's working directory (sandbox clone for CoW-sandboxed
+            // callers — resolved inside the service from the caller session).
+            let attachment_id = req_str(args, "attachmentId")
+                .map_err(|_| "attachmentId is required".to_string())?;
+            let dest_dir = opt_str(args, "destDir");
+            api.file_get_attachment(ws.clone(), attachment_id, caller, dest_dir)
                 .await
                 .map_err(map_err)
         }

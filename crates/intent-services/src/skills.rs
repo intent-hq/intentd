@@ -640,7 +640,7 @@ fn normalize_scalar(value: Option<&serde_yaml::Value>) -> Option<String> {
 }
 
 /// Build the skills catalog XML for prompt injection
-fn build_skills_catalog(skills: &[SkillMetadata]) -> String {
+pub(crate) fn build_skills_catalog(skills: &[SkillMetadata]) -> String {
     if skills.is_empty() {
         return String::new();
     }

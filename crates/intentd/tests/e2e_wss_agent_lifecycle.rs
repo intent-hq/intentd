@@ -616,6 +616,144 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(mc >= 1, "assistant message persisted (messageCount={mc})");
 }
 
+/// Abnormal finish reason (PROTOCOL §7): a turn resolving with a
+/// non-`end_turn` stop reason (`refusal` here) durably tags the assistant row
+/// with `metadata.finishReason` — visible on the `agent.getConversation`
+/// transcript after the turn — and the terminal `agent:stream:end` carries
+/// the same `finishReason` live. The turn stays a completion: `agent:idle`
+/// fires (carrying its existing `finishReason` lifecycle field) and
+/// `agent:failed` never does.
+#[tokio::test]
+async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
+    let Some(script) = gate("WSS abnormal finishReason E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "refusing to continue",
+        "stopReason": "refusal",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-FINISH", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "do something" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Terminal surface: stream:end carries finishReason, agent:idle follows,
+    // agent:failed never fires — an abnormal stop reason is a completion.
+    let mut end_frame: Option<Value> = None;
+    let mut idle_frame: Option<Value> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:stream:end") => {
+                end_frame = Some(event.clone());
+            }
+            Some("agent:idle") => {
+                idle_frame = Some(event.clone());
+                break;
+            }
+            Some("agent:failed") => {
+                panic!("agent:failed emitted for an abnormal (refusal) completion: {frame}");
+            }
+            _ => {}
+        }
+    }
+    let end = end_frame.expect("terminal agent:stream:end observed");
+    assert_eq!(
+        end["data"]["finishReason"].as_str(),
+        Some("refusal"),
+        "terminal stream:end carries the abnormal finishReason: {end}"
+    );
+    let message_id = end["data"]["messageId"]
+        .as_str()
+        .expect("stream:end carries the persisted messageId")
+        .to_string();
+    let idle = idle_frame.expect("agent:idle observed");
+    assert_eq!(
+        idle["data"]["finishReason"].as_str(),
+        Some("refusal"),
+        "agent:idle lifecycle finishReason: {idle}"
+    );
+
+    // Durable half: the transcript row carries metadata.finishReason so a
+    // reloading client can render the ending without having seen the event.
+    let convo = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let assistant = messages
+        .iter()
+        .find(|m| m["id"] == json!(message_id))
+        .expect("assistant row from the turn present in the transcript");
+    assert_eq!(assistant["role"], json!("assistant"));
+    assert_eq!(
+        assistant["metadata"]["finishReason"].as_str(),
+        Some("refusal"),
+        "assistant row durably tagged with the abnormal finishReason: {assistant}"
+    );
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as
@@ -2276,6 +2414,170 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
 
     // Release the parked worker so the daemon tears down cleanly.
     let stopped = wss_rpc(&mut rpc, 17, "agent.stop", json!({ "agentId": busy_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+}
+
+/// monorepo#2063 A2 over the real WSS wire: `agent.diagnostics` rows carry
+/// `subtreeMemoryBytes` for an agent whose spawned subtree the live sampler
+/// has attributed, and omit it for an agent that was never spawned — proving
+/// the composition-root `set_tree_probe` wiring in `cmd_serve`, the sampler's
+/// per-agent bucketing, and the wire shape end to end (not just the
+/// service-level fake). Also asserts the field stays off the hot `agent.get` /
+/// `agent.list` payloads (diagnostics-only by design).
+///
+/// Timing: the sampler publishes a full attribution sweep at boot and then on
+/// its ~5s baseline cadence, so the parked agent's bucket lands within one
+/// baseline period of the spawn — the poll loop below bounds that wait.
+#[tokio::test]
+async fn agent_diagnostics_reports_subtree_memory_over_wss() {
+    let Some(script) = gate("WSS diagnostics subtreeMemoryBytes E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Park the prompted agent mid-turn so its node child stays alive across
+    // sampler sweeps and keeps a registered agent-root pid.
+    let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["chat:stream:delta"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Never prompted — no worker child, so no bucket and no field.
+    let idle = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Unspawned", "model": "mock:default" }),
+    )
+    .await;
+    let idle_id = idle["agent"]["id"].as_str().expect("idle id").to_string();
+
+    // Prompted and parked — a live node subtree for the sampler to attribute.
+    let busy = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Spawned", "model": "mock:default" }),
+    )
+    .await;
+    let busy_id = busy["agent"]["id"].as_str().expect("busy id").to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": busy_id, "content": "go" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait until the turn has streamed its pre-cancel chunk — the worker child
+    // is now live and registered as an agent root.
+    let mut parked = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "chat:stream:delta" {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "busy agent streamed a chunk and parked mid-turn");
+
+    // Poll diagnostics until the live sampler's next full sweep (≤ ~5s away)
+    // attributes the parked subtree; the budget leaves slack for slow CI.
+    let deadline = std::time::Instant::now() + common::test_timeout(Duration::from_secs(30));
+    let mut req_id = 20i64;
+    let mut busy_bytes: Option<u64> = None;
+    let mut last_diag = Value::Null;
+    while std::time::Instant::now() < deadline {
+        req_id += 1;
+        let diag = wss_rpc(
+            &mut rpc,
+            req_id,
+            "agent.diagnostics",
+            json!({ "workspaceId": ws_id }),
+        )
+        .await;
+        let agents = diag["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents array")
+            .clone();
+        last_diag = diag;
+        let busy_row = agents
+            .iter()
+            .find(|a| a["id"] == json!(busy_id))
+            .expect("busy row in diagnostics");
+        if let Some(bytes) = busy_row["subtreeMemoryBytes"].as_u64() {
+            busy_bytes = Some(bytes);
+            // The never-spawned agent's row omits the field entirely (absent,
+            // never 0/null) — asserted on the same snapshot that proved the
+            // sweep has attribution data.
+            let idle_row = agents
+                .iter()
+                .find(|a| a["id"] == json!(idle_id))
+                .expect("idle row in diagnostics");
+            assert!(
+                idle_row.get("subtreeMemoryBytes").is_none(),
+                "unspawned agent row omits subtreeMemoryBytes: {idle_row}"
+            );
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    let busy_bytes = busy_bytes.unwrap_or_else(|| {
+        panic!("sampler never attributed the parked subtree: {last_diag}");
+    });
+    assert!(busy_bytes > 0, "a live node subtree has resident bytes");
+
+    // Diagnostics-only by design: the hot list payloads never carry the field.
+    let got = wss_rpc(&mut rpc, 90, "agent.get", json!({ "agentId": busy_id })).await;
+    assert!(
+        got["agent"].get("subtreeMemoryBytes").is_none(),
+        "agent.get omits subtreeMemoryBytes: {}",
+        got["agent"]
+    );
+    let list = wss_rpc(&mut rpc, 91, "agent.list", json!({ "workspaceId": ws_id })).await;
+    for row in list["agents"].as_array().expect("agents array") {
+        assert!(
+            row.get("subtreeMemoryBytes").is_none(),
+            "agent.list omits subtreeMemoryBytes: {row}"
+        );
+    }
+
+    // Release the parked worker so the daemon tears down cleanly.
+    let stopped = wss_rpc(&mut rpc, 92, "agent.stop", json!({ "agentId": busy_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 }
 
@@ -4280,7 +4582,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
             None,
         )
         .await
-        .expect("create note");
+        .expect("create note")
+        .note;
     (ws.0, note.id.0)
 }
 
@@ -4338,9 +4641,11 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 
@@ -5787,9 +6092,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     // First turn is slow to open a deterministic window where the second send
     // (carrying messageMetadata) lands on a busy agent and queues.
     let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the queueInfo assertions
+        // exercise the stamp without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -5935,6 +6244,147 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     assert_eq!(
         tagged["contentBlocks"][0]["messageMetadata"], tagged["metadata"],
         "drained user block must fold the same messageMetadata: {tagged}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production-default threshold gate (monorepo#2353): with NO env override, a
+// queued entry that waited only ~2s (below the 5s threshold) drains WITHOUT
+// the dequeue-wait [SYSTEM NOTE] and WITHOUT the queueInfo metadata stamp —
+// the sub-threshold hop reads exactly like an immediate delivery (PROTOCOL
+// §5.5), while caller-supplied messageMetadata still persists verbatim.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
+    let Some(script) = gate("WSS sub-threshold dequeue-wait E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // 2s busy window < 5s threshold; INTENTD_DEQUEUE_WAIT_MIN_MS deliberately
+    // NOT set — this test exercises the production default.
+    let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SubThresh", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // First send — the agent goes busy for 2000ms.
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first message" }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+    sleep(Duration::from_millis(200)).await;
+
+    // Second send while busy — queues, waits ~2s, drains sub-threshold.
+    let metadata = json!({ "type": "event_notification" });
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "sub-threshold queued message",
+            "messageMetadata": metadata,
+        }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+
+    // Wait for both turns to finish (first send + drained queued send).
+    let mut stream_end_count = 0;
+    for _ in 0..120 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            stream_end_count += 1;
+            if stream_end_count >= 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(stream_end_count, 2, "both turns must complete");
+
+    let convo = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let drained = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| {
+            m["role"] == "user"
+                && m["contentBlocks"][0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("sub-threshold queued message"))
+        })
+        .expect("drained user message row present");
+    // No dequeue-wait system note on the persisted content.
+    let text = drained["contentBlocks"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("This message was queued at"),
+        "sub-threshold drain must not carry the dequeue-wait note: {drained}"
+    );
+    // No queueInfo stamp — neither on the row metadata nor the in-block fold.
+    assert!(
+        drained["metadata"]["queueInfo"].is_null(),
+        "sub-threshold drain must not stamp queueInfo on row metadata: {drained}"
+    );
+    assert!(
+        drained["contentBlocks"][0]["messageMetadata"]["queueInfo"].is_null(),
+        "sub-threshold drain must not fold queueInfo into the block: {drained}"
+    );
+    // Caller-supplied messageMetadata still persists verbatim.
+    assert_eq!(
+        drained["metadata"]["type"], "event_notification",
+        "caller messageMetadata must persist unchanged: {drained}"
     );
 }
 
@@ -8600,9 +9050,13 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
+        // The 2s busy window sits below the 5s dequeue-wait annotation
+        // threshold (monorepo#2353); drop it so the wait-note assertions
+        // exercise the annotation without slowing the suite.
+        ("INTENTD_DEQUEUE_WAIT_MIN_MS", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];

@@ -273,6 +273,9 @@ pub fn parse_tasks(content: &str) -> Vec<NoteTaskRow> {
                 status: status.to_string(),
                 task_note_id: task_note_id.clone(),
                 linked_task_note_id: task_note_id,
+                depends_on: Vec::new(),
+                conflicts_with: Vec::new(),
+                unmet_depends_on: Vec::new(),
             })
         })
         .collect()
@@ -1224,9 +1227,21 @@ fn trailing_word(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// One task parsed from a `@@@task` block.
+#[derive(Debug, Default)]
 pub struct ParsedTaskBlock {
     pub title: String,
     pub content: String,
+    /// Raw `key=` header attribute (local key, unresolved).
+    pub key: Option<String>,
+    /// Raw `dependsOn=` header attribute items (unresolved keys/titles/ids).
+    pub depends_on: Vec<String>,
+    /// Raw `conflictsWith=` header attribute items (unresolved).
+    pub conflicts_with: Vec<String>,
+    /// Raw `effort=` header attribute (unparsed estimate).
+    pub effort: Option<String>,
+    /// Parse-level problems on the fence header (unknown/duplicate/empty
+    /// attributes). The block still parses; callers surface these as warnings.
+    pub issues: Vec<String>,
 }
 
 /// Result of [`extract_task_blocks`].
@@ -1269,7 +1284,11 @@ fn parse_task_block_content(block: &str) -> Option<ParsedTaskBlock> {
     }
     let title = title?;
     let content = lines[start..].join("\n").trim().to_string();
-    Some(ParsedTaskBlock { title, content })
+    Some(ParsedTaskBlock {
+        title,
+        content,
+        ..Default::default()
+    })
 }
 
 /// True if the content contains at least one `@@@task`/`@@@tasks` fence-and-close
@@ -1278,8 +1297,122 @@ pub fn has_task_blocks(content: &str) -> bool {
     !scan_blocks(content).is_empty()
 }
 
-/// Scan raw `@@@task` blocks → `(full_range_start, full_range_end, body)`.
-fn scan_blocks(content: &str) -> Vec<(usize, usize, String)> {
+/// Header attributes parsed from a `@@@task` fence line.
+#[derive(Debug, Default)]
+struct TaskBlockHeader {
+    key: Option<String>,
+    depends_on: Vec<String>,
+    conflicts_with: Vec<String>,
+    effort: Option<String>,
+    issues: Vec<String>,
+}
+
+/// One raw block found by [`scan_blocks`]: full range + fence header + body.
+struct ScannedBlock {
+    start: usize,
+    end: usize,
+    header: TaskBlockHeader,
+    body: String,
+}
+
+/// Parse the fence-line text after `@@@task`/`@@@tasks` into header attributes.
+///
+/// Grammar: whitespace-separated `name=value` pairs; list values are
+/// comma-separated bare tokens with optional whitespace around commas
+/// (`dependsOn=a, b ,c`). Known names: `key`, `dependsOn`, `conflictsWith`,
+/// `effort` (case-sensitive). Returns `None` when the text is not
+/// attribute-shaped at all (free text, missing `=`, non-alphanumeric name) —
+/// such lines are not fences, matching the pre-attribute behavior. Semantic
+/// problems on attribute-shaped tokens (unknown name, duplicate, empty value)
+/// keep the fence valid and are carried on `issues`.
+fn parse_fence_header(header: &str) -> Option<TaskBlockHeader> {
+    let mut h = TaskBlockHeader::default();
+    let trimmed = header.trim();
+    if trimmed.is_empty() {
+        return Some(h);
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut attrs: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let mut acc = tokens[idx].to_string();
+        // Re-join list items split around commas: `a, b` / `a ,b` / `a , b`.
+        while idx + 1 < tokens.len() && (acc.ends_with(',') || tokens[idx + 1].starts_with(',')) {
+            idx += 1;
+            acc.push_str(tokens[idx]);
+        }
+        attrs.push(acc);
+        idx += 1;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for attr in attrs {
+        let (name, value) = attr.split_once('=')?;
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        // Duplicates are detected by attribute-name occurrence (not by a
+        // filled slot), so `key= key=second` is empty-value + duplicate and
+        // the second value is never silently accepted.
+        if seen.iter().any(|s| s == name) {
+            h.issues.push(format!(
+                "duplicate attribute `{name}` (first occurrence kept)"
+            ));
+            continue;
+        }
+        seen.push(name.to_string());
+        match name {
+            "key" => set_scalar_attr(&mut h.key, name, value, &mut h.issues),
+            "effort" => set_scalar_attr(&mut h.effort, name, value, &mut h.issues),
+            "dependsOn" => set_list_attr(&mut h.depends_on, name, value, &mut h.issues),
+            "conflictsWith" => set_list_attr(&mut h.conflicts_with, name, value, &mut h.issues),
+            other => h
+                .issues
+                .push(format!("unknown attribute `{other}` on task block header")),
+        }
+    }
+    Some(h)
+}
+
+fn set_scalar_attr(slot: &mut Option<String>, name: &str, value: &str, issues: &mut Vec<String>) {
+    if value.is_empty() {
+        issues.push(format!("empty value for attribute `{name}`"));
+    } else if value.contains(',') || value.contains('=') {
+        // A comma or `=` inside a scalar value is almost certainly a stray
+        // comma gluing attributes together (`key=a ,dependsOn=b`) or a list
+        // value on a scalar attribute (`key=a,b`) — flag it, don't guess.
+        issues.push(format!(
+            "malformed value `{value}` for attribute `{name}` (expected a single bare token; attributes are separated by whitespace)"
+        ));
+    } else {
+        *slot = Some(value.to_string());
+    }
+}
+
+fn set_list_attr(slot: &mut Vec<String>, name: &str, value: &str, issues: &mut Vec<String>) {
+    let mut items: Vec<String> = Vec::new();
+    let mut any_item = false;
+    for item in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        any_item = true;
+        if item.contains('=') {
+            // A stray comma before another attribute glues `name=value` into
+            // this list (`dependsOn=a, key=b`) — flag and drop the item.
+            issues.push(format!(
+                "malformed item `{item}` in attribute `{name}` (attributes are separated by whitespace, not commas)"
+            ));
+        } else {
+            items.push(item.to_string());
+        }
+    }
+    if !any_item {
+        issues.push(format!("empty value for attribute `{name}`"));
+    }
+    *slot = items;
+}
+
+/// Scan raw `@@@task` blocks. The fence line may carry optional header
+/// attributes (see [`parse_fence_header`]); a bare fence behaves exactly as
+/// before.
+fn scan_blocks(content: &str) -> Vec<ScannedBlock> {
     let b = content.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -1289,23 +1422,42 @@ fn scan_blocks(content: &str) -> Vec<(usize, usize, String)> {
         if j < b.len() && b[j] == b's' {
             j += 1;
         }
-        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
-            j += 1;
-        }
-        if j < b.len() && b[j] == b'\r' {
-            j += 1;
-        }
-        if j >= b.len() || b[j] != b'\n' {
+        // The keyword must be followed by whitespace or end-of-line.
+        if j < b.len() && !matches!(b[j], b' ' | b'\t' | b'\r' | b'\n') {
             i = pos + "@@@task".len();
             continue;
         }
-        j += 1;
-        let body_start = j;
-        match content[j..].find("@@@") {
+        let Some(line_end_rel) = content[j..].find('\n') else {
+            // No newline after the fence keyword — not a block.
+            i = pos + "@@@task".len();
+            continue;
+        };
+        let line_end = j + line_end_rel;
+        // Strip at most ONE trailing CR (CRLF line ending) — main's scanner
+        // consumed a single optional `\r`, so `@@@task\r\r\n` stays a
+        // non-fence via the interior-CR guard below.
+        let raw_header = &content[j..line_end];
+        let header_text = raw_header.strip_suffix('\r').unwrap_or(raw_header);
+        let header = if header_text.contains('\r') {
+            None
+        } else {
+            parse_fence_header(header_text)
+        };
+        let Some(header) = header else {
+            i = pos + "@@@task".len();
+            continue;
+        };
+        let body_start = line_end + 1;
+        match content[body_start..].find("@@@") {
             Some(close_rel) => {
-                let body_end = j + close_rel;
+                let body_end = body_start + close_rel;
                 let full_end = body_end + 3;
-                out.push((pos, full_end, content[body_start..body_end].to_string()));
+                out.push(ScannedBlock {
+                    start: pos,
+                    end: full_end,
+                    header,
+                    body: content[body_start..body_end].to_string(),
+                });
                 i = full_end;
             }
             None => break,
@@ -1322,17 +1474,22 @@ pub fn extract_task_blocks(content: &str) -> TaskBlocksResult {
     let mut out = String::new();
     let mut cursor = 0;
     let mut valid_index = 0;
-    for (start, end, body) in &blocks {
-        out.push_str(&content[cursor..*start]);
-        match parse_task_block_content(body) {
-            Some(task) => {
+    for block in blocks {
+        out.push_str(&content[cursor..block.start]);
+        match parse_task_block_content(&block.body) {
+            Some(mut task) => {
                 out.push_str(&format!("<!-- task-block-placeholder-{valid_index} -->"));
+                task.key = block.header.key;
+                task.depends_on = block.header.depends_on;
+                task.conflicts_with = block.header.conflicts_with;
+                task.effort = block.header.effort;
+                task.issues = block.header.issues;
                 tasks.push(task);
                 valid_index += 1;
             }
             None => out.push_str("<!-- invalid-task-block-removed -->"),
         }
-        cursor = *end;
+        cursor = block.end;
     }
     out.push_str(&content[cursor..]);
     TaskBlocksResult {
@@ -2041,6 +2198,201 @@ mod tests {
             .contains("<!-- invalid-task-block-removed -->"));
         assert!(has_task_blocks(content));
         assert!(!has_task_blocks("no blocks here"));
+    }
+
+    #[test]
+    fn bare_header_has_no_attributes_or_issues() {
+        let result = extract_task_blocks("@@@task\n# T\nbody\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert!(t.depends_on.is_empty());
+        assert!(t.conflicts_with.is_empty());
+        assert_eq!(t.effort, None);
+        assert!(t.issues.is_empty());
+    }
+
+    #[test]
+    fn header_attr_key_alone() {
+        let result = extract_task_blocks("@@@task key=t1\n# T\nbody\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key.as_deref(), Some("t1"));
+        assert!(t.depends_on.is_empty());
+        assert!(t.conflicts_with.is_empty());
+        assert_eq!(t.effort, None);
+        assert!(t.issues.is_empty());
+        assert_eq!(t.title, "T");
+        assert_eq!(t.content, "body");
+        assert!(result
+            .content_without_blocks
+            .contains("<!-- task-block-placeholder-0 -->"));
+    }
+
+    #[test]
+    fn header_attr_depends_on_list() {
+        let result = extract_task_blocks("@@@task dependsOn=t1,t2,t3\n# T\n@@@");
+        assert_eq!(result.tasks[0].depends_on, vec!["t1", "t2", "t3"]);
+        assert!(result.tasks[0].issues.is_empty());
+    }
+
+    #[test]
+    fn header_attr_conflicts_with_list() {
+        let result = extract_task_blocks("@@@task conflictsWith=a,b\n# T\n@@@");
+        assert_eq!(result.tasks[0].conflicts_with, vec!["a", "b"]);
+        assert!(result.tasks[0].issues.is_empty());
+    }
+
+    #[test]
+    fn header_attr_effort_alone() {
+        let result = extract_task_blocks("@@@task effort=2h\n# T\n@@@");
+        assert_eq!(result.tasks[0].effort.as_deref(), Some("2h"));
+        assert!(result.tasks[0].issues.is_empty());
+    }
+
+    #[test]
+    fn header_attrs_combined() {
+        let content = "@@@task key=t3 dependsOn=t1,t2 conflictsWith=t4 effort=30m\n# T\nbody\n@@@";
+        let result = extract_task_blocks(content);
+        let t = &result.tasks[0];
+        assert_eq!(t.key.as_deref(), Some("t3"));
+        assert_eq!(t.depends_on, vec!["t1", "t2"]);
+        assert_eq!(t.conflicts_with, vec!["t4"]);
+        assert_eq!(t.effort.as_deref(), Some("30m"));
+        assert!(t.issues.is_empty());
+        assert!(has_task_blocks(content));
+    }
+
+    #[test]
+    fn header_attrs_whitespace_tolerant() {
+        let content = "@@@task \t key=t1 \t dependsOn=a, b ,c , d\teffort=1d \n# T\n@@@";
+        let result = extract_task_blocks(content);
+        let t = &result.tasks[0];
+        assert_eq!(t.key.as_deref(), Some("t1"));
+        assert_eq!(t.depends_on, vec!["a", "b", "c", "d"]);
+        assert_eq!(t.effort.as_deref(), Some("1d"));
+        assert!(t.issues.is_empty());
+    }
+
+    #[test]
+    fn header_attrs_on_tasks_variant_and_crlf() {
+        let result = extract_task_blocks("@@@tasks key=t1 dependsOn=a,b\r\n# T\r\nbody\r\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key.as_deref(), Some("t1"));
+        assert_eq!(t.depends_on, vec!["a", "b"]);
+        assert!(t.issues.is_empty());
+    }
+
+    #[test]
+    fn header_unknown_attribute_is_issue_not_rejection() {
+        let result = extract_task_blocks("@@@task key=t1 priority=high\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key.as_deref(), Some("t1"));
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("unknown attribute `priority`"));
+    }
+
+    #[test]
+    fn header_attribute_names_are_case_sensitive() {
+        let result = extract_task_blocks("@@@task dependson=t1\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("unknown attribute `dependson`"));
+    }
+
+    #[test]
+    fn header_empty_and_duplicate_values_are_issues() {
+        let result = extract_task_blocks("@@@task key= effort=1h effort=2h dependsOn=,\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert_eq!(t.effort.as_deref(), Some("1h"));
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 3);
+        assert!(t.issues[0].contains("empty value for attribute `key`"));
+        assert!(t.issues[1].contains("duplicate attribute `effort`"));
+        assert!(t.issues[2].contains("empty value for attribute `dependsOn`"));
+    }
+
+    #[test]
+    fn header_duplicate_after_empty_first_value_is_not_accepted() {
+        // Duplicates are keyed on attribute-name occurrence: a later value
+        // never silently fills a slot the first (empty) occurrence left unset.
+        let result = extract_task_blocks("@@@task key= key=second\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("empty value for attribute `key`"));
+        assert!(t.issues[1].contains("duplicate attribute `key`"));
+
+        let result = extract_task_blocks("@@@task dependsOn= dependsOn=a\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("empty value for attribute `dependsOn`"));
+        assert!(t.issues[1].contains("duplicate attribute `dependsOn`"));
+    }
+
+    #[test]
+    fn header_multiple_trailing_crs_stay_non_fence() {
+        // Main consumed at most one `\r` before requiring `\n`; extra CRs
+        // must keep disqualifying the fence.
+        assert!(!has_task_blocks("@@@task\r\r\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task \r\r\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task key=a\r\r\n# T\n@@@"));
+        assert!(has_task_blocks("@@@task\r\n# T\n@@@"));
+    }
+
+    #[test]
+    fn header_stray_comma_gluing_attributes_is_flagged() {
+        // A comma between attributes glues the next `name=value` into the
+        // previous value; that must surface as an issue, never silently.
+        let result = extract_task_blocks("@@@task dependsOn=a, key=b\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.depends_on, vec!["a"]);
+        assert_eq!(t.key, None);
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("malformed item `key=b` in attribute `dependsOn`"));
+
+        let result = extract_task_blocks("@@@task key=a ,dependsOn=b\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert!(t.depends_on.is_empty());
+        assert_eq!(t.issues.len(), 1);
+        assert!(t.issues[0].contains("malformed value `a,dependsOn=b` for attribute `key`"));
+    }
+
+    #[test]
+    fn header_scalar_values_reject_commas_and_equals() {
+        let result = extract_task_blocks("@@@task key=a,b effort=1h,2h\n# T\n@@@");
+        assert_eq!(result.tasks.len(), 1);
+        let t = &result.tasks[0];
+        assert_eq!(t.key, None);
+        assert_eq!(t.effort, None);
+        assert_eq!(t.issues.len(), 2);
+        assert!(t.issues[0].contains("malformed value `a,b` for attribute `key`"));
+        assert!(t.issues[1].contains("malformed value `1h,2h` for attribute `effort`"));
+    }
+
+    #[test]
+    fn header_free_text_is_not_a_fence() {
+        // Non-attribute-shaped trailing text keeps the pre-attribute behavior:
+        // the line is not a fence at all.
+        assert!(!has_task_blocks("@@@task something\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task =x\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@task key=a extra words\n# T\n@@@"));
+        assert!(!has_task_blocks("@@@taskkey=a\n# T\n@@@"));
+        let result = extract_task_blocks("@@@task something\n# T\n@@@");
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.content_without_blocks, "@@@task something\n# T\n@@@");
     }
 
     #[test]

@@ -176,6 +176,10 @@ fn descendant_pids(root: u32) -> Vec<i32> {
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
+    // Pin resumeInterruptedOnStart=off: this suite drives resumption via the
+    // explicit `agent.resolveInterrupted` RPC, but the `auto` default would
+    // auto-resume stale in-flight agents at restart on headless hosts.
+    common::disable_resume_on_start(data_dir);
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -423,9 +427,11 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
 

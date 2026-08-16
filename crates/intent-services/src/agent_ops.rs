@@ -23,6 +23,15 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Age past which an undelivered ready-to-send queue entry on an agent that is
+/// not actively running counts as a `stale-queue-entry` stuck-risk in
+/// `agent.diagnostics` (intent-hq/monorepo#1897): during the monorepo#1791
+/// incident a settlement wake sat undelivered at position 0 for ~13 minutes on
+/// an idle agent while diagnostics reported zero stuck risks. Five minutes is
+/// comfortably past any normal drain latency (drains trigger in seconds) while
+/// catching a wedged queue well before the incident's timescale.
+const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -126,6 +135,13 @@ pub(crate) struct AssignedAgentScan {
     pub(crate) cleaned_up: Vec<AgentId>,
     pub(crate) poisoned: Vec<AgentId>,
 }
+
+mod batch;
+
+// Delivery-time ready-set delta for completion wakes
+// (intent-hq/monorepo#2044): enqueue-time trigger stamping + the pure delta
+// helper the delivery paths render fresh at flush time.
+pub(crate) mod ready_delta;
 
 #[cfg(test)]
 mod tests;
@@ -639,8 +655,9 @@ pub(crate) struct QueuedMessage {
     pub id: String,
     /// Turn correlation id (monorepo#1022): stable across terminal-failure
     /// requeues so retries of the same logical turn share one id. Fresh
-    /// enqueues set `turn_id = id`; `persist_error_and_requeue` mints a new
-    /// entry `id` but carries the failed turn's original `turn_id` forward.
+    /// enqueues set `turn_id = id`; `publish_error_status_and_requeue` mints
+    /// a new entry `id` but carries the failed turn's original `turn_id`
+    /// forward.
     /// `#[serde(default)]` keeps legacy persisted payloads decodable —
     /// rehydration backfills an empty `turn_id` with the entry `id`.
     #[serde(default)]
@@ -1335,13 +1352,44 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
     priority == Some("interrupt")
 }
 
+/// Validate an FE-supplied `fileBlocks` array (PROTOCOL §5.5): every entry
+/// must carry EXACTLY one of inline `data` (base64 payload) or an
+/// attachment-registry `attachmentId` reference, both non-empty strings when
+/// present. Both-or-neither is `Error::InvalidParams` (→ `-32602`) naming the
+/// offending index. A non-array payload and non-object entries are tolerated
+/// (skipped downstream like every other malformed attachment entry) so
+/// legacy callers keep their fail-soft behavior.
+pub(crate) fn validate_file_blocks(method: &str, file_blocks: Option<&Value>) -> Result<()> {
+    let Some(files) = file_blocks.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (i, file) in files.iter().enumerate() {
+        let Some(obj) = file.as_object() else {
+            continue;
+        };
+        let has_data = obj.get("data").and_then(Value::as_str).is_some();
+        let has_ref = obj
+            .get("attachmentId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_data == has_ref {
+            return Err(Error::InvalidParams(format!(
+                "{method}: fileBlocks[{i}] must carry exactly one of `data` or `attachmentId`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The persisted content-block array for a user message: one `text` block
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
 /// them). Image entries require `data` + `mimeType` and file entries require
-/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
-/// assembly (`append_attachment_blocks`) enforces; malformed entries are
-/// silently skipped so a partial attachment array never breaks the persist.
+/// `fileName` plus EITHER inline `data` + `mimeType` OR an
+/// attachment-registry `attachmentId` reference (PROTOCOL §5.5) — the same
+/// attachment contract prompt assembly (`append_attachment_blocks`) enforces;
+/// malformed entries are silently skipped so a partial attachment array never
+/// breaks the persist.
 pub(crate) fn user_message_blocks(
     content: &str,
     image_blocks: Option<&Value>,
@@ -1362,7 +1410,27 @@ pub(crate) fn user_message_blocks(
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+            // Same non-blank filter as `validate_file_blocks` and prompt
+            // assembly — a whitespace attachmentId must not shadow inline
+            // data into a dangling blank reference.
+            let attachment_id = file
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if let (Some(id), Some(name)) = (attachment_id, name) {
+                let mut block = json!({
+                    "type": "file",
+                    "attachmentId": id,
+                    "fileName": name,
+                });
+                if let Some(mime) = mime {
+                    block["mimeType"] = json!(mime);
+                }
+                if let Some(size) = file.get("size").and_then(Value::as_u64) {
+                    block["size"] = json!(size);
+                }
+                blocks.push(block);
+            } else if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
                 blocks.push(json!({
                     "type": "file",
                     "data": data,
@@ -1855,14 +1923,96 @@ impl Services {
         self.project_lite_with_flags_inner(session, |s| project_lite_from_projection(s, projection))
     }
 
+    /// The current effective `agentFeatures` values as the JSON snapshot
+    /// shape stamped on new sessions (intent-hq/monorepo#2459). Used to
+    /// project a value for legacy (pre-0096) rows whose `harness_features`
+    /// is NULL; best-effort — an encode failure yields `None` and the wire
+    /// field stays omitted.
+    fn current_agent_features_snapshot(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(&self.effective_settings().agent_features).ok()
+    }
+
+    /// The `agentFeatures` values governing `session`'s runtime surface: the
+    /// snapshot captured at creation (`harness_features`, monorepo#2459) when
+    /// present and decodable, else the live effective settings (legacy
+    /// pre-0096 rows, or a snapshot written by a newer daemon this build
+    /// cannot decode). Respawns read this instead of the live settings so a
+    /// settings change never alters an existing session's tools/prompt —
+    /// matching what `harnessFeatures` reports on the wire.
+    pub(crate) fn session_agent_features(
+        &self,
+        session: &AgentSession,
+    ) -> intent_core::settings_file::AgentFeaturesSettings {
+        session
+            .harness_features
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| self.effective_settings().agent_features)
+    }
+
+    /// Lazy legacy freeze (intent-hq/monorepo#2459): when a legacy (pre-0096)
+    /// session whose `harness_features` is still NULL is ACTIVATED — reaches
+    /// `ensure_started`, the single choke point every turn (first spawn,
+    /// resume, respawn, wake) funnels through — materialize the snapshot
+    /// once: persist the currently-resolved `agentFeatures` values, with the
+    /// legacy per-session taskGraph pin (0095 column) folded in — the pin
+    /// wins over the live setting for that key, matching the pre-freeze
+    /// COALESCE read. From then on the session reads its frozen snapshot like
+    /// any new session. `harness_version` stays "1.0" — only the flags
+    /// freeze. A no-op for rows that already carry a snapshot; before first
+    /// activation NULL keeps the read-time live projection. Best-effort: a
+    /// failed write WARNs and leaves the live-settings fallback in place.
+    pub(crate) async fn materialize_legacy_harness_features(&self, session: &mut AgentSession) {
+        if session.harness_features.is_some() {
+            return;
+        }
+        let mut features = self.effective_settings().agent_features;
+        match self
+            .store
+            .get_agent_session_task_graph_enabled(&session.id)
+            .await
+        {
+            Ok(pinned) => features.task_graph = pinned,
+            Err(e) => {
+                tracing::warn!(agent_id = %session.id, error = %e,
+                    "legacy feature freeze: taskGraph pin read failed; skipping");
+                return;
+            }
+        }
+        let Ok(snapshot) = serde_json::to_value(&features) else {
+            tracing::warn!(agent_id = %session.id,
+                "legacy feature freeze: agentFeatures snapshot encode failed; skipping");
+            return;
+        };
+        match self
+            .store
+            .materialize_agent_session_harness_features(&session.id, &snapshot)
+            .await
+        {
+            Ok(persisted) => session.harness_features = persisted,
+            Err(e) => {
+                tracing::warn!(agent_id = %session.id, error = %e,
+                    "legacy feature freeze: snapshot write failed; session keeps live fallback");
+            }
+        }
+    }
+
     /// Shared runtime-flag overlay behind the two `project_lite_with_flags*`
     /// entry points: compute the flags from the session, project it via
     /// `project`, then overlay.
     fn project_lite_with_flags_inner(
         &self,
-        session: AgentSession,
+        mut session: AgentSession,
         project: impl FnOnce(AgentSession) -> AgentLite,
     ) -> AgentLite {
+        // Legacy rows (pre-0096) carry no captured agentFeatures snapshot:
+        // project the CURRENT effective settings on read so the wire always
+        // carries a value. This read path never persists — the row stays NULL
+        // until its first activation freezes the snapshot
+        // (`materialize_legacy_harness_features`).
+        if session.harness_features.is_none() {
+            session.harness_features = self.current_agent_features_snapshot();
+        }
         let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);
         let (turn_in_flight, last_stream_activity_at) =
@@ -1887,6 +2037,9 @@ impl Services {
         } else {
             None
         };
+        // Delete grace window (§5.5): overlay the pending-deletion deadline
+        // from the in-memory registry (O(1) map lookup, never persisted).
+        let pending_delete_at = self.pending_agent_deletes.deadline(session.id.0.as_str());
         let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1895,6 +2048,7 @@ impl Services {
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
         lite.session_corrupted = session_corrupted;
+        lite.pending_delete_at = pending_delete_at;
         if let Some((live_response, live_digest)) = live_overlay {
             if live_response.is_some() {
                 // The in-flight turn has derivable streamed text: the newest
@@ -2161,13 +2315,14 @@ impl Services {
     /// watchCompletion) and when wake delivery removes them (fired watch /
     /// delegation-group clear).
     ///
-    /// The watch set is also a `displayStatus` in-progress promotion input
-    /// (an idle parent still waiting on delegated children reads as active
-    /// work), so every publish recomputes the anchor workspace's derived
-    /// status — transition-only and best-effort
-    /// ([`Services::maybe_emit_display_status_changed`] dedupes against the
-    /// last observation and swallows errors), so a no-op recompute stays
-    /// silent and can never break the watch lifecycle.
+    /// The watch set also feeds the anchor workspace's derived
+    /// `displayStatus` and its orthogonal `waiting` flag (an idle parent
+    /// still waiting on delegated children reads as pending work), so every
+    /// publish recomputes both — transition-only and best-effort
+    /// ([`Services::maybe_emit_display_status_changed`] /
+    /// [`Services::maybe_emit_waiting_changed`] dedupe against the last
+    /// observation and swallow errors), so a no-op recompute stays silent
+    /// and can never break the watch lifecycle.
     pub(crate) async fn publish_subscriptions_changed(
         &self,
         workspace_id: &WorkspaceId,
@@ -2192,6 +2347,7 @@ impl Services {
         )
         .await;
         self.maybe_emit_display_status_changed(workspace_id).await;
+        self.maybe_emit_waiting_changed(workspace_id).await;
     }
 
     /// `agent.create`: persist a new session; the process spawns lazily on first
@@ -2306,6 +2462,7 @@ impl Services {
             workspace_context: _,
             context_references,
             image_blocks,
+            file_blocks,
             is_background,
             name_explicitly_set: _,
         } = extra;
@@ -2332,6 +2489,13 @@ impl Services {
         let image_blocks = image_blocks
             .or_else(|| meta_get("imageBlocks"))
             .filter(|v| !v.is_null());
+        let file_blocks = file_blocks
+            .or_else(|| meta_get("fileBlocks"))
+            .filter(|v| !v.is_null());
+        // Attachment-reference validation (PROTOCOL §5.5): every file block
+        // must carry exactly one of `data` / `attachmentId`. Runs before any
+        // side effect so a `-32602` rejection persists nothing.
+        validate_file_blocks("agent.create", file_blocks.as_ref())?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
@@ -2489,6 +2653,15 @@ impl Services {
                 resolved_model.as_deref(),
             ),
         };
+        // Harness stamp (intent-hq/monorepo#2459): every new session gets the
+        // CURRENT harness version and a snapshot of the effective
+        // agentFeatures values, captured once here and immutable for the
+        // session's life. Creation time is the only input — delegated /
+        // wakeOrCreate children funnel through this op and mint the latest
+        // version, never inheriting the parent's pinned one.
+        let settings = self.effective_settings();
+        let harness_features = serde_json::to_value(&settings.agent_features)
+            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
         let session = AgentSession {
             id,
             workspace_id,
@@ -2538,18 +2711,27 @@ impl Services {
             initial_message,
             context_references,
             image_blocks,
+            file_blocks,
             is_background,
             metadata,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
+            pending_delete_at: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: Some(harness_features),
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
         };
-        self.store.insert_agent_session(&session).await?;
+        // The legacy per-session taskGraph pin (0095) keeps being written for
+        // fallback reads; its value equals the snapshot's `taskGraph`.
+        let task_graph_enabled = settings.agent_features.task_graph;
+        self.store
+            .insert_agent_session_with_task_graph(&session, task_graph_enabled)
+            .await?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
@@ -2767,6 +2949,12 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // Immediate-delete-while-pending (§5.5): an immediate delete
+        // supersedes a running grace window — drop the pending entry and
+        // abort its timer, then commit now. The timer-fired commit path has
+        // already claimed (removed) its entry before calling here, so this
+        // is a no-op for it.
+        self.pending_agent_deletes.cancel(agent_id.0.as_str());
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -2798,9 +2986,11 @@ impl Services {
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
         // child-only sweep would leak (deleted_parent, child) entries for the
-        // daemon's lifetime.
+        // daemon's lifetime. The streaming path's terminal-error stash
+        // (monorepo#2050) is dropped on the same terms.
         self.clear_failure_streak(&agent_id);
         self.clear_failure_wake_dedup_all_roles(&agent_id);
+        self.discard_pending_terminal_error(&agent_id);
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
         self.remove_event_subscriptions_for_agent(&agent_id).await;
@@ -2829,6 +3019,130 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// `agent.delete` with `undoDelayMs > 0` (PROTOCOL §5.5): register an
+    /// in-memory pending deletion with deadline `now + undo_delay_ms`
+    /// (clamped to the 60s cap) and return the ISO `deleteAt` deadline.
+    /// Scheduling does NOT stop the agent — the deadline commit runs the
+    /// ordinary [`Services::agent_delete_op`] cascade (which does). Emits
+    /// `agent:delete-scheduled`. Re-scheduling while pending is idempotent;
+    /// nothing is persisted, so a daemon restart drops the pending deletion.
+    pub(crate) async fn agent_schedule_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        undo_delay_ms: u64,
+    ) -> Result<String> {
+        // Validate existence up front so scheduling a delete for an unknown
+        // session is the standard `NotFound` error, not a timer that fails
+        // later. When the caller declares a workspace, reject a
+        // cross-workspace bare-id probe the same way `agent_delete_op` does.
+        let session_ws = self
+            .store
+            .get_agent_session_summary(&agent_id)
+            .await?
+            .workspace_id;
+        if let Some(ws) = workspace_id.as_ref() {
+            if session_ws != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let delay_ms = crate::delete_grace::clamp_undo_delay_ms(undo_delay_ms);
+        let delete_at = intent_core::iso_ms_from_now(delay_ms);
+        let key = agent_id.0.clone();
+        let timer_services = self.clone();
+        let timer_id = agent_id.clone();
+        let timer_ws = session_ws.clone();
+        // Idempotent re-schedule (§5.5): the registry arms the timer only
+        // when nothing is pending for this key — the check runs under the
+        // registry lock, so concurrent schedules converge on one deadline
+        // and only the arming call emits `agent:delete-scheduled`.
+        if let Some(existing) =
+            self.pending_agent_deletes
+                .schedule(key, delete_at.clone(), move |generation| {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        // Claim-or-abstain: only the timer that still owns the
+                        // entry commits. A cancel or an immediate delete that
+                        // raced ahead removed/superseded the entry — do nothing.
+                        if !timer_services
+                            .pending_agent_deletes
+                            .claim(timer_id.0.as_str(), generation)
+                        {
+                            return;
+                        }
+                        // Commit via the existing immediate-delete cascade (same
+                        // events). Best-effort: the caller is long gone, so a
+                        // failure is logged, not surfaced.
+                        if let Err(e) = timer_services
+                            .agent_delete_op(timer_id.clone(), Some(timer_ws))
+                            .await
+                        {
+                            tracing::warn!(
+                                agent = %timer_id.0,
+                                error = %e,
+                                "scheduled agent delete failed at commit"
+                            );
+                        }
+                    })
+                })
+        {
+            return Ok(existing);
+        }
+        crate::publish_event(
+            &self.event_bus,
+            crate::agent_delete_scheduled_event(&session_ws, &agent_id, &delete_at),
+        )
+        .await;
+        Ok(delete_at)
+    }
+
+    /// `agent.cancelDelete` (PROTOCOL §5.5): cancel a pending agent-session
+    /// deletion. `true` when something was pending (emits
+    /// `agent:delete-cancelled`), `false` otherwise (already committed, or
+    /// never scheduled) — the non-error, race-safe outcome. A caller-declared
+    /// workspace mismatch is rejected as `NotFound` BEFORE touching the
+    /// registry, mirroring `agent_delete_op`/`agent_schedule_delete_op`, so
+    /// a stale or cross-workspace scoped cancel cannot remove another
+    /// workspace's pending deletion.
+    pub(crate) async fn agent_cancel_delete_op(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<bool> {
+        let session_ws = match self.store.get_agent_session_summary(&agent_id).await {
+            Ok(summary) => summary.workspace_id,
+            // Row already gone: the deletion committed (or the session never
+            // existed) — nothing pending, the race-safe non-error outcome.
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if let Some(ws) = workspace_id.as_ref() {
+            if session_ws != *ws {
+                return Err(Error::NotFound(format!("agent session {agent_id}")));
+            }
+        }
+        let cancelled = self.pending_agent_deletes.cancel(agent_id.0.as_str());
+        if cancelled {
+            crate::publish_event(
+                &self.event_bus,
+                crate::agent_delete_cancelled_event(&session_ws, &agent_id),
+            )
+            .await;
+        }
+        Ok(cancelled)
+    }
+
+    /// Abort any pending agent-session deletions in `workspace_id` without
+    /// emitting per-agent cancel events: the caller is the workspace delete
+    /// cascade (immediate or committed-from-pending), which supersedes them —
+    /// every session is deleted right after, emitting `agent:deleted` per
+    /// session (§5.5 cascade interaction).
+    pub(crate) fn abort_pending_agent_deletes(&self, sessions: &[AgentSession]) {
+        for session in sessions {
+            self.pending_agent_deletes.cancel(session.id.0.as_str());
+        }
+    }
+
     /// `agent.getSession` (PROTOCOL §5.5). Full [`AgentSession`] projection —
     /// the superset that `agent.get`/[`AgentLite`] strips (`systemPrompt`,
     /// `specialist`, persisted metadata block, full `messages` log). Used by
@@ -2840,6 +3154,14 @@ impl Services {
         // monorepo#940: derived on emit (never persisted); see
         // `project_lite_with_flags`.
         session.session_corrupted = self.session_poisoned(&session);
+        // Delete grace window (§5.5): overlay the pending-deletion deadline
+        // from the in-memory registry (O(1) map lookup, never persisted).
+        session.pending_delete_at = self.pending_agent_deletes.deadline(agent_id.0.as_str());
+        // Legacy rows (pre-0096): project the current effective agentFeatures
+        // on read (never persisted); see `project_lite_with_flags_inner`.
+        if session.harness_features.is_none() {
+            session.harness_features = self.current_agent_features_snapshot();
+        }
         Ok(session)
     }
 
@@ -2880,6 +3202,7 @@ impl Services {
             "initialMessage",
             "contextReferences",
             "imageBlocks",
+            "fileBlocks",
             "isBackground",
         ];
         for key in obj.keys() {
@@ -2991,6 +3314,14 @@ impl Services {
                     session.image_blocks = if value.is_null() {
                         None
                     } else {
+                        Some(value.clone())
+                    };
+                }
+                "fileBlocks" => {
+                    session.file_blocks = if value.is_null() {
+                        None
+                    } else {
+                        validate_file_blocks("agent.update", Some(value))?;
                         Some(value.clone())
                     };
                 }
@@ -3500,6 +3831,9 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
+        // Attachment-reference validation (PROTOCOL §5.5) before any state
+        // change, matching `agent.sendMessage`.
+        validate_file_blocks("agent.queueMessage", file_blocks.as_ref())?;
         // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
         // truncated/mistyped id would otherwise create a queue entry that
         // never drains (same fail-closed contract as `agent.sendMessage`).
@@ -3725,6 +4059,10 @@ impl Services {
                 )));
             }
         }
+        // Attachment-reference validation (PROTOCOL §5.5): every file block
+        // must carry exactly one of `data` / `attachmentId`, rejected before
+        // any state change.
+        validate_file_blocks("agent.sendMessage", file_blocks.as_ref())?;
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
@@ -3866,6 +4204,27 @@ impl Services {
         // transcript must not double-append (STAB-112).
         if entry.persisted {
             return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
+        }
+        // Delivery-time unblocked hints (monorepo#2044): on the no-manager
+        // path this persist IS the delivery, so the section is resolved here
+        // — parity with the manager's `send_queued_message_now` and the
+        // store-only `deliver_parent_wake` branch. Same idempotency guard:
+        // a content that already carries the section is never re-annotated.
+        let mut entry = entry;
+        if !entry
+            .content
+            .contains(ready_delta::UNBLOCKED_SECTION_PREFIX)
+            && ready_delta::metadata_has_triggers(entry.message_metadata.as_ref())
+        {
+            if let Some(section) = self
+                .unblocked_section_for_delivery(
+                    &agent_id,
+                    std::iter::once(entry.message_metadata.as_ref()),
+                )
+                .await
+            {
+                entry.content = format!("{}\n\n{}", entry.content, section);
+            }
         }
         // STAB-133: persist the entry's attachments alongside the text block.
         let blocks = user_message_blocks(
@@ -4504,16 +4863,7 @@ impl Services {
         let count = self
             .dismissed_question_count(agent_id, dismissed_message_id)
             .await;
-        let noun = match count {
-            0 => "questions".to_string(),
-            1 => "1 question".to_string(),
-            n => format!("{n} questions"),
-        };
-        let content = format!(
-            "User dismissed your {noun} without answering. This is an informative \
-             notice only — do not re-ask and do not proceed with any work; end \
-             your turn and wait for the user's next message."
-        );
+        let content = crate::harness::latest().questions_dismissed_notice(count);
         let metadata = json!({
             "type": QUESTIONS_DISMISSED_METADATA_TYPE,
             "source": "system",
@@ -4705,7 +5055,7 @@ impl Services {
         // a no-op. Errors from the store lookup or the status writer are
         // logged and swallowed — the report itself is already persisted, and
         // the caller's response must not depend on FE-facing task metadata.
-        if let Some(note_id) = task_note_id {
+        if let Some(note_id) = task_note_id.clone() {
             self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
                 .await;
         }
@@ -4728,14 +5078,36 @@ impl Services {
                 .await
                 .map(|s| s.workspace_id)
                 .unwrap_or_else(|_| workspace_id.clone());
+            // Mark any ungrouped watches whose parent matches this parent as
+            // report_delivered, so deliver_completion_to_watches will skip agent:idle
+            // for them (suppressing the duplicate wake). Do NOT mark watches for other
+            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
+            // completion wake and should not receive the report wake. The marking runs
+            // BEFORE the wake is built (issue intent-hq/monorepo#2528) so the wake's
+            // disarm disclosure — text suffix + metadata — reflects the actual flip.
+            let watches = self.find_watches_for_child(&caller);
+            let mut marked = false;
+            for watch in watches.iter().filter(|w| {
+                w.group_id.is_none() && w.parent_agent_id == parent && !w.report_delivered
+            }) {
+                marked |= self.mark_watch_report_delivered(&watch.id);
+            }
             // Deliver exactly ONE wake to the parent, regardless of watch count.
-            // Format the wake message with the persisted report.
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Child agent {} ({}) completed. Report: {}",
-                session.name, caller.0, report_text
+            // Format the wake message with the persisted report. "reported", not
+            // "completed" — a report is not necessarily a completion (monorepo#2528).
+            // `marked` = the flip disarmed the parent's one-shot watch for
+            // agent:idle — it never fires on the child's completion again
+            // (failure/deletion still deliver); the wake discloses it with the
+            // re-arm pointer, mirroring the #2051 retirement note in
+            // `format_completion_wake`. Wording owned by the harness (H6).
+            let wake_text = crate::harness::latest().report_to_parent_wake(
+                &session.name,
+                &caller.0,
+                &report_text,
+                marked,
             );
             // Build event notification metadata (mirroring deliver_completion_to_watches).
-            let metadata = json!({
+            let mut metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
                 "eventTypes": ["agent:reportToParent"],
@@ -4758,6 +5130,22 @@ impl Services {
                     }
                 }]
             });
+            // Enqueue-time trigger record (intent-hq/monorepo#2044): stamp
+            // the reporting child's linked task-note id so the delivery path
+            // can compute the "tasks now unblocked" section fresh at render
+            // time. Only the triggering fact is stored here.
+            if let Some(note_id) = &task_note_id {
+                ready_delta::stamp_trigger_tasks(
+                    &mut metadata,
+                    &[(workspace_id.0.clone(), note_id.0.clone())],
+                );
+            }
+            // Machine-readable disarm flag (monorepo#2060 parity, the
+            // `hookStillActive` twin): present iff this call flipped a watch;
+            // omitted entirely when nothing was disarmed.
+            if marked {
+                metadata["watchStillArmed"] = json!(false);
+            }
             // Deliver the wake to the parent unconditionally (even if no watch exists).
             if let Err(e) = self
                 .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
@@ -4769,20 +5157,6 @@ impl Services {
                     child = %caller.0,
                     "failed to deliver reportToParent wake to parent"
                 );
-            }
-
-            // Mark any ungrouped watches whose parent matches this parent as
-            // report_delivered, so deliver_completion_to_watches will skip agent:idle
-            // for them (suppressing the duplicate wake). Do NOT mark watches for other
-            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
-            // completion wake and should not receive the report wake.
-            let watches = self.find_watches_for_child(&caller);
-            let mut marked = false;
-            for watch in watches
-                .iter()
-                .filter(|w| w.group_id.is_none() && w.parent_agent_id == parent)
-            {
-                marked |= self.mark_watch_report_delivered(&watch.id);
             }
             // Marking flips the parent's waiting projection (report_delivered
             // watches are excluded), so publish the refreshed flags in the
@@ -4937,18 +5311,16 @@ impl Services {
         let caller = caller_agent_id.ok_or_else(|| {
             Error::Internal("requestAttention is only available to agents".to_string())
         })?;
-        let (meta_kind, task_target, task_target_word, wake_verb) = match kind.as_str() {
+        let (meta_kind, task_target, task_target_word) = match kind.as_str() {
             "discussion" => (
                 "discussion-request",
                 intent_core::TaskStatus::DiscussionNeeded,
                 "discussion_needed",
-                "requests a discussion",
             ),
             "blocker" => (
                 "blocker-report",
                 intent_core::TaskStatus::Blocked,
                 "blocked",
-                "reports a blocker",
             ),
             other => {
                 return Err(Error::InvalidParams(format!(
@@ -5077,9 +5449,11 @@ impl Services {
                 .await
                 .map(|s| s.workspace_id)
                 .unwrap_or_else(|_| workspace_id.clone());
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Child agent {} ({}) {}: {}",
-                session.name, caller.0, wake_verb, reason
+            let wake_text = crate::harness::latest().attention_parent_wake(
+                &session.name,
+                &caller.0,
+                &kind,
+                &reason,
             );
             let metadata = json!({
                 "type": "event_notification",
@@ -5122,14 +5496,27 @@ impl Services {
             .into_iter()
             .filter(|w| w.wake_on_attention && Some(&w.parent_agent_id) != parent.as_ref())
         {
-            let wake_text = format!(
-                "[WORKSPACE EVENTS] Watched agent {} ({}) {}: {}",
-                session.name, caller.0, wake_verb, reason
+            // Attention is not a completion, so the watch is left in place —
+            // say so explicitly (issue monorepo#2051) to avoid reading as
+            // terminal next to the retiring completion wake. A watch adopted
+            // into an `after_all` delegation group wakes at group settlement,
+            // not this agent's individual completion, so state the promise
+            // that actually holds.
+            let wake_text = crate::harness::latest().attention_watcher_wake(
+                &session.name,
+                &caller.0,
+                &kind,
+                &reason,
+                watch.group_id.is_some(),
             );
+            // `watchStillArmed: true` (monorepo#2060) is the machine-readable
+            // twin of the "remains armed" note above, mirroring the hook
+            // wakes' `hookStillActive` flag.
             let metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
                 "eventTypes": [intent_core::events::AGENT_ATTENTION_REQUESTED],
+                "watchStillArmed": true,
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
                     "type": intent_core::events::AGENT_ATTENTION_REQUESTED,
@@ -5169,13 +5556,30 @@ impl Services {
     }
 
     /// `agent.delegate`: create a session and (best-effort) assign it to the
-    /// target task note (PROTOCOL §5.5).
+    /// target task note (PROTOCOL §5.5). The batch form (`tasks` present)
+    /// routes to [`Self::agent_delegate_batch_op`]; single-task calls are
+    /// unchanged.
     pub(crate) async fn agent_delegate_op(
         &self,
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
     ) -> Result<Value> {
+        // `greedy` was a batch-level conflict override; it is REMOVED. Any
+        // supplied value — `true`, `false`, or an explicit `null` — rejects
+        // on BOTH forms (the check sits before the batch routing so a
+        // single-task call cannot silently carry it either); only a missing
+        // field passes.
+        if input.greedy.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
+            ));
+        }
+        if input.tasks.is_some() {
+            return self
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id)
+                .await;
+        }
         let wait_mode = input.wait_mode.clone();
         // Per-agent microVM sizing: validate at delegate time so invalid
         // input errors here, not at VM boot (accepted-and-ignored on
@@ -5240,27 +5644,11 @@ impl Services {
         // subscriber and the `git_ops` commit gate.
         if let (Some(note), Some(note_id)) = (task_note.as_ref(), session_task_note_id.as_ref()) {
             let title = first_nonempty(&note.title).unwrap_or_default();
-            // Build the preamble from adjacent string literals (via `concat!`)
-            // so no source-level indentation leaks into the emitted bytes. Every
-            // `\n` is explicit; the resulting string is byte-for-byte the
-            // reference `DelegateTaskTool` preamble
-            // (`agent-interaction-tools.ts`).
-            let preamble = format!(
-                concat!(
-                    "**Your Task Note:** \"{title}\" (ID: {note_id})\n",
-                    "This note is your workspace for this task. Update it with your progress, findings, and deliverables.\n",
-                    "\n",
-                    "**SCOPE: Complete THIS task only.** When done, mark it complete and end your session. Do not pick up other tasks.",
-                ),
-                title = title,
-                note_id = note_id,
-            );
-            message = Some(match message {
-                Some(body) if !body.is_empty() => {
-                    format!("{body}\n\n---\n{preamble}")
-                }
-                _ => preamble,
-            });
+            message = Some(crate::harness::latest().delegation_first_message(
+                message.as_deref(),
+                &title,
+                &note_id.0,
+            ));
         }
         // Resolve the child agent's name to match the reference `DelegateTaskTool`
         // (agent-interaction-tools.ts): the taskText path uses `taskText`, the
@@ -5483,6 +5871,11 @@ impl Services {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // Resolved ACP provider persisted on the created session (AgentLite
+        // `provider`, skip-if-none) — surfaced on the delegate result so
+        // clients can render the provider immediately (PROTOCOL §5.5). Absent
+        // when the session has none (provider CLI default applies).
+        let provider = created["agent"]["provider"].as_str().map(str::to_string);
 
         // Track effective isolation mode for the result. Provisioning runs in
         // a background task (monorepo#871), so an eligible CoW request reports
@@ -5705,6 +6098,12 @@ impl Services {
 
         // Include effective isolation in the result when isolation was requested
         let mut result = json!({ "ok": true, "agentId": agent_id, "name": name });
+        if let Some(provider) = provider {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert("provider".to_string(), json!(provider));
+        }
         if let Some(eff_iso) = effective_isolation {
             result
                 .as_object_mut()
@@ -5712,6 +6111,426 @@ impl Services {
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
         Ok(result)
+    }
+
+    /// Snapshot every task note in `workspace_id` into the
+    /// [`batch::BatchTaskSnap`] shape (+ a note-id → title map). Shared by
+    /// batch `agent.delegate` classification and the delivery-time unblocked
+    /// computation (intent-hq/monorepo#2044), so both consume identical
+    /// readiness inputs: status, `dependsOn`/`conflictsWith` edges, live
+    /// assigned agents, and effort estimates.
+    pub(crate) async fn snapshot_batch_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<(
+        HashMap<String, batch::BatchTaskSnap>,
+        HashMap<String, String>,
+    )> {
+        let notes = self.store.list_notes(workspace_id).await?;
+        let mut titles: HashMap<String, String> = HashMap::new();
+        let mut snaps: HashMap<String, batch::BatchTaskSnap> = HashMap::new();
+        for note in &notes {
+            let Some(task) = &note.metadata.task else {
+                continue;
+            };
+            let live_agent = if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+                || task.assigned_agent_ids.is_empty()
+            {
+                None
+            } else {
+                self.scan_assigned_agents(&task.assigned_agent_ids)
+                    .await?
+                    .live_session
+                    .map(|s| (s.id.0, s.name))
+            };
+            titles.insert(note.id.0.clone(), note.title.clone());
+            snaps.insert(
+                note.id.0.clone(),
+                batch::BatchTaskSnap {
+                    status: task.status,
+                    depends_on: task.depends_on.iter().map(|d| d.0.clone()).collect(),
+                    conflicts_with: task.conflicts_with.iter().map(|c| c.0.clone()).collect(),
+                    live_agent,
+                    effort_minutes: task
+                        .estimated_effort
+                        .as_deref()
+                        .and_then(crate::task_effort::parse_effort_minutes),
+                },
+            );
+        }
+        Ok((snaps, titles))
+    }
+
+    /// Delivery-time "tasks now unblocked" section for a draining batch of
+    /// completion wakes (intent-hq/monorepo#2044). `metadatas` are the
+    /// `messageMetadata` values of EVERY entry delivering in the same model
+    /// turn: their stamped trigger tasks (enqueue-time facts — the settled
+    /// children's linked task-note ids) are collected and deduplicated, the
+    /// named workspaces' task state is fetched FRESH, and ONE coalesced
+    /// [`ready_delta::ready_set_delta`] is rendered — so the section always
+    /// reflects readiness at delivery time, never a stale enqueue-time
+    /// snapshot. Returns `None` when no entry carries triggers or the delta
+    /// is empty. Strictly advisory and best-effort: store errors fail open
+    /// (`None`) and the wake delivers unannotated.
+    pub(crate) async fn unblocked_section_for_delivery<'a>(
+        &self,
+        agent_id: &AgentId,
+        metadatas: impl Iterator<Item = Option<&'a Value>>,
+    ) -> Option<String> {
+        let triggers = ready_delta::collect_trigger_tasks(metadatas);
+        if triggers.is_empty() {
+            return None;
+        }
+        match self
+            .store
+            .get_agent_session_task_graph_enabled(agent_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    %error,
+                    "taskGraph session snapshot unavailable; delivering wake without the section"
+                );
+                return None;
+            }
+        }
+        // Group trigger task ids per workspace (cross-workspace parents can
+        // in principle coalesce wakes from several workspaces) and compute
+        // one delta per workspace against its CURRENT snapshot.
+        let mut by_ws: Vec<(String, Vec<String>)> = Vec::new();
+        for (ws, id) in &triggers {
+            match by_ws.iter_mut().find(|(w, _)| w == ws) {
+                Some((_, ids)) => ids.push(id.clone()),
+                None => by_ws.push((ws.clone(), vec![id.clone()])),
+            }
+        }
+        let mut delta = Vec::new();
+        for (ws, ids) in &by_ws {
+            let workspace_id = WorkspaceId::from(ws.as_str());
+            let (snaps, titles) = match self.snapshot_batch_tasks(&workspace_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %ws,
+                        error = %e,
+                        "unblocked-section snapshot failed; delivering wake without the section"
+                    );
+                    continue;
+                }
+            };
+            delta.extend(ready_delta::ready_set_delta(ids, &snaps, &titles));
+        }
+        if delta.is_empty() {
+            return None;
+        }
+        Some(ready_delta::render_unblocked_section(
+            &delta,
+            triggers.len() > 1,
+        ))
+    }
+
+    /// Batch `agent.delegate` (PROTOCOL §5.5): classify every task in
+    /// `input.tasks` as start / held / skipped — a PURE function of current
+    /// state (task statuses, `dependsOn`/`conflictsWith` edges, live assigned
+    /// agents; see [`batch::classify_batch_tasks`]) — then delegate exactly
+    /// the start subset through the unchanged single-task path (per-task
+    /// agent creation, group enrollment honoring `waitMode`). Entries may be
+    /// bare task-note ids or objects carrying per-task
+    /// `specialist`/`model`/`reasoningEffort` overrides of the top-level
+    /// defaults. No scheduler state is written: held tasks are simply not
+    /// started, and re-calling with the same list is idempotent
+    /// (running/terminal tasks classify as `skipped`). The result enumerates
+    /// EVERY supplied task with its disposition + reason and projects the
+    /// unlock plan; the existing group settlement wake is the resume signal —
+    /// the caller re-calls delegate then, which recomputes everything.
+    async fn agent_delegate_batch_op(
+        &self,
+        workspace_id: WorkspaceId,
+        input: intent_core::AgentDelegateInput,
+        parent_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        use batch::{
+            classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
+        };
+        use intent_core::BatchTaskEntry;
+
+        let entries: Vec<BatchTaskEntry> = input.tasks.clone().unwrap_or_default();
+        // Per-task option overrides, keyed by task-note id. Only OBJECT
+        // entries populate the map, so for a duplicated id the last object
+        // entry wins and a trailing bare-string duplicate does NOT reset an
+        // earlier object's overrides (classification dedups to one row
+        // anyway).
+        let mut overrides: HashMap<String, intent_core::BatchTaskOptions> = HashMap::new();
+        for entry in &entries {
+            if let BatchTaskEntry::Options(opts) = entry {
+                if opts.agent_instructions.is_some() {
+                    return Err(Error::InvalidParams(
+                        "agent.delegate: agentInstructions is not supported on a tasks entry — each started task's first message resolves from its own task note".to_string(),
+                    ));
+                }
+                overrides.insert(opts.task_note_id.0.clone(), opts.clone());
+            }
+        }
+        let requested: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.task_note_id().0.clone())
+            .collect();
+        if requested.is_empty() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: tasks must be a non-empty array of task note ids".to_string(),
+            ));
+        }
+        // The batch form is an alternative addressing mode: mixing it with
+        // the single-task addressing params is ambiguous and rejected.
+        if input.task_note_id.is_some() || input.note_id.is_some() || input.task_text.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: tasks is mutually exclusive with taskNoteId/noteId/taskText"
+                    .to_string(),
+            ));
+        }
+        // Single-task-only params are rejected rather than silently dropped:
+        // `agentInstructions` addresses ONE child's first message (each batch
+        // child resolves its own from its task note), and `force` overrides
+        // the occupancy gate that batch mode deliberately maps to `skipped`.
+        if input.agent_instructions.is_some() {
+            return Err(Error::InvalidParams(
+                "agent.delegate: agentInstructions is not supported with tasks — each started task's first message resolves from its own task note".to_string(),
+            ));
+        }
+        if input.force == Some(true) {
+            return Err(Error::InvalidParams(
+                "agent.delegate: force is not supported with tasks — occupied tasks classify as skipped (use the single-task form to force a second agent)".to_string(),
+            ));
+        }
+        // Depth + watch-scope guards up front (the same checks the
+        // single-task path runs before any side-effectful work) so a
+        // rejection is one clear error before any child is created, not N
+        // identical per-task failures.
+        if let Some(parent) = &parent_agent_id {
+            let parent_session = self.store.get_agent_session(parent).await.ok();
+            let parent_depth = parent_session
+                .as_ref()
+                .and_then(|s| s.delegation_depth)
+                .unwrap_or(0);
+            if parent_depth >= MAX_DELEGATION_DEPTH {
+                return Err(Error::InvalidParams(format!(
+                    "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {parent_depth}. Please complete this task directly instead of delegating further."
+                )));
+            }
+            if let Some(session) = parent_session
+                .as_ref()
+                .filter(|s| s.status != AgentStatus::Deleted)
+            {
+                crate::agent_subscriptions::check_watch_scope(
+                    &session.workspace_id,
+                    &workspace_id,
+                )?;
+            }
+        }
+
+        // Snapshot every task note in the workspace (not just the requested
+        // ones): conflicts are symmetric and a running non-requested task
+        // must still hold a requested one, and dependency statuses can name
+        // any task note.
+        let (snaps, titles) = self.snapshot_batch_tasks(&workspace_id).await?;
+        let unknown: Vec<&String> = requested
+            .iter()
+            .filter(|id| !snaps.contains_key(*id))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(Error::InvalidParams(format!(
+                "agent.delegate: tasks names ids that are not task notes in this workspace: {}",
+                unknown
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let classified = classify_batch_tasks(&requested, &snaps);
+        // Relation-less annotation (monorepo#2457 part 3): requested tasks
+        // the graph does not cover (no relations of their own, not
+        // referenced by any other requested task) classify exactly as
+        // before, but their rows carry `relationsUnknown: true` and the
+        // summary counts the started ones.
+        let relations_unknown = relations_unknown_ids(&requested, &snaps);
+
+        // Delegate the start subset through the unchanged single-task path.
+        // A per-task failure becomes an `error` disposition rather than
+        // failing the batch — earlier tasks may already have started.
+        let mut rows: Vec<Value> = Vec::new();
+        let mut started_ids: Vec<String> = Vec::new();
+        for (id, disposition) in &classified {
+            let title = titles.get(id).cloned().unwrap_or_default();
+            let mut row = json!({ "taskNoteId": id, "title": title });
+            let obj = row.as_object_mut().unwrap();
+            if relations_unknown.contains(id) {
+                obj.insert("relationsUnknown".into(), json!(true));
+            }
+            match disposition {
+                BatchDisposition::Start => {
+                    // Per-entry overrides beat the top-level defaults, field
+                    // by field.
+                    let opts = overrides.get(id);
+                    let single = intent_core::AgentDelegateInput {
+                        task_note_id: Some(NoteId::from(id.as_str())),
+                        specialist: opts
+                            .and_then(|o| o.specialist.clone())
+                            .or_else(|| input.specialist.clone()),
+                        model: opts
+                            .and_then(|o| o.model.clone())
+                            .or_else(|| input.model.clone()),
+                        reasoning_effort: opts
+                            .and_then(|o| o.reasoning_effort.clone())
+                            .or_else(|| input.reasoning_effort.clone()),
+                        behavior_prompt: input.behavior_prompt.clone(),
+                        wait_mode: input.wait_mode.clone(),
+                        skip_auto_commit: input.skip_auto_commit,
+                        isolation: input.isolation.clone(),
+                        ..Default::default()
+                    };
+                    match Box::pin(self.agent_delegate_op(
+                        workspace_id.clone(),
+                        single,
+                        parent_agent_id.clone(),
+                    ))
+                    .await
+                    {
+                        Ok(res) => {
+                            obj.insert("disposition".into(), json!("started"));
+                            obj.insert("agentId".into(), res["agentId"].clone());
+                            obj.insert("agentName".into(), res["name"].clone());
+                            started_ids.push(id.clone());
+                        }
+                        Err(e) => {
+                            obj.insert("disposition".into(), json!("error"));
+                            obj.insert("reason".into(), json!(e.to_string()));
+                        }
+                    }
+                }
+                BatchDisposition::HeldOnDeps {
+                    unmet,
+                    decision_needed,
+                } => {
+                    obj.insert("disposition".into(), json!("held:blocked-on-deps"));
+                    obj.insert("unmetDependsOn".into(), json!(unmet));
+                    let mut reason =
+                        format!("waiting on incomplete dependencies: {}", unmet.join(", "));
+                    if !decision_needed.is_empty() {
+                        obj.insert("decisionNeeded".into(), json!(decision_needed));
+                        reason.push_str(&format!(
+                            "; dependencies {} are cancelled or missing and will never complete — decision needed",
+                            decision_needed.join(", ")
+                        ));
+                    }
+                    obj.insert("reason".into(), json!(reason));
+                }
+                BatchDisposition::HeldOnConflict { conflicts_with } => {
+                    obj.insert("disposition".into(), json!("held:conflict"));
+                    obj.insert("conflictsWith".into(), json!(conflicts_with));
+                    obj.insert(
+                        "reason".into(),
+                        json!(format!(
+                            "conflictsWith intersects the running/starting set ({}); delegate it individually to force it",
+                            conflicts_with.join(", ")
+                        )),
+                    );
+                }
+                BatchDisposition::SkippedAlreadyRunning {
+                    agent_id,
+                    agent_name,
+                } => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("agentId".into(), json!(agent_id));
+                    obj.insert("agentName".into(), json!(agent_name));
+                    obj.insert(
+                        "reason".into(),
+                        json!(format!(
+                            "already being worked by agent {agent_id} (\"{agent_name}\")"
+                        )),
+                    );
+                }
+                BatchDisposition::SkippedComplete => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("reason".into(), json!("task is complete"));
+                }
+                BatchDisposition::SkippedCancelled => {
+                    obj.insert("disposition".into(), json!("skipped"));
+                    obj.insert("reason".into(), json!("task is cancelled"));
+                }
+            }
+            rows.push(row);
+        }
+
+        // Project the unlock plan from what ACTUALLY started (an errored
+        // start never settles) plus every live-agent task in the workspace —
+        // requested or not — since any of those settling can release a hold.
+        let unlocked = project_unlock_plan(&classified, &snaps, &started_ids);
+
+        let held_count = rows
+            .iter()
+            .filter(|r| {
+                r["disposition"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("held:"))
+            })
+            .count();
+        let mut unlock_message = if unlocked.is_empty() {
+            if held_count == 0 {
+                "Nothing is held; no re-call needed beyond the normal completion wakes.".to_string()
+            } else {
+                "Held tasks are not unlocked by the started/running set settling alone (dependencies outside it that are incomplete, cancelled, or missing — possibly needing a decision — or conflicts with tasks that are not settling). Resolve those, then re-call agent.delegate.".to_string()
+            }
+        } else {
+            format!(
+                "When the started/running tasks settle, {} become startable — re-call agent.delegate then with the same list or a subset (classification is recomputed each call).",
+                unlocked.join(", ")
+            )
+        };
+        // Effort-weighted critical-path estimate (response text only, no wake
+        // changes): surfaced only when at least one requested chain carries a
+        // parseable estimate — pure-defaults graphs stay silent, and the
+        // number reflects only estimated chains, so it can understate when
+        // an unestimated chain is longer.
+        let critical_path_minutes = batch::serial_remaining_minutes(&requested, &snaps);
+        if let Some(minutes) = critical_path_minutes {
+            unlock_message.push_str(&format!(
+                " ~{minutes} min of serial work remains on the critical path."
+            ));
+        }
+        // Count started relation-less tasks in the human-readable summary
+        // (annotation only — nothing about the start decision changed).
+        let started_unknown = started_ids
+            .iter()
+            .filter(|id| relations_unknown.contains(*id))
+            .count();
+        if started_unknown > 0 {
+            unlock_message.push_str(&format!(
+                " {started_unknown} of {} started tasks carry no relations — the graph does not cover them.",
+                started_ids.len()
+            ));
+        }
+
+        let mut unlock_plan = json!({
+            "unlockedBySettlement": unlocked,
+            "message": unlock_message,
+        });
+        if let Some(minutes) = critical_path_minutes {
+            unlock_plan
+                .as_object_mut()
+                .unwrap()
+                .insert("criticalPathMinutes".into(), json!(minutes));
+        }
+        Ok(json!({
+            "ok": true,
+            "tasks": rows,
+            "startedTaskIds": started_ids,
+            "unlockPlan": unlock_plan,
+        }))
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
@@ -6080,9 +6899,15 @@ impl Services {
             .await;
         // Close the registration-time race: a target that already settled
         // delivers its synthetic completion immediately (same reconciliation
-        // path as `app.agents.waitFor` / startup rehydration).
-        self.reconcile_watch_child_on_rehydration(&target_agent_id, &target_ws)
-            .await;
+        // path as `app.agents.waitFor` / startup rehydration). Registration
+        // call site (monorepo#2532): a reported idle target still owning
+        // active hooks/PR monitors defers instead of firing instantly.
+        self.reconcile_watch_child_on_rehydration(
+            &target_agent_id,
+            &target_ws,
+            crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+        )
+        .await;
         Ok(json!({
             "ok": true,
             "subscriptionId": id,
@@ -6343,9 +7168,15 @@ impl Services {
         // Reconcile already-settled targets NOW (immediate: fires the fresh
         // watch right away; after_all: records the completion in the
         // still-open group, which fires once it seals on the caller's idle).
+        // Registration call site (monorepo#2532): a reported idle target
+        // still owning active hooks/PR monitors defers instead.
         for (target, target_ws) in reconcile_targets {
-            self.reconcile_watch_child_on_rehydration(&target, &target_ws)
-                .await;
+            self.reconcile_watch_child_on_rehydration(
+                &target,
+                &target_ws,
+                crate::agent_subscriptions::WatchReconcileCallSite::Registration,
+            )
+            .await;
         }
         Ok(json!({ "ok": true, "waitMode": wait_mode, "results": results }))
     }
@@ -6498,6 +7329,7 @@ impl Services {
             self.remove_event_subscriptions_for_agent(&agent_id).await;
             for anchor in &anchors {
                 self.maybe_emit_display_status_changed(anchor).await;
+                self.maybe_emit_waiting_changed(anchor).await;
             }
             // Agent-waiting deferral backstop (issue intent-hq/monorepo#1468):
             // dropping every outgoing watch may remove the caller's last
@@ -6682,7 +7514,7 @@ impl Services {
             return None;
         }
         let json = serde_json::to_string(&snapshot).ok()?;
-        Some(format!("current ws.agent.snapshot() => {json}"))
+        Some(crate::harness::latest().snapshot_line(&json))
     }
 
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,
@@ -6696,6 +7528,12 @@ impl Services {
     /// drain order via [`Services::queue_snapshot_preview`] (content truncated
     /// to [`QUEUE_PREVIEW_MAX_CHARS`] chars, sender attribution preserved in
     /// `messageMetadata`) — and `summary.queuedAgents` counts those agents.
+    /// A queue whose ready-to-send entries have sat undelivered past
+    /// [`STALE_QUEUE_ENTRY_AFTER_MS`] while the target agent is not actively
+    /// responding raises a `stale-queue-entry` stuck-risk
+    /// (intent-hq/monorepo#1897). Affirmatively-parked queues are excluded:
+    /// archived workspaces park every entry, and an active question hold
+    /// parks automatic (non-user-origin) entries — neither is stuck.
     /// The daemon does not track per-agent event queues, deleted-agent
     /// references, or delivery health, so `deletedAgentReferences` and
     /// `recentEvents` are empty and `deliveryStats` is zeroed — honestly
@@ -6951,6 +7789,16 @@ impl Services {
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
+        // Per-agent subtree memory attribution (monorepo#2063 A2): resident
+        // bytes of each agent's descendant process tree from the runtime
+        // manager's tree probe, stamped as `subtreeMemoryBytes` (omitted when
+        // the agent has no bucket — not spawned, no sample yet, or no runtime
+        // manager attached). Diagnostics-only by design: this deliberately
+        // stays off the hot `agent.list`/`agent.get` payloads.
+        let agent_memory: HashMap<AgentId, u64> = self
+            .agent_manager()
+            .map(|m| m.agent_memory_samples())
+            .unwrap_or_default();
         let mut agent_rows: Vec<Value> = Vec::new();
         for id in &all_agent_ids {
             if !in_scope(id) {
@@ -7025,6 +7873,9 @@ impl Services {
                     row.insert("waitingOnPrMonitors".into(), Value::Array(monitors));
                 }
             }
+            if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
+                row.insert("subtreeMemoryBytes".into(), json!(bytes));
+            }
             agent_rows.push(Value::Object(row));
         }
 
@@ -7083,6 +7934,113 @@ impl Services {
                 }
                 stuck_risks.push(Value::Object(risk));
             }
+        }
+        // Stale undelivered queue entries (intent-hq/monorepo#1897): a
+        // ready-to-send entry older than [`STALE_QUEUE_ENTRY_AFTER_MS`] whose
+        // target agent is not actively responding should have drained long
+        // ago — surface it instead of leaving the wake invisible. Entries
+        // under edit are excluded (the drain skips them by design), as are
+        // entries whose `queuedAt` fails to parse. An actively-responding,
+        // non-stale agent legitimately holds its queue until the turn ends.
+        //
+        // Affirmatively-parked queues are expected, not stuck: an archived
+        // workspace parks every queue until unarchive (the drain kick then
+        // delivers), and an active question hold (PROTOCOL §5.5) parks
+        // automatic entries until the user answers or dismisses — but never
+        // user-origin entries, which drain through the hold, so a stale
+        // user-origin entry under a hold is still a genuine risk. Both checks
+        // are lazy — one workspace read per call and one bounded
+        // [`Services::question_hold_active`] session read per agent, paid
+        // only when a stale candidate actually exists.
+        let mut workspace_archived: Option<bool> = None;
+        for q in &queues {
+            let aid = q["agentId"].as_str().unwrap_or_default();
+            let actively_responding = session_by_id.get(aid).is_some_and(|s| {
+                agent_status_wire(s.status) == Some("responding")
+                    && age_ms(now_ms, &s.updated_at) <= stale_after_ms
+            });
+            if actively_responding {
+                continue;
+            }
+            let mut stale: Vec<(&str, i64)> = q["entries"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|e| e["editing"].as_bool() != Some(true))
+                        .filter_map(|e| {
+                            let queued_at = e["queuedAt"].as_str()?;
+                            let queued_ms =
+                                (parse_iso(queued_at)?.unix_timestamp_nanos() / 1_000_000) as i64;
+                            let age = (now_ms - queued_ms).max(0);
+                            if age > STALE_QUEUE_ENTRY_AFTER_MS {
+                                Some((e["id"].as_str().unwrap_or_default(), age))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if stale.is_empty() {
+                continue;
+            }
+            let archived = match workspace_archived {
+                Some(v) => v,
+                None => {
+                    let v = !workspace_id.is_chief()
+                        && self
+                            .store
+                            .get_workspace(&workspace_id)
+                            .await
+                            .map(|w| w.archived)
+                            .unwrap_or(false);
+                    workspace_archived = Some(v);
+                    v
+                }
+            };
+            if archived {
+                break;
+            }
+            let agent = AgentId(aid.to_string());
+            if self.question_hold_active(&agent).await {
+                let user_origin_ids: HashSet<String> = {
+                    let guard = self
+                        .agent_queues
+                        .lock()
+                        .expect("agent queue registry poisoned");
+                    guard
+                        .get(&agent)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|m| m.user_origin)
+                                .map(|m| m.id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                stale.retain(|(id, _)| user_origin_ids.contains(*id));
+            }
+            let Some((oldest_id, oldest_age)) = stale.iter().max_by_key(|(_, age)| *age) else {
+                continue;
+            };
+            let status = session_by_id
+                .get(aid)
+                .and_then(|s| agent_status_wire(s.status))
+                .unwrap_or("unknown");
+            stuck_risks.push(json!({
+                "type": "stale-queue-entry",
+                "severity": "warning",
+                "message": format!(
+                    "Agent {aid} ({status}) has {} undelivered queued message(s); oldest entry {oldest_id} queued {oldest_age}ms ago",
+                    stale.len(),
+                ),
+                "agentId": aid,
+                "entryId": oldest_id,
+                "ageMs": oldest_age,
+                "count": stale.len(),
+            }));
         }
         for sub in &subscriptions {
             if sub["orphaned"].as_bool() == Some(true) {
@@ -7768,6 +8726,7 @@ impl Services {
             workspace_context: None,
             context_references: None,
             image_blocks: None,
+            file_blocks: None,
             is_background: None,
             name_explicitly_set: None,
         };
@@ -9210,6 +10169,194 @@ fn validate_message_role(role: &str) -> Result<()> {
     }
 }
 
+/// Per-segment char cap for the restart-resume tail recap (middle-truncated):
+/// generous enough to replay a real request/partial response verbatim, small
+/// enough that a pathological message cannot blow up the continuation prompt.
+const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
+
+/// Cap on replayed tail segments: every restart cycle can stack one more
+/// flushed partial row onto the incomplete tail, so a restart loop must not
+/// grow the recap without bound. When over, the oldest segments AFTER the
+/// original lost request are elided (the head segment is the request the
+/// whole recap exists to preserve; the freshest partials matter most).
+const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
+
+/// The restart-resume continuation message (`resume_interrupted_agent`).
+/// Re-sent verbatim on every resume, so persisted copies of it in the
+/// transcript tail are never replayed by the recap — a second restart would
+/// otherwise stop the tail walk at the previous resume's continuation row
+/// and lose the original request again.
+pub(crate) const RESUME_CONTINUATION_TEXT: &str = "You were interrupted because the harness shut \
+     down. You now have a chance to continue the work — review your last steps and pick up where \
+     you left off.";
+
+/// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
+/// recap text plus any attachment blocks the replayed user rows carried.
+/// Persisted user rows keep their image/file blocks (STAB-133), and dropping
+/// them here would resume an interrupted attachment-bearing request with
+/// only its text — the blocks ride `TurnOptions::prepend_image_blocks` /
+/// `prepend_file_blocks`, whose prompt assembly (`append_attachment_blocks`)
+/// emits them on the recreate branch too (the history XML is text-only).
+pub(crate) struct ResumeTailRecap {
+    pub(crate) text: String,
+    /// Replayed user rows' `image` blocks (persisted shape carries the same
+    /// `data`/`mimeType` keys prompt assembly reads; the extra `type` key is
+    /// ignored). `None` when the replayed rows had none.
+    pub(crate) image_blocks: Option<Value>,
+    /// Replayed user rows' `file` blocks (inline `data`/`mimeType`/`fileName`
+    /// or attachment-reference `attachmentId`/`fileName` — both shapes are
+    /// what prompt assembly reads). `None` when the replayed rows had none.
+    pub(crate) file_blocks: Option<Value>,
+}
+
+/// One replayed tail row, in transcript order.
+enum TailSegment {
+    /// A user message the provider never committed.
+    User(String),
+    /// Partial assistant output flushed by an interruption.
+    Partial(String),
+}
+
+/// Build the mid-turn tail recap for a restart resume (monorepo#2539).
+///
+/// A `session/load` resume replays the PROVIDER's session checkpoint, which
+/// only contains completed turns — a turn is committed provider-side only
+/// when its `session/prompt` resolves, so every row after the last COMPLETED
+/// assistant turn is absent from the resumed context even though the daemon
+/// transcript has it. This recap replays that daemon-side tail (prompt-only,
+/// via `TurnOptions::prepend_content`) ahead of the continuation message,
+/// with an explicit cut-off disclosure.
+///
+/// The backward walk collects user rows and `metadata.interrupted`-tagged
+/// assistant rows (skipping system rows) until the completed-turn boundary.
+/// A single restart leaves `user + partial`; repeated restarts stack further
+/// partials, and the previous resumes' persisted continuation rows are
+/// skipped (each resume re-sends [`RESUME_CONTINUATION_TEXT`] verbatim).
+/// Replayed text is XML-escaped like `format_history_as_xml`, so a message
+/// containing closing tags cannot break out of its quoting element. Returns
+/// `None` when the tail has no incomplete rows (the provider checkpoint is
+/// current) or when an unexpected row shape makes the tail unreadable.
+fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap> {
+    let mut segments: Vec<TailSegment> = Vec::new();
+    // Grouped per row so reversing the walk order can't flip the block order
+    // WITHIN a multi-attachment row.
+    let mut image_rows: Vec<Vec<Value>> = Vec::new();
+    let mut file_rows: Vec<Vec<Value>> = Vec::new();
+    for m in messages.iter().rev() {
+        match m.role.as_str() {
+            "system" => continue,
+            "assistant" => {
+                let interrupted = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !interrupted {
+                    // Completed turn — the provider's checkpoint covers this
+                    // row and everything before it.
+                    break;
+                }
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("");
+                if !text.is_empty() {
+                    segments.push(TailSegment::Partial(text));
+                }
+            }
+            "user" => {
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("\n");
+                if text == RESUME_CONTINUATION_TEXT {
+                    // A previous resume's continuation row — re-sent fresh by
+                    // every resume, never replayed.
+                    continue;
+                }
+                let mut row_images: Vec<Value> = Vec::new();
+                let mut row_files: Vec<Value> = Vec::new();
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("image") => row_images.push(b.clone()),
+                        Some("file") => row_files.push(b.clone()),
+                        _ => {}
+                    }
+                }
+                if !row_images.is_empty() {
+                    image_rows.push(row_images);
+                }
+                if !row_files.is_empty() {
+                    file_rows.push(row_files);
+                }
+                if !text.is_empty() {
+                    segments.push(TailSegment::User(text));
+                }
+            }
+            // Any other tail shape (e.g. a bare `tool` row) is not the
+            // interrupted-turn pattern this recap understands — fail safe.
+            _ => return None,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    segments.reverse();
+    image_rows.reverse();
+    file_rows.reverse();
+    let image_blocks: Vec<Value> = image_rows.into_iter().flatten().collect();
+    let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
+    let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
+    if elided > 0 {
+        segments.drain(1..1 + elided);
+    }
+    let has_partial = segments
+        .iter()
+        .any(|s| matches!(s, TailSegment::Partial(_)));
+    let mut recap = String::from(
+        "<supervisor>\nRestart recovery: the harness restarted while you were \
+         responding, and your restored session may predate the exchange below \
+         — it is repeated here (parts of it may or may not already be in your \
+         context).\n\n",
+    );
+    if elided > 0 {
+        recap.push_str(&format!(
+            "({elided} older interrupted segment(s) elided.)\n\n"
+        ));
+    }
+    for segment in &segments {
+        let (label, tag, text) = match segment {
+            TailSegment::User(text) => (
+                "The user's message, delivered before the interruption:",
+                "interrupted_user_message",
+                text,
+            ),
+            TailSegment::Partial(text) => (
+                "Your partial response before the cut-off (it did NOT \
+                 complete; anything after this point was lost):",
+                "interrupted_partial_response",
+                text,
+            ),
+        };
+        recap.push_str(&format!(
+            "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
+            crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
+                text,
+                RESUME_RECAP_SEGMENT_MAX_CHARS,
+            )),
+        ));
+    }
+    if !has_partial {
+        recap.push_str(
+            "Your response was cut off before any output was produced — \
+             treat that request as not yet acted on.\n",
+        );
+    }
+    recap.push_str("</supervisor>");
+    Some(ResumeTailRecap {
+        text: recap,
+        image_blocks: (!image_blocks.is_empty()).then(|| Value::Array(image_blocks)),
+        file_blocks: (!file_blocks.is_empty()).then(|| Value::Array(file_blocks)),
+    })
+}
+
 impl Services {
     /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
     /// daemon's resume orchestrator calls this to resume every turn Task C
@@ -9505,30 +10652,80 @@ impl Services {
         }
 
         // Deliver continuation message
-        let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
+        let continuation = RESUME_CONTINUATION_TEXT;
 
-        // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load).
+        // Mid-turn tail recap (monorepo#2539): a `session/load` resume replays
+        // the PROVIDER's session checkpoint, which contains only completed
+        // turns — the interrupted `session/prompt` never resolved
+        // provider-side, so the interrupting user message and the partial
+        // assistant output (both durable in the daemon transcript; the UI
+        // renders them) would silently vanish from the model-visible context
+        // and the agent would resume from a stale point. Rebuild that tail
+        // from the transcript and deliver it prompt-only
+        // (`TurnOptions::prepend_content`, attachments via the prepend block
+        // fields) ahead of the continuation. `build_turn_prompt` drops the
+        // prepend TEXT when the session is recreated instead of resumed
+        // (`history_covers_prepend`: the `<supervisor>` history replay
+        // already carries the whole transcript) while the prepend
+        // ATTACHMENTS still ride (the history XML is text-only), so the tail
+        // reaches the agent exactly once on either branch. The recap is
+        // built from the pre-marker `session` snapshot, so the just-appended
+        // interruption marker never leaks into it.
+        let recap = build_resume_tail_recap(&session.messages);
+
+        // Use the send-message machinery to deliver the continuation (lazily
+        // respawns the provider and resumes via ACP `session/load`).
         // Automatic origin: a resume continuation must not bury a Q&A the
         // agent had pending when the harness shut down (question hold — the
-        // marker is persisted, so the hold survives the restart).
-        if let Err(e) = self
-            .agent_send_message(
-                workspace_id.clone(),
-                agent_id.clone(),
-                continuation.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                intent_core::MessageOrigin::Automatic,
-            )
-            .await
-        {
+        // marker is persisted, so the hold survives the restart). The manager
+        // path is called directly so the recap can ride
+        // `TurnOptions::prepend_content`; the store-only fallback (no manager
+        // attached) keeps the plain trait call — it drives no outbound
+        // prompt, so there is no context to repair.
+        let send_result = match self.agent_manager() {
+            Some(manager) => {
+                let options = match recap {
+                    Some(recap) => crate::agent_manager::TurnOptions {
+                        prepend_content: Some(recap.text),
+                        prepend_image_blocks: recap.image_blocks,
+                        prepend_file_blocks: recap.file_blocks,
+                        origin: intent_core::MessageOrigin::Automatic,
+                        ..crate::agent_manager::TurnOptions::default()
+                    },
+                    None => crate::agent_manager::TurnOptions {
+                        origin: intent_core::MessageOrigin::Automatic,
+                        ..crate::agent_manager::TurnOptions::default()
+                    },
+                };
+                manager
+                    .send_message(
+                        agent_id.clone(),
+                        workspace_id.clone(),
+                        continuation.to_string(),
+                        None,
+                        options,
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message(
+                    workspace_id.clone(),
+                    agent_id.clone(),
+                    continuation.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    intent_core::MessageOrigin::Automatic,
+                )
+                .await
+            }
+        };
+        if let Err(e) = send_result {
             reset_to_pending().await;
             return Err(e);
         }

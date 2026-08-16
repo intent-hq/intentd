@@ -16,9 +16,11 @@ use intent_core::events::{
     AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED, NOTE_CREATED, NOTE_DELETED,
     NOTE_UPDATED, PR_LINKED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
     WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
 };
-use intent_core::{now_iso, AgentId, Event, NoteId, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    extract_spec_task_ids, now_iso, AgentId, Event, Note, NoteId, WorkspaceApi, WorkspaceId,
+};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -81,10 +83,12 @@ pub(crate) struct CommentSubscribeParams {
 
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
 /// scoped by `agentId` (like the comment channel's `noteId`, NOT `workspaceId`);
-/// `replaceGroup` is optional.
+/// `replaceGroup` is optional. `sinceMessageId` (optional) requests a resumed
+/// seq-0 snapshot: only messages AFTER that id (§7.1 resume).
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
+    pub since_message_id: Option<String>,
     pub replace_group: Option<String>,
 }
 
@@ -210,7 +214,9 @@ pub(crate) fn parse_comment_subscribe_params(
 }
 
 /// Validate `chat.subscribe` params. A missing/empty `agentId` is a `-32602`
-/// error (the chat channel is per-agent, CS-0).
+/// error (the chat channel is per-agent, CS-0). `sinceMessageId` is optional:
+/// absent / `null` / empty string all mean "no resume" (standard snapshot,
+/// no `resumed` key); a present non-string value is a `-32602` error.
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
@@ -218,8 +224,15 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Err("agentId is required".to_string()),
     };
+    let since_message_id = match params.get("sinceMessageId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err("sinceMessageId must be a string".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
+        since_message_id,
         replace_group: replace_group(params),
     })
 }
@@ -330,6 +343,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             WORKSPACE_ACTIVITY_CHANGED,
             WORKSPACE_ATTENTION_CHANGED,
             WORKSPACE_DISPLAY_STATUS_CHANGED,
+            WORKSPACE_WAITING_CHANGED,
             PR_LINKED,
             PR_UPDATED,
             PR_UNLINKED,
@@ -368,16 +382,11 @@ pub(crate) async fn channel_snapshot(
             Ok(notes) => serde_json::to_value(notes).unwrap_or_else(|_| empty()),
             Err(_) => empty(),
         },
-        Channel::Task => match api.list_notes(workspace_id).await {
-            Ok(notes) => {
-                let tasks: Vec<_> = notes
-                    .into_iter()
-                    .filter(|n| n.metadata.task.is_some())
-                    .collect();
-                serde_json::to_value(tasks).unwrap_or_else(|_| empty())
-            }
-            Err(_) => empty(),
-        },
+        // Task snapshot rows are note-shaped entities enriched with the
+        // additive `specLinked` flag (same semantics as `task.list`, §5.4).
+        // The dedicated [`task_snapshot`] also hands the forwarder the link
+        // set it needs to seed the stateful task-delta mapper.
+        Channel::Task => task_snapshot(api, workspace_id).await.0,
         Channel::Agent => match api.agent_list(workspace_id.clone()).await {
             Ok(agents) => serde_json::to_value(agents).unwrap_or_else(|_| empty()),
             Err(_) => empty(),
@@ -419,8 +428,8 @@ pub(crate) async fn channel_snapshot(
 /// Materialize the chat channel's seq-0 snapshot: the newest page of
 /// `agent.getConversation` as the `{ agentId, messages, truncated,
 /// totalMessages, nextToken }` OBJECT (CS-0 D3), reused verbatim from the
-/// existing paginated read, then — when a turn is currently streaming —
-/// the in-flight partial assistant message merged in (CS-0 D5) so a
+/// existing paginated read, then — when the live-turn slot holds a message not
+/// yet in that page — its partial assistant message merged in (CS-0 D5) so a
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
 ///
 /// **Bounded** (monorepo#958): exactly ONE conversation read, with no
@@ -429,13 +438,31 @@ pub(crate) async fn channel_snapshot(
 /// bounded newest page regardless of transcript length — the paginated op
 /// selects just that page SQL-side and never re-hydrates the full history.
 /// Older pages stay client-pulled via `agent.getConversation { nextToken }`.
-/// The merge is gated on [`WorkspaceApi::agent_is_busy`]: a lingering
-/// `agent_live_turn` slot whose worker is gone (mid-turn crash, race between
-/// abort and slot release) MUST NOT surface a phantom "streaming" message
-/// when a client opens the chat. On a read error the snapshot degrades to an
-/// empty messages page rather than failing the subscription (matching
+/// [`WorkspaceApi::agent_is_busy`] decides the merged message's `isStreaming`
+/// flag, NOT whether to merge at all (monorepo#2104): a populated
+/// `agent_live_turn` slot whose worker is gone (mid-turn crash, a flush that
+/// failed with a non-UNIQUE store error and kept the slot as the only copy of
+/// the content) still holds real output the user watched arrive, so it is
+/// served — just never as "streaming". The invariant that survives is the one
+/// that mattered: an orphaned slot MUST NOT surface a phantom *streaming*
+/// message. An EMPTY orphan slot is skipped entirely, so a dead turn that
+/// streamed nothing adds no blank row. On a read error the snapshot degrades to
+/// an empty messages page rather than failing the subscription (matching
 /// [`channel_snapshot`]'s degrade-to-empty pattern).
-pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) -> Value {
+///
+/// **Resume (§7.1).** When `since_message_id` is provided, the same bounded
+/// newest page is read (still exactly ONE read — the resume is a post-filter,
+/// never a second fetch), then [`apply_resume_filter`] trims it: if the id is
+/// found in the page the snapshot carries only the messages AFTER it with
+/// `resumed: true`; otherwise (unknown / pruned / older than the bounded page)
+/// the full standard page is served with `resumed: false` so the client
+/// rehydrates. The live-turn merge and activity-flags overlay apply in both
+/// cases, after the filter, so an in-flight partial is never trimmed away.
+pub(crate) async fn chat_snapshot(
+    api: &dyn WorkspaceApi,
+    agent_id: &AgentId,
+    since_message_id: Option<&str>,
+) -> Value {
     let mut snapshot = match api
         .agent_get_conversation(agent_id.clone(), None, None, None, None)
         .await
@@ -449,10 +476,21 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
             "nextToken": Value::Null,
         }),
     };
-    if api.agent_is_busy(agent_id.clone()) {
-        if let Some(live) = api.agent_live_turn(agent_id.clone()) {
-            merge_live_turn(&mut snapshot, agent_id, &live);
-        }
+    if let Some(since) = since_message_id {
+        apply_resume_filter(&mut snapshot, since);
+    }
+    // Read busy BEFORE the slot, never after. The two reads are separate lock
+    // acquisitions, so a turn can claim `busy` between them; `try_begin` clears a
+    // stale slot under the busy lock before publishing the claim, which makes
+    // `busy == true` ⇒ "the stale slot is already gone" — but only for a reader
+    // in this order. Reversed, a snapshot could read the PREVIOUS turn's content
+    // and then a freshly-claimed `busy`, and label stale content `isStreaming:
+    // true` — the phantom-streaming state this whole gate exists to prevent. In
+    // this order the residual interleaving is the harmless mirror: the new turn's
+    // content labelled settled, which the next delta or snapshot corrects.
+    let is_streaming = api.agent_is_busy(agent_id.clone());
+    if let Some(live) = api.agent_live_turn(agent_id.clone()) {
+        merge_live_turn(&mut snapshot, agent_id, &live, is_streaming);
     }
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
@@ -468,13 +506,60 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
     snapshot
 }
 
-/// Append the in-flight assistant message to a chat snapshot's `messages` page
+/// Trim a chat seq-0 snapshot to the messages AFTER `since` (§7.1 resume).
+///
+/// If `since` matches a message id in the bounded page, `messages` keeps only
+/// the rows after it and the snapshot gains `resumed: true`; `truncated` /
+/// `nextToken` are cleared (no gap exists — the client already holds
+/// everything up to `since`). If `since` is not in the page (unknown, pruned,
+/// or older than the bounded newest page — indistinguishable without a second
+/// read, and the bounded-read contract forbids one), the page is left intact
+/// and the snapshot gains `resumed: false`: the client must discard its cache
+/// and rehydrate from the standard snapshot. `totalMessages` stays the
+/// transcript-wide count in both cases (same semantics as the standard
+/// snapshot, where `messages.len()` already ≠ `totalMessages` when truncated).
+fn apply_resume_filter(snapshot: &mut Value, since: &str) {
+    let Some(obj) = snapshot.as_object_mut() else {
+        return;
+    };
+    let found_at = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .position(|m| m.get("id").and_then(Value::as_str) == Some(since))
+        });
+    match found_at {
+        Some(idx) => {
+            if let Some(arr) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+                arr.drain(..=idx);
+            }
+            obj.insert("resumed".to_string(), Value::Bool(true));
+            obj.insert("truncated".to_string(), Value::Bool(false));
+            obj.insert("nextToken".to_string(), Value::Null);
+        }
+        None => {
+            obj.insert("resumed".to_string(), Value::Bool(false));
+        }
+    }
+}
+
+/// Append the live turn's assistant message to a chat snapshot's `messages` page
 /// (CS-0 D5). Its `seq` is the next monotonic value (`totalMessages`, since seq
-/// is contiguous from 0) and it carries `isStreaming: true` as a render hint the
-/// terminal reconcile clears via `streamingComplete`. Idempotent: if the turn's
-/// message already persisted (id present in the page) it is left untouched, so a
-/// snapshot taken in the window between persist and slot-clear never duplicates.
-fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
+/// is contiguous from 0) and it carries `isStreaming: is_streaming` — `true`
+/// while a worker still holds the turn's busy claim, as a render hint the
+/// terminal reconcile clears via `streamingComplete`; `false` for an orphaned
+/// slot (monorepo#2104), whose content is real but final. Idempotent: if the
+/// turn's message already persisted (id present in the page) it is left
+/// untouched, so a snapshot taken in the window between persist and slot-clear
+/// never duplicates.
+///
+/// An orphaned slot with NO content blocks is skipped: there is nothing to show,
+/// and a dead turn that streamed nothing must not add a blank assistant row. A
+/// still-streaming turn keeps merging empty — a turn that has only just begun
+/// legitimately has no blocks yet, and the client needs the id to reconcile
+/// against.
+fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_streaming: bool) {
     let Some(message_id) = live.get("messageId").and_then(Value::as_str) else {
         return;
     };
@@ -482,6 +567,10 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
         .get("contentBlocks")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let populated = blocks.as_array().is_some_and(|b| !b.is_empty());
+    if !is_streaming && !populated {
+        return;
+    }
     let Some(obj) = snapshot.as_object_mut() else {
         return;
     };
@@ -506,7 +595,7 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value) {
         "role": "assistant",
         "contentBlocks": blocks,
         "timestamp": now_iso(),
-        "isStreaming": true,
+        "isStreaming": is_streaming,
     }));
     obj.insert("totalMessages".to_string(), json!(total + 1));
 }
@@ -599,7 +688,7 @@ impl ChatDeltaState {
         match event.event_type.as_str() {
             CHAT_STREAM_DELTA => self.chunk_delta(event),
             AGENT_TOOL_CALL => self.tool_delta(event),
-            AGENT_STREAM_END => self.finalize(api).await,
+            AGENT_STREAM_END => self.finalize(api, event).await,
             AGENT_MESSAGE => self.message_row_delta(api, event).await,
             _ => None,
         }
@@ -744,10 +833,17 @@ impl ChatDeltaState {
     /// persisted `record_tool` shape (D6). Once the call completes WITH
     /// output, also synthesize a `tool_result` block, and — when a `completed`
     /// (not `error`) output carries a proposal-MIME resource item (§7.1) — a
-    /// standalone proposal-resource block. The `tool_result` block id is the
-    /// `tool_use` index + 1 (it is appended right after) and the proposal
-    /// block follows at + 2; a mispredicted id self-heals at the terminal
-    /// reconcile via `removedIds`.
+    /// standalone proposal-resource block. Their ids are NOT derived from the
+    /// `tool_use` id — they are read verbatim off the event (`resultBlockId` /
+    /// `proposalBlockIds`), which `record_tool` stamps from the indices the
+    /// blocks actually took in the durable transcript. Predicting them as
+    /// `tool_use` index + 1 was wrong whenever text interleaved between a call
+    /// and its completion, or a parallel call's `tool_use` already owned that
+    /// index — the live block then clobbered a legitimate block on every
+    /// id-keyed client until the terminal reconcile healed it
+    /// (monorepo#2029). An event without the field (no such block was
+    /// materialized) synthesizes nothing; a genuinely orphaned live block
+    /// still self-heals at the terminal reconcile via `removedIds`.
     fn tool_delta(&mut self, event: &Event) -> Option<Value> {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
@@ -779,7 +875,11 @@ impl ChatDeltaState {
         );
         let completed = status == "completed" || status == "error";
         if completed {
-            if let (Some(output), Some(result_id)) = (d.get("output"), next_block_id(&block_id)) {
+            let result_id = d
+                .get("resultBlockId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let (Some(output), Some(result_id)) = (d.get("output"), result_id) {
                 let result_block = json!({
                     "type": "tool_result",
                     "id": result_id,
@@ -801,7 +901,10 @@ impl ChatDeltaState {
                 // otherwise fall back to lifting a proposal-MIME resource
                 // item out of the echoed output. Gated on `completed` only
                 // (matching `record_tool`) — an errored tool must not surface
-                // an actionable ProposalCard.
+                // an actionable ProposalCard. Each item is paired positionally
+                // with the id `record_tool` gave the block it wrote for that
+                // same item; an item without an id (the event carried none —
+                // nothing was materialized for it) is skipped.
                 if status == "completed" {
                     let items: Vec<Value> = d
                         .get("registeredAttachments")
@@ -812,23 +915,23 @@ impl ChatDeltaState {
                                 .into_iter()
                                 .collect()
                         });
-                    let mut anchor_id = result_id.clone();
-                    for item in items {
-                        let Some(attach_id) = next_block_id(&anchor_id) else {
-                            break;
-                        };
+                    let attach_ids: Vec<&str> = d
+                        .get("proposalBlockIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    for (item, attach_id) in items.iter().zip(attach_ids) {
                         let attach_block =
                             intent_services::tool_block::build_proposal_resource_block(
-                                &attach_id, &item,
+                                attach_id, item,
                             );
-                        let attach_added = self.note_block(&attach_id);
+                        let attach_added = self.note_block(attach_id);
                         push_entity(
                             &mut added,
                             &mut updated,
                             attach_added,
                             self.entity(&message_id, attach_block, None, None, false),
                         );
-                        anchor_id = attach_id;
                     }
                 }
             }
@@ -839,7 +942,28 @@ impl ChatDeltaState {
     /// Finalize the turn on `agent:stream:end`: reconcile against the persisted
     /// message, then reset the per-turn accumulation so the next turn on this
     /// subscription starts clean.
-    async fn finalize(&mut self, api: &dyn WorkspaceApi) -> Option<Value> {
+    ///
+    /// The turn's message id is normally learned live (`seed_from_snapshot` or
+    /// the first chunk/tool delta), but a subscription that opened after the
+    /// last chunk and merged no in-flight message never learns it — and would
+    /// then emit no terminal frame at all, leaving the turn missing from its
+    /// transcript until the client resubscribes or refetches
+    /// ([monorepo#2105](https://github.com/intent-hq/monorepo/issues/2105)).
+    /// The terminal event already names the row it closes, so fall back to its
+    /// `messageId`: the reconcile below re-reads the same bounded page a fresh
+    /// snapshot would, and with no live-emitted ids every persisted block
+    /// arrives as `added` with no orphan `removedIds` — the client converges on
+    /// the fresh-snapshot state, which is exactly the §7.1 invariant. The
+    /// fallback is inert whenever the id is already known (the normal case) and
+    /// when the event carries none (a turn that persisted no assistant row).
+    async fn finalize(&mut self, api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+        if self.message_id.is_none() {
+            self.message_id = event
+                .data
+                .get("messageId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         let delta = self.reconcile(api).await;
         self.text_acc.clear();
         self.seen_ids.clear();
@@ -978,14 +1102,6 @@ fn push_entity(added: &mut Vec<Value>, updated: &mut Vec<Value>, is_added: bool,
     }
 }
 
-/// `{prefix}:{n}` → `{prefix}:{n+1}` — the `tool_result` block id follows its
-/// `tool_use` block by one index in the persisted transcript (`record_tool`).
-fn next_block_id(block_id: &str) -> Option<String> {
-    let (prefix, idx) = block_id.rsplit_once(':')?;
-    let n: usize = idx.parse().ok()?;
-    Some(format!("{prefix}:{}", n + 1))
-}
-
 /// Map one bus change event to a channel delta via the re-read strategy (TB-0
 /// §2.2 option B). Dispatches to the per-channel mapper; returns `None` for an
 /// event that does not translate (unrelated type, missing id, or re-read miss).
@@ -998,10 +1114,15 @@ pub(crate) async fn channel_delta(
 ) -> Option<Value> {
     match channel {
         Channel::Note => note_delta(api, workspace_id, event).await,
-        Channel::Task => task_delta(api, workspace_id, event).await,
         Channel::Agent => agent_delta(api, event).await,
         Channel::Workspace => workspace_delta(api, event).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
+        // The task channel uses the stateful [`task_delta`] mapper directly in
+        // the forwarder: it tracks the spec's task-link set across deltas so a
+        // spec-body edit can refresh flipped `specLinked` flags
+        // (monorepo#2407) — so this generic stateless arm is unreachable for
+        // `Task`.
+        Channel::Task => None,
         // The chat channel uses the dedicated, stateful [`ChatDeltaState`] mapper
         // on the `forward_chat_subscription` path (CS-3) — its deltas are
         // event-payload-driven, not re-read — so this generic re-read arm is
@@ -1010,19 +1131,148 @@ pub(crate) async fn channel_delta(
     }
 }
 
+/// Materialize the task channel's seq-0 snapshot AND the spec's
+/// `intent://local/task/{id}` link set from ONE `list_notes` read (no extra
+/// query — O(rows) cost contract). Snapshot rows are note-shaped entities
+/// enriched with the additive `specLinked` flag (same semantics as
+/// `task.list`, §5.4); the returned link set seeds the forwarder's stateful
+/// [`task_delta`] mapper so later spec-body edits can be diffed against it
+/// (monorepo#2407). On a read error both degrade to empty rather than
+/// failing the subscription.
+pub(crate) async fn task_snapshot(
+    api: &dyn WorkspaceApi,
+    workspace_id: &WorkspaceId,
+) -> (Value, HashSet<String>) {
+    match api.list_notes(workspace_id).await {
+        Ok(notes) => {
+            let linked = notes
+                .iter()
+                .find(|n| n.id.as_str() == "spec")
+                .map(|n| extract_spec_task_ids(&n.content))
+                .unwrap_or_default();
+            let tasks: Vec<Value> = notes
+                .into_iter()
+                .filter(|n| n.metadata.task.is_some())
+                .filter_map(|n| task_note_value(n, &linked))
+                .collect();
+            (Value::Array(tasks), linked)
+        }
+        Err(_) => (Value::Array(Vec::new()), HashSet::new()),
+    }
+}
+
+/// Serialize a task note for the `task` channel wire, stamping the additive
+/// `specLinked` flag: true iff the note id appears in `linked` (the spec
+/// body's `intent://local/task/{id}` link set — same semantics as `task.list`,
+/// §5.4). Serialization keeps the note shape untouched otherwise; a non-object
+/// serialization is dropped (never happens for [`Note`]).
+fn task_note_value(note: Note, linked: &HashSet<String>) -> Option<Value> {
+    let spec_linked = linked.contains(note.id.as_str());
+    let mut value = serde_json::to_value(note).ok()?;
+    value
+        .as_object_mut()?
+        .insert("specLinked".to_string(), Value::Bool(spec_linked));
+    Some(value)
+}
+
+/// Resolve `note_id`'s CURRENT spec linkage from ONE bounded
+/// `get_note("spec")` read and record it in the tracked set — touching ONLY
+/// that id. The set must keep reflecting what was last STAMPED onto emitted
+/// rows, per id: a fresh spec read here may already contain link changes for
+/// OTHER tasks whose spec `note:updated` has not reached this forwarder yet,
+/// and adopting those memberships without re-emitting their rows would make
+/// the later flip diff see no difference — a permanently stale subscriber
+/// flag, the very bug class of monorepo#2407. A missing spec degrades to
+/// unlinked (`specLinked: false`), matching `task.list`. Unlike `task_get`
+/// (which propagates non-NotFound store errors), a TRANSIENT read error also
+/// degrades to unlinked here: dropping the delta would lose the row change
+/// itself, which is worse than a conservatively-false flag that self-corrects
+/// on the task's next event (or on the next spec-body edit, whose flip diff
+/// re-emits the affected rows — see [`spec_link_flip_delta`]).
+async fn stamp_spec_linked(
+    api: &dyn WorkspaceApi,
+    workspace_id: &WorkspaceId,
+    note_id: &str,
+    linked: &mut HashSet<String>,
+) {
+    let is_linked = match api
+        .get_note(workspace_id.clone(), NoteId::from("spec"))
+        .await
+    {
+        Ok(spec) => extract_spec_task_ids(&spec.content).contains(note_id),
+        Err(_) => false,
+    };
+    if is_linked {
+        linked.insert(note_id.to_string());
+    } else {
+        linked.remove(note_id);
+    }
+}
+
+/// Map a spec `note:updated` / `note:deleted` to `updated` rows for the
+/// tasks whose `specLinked` flag flipped (monorepo#2407): ONE `list_notes`
+/// read yields both the new link set (from the spec's own content; empty
+/// when the spec is gone, so a deletion unlinks every tracked task) and the
+/// task rows to re-emit, keeping the O(rows) cost contract — no per-task
+/// scans. Ids in the symmetric difference against the tracked set that are
+/// not task notes (dangling links) flip silently; an edit that leaves the
+/// link set unchanged emits nothing. The tracked set is replaced so every
+/// stamp the subscriber has seen agrees with it; on a read error the delta
+/// is dropped and the set kept (the next spec read reconverges).
+async fn spec_link_flip_delta(
+    api: &dyn WorkspaceApi,
+    workspace_id: &WorkspaceId,
+    linked: &mut HashSet<String>,
+) -> Option<Value> {
+    let notes = api.list_notes(workspace_id).await.ok()?;
+    let new_linked = notes
+        .iter()
+        .find(|n| n.id.as_str() == "spec")
+        .map(|n| extract_spec_task_ids(&n.content))
+        .unwrap_or_default();
+    let flipped: HashSet<String> = linked.symmetric_difference(&new_linked).cloned().collect();
+    let updated: Vec<Value> = notes
+        .into_iter()
+        .filter(|n| n.metadata.task.is_some() && flipped.contains(n.id.as_str()))
+        .filter_map(|n| task_note_value(n, &new_linked))
+        .collect();
+    *linked = new_linked;
+    if updated.is_empty() {
+        None
+    } else {
+        Some(json!({ "updated": updated }))
+    }
+}
+
 /// Map a `task` channel event by re-reading the note and keeping only task
 /// notes. `note:created` → `added`, `note:updated`/`task:status-changed` →
 /// `updated` when the note still projects a task or `removedIds` when the note
 /// has been demoted (task block removed), `note:deleted` → `removedIds` (the
 /// delete is idempotent on the client even when the removed note was not a
-/// task).
+/// task). `added`/`updated` rows carry the additive `specLinked` flag (one
+/// extra spec-note read per delta, still O(rows) — see [`task_note_value`]).
+///
+/// The mapper is stateful: `linked` tracks the spec's task-link set as last
+/// stamped onto emitted rows (seeded from [`task_snapshot`]'s read).
+/// `note:updated` AND `note:deleted` for the SPEC itself route to
+/// [`spec_link_flip_delta`], which diffs the new link set against `linked`
+/// (empty after a deletion) and re-emits exactly the flipped task rows
+/// (monorepo#2407) instead of the old junk `removedIds: ["spec"]` demotion.
+/// Per-task arms stamp the event's own row via [`stamp_spec_linked`], which
+/// updates ONLY that id in `linked` — never the whole set, so link changes
+/// for other tasks stay visible to the flip diff of the spec event that
+/// carries them.
 pub(crate) async fn task_delta(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
     event: &Event,
+    linked: &mut HashSet<String>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
+        NOTE_UPDATED | NOTE_DELETED if note_id == "spec" => {
+            spec_link_flip_delta(api, workspace_id, linked).await
+        }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         NOTE_CREATED => {
             let note = api
@@ -1030,7 +1280,8 @@ pub(crate) async fn task_delta(
                 .await
                 .ok()?;
             note.metadata.task.as_ref()?;
-            Some(json!({ "added": [serde_json::to_value(note).ok()?] }))
+            stamp_spec_linked(api, workspace_id, note_id, linked).await;
+            Some(json!({ "added": [task_note_value(note, linked)?] }))
         }
         NOTE_UPDATED | TASK_STATUS_CHANGED => {
             let note = api
@@ -1040,7 +1291,8 @@ pub(crate) async fn task_delta(
             if note.metadata.task.is_none() {
                 return Some(json!({ "removedIds": [note_id] }));
             }
-            Some(json!({ "updated": [serde_json::to_value(note).ok()?] }))
+            stamp_spec_linked(api, workspace_id, note_id, linked).await;
+            Some(json!({ "updated": [task_note_value(note, linked)?] }))
         }
         _ => None,
     }
@@ -1095,6 +1347,7 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | WORKSPACE_ACTIVITY_CHANGED
         | WORKSPACE_ATTENTION_CHANGED
         | WORKSPACE_DISPLAY_STATUS_CHANGED
+        | WORKSPACE_WAITING_CHANGED
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {

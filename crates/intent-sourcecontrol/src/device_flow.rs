@@ -89,11 +89,17 @@ pub const DEFAULT_LOGIN_BASE_URI: &str = "https://github.com";
 
 /// Build the login client the flow requires (`base_uri` + `Accept:
 /// application/json`, per octocrab's `authenticate_as_device` contract).
+/// Connect/read/write timeouts mirror the main client's so a dead connection
+/// fails instead of pending forever (intent-hq/monorepo#1988; see
+/// [`crate::github`] for the constants' rationale).
 fn login_client(base_uri: &str) -> Result<octocrab::Octocrab> {
     Ok(octocrab::Octocrab::builder()
         .base_uri(base_uri)
         .map_err(|e| Error::Config(format!("invalid github login base uri: {e}")))?
         .add_header(http::header::ACCEPT, "application/json".to_string())
+        .set_connect_timeout(Some(crate::github::CONNECT_TIMEOUT))
+        .set_read_timeout(Some(crate::github::READ_WRITE_TIMEOUT))
+        .set_write_timeout(Some(crate::github::READ_WRITE_TIMEOUT))
         .build()?)
 }
 

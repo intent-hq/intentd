@@ -271,7 +271,7 @@ struct PersistedCache {
 }
 
 /// Schema version of [`PersistedCache`]; unknown versions are discarded.
-const PERSIST_VERSION: u32 = 1;
+const PERSIST_VERSION: u32 = 2;
 
 /// One in-memory negative entry: a probe failure under `version_key` at
 /// `failed_at_ms`, with the human-readable `reason` served to callers within

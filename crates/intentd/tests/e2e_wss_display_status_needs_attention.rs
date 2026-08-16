@@ -339,9 +339,11 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             token_usage: None,
             cow_supported: None,
             display_status: None,
+            waiting: false,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
+            pending_delete_at: None,
         })
         .await
         .expect("insert ws");
@@ -577,9 +579,9 @@ async fn discussion_request_promotes_and_user_message_retires_over_wss() {
         }
     }
     // And the retired request never re-raises: the read path settles at
-    // `unread` (the turn-end blue dot promotes the idle base, §6.5 step 9)
+    // `idle` (the turn-end blue dot is not a displayStatus axis, §6.5)
     // without ever serving needs_attention again.
-    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
+    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
 }
 
 /// Scenario 3 — a pending-question tail promotes `needs_attention`: the
@@ -781,9 +783,9 @@ async fn question_tail_promotes_and_dismiss_retires_over_wss() {
             break;
         }
     }
-    // Settles at `unread`: the asker's completed turn raised the turn-end
-    // blue dot, which promotes the idle base (§6.5 step 9).
-    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
+    // Settles at `idle`: the asker's completed turn raised the turn-end
+    // blue dot, but the flag is not a displayStatus axis (§6.5).
+    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
 }
 
 /// Scenario 4 — isolation: a DELEGATED (background, task-linked) agent
@@ -932,9 +934,10 @@ async fn delegated_blocker_never_promotes_needs_attention_over_wss() {
         status, "blocked",
         "a delegated/background blocker never promotes the workspace"
     );
-    assert_ne!(
-        status, "unread",
-        "a background delegate's turn end never raises the workspace blue dot"
+    let got = wss_rpc(&mut rpc, "workspace.get", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        got["workspace"]["attention"], "none",
+        "a background delegate's turn end never raises the workspace blue dot: {got}"
     );
 }
 
@@ -1100,9 +1103,9 @@ async fn transcript_mutation_ops_recompute_needs_attention_over_wss() {
             break;
         }
     }
-    // … and the read path settles at `unread` (the asker's completed turn
-    // raised the blue dot over the idle base) without re-serving it.
-    poll_display_status(&mut rpc, &ws_id, "unread", true).await;
+    // … and the read path settles at `idle` (the asker's turn-end blue dot
+    // is not a displayStatus axis) without re-serving needs_attention.
+    poll_display_status(&mut rpc, &ws_id, "idle", true).await;
 
     // ---- Raise over the wire: agent.replaceMessages swaps the transcript
     // back to one ending on the question-bearing assistant row ----

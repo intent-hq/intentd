@@ -355,6 +355,65 @@ async fn specialist_hidden_round_trips_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the embedded bundled catalog: with an empty user tier and no
+/// bundled-dir override, `specialist.list` over WSS returns exactly the eight
+/// embedded reference specialists — `pr-shepherd` is gone from the bundled set
+/// (review thread PRRT_kwDOS9Wxuc6YSV2u).
+#[tokio::test]
+async fn embedded_bundled_catalog_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Hermetic empty user tier: HOME=data_dir with no specialists written.
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let list = wss_rpc(&mut ws, 2, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let mut ids: Vec<&str> = specs
+        .iter()
+        .map(|s| s["id"].as_str().expect("specialist id"))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "chief-of-staff",
+            "developer",
+            "implementor",
+            "pr-reviewer",
+            "ralph",
+            "spec-writer",
+            "ui-designer",
+            "verifier",
+        ],
+        "bundled catalog over WSS is exactly the eight embedded ids (no pr-shepherd)"
+    );
+    for spec in specs {
+        assert_eq!(spec["source"], "bundled", "{}: embedded tier", spec["id"]);
+    }
+
+    drop(daemon);
+}
+
 /// WSS e2e for config-scalar inheritance across tiers (PROTOCOL §5.11,
 /// monorepo#718): a user-tier override that omits `model`/`agentType`
 /// inherits the bundled tier's values on `specialist.get` and
@@ -690,8 +749,10 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         token_usage: None,
         cow_supported: None,
         display_status: None,
+        waiting: false,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
+        pending_delete_at: None,
     }
 }
