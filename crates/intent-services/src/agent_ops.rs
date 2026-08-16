@@ -10048,6 +10048,194 @@ fn validate_message_role(role: &str) -> Result<()> {
     }
 }
 
+/// Per-segment char cap for the restart-resume tail recap (middle-truncated):
+/// generous enough to replay a real request/partial response verbatim, small
+/// enough that a pathological message cannot blow up the continuation prompt.
+const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
+
+/// Cap on replayed tail segments: every restart cycle can stack one more
+/// flushed partial row onto the incomplete tail, so a restart loop must not
+/// grow the recap without bound. When over, the oldest segments AFTER the
+/// original lost request are elided (the head segment is the request the
+/// whole recap exists to preserve; the freshest partials matter most).
+const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
+
+/// The restart-resume continuation message (`resume_interrupted_agent`).
+/// Re-sent verbatim on every resume, so persisted copies of it in the
+/// transcript tail are never replayed by the recap — a second restart would
+/// otherwise stop the tail walk at the previous resume's continuation row
+/// and lose the original request again.
+pub(crate) const RESUME_CONTINUATION_TEXT: &str = "You were interrupted because the harness shut \
+     down. You now have a chance to continue the work — review your last steps and pick up where \
+     you left off.";
+
+/// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
+/// recap text plus any attachment blocks the replayed user rows carried.
+/// Persisted user rows keep their image/file blocks (STAB-133), and dropping
+/// them here would resume an interrupted attachment-bearing request with
+/// only its text — the blocks ride `TurnOptions::prepend_image_blocks` /
+/// `prepend_file_blocks`, whose prompt assembly (`append_attachment_blocks`)
+/// emits them on the recreate branch too (the history XML is text-only).
+pub(crate) struct ResumeTailRecap {
+    pub(crate) text: String,
+    /// Replayed user rows' `image` blocks (persisted shape carries the same
+    /// `data`/`mimeType` keys prompt assembly reads; the extra `type` key is
+    /// ignored). `None` when the replayed rows had none.
+    pub(crate) image_blocks: Option<Value>,
+    /// Replayed user rows' `file` blocks (inline `data`/`mimeType`/`fileName`
+    /// or attachment-reference `attachmentId`/`fileName` — both shapes are
+    /// what prompt assembly reads). `None` when the replayed rows had none.
+    pub(crate) file_blocks: Option<Value>,
+}
+
+/// One replayed tail row, in transcript order.
+enum TailSegment {
+    /// A user message the provider never committed.
+    User(String),
+    /// Partial assistant output flushed by an interruption.
+    Partial(String),
+}
+
+/// Build the mid-turn tail recap for a restart resume (monorepo#2539).
+///
+/// A `session/load` resume replays the PROVIDER's session checkpoint, which
+/// only contains completed turns — a turn is committed provider-side only
+/// when its `session/prompt` resolves, so every row after the last COMPLETED
+/// assistant turn is absent from the resumed context even though the daemon
+/// transcript has it. This recap replays that daemon-side tail (prompt-only,
+/// via `TurnOptions::prepend_content`) ahead of the continuation message,
+/// with an explicit cut-off disclosure.
+///
+/// The backward walk collects user rows and `metadata.interrupted`-tagged
+/// assistant rows (skipping system rows) until the completed-turn boundary.
+/// A single restart leaves `user + partial`; repeated restarts stack further
+/// partials, and the previous resumes' persisted continuation rows are
+/// skipped (each resume re-sends [`RESUME_CONTINUATION_TEXT`] verbatim).
+/// Replayed text is XML-escaped like `format_history_as_xml`, so a message
+/// containing closing tags cannot break out of its quoting element. Returns
+/// `None` when the tail has no incomplete rows (the provider checkpoint is
+/// current) or when an unexpected row shape makes the tail unreadable.
+fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap> {
+    let mut segments: Vec<TailSegment> = Vec::new();
+    // Grouped per row so reversing the walk order can't flip the block order
+    // WITHIN a multi-attachment row.
+    let mut image_rows: Vec<Vec<Value>> = Vec::new();
+    let mut file_rows: Vec<Vec<Value>> = Vec::new();
+    for m in messages.iter().rev() {
+        match m.role.as_str() {
+            "system" => continue,
+            "assistant" => {
+                let interrupted = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("interrupted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !interrupted {
+                    // Completed turn — the provider's checkpoint covers this
+                    // row and everything before it.
+                    break;
+                }
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("");
+                if !text.is_empty() {
+                    segments.push(TailSegment::Partial(text));
+                }
+            }
+            "user" => {
+                let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let text = crate::agent_session::text_block_strings(blocks).join("\n");
+                if text == RESUME_CONTINUATION_TEXT {
+                    // A previous resume's continuation row — re-sent fresh by
+                    // every resume, never replayed.
+                    continue;
+                }
+                let mut row_images: Vec<Value> = Vec::new();
+                let mut row_files: Vec<Value> = Vec::new();
+                for b in blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("image") => row_images.push(b.clone()),
+                        Some("file") => row_files.push(b.clone()),
+                        _ => {}
+                    }
+                }
+                if !row_images.is_empty() {
+                    image_rows.push(row_images);
+                }
+                if !row_files.is_empty() {
+                    file_rows.push(row_files);
+                }
+                if !text.is_empty() {
+                    segments.push(TailSegment::User(text));
+                }
+            }
+            // Any other tail shape (e.g. a bare `tool` row) is not the
+            // interrupted-turn pattern this recap understands — fail safe.
+            _ => return None,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    segments.reverse();
+    image_rows.reverse();
+    file_rows.reverse();
+    let image_blocks: Vec<Value> = image_rows.into_iter().flatten().collect();
+    let file_blocks: Vec<Value> = file_rows.into_iter().flatten().collect();
+    let elided = segments.len().saturating_sub(RESUME_RECAP_MAX_SEGMENTS);
+    if elided > 0 {
+        segments.drain(1..1 + elided);
+    }
+    let has_partial = segments
+        .iter()
+        .any(|s| matches!(s, TailSegment::Partial(_)));
+    let mut recap = String::from(
+        "<supervisor>\nRestart recovery: the harness restarted while you were \
+         responding, and your restored session may predate the exchange below \
+         — it is repeated here (parts of it may or may not already be in your \
+         context).\n\n",
+    );
+    if elided > 0 {
+        recap.push_str(&format!(
+            "({elided} older interrupted segment(s) elided.)\n\n"
+        ));
+    }
+    for segment in &segments {
+        let (label, tag, text) = match segment {
+            TailSegment::User(text) => (
+                "The user's message, delivered before the interruption:",
+                "interrupted_user_message",
+                text,
+            ),
+            TailSegment::Partial(text) => (
+                "Your partial response before the cut-off (it did NOT \
+                 complete; anything after this point was lost):",
+                "interrupted_partial_response",
+                text,
+            ),
+        };
+        recap.push_str(&format!(
+            "{label}\n<{tag}>\n{}\n</{tag}>\n\n",
+            crate::history_xml::escape_xml(&crate::history_xml::truncate_middle_content(
+                text,
+                RESUME_RECAP_SEGMENT_MAX_CHARS,
+            )),
+        ));
+    }
+    if !has_partial {
+        recap.push_str(
+            "Your response was cut off before any output was produced — \
+             treat that request as not yet acted on.\n",
+        );
+    }
+    recap.push_str("</supervisor>");
+    Some(ResumeTailRecap {
+        text: recap,
+        image_blocks: (!image_blocks.is_empty()).then(|| Value::Array(image_blocks)),
+        file_blocks: (!file_blocks.is_empty()).then(|| Value::Array(file_blocks)),
+    })
+}
+
 impl Services {
     /// Wake-triggered auto-resume sweep (sleep-resume Task D): on a host wake the
     /// daemon's resume orchestrator calls this to resume every turn Task C
@@ -10343,30 +10531,80 @@ impl Services {
         }
 
         // Deliver continuation message
-        let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
+        let continuation = RESUME_CONTINUATION_TEXT;
 
-        // Use the agent_send_message machinery to deliver the message
-        // (lazily respawns provider and resumes via ACP session/load).
+        // Mid-turn tail recap (monorepo#2539): a `session/load` resume replays
+        // the PROVIDER's session checkpoint, which contains only completed
+        // turns — the interrupted `session/prompt` never resolved
+        // provider-side, so the interrupting user message and the partial
+        // assistant output (both durable in the daemon transcript; the UI
+        // renders them) would silently vanish from the model-visible context
+        // and the agent would resume from a stale point. Rebuild that tail
+        // from the transcript and deliver it prompt-only
+        // (`TurnOptions::prepend_content`, attachments via the prepend block
+        // fields) ahead of the continuation. `build_turn_prompt` drops the
+        // prepend TEXT when the session is recreated instead of resumed
+        // (`history_covers_prepend`: the `<supervisor>` history replay
+        // already carries the whole transcript) while the prepend
+        // ATTACHMENTS still ride (the history XML is text-only), so the tail
+        // reaches the agent exactly once on either branch. The recap is
+        // built from the pre-marker `session` snapshot, so the just-appended
+        // interruption marker never leaks into it.
+        let recap = build_resume_tail_recap(&session.messages);
+
+        // Use the send-message machinery to deliver the continuation (lazily
+        // respawns the provider and resumes via ACP `session/load`).
         // Automatic origin: a resume continuation must not bury a Q&A the
         // agent had pending when the harness shut down (question hold — the
-        // marker is persisted, so the hold survives the restart).
-        if let Err(e) = self
-            .agent_send_message(
-                workspace_id.clone(),
-                agent_id.clone(),
-                continuation.to_string(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                intent_core::MessageOrigin::Automatic,
-            )
-            .await
-        {
+        // marker is persisted, so the hold survives the restart). The manager
+        // path is called directly so the recap can ride
+        // `TurnOptions::prepend_content`; the store-only fallback (no manager
+        // attached) keeps the plain trait call — it drives no outbound
+        // prompt, so there is no context to repair.
+        let send_result = match self.agent_manager() {
+            Some(manager) => {
+                let options = match recap {
+                    Some(recap) => crate::agent_manager::TurnOptions {
+                        prepend_content: Some(recap.text),
+                        prepend_image_blocks: recap.image_blocks,
+                        prepend_file_blocks: recap.file_blocks,
+                        origin: intent_core::MessageOrigin::Automatic,
+                        ..crate::agent_manager::TurnOptions::default()
+                    },
+                    None => crate::agent_manager::TurnOptions {
+                        origin: intent_core::MessageOrigin::Automatic,
+                        ..crate::agent_manager::TurnOptions::default()
+                    },
+                };
+                manager
+                    .send_message(
+                        agent_id.clone(),
+                        workspace_id.clone(),
+                        continuation.to_string(),
+                        None,
+                        options,
+                    )
+                    .await
+            }
+            None => {
+                self.agent_send_message(
+                    workspace_id.clone(),
+                    agent_id.clone(),
+                    continuation.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    intent_core::MessageOrigin::Automatic,
+                )
+                .await
+            }
+        };
+        if let Err(e) = send_result {
             reset_to_pending().await;
             return Err(e);
         }
