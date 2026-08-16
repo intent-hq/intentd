@@ -25608,6 +25608,56 @@ mod last_activity_events {
         assert_eq!(ev["type"], expected_type);
     }
 
+    /// Bounded poll for the debounced derivation to persist a `lastActivity`
+    /// on the harness workspace. A fixed sleep races the debounce timer,
+    /// which routinely fires well past its nominal window on loaded runners
+    /// (monorepo#2585).
+    async fn wait_for_persisted_last_activity(h: &Harness) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(persisted) = h
+                .store
+                .get_workspace(&h.ws)
+                .await
+                .expect("reload")
+                .last_activity
+            {
+                return persisted;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounce persisted a lastActivity (within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Bounded poll for the harness workspace's debounce task to finish (it
+    /// removes itself from the debouncers map on completion). Unlike
+    /// `wait_for_persisted_last_activity`, this also covers derivations that
+    /// are expected to be no-ops — nothing is persisted or emitted to observe
+    /// — so an assertion that follows genuinely runs after the derivation
+    /// instead of racing it behind a fixed sleep (monorepo#2585).
+    async fn wait_for_debounce_settled(h: &Harness) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = h
+                .services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !pending {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounce task settled (within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// After `raise_attention` (which bumps workspace.updated_at), a
     /// `workspace:updated { lastActivity }` event is emitted (after debounce).
     #[tokio::test]
@@ -25778,8 +25828,10 @@ mod last_activity_events {
             .await
             .expect("raise");
 
-        // Wait for the debounce window to fire and derive.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait for the debounce window to fire and derive (bounded poll: the
+        // timer fires late under CI load, monorepo#2585). The store column
+        // itself carries the derived value (survives restart).
+        let persisted = wait_for_persisted_last_activity(&h).await;
 
         let expected = h
             .store
@@ -25788,16 +25840,9 @@ mod last_activity_events {
             .expect("reload")
             .updated_at;
 
-        // The store column itself carries the derived value (survives restart).
-        let persisted = h
-            .store
-            .get_workspace(&h.ws)
-            .await
-            .expect("reload")
-            .last_activity;
         assert_eq!(
-            persisted.as_deref(),
-            Some(expected.as_str()),
+            persisted.as_str(),
+            expected.as_str(),
             "derived lastActivity must be persisted to the workspace column"
         );
 
@@ -25827,19 +25872,13 @@ mod last_activity_events {
         let h = harness().await;
 
         // Let the debounce derive and persist first, so the guard below runs
-        // against a column the services layer actually wrote.
+        // against a column the services layer actually wrote (bounded poll:
+        // a fixed sleep races the debounce timer under CI load, monorepo#2585).
         h.services
             .raise_attention(&h.ws, WorkspaceAttention::Unread)
             .await
             .expect("raise");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let persisted = h
-            .store
-            .get_workspace(&h.ws)
-            .await
-            .expect("reload")
-            .last_activity
-            .expect("debounce persisted a lastActivity");
+        let persisted = wait_for_persisted_last_activity(&h).await;
 
         // Store guard: a stale write is declined and the column holds.
         assert!(!h
@@ -25874,7 +25913,10 @@ mod last_activity_events {
             .raise_attention(&h.ws, WorkspaceAttention::ReviewRequired)
             .await
             .expect("raise again");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The no-op derivation persists and emits nothing, so wait for the
+        // debounce task itself to settle — a fixed sleep would leave this
+        // assertion vacuous whenever the timer fires late (monorepo#2585).
+        wait_for_debounce_settled(&h).await;
         assert_eq!(
             h.store
                 .get_workspace(&h.ws)
