@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.4] - 2026-08-16
+
+### 🐛 Bug Fixes
+
+- *(agent)* Disclose reportToParent watch disarm and repair watch re-arm on interim-idle children ([#1250](https://github.com/intent-hq/intentd/pull/1250))
+- *(agent)* Replay interrupted-turn tail on session/load resume ([#1249](https://github.com/intent-hq/intentd/pull/1249))
+
+### 🧪 Testing
+
+- Pin v1 golden fixtures for system-message surfaces ([#1251](https://github.com/intent-hq/intentd/pull/1251))
+
+
 ## [0.7.3] - 2026-08-15
 
 ### 🐛 Bug Fixes
