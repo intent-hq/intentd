@@ -13281,6 +13281,18 @@ impl WorkspaceApi for Services {
                                     })
                                     .await?;
                                 ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                                // The repository folder IS the checkout:
+                                // persist it as `worktreePath` (standalone-row
+                                // parity with cache hydration) so agent spawn
+                                // cwd resolution and the workspace file
+                                // watcher see the checkout
+                                // (intent-hq/monorepo#2611). The delete
+                                // cleanup never trashes it — its standalone
+                                // arm is gated on the daemon-owned
+                                // `<parent>/<wsId>/<slug>` layout, which a
+                                // user-chosen folder never matches.
+                                ws.worktree_path =
+                                    Some(repo_dir.to_string_lossy().into_owned());
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
@@ -14647,67 +14659,92 @@ impl WorkspaceApi for Services {
                                     Some(intent_core::CheckoutMode::Cow)
                                         | Some(intent_core::CheckoutMode::Direct)
                                 );
-                                // Under the per-repo lock: git-metadata work
-                                // only (registration prune, rename of the
-                                // checkout to a trash path, branch-delete
-                                // guard; for CoW just the rename + metadata
-                                // dir removal). On the rename-success path
-                                // the multi-GB recursive removal runs below,
-                                // after the lock is released, so concurrent
-                                // `workspace.create` provisioning on the same
-                                // repo is not starved by bulk deletes; only
-                                // the rare rename-failure fallback removes
-                                // in place under the lock.
-                                let trash = worktree_locks_bg
-                                    .with_lock(&repo_dir, move || async move {
-                                        let task = tokio::task::spawn_blocking(move || {
-                                            if is_standalone {
-                                                cleanup_workspace_cow_checkout_locked(&wt_locked)
-                                            } else {
-                                                cleanup_workspace_worktree_locked(
-                                                    &repo,
-                                                    &wt_locked,
-                                                    &branch,
-                                                    branch_flag,
-                                                )
+                                // Standalone-checkout removal is gated on the
+                                // daemon-owned `<parent>/<wsId>/<slug>` layout
+                                // (parent dir named after the workspace id —
+                                // the `workspace_dir_candidates` invariant).
+                                // An `isNewRepo` direct row's checkout IS the
+                                // user's repository folder
+                                // (`worktree_path == repository_path`,
+                                // intent-hq/monorepo#2611): never provisioned
+                                // by the daemon, never deleted with the
+                                // workspace.
+                                let standalone_owned = wt_locked
+                                    .parent()
+                                    .and_then(Path::file_name)
+                                    .map(|n| n == std::ffi::OsStr::new(ws_cleanup.id.as_str()))
+                                    .unwrap_or(false);
+                                if is_standalone && !standalone_owned {
+                                    tracing::debug!(
+                                        workspace = %ws_cleanup.id.as_str(),
+                                        checkout = %wt_locked.display(),
+                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
+                                    );
+                                } else {
+                                    // Under the per-repo lock: git-metadata work
+                                    // only (registration prune, rename of the
+                                    // checkout to a trash path, branch-delete
+                                    // guard; for CoW just the rename + metadata
+                                    // dir removal). On the rename-success path
+                                    // the multi-GB recursive removal runs below,
+                                    // after the lock is released, so concurrent
+                                    // `workspace.create` provisioning on the same
+                                    // repo is not starved by bulk deletes; only
+                                    // the rare rename-failure fallback removes
+                                    // in place under the lock.
+                                    let trash = worktree_locks_bg
+                                        .with_lock(&repo_dir, move || async move {
+                                            let task = tokio::task::spawn_blocking(move || {
+                                                if is_standalone {
+                                                    cleanup_workspace_cow_checkout_locked(
+                                                        &wt_locked,
+                                                    )
+                                                } else {
+                                                    cleanup_workspace_worktree_locked(
+                                                        &repo,
+                                                        &wt_locked,
+                                                        &branch,
+                                                        branch_flag,
+                                                    )
+                                                }
+                                            })
+                                            .await;
+                                            match task {
+                                                Ok(trash) => trash,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "background worktree cleanup task failed"
+                                                    );
+                                                    None
+                                                }
                                             }
                                         })
                                         .await;
-                                        match task {
-                                            Ok(trash) => trash,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "background worktree cleanup task failed"
-                                                );
-                                                None
-                                            }
+                                    if let Some(trash) = trash {
+                                        let removal = tokio::task::spawn_blocking(move || {
+                                            cleanup_detached_worktree(&trash)
+                                        })
+                                        .await;
+                                        if let Err(e) = removal {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "background detached-worktree removal task failed"
+                                            );
                                         }
-                                    })
-                                    .await;
-                                if let Some(trash) = trash {
-                                    let removal = tokio::task::spawn_blocking(move || {
-                                        cleanup_detached_worktree(&trash)
-                                    })
-                                    .await;
-                                    if let Err(e) = removal {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "background detached-worktree removal task failed"
-                                        );
-                                    }
-                                    // Retry the empty-only parent `remove_dir`
-                                    // the trash sibling blocked — back under
-                                    // the per-repo lock, so it can't race a
-                                    // same-slug recreate's freshly created
-                                    // parent between its `create_dir_all` and
-                                    // `git worktree add`. O(1) while held.
-                                    if let Some(parent) = wt.parent().map(Path::to_path_buf) {
-                                        worktree_locks_bg
-                                            .with_lock(&repo_dir, move || async move {
-                                                let _ = std::fs::remove_dir(&parent);
-                                            })
-                                            .await;
+                                        // Retry the empty-only parent `remove_dir`
+                                        // the trash sibling blocked — back under
+                                        // the per-repo lock, so it can't race a
+                                        // same-slug recreate's freshly created
+                                        // parent between its `create_dir_all` and
+                                        // `git worktree add`. O(1) while held.
+                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                            worktree_locks_bg
+                                                .with_lock(&repo_dir, move || async move {
+                                                    let _ = std::fs::remove_dir(&parent);
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }

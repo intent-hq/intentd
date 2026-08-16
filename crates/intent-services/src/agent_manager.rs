@@ -7503,6 +7503,12 @@ fn resolve_spawn(
     // catch-all rather than blocking the spawn.
     //
     // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
+    //
+    // Workspace chain (TS agent-factory parity): `path` → `worktree_path` →
+    // `repository_path`. The last covers direct-mode rows without a persisted
+    // checkout path (legacy `isNewRepo` rows, skip-worktree workspaces) so
+    // their agents spawn in the repository folder, never the temp dir
+    // (intent-hq/monorepo#2611).
     let cwd = session
         .sandbox_path
         .clone()
@@ -7510,7 +7516,12 @@ fn resolve_spawn(
         .filter(|p| p.is_dir())
         .or_else(|| {
             workspace
-                .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+                .and_then(|w| {
+                    w.path
+                        .clone()
+                        .or_else(|| w.worktree_path.clone())
+                        .or_else(|| w.repository_path.clone())
+                })
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
         })

@@ -19402,8 +19402,14 @@ mod worktree_provisioning {
             "workspace branch checked out directly in the repository folder"
         );
 
-        // Direct mode: standalone repo, no worktree provisioned.
-        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        // Direct mode: the repository folder IS the checkout — the row
+        // carries it as `worktree_path` so spawn cwd resolution and the file
+        // watcher see it (intent-hq/monorepo#2611).
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_dir.0.to_string_lossy().as_ref()),
+            "worktree_path carries the initialized repository folder"
+        );
         assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             ws.base_commit_sha.as_deref(),
@@ -19487,7 +19493,11 @@ mod worktree_provisioning {
             "init\n",
             "existing files must not be overwritten"
         );
-        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_dir.0.to_string_lossy().as_ref()),
+            "worktree_path carries the repository folder (the checkout)"
+        );
         assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             src.head().unwrap().shorthand().unwrap(),
@@ -19495,6 +19505,62 @@ mod worktree_provisioning {
             "workspace branch checked out in place"
         );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// Delete safety for `isNewRepo` direct workspaces
+    /// (intent-hq/monorepo#2611): the row carries
+    /// `worktree_path == repository_path`, but that directory is the USER'S
+    /// repository folder — not a daemon-provisioned checkout under the
+    /// workspaces root — so `workspace.delete` must remove only the row and
+    /// never the directory.
+    #[tokio::test]
+    async fn delete_is_new_repo_workspace_keeps_user_repository_dir() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-del-src");
+        let root = unique_dir("intentd-newrepo-del-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(repo_dir.0.join(".git").exists());
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+
+        // Fast-ack: the checkout cleanup runs in the background. Give it
+        // ample time to (wrongly) rename the directory to a trash sibling —
+        // the pre-guard failure mode — before asserting it survived.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        assert!(
+            repo_dir.0.join(".git").exists(),
+            "user repository folder must survive workspace.delete"
+        );
+        let repo_name = repo_dir
+            .0
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let trashed = std::fs::read_dir(repo_dir.0.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{repo_name}.deleting-"))
+            });
+        assert!(!trashed, "no trash rename of the user repository folder");
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
     }
 
     /// An `isNewRepo` create on an already-initialized repo honors a
