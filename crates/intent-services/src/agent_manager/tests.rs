@@ -10389,6 +10389,19 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         .expect("worktree_path still wins");
     assert_eq!(resolved.cwd, wt_dir);
 
+    // A stale (non-directory) `path` must not suppress a live candidate
+    // further down the chain — each entry is `is_dir()`-checked individually.
+    workspace.path = Some(
+        std::env::temp_dir()
+            .join(format!("intentd-stale-path-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+    );
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
+        .expect("stale path skipped, worktree_path resolves");
+    assert_eq!(resolved.cwd, wt_dir, "stale `path` never wins the chain");
+    workspace.path = None;
+
     // A missing repository_path directory falls through to the temp dir.
     workspace.worktree_path = None;
     workspace.repository_path = Some(

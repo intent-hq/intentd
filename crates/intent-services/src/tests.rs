@@ -19563,6 +19563,50 @@ mod worktree_provisioning {
         assert!(store.list_workspaces(true).await.expect("list").is_empty());
     }
 
+    /// The standalone-checkout ownership gate is root-anchored, not
+    /// basename-matched: a user repository living at
+    /// `<any-parent>/<workspaceId>/<repo>` OUTSIDE the daemon's workspace
+    /// roots (the id is derivable from the initial prompt, so this layout is
+    /// caller-reachable) must survive `workspace.delete` — both the
+    /// trash-rename of the checkout and the recursive
+    /// `workspace_dir_candidates` sweep of its parent directory.
+    #[tokio::test]
+    async fn delete_direct_workspace_outside_roots_keeps_spoofed_id_layout() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-spoof-del-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        // `<any-parent>/<wsId>/<repo>` outside the workspaces root.
+        let ws_id = WorkspaceId::new();
+        let outer = unique_dir("intentd-spoof-del-parent");
+        let repo_dir = outer.0.join(ws_id.as_str()).join("myrepo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        git2::Repository::init(&repo_dir).unwrap();
+
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(repo_dir.to_string_lossy().to_string());
+        ws.worktree_path = Some(repo_dir.to_string_lossy().to_string());
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+        store.insert_workspace(&ws).await.expect("insert ws");
+
+        svc.delete_workspace(ws_id.clone()).await.expect("delete");
+
+        // Fast-ack: give the background cleanup ample time to (wrongly)
+        // trash-rename the checkout or sweep `<parent>/<wsId>/` before
+        // asserting both survived.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        assert!(
+            repo_dir.join(".git").exists(),
+            "repository under a spoofed <parent>/<wsId>/<repo> layout must survive"
+        );
+        assert!(
+            repo_dir.parent().unwrap().exists(),
+            "the <parent>/<wsId>/ directory must not be swept outside daemon roots"
+        );
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+    }
+
     /// An `isNewRepo` create on an already-initialized repo honors a
     /// caller-supplied non-HEAD `baseRef`: the in-place workspace branch (and
     /// `baseCommitSha`) start at the requested base, not at HEAD.

@@ -14622,6 +14622,51 @@ impl WorkspaceApi for Services {
                 let deleted_worktree_path = ws_for_cleanup
                     .as_ref()
                     .and_then(|w| w.worktree_path.clone());
+                // Root-anchored ownership: the persisted checkout counts as
+                // daemon-provisioned only when its parent directory is named
+                // after the workspace id AND it lives under a root the daemon
+                // provisions into (the boot workspaces root or the currently
+                // configured `workspace.worktreesLocation`). The parent
+                // basename alone is spoofable — the workspace id derives from
+                // the initial prompt, so an `isNewRepo` caller could place
+                // their repository at `<anywhere>/<wsId>/<repo>` and a
+                // basename-only gate would route the user's folder into the
+                // delete paths below. Trade-off: a checkout provisioned under
+                // a since-changed custom location is no longer matched and its
+                // `<oldLocation>/<wsId>/` directory leaks instead of being
+                // swept — leaking is the safe direction (never delete what we
+                // cannot prove we created).
+                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
+                    let wt = Path::new(wt);
+                    let parent_is_ws_id = wt
+                        .parent()
+                        .and_then(Path::file_name)
+                        .map(|n| n == std::ffi::OsStr::new(id_bg.as_str()))
+                        .unwrap_or(false);
+                    parent_is_ws_id
+                        && (wt.starts_with(&workspaces_root_bg)
+                            || worktrees_location_bg
+                                .as_deref()
+                                .is_some_and(|loc| wt.starts_with(loc)))
+                });
+                // A standalone row's checkout path is caller-influenced
+                // (`repository_path == worktree_path`), so unless ownership is
+                // proven above it must not seed the final
+                // `workspace_dir_candidates` sweep either — that sweep
+                // recursively removes the checkout's parent directory.
+                // Worktree-mode rows keep their persisted path: the daemon
+                // derived it at provision time (covers a since-changed custom
+                // location).
+                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
+                    matches!(
+                        w.checkout_mode,
+                        Some(intent_core::CheckoutMode::Cow)
+                            | Some(intent_core::CheckoutMode::Direct)
+                    )
+                });
+                let sweep_worktree_path = deleted_worktree_path
+                    .as_deref()
+                    .filter(|_| !is_standalone_row || checkout_owned);
                 if let Some(ws_cleanup) = ws_for_cleanup {
                     // Only run the worktree cleanup if the workspace is still
                     // deleted (no recreate) or the recreate has a different
@@ -14660,21 +14705,15 @@ impl WorkspaceApi for Services {
                                         | Some(intent_core::CheckoutMode::Direct)
                                 );
                                 // Standalone-checkout removal is gated on the
-                                // daemon-owned `<parent>/<wsId>/<slug>` layout
-                                // (parent dir named after the workspace id —
-                                // the `workspace_dir_candidates` invariant).
-                                // An `isNewRepo` direct row's checkout IS the
-                                // user's repository folder
+                                // root-anchored `checkout_owned` proof above
+                                // (`<root>/<wsId>/<slug>` under a daemon
+                                // root). An `isNewRepo` direct row's checkout
+                                // IS the user's repository folder
                                 // (`worktree_path == repository_path`,
                                 // intent-hq/monorepo#2611): never provisioned
                                 // by the daemon, never deleted with the
                                 // workspace.
-                                let standalone_owned = wt_locked
-                                    .parent()
-                                    .and_then(Path::file_name)
-                                    .map(|n| n == std::ffi::OsStr::new(ws_cleanup.id.as_str()))
-                                    .unwrap_or(false);
-                                if is_standalone && !standalone_owned {
+                                if is_standalone && !checkout_owned {
                                     tracing::debug!(
                                         workspace = %ws_cleanup.id.as_str(),
                                         checkout = %wt_locked.display(),
@@ -14778,7 +14817,7 @@ impl WorkspaceApi for Services {
                     .map(Path::to_path_buf);
                 for dir in workspace_dir_candidates(
                     &id_bg,
-                    deleted_worktree_path.as_deref(),
+                    sweep_worktree_path,
                     &workspaces_root_bg,
                     worktrees_location_bg.as_deref(),
                 ) {

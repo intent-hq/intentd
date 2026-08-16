@@ -7505,25 +7505,29 @@ fn resolve_spawn(
     // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
     //
     // Workspace chain (TS agent-factory parity): `path` → `worktree_path` →
-    // `repository_path`. The last covers direct-mode rows without a persisted
-    // checkout path (legacy `isNewRepo` rows, skip-worktree workspaces) so
-    // their agents spawn in the repository folder, never the temp dir
-    // (intent-hq/monorepo#2611).
+    // `repository_path`. Each candidate is `is_dir()`-checked individually so
+    // a stale entry (e.g. an obsolete `path` on a legacy row) never suppresses
+    // a live checkout further down the chain. The last covers direct-mode rows
+    // without a persisted checkout path (legacy `isNewRepo` rows,
+    // skip-worktree workspaces) so their agents spawn in the repository
+    // folder, never the temp dir (intent-hq/monorepo#2611).
     let cwd = session
         .sandbox_path
         .clone()
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .or_else(|| {
-            workspace
-                .and_then(|w| {
-                    w.path
-                        .clone()
-                        .or_else(|| w.worktree_path.clone())
-                        .or_else(|| w.repository_path.clone())
-                })
+            workspace.and_then(|w| {
+                [
+                    w.path.as_deref(),
+                    w.worktree_path.as_deref(),
+                    w.repository_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
                 .map(PathBuf::from)
-                .filter(|p| p.is_dir())
+                .find(|p| p.is_dir())
+            })
         })
         .or_else(|| {
             workspace
