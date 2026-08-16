@@ -1932,6 +1932,24 @@ impl Services {
         serde_json::to_value(&self.effective_settings().agent_features).ok()
     }
 
+    /// The `agentFeatures` values governing `session`'s runtime surface: the
+    /// snapshot captured at creation (`harness_features`, monorepo#2459) when
+    /// present and decodable, else the live effective settings (legacy
+    /// pre-0096 rows, or a snapshot written by a newer daemon this build
+    /// cannot decode). Respawns read this instead of the live settings so a
+    /// settings change never alters an existing session's tools/prompt —
+    /// matching what `harnessFeatures` reports on the wire.
+    pub(crate) fn session_agent_features(
+        &self,
+        session: &AgentSession,
+    ) -> intent_core::settings_file::AgentFeaturesSettings {
+        session
+            .harness_features
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| self.effective_settings().agent_features)
+    }
+
     /// Shared runtime-flag overlay behind the two `project_lite_with_flags*`
     /// entry points: compute the flags from the session, project it via
     /// `project`, then overlay.

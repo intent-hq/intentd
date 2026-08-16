@@ -29302,4 +29302,54 @@ mod harness_versioning {
                 .expect("raw read");
         assert_eq!(raw, None, "projection never writes the snapshot back");
     }
+
+    /// The runtime surface follows the persisted snapshot, not live settings:
+    /// `session_agent_features` (the respawn read used for the MCP bridge and
+    /// prompt assembly) decodes `harness_features` when present — so a
+    /// settings change after creation never alters an existing session's
+    /// tools — and falls back to the live effective settings only for legacy
+    /// NULL-snapshot rows.
+    #[tokio::test]
+    async fn respawn_features_follow_persisted_snapshot_not_live_settings() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+        // Pin the persisted snapshot to a non-default shape (hostExec off —
+        // live default is on).
+        let mut pinned =
+            serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
+                .unwrap();
+        pinned["hostExec"] = serde_json::json!(false);
+        sqlx::query("UPDATE agent_session SET harness_features = ? WHERE id = ?")
+            .bind(pinned.to_string())
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("pin snapshot");
+
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let features = svc.session_agent_features(&session);
+        assert!(
+            !features.host_exec,
+            "respawn read follows the persisted snapshot (hostExec off), not live settings"
+        );
+        assert!(
+            svc.effective_settings().agent_features.host_exec,
+            "live settings still default hostExec on — the snapshot diverged deliberately"
+        );
+
+        // Legacy NULL-snapshot rows fall back to the live settings.
+        sqlx::query("UPDATE agent_session SET harness_features = NULL WHERE id = ?")
+            .bind(&id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("null out snapshot");
+        let legacy = svc.store().get_agent_session(&id).await.expect("get");
+        assert_eq!(
+            svc.session_agent_features(&legacy),
+            svc.effective_settings().agent_features,
+            "legacy rows fall back to live effective settings"
+        );
+    }
 }

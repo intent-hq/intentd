@@ -2183,6 +2183,13 @@ impl AgentManager {
         // flag (same snapshot semantics as the `[agentFeatures]` capture
         // below).
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+        // `[agentFeatures]` for this session: the snapshot stamped on the row
+        // at creation (`harness_features`, monorepo#2459), with a live-settings
+        // fallback for legacy pre-0096 rows. Used for both the MCP bridge and
+        // the prompt assembly below, so a respawn (model change, daemon
+        // restart) keeps the surface the session was created with — matching
+        // what `harnessFeatures` reports on the wire.
+        let agent_features = self.services.session_agent_features(&session);
 
         // Per-agent in-process MCP server over the SAME services surface the FE
         // uses, with the §18.4 denylist for this agent type applied, served over
@@ -2195,10 +2202,10 @@ impl AgentManager {
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
                 .with_turn_attachments(Some(self.services.turn_attachments()))
-                // `[agentFeatures]` toggles are captured here, at bridge
-                // creation, so they apply to new sessions only — a settings
-                // change never mutates a live agent's surface.
-                .with_agent_features(self.services.effective_settings().agent_features)
+                // The session's captured `[agentFeatures]` snapshot: settings
+                // changes after creation never mutate this session's surface,
+                // across respawns included.
+                .with_agent_features(agent_features.clone())
                 // Sub-agent bridges prune/deny `ws.app.question.*` (top-level
                 // agents only own a user-facing chat turn).
                 .with_sub_agent(is_sub_agent)
@@ -2289,13 +2296,13 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `rtk.enabled` and the `[agentFeatures]` toggles are global
-            // (non-workspace-scoped) settings, captured once here so the
-            // persisted prompt reflects the flags at session creation
-            // ("new sessions only"); auto-commit resolves per-workspace
-            // (persisted override → global `git.autoCommit` fallback, spec
-            // Diagnosis §3b) so the prompt reflects what the commit gate
-            // will actually enforce.
+            // `rtk.enabled` is a global (non-workspace-scoped) setting read
+            // live at spawn; the `[agentFeatures]` toggles come from the
+            // session's captured snapshot (`agent_features` above) so the
+            // prompt matches the surface stamped at session creation;
+            // auto-commit resolves per-workspace (persisted override → global
+            // `git.autoCommit` fallback, spec Diagnosis §3b) so the prompt
+            // reflects what the commit gate will actually enforce.
             let settings = self.services.effective_settings();
             let auto_commit_enabled = self.services.effective_auto_commit(&workspace_id).await;
             // Sub-agent gating: `is_sub_agent` (derived from the session read
@@ -2311,7 +2318,7 @@ impl AgentManager {
                 is_sub_agent,
                 auto_commit_enabled,
                 settings.rtk.enabled,
-                &settings.agent_features,
+                &agent_features,
                 workspace.as_ref(),
                 Some(&session),
             )
