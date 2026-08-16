@@ -1,31 +1,35 @@
 #!/usr/bin/env node
-// Minimal mock MCP stdio server for the `mcp.servers.*` UDS integration test
-// (PROTOCOL §5.22 / §18.3). Speaks newline-delimited JSON-RPC over stdio:
+// Minimal mock MCP server for the `mcp.servers.*` UDS integration tests
+// (PROTOCOL §5.22 / §18.3). Two modes:
+//
+// Default (stdio): newline-delimited JSON-RPC over stdio:
 //   - `initialize`               → capability/serverInfo result
 //   - `notifications/initialized`→ ignored (notification, no id)
 //   - `tools/list`               → two tools (so toolCount == 2)
 //   - `ping`                     → empty result (health check)
 // Any other request id gets an empty result. Notifications are never answered.
+//
+// `--http`: MCP streamable-HTTP transport on 127.0.0.1 (ephemeral port). Every
+// POSTed JSON-RPC request is answered with a plain JSON body via the same
+// dispatch; notifications get 202. The bound port is announced on stdout as
+// `PORT=<n>` so the harness can read it.
 
 import { createInterface } from 'node:readline';
+import { createServer } from 'node:http';
 
 const TOOLS = [
   { name: 'echo', description: 'Echo back input', inputSchema: { type: 'object' } },
   { name: 'reverse', description: 'Reverse a string', inputSchema: { type: 'object' } },
 ];
 
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + '\n');
-}
-
-function handle(msg) {
-  // Notifications (no id) are never answered.
+// The JSON-RPC response for a request `msg`, or null for notifications.
+function respond(msg) {
   if (msg.id === undefined || msg.id === null) {
-    return;
+    return null;
   }
   switch (msg.method) {
     case 'initialize':
-      send({
+      return {
         jsonrpc: '2.0',
         id: msg.id,
         result: {
@@ -33,31 +37,69 @@ function handle(msg) {
           capabilities: { tools: {} },
           serverInfo: { name: 'mock-mcp-server', version: '0.0.0' },
         },
-      });
-      break;
+      };
     case 'tools/list':
-      send({ jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } });
-      break;
+      return { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } };
     case 'ping':
-      send({ jsonrpc: '2.0', id: msg.id, result: {} });
-      break;
+      return { jsonrpc: '2.0', id: msg.id, result: {} };
     default:
-      send({ jsonrpc: '2.0', id: msg.id, result: {} });
-      break;
+      return { jsonrpc: '2.0', id: msg.id, result: {} };
   }
 }
 
-const rl = createInterface({ input: process.stdin });
-rl.on('line', (line) => {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return;
-  }
-  let msg;
-  try {
-    msg = JSON.parse(trimmed);
-  } catch {
-    return;
-  }
-  handle(msg);
-});
+function runStdio() {
+  const rl = createInterface({ input: process.stdin });
+  rl.on('line', (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    const reply = respond(msg);
+    if (reply) {
+      process.stdout.write(JSON.stringify(reply) + '\n');
+    }
+  });
+}
+
+function runHttp() {
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => {
+      let msg;
+      try {
+        msg = JSON.parse(body);
+      } catch {
+        res.writeHead(400).end();
+        return;
+      }
+      const reply = respond(msg);
+      if (!reply) {
+        res.writeHead(202).end();
+        return;
+      }
+      const payload = JSON.stringify(reply);
+      res
+        .writeHead(200, {
+          'content-type': 'application/json',
+          'mcp-session-id': 'mock-session',
+        })
+        .end(payload);
+    });
+  });
+  server.listen(0, '127.0.0.1', () => {
+    process.stdout.write(`PORT=${server.address().port}\n`);
+  });
+}
+
+if (process.argv.includes('--http')) {
+  runHttp();
+} else {
+  runStdio();
+}

@@ -2,7 +2,8 @@
 //! of **user-configured external** MCP servers (distinct from the §6.8 agent→BE
 //! callback). Config lives in the **sensitive** `mcp.servers` setting (`env`/
 //! `headers` redacted over the wire); the [`McpHub`] spawns/stops/restarts
-//! **stdio** servers and a health monitor pings them, pushing
+//! **stdio** servers, probes remote **http**/**sse** endpoints from the daemon
+//! host, and a health monitor pings/re-probes them, pushing
 //! `mcp.servers:status-changed` (§10) on every transition. Runtime status is
 //! never persisted. Ports `mcp-hub.ts`/`server-manager.ts`/`health-monitor.ts`/
 //! `user-mcp-settings.ts`.
@@ -34,6 +35,9 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for a single health `ping`.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+/// `Accept` header required by MCP streamable HTTP (the server may answer a
+/// POST with either a plain JSON body or an SSE stream).
+const HTTP_ACCEPT: &str = "application/json, text/event-stream";
 /// Default health-check interval (parity: `HealthMonitor` 30s).
 const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 /// Consecutive ping failures before the monitor restarts a server (parity: 3).
@@ -223,13 +227,23 @@ async fn write_configs(secrets: &AsyncSecretStore, map: &Map<String, Value>) -> 
     secrets.store(SETTING_KEY, &raw).await
 }
 
-/// A live, spawned stdio MCP server: the child process, its JSON-RPC connection,
-/// the last published status, and the consecutive health-failure count.
+/// Transport-specific runtime half of a tracked server entry.
+enum ServerRuntime {
+    /// A spawned stdio child + its JSON-RPC stdio connection.
+    Stdio {
+        child: Child,
+        pid: Option<u32>,
+        conn: Arc<Connection>,
+    },
+    /// A remote (`http`/`sse`) endpoint probed over the network — no process.
+    Remote,
+}
+
+/// A tracked MCP server: its config, transport runtime, the last published
+/// status, and the consecutive health-failure count (stdio only).
 struct RunningServer {
     config: Value,
-    child: Child,
-    pid: Option<u32>,
-    conn: Arc<Connection>,
+    runtime: ServerRuntime,
     status: Value,
     failures: u32,
 }
@@ -330,9 +344,10 @@ impl McpHub {
         existed
     }
 
-    /// Start `config` (stdio only). Replaces any existing instance, performs the
-    /// MCP handshake, and emits `running` (or `error`). When `enable_user_servers`
-    /// is false the server is left `stopped`.
+    /// Start `config`. Replaces any existing instance and emits `running` (or
+    /// `error`): stdio configs spawn a child + MCP handshake, `http`/`sse`
+    /// configs are probed over the network from the daemon host. When
+    /// `enable_user_servers` is false the server is left `stopped`.
     pub async fn start(&self, config: Value, enable_user_servers: bool) -> Value {
         let id = config_id(&config);
         self.stop_inner(&id).await;
@@ -341,15 +356,25 @@ impl McpHub {
             self.publish_status(&st).await;
             return st;
         }
+        let transport = config
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("stdio")
+            .to_string();
+        if transport != "stdio" {
+            return self.start_remote(id, config).await;
+        }
         match spawn_stdio(&config).await {
             Ok((child, pid, conn, tool_count)) => {
                 let status =
                     status_value(&id, "running", pid, tool_count, None, Some(now_millis()));
                 let rs = RunningServer {
                     config,
-                    child,
-                    pid,
-                    conn: Arc::new(conn),
+                    runtime: ServerRuntime::Stdio {
+                        child,
+                        pid,
+                        conn: Arc::new(conn),
+                    },
                     status: status.clone(),
                     failures: 0,
                 };
@@ -365,6 +390,23 @@ impl McpHub {
         }
     }
 
+    /// Probe a remote (`http`/`sse`) config and register the outcome. Unlike a
+    /// failed stdio spawn, a failed probe keeps the entry tracked (state
+    /// `error`) so the health sweep re-probes it — there is no process to
+    /// restart, only status to flip.
+    async fn start_remote(&self, id: String, config: Value) -> Value {
+        let status = remote_probe_status(&id, &config).await;
+        let rs = RunningServer {
+            config,
+            runtime: ServerRuntime::Remote,
+            status: status.clone(),
+            failures: 0,
+        };
+        self.inner.servers.lock().unwrap().insert(id, rs);
+        self.publish_status(&status).await;
+        status
+    }
+
     /// Restart `config`: stop-then-start (emits `stopped` then `running`/`error`).
     pub async fn restart(&self, config: Value, enable_user_servers: bool) -> Value {
         let id = config_id(&config);
@@ -372,18 +414,37 @@ impl McpHub {
         self.start(config, enable_user_servers).await
     }
 
-    /// One health sweep: ping every running server, reset the failure count on
-    /// success, and restart a server that has exceeded [`MAX_FAILURES`].
+    /// One health sweep. stdio servers are pinged over their connection and
+    /// restarted after [`MAX_FAILURES`] consecutive failures. Remote
+    /// (`http`/`sse`) servers are re-probed from the daemon host and their
+    /// status flipped on transition — never restarted (no process to manage).
     async fn health_tick(&self) {
-        let targets: Vec<(String, Arc<Connection>)> = self
+        enum Probe {
+            Stdio(Arc<Connection>),
+            Remote(Value),
+        }
+        let targets: Vec<(String, Probe)> = self
             .inner
             .servers
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, rs)| (id.clone(), rs.conn.clone()))
+            .map(|(id, rs)| {
+                let probe = match &rs.runtime {
+                    ServerRuntime::Stdio { conn, .. } => Probe::Stdio(conn.clone()),
+                    ServerRuntime::Remote => Probe::Remote(rs.config.clone()),
+                };
+                (id.clone(), probe)
+            })
             .collect();
-        for (id, conn) in targets {
+        for (id, probe) in targets {
+            let conn = match probe {
+                Probe::Remote(config) => {
+                    self.reprobe_remote(&id, &config).await;
+                    continue;
+                }
+                Probe::Stdio(conn) => conn,
+            };
             if ping(&conn).await {
                 if let Some(rs) = self.inner.servers.lock().unwrap().get_mut(&id) {
                     rs.failures = 0;
@@ -404,6 +465,34 @@ impl McpHub {
                 tracing::warn!(server = %id, "mcp server unhealthy; restarting");
                 self.restart(config, true).await;
             }
+        }
+    }
+
+    /// Re-probe a remote server and store the fresh status, emitting
+    /// `mcp.servers:status-changed` on a state transition. `startedAt` is
+    /// preserved across consecutive `running` probes.
+    async fn reprobe_remote(&self, id: &str, config: &Value) {
+        let mut next = remote_probe_status(id, config).await;
+        let changed = {
+            let mut map = self.inner.servers.lock().unwrap();
+            // The entry may have been stopped or replaced while the probe ran.
+            let Some(rs) = map.get_mut(id) else { return };
+            if !matches!(rs.runtime, ServerRuntime::Remote) || rs.config != *config {
+                return;
+            }
+            let changed = rs.status.get("state") != next.get("state");
+            if !changed {
+                if let (Some(prev), Some(obj)) =
+                    (rs.status.get("startedAt").cloned(), next.as_object_mut())
+                {
+                    obj.insert("startedAt".into(), prev);
+                }
+            }
+            rs.status = next.clone();
+            changed
+        };
+        if changed {
+            self.publish_status(&next).await;
         }
     }
 
@@ -532,21 +621,243 @@ async fn ping(conn: &Connection) -> bool {
         .is_ok()
 }
 
-/// Terminate a server's whole process group (SIGTERM → grace → SIGKILL), then
-/// let the [`Connection`] drop to abort its reader/writer tasks. Descendants
-/// that escaped into their OWN process groups survive the group kill, so they
-/// are snapshotted before signalling and swept afterwards
-/// (`intent_acp::descendant_sweep`).
+/// Probe `config` and shape the outcome as a wire `McpServerStatus` (§5.22).
+async fn remote_probe_status(id: &str, config: &Value) -> Value {
+    match probe_remote(config).await {
+        Ok(tool_count) => status_value(id, "running", None, tool_count, None, Some(now_millis())),
+        Err(e) => status_error(id, &e.to_string()),
+    }
+}
+
+/// Probe a remote MCP endpoint from the daemon host. `http` runs the full MCP
+/// handshake (`initialize` → `notifications/initialized` → `tools/list`) over
+/// streamable HTTP POST; `sse` is a reachability probe only (full SSE sessions
+/// are out of scope). `Ok` carries the advertised tool count (http only).
+async fn probe_remote(config: &Value) -> Result<Option<u64>> {
+    let transport = config
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("stdio");
+    let url = config
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::InvalidParams(format!("{transport} server requires a url")))?;
+    let client = reqwest::Client::builder()
+        .timeout(HANDSHAKE_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
+    let headers = config_headers(config);
+    match transport {
+        "sse" => probe_sse(&client, url, &headers).await.map(|()| None),
+        _ => probe_http_handshake(&client, url, &headers).await,
+    }
+}
+
+/// The configured request headers of a remote config (`headers` object;
+/// non-string values are serialized, mirroring the stdio `env` handling).
+fn config_headers(config: &Value) -> Vec<(String, String)> {
+    config
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), val)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reachability probe for an `sse` endpoint: a GET with
+/// `Accept: text/event-stream` must answer 2xx. The stream body is never read.
+async fn probe_sse(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<()> {
+    let mut req = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/event-stream");
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.send().await.map_err(|e| classify_send_error(e, url))?;
+    check_http_status(resp.status())
+}
+
+/// MCP handshake over streamable HTTP POST, mirroring the stdio handshake:
+/// `initialize` (required) → `notifications/initialized` (best-effort) →
+/// `tools/list` (best-effort tool count). The `Mcp-Session-Id` issued by
+/// `initialize` is echoed on follow-ups per the streamable-HTTP transport.
+async fn probe_http_handshake(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<Option<u64>> {
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "intentd", "version": env!("CARGO_PKG_VERSION") },
+        },
+    });
+    let resp = post_rpc(client, url, headers, None, &init).await?;
+    check_http_status(resp.status())?;
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let envelope = read_rpc_response(resp, 1).await?;
+    if let Some(err) = envelope.get("error") {
+        return Err(Error::Internal(format!("mcp initialize failed: {err}")));
+    }
+    // Notification (servers typically answer 202); failures are non-fatal.
+    let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    let _ = post_rpc(client, url, headers, session.as_deref(), &inited).await;
+    let tools = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} });
+    let tool_count = match post_rpc(client, url, headers, session.as_deref(), &tools).await {
+        Ok(resp) if resp.status().is_success() => {
+            read_rpc_response(resp, 2).await.ok().and_then(|v| {
+                v.get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+            })
+        }
+        _ => None,
+    };
+    Ok(tool_count)
+}
+
+/// POST one JSON-RPC message to a streamable-HTTP endpoint with the configured
+/// headers (plus the session id when the server issued one).
+async fn post_rpc(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+    session: Option<&str>,
+    body: &Value,
+) -> Result<reqwest::Response> {
+    let mut req = client
+        .post(url)
+        .header(reqwest::header::ACCEPT, HTTP_ACCEPT)
+        .json(body);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(sid) = session {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    req.send().await.map_err(|e| classify_send_error(e, url))
+}
+
+/// Read a JSON-RPC response envelope from a streamable-HTTP reply: a JSON body
+/// directly, or the SSE frame carrying the response with `id`. The per-request
+/// SSE stream closes once the response is delivered, and the read is bounded
+/// by the client-wide [`HANDSHAKE_TIMEOUT`] either way.
+async fn read_rpc_response(mut resp: reqwest::Response, id: u64) -> Result<Value> {
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !ct.starts_with("text/event-stream") {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Internal(format!("read response failed: {e}")))?;
+        return serde_json::from_str(&text)
+            .map_err(|e| Error::Internal(format!("invalid JSON-RPC response: {e}")));
+    }
+    let mut buf = String::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                if let Some(v) = sse_response_for_id(&buf, id) {
+                    return Ok(v);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(Error::Internal(format!("read response failed: {e}"))),
+        }
+    }
+    sse_response_for_id(&buf, id)
+        .ok_or_else(|| Error::Internal("no JSON-RPC response in SSE stream".to_string()))
+}
+
+/// Find the JSON-RPC envelope with `id` among the `data:` lines of an SSE
+/// buffer (a response fits one data line in practice).
+fn sse_response_for_id(buf: &str, id: u64) -> Option<Value> {
+    for line in buf.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if v.get("id").and_then(Value::as_u64) == Some(id) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Map a transport-level reqwest failure onto a user-facing `lastError`.
+fn classify_send_error(e: reqwest::Error, url: &str) -> Error {
+    if e.is_timeout() {
+        Error::Internal(format!("timed out connecting to {url}"))
+    } else if e.is_connect() {
+        Error::Internal(format!("unreachable from daemon host: {url}"))
+    } else {
+        Error::Internal(format!("request to {url} failed: {e}"))
+    }
+}
+
+/// Map a non-success HTTP status onto a user-facing `lastError`.
+fn check_http_status(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    let code = status.as_u16();
+    Err(match code {
+        401 | 403 => Error::Internal(format!(
+            "authentication failed (HTTP {code}) — check configured headers"
+        )),
+        500..=599 => Error::Internal(format!("server error (HTTP {code})")),
+        _ => Error::Internal(format!("unexpected HTTP {code} from server")),
+    })
+}
+
+/// Terminate a stdio server's whole process group (SIGTERM → grace → SIGKILL),
+/// then let the [`Connection`] drop to abort its reader/writer tasks.
+/// Descendants that escaped into their OWN process groups survive the group
+/// kill, so they are snapshotted before signalling and swept afterwards
+/// (`intent_acp::descendant_sweep`). Remote entries have no process — no-op.
 async fn reap(rs: &mut RunningServer) {
+    let ServerRuntime::Stdio { child, pid, .. } = &mut rs.runtime else {
+        return;
+    };
     #[cfg(unix)]
     {
-        if let Some(pid) = rs.pid {
+        if let Some(pid) = *pid {
             let descendants = intent_acp::descendant_pids(pid).await;
             let _ = kill_group(pid, nix::sys::signal::Signal::SIGTERM);
             let mut exited = false;
             let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
             for _ in 0..iters {
-                if matches!(rs.child.try_wait(), Ok(Some(_))) {
+                if matches!(child.try_wait(), Ok(Some(_))) {
                     exited = true;
                     break;
                 }
@@ -557,12 +868,13 @@ async fn reap(rs: &mut RunningServer) {
             }
             intent_acp::sweep_escaped_descendants(&descendants).await;
         } else {
-            let _ = rs.child.kill().await;
+            let _ = child.kill().await;
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = rs.child.kill().await;
+        let _ = pid;
+        let _ = child.kill().await;
     }
 }
 
@@ -1111,15 +1423,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_start_non_stdio_transport_returns_error_status() {
+    async fn hub_start_non_stdio_transport_probes_and_stays_tracked_on_error() {
+        // Non-stdio configs are probed, not rejected. A failed probe keeps the
+        // entry tracked in `error` (the sweep re-probes it) — unlike a failed
+        // stdio spawn, which drops the entry back to `stopped`.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
         let h = McpHub::new();
-        let cfg = json!({ "id": "h", "transport": "http", "url": "https://x" });
+        let cfg = json!({ "id": "h", "transport": "http", "url": url });
         let status = h.start(cfg, true).await;
         assert_eq!(status["state"], json!("error"));
-        assert!(status["lastError"]
-            .as_str()
-            .unwrap()
-            .contains("not supported"));
+        assert_eq!(h.status("h")["state"], json!("error"));
     }
 
     #[tokio::test]
@@ -1598,5 +1914,221 @@ mod tests {
         svc(None, &secrets, &h).start_enabled().await;
         // Spawn failed → no live entry → status stays stopped.
         assert_eq!(h.status("go"), status_stopped("go"));
+    }
+
+    // -- remote (http/sse) probing ------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Minimal one-shot HTTP stub: accepts connections and answers every
+    /// request on each connection with `response` (raw bytes). Returns the
+    /// bound URL. Lives until the returned guard is dropped.
+    async fn http_stub(response: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        // Read one request's worth of bytes (best-effort framing:
+                        // the tiny probe requests always arrive in one read).
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        if sock.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A well-formed streamable-HTTP MCP response body answering whatever id
+    /// the request carried is impossible in a canned stub, so the stub answers
+    /// id 1 (initialize) and relies on tools/list being best-effort.
+    fn ok_json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn remote_cfg(id: &str, transport: &str, url: &str) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "transport": transport,
+            "url": url,
+            "enabled": true,
+        })
+    }
+
+    #[tokio::test]
+    async fn http_probe_success_maps_to_running() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _guard) = http_stub(leaked).await;
+
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-ok", "http", &url), true).await;
+        assert_eq!(status["state"], json!("running"));
+        assert!(status["pid"].is_null(), "remote servers have no pid");
+        assert!(status["startedAt"].is_number());
+    }
+
+    #[tokio::test]
+    async fn http_probe_401_maps_to_auth_error() {
+        let (url, _guard) =
+            http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-auth", "http", &url), true).await;
+        assert_eq!(status["state"], json!("error"));
+        let err = status["lastError"].as_str().unwrap();
+        assert!(err.contains("authentication failed"), "got: {err}");
+        assert!(err.contains("401"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_500_maps_to_server_error() {
+        let (url, _guard) =
+            http_stub("HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n").await;
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-500", "http", &url), true).await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("server error (HTTP 500)"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_closed_port_maps_to_unreachable() {
+        // Bind + drop to get a port that is closed at probe time.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-dead", "http", &url), true).await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable from daemon host"));
+    }
+
+    #[tokio::test]
+    async fn sse_probe_2xx_maps_to_running_without_tool_count() {
+        let (url, _guard) = http_stub(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\n\r\n",
+        )
+        .await;
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-sse", "sse", &url), true).await;
+        assert_eq!(status["state"], json!("running"));
+        assert!(status["toolCount"].is_null());
+    }
+
+    #[tokio::test]
+    async fn remote_config_without_url_maps_to_error() {
+        let h = McpHub::new();
+        let status = h
+            .start(json!({ "id": "r-nourl", "transport": "http" }), true)
+            .await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("requires a url"));
+    }
+
+    #[tokio::test]
+    async fn health_tick_reprobe_emits_event_on_remote_transition() {
+        // Start against a live stub (running), kill the stub, then a sweep
+        // must flip the status to error and publish the transition.
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, guard) = http_stub(leaked).await;
+
+        let (_tmp, store) = open_store().await;
+        let bus = EventBus::new(store);
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let h = McpHub::new();
+        h.set_event_bus(bus);
+
+        let status = h.start(remote_cfg("r-flip", "http", &url), true).await;
+        assert_eq!(status["state"], json!("running"));
+        // Drain the `running` event.
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("running event")
+            .expect("subscription open");
+
+        guard.abort(); // stub gone → next probe fails
+        h.health_tick().await;
+        assert_eq!(h.status("r-flip")["state"], json!("error"));
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("error event delivered")
+            .expect("subscription open");
+        let data = serde_json::to_value(&batch[0].data).unwrap();
+        assert_eq!(data["serverId"], json!("r-flip"));
+        assert_eq!(data["status"]["state"], json!("error"));
+    }
+
+    #[tokio::test]
+    async fn health_tick_reprobe_no_event_when_state_unchanged() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _guard) = http_stub(leaked).await;
+
+        let (_tmp, store) = open_store().await;
+        let bus = EventBus::new(store);
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let h = McpHub::new();
+        h.set_event_bus(bus);
+
+        let started = h.start(remote_cfg("r-same", "http", &url), true).await;
+        assert_eq!(started["state"], json!("running"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("running event")
+            .expect("subscription open");
+        let started_at = started["startedAt"].clone();
+
+        h.health_tick().await;
+        // Still running, startedAt preserved, and no second event.
+        let now = h.status("r-same");
+        assert_eq!(now["state"], json!("running"));
+        assert_eq!(now["startedAt"], started_at);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), sub.recv())
+                .await
+                .is_err(),
+            "no event on an unchanged state"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_stop_removes_remote_entry() {
+        let (url, _guard) =
+            http_stub("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await;
+        let h = McpHub::new();
+        let _ = h.start(remote_cfg("r-stop", "http", &url), true).await;
+        assert_eq!(h.status("r-stop")["state"], json!("error"));
+        assert!(h.stop("r-stop").await, "tracked entry is stopped");
+        assert_eq!(h.status("r-stop"), status_stopped("r-stop"));
     }
 }
