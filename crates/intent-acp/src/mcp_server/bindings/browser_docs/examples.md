@@ -85,12 +85,16 @@ listener, so there `openTunnel` fails with an explanatory error.)
 // → { remotePort: 8000, closed: true }
 ```
 
-Recovery: `localPort` is ephemeral — forwards are client-process state and drop on client
-restart or transport change. If a connect to a previously returned `localPort` is refused,
-or the forward is missing from `listTunnels`, just call `openTunnel` with the same
-`remotePort` again: it returns the current `localPort` (`reused: true` when the forward
-was still alive, a transparent recreate when it was not). Re-opening is the standard
-move, not an error to diagnose.
+Lifecycle: forwards are persistent — a forward keeps its `localPort` for the Electron
+app's lifetime and survives transient daemon-connection drops (it lazily reconnects on
+the next inbound connection). It is closed only by an explicit `closeTunnel`, a daemon
+backend switch, app quit, or all of its owning workspaces being archived/deleted
+(forwards not tied to any workspace live for the app lifetime). One exception: a
+definitively refused connect to the daemon-side port (server gone) drops the forward
+immediately — re-open with the same `remotePort` to re-mint it. `openTunnel` stays
+idempotent per `remotePort` (`reused: true` when already registered). Older Electron
+clients may still exhibit the previous ephemeral behavior; if a `localPort` refuses
+connections there, re-open with the same `remotePort`.
 
 ## Cleaning Up Tabs
 
