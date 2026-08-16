@@ -18,41 +18,51 @@ const SPECIALISTS_FOLDER: &str = "specialists";
 const BUNDLED_DIR_ENV: &str = "INTENTD_BUNDLED_SPECIALISTS_DIR";
 
 /// The reference specialist definitions embedded at compile time (PP-2,
-/// byte-identical to the reference `resources/specialists/` bundle). They form
-/// the floor of the bundled tier so daemon-side resolution works with zero
-/// local files; an on-disk bundled file (env override / packaged resources)
-/// with the same id still wins over the embedded copy.
-const EMBEDDED_BUNDLED: &[(&str, &str)] = &[
+/// byte-identical to the reference bundle, kept under the versioned
+/// `resources/specialists/v1/` layout — H2, intent-hq/monorepo#2459). They
+/// form the floor of the bundled tier so daemon-side resolution works with
+/// zero local files; an on-disk bundled file (env override / packaged
+/// resources) with the same id still wins over the embedded copy. The v1
+/// harness doctrine (`crate::harness::v1::ENTRY`) points at this same set.
+pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
     (
         "chief-of-staff",
-        include_str!("../resources/specialists/chief-of-staff.md"),
+        include_str!("../resources/specialists/v1/chief-of-staff.md"),
     ),
     (
         "developer",
-        include_str!("../resources/specialists/developer.md"),
+        include_str!("../resources/specialists/v1/developer.md"),
     ),
     (
         "implementor",
-        include_str!("../resources/specialists/implementor.md"),
+        include_str!("../resources/specialists/v1/implementor.md"),
     ),
     (
         "pr-reviewer",
-        include_str!("../resources/specialists/pr-reviewer.md"),
+        include_str!("../resources/specialists/v1/pr-reviewer.md"),
     ),
-    ("ralph", include_str!("../resources/specialists/ralph.md")),
+    (
+        "ralph",
+        include_str!("../resources/specialists/v1/ralph.md"),
+    ),
     (
         "spec-writer",
-        include_str!("../resources/specialists/spec-writer.md"),
+        include_str!("../resources/specialists/v1/spec-writer.md"),
     ),
     (
         "ui-designer",
-        include_str!("../resources/specialists/ui-designer.md"),
+        include_str!("../resources/specialists/v1/ui-designer.md"),
     ),
     (
         "verifier",
-        include_str!("../resources/specialists/verifier.md"),
+        include_str!("../resources/specialists/v1/verifier.md"),
     ),
 ];
+
+/// The embedded bundled floor the specialist 3-tier resolution uses — the
+/// LATEST version's set (the file tiers above it are user-owned and
+/// unversioned).
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1;
 
 /// Resolve an embedded bundled specialist by id (the lowest tier).
 fn load_embedded(id: &str) -> Option<Value> {

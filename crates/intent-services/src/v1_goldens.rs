@@ -1517,6 +1517,59 @@ async fn golden_assembled_prompt_auto_commit_and_sub_agent_variants() {
     assert!(sub_agent.contains("## Commit Policy"));
 }
 
+/// H2 regression: a session stamped `harnessVersion: "1.0"` (every session
+/// H1 has created) resolves the v1 doctrine set and assembles the exact
+/// bytes the pre-versioned layout produced — pinned here as equality with
+/// the session-less (latest) assembly, whose layers are themselves
+/// byte-pinned by the goldens above and the doctrine hashes below. An
+/// unknown/corrupt stamp falls back to the latest instead of failing.
+#[tokio::test]
+async fn golden_v1_session_assembles_identical_to_latest() {
+    let (_t, svc, ws) = setup().await;
+    let owner = AgentId::from("agent-h2-pin");
+    seed_agent(&svc, &ws, &owner).await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&owner)
+        .await
+        .expect("session");
+    assert_eq!(session.harness_version, "1.0", "H1 stamps 1.0");
+    let features = intent_core::settings_file::AgentFeaturesSettings::default();
+    let specialist = crate::rules::SpecialistPromptInjection {
+        behavior_prompt: Some("Implement the task.".to_string()),
+        specialist_name: Some("Implementor".to_string()),
+        role_reminder: Some("Stay in scope.".to_string()),
+    };
+    let assemble = |session: Option<intent_core::AgentSession>| {
+        let store = svc.store();
+        let specialist = specialist.clone();
+        let features = features.clone();
+        async move {
+            crate::rules::assemble_system_prompt(
+                store,
+                None,
+                "task-loop",
+                Some(&specialist),
+                false,
+                false,
+                false,
+                &features,
+                None,
+                session.as_ref(),
+            )
+            .await
+            .expect("assembled prompt")
+        }
+    };
+    let latest = assemble(None).await;
+    let pinned_v1 = assemble(Some(session.clone())).await;
+    assert_eq!(pinned_v1, latest, "1.0 session == pre-change assembly");
+    // A stale/corrupt stamp falls back to the latest (never fails a spawn).
+    session.harness_version = "9.9".to_string();
+    let unknown = assemble(Some(session)).await;
+    assert_eq!(unknown, latest, "unknown stamp falls back to latest");
+}
+
 /// The bundled doctrine layers are large; pin them by SHA-256 so any change
 /// to the shipped instruction markdown (or the feature-gating composition)
 /// fails here and forces a harness-version decision. The hashes are of
