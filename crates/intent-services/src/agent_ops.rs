@@ -1923,14 +1923,47 @@ impl Services {
         self.project_lite_with_flags_inner(session, |s| project_lite_from_projection(s, projection))
     }
 
+    /// The current effective `agentFeatures` values as the JSON snapshot
+    /// shape stamped on new sessions (intent-hq/monorepo#2459). Used to
+    /// project a value for legacy (pre-0096) rows whose `harness_features`
+    /// is NULL; best-effort — an encode failure yields `None` and the wire
+    /// field stays omitted.
+    fn current_agent_features_snapshot(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(&self.effective_settings().agent_features).ok()
+    }
+
+    /// The `agentFeatures` values governing `session`'s runtime surface: the
+    /// snapshot captured at creation (`harness_features`, monorepo#2459) when
+    /// present and decodable, else the live effective settings (legacy
+    /// pre-0096 rows, or a snapshot written by a newer daemon this build
+    /// cannot decode). Respawns read this instead of the live settings so a
+    /// settings change never alters an existing session's tools/prompt —
+    /// matching what `harnessFeatures` reports on the wire.
+    pub(crate) fn session_agent_features(
+        &self,
+        session: &AgentSession,
+    ) -> intent_core::settings_file::AgentFeaturesSettings {
+        session
+            .harness_features
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(|| self.effective_settings().agent_features)
+    }
+
     /// Shared runtime-flag overlay behind the two `project_lite_with_flags*`
     /// entry points: compute the flags from the session, project it via
     /// `project`, then overlay.
     fn project_lite_with_flags_inner(
         &self,
-        session: AgentSession,
+        mut session: AgentSession,
         project: impl FnOnce(AgentSession) -> AgentLite,
     ) -> AgentLite {
+        // Legacy rows (pre-0096) carry no captured agentFeatures snapshot:
+        // project the CURRENT effective settings on read so the wire always
+        // carries a value. Never persisted — a legacy row stays NULL.
+        if session.harness_features.is_none() {
+            session.harness_features = self.current_agent_features_snapshot();
+        }
         let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);
         let (turn_in_flight, last_stream_activity_at) =
@@ -2571,6 +2604,15 @@ impl Services {
                 resolved_model.as_deref(),
             ),
         };
+        // Harness stamp (intent-hq/monorepo#2459): every new session gets the
+        // CURRENT harness version and a snapshot of the effective
+        // agentFeatures values, captured once here and immutable for the
+        // session's life. Creation time is the only input — delegated /
+        // wakeOrCreate children funnel through this op and mint the latest
+        // version, never inheriting the parent's pinned one.
+        let settings = self.effective_settings();
+        let harness_features = serde_json::to_value(&settings.agent_features)
+            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
         let session = AgentSession {
             id,
             workspace_id,
@@ -2627,13 +2669,16 @@ impl Services {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: Some(harness_features),
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
         };
-        let settings = self.effective_settings();
+        // The legacy per-session taskGraph pin (0095) keeps being written for
+        // fallback reads; its value equals the snapshot's `taskGraph`.
         let task_graph_enabled = settings.agent_features.task_graph;
         self.store
             .insert_agent_session_with_task_graph(&session, task_graph_enabled)
@@ -3049,6 +3094,11 @@ impl Services {
         // Delete grace window (§5.5): overlay the pending-deletion deadline
         // from the in-memory registry (O(1) map lookup, never persisted).
         session.pending_delete_at = self.pending_agent_deletes.deadline(agent_id.0.as_str());
+        // Legacy rows (pre-0096): project the current effective agentFeatures
+        // on read (never persisted); see `project_lite_with_flags_inner`.
+        if session.harness_features.is_none() {
+            session.harness_features = self.current_agent_features_snapshot();
+        }
         Ok(session)
     }
 

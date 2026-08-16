@@ -2249,6 +2249,24 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// The harness version stamped on every newly created agent session
+/// (intent-hq/monorepo#2459). Single-source constant: session creation
+/// (`agent.create` and everything funneling through it — delegate,
+/// wakeOrCreate) stamps exactly this value, and a new session ALWAYS gets the
+/// current version — the stamp depends only on creation time, never on the
+/// creating parent's pinned version. Bump when doctrine text or feature
+/// defaults change materially; existing sessions keep their stamped version
+/// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
+/// (migration 0096).
+pub const CURRENT_HARNESS_VERSION: &str = "1.0";
+
+/// Serde default for [`AgentSession::harness_version`]: payloads persisted or
+/// exported before harness versioning existed deserialize as "1.0", matching
+/// the migration-0096 backfill.
+fn default_harness_version() -> String {
+    CURRENT_HARNESS_VERSION.to_string()
+}
+
 /// Metadata key under which the question-dismissal marker is persisted on the
 /// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
 /// assistant message whose trailing question resource blocks the user
@@ -2497,6 +2515,21 @@ pub struct AgentSession {
     /// pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// Harness version this session was stamped with at creation
+    /// (intent-hq/monorepo#2459). Immutable for the session's life — a daemon
+    /// upgrade never changes it, and there is no upgrade/migration/pinning
+    /// op. Pre-feature rows read back "1.0" (migration-0096 backfill; same
+    /// serde default for pre-feature payloads).
+    #[serde(default = "default_harness_version")]
+    pub harness_version: String,
+    /// JSON snapshot of the effective `agentFeatures` on/off values captured
+    /// at session creation ([`crate::settings_file::AgentFeaturesSettings`]
+    /// in its camelCase wire form). Immutable like `harness_version`; later
+    /// settings changes affect only new sessions. `None` for pre-snapshot
+    /// rows — the service layer projects the current settings on read so the
+    /// wire always carries a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_features: Option<serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2802,6 +2835,16 @@ pub struct AgentLite {
     /// (not `null`) when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// Harness version the session was stamped with at creation; mirrors
+    /// [`AgentSession::harness_version`] (intent-hq/monorepo#2459).
+    #[serde(default = "default_harness_version")]
+    pub harness_version: String,
+    /// Captured `agentFeatures` snapshot; mirrors
+    /// [`AgentSession::harness_features`]. `None` for pre-snapshot rows here
+    /// (no settings context) — the service projection overlays the current
+    /// settings so the wire always carries a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_features: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
 }
 
@@ -2880,6 +2923,8 @@ impl AgentLite {
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
+            harness_version: session.harness_version,
+            harness_features: session.harness_features,
             metadata,
         }
     }
@@ -4551,6 +4596,8 @@ mod tests {
     fn agent_lite_metadata_and_activity_wire_shape() {
         let ts = "t1".to_string();
         let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: Some(AgentId::from("agent-parent")),
@@ -4640,6 +4687,8 @@ mod tests {
     #[test]
     fn agent_lite_is_initial_agent_omitted_unless_true() {
         let session = |metadata: Option<serde_json::Value>| AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -4712,6 +4761,8 @@ mod tests {
     #[test]
     fn agent_session_camel_case_parity() {
         let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-1"),
             workspace_id: WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -4784,6 +4835,7 @@ mod tests {
                     "contentBlocks": [{ "type": "text", "text": "hi" }],
                     "timestamp": "t0"
                 }],
+                "harnessVersion": CURRENT_HARNESS_VERSION,
                 "createdAt": "t0",
                 "updatedAt": "t1"
             })

@@ -1075,6 +1075,8 @@ async fn process_cap_events_queued_resumed_evicted() {
     let ts = now_iso();
     store
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: a.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -1120,6 +1122,8 @@ async fn process_cap_events_queued_resumed_evicted() {
         .unwrap();
     store
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: b.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -1179,6 +1183,8 @@ async fn process_cap_events_queued_resumed_evicted() {
     let ts = now_iso();
     store
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: c_clone.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -1268,6 +1274,8 @@ async fn process_cap_events_queued_resumed_evicted() {
     let ts = now_iso();
     store
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: d.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -3082,6 +3090,8 @@ async fn seed_agent_with_task_graph(
         pending_delete_at: None,
     };
     let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -6747,6 +6757,8 @@ async fn services_with_specialists_and_registry(
 /// An otherwise-empty session carrying just the `specialist` under test.
 fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
     AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId::from("agent-spb"),
         workspace_id: WorkspaceId::from("ws-spb"),
         parent_agent_id: None,
@@ -7140,6 +7152,8 @@ async fn stop_returns_false_for_unknown_agent() {
 async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,

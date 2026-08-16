@@ -1185,6 +1185,8 @@ mod tests {
 
     async fn create_test_agent(store: &Store, ws_id: &WorkspaceId, agent_id: &AgentId) {
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -1323,6 +1325,8 @@ mod tests {
         // Create agent
         let agent_id = AgentId::new();
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.id.clone(),
             parent_agent_id: None,
@@ -1478,6 +1482,8 @@ mod tests {
 
         let agent_id = AgentId::new();
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.id.clone(),
             parent_agent_id: None,
@@ -1615,6 +1621,8 @@ mod tests {
 
         let agent_id = AgentId::new();
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.id.clone(),
             parent_agent_id: None,
@@ -1721,6 +1729,8 @@ mod tests {
         // Create agent temporarily to satisfy FK, then we'll delete it
         let agent_id = AgentId::new();
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -1805,6 +1815,8 @@ mod tests {
 
         let agent_id = AgentId::new();
         let agent = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.id.clone(),
             parent_agent_id: None,

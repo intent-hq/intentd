@@ -275,6 +275,8 @@ mod tests {
     fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(id.to_string()),
             workspace_id: ws.clone(),
             backend_session_id: None,

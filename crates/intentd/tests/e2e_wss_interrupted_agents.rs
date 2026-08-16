@@ -276,6 +276,8 @@ async fn interrupted_agents_persisted_across_restart() {
             .expect("insert workspace");
 
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(agent_id.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             backend_session_id: None,

@@ -7778,6 +7778,8 @@ mod wsapi4_bindings_tests {
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
