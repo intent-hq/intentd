@@ -1476,6 +1476,25 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let proc_usage = spawn_proc_usage_sampler();
     spawn_child_tree_sampler(manager.clone(), child_usage.clone());
     let route_info = spawn_route_info_sampler();
+    // Workspaces-root disk sampler: same resolution as the service layer —
+    // the effective `workspaces.root` setting (startup-pinned from
+    // `INTENTD_WORKSPACES_DIR` above, tilde-expanded) wins, else the default
+    // root. Fixed for the daemon's lifetime (the setting applies on restart).
+    // The non-panicking default resolver returns `None` under the hermetic
+    // test guard with no workspaces dir; the fields then stay absent.
+    let workspaces_root = boot_settings
+        .effective
+        .workspaces
+        .root
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| PathBuf::from(intent_core::expand_tilde_string(r)))
+        .or_else(intent_services::try_default_workspaces_root);
+    let workspaces_disk = match workspaces_root {
+        Some(root) => spawn_workspaces_disk_sampler(root),
+        None => Arc::new(WorkspacesDiskUsage::default()),
+    };
 
     let control = Arc::new(DaemonControl {
         manager: manager.clone(),
@@ -1485,6 +1504,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         proc_usage,
         child_usage,
         route_info,
+        workspaces_disk,
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: legacy_import_lock.clone(),
@@ -1788,6 +1808,9 @@ struct DaemonControl {
     /// Cached route-discovery snapshot (`localIps` + `hostname`) from the
     /// background sampler, so `status()` never enumerates interfaces inline.
     route_info: Arc<RouteInfo>,
+    /// Latest workspaces-root disk sample (available/total bytes) from the
+    /// background sampler, so `status()` never calls `statfs(2)` inline.
+    workspaces_disk: Arc<WorkspacesDiskUsage>,
     /// Live store and asset destination shared with Services for legacy import.
     legacy_import_store: Store,
     legacy_import_assets_root: PathBuf,
@@ -1903,6 +1926,74 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         loop {
             tick.tick().await;
             sample(&mut sys, &task_usage);
+        }
+    });
+    usage
+}
+
+/// Latest workspaces-root disk sample (`available`, `total` bytes of the
+/// volume containing the resolved workspaces root) for `system.status` (§5.7),
+/// written by the background sampler task and read from `status()` without
+/// touching the OS. `None` until the first sample lands or when no mounted
+/// volume matches the root, so the wire fields stay presence-detected —
+/// absent, never a misleading 0.
+#[derive(Default)]
+struct WorkspacesDiskUsage {
+    inner: std::sync::RwLock<Option<(u64, u64)>>,
+}
+
+impl WorkspacesDiskUsage {
+    fn load(&self) -> Option<(u64, u64)> {
+        *self
+            .inner
+            .read()
+            .expect("workspaces disk usage lock poisoned")
+    }
+}
+
+/// Resolve `(available, total)` bytes of the mounted volume containing
+/// `root`: the disk whose mount point is the longest path-prefix of the
+/// canonicalized root (canonicalization resolves symlinks so e.g. a macOS
+/// `/tmp` root matches its real `/private/tmp` volume; a not-yet-created root
+/// falls back to prefix-matching the raw path). `None` when no mount matches.
+fn workspaces_disk_sample(root: &Path) -> Option<(u64, u64)> {
+    let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| target.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| (d.available_space(), d.total_space()))
+}
+
+/// Spawn the workspaces-root disk sampler backing `system.status` (§5.7).
+/// Takes one synchronous sample first so the fields are populated before the
+/// listeners come up, then refreshes on a slow tick — free space moves slowly
+/// at the granularity clients care about (disk-pressure warnings), so a
+/// short-TTL cache keeps the status read path free of `statfs(2)` calls, per
+/// the derived-field ladder. The root is resolved once at boot: `serve` pins
+/// `INTENTD_WORKSPACES_DIR` into `workspaces.root` before this runs, and the
+/// setting requires a daemon restart to change.
+fn spawn_workspaces_disk_sampler(root: PathBuf) -> Arc<WorkspacesDiskUsage> {
+    let usage = Arc::new(WorkspacesDiskUsage::default());
+    let sample = move |usage: &WorkspacesDiskUsage| {
+        let sampled = workspaces_disk_sample(&root);
+        *usage
+            .inner
+            .write()
+            .expect("workspaces disk usage lock poisoned") = sampled;
+    };
+    sample(&usage);
+
+    let task_usage = usage.clone();
+    tokio::spawn(async move {
+        let period = Duration::from_secs(30);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            sample(&task_usage);
         }
     });
     usage
@@ -2404,6 +2495,10 @@ impl SystemControl for DaemonControl {
         // Aggregate-budget visibility (monorepo#2063): absent when the budget
         // is off, so the wire fields stay presence-detected.
         let budget = self.manager.registry().budget_status();
+        // Workspaces-volume disk space from the background sampler: `None`
+        // (absent on the wire) until the first sample lands or when no
+        // mounted volume matches the root.
+        let workspaces_disk = self.workspaces_disk.load();
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),
             uds: true,
@@ -2428,6 +2523,8 @@ impl SystemControl for DaemonControl {
             agent_memory_budget_bytes: budget.map(|(bytes, _, _)| bytes),
             agent_memory_charged_bytes: budget.and_then(|(_, charged, _)| charged),
             queued_spawns: budget.map(|(_, _, queued)| queued),
+            workspaces_disk_available_bytes: workspaces_disk.map(|(avail, _)| avail),
+            workspaces_disk_total_bytes: workspaces_disk.map(|(_, total)| total),
         }
     }
 

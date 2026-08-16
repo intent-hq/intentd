@@ -6994,6 +6994,27 @@ fn default_workspaces_root() -> PathBuf {
         .join("workspaces")
 }
 
+/// Non-panicking [`default_workspaces_root`] for boot-time consumers that must
+/// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
+/// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
+/// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
+/// `$HOME` default would panic — else the same root the service layer uses.
+pub fn try_default_workspaces_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
+        return None;
+    }
+    Some(
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("intent")
+            .join("workspaces"),
+    )
+}
+
 /// Structural guard against `~/intent/workspaces` leaks from tests. Fires only
 /// inside crate unit tests (`cfg(test)`) or when the harness explicitly opts
 /// in via `INTENTD_ASSERT_HERMETIC_ROOT`; production `intentd` binaries never
