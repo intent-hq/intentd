@@ -433,6 +433,8 @@ mod tests {
 
     fn test_session(agent_id: &AgentId, ws_id: &WorkspaceId, ts: &str) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             backend_session_id: None,

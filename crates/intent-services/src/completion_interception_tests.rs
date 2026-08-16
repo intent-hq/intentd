@@ -134,6 +134,8 @@ mod tests {
         sandbox_path: Option<String>,
     ) {
         let agent = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: parent_id.cloned(),

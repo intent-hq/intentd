@@ -1680,6 +1680,8 @@ fn session_from_legacy_json(
     metadata.insert("legacyImport".to_string(), Value::Object(legacy_import));
 
     let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id,
         workspace_id: workspace.id.clone(),
         parent_agent_id,

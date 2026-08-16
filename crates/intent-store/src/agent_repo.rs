@@ -23,7 +23,8 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
-    stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled";
+    stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
+    harness_features";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt` and `image_blocks` are intentionally omitted:
@@ -34,7 +35,8 @@ const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_session_id, acp
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     initial_message, context_references, file_blocks, is_background, metadata, sandbox_id, \
-    sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, effort_levels";
+    sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
+    effort_levels, harness_version, harness_features";
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
@@ -359,10 +361,11 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 37-column `agent_session` insert value list onto `query`, in
+/// Bind the full 39-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
-/// lives in one place.
+/// lives in one place. The harness stamp (`harness_version` /
+/// `harness_features`) binds from the session struct itself.
 fn bind_session_insert<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     s: &'q AgentSession,
@@ -405,7 +408,9 @@ fn bind_session_insert<'q>(
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
         .bind(effort_levels_to_db(&s.effort_levels)?)
-        .bind(task_graph_enabled as i64))
+        .bind(task_graph_enabled as i64)
+        .bind(&s.harness_version)
+        .bind(json_col_to_db(&s.harness_features)?))
 }
 
 impl Store {
@@ -430,7 +435,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?
             .execute(self.write_pool())
@@ -489,7 +494,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(sqlx::query(&session_sql), s, false)?
                 .execute(&mut *tx)
@@ -583,15 +588,21 @@ impl Store {
     }
 
     /// Read the daemon-owned task-graph snapshot captured when this agent was
-    /// created. The value is deliberately outside the session wire model.
+    /// created. Prefers the whole-harness `harness_features` snapshot's
+    /// `taskGraph` value (0096) and falls back to the legacy
+    /// `task_graph_enabled` column (0095) for pre-snapshot rows — behavior
+    /// identical for every row written before the fold.
     pub async fn get_agent_session_task_graph_enabled(&self, id: &AgentId) -> Result<bool> {
-        sqlx::query_scalar::<_, i64>("SELECT task_graph_enabled FROM agent_session WHERE id = ?")
-            .bind(&id.0)
-            .fetch_optional(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("get agent taskGraph snapshot failed: {e}")))?
-            .map(|value| value != 0)
-            .ok_or_else(|| Error::NotFound(format!("agent session {id}")))
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(harness_features ->> '$.taskGraph', task_graph_enabled) \
+             FROM agent_session WHERE id = ?",
+        )
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get agent taskGraph snapshot failed: {e}")))?
+        .map(|value| value != 0)
+        .ok_or_else(|| Error::NotFound(format!("agent session {id}")))
     }
 
     /// Lightweight status-only lookup used by hot paths that just need the
@@ -1927,6 +1938,8 @@ fn map_session_row_with_heavy_cols(
         // Derived on emit by the service layer (monorepo#940); never persisted.
         session_corrupted: false,
         pending_delete_at: None,
+        harness_version: col(row, "harness_version")?,
+        harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         sandbox_id: col(row, "sandbox_id")?,
@@ -2854,6 +2867,8 @@ mod tests {
             .await
             .expect("insert workspace");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(format!("agent-{}", Uuid::new_v4())),
             workspace_id: ws_id,
             backend_session_id: None,
@@ -2972,6 +2987,8 @@ mod tests {
             .expect("insert workspace");
         let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             backend_session_id: None,
@@ -3131,6 +3148,8 @@ mod tests {
         acp_session_id: Option<&str>,
     ) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             backend_session_id: None,
@@ -4607,6 +4626,8 @@ mod tests {
             {"type": "image", "data": "A".repeat(4096), "mimeType": "image/png"}
         ]);
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             backend_session_id: None,
@@ -4781,6 +4802,8 @@ mod tests {
         // Insert agent session with provider and acp_session_id
         let agent_id = AgentId("agent-inv-test".to_string());
         let mut session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             backend_session_id: None,
@@ -5069,6 +5092,8 @@ mod tests {
 
         for agent_id in [&agent1, &agent2] {
             let session = AgentSession {
+                harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+                harness_features: None,
                 id: agent_id.clone(),
                 workspace_id: ws_id.clone(),
                 backend_session_id: None,
@@ -7848,5 +7873,212 @@ mod tests {
             "decisively better archived match overcomes the penalty: {hits:?}"
         );
         assert_eq!(hits[1].workspace_id, ws_active.0);
+    }
+
+    /// Harness stamp round-trip (0096): a session inserted with a harness
+    /// version + captured agentFeatures snapshot reads both back verbatim on
+    /// the full and summary lookups.
+    #[tokio::test]
+    async fn harness_stamp_roundtrip() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-test".to_string());
+        insert_test_workspace(&store, &ws_id).await;
+        let snapshot = serde_json::json!({ "taskGraph": true, "backgroundHooks": false });
+        let mut session = test_harness_session(&ws_id);
+        session.harness_version = "2.3".to_string();
+        session.harness_features = Some(snapshot.clone());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let full = store.get_agent_session(&session.id).await.expect("get");
+        assert_eq!(full.harness_version, "2.3");
+        assert_eq!(full.harness_features, Some(snapshot.clone()));
+        let summary = store
+            .get_agent_session_summary(&session.id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.harness_version, "2.3");
+        assert_eq!(summary.harness_features, Some(snapshot));
+    }
+
+    /// Migration-0096 backfill: a row written without the harness columns
+    /// (simulating a pre-feature session) reads back harnessVersion "1.0"
+    /// with no captured features.
+    #[tokio::test]
+    async fn harness_backfill_defaults_to_one_dot_zero() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-test".to_string());
+        insert_test_workspace(&store, &ws_id).await;
+        let session = test_harness_session(&ws_id);
+        // Insert bypassing the harness binds — only the pre-0096 column set —
+        // so the schema defaults apply exactly as the migration backfill did.
+        sqlx::query(
+            "INSERT INTO agent_session (id, workspace_id, name, name_explicitly_set, status, \
+             is_active, created_at, updated_at) VALUES (?,?,?,0,'idle',0,?,?)",
+        )
+        .bind(&session.id.0)
+        .bind(&ws_id.0)
+        .bind(&session.name)
+        .bind(&session.created_at)
+        .bind(&session.updated_at)
+        .execute(store.write_pool())
+        .await
+        .expect("raw legacy insert");
+
+        let full = store.get_agent_session(&session.id).await.expect("get");
+        assert_eq!(full.harness_version, "1.0", "backfill pins 1.0");
+        assert_eq!(full.harness_features, None, "legacy rows carry no snapshot");
+        let summary = store
+            .get_agent_session_summary(&session.id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.harness_version, "1.0");
+        assert_eq!(summary.harness_features, None);
+    }
+
+    /// The taskGraph pin folds into the harness snapshot: the reader prefers
+    /// `harness_features -> '$.taskGraph'` and falls back to the legacy
+    /// `task_graph_enabled` column for pre-snapshot rows (behavior identical).
+    #[tokio::test]
+    async fn task_graph_reader_prefers_snapshot_with_legacy_fallback() {
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-test".to_string());
+        insert_test_workspace(&store, &ws_id).await;
+
+        // Snapshot present: taskGraph true wins even with the legacy pin off.
+        let mut with_snapshot = test_harness_session(&ws_id);
+        with_snapshot.harness_features = Some(serde_json::json!({ "taskGraph": true }));
+        store
+            .insert_agent_session_with_task_graph(&with_snapshot, false)
+            .await
+            .expect("insert with snapshot");
+        assert!(
+            store
+                .get_agent_session_task_graph_enabled(&with_snapshot.id)
+                .await
+                .expect("read snapshot pin"),
+            "snapshot taskGraph=true wins over legacy column 0"
+        );
+
+        // No snapshot (legacy row): the 0095 column still governs.
+        let legacy = test_harness_session(&ws_id);
+        store
+            .insert_agent_session_with_task_graph(&legacy, true)
+            .await
+            .expect("insert legacy");
+        assert!(
+            store
+                .get_agent_session_task_graph_enabled(&legacy.id)
+                .await
+                .expect("read legacy pin"),
+            "NULL snapshot falls back to task_graph_enabled"
+        );
+    }
+
+    /// Minimal valid session for the harness tests; harness fields at their
+    /// legacy defaults (callers override as needed).
+    fn test_harness_session(ws_id: &WorkspaceId) -> AgentSession {
+        let ts = intent_core::now_iso();
+        AgentSession {
+            id: AgentId(format!("agent-{}", uuid::Uuid::new_v4())),
+            workspace_id: ws_id.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Harness".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        }
+    }
+
+    /// Insert a minimal workspace row so agent-session FKs resolve.
+    async fn insert_test_workspace(store: &Store, ws_id: &WorkspaceId) {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+            display_status: None,
+            waiting: false,
+            checkout_mode: None,
+            disk_usage: None,
+            pending_delete_at: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
     }
 }

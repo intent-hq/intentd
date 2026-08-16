@@ -58,6 +58,7 @@ pub use ids::{
 pub use model::extract_spec_task_ids;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
+pub use model::CURRENT_HARNESS_VERSION;
 pub use model::DISMISSED_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;

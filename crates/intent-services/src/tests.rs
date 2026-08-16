@@ -267,6 +267,8 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     // under parallel-test load, flipping `agents[0]` (monorepo#967).
     let mk_agent =
         |id: &str, name: &str, specialist: Option<&str>, created_at: &str| AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -2700,6 +2702,8 @@ async fn note_add_stamps_agent_author_with_session_name() {
     let (_tmp, svc, ws, id) = setup("body").await;
     let agent_id = AgentId::from("agent-writer");
     let session = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: agent_id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -4881,6 +4885,8 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
     let agent = AgentId::from("agent-sub-guard");
     svc.store()
         .insert_agent_session(&AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -5232,6 +5238,8 @@ mod change_event_parity {
         h.store.insert_note(&tn).await.expect("insert task note");
         // A live session so provenance resolves the display name.
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-prov"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -5465,6 +5473,8 @@ mod change_event_parity {
         );
         h.store.insert_note(&n).await.expect("insert note");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-conv"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -5616,6 +5626,8 @@ mod change_event_parity {
         let plain = note(&h.ws, "plain-agent", "body");
         h.store.insert_note(&plain).await.expect("insert note");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from("agent-task"),
             workspace_id: h.ws.clone(),
             parent_agent_id: None,
@@ -6596,6 +6608,8 @@ mod change_event_parity {
     /// Minimal agent session row for the auto-unarchive stamp tests.
     fn auto_unarchive_session(agent_id: &AgentId, ws: &WorkspaceId, name: &str) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -8478,6 +8492,8 @@ mod mcp_callback {
             .expect("note");
         let agent_id = AgentId::from_string("agent-mcp-writer");
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -15804,6 +15820,8 @@ mod search_adapters {
         let id = AgentId::from(agent);
         let ts = intent_core::now_iso();
         let session = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -17673,6 +17691,8 @@ mod rules {
 
         // Create a mock agent session with sandbox fields
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -17814,6 +17834,8 @@ mod rules {
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-coordinator"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -17945,6 +17967,8 @@ mod rules {
         };
 
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -18072,6 +18096,8 @@ mod rules {
         };
 
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -18199,6 +18225,8 @@ mod rules {
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -18330,6 +18358,8 @@ mod rules {
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
         let agent_session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
             workspace_id: intent_core::WorkspaceId::from("ws-1"),
             parent_agent_id: None,
@@ -22057,6 +22087,8 @@ mod file_ops_service {
         // Create agent
         let agent_id = AgentId::new();
         let agent = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -23082,6 +23114,8 @@ mod heal_stale_agent_sessions {
     fn mk_session(ws: &WorkspaceId, id: &str, status: AgentStatus) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -25168,6 +25202,8 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     let sess1 = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-1"),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -25211,6 +25247,8 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     };
 
     let sess2 = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-2"),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -25333,6 +25371,8 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     let ts = now_iso();
 
     let sess = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from("agent-a"),
         workspace_id: ws1.clone(),
         parent_agent_id: None,
@@ -26219,6 +26259,8 @@ mod last_activity_events {
 
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -26477,6 +26519,8 @@ mod turn_end_unread_gate {
 
     pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -26881,6 +26925,8 @@ mod turn_token_usage {
 
     fn agent_session(agent_id: &AgentId, ws: &WorkspaceId, model: &str) -> AgentSession {
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             backend_session_id: None,
@@ -28640,6 +28686,8 @@ mod agent_delete_grace_window {
     fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -29102,5 +29150,156 @@ mod agent_delete_grace_window {
                 .expect("scoped cancel"),
             "correctly scoped cancel succeeds"
         );
+    }
+}
+
+/// Harness versioning (intent-hq/monorepo#2459): session creation stamps
+/// `CURRENT_HARNESS_VERSION` + the effective agentFeatures snapshot, children
+/// mint the latest version regardless of the creator's pin, and legacy rows
+/// project the current settings on read.
+mod harness_versioning {
+    use super::*;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    async fn create_agent(
+        svc: &Services,
+        ws: &WorkspaceId,
+        parent: Option<AgentId>,
+    ) -> serde_json::Value {
+        svc.agent_create_op(
+            ws.clone(),
+            Some("Harness".into()),
+            None,
+            None,
+            parent,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create agent")
+    }
+
+    /// New sessions stamp the current harness version and the full
+    /// agentFeatures snapshot at creation; both persist and surface on the
+    /// `agent.create` wire projection.
+    #[tokio::test]
+    async fn create_stamps_current_version_and_features_snapshot() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let agent = &created["agent"];
+        assert_eq!(
+            agent["harnessVersion"],
+            intent_core::CURRENT_HARNESS_VERSION,
+            "wire projection carries the stamped version"
+        );
+        let features = agent["harnessFeatures"]
+            .as_object()
+            .expect("wire projection carries the captured snapshot");
+        // The snapshot is the camelCase wire form of AgentFeaturesSettings —
+        // spot-check the defaults (taskGraph opt-in off, the rest on).
+        assert_eq!(features["taskGraph"], false);
+        assert_eq!(features["backgroundHooks"], true);
+
+        // Persisted, not projected: the row itself carries the stamp.
+        let id = AgentId::from(agent["id"].as_str().unwrap());
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        assert_eq!(
+            session.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
+        let persisted = session.harness_features.expect("persisted snapshot");
+        assert_eq!(persisted["taskGraph"], serde_json::json!(false));
+    }
+
+    /// Delegation mints LATEST, never inherits: a child created by a parent
+    /// pinned to an older harness version still stamps the current constant —
+    /// the stamp depends only on creation time, never on the creator.
+    #[tokio::test]
+    async fn child_session_mints_latest_never_inherits_parent_pin() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let parent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        // Age the parent's pin to a version that is NOT the current constant
+        // (simulating a session created by an older daemon).
+        sqlx::query("UPDATE agent_session SET harness_version = '0.9-legacy' WHERE id = ?")
+            .bind(&parent_id.0)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("age parent pin");
+        assert_eq!(
+            svc.store()
+                .get_agent_session(&parent_id)
+                .await
+                .expect("parent")
+                .harness_version,
+            "0.9-legacy"
+        );
+
+        let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
+        assert_eq!(
+            child["agent"]["harnessVersion"],
+            intent_core::CURRENT_HARNESS_VERSION,
+            "child stamps the current constant, not the parent's 0.9-legacy pin"
+        );
+        let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
+        let session = svc.store().get_agent_session(&child_id).await.expect("get");
+        assert_eq!(
+            session.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
+        assert!(
+            session.harness_features.is_some(),
+            "child snapshot captured"
+        );
+    }
+
+    /// Legacy rows (pre-0096, NULL snapshot) read back version "1.0" and the
+    /// wire projections overlay the CURRENT settings as the features value —
+    /// without persisting anything.
+    #[tokio::test]
+    async fn legacy_rows_project_current_settings_on_read() {
+        let (_tmp, svc, ws) = setup().await;
+        let created = create_agent(&svc, &ws, None).await;
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        // Simulate a pre-feature row: backfilled version, NULL snapshot.
+        sqlx::query(
+            "UPDATE agent_session SET harness_version = '1.0', harness_features = NULL \
+             WHERE id = ?",
+        )
+        .bind(&id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("null out snapshot");
+
+        // agent.get projection: current settings overlaid.
+        let session = svc.store().get_agent_session(&id).await.expect("get");
+        let lite = svc.project_lite_with_flags(session);
+        assert_eq!(lite.harness_version, "1.0");
+        let features = lite.harness_features.expect("projected from settings");
+        assert_eq!(features["taskGraph"], serde_json::json!(false));
+
+        // agent.getSession: same overlay.
+        let full = svc
+            .agent_get_session_op(id.clone())
+            .await
+            .expect("getSession");
+        assert!(full.harness_features.is_some());
+
+        // Never persisted: the row still carries NULL.
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT harness_features FROM agent_session WHERE id = ?")
+                .bind(&id.0)
+                .fetch_one(svc.store().read_pool())
+                .await
+                .expect("raw read");
+        assert_eq!(raw, None, "projection never writes the snapshot back");
     }
 }

@@ -9994,6 +9994,8 @@ mod role_reminder_tests {
     ) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
             parent_agent_id: None,
@@ -12122,6 +12124,8 @@ mod agent_retry_tests {
     fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
         let ts = now_iso();
         AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: agent_id.clone(),
             workspace_id: ws.clone(),
             parent_agent_id: None,

@@ -7591,6 +7591,8 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     let ws_c = WorkspaceId::new();
     let ts = now_iso();
     let seed = |id: &str, ws: &WorkspaceId, name: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId(id.to_string()),
         workspace_id: ws.clone(),
         backend_session_id: None,
