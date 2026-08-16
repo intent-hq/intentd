@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.9] - 2026-08-16
+
+### 🚀 Features
+
+- *(mcp)* Probe http/sse MCP servers and report real status ([#1263](https://github.com/intent-hq/intentd/pull/1263))
+
+
 ## [0.7.8] - 2026-08-16
 
 ### 🚀 Features
