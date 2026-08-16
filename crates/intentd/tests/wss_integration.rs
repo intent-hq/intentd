@@ -795,6 +795,9 @@ async fn wss_oversized_message_terminates_connection() {
 /// Agent ids are server-assigned: `agent.create` rejects a client-supplied
 /// `agentId` with `-32602` ("server-assigned"), and a create without the
 /// field mints an `agent-{uuid}` id that `agent.get` resolves (PROTOCOL §5.5).
+/// The created/resolved `AgentLite` payloads also carry the harness stamp
+/// (`harnessVersion` = current constant, `harnessFeatures` = the captured
+/// agentFeatures snapshot) over the real wire (intent-hq/monorepo#2459).
 #[tokio::test]
 async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
@@ -843,6 +846,35 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
             .is_some_and(|tail| uuid::Uuid::parse_str(tail).is_ok()),
         "server mints agent-{{uuid}}: {created}"
     );
+    // Harness stamp on the create response (monorepo#2459): the wire carries
+    // the current version constant and the full captured agentFeatures
+    // snapshot in camelCase.
+    assert_eq!(
+        created["result"]["agent"]["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.create response carries harnessVersion: {created}"
+    );
+    let features = &created["result"]["agent"]["harnessFeatures"];
+    assert!(
+        features.is_object(),
+        "agent.create response carries the harnessFeatures snapshot: {created}"
+    );
+    for key in [
+        "backgroundHooks",
+        "hostExec",
+        "scripts",
+        "terminalAccess",
+        "browserAutomation",
+        "richChatBlocks",
+        "structuredQuestions",
+        "attentionRequests",
+        "stateSnapshot",
+    ] {
+        assert!(
+            features[key].is_boolean(),
+            "harnessFeatures.{key} must be a boolean toggle: {created}"
+        );
+    }
     let get_frame = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
     );
@@ -851,6 +883,37 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
         got["result"]["agent"]["id"].as_str(),
         Some(minted.as_str()),
         "agent.get at the server-minted id must resolve: {got}"
+    );
+    // The stamp survives the read path too (agent.get projects the persisted
+    // row, not the create-time in-memory value).
+    assert_eq!(
+        got["result"]["agent"]["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.get response carries harnessVersion: {got}"
+    );
+    assert_eq!(
+        got["result"]["agent"]["harnessFeatures"], *features,
+        "agent.get returns the same persisted harnessFeatures snapshot: {got}"
+    );
+    // agent.list projects the same stamp on its AgentLite rows.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    let row = listed["result"]["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(minted.as_str()))
+        .expect("minted agent in list");
+    assert_eq!(
+        row["harnessVersion"].as_str(),
+        Some(intent_core::CURRENT_HARNESS_VERSION),
+        "agent.list rows carry harnessVersion: {listed}"
+    );
+    assert_eq!(
+        row["harnessFeatures"], *features,
+        "agent.list rows carry the persisted harnessFeatures snapshot: {listed}"
     );
 
     srv.ws.stop().await;
@@ -7591,6 +7654,8 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
     let ws_c = WorkspaceId::new();
     let ts = now_iso();
     let seed = |id: &str, ws: &WorkspaceId, name: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId(id.to_string()),
         workspace_id: ws.clone(),
         backend_session_id: None,

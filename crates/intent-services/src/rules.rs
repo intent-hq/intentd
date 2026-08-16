@@ -1045,6 +1045,8 @@ This is a test skill.
 
         let ts = intent_core::now_iso();
         let session = intent_core::AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: intent_core::AgentId::from("agent-skip"),
             workspace_id: intent_core::WorkspaceId::from("ws-skip"),
             parent_agent_id: None,

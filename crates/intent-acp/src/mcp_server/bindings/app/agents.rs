@@ -500,6 +500,8 @@ mod tests {
 
     fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
         AgentLite {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId::from_string(id),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,

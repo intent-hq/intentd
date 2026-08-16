@@ -997,6 +997,8 @@ async fn golden_hook_eviction_internal_error_notice_bytes() {
 async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: id.clone(),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -1622,6 +1624,8 @@ fn golden_skills_catalog_wrapper() {
 #[test]
 fn golden_isolation_hints() {
     let mut session = intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId::from("agent-iso"),
         workspace_id: WorkspaceId::from("ws-1"),
         parent_agent_id: None,
