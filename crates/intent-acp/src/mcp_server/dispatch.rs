@@ -21,7 +21,31 @@ use serde_json::{json, Value};
 /// `__mcpContentItems` contributes its resource items here, so registration
 /// at the tool result no longer depends on the agent's JS returning the
 /// envelope. Shared between the host closure and `dispatch_workspace_api`.
-type PendingAttachments = Arc<Mutex<Vec<TurnAttachment>>>;
+///
+/// Frames are keyed by a sequence number taken synchronously when the JS
+/// invokes `host()` — NOT when the dispatch future resolves — so parallel
+/// calls (`Promise.all([...])`) drain in call order even when an earlier
+/// call's I/O finishes later.
+#[derive(Default)]
+struct PendingAttachmentState {
+    /// Next `host()` frame sequence number (call order).
+    next_seq: u64,
+    /// Collected batches, keyed by their frame's sequence number.
+    entries: Vec<(u64, Vec<TurnAttachment>)>,
+}
+
+impl PendingAttachmentState {
+    /// Flatten the collected batches in `host()` call order.
+    fn drain_in_call_order(&mut self) -> Vec<TurnAttachment> {
+        let mut entries = std::mem::take(&mut self.entries);
+        entries.sort_by_key(|(seq, _)| *seq);
+        entries.into_iter().flat_map(|(_, batch)| batch).collect()
+    }
+}
+
+/// Shared handle to [`PendingAttachmentState`] between the host closure and
+/// `dispatch_workspace_api`.
+type PendingAttachments = Arc<Mutex<PendingAttachmentState>>;
 
 use super::WorkspaceMcpServer;
 
@@ -84,7 +108,7 @@ impl WorkspaceMcpServer {
         // stamping would mint nonces that never register.
         let pending: Option<PendingAttachments> =
             match (&self.turn_attachments, &self.caller_agent_id) {
-                (Some(_), Some(_)) => Some(Arc::new(Mutex::new(Vec::new()))),
+                (Some(_), Some(_)) => Some(Arc::new(Mutex::new(PendingAttachmentState::default()))),
                 _ => None,
             };
         let host = make_workspace_host_with_pending(
@@ -117,7 +141,7 @@ impl WorkspaceMcpServer {
         // register no matter what the script did afterwards — discarded the
         // envelope, returned something else, or even threw (monorepo#2637).
         let pending_batch: Vec<TurnAttachment> = pending
-            .map(|p| std::mem::take(&mut *p.lock().unwrap()))
+            .map(|p| p.lock().unwrap().drain_in_call_order())
             .unwrap_or_default();
         match eval_result {
             Ok(v) => match v.get("__k").and_then(Value::as_str) {
@@ -555,6 +579,16 @@ fn make_workspace_host_with_pending(
         let registry = turn_attachments.clone();
         let features = features.clone();
         let pending = pending.clone();
+        // Take the frame's sequence number NOW — synchronously, while the JS
+        // engine is invoking `host()` — so parallel calls
+        // (`Promise.all([...])`) keep call order even when an earlier call's
+        // dispatch awaits I/O and resolves later.
+        let seq = pending.as_ref().map(|p| {
+            let mut state = p.lock().unwrap();
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            seq
+        });
         Box::pin(async move {
             let result = workspace_host_dispatch(
                 api,
@@ -566,12 +600,12 @@ fn make_workspace_host_with_pending(
                 arg,
             )
             .await;
-            match (result, &pending) {
-                (Ok(mut value), Some(pending)) => {
-                    collect_binding_attachments(&mut value, pending);
+            match (result, &pending, seq) {
+                (Ok(mut value), Some(pending), Some(seq)) => {
+                    collect_binding_attachments(&mut value, pending, seq);
                     Ok(value)
                 }
-                (result, _) => result,
+                (result, ..) => result,
             }
         }) as BoxFuture<'static, std::result::Result<Value, String>>
     })
@@ -581,9 +615,10 @@ fn make_workspace_host_with_pending(
 /// carries `__mcpContentItems`, stamp a fresh nonce into each resource item
 /// (mutating the value the agent's JS will see, so a returned envelope
 /// carries the SAME nonce) and stash the canonical payloads in the
-/// per-invocation collector. `dispatch_workspace_api` drains the collector
+/// per-invocation collector under the frame's call-order sequence number.
+/// `dispatch_workspace_api` drains the collector (sorted by that number)
 /// into the registry when the tool call completes.
-fn collect_binding_attachments(value: &mut Value, pending: &PendingAttachments) {
+fn collect_binding_attachments(value: &mut Value, pending: &PendingAttachments, seq: u64) {
     let Some(items) = value
         .get_mut("__mcpContentItems")
         .and_then(Value::as_array_mut)
@@ -592,7 +627,7 @@ fn collect_binding_attachments(value: &mut Value, pending: &PendingAttachments) 
     };
     let batch = stamp_and_collect(items, &HashSet::new());
     if !batch.is_empty() {
-        pending.lock().unwrap().extend(batch);
+        pending.lock().unwrap().entries.push((seq, batch));
     }
 }
 
@@ -721,6 +756,41 @@ fn extract_missing_prop(msg: &str) -> Option<String> {
     let rest = &msg[start..];
     let end = rest.find('\'')?;
     Some(rest[..end].to_string())
+}
+
+#[cfg(test)]
+mod pending_attachment_order_tests {
+    use super::*;
+
+    fn attachment(name: &str) -> TurnAttachment {
+        TurnAttachment {
+            id: new_attachment_id(),
+            policy: AttachmentPolicy::AtToolResult,
+            mime_type: "application/vnd.intent.proposal+json".into(),
+            uri: format!("intent-proposal://test/{name}"),
+            name: name.to_string(),
+            text: "{}".into(),
+        }
+    }
+
+    /// Parallel `host()` calls can resolve out of order (`Promise.all` where
+    /// the first call awaits I/O the second does not); the drain must yield
+    /// call order — the frame sequence number — not completion order.
+    #[test]
+    fn drain_yields_call_order_not_completion_order() {
+        let mut state = PendingAttachmentState::default();
+        let (seq_a, seq_b) = (state.next_seq, state.next_seq + 1);
+        state.next_seq += 2;
+        // Completion order reversed: the second call's batch lands first.
+        state.entries.push((seq_b, vec![attachment("Second")]));
+        state.entries.push((seq_a, vec![attachment("First")]));
+        let drained = state.drain_in_call_order();
+        assert_eq!(
+            drained.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["First", "Second"]
+        );
+        assert!(state.entries.is_empty(), "drain empties the collector");
+    }
 }
 
 #[cfg(test)]
