@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.11] - 2026-08-16
+
+### 🚀 Features
+
+- *(host)* Report validated standard-directory favorites on host.listDirectory ([#1268](https://github.com/intent-hq/intentd/pull/1268))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Register proposal turn attachments at binding call time ([#1270](https://github.com/intent-hq/intentd/pull/1270))
+
+### 📚 Documentation
+
+- *(acp)* Update browser_docs tunnel lifecycle for persistent forwards ([#1269](https://github.com/intent-hq/intentd/pull/1269))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(core)* Stop seeding taskGraph into the first-boot config template ([#1271](https://github.com/intent-hq/intentd/pull/1271))
+
+
 ## [0.7.10] - 2026-08-16
 
 ### 🐛 Bug Fixes
