@@ -31,8 +31,14 @@ use crate::{system_actor, EventBus};
 const SETTING_KEY: &str = "mcp.servers";
 /// MCP protocol version advertised on `initialize` (mirrors the stdio peers).
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP protocol version advertised on remote `http` probes: the earliest
+/// revision that defines the streamable-HTTP transport.
+const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 /// Timeout for the `initialize`/`tools/list` handshake requests.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall wall-clock bound for one remote probe (handshake + follow-ups),
+/// so a slow endpoint cannot hold a probe for multiple per-request timeouts.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for a single health `ping`.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Accept` header required by MCP streamable HTTP (the server may answer a
@@ -437,10 +443,14 @@ impl McpHub {
                 (id.clone(), probe)
             })
             .collect();
+        // Remote probes run concurrently (each bounded by [`PROBE_TIMEOUT`]),
+        // so slow endpoints cannot serialize the sweep and starve stdio pings.
+        let mut remote_probes = tokio::task::JoinSet::new();
         for (id, probe) in targets {
             let conn = match probe {
                 Probe::Remote(config) => {
-                    self.reprobe_remote(&id, &config).await;
+                    let hub = self.clone();
+                    remote_probes.spawn(async move { hub.reprobe_remote(&id, &config).await });
                     continue;
                 }
                 Probe::Stdio(conn) => conn,
@@ -466,6 +476,7 @@ impl McpHub {
                 self.restart(config, true).await;
             }
         }
+        while remote_probes.join_next().await.is_some() {}
     }
 
     /// Re-probe a remote server and store the fresh status, emitting
@@ -633,6 +644,9 @@ async fn remote_probe_status(id: &str, config: &Value) -> Value {
 /// handshake (`initialize` → `notifications/initialized` → `tools/list`) over
 /// streamable HTTP POST; `sse` is a reachability probe only (full SSE sessions
 /// are out of scope). `Ok` carries the advertised tool count (http only).
+/// The whole probe is bounded by [`PROBE_TIMEOUT`] on top of the per-request
+/// [`HANDSHAKE_TIMEOUT`]. Redirects are never followed: configured headers may
+/// carry credentials that reqwest would forward to a cross-host redirect.
 async fn probe_remote(config: &Value) -> Result<Option<u64>> {
     let transport = config
         .get("transport")
@@ -642,16 +656,23 @@ async fn probe_remote(config: &Value) -> Result<Option<u64>> {
         .get("url")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::InvalidParams(format!("{transport} server requires a url")))?;
+        .ok_or_else(|| Error::InvalidParams(format!("{transport} server requires a url")))?
+        .to_string();
     let client = reqwest::Client::builder()
         .timeout(HANDSHAKE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::Internal(format!("http client init failed: {e}")))?;
     let headers = config_headers(config);
-    match transport {
-        "sse" => probe_sse(&client, url, &headers).await.map(|()| None),
-        _ => probe_http_handshake(&client, url, &headers).await,
-    }
+    let probe = async move {
+        match transport {
+            "sse" => probe_sse(&client, &url, &headers).await.map(|()| None),
+            _ => probe_http_handshake(&client, &url, &headers).await,
+        }
+    };
+    tokio::time::timeout(PROBE_TIMEOUT, probe)
+        .await
+        .map_err(|_| Error::Internal("probe timed out".to_string()))?
 }
 
 /// The configured request headers of a remote config (`headers` object;
@@ -694,7 +715,9 @@ async fn probe_sse(
 /// MCP handshake over streamable HTTP POST, mirroring the stdio handshake:
 /// `initialize` (required) → `notifications/initialized` (best-effort) →
 /// `tools/list` (best-effort tool count). The `Mcp-Session-Id` issued by
-/// `initialize` is echoed on follow-ups per the streamable-HTTP transport.
+/// `initialize` is echoed on follow-ups per the streamable-HTTP transport,
+/// and the session is torn down with a best-effort `DELETE` afterwards so
+/// periodic re-probes don't accumulate orphaned sessions server-side.
 async fn probe_http_handshake(
     client: &reqwest::Client,
     url: &str,
@@ -705,12 +728,12 @@ async fn probe_http_handshake(
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": MCP_HTTP_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "intentd", "version": env!("CARGO_PKG_VERSION") },
         },
     });
-    let resp = post_rpc(client, url, headers, None, &init).await?;
+    let resp = post_rpc(client, url, headers, None, None, &init).await?;
     check_http_status(resp.status())?;
     let session = resp
         .headers()
@@ -718,14 +741,20 @@ async fn probe_http_handshake(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let envelope = read_rpc_response(resp, 1).await?;
-    if let Some(err) = envelope.get("error") {
-        return Err(Error::Internal(format!("mcp initialize failed: {err}")));
-    }
+    let result = validate_rpc_result(&envelope, 1, "initialize")?;
+    // Revisions ≥2025-06-18 expect the negotiated version echoed back as an
+    // `MCP-Protocol-Version` header on subsequent HTTP requests.
+    let proto = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let sid = session.as_deref();
+    let ver = proto.as_deref();
     // Notification (servers typically answer 202); failures are non-fatal.
     let inited = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-    let _ = post_rpc(client, url, headers, session.as_deref(), &inited).await;
+    let _ = post_rpc(client, url, headers, sid, ver, &inited).await;
     let tools = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} });
-    let tool_count = match post_rpc(client, url, headers, session.as_deref(), &tools).await {
+    let tool_count = match post_rpc(client, url, headers, sid, ver, &tools).await {
         Ok(resp) if resp.status().is_success() => {
             read_rpc_response(resp, 2).await.ok().and_then(|v| {
                 v.get("result")
@@ -736,16 +765,47 @@ async fn probe_http_handshake(
         }
         _ => None,
     };
+    // Best-effort session teardown (spec: clients SHOULD send HTTP DELETE).
+    if let Some(sid) = sid {
+        let mut req = client.delete(url).header("Mcp-Session-Id", sid);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(ver) = ver {
+            req = req.header("MCP-Protocol-Version", ver);
+        }
+        let _ = req.send().await;
+    }
     Ok(tool_count)
 }
 
+/// Validate a JSON-RPC 2.0 response envelope: `jsonrpc: "2.0"`, matching `id`,
+/// no `error`, and a `result` object present. Returns the `result`. This is
+/// what keeps a non-MCP JSON endpoint from being reported as `running`.
+fn validate_rpc_result<'a>(envelope: &'a Value, id: u64, method: &str) -> Result<&'a Value> {
+    if let Some(err) = envelope.get("error") {
+        return Err(Error::Internal(format!("mcp {method} failed: {err}")));
+    }
+    if envelope.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || envelope.get("id").and_then(Value::as_u64) != Some(id)
+    {
+        return Err(Error::Internal(format!(
+            "mcp {method} failed: not a JSON-RPC 2.0 response"
+        )));
+    }
+    envelope
+        .get("result")
+        .ok_or_else(|| Error::Internal(format!("mcp {method} failed: response carries no result")))
+}
+
 /// POST one JSON-RPC message to a streamable-HTTP endpoint with the configured
-/// headers (plus the session id when the server issued one).
+/// headers (plus the session id / negotiated protocol version when known).
 async fn post_rpc(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
     session: Option<&str>,
+    protocol_version: Option<&str>,
     body: &Value,
 ) -> Result<reqwest::Response> {
     let mut req = client
@@ -757,6 +817,9 @@ async fn post_rpc(
     }
     if let Some(sid) = session {
         req = req.header("Mcp-Session-Id", sid);
+    }
+    if let Some(ver) = protocol_version {
+        req = req.header("MCP-Protocol-Version", ver);
     }
     req.send().await.map_err(|e| classify_send_error(e, url))
 }
@@ -963,9 +1026,11 @@ impl<'a> McpServersService<'a> {
         let normalized = normalize_config(config, Some(server_id))?;
         configs.insert(server_id.to_string(), normalized.clone());
         write_configs(self.secrets, &configs).await?;
-        // Apply live: a running server picks up the new command/env on restart.
-        let running = self.hub.status(server_id)["state"] == "running";
-        if running {
+        // Apply live: any tracked server (running, or a remote in `error`)
+        // picks up the new definition on restart — an error-state remote must
+        // re-probe the updated URL/headers, not keep probing the old config.
+        let tracked = self.hub.status(server_id)["state"] != "stopped";
+        if tracked {
             let enable = enable_user_servers(&self.effective());
             self.hub.restart(normalized.clone(), enable).await;
         }
@@ -2076,6 +2141,7 @@ mod tests {
             .expect("subscription open");
 
         guard.abort(); // stub gone → next probe fails
+        let _ = guard.await; // listener provably dropped before the re-probe
         h.health_tick().await;
         assert_eq!(h.status("r-flip")["state"], json!("error"));
         let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
@@ -2130,5 +2196,54 @@ mod tests {
         assert_eq!(h.status("r-stop")["state"], json!("error"));
         assert!(h.stop("r-stop").await, "tracked entry is stopped");
         assert_eq!(h.status("r-stop"), status_stopped("r-stop"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_non_jsonrpc_body_maps_to_error() {
+        // A JSON endpoint that is not an MCP server (no jsonrpc/id/result
+        // envelope) must NOT be reported as running.
+        let resp = ok_json_response(r#"{"hello":"world"}"#);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _guard) = http_stub(leaked).await;
+
+        let h = McpHub::new();
+        let status = h.start(remote_cfg("r-notmcp", "http", &url), true).await;
+        assert_eq!(status["state"], json!("error"));
+        assert!(status["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("not a JSON-RPC 2.0 response"));
+    }
+
+    #[tokio::test]
+    async fn update_reprobes_error_state_remote() {
+        // A remote stuck in `error` (dead URL) must re-probe the NEW config on
+        // update, not stay pinned to the old one until the next health tick.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let resp = ok_json_response(body);
+        let leaked: &'static str = Box::leak(resp.into_boxed_str());
+        let (live_url, _guard) = http_stub(leaked).await;
+
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let s = svc(None, &secrets, &h);
+        s.create(json!({
+            "id": "r-upd", "transport": "http", "url": dead_url, "enabled": true,
+        }))
+        .await
+        .unwrap();
+        let out = s.toggle("r-upd", true).await.unwrap();
+        assert_eq!(out["status"]["state"], json!("error"));
+
+        s.update(
+            "r-upd",
+            json!({ "transport": "http", "url": live_url, "enabled": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.status("r-upd")["state"], json!("running"));
     }
 }

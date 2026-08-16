@@ -69,6 +69,10 @@ function runStdio() {
 
 function runHttp() {
   const server = createServer((req, res) => {
+    if (req.method === 'DELETE') {
+      res.writeHead(204).end();
+      return;
+    }
     let body = '';
     req.on('data', (chunk) => (body += chunk));
     req.on('end', () => {
