@@ -375,15 +375,24 @@ pub(crate) fn build_isolation_hint(
 }
 
 /// Format the RTK instruction line for the given usable subcommands. Wording
-/// owned by the harness (H5).
-pub(crate) fn rtk_instruction_line(subcommands: &[String]) -> String {
-    crate::harness::latest().rtk_instruction_line(subcommands)
+/// owned by the given harness (H5); session-scoped assembly passes the
+/// session's pinned harness, session-less callers pass
+/// `crate::harness::latest()`.
+pub(crate) fn rtk_instruction_line(
+    harness: &'static dyn crate::harness::Harness,
+    subcommands: &[String],
+) -> String {
+    harness.rtk_instruction_line(subcommands)
 }
 
-/// Build the RTK instruction line when enabled and available.
+/// Build the RTK instruction line when enabled and available, worded by
+/// `harness` (the session's pinned harness in session-scoped assembly).
 /// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
 /// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
-async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
+async fn build_rtk_instruction(
+    harness: &'static dyn crate::harness::Harness,
+    rtk_enabled: bool,
+) -> Option<String> {
     if !rtk_enabled {
         return None;
     }
@@ -400,7 +409,7 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
         return None;
     }
 
-    Some(rtk_instruction_line(&status.subcommands))
+    Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
 /// Assemble the effective system prompt (the **internal** injection pipeline,
@@ -492,9 +501,10 @@ pub(crate) async fn assemble_system_prompt(
         }
     }
     // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
-    // subcommand, append the instruction line. Placed after workspace-rules,
-    // before skills / isolation hint / specialist role.
-    if let Some(rtk_instruction) = build_rtk_instruction(rtk_enabled).await {
+    // subcommand, append the instruction line (worded by the session's pinned
+    // harness). Placed after workspace-rules, before skills / isolation hint /
+    // specialist role.
+    if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
         parts.push(rtk_instruction);
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user

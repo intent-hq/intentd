@@ -1220,8 +1220,12 @@ impl Services {
             .ok()
             .and_then(|w| w.path.or(w.worktree_path))
             .map(PathBuf::from);
+        // Embedded floor pinned to the session's stamped harness version
+        // (H2); the wrapper wording stays latest-owned (turn envelope, H6).
+        let entry = crate::harness::resolve_entry(&session.harness_version);
         let (name, reminder) = self
             .specialists_service()
+            .with_embedded(entry.doctrine.specialists)
             .resolve_role_reminder(specialist_id, workspace_path.as_deref())?;
         Some(crate::harness::latest().role_reminder_prefix(&name, &reminder))
     }
@@ -1246,8 +1250,12 @@ impl Services {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // Embedded floor pinned to the session's stamped harness version
+        // (H2) so respawns under a newer binary keep the pinned prompts.
+        let entry = crate::harness::resolve_entry(&session.harness_version);
         let resolved = session.specialist.as_deref().and_then(|id| {
             self.specialists_service()
+                .with_embedded(entry.doctrine.specialists)
                 .resolve_prompt_injection(id, workspace_path)
         });
         match (override_bp, resolved) {

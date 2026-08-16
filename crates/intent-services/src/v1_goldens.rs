@@ -1629,7 +1629,10 @@ fn golden_user_rules_wrapper() {
 #[test]
 fn golden_rtk_instruction_line() {
     assert_eq!(
-        crate::rules::rtk_instruction_line(&["git".to_string(), "cargo".to_string()]),
+        crate::rules::rtk_instruction_line(
+            crate::harness::latest(),
+            &["git".to_string(), "cargo".to_string()]
+        ),
         "Prefix these commands with rtk for compressed, LLM-friendly output: git, cargo"
     );
 }

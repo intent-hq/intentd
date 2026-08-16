@@ -131,11 +131,10 @@ pub(crate) struct HarnessEntry {
 /// (`(id, body)` pairs, the floor of the specialist 3-tier resolution).
 pub(crate) struct Doctrine {
     pub instructions: &'static crate::instructions::InstructionSet,
-    /// The version's embedded specialist bundle. The live specialist 3-tier
-    /// resolution reads the latest bundle directly
-    /// (`specialists::EMBEDDED_BUNDLED`); this pin keeps every past
-    /// version's prompts bundled and is exercised by registry tests.
-    #[allow(dead_code)]
+    /// The version's embedded specialist bundle — the floor of the specialist
+    /// 3-tier resolution for sessions stamped with this version
+    /// (`SpecialistsService::with_embedded`); session-less `specialist.*`
+    /// RPCs keep reading the latest bundle.
     pub specialists: &'static [(&'static str, &'static str)],
 }
 

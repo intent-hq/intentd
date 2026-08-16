@@ -59,14 +59,16 @@ pub(crate) const EMBEDDED_BUNDLED_V1: &[(&str, &str)] = &[
     ),
 ];
 
-/// The embedded bundled floor the specialist 3-tier resolution uses — the
-/// LATEST version's set (the file tiers above it are user-owned and
-/// unversioned).
+/// The embedded bundled floor the specialist 3-tier resolution uses by
+/// default — the LATEST version's set (the file tiers above it are
+/// user-owned and unversioned). Session-scoped resolution swaps in the
+/// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
 const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V1;
 
-/// Resolve an embedded bundled specialist by id (the lowest tier).
-fn load_embedded(id: &str) -> Option<Value> {
-    EMBEDDED_BUNDLED
+/// Resolve an embedded bundled specialist by id from `bundle` (the lowest
+/// tier).
+fn load_embedded(bundle: &[(&str, &str)], id: &str) -> Option<Value> {
+    bundle
         .iter()
         .find(|(k, _)| *k == id)
         .map(|(k, content)| build_def(k, content, "bundled", Path::new("")))
@@ -87,6 +89,11 @@ fn default_user_dir() -> Option<PathBuf> {
 
 /// Default bundled specialists directory: the [`BUNDLED_DIR_ENV`] override if
 /// set, else `resources/specialists/` next to the running executable.
+/// Deliberately UNVERSIONED (no `v1/` segment): this on-disk tier is an
+/// install-owned override layer (like the user/project tiers), not a copy of
+/// the repo's versioned `resources/specialists/<ver>/` source layout — the
+/// versioned bundles ship embedded via `include_str!`, and no packaging step
+/// places files here.
 fn default_bundled_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(BUNDLED_DIR_ENV) {
         let p = PathBuf::from(p);
@@ -616,6 +623,11 @@ fn auto_generate_role_reminder(behavior_prompt: &str) -> String {
 pub(crate) struct SpecialistsService {
     user_dir: Option<PathBuf>,
     bundled_dir: Option<PathBuf>,
+    /// The embedded bundled floor (H2): the latest bundle by default;
+    /// session-scoped resolution swaps in the session's pinned version's
+    /// bundle via [`Self::with_embedded`]. The file tiers above it are
+    /// user-owned and unversioned.
+    embedded: &'static [(&'static str, &'static str)],
 }
 
 impl SpecialistsService {
@@ -626,7 +638,17 @@ impl SpecialistsService {
         Self {
             user_dir: user_dir.or_else(default_user_dir),
             bundled_dir: bundled_dir.or_else(default_bundled_dir),
+            embedded: EMBEDDED_BUNDLED,
         }
+    }
+
+    /// Replace the embedded bundled floor with a pinned version's bundle
+    /// (H2): session-scoped resolution (prompt injection, role reminder)
+    /// resolves specialists against the doctrine the session was stamped
+    /// with, so a respawn under a newer binary keeps the pinned prompts.
+    pub(crate) fn with_embedded(mut self, bundle: &'static [(&'static str, &'static str)]) -> Self {
+        self.embedded = bundle;
+        self
     }
 
     /// Load one specialist file from `dir` as `source`, if it exists and reads;
@@ -645,7 +667,9 @@ impl SpecialistsService {
 
     /// Resolve a single id through the 3-tier order project > user > bundled.
     /// Within the bundled tier an on-disk file wins over the embedded copy;
-    /// the compile-time [`EMBEDDED_BUNDLED`] set is the always-available floor.
+    /// the compile-time embedded set (`self.embedded`, the latest bundle
+    /// unless a session pinned one via [`Self::with_embedded`]) is the
+    /// always-available floor.
     /// Tiers are folded from the floor upward so `hidden` and the config
     /// scalars ([`INHERITED_CONFIG_KEYS`]) inherit across them: a higher-tier
     /// file that omits a key keeps the lower tiers' effective value, while an
@@ -658,7 +682,7 @@ impl SpecialistsService {
         // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
         // resolve_role_reminder, resolve_prompt_injection).
         validate_id(id).ok()?;
-        let mut resolved = load_embedded(id);
+        let mut resolved = load_embedded(self.embedded, id);
         let project = workspace_path.map(project_dir);
         let tiers = [
             (self.bundled_dir.as_deref(), "bundled"),
@@ -685,7 +709,7 @@ impl SpecialistsService {
         scope: &str,
         workspace_path: Option<&Path>,
     ) -> Option<Value> {
-        let mut resolved = load_embedded(id);
+        let mut resolved = load_embedded(self.embedded, id);
         let project = workspace_path.map(project_dir);
         let tiers = [
             (self.bundled_dir.as_deref(), "bundled"),
@@ -847,7 +871,7 @@ impl SpecialistsService {
     /// project tier.
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
-        for (id, content) in EMBEDDED_BUNDLED {
+        for (id, content) in self.embedded {
             acc.insert(
                 id.to_string(),
                 build_def(id, content, "bundled", Path::new("")),
@@ -1250,6 +1274,38 @@ mod tests {
 
     fn service_over(dir: &TempSpecialistsDir) -> SpecialistsService {
         SpecialistsService::new(Some(dir.path.clone()), Some(dir.path.clone()))
+    }
+
+    /// `with_embedded` swaps the embedded floor (H2): resolution and `list`
+    /// read the pinned bundle instead of the latest one, while the file tiers
+    /// above stay in play.
+    #[test]
+    fn with_embedded_pins_the_floor_bundle() {
+        static PINNED: &[(&str, &str)] = &[(
+            "implementor",
+            "---\nname: \"Pinned Implementor\"\ndescription: \"d\"\n---\n\npinned body",
+        )];
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty).with_embedded(PINNED);
+        let def = svc.resolve("implementor", None).expect("resolves");
+        assert_eq!(def["name"], "Pinned Implementor");
+        assert_eq!(def["behaviorPrompt"], "pinned body");
+        // list() reflects the pinned floor too (one entry, the pinned id).
+        let listed = svc.list(None).unwrap();
+        let ids: Vec<&str> = listed["specialists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["implementor"]);
+        // A file tier still overrides the pinned floor.
+        empty.write(
+            "implementor",
+            "---\nname: \"File Implementor\"\ndescription: \"d\"\n---\n\nfile body",
+        );
+        let def = svc.resolve("implementor", None).expect("resolves");
+        assert_eq!(def["name"], "File Implementor");
     }
 
     #[test]

@@ -333,10 +333,12 @@ fn gated_workspace_agent(
     }
 }
 
-/// [`get_instruction_with_common_for`] over the LATEST instruction set. Used
-/// by callers with no session to pin against (e.g. the commit-message
-/// background body); session-scoped prompt assembly resolves the session's
-/// pinned set via the harness registry instead.
+/// [`get_instruction_with_common_for`] over the LATEST instruction set.
+/// Test-only convenience (byte-pin goldens, unit tests): every production
+/// caller has a session in scope and resolves the session's pinned set via
+/// the harness registry instead (prompt assembly, and the commit-message
+/// background body in `auto_commit.rs`).
+#[cfg(test)]
 pub(crate) fn get_instruction_with_common(
     agent_type: &str,
     features: &AgentFeaturesSettings,
