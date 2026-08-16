@@ -727,6 +727,21 @@ async fn wss_system_status_includes_capacity_version_uptime() {
             );
         }
     }
+    // Workspaces-root disk fields (additive): the harness points
+    // INTENTD_WORKSPACES_DIR at an existing tempdir and the sampler takes a
+    // synchronous first sample before the listeners come up, so both fields
+    // are present with plausible volume sizes.
+    let disk_avail = obj["workspacesDiskAvailableBytes"]
+        .as_u64()
+        .expect("workspacesDiskAvailableBytes is u64");
+    let disk_total = obj["workspacesDiskTotalBytes"]
+        .as_u64()
+        .expect("workspacesDiskTotalBytes is u64");
+    assert!(disk_total > 0, "workspacesDiskTotalBytes > 0: {r}");
+    assert!(
+        disk_avail <= disk_total,
+        "available must not exceed total: {r}"
+    );
 }
 
 #[tokio::test]

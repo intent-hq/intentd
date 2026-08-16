@@ -28169,6 +28169,41 @@ mod worktrees_location {
         assert!(got.is_dir(), "expanded location is created");
     }
 
+    /// The side-effect-free mirror used by the `system.status` workspaces-disk
+    /// sampler tracks `resolve_workspaces_parent` precedence: a non-empty
+    /// absolute location wins unless the root is startup-pinned; empty /
+    /// pinned / relative (invalid) forms fall through to the default root —
+    /// and it never creates directories.
+    #[test]
+    fn provisioning_parent_mirror_tracks_create_precedence() {
+        use crate::try_workspaces_provisioning_parent;
+        let custom = tempfile::tempdir().expect("custom root");
+        let nested = custom.path().join("nested").join("worktrees");
+        let nested_str = nested.to_string_lossy().to_string();
+
+        // Non-empty absolute setting, no pin → the location, NOT created.
+        let got =
+            try_workspaces_provisioning_parent(false, &nested_str).expect("location resolves");
+        assert_eq!(got, nested, "setting wins over default root");
+        assert!(!nested.exists(), "mirror never creates directories");
+
+        // Startup pin → the default root even when the setting is set.
+        let fallback = crate::try_default_workspaces_root();
+        assert_eq!(
+            try_workspaces_provisioning_parent(true, &nested_str),
+            fallback,
+            "startup pin keeps precedence"
+        );
+        // Empty / whitespace / relative (create would error) → default root.
+        for loc in ["", "   ", "relative/dir"] {
+            assert_eq!(
+                try_workspaces_provisioning_parent(false, loc),
+                fallback,
+                "`{loc}` falls back to the default root"
+            );
+        }
+    }
+
     /// End-to-end through `workspace.create`: with the setting present the
     /// workspace lands under the configured location (metadata file proves
     /// the resolved parent); cleared back to empty, the next create falls

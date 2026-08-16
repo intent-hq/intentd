@@ -104,6 +104,17 @@ pub struct SystemStatus {
     /// Spawns currently queued behind the admission gate (slot cap or memory
     /// budget). `None` when the budget is off.
     pub queued_spawns: Option<u64>,
+    /// Available bytes on the volume containing the daemon's resolved
+    /// workspaces root. `None` until the background disk sampler lands its
+    /// first sample, or when no mounted volume matches the root (e.g. an
+    /// empty disks list in a locked-down container, or an unmounted drive
+    /// letter on Windows — a merely not-yet-created root still matches its
+    /// would-be volume). Presence-detected on the wire — omitted when `None`,
+    /// never null or 0.
+    pub workspaces_disk_available_bytes: Option<u64>,
+    /// Total bytes of the volume containing the workspaces root. `None`
+    /// alongside `workspaces_disk_available_bytes`.
+    pub workspaces_disk_total_bytes: Option<u64>,
 }
 
 /// A `(username, password)` pair resolved for `system.gitCredential`.
@@ -264,6 +275,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     }
     if let Some(queued) = status.queued_spawns {
         obj.insert("queuedSpawns".into(), queued.into());
+    }
+    if let Some(avail) = status.workspaces_disk_available_bytes {
+        obj.insert("workspacesDiskAvailableBytes".into(), avail.into());
+    }
+    if let Some(total) = status.workspaces_disk_total_bytes {
+        obj.insert("workspacesDiskTotalBytes".into(), total.into());
     }
     v
 }

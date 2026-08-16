@@ -7002,6 +7002,51 @@ fn default_workspaces_root() -> PathBuf {
         .join("workspaces")
 }
 
+/// Non-panicking [`default_workspaces_root`] for boot-time consumers that must
+/// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
+/// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
+/// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
+/// `$HOME` default would panic — else the same root the service layer uses.
+pub fn try_default_workspaces_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
+        return None;
+    }
+    Some(
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("intent")
+            .join("workspaces"),
+    )
+}
+
+/// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
+/// observability consumers (the `system.status` workspaces-disk sampler in the
+/// composition root): the parent directory `workspace.create` would provision
+/// new checkouts under, with the same precedence — the startup-pinned
+/// `workspaces.root` (`root_pinned`, `INTENTD_WORKSPACES_DIR`) wins, then a
+/// non-empty absolute `workspace.worktreesLocation` (tilde-expanded), then the
+/// default root. Unlike the create-path resolver it never creates directories,
+/// never errors (a relative location — which would fail the create — falls
+/// back to the default root), and never fires the hermetic guard (`None` via
+/// [`try_default_workspaces_root`] in that posture).
+pub fn try_workspaces_provisioning_parent(
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Option<PathBuf> {
+    let location = worktrees_location.trim();
+    if !root_pinned && !location.is_empty() {
+        let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+    try_default_workspaces_root()
+}
+
 /// Structural guard against `~/intent/workspaces` leaks from tests. Fires only
 /// inside crate unit tests (`cfg(test)`) or when the harness explicitly opts
 /// in via `INTENTD_ASSERT_HERMETIC_ROOT`; production `intentd` binaries never
