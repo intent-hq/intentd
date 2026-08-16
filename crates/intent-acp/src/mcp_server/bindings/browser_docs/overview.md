@@ -89,9 +89,12 @@ for the lifetime of the Electron app. Transient drops of the underlying daemon
 connection do not kill it — the forward stays registered on the same `localPort` and
 lazily reconnects on the next inbound connection.
 
-- A forward is closed only by: an explicit `closeTunnel`, switching the daemon
-  backend/connection, quitting the app, or all of its owning workspaces being
-  archived/deleted. Forwards not tied to any workspace live for the app lifetime.
+- A forward is closed only by: an explicit `closeTunnel`, a daemon backend switch,
+  quitting the app, or all of its owning workspaces being archived/deleted. Forwards
+  not tied to any workspace live for the app lifetime.
+- One exception: a definitively refused connect to the daemon-side port (server gone)
+  drops the forward immediately — re-open with `openTunnel { remotePort }` to re-mint
+  it.
 - `openTunnel` is cheap and idempotent per `remotePort`: it returns the existing
   forward (`reused: true`) when one is already registered, so calling it again is
   always safe and returns the current `localPort`.

@@ -89,7 +89,9 @@ Lifecycle: forwards are persistent — a forward keeps its `localPort` for the E
 app's lifetime and survives transient daemon-connection drops (it lazily reconnects on
 the next inbound connection). It is closed only by an explicit `closeTunnel`, a daemon
 backend switch, app quit, or all of its owning workspaces being archived/deleted
-(forwards not tied to any workspace live for the app lifetime). `openTunnel` stays
+(forwards not tied to any workspace live for the app lifetime). One exception: a
+definitively refused connect to the daemon-side port (server gone) drops the forward
+immediately — re-open with the same `remotePort` to re-mint it. `openTunnel` stays
 idempotent per `remotePort` (`reused: true` when already registered). Older Electron
 clients may still exhibit the previous ephemeral behavior; if a `localPort` refuses
 connections there, re-open with the same `remotePort`.
