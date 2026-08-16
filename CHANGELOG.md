@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.6] - 2026-08-16
+
+### 🧪 Testing
+
+- *(services)* Deflake lastActivity debounce persist waits with bounded polls ([#1256](https://github.com/intent-hq/intentd/pull/1256))
+
+
 ## [0.7.5] - 2026-08-16
 
 ### 🚀 Features
