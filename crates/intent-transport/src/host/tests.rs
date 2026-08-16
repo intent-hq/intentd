@@ -364,6 +364,10 @@ async fn handle_list_directory_returns_entries_for_cwd() {
     assert_eq!(parsed["id"], 13);
     assert!(parsed["result"]["entries"].is_array());
     assert!(parsed["result"]["path"].is_string());
+    // The additive `favorites` field is always present; `home` always leads.
+    let favorites = parsed["result"]["favorites"].as_array().unwrap();
+    assert_eq!(favorites[0]["id"], "home");
+    assert!(favorites[0]["path"].is_string());
 }
 
 #[tokio::test]
