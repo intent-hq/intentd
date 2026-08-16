@@ -268,6 +268,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
         // Agent 1: will be resumed
         let session1 = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(agent_resume.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             backend_session_id: None,
@@ -325,6 +327,8 @@ async fn resolve_interrupted_resume_and_abandon() {
 
         // Agent 2: will be abandoned
         let session2 = AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
             id: AgentId(agent_abandon.clone()),
             workspace_id: WorkspaceId(ws_id.to_string()),
             backend_session_id: None,

@@ -733,6 +733,8 @@ async fn persisted_pr_status_only_is_pr_open_over_wss() {
 fn top_level_session(ws: &WorkspaceId, id: &str) -> intent_core::AgentSession {
     let ts = now_iso();
     intent_core::AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: intent_core::AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,

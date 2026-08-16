@@ -767,6 +767,8 @@ async fn workspace_emit_notification_reports_unavailable_in_port() {
 /// `name`, `status`, and `is_responding` matter to the archive guardrail.
 fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) -> AgentLite {
     AgentLite {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
         id: AgentId::from_string(id),
         workspace_id: WorkspaceId::from_string("ws-1"),
         parent_agent_id: None,
