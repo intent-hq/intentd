@@ -6887,20 +6887,39 @@ pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
 /// that must stay OUT of the `known_repo` registry
 /// (intent-hq/monorepo#2227): either the workspace's `repository_path` IS its
 /// checkout (standalone clone / cache hydration, where
-/// `repository_path == worktree_path`), or the path lives under one of the
-/// daemon's workspace roots (covers `ws.path` fallbacks, worktree-less rows,
-/// and leftovers from deleted workspaces). Genuine user repos live outside
-/// the roots and are never their own checkout.
+/// `repository_path == worktree_path`) AND it follows the daemon-owned
+/// `<parent>/<workspaceId>/<slug>` layout (parent directory named after the
+/// workspace id — covers checkouts under a former worktrees location), or the
+/// path lives under one of the daemon's workspace roots (covers `ws.path`
+/// fallbacks, worktree-less rows, and leftovers from deleted workspaces).
+/// The layout gate keeps `isNewRepo` direct rows — whose checkout IS the
+/// user's own repository folder (`repository_path == worktree_path`,
+/// intent-hq/monorepo#2611) — registered and visible like any other
+/// user-picked local repo. Genuine user repos live outside the roots and
+/// never match the daemon-owned layout.
 fn is_workspace_owned_checkout(
+    workspace_id: &WorkspaceId,
     repo_path: &str,
     worktree_path: Option<&str>,
     workspaces_roots: &[PathBuf],
 ) -> bool {
-    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path) {
+    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path)
+        && checkout_parent_is_workspace_dir(repo_path, workspace_id)
+    {
         return true;
     }
     let path = Path::new(repo_path);
     workspaces_roots.iter().any(|root| path.starts_with(root))
+}
+
+/// True when `checkout`'s parent directory is named after `workspace_id` —
+/// the daemon-owned `<parent>/<workspaceId>/<slug>` provisioning layout.
+fn checkout_parent_is_workspace_dir(checkout: &str, workspace_id: &WorkspaceId) -> bool {
+    Path::new(checkout)
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
+        .unwrap_or(false)
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -7790,7 +7809,12 @@ async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf])
         if repo_path.is_empty() {
             continue;
         }
-        if is_workspace_owned_checkout(repo_path, ws.worktree_path.as_deref(), workspaces_roots) {
+        if is_workspace_owned_checkout(
+            &ws.id,
+            repo_path,
+            ws.worktree_path.as_deref(),
+            workspaces_roots,
+        ) {
             continue;
         }
         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
@@ -7801,19 +7825,29 @@ async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf])
     // Self-heal: drop rows registered before the skip above existed. A row is
     // workspace-owned when it sits under a workspaces root (also covers
     // leftovers from deleted workspaces) or matches a live workspace's
-    // standalone checkout (`repository_path == worktree_path`) that lives
-    // outside the current roots (e.g. under a former worktrees location).
+    // standalone checkout (`repository_path == worktree_path` in the
+    // daemon-owned `<parent>/<wsId>/<slug>` layout) that lives outside the
+    // current roots (e.g. under a former worktrees location). An `isNewRepo`
+    // direct row also has `repository_path == worktree_path` but the folder
+    // is the user's own repository (intent-hq/monorepo#2611): the layout gate
+    // keeps it in the registry.
     let standalone: std::collections::HashSet<&str> = workspaces
         .iter()
         .filter(|ws| {
             ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
                 && ws.repository_path == ws.worktree_path
+                && ws
+                    .repository_path
+                    .as_deref()
+                    .is_some_and(|p| checkout_parent_is_workspace_dir(p, &ws.id))
         })
         .filter_map(|ws| ws.repository_path.as_deref())
         .collect();
     for repo in store.list_known_repos().await? {
         if standalone.contains(repo.path.as_str())
-            || is_workspace_owned_checkout(&repo.path, None, workspaces_roots)
+            || workspaces_roots
+                .iter()
+                .any(|root| Path::new(&repo.path).starts_with(root))
         {
             store.remove_known_repo(&repo.path).await?;
         }
@@ -13636,6 +13670,7 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .filter(|p| {
                             !is_workspace_owned_checkout(
+                                &ws.id,
                                 p,
                                 ws.worktree_path.as_deref(),
                                 &registry_roots,
@@ -14637,17 +14672,11 @@ impl WorkspaceApi for Services {
                 // swept — leaking is the safe direction (never delete what we
                 // cannot prove we created).
                 let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
-                    let wt = Path::new(wt);
-                    let parent_is_ws_id = wt
-                        .parent()
-                        .and_then(Path::file_name)
-                        .map(|n| n == std::ffi::OsStr::new(id_bg.as_str()))
-                        .unwrap_or(false);
-                    parent_is_ws_id
-                        && (wt.starts_with(&workspaces_root_bg)
+                    checkout_parent_is_workspace_dir(wt, &id_bg)
+                        && (Path::new(wt).starts_with(&workspaces_root_bg)
                             || worktrees_location_bg
                                 .as_deref()
-                                .is_some_and(|loc| wt.starts_with(loc)))
+                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
                 });
                 // A standalone row's checkout path is caller-influenced
                 // (`repository_path == worktree_path`), so unless ownership is
