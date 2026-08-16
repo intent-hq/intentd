@@ -37,7 +37,7 @@ intent-transport = { path = "../intent-transport", version = "0.7.7" }
 intent-js = { path = "../intent-js", version = "0.7.7", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
 
 [features]
 default = []

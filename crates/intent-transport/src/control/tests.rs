@@ -41,6 +41,8 @@ impl FakeControl {
                 agent_memory_budget_bytes: Some(21_474_836_480),
                 agent_memory_charged_bytes: Some(3_221_225_472),
                 queued_spawns: Some(1),
+                workspaces_disk_available_bytes: Some(250_000_000_000),
+                workspaces_disk_total_bytes: Some(1_000_000_000_000),
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
@@ -166,6 +168,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         agent_memory_budget_bytes: None,
         agent_memory_charged_bytes: None,
         queued_spawns: None,
+        workspaces_disk_available_bytes: None,
+        workspaces_disk_total_bytes: None,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));
@@ -184,6 +188,9 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
     assert!(!obj.contains_key("agentMemoryBudgetBytes"));
     assert!(!obj.contains_key("agentMemoryChargedBytes"));
     assert!(!obj.contains_key("queuedSpawns"));
+    // No disk sample ⇒ the disk fields are ABSENT (presence-detected), not null.
+    assert!(!obj.contains_key("workspacesDiskAvailableBytes"));
+    assert!(!obj.contains_key("workspacesDiskTotalBytes"));
 }
 
 /// The descendant-tree fields ride `system.status` so a debug
@@ -226,6 +233,15 @@ fn status_json_carries_the_budget_fields_when_installed() {
         .unwrap()
         .contains_key("agentMemoryChargedBytes"));
     assert_eq!(v["queuedSpawns"], 0);
+}
+
+/// The workspaces-root disk fields ride `system.status` so a client can warn
+/// when the volume hosting workspace checkouts is running out of space.
+#[test]
+fn status_json_carries_the_workspaces_disk_fields_when_sampled() {
+    let v = status_json(&FakeControl::new().status, true);
+    assert_eq!(v["workspacesDiskAvailableBytes"], 250_000_000_000u64);
+    assert_eq!(v["workspacesDiskTotalBytes"], 1_000_000_000_000u64);
 }
 
 #[tokio::test]
