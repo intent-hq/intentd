@@ -77,7 +77,10 @@ const HOOK_LOG_MAX_BYTES: usize = 8 * 1024;
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wake messages; longer captures are head-truncated to the most recent tail.
-const HOOK_WAKE_LOGS_CAP: usize = 2048;
+/// Owned by the harness (H6) alongside the section wording; re-exposed here
+/// for the byte-exact truncation tests.
+#[cfg(test)]
+const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 
 /// Cap (in bytes) on a run's JSON-serialized carry-over state. An oversized
 /// `state` is dropped (the previous state is kept) with a warning line
@@ -355,11 +358,8 @@ fn parse_state(v: &Value, logs: &mut Option<String>) -> StateUpdate {
     }
     let serialized = state.to_string();
     if serialized.len() > HOOK_STATE_MAX_BYTES {
-        let warning = format!(
-            "[hook state dropped: {} bytes exceeds the {HOOK_STATE_MAX_BYTES}-byte cap; \
-             previous state kept]",
-            serialized.len()
-        );
+        let warning = crate::harness::latest()
+            .hook_state_dropped_warning(serialized.len(), HOOK_STATE_MAX_BYTES);
         let combined = match logs.take() {
             Some(l) => format!("{l}\n{warning}"),
             None => warning,
@@ -387,24 +387,9 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// Append a run's captured console output to a wake message as a
 /// `[hook logs]` section, head-truncated to [`HOOK_WAKE_LOGS_CAP`] chars so a
 /// log-heavy run cannot flood the owner's queue. No-op when the run logged
-/// nothing.
+/// nothing. Wording and truncation owned by the harness (H6).
 pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
-    let Some(logs) = logs.filter(|l| !l.is_empty()) else {
-        return message.to_string();
-    };
-    if logs.chars().count() <= HOOK_WAKE_LOGS_CAP {
-        return format!("{message}\n\n[hook logs]\n{logs}");
-    }
-    let start = logs
-        .char_indices()
-        .rev()
-        .nth(HOOK_WAKE_LOGS_CAP - 1)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    format!(
-        "{message}\n\n[hook logs]\n[earlier log lines truncated]\n{}",
-        &logs[start..]
-    )
+    crate::harness::latest().hook_wake_logs_section(message, logs)
 }
 
 /// Project one active hook into its idle-visibility `waitingOnHooks` entry:
@@ -812,8 +797,8 @@ impl Services {
         // owner-side cancel delivers no wake.
         let notice = caller
             .is_none()
-            .then_some("This hook was cancelled from the app.");
-        let hook = self.cancel_active_hook(hook, notice).await?;
+            .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
+        let hook = self.cancel_active_hook(hook, notice.as_deref()).await?;
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
@@ -880,7 +865,7 @@ impl Services {
             if let Err(e) = self
                 .cancel_active_hook(
                     hook,
-                    Some("This hook was cancelled because its workspace was archived."),
+                    Some(&crate::harness::latest().hook_cancelled_workspace_archived_notice()),
                 )
                 .await
             {
@@ -1286,10 +1271,8 @@ impl Services {
                 hook.run_count += 1;
                 hook.last_error = Some(error.clone());
                 self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-                let notice = format!(
-                    "Your background hook \"{}\" was evicted after a failed run: {error}",
-                    hook.name
-                );
+                let notice =
+                    crate::harness::latest().hook_evicted_failed_run_notice(&hook.name, &error);
                 let notice = match logs {
                     RunLogs::Captured(ref l) => with_wake_logs(&notice, l.as_deref()),
                     RunLogs::Lost => notice,
@@ -1351,10 +1334,8 @@ impl Services {
         hook.next_run_at = None;
         hook.last_error = Some(error.clone());
         self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-        let notice = format!(
-            "Your background hook \"{}\" was evicted after an internal error: {error}",
-            hook.name
-        );
+        let notice =
+            crate::harness::latest().hook_evicted_internal_error_notice(&hook.name, &error);
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
         // (§6.5) and drop the `waiting` flag (§5.1) — best-effort like
@@ -1397,26 +1378,11 @@ impl Services {
     /// runs AND dispatches instead of "without a dispatch".
     async fn finish_expiry(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let plural = |n: i64| if n == 1 { "" } else { "s" };
-        let tally = if hook.perpetual {
-            format!(
-                "{} run{}, {} dispatch{}",
-                hook.run_count,
-                plural(hook.run_count),
-                hook.dispatch_count,
-                if hook.dispatch_count == 1 { "" } else { "es" }
-            )
-        } else {
-            format!(
-                "{} run{} completed without a dispatch",
-                hook.run_count,
-                plural(hook.run_count)
-            )
-        };
-        let notice = format!(
-            "Your background hook \"{}\" expired after reaching its TTL ({tally}). Schedule a \
-             new hook via ws.hook.schedule if the condition is still worth watching.",
-            hook.name,
+        let notice = crate::harness::latest().hook_expired_notice(
+            &hook.name,
+            hook.perpetual,
+            hook.run_count,
+            hook.dispatch_count,
         );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
@@ -1482,29 +1448,16 @@ impl Services {
         if reason == "dispatched" {
             metadata["hookStillActive"] = json!(dispatch_still_active);
         }
+        let harness = crate::harness::latest();
         let state_note = match reason {
-            "dispatched" if dispatch_still_active => Some(format!(
-                "[This hook remains active until {} — cancel via ws.hook.cancel \
-                 when no longer needed.]",
-                hook.expires_at.as_deref().unwrap_or("its TTL elapses")
-            )),
-            "dispatched" => Some(
-                "[This hook is now retired and will not run again — reschedule via \
-                 ws.hook.schedule if still needed.]"
-                    .to_string(),
-            ),
-            "evicted" => Some(
-                "[This hook will not run again. Schedule a new hook via \
-                 ws.hook.schedule if the condition is still worth watching.]"
-                    .to_string(),
-            ),
+            "dispatched" if dispatch_still_active => {
+                Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
+            }
+            "dispatched" => Some(harness.hook_dispatch_retired_note()),
+            "evicted" => Some(harness.hook_evicted_state_note()),
             _ => None,
         };
-        let mut content = format!("[Background hook \"{}\"] {message}", hook.name);
-        if let Some(note) = state_note {
-            content.push_str("\n\n");
-            content.push_str(&note);
-        }
+        let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
         if let Err(e) = self
             .deliver_wake_message(
                 &hook.workspace_id,

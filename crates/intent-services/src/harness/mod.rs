@@ -13,9 +13,15 @@
 //! is exactly the changed surfaces.
 //!
 //! Wake/queue system messages (hook/PR-monitor/watch wakes, dequeue notes,
-//! delegation preamble, …) migrate behind the harness separately (H6).
+//! delegation preamble, notices — H6) live behind the same trait: the
+//! producing functions in the managers remain as thin delegators (so tests
+//! and goldens keep their call paths) while every byte of wording lives in
+//! the version module.
 
 pub(crate) mod v1;
+
+use crate::agent_ops::ready_delta::UnblockedTask;
+use crate::pr_monitor::PrMonitorSnapshot;
 
 /// Typed inputs for [`Harness::compose_turn_prompt`]: the per-turn envelope
 /// layers, outermost-first. Each optional layer is either raw data the
@@ -39,6 +45,35 @@ pub(crate) struct TurnEnvelopeParams<'a> {
     pub role_reminder: Option<&'a str>,
     /// The turn body: user content, possibly history-wrapped.
     pub body: &'a str,
+}
+
+/// Typed inputs for the per-child settlement texts
+/// ([`Harness::completion_wake`] / [`Harness::group_child_line`]): the data
+/// half of a child-settlement report, extracted from the `agent:*` event by
+/// the caller. All text fields arrive pre-filtered (empty strings resolved
+/// to `None`); precedence between them (report over summary, stall tail
+/// suppression next to a rendered report) is wording and belongs to the
+/// harness.
+pub(crate) struct ChildSettlementParams<'a> {
+    /// The child's agent id (`agent-…`), always present.
+    pub child_id: &'a str,
+    /// Resolved display name (event `agentName`, falling back to the event
+    /// actor); `None` renders the bare id.
+    pub agent_name: Option<&'a str>,
+    /// The settlement event type (`agent:idle` / `agent:failed` /
+    /// `agent:deleted`); unknown types render verbatim.
+    pub event_type: &'a str,
+    /// The child's completion report (persisted or event-carried).
+    pub completion_report: Option<&'a str>,
+    /// The event's `lastResponseSummary`; loses to a present report.
+    pub last_response_summary: Option<&'a str>,
+    /// The event's `error` text.
+    pub error: Option<&'a str>,
+    /// Pending attention request folded onto a group line:
+    /// `(kind, reason)` with kind `"blocker"` / `"discussion"`.
+    pub attention: Option<(&'a str, &'a str)>,
+    /// Suspected stall (monorepo#1016): `(task_title, task_status)`.
+    pub stall: Option<(&'a str, &'a str)>,
 }
 
 /// One method per system-generated text surface. Implementations own 100% of
@@ -89,6 +124,152 @@ pub(crate) trait Harness: Send + Sync {
     /// (FirstTurnPrepend → snapshot → Context → naming nudge → role reminder
     /// → body) is itself versioned.
     fn compose_turn_prompt(&self, params: &TurnEnvelopeParams<'_>) -> String;
+
+    // --- Queue notes and warnings (`agent_manager.rs`) ---
+
+    /// `[SYSTEM NOTE]` appended to a stale queued-message redrive (#576).
+    fn stale_redrive_note(&self, report_timestamp: &str) -> String;
+    /// `[SYSTEM NOTE]` appended to a drained queue entry (monorepo#2353).
+    fn dequeue_wait_note(&self, queued_at: &str, waited: &str) -> String;
+    /// Human-readable wait for [`Harness::dequeue_wait_note`]: `Ns` under a
+    /// minute, then `Nm Ss`, then `Nh Mm`; negative waits clamp to `0s`.
+    fn wait_duration(&self, secs: i64) -> String;
+    /// `[SYSTEM WARNING]` injected after a prompt idle-timeout interrupt;
+    /// `window` is the pre-rendered seconds value (e.g. `1800` / `1.5`).
+    fn idle_timeout_warning(&self, window: &str) -> String;
+
+    // --- Prompt notices (`agent_manager.rs`) ---
+
+    /// `[System: {n} image(s) …]` notice after note-referenced images are
+    /// inlined (Fidelity B, PROTOCOL §5.5).
+    fn note_images_notice(&self, n: usize) -> String;
+    /// `[Attachment: …]` reference notice (PROTOCOL §5.5): metadata plus the
+    /// `ws.file.getAttachment` retrieval instruction.
+    fn attachment_reference_notice(
+        &self,
+        name: &str,
+        mime: Option<&str>,
+        size: Option<u64>,
+        id: &str,
+    ) -> String;
+
+    // --- Completion / group / watch wakes (`lib.rs`, `agent_ops.rs`) ---
+
+    /// `[WORKSPACE EVENTS] Child agent {label} {kind}.` completion wake with
+    /// report/summary/error tail and the #2051 watch-retired notes.
+    fn completion_wake(&self, params: &ChildSettlementParams<'_>, watch_retired: bool) -> String;
+    /// One `- {label} {kind}.…` per-child line of an after_all group wake,
+    /// including the attention fold.
+    fn group_child_line(&self, params: &ChildSettlementParams<'_>) -> String;
+    /// The aggregated group-settlement wake: header plus accumulated
+    /// per-child lines.
+    fn group_settlement_wake(&self, total: usize, partial: bool, child_lines: &[String]) -> String;
+    /// `[WORKSPACE EVENTS] Child agent … reported.` wake for an ungrouped
+    /// `agent.reportToParent`, with the consumed-watch note when the report
+    /// disarmed the parent's one-shot watch (monorepo#2528).
+    fn report_to_parent_wake(
+        &self,
+        agent_name: &str,
+        agent_id: &str,
+        report: &str,
+        watch_consumed: bool,
+    ) -> String;
+    /// Kind-flavored attention-request wake to the parent (`kind` is
+    /// `"discussion"` / `"blocker"`).
+    fn attention_parent_wake(
+        &self,
+        agent_name: &str,
+        agent_id: &str,
+        kind: &str,
+        reason: &str,
+    ) -> String;
+    /// Attention-request fan-out wake to an explicit watcher (monorepo#1229);
+    /// `grouped_watch` flips the completion promise to group settlement.
+    fn attention_watcher_wake(
+        &self,
+        agent_name: &str,
+        agent_id: &str,
+        kind: &str,
+        reason: &str,
+        grouped_watch: bool,
+    ) -> String;
+    /// `[WORKSPACE EVENTS] {n} event(s) matched your subscription: {types}.`
+    fn event_subscription_wake(&self, event_count: usize, event_types: &[&str]) -> String;
+    /// The advisory "Tasks now unblocked by …" section (monorepo#2044).
+    fn unblocked_section(&self, delta: &[UnblockedTask], multiple_triggers: bool) -> String;
+
+    // --- Hook wakes and notices (`hook_manager.rs`) ---
+
+    /// Append a run's captured console output as a `[hook logs]` section,
+    /// head-truncated so a log-heavy run cannot flood the owner's queue.
+    fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String;
+    /// Log-line warning for a returned hook `state` exceeding the byte cap.
+    fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String;
+    /// `[Background hook "{name}"] {message}` framing plus the optional
+    /// trailing state note.
+    fn hook_wake_framing(&self, hook_name: &str, message: &str, state_note: Option<&str>)
+        -> String;
+    /// State note on a re-armed perpetual dispatch: the hook remains active
+    /// until `expires_at` (`None` renders the TTL-elapses fallback).
+    fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String;
+    /// State note on a one-shot dispatch: the hook is retired.
+    fn hook_dispatch_retired_note(&self) -> String;
+    /// State note on an eviction wake: the hook will not run again.
+    fn hook_evicted_state_note(&self) -> String;
+    /// Eviction notice body after a failed run.
+    fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String;
+    /// Eviction notice body after an internal (store) error.
+    fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String;
+    /// TTL-expiry notice body, with the perpetual runs+dispatches tally.
+    fn hook_expired_notice(
+        &self,
+        hook_name: &str,
+        perpetual: bool,
+        run_count: i64,
+        dispatch_count: i64,
+    ) -> String;
+    /// FE-cancel notice body (`hook.cancel` with no agent caller).
+    fn hook_cancelled_from_app_notice(&self) -> String;
+    /// Archive-sweep cancel notice body.
+    fn hook_cancelled_workspace_archived_notice(&self) -> String;
+
+    // --- PR monitor wakes and notices (`pr_monitor.rs`) ---
+
+    /// The `<owner>/<name>#<number>` label every wake and event payload uses.
+    fn pr_monitor_label(&self, owner: &str, name: &str, number: i64) -> String;
+    /// The refreshed merge-requirements checklist ("where the PR stands
+    /// now").
+    fn pr_checklist(&self, snapshot: &PrMonitorSnapshot) -> String;
+    /// Per-field change lines between two snapshots (the diff wording is
+    /// versioned: the lines are both wake bullets and the persisted
+    /// `pending_changes` set).
+    fn pr_diff_lines(&self, old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String>;
+    /// The consolidated change wake: bullets plus the refreshed checklist.
+    fn pr_change_wake(
+        &self,
+        label: &str,
+        changes: &[String],
+        snapshot: &PrMonitorSnapshot,
+    ) -> String;
+    /// The terminal wake: merged/closed, monitoring stopped.
+    fn pr_terminal_wake(
+        &self,
+        label: &str,
+        changes: &[String],
+        snapshot: &PrMonitorSnapshot,
+    ) -> String;
+    /// FE-cancel notice (`pr.unmonitor` with no agent caller).
+    fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String;
+    /// Archive-sweep cancel notice.
+    fn pr_monitor_cancelled_workspace_archived_notice(&self, label: &str) -> String;
+
+    // --- Other conversation-reaching strings (`agent_ops.rs`) ---
+
+    /// The delegated child's first message: the optional body joined with the
+    /// TASK-C "Your Task Note" preamble.
+    fn delegation_first_message(&self, body: Option<&str>, title: &str, note_id: &str) -> String;
+    /// System notice after the user dismissed pending structured questions.
+    fn questions_dismissed_notice(&self, count: usize) -> String;
 }
 
 /// The latest harness version identifier — the version stamped onto new
