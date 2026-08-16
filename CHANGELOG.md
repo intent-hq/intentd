@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.8] - 2026-08-16
+
+### 🚀 Features
+
+- *(status)* Report workspaces-root disk space in system.status ([#1261](https://github.com/intent-hq/intentd/pull/1261))
+
+
 ## [0.7.7] - 2026-08-16
 
 ### 🚀 Features
