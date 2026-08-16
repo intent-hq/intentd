@@ -33,9 +33,24 @@ fn now_ms() -> i64 {
 }
 
 /// Wrap user-rule content for prompt injection (port of
-/// `formatUserRulesForContext`). Wording owned by the harness (H5).
+/// `formatUserRulesForContext`). Wording owned by the harness (H5); prompt
+/// assembly routes through the session's pinned harness directly (H2), so
+/// this latest-bound wrapper remains for the golden pins.
+#[cfg(test)]
 pub(crate) fn format_user_rules_for_context(content: &str, source: &str) -> String {
     crate::harness::latest().user_rules_wrapper(content, source)
+}
+
+/// The harness registry row for a session's stamped `harnessVersion` (H2):
+/// the pinned harness + doctrine when a session is supplied, else the latest
+/// (session-less callers — previews, background one-shots).
+fn session_harness_entry(
+    agent_session: Option<&intent_core::AgentSession>,
+) -> &'static crate::harness::HarnessEntry {
+    match agent_session {
+        Some(s) => crate::harness::resolve_entry(&s.harness_version),
+        None => crate::harness::latest_entry(),
+    }
 }
 
 /// A workspace rule file resolved off the worktree.
@@ -230,7 +245,32 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 ///
 /// `agent_features` gates feature-specific sections of the tier-3 bundled
 /// bodies only; tier 1/2 user-supplied content is never filtered.
+///
+/// Latest-bound convenience form kept for unit tests; prompt assembly
+/// resolves the session's pinned set via [`get_specialization_rules_for`].
+#[cfg(test)]
 pub(crate) async fn get_specialization_rules(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+) -> String {
+    get_specialization_rules_for(
+        crate::harness::latest_entry().doctrine.instructions,
+        store,
+        workspace_path,
+        agent_type,
+        agent_features,
+    )
+    .await
+}
+
+/// [`get_specialization_rules`] with an explicit tier-3 instruction set —
+/// the SESSION's pinned doctrine when called from [`assemble_system_prompt`]
+/// (H2): tier 1/2 user-supplied content is unversioned, only the bundled
+/// built-in comes from `set`.
+pub(crate) async fn get_specialization_rules_for(
+    set: &'static crate::instructions::InstructionSet,
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
@@ -253,8 +293,9 @@ pub(crate) async fn get_specialization_rules(
             }
         }
     }
-    // 3. Bundled built-in (composed with common/workspace per the reference).
-    crate::instructions::get_instruction_with_common(agent_type, agent_features)
+    // 3. Bundled built-in (composed with common/workspace per the reference),
+    // from the caller's pinned instruction set.
+    crate::instructions::get_instruction_with_common_for(set, agent_type, agent_features)
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
@@ -301,14 +342,16 @@ pub(crate) fn build_isolation_hint(
         .and_then(|s| s.specialist_name.as_deref())
         .unwrap_or("");
 
+    // The session's pinned harness owns the hint wording (H2); session-less
+    // calls resolve to the latest.
+    let harness = session_harness_entry(agent_session).harness;
+
     // Case 1: Sandboxed implementor — inject isolation context
     if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
-        return Some(
-            crate::harness::latest().sandboxed_implementor_hint(sandbox_path, sandbox_branch),
-        );
+        return Some(harness.sandboxed_implementor_hint(sandbox_path, sandbox_branch));
     }
 
     // Case 2: Coordinator in CoW-enabled direct-mode workspace
@@ -322,7 +365,7 @@ pub(crate) fn build_isolation_hint(
             let cow_supported = ws.cow_supported.unwrap_or(false);
 
             if is_direct_mode && cow_supported {
-                return Some(crate::harness::latest().coordinator_cow_hint());
+                return Some(harness.coordinator_cow_hint());
             }
         }
     }
@@ -332,15 +375,24 @@ pub(crate) fn build_isolation_hint(
 }
 
 /// Format the RTK instruction line for the given usable subcommands. Wording
-/// owned by the harness (H5).
-pub(crate) fn rtk_instruction_line(subcommands: &[String]) -> String {
-    crate::harness::latest().rtk_instruction_line(subcommands)
+/// owned by the given harness (H5); session-scoped assembly passes the
+/// session's pinned harness, session-less callers pass
+/// `crate::harness::latest()`.
+pub(crate) fn rtk_instruction_line(
+    harness: &'static dyn crate::harness::Harness,
+    subcommands: &[String],
+) -> String {
+    harness.rtk_instruction_line(subcommands)
 }
 
-/// Build the RTK instruction line when enabled and available.
+/// Build the RTK instruction line when enabled and available, worded by
+/// `harness` (the session's pinned harness in session-scoped assembly).
 /// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
 /// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
-async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
+async fn build_rtk_instruction(
+    harness: &'static dyn crate::harness::Harness,
+    rtk_enabled: bool,
+) -> Option<String> {
     if !rtk_enabled {
         return None;
     }
@@ -357,7 +409,7 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
         return None;
     }
 
-    Some(rtk_instruction_line(&status.subcommands))
+    Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
 /// Assemble the effective system prompt (the **internal** injection pipeline,
@@ -378,11 +430,19 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
 /// populated (tier 3 always resolves), so this returns `None` only in the
 /// unreachable case where even the bundled specialization is empty.
 ///
-/// `agent_features` (the `[agentFeatures]` toggles, read once at session
-/// creation like `rtk_enabled`) gates feature-specific prompt sections: the
-/// bundled specialization bodies via [`get_specialization_rules`], and the
-/// `## Asking the User Questions` footer block (`structuredQuestions`). With
-/// all defaults on the assembled prompt is byte-identical to the ungated one.
+/// `agent_features` (the `[agentFeatures]` toggles — the session's captured
+/// snapshot resolved by the caller via `session_agent_features`, falling back
+/// to live settings only for legacy NULL-snapshot rows) gates
+/// feature-specific prompt sections: the bundled specialization bodies via
+/// [`get_specialization_rules_for`], and the `## Asking the User Questions`
+/// footer block (`structuredQuestions`). With all defaults on the assembled
+/// prompt is byte-identical to the ungated one.
+///
+/// H2 (intent-hq/monorepo#2459): every harness-owned surface and the tier-3
+/// bundled doctrine resolve through the SESSION's stamped `harnessVersion`
+/// (via the harness registry), so an existing session keeps the exact prompt
+/// text it was created with even after the binary ships a newer doctrine set;
+/// a `None` session resolves to the latest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
@@ -396,13 +456,24 @@ pub(crate) async fn assemble_system_prompt(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
 ) -> Option<String> {
+    // The session's pinned harness + doctrine (H2): a stamped session keeps
+    // assembling the exact version it was created with; session-less calls
+    // (previews, background one-shots) resolve to the latest.
+    let entry = session_harness_entry(agent_session);
+    let harness = entry.harness;
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
         parts.push(c);
     }
-    let specialization =
-        get_specialization_rules(store, workspace_path, agent_type, agent_features).await;
+    let specialization = get_specialization_rules_for(
+        entry.doctrine.instructions,
+        store,
+        workspace_path,
+        agent_type,
+        agent_features,
+    )
+    .await;
     if !specialization.trim().is_empty() {
         parts.push(specialization);
     }
@@ -412,7 +483,7 @@ pub(crate) async fn assemble_system_prompt(
     if let Some(path) = workspace_path {
         if let Some((content, source)) = load_workspace_rules(path, None) {
             if !content.trim().is_empty() {
-                parts.push(format_user_rules_for_context(&content, &source));
+                parts.push(harness.user_rules_wrapper(&content, &source));
             }
         }
     }
@@ -424,15 +495,16 @@ pub(crate) async fn assemble_system_prompt(
             if let Some(instructions) = repo_config.instructions {
                 if !instructions.trim().is_empty() {
                     let source = format!("{}/.intent/config.json", repo_path.display());
-                    parts.push(format_user_rules_for_context(&instructions, &source));
+                    parts.push(harness.user_rules_wrapper(&instructions, &source));
                 }
             }
         }
     }
     // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
-    // subcommand, append the instruction line. Placed after workspace-rules,
-    // before skills / isolation hint / specialist role.
-    if let Some(rtk_instruction) = build_rtk_instruction(rtk_enabled).await {
+    // subcommand, append the instruction line (worded by the session's pinned
+    // harness). Placed after workspace-rules, before skills / isolation hint /
+    // specialist role.
+    if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
         parts.push(rtk_instruction);
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user
@@ -466,14 +538,14 @@ pub(crate) async fn assemble_system_prompt(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        parts.push(crate::harness::latest().specialist_role_section(bp));
+        parts.push(harness.specialist_role_section(bp));
     }
     // Commit-policy layer: one status-neutral clause, injected for every agent
     // (top-level and sub-agents alike) regardless of the auto-commit state.
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    parts.push(crate::harness::latest().commit_policy_clause());
+    parts.push(harness.commit_policy_clause());
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -491,7 +563,7 @@ pub(crate) async fn assemble_system_prompt(
             .and_then(|s| s.role_reminder.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        parts.push(crate::harness::latest().role_reminder_footer(name, reminder));
+        parts.push(harness.role_reminder_footer(name, reminder));
     }
     // Asking the User Questions + Suggested Next Steps — top-level
     // interactive agents only. Sub-agents don't own a user-facing chat turn
@@ -500,7 +572,7 @@ pub(crate) async fn assemble_system_prompt(
     // `agentFeatures.structuredQuestions` (spec audit row 8).
     if !is_sub_agent {
         if agent_features.structured_questions {
-            parts.push(crate::harness::latest().ask_questions_block());
+            parts.push(harness.ask_questions_block());
         }
         // Per-session effective state for the SP-1 footer wording: a session
         // that opted out via `skipAutoCommit` (delegation/creation while the
@@ -509,12 +581,12 @@ pub(crate) async fn assemble_system_prompt(
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
-        parts.push(crate::harness::latest().suggested_next_steps_block(effective_auto_commit));
+        parts.push(harness.suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {
         None
     } else {
-        Some(crate::harness::latest().join_prompt_layers(&parts))
+        Some(harness.join_prompt_layers(&parts))
     }
 }
 
