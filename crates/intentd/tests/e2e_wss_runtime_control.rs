@@ -690,7 +690,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     );
     // Aggregate-budget fields (monorepo#2063): the budget is ON by default
     // (auto resolves to recommended), so agentMemoryBudgetBytes and queuedSpawns
-    // are present. agentMemoryChargedBytes is absent until the descendant-tree
+    // are present. agentMemoryChargedBytes only appears once the descendant-tree
     // sampler lands its first sample.
     let obj = r.as_object().expect("result is object");
     assert!(
@@ -710,11 +710,23 @@ async fn wss_system_status_includes_capacity_version_uptime() {
         Some(0),
         "no spawn is queued in a fresh daemon: {r}"
     );
-    // agentMemoryChargedBytes is absent until the first sample
-    assert!(
-        !obj.contains_key("agentMemoryChargedBytes"),
-        "agentMemoryChargedBytes must be absent before first sample: {r}"
-    );
+    // agentMemoryChargedBytes is absent until the sampler's first sample, but
+    // "before the first sample" is not deterministically observable from a
+    // client: the sampler can land its first sample before this RPC (seen on
+    // CI — monorepo#2567), making the field present-with-0 on a fresh daemon.
+    // Accept both orderings; when present it must be a u64, never null. Do
+    // not tighten this back to "must be absent" — the deterministic
+    // absent-until-first-sample contract is covered by the status_json unit
+    // tests in intent-transport's control/tests.rs.
+    match obj.get("agentMemoryChargedBytes") {
+        None => {}
+        Some(v) => {
+            assert!(
+                v.is_u64(),
+                "agentMemoryChargedBytes is u64 when present, never null: {r}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
