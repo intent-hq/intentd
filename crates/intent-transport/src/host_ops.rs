@@ -751,12 +751,34 @@ const FAVORITE_DIRS: [(&str, &str, &str); 3] = [
     ("downloads", "XDG_DOWNLOAD_DIR", "Downloads"),
 ];
 
+/// Drop the shell backslash-escapes `xdg-user-dirs-update` writes into
+/// `user-dirs.dirs` values (`\$` → `$`, `\"` → `"`, `\\` → `\`, and generally
+/// `\X` → `X`); a trailing lone backslash is dropped.
+fn unescape_xdg_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Parse `home/.config/user-dirs.dirs` (the XDG user-dirs config, present on
 /// Linux) into `XDG_*_DIR` key → resolved absolute path. Lines must look like
 /// `XDG_DESKTOP_DIR="$HOME/Desktop"`: values are double-quoted, and per the
-/// XDG spec must be absolute or start with `$HOME/` — anything else (and
-/// comments / malformed lines) is skipped. A missing/unreadable file yields an
-/// empty map, which is also the expected macOS behavior (no such file).
+/// XDG spec must be absolute or be exactly `$HOME` / start with `$HOME/` —
+/// anything else (including slash-less forms like `$HOMEfoo`, comments, and
+/// malformed lines) is skipped. Values are shell-format, so backslash escapes
+/// written by `xdg-user-dirs-update` (`\$`, `\"`, `\\`) are unescaped after
+/// the `$HOME` prefix check. A missing/unreadable file yields an empty map,
+/// which is also the expected macOS behavior (no such file).
 fn parse_xdg_user_dirs(home: &Path) -> std::collections::HashMap<String, PathBuf> {
     let mut map = std::collections::HashMap::new();
     let Ok(content) = std::fs::read_to_string(home.join(".config").join("user-dirs.dirs")) else {
@@ -781,16 +803,41 @@ fn parse_xdg_user_dirs(home: &Path) -> std::collections::HashMap<String, PathBuf
         else {
             continue;
         };
-        let path = if let Some(rest) = value.strip_prefix("$HOME") {
+        let path = if value == "$HOME" || value.starts_with("$HOME/") {
+            let rest = unescape_xdg_value(&value["$HOME".len()..]);
             home.join(rest.trim_start_matches('/'))
-        } else if Path::new(value).is_absolute() {
-            PathBuf::from(value)
         } else {
-            continue;
+            let unescaped = unescape_xdg_value(value);
+            if !Path::new(&unescaped).is_absolute() {
+                continue;
+            }
+            PathBuf::from(unescaped)
         };
         map.insert(key.to_string(), path);
     }
     map
+}
+
+/// How long a computed `favorites` array is served from cache. Standard user
+/// directories effectively never move mid-session, so recomputation is pure
+/// overhead on repeated `host.listDirectory` navigation; 60s matches the
+/// file's other short-TTL discovery cache ([`FIND_BINARY_CACHE_TTL`]) and is
+/// short enough that a freshly created `~/Documents` shows up promptly.
+const FAVORITES_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Process-wide cache for [`favorites_cached`], keyed by the `home` path.
+/// Every result is cached (favorites always carry at least `home`), placing
+/// the field on the AGENTS.md derived-field ladder's TTL-cache rung: the
+/// user-dirs.dirs read + existence probes run at most once per TTL window,
+/// not on every `host.listDirectory` dispatch.
+fn favorites_cache() -> &'static DiscoveryCache<Vec<Value>> {
+    static CACHE: OnceLock<DiscoveryCache<Vec<Value>>> = OnceLock::new();
+    CACHE.get_or_init(|| DiscoveryCache::new(FAVORITES_CACHE_TTL))
+}
+
+/// TTL-cached wrapper around [`favorites_with`] — see [`favorites_cache`].
+fn favorites_cached(home: &Path) -> Vec<Value> {
+    favorites_cache().get_or_compute(&home.to_string_lossy(), || favorites_with(home), |_| true)
 }
 
 /// Build the `favorites` array for the `host.listDirectory` result: `{ id,
@@ -821,8 +868,10 @@ fn favorites_with(home: &Path) -> Vec<Value> {
 /// `None`/empty. `parent` is `null` at the filesystem root. Entries include
 /// hidden files (the FE filters), sorted directories-first then by name.
 /// `favorites` reports the standard user directories that exist on the daemon
-/// host (see [`favorites_with`]). Returns the error message (mapped to
-/// `-32603` by the caller) on IO errors.
+/// host (see [`favorites_with`]), served through the TTL cache
+/// ([`favorites_cached`]) so repeated directory navigation does not re-read
+/// the user-dirs config or re-probe on every dispatch. Returns the error
+/// message (mapped to `-32603` by the caller) on IO errors.
 pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Value, String> {
     let target = match path {
         Some(p) if !p.is_empty() => expand_path(p, home),
@@ -869,7 +918,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
             .unwrap_or(Value::Null),
         "home": home.to_string_lossy(),
         "entries": entries_json,
-        "favorites": favorites_with(home),
+        "favorites": favorites_cached(home),
     }))
 }
 

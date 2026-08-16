@@ -382,17 +382,19 @@ fn favorites_resolve_xdg_user_dirs_overrides() {
 }
 
 #[test]
-fn favorites_fall_back_to_conventional_on_invalid_xdg_values() {
-    // Unquoted / relative XDG values are invalid per the spec and must be
-    // ignored — the conventional home-joined name is used instead.
-    let home = unique_temp_dir("fav-xdg-invalid");
+fn favorites_unescape_shell_escapes_in_xdg_values() {
+    // `user-dirs.dirs` values are shell-format: `xdg-user-dirs-update` writes
+    // backslash escapes for shell-special characters (e.g. `\$`, `\"`, `\\`),
+    // which must be unescaped so the on-disk name resolves.
+    let home = unique_temp_dir("fav-xdg-esc");
     let home = home.path();
     std::fs::create_dir_all(home.join(".config")).unwrap();
-    std::fs::create_dir_all(home.join("Documents")).unwrap();
-    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    std::fs::create_dir_all(home.join("Archive$2026")).unwrap();
+    std::fs::create_dir_all(home.join("a\"b\\c")).unwrap();
     std::fs::write(
         home.join(".config").join("user-dirs.dirs"),
-        "XDG_DOCUMENTS_DIR=$HOME/Unquoted\nXDG_DOWNLOAD_DIR=\"relative/path\"\n",
+        "XDG_DOCUMENTS_DIR=\"$HOME/Archive\\$2026\"\n\
+         XDG_DOWNLOAD_DIR=\"$HOME/a\\\"b\\\\c\"\n",
     )
     .unwrap();
     let pairs = favorite_pairs(&favorites_with(home));
@@ -400,6 +402,47 @@ fn favorites_fall_back_to_conventional_on_invalid_xdg_values() {
         pairs,
         vec![
             ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "documents".into(),
+                home.join("Archive$2026").to_string_lossy().into_owned()
+            ),
+            (
+                "downloads".into(),
+                home.join("a\"b\\c").to_string_lossy().into_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn favorites_fall_back_to_conventional_on_invalid_xdg_values() {
+    // Unquoted / relative XDG values are invalid per the spec and must be
+    // ignored — the conventional home-joined name is used instead. A
+    // slash-less `$HOME`-prefixed value (`$HOMEfoo`) is not the documented
+    // `$HOME/` form and must be skipped, not resolved as home-relative.
+    let home = unique_temp_dir("fav-xdg-invalid");
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    std::fs::create_dir_all(home.join("Documents")).unwrap();
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    std::fs::create_dir_all(home.join("Desktop")).unwrap();
+    std::fs::create_dir_all(home.join("foo")).unwrap();
+    std::fs::write(
+        home.join(".config").join("user-dirs.dirs"),
+        "XDG_DOCUMENTS_DIR=$HOME/Unquoted\nXDG_DOWNLOAD_DIR=\"relative/path\"\nXDG_DESKTOP_DIR=\"$HOMEfoo\"\n",
+    )
+    .unwrap();
+    let pairs = favorite_pairs(&favorites_with(home));
+    // Desktop falls back to the conventional ~/Desktop (the `$HOMEfoo` value
+    // is skipped, never resolved to ~/foo), documents and downloads to theirs.
+    assert_eq!(
+        pairs,
+        vec![
+            ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "desktop".into(),
+                home.join("Desktop").to_string_lossy().into_owned()
+            ),
             (
                 "documents".into(),
                 home.join("Documents").to_string_lossy().into_owned()
