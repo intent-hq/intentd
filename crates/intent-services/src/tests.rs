@@ -25626,7 +25626,33 @@ mod last_activity_events {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "debounce persisted a lastActivity"
+                "debounce persisted a lastActivity (within 10s)"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Bounded poll for the harness workspace's debounce task to finish (it
+    /// removes itself from the debouncers map on completion). Unlike
+    /// `wait_for_persisted_last_activity`, this also covers derivations that
+    /// are expected to be no-ops — nothing is persisted or emitted to observe
+    /// — so an assertion that follows genuinely runs after the derivation
+    /// instead of racing it behind a fixed sleep (monorepo#2585).
+    async fn wait_for_debounce_settled(h: &Harness) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending = h
+                .services
+                .last_activity_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws);
+            if !pending {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounce task settled (within 10s)"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -25887,7 +25913,10 @@ mod last_activity_events {
             .raise_attention(&h.ws, WorkspaceAttention::ReviewRequired)
             .await
             .expect("raise again");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The no-op derivation persists and emits nothing, so wait for the
+        // debounce task itself to settle — a fixed sleep would leave this
+        // assertion vacuous whenever the timer fires late (monorepo#2585).
+        wait_for_debounce_settled(&h).await;
         assert_eq!(
             h.store
                 .get_workspace(&h.ws)
