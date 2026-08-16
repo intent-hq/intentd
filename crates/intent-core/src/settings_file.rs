@@ -1077,8 +1077,11 @@ fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value>
 /// The fully-commented default `config.toml` written by
 /// [`SettingsFile::load_or_init`] when no file exists. Every key appears with
 /// its default value (or a commented-out example when there is no default),
-/// annotated with its catalog label and description. Parsing this template
-/// must yield exactly [`SettingsFile::default`] (enforced by a unit test).
+/// annotated with its catalog label and description — except the opt-in
+/// `agentFeatures.taskGraph`, deliberately not seeded so configs without the
+/// key pick up a future default flip automatically (intent-hq/monorepo#2643).
+/// Parsing this template must yield exactly [`SettingsFile::default`]
+/// (enforced by a unit test).
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r##"# intentd configuration (non-secret settings).
 #
 # Strictly parsed: unknown keys, wrong types, and out-of-range values are
@@ -1334,8 +1337,8 @@ toonOutput = true
 maxPerAgent = 5
 
 [agentFeatures]
-# All toggles default to on (except taskGraph, which is opt-in); changes
-# apply to new agent sessions only.
+# All toggles listed here default to on; changes apply to new agent
+# sessions only.
 # Background hooks -- expose background hooks (ws.hook.*) to agents.
 backgroundHooks = true
 # Host exec -- expose one-shot host command execution (ws.host.exec) to
@@ -1363,12 +1366,6 @@ stateSnapshot = true
 # PR monitor -- expose centralized PR monitoring (ws.pr.monitor /
 # ws.pr.unmonitor) to agents.
 prMonitor = true
-# Task graph -- teach agents the task-graph workflow (batch delegate,
-# dependsOn/conflictsWith relations, @@@task fence attributes, unblocked-wake
-# hints). Docs/prompt only; the APIs themselves always work. Prompt/help and
-# wake teaching use the value captured when the parent session is created.
-# Opt-in: defaults to off.
-taskGraph = false
 
 [wakeResume]
 # Wake resume enabled -- detect host sleep/wake and resume work on wake.
@@ -1534,16 +1531,21 @@ mod tests {
 
     #[test]
     fn task_graph_defaults_off_and_opts_in() {
-        // Opt-in (intent-hq/monorepo#2445): empty file and the shipped
-        // template both resolve to off; an explicit `taskGraph = true` opts in.
+        // Opt-in (intent-hq/monorepo#2445): empty file resolves to off, and
+        // the shipped template no longer seeds the key (monorepo#2643), so
+        // first-boot configs pick up a future default flip automatically; an
+        // explicit `taskGraph = true` opts in.
         let parsed = SettingsFile::parse_str("").expect("empty file parses");
         assert!(!parsed.agent_features.task_graph);
-        assert!(DEFAULT_CONFIG_TEMPLATE.contains("taskGraph = false"));
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("taskGraph"));
         let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
         assert!(!templated.agent_features.task_graph);
         let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = true\n")
             .expect("override parses");
         assert!(parsed.agent_features.task_graph);
+        let parsed = SettingsFile::parse_str("[agentFeatures]\ntaskGraph = false\n")
+            .expect("override parses");
+        assert!(!parsed.agent_features.task_graph);
     }
 
     #[test]
