@@ -1950,6 +1950,53 @@ impl Services {
             .unwrap_or_else(|| self.effective_settings().agent_features)
     }
 
+    /// Lazy legacy freeze (intent-hq/monorepo#2459): when a legacy (pre-0096)
+    /// session whose `harness_features` is still NULL is ACTIVATED — reaches
+    /// `ensure_started`, the single choke point every turn (first spawn,
+    /// resume, respawn, wake) funnels through — materialize the snapshot
+    /// once: persist the currently-resolved `agentFeatures` values, with the
+    /// legacy per-session taskGraph pin (0095 column) folded in — the pin
+    /// wins over the live setting for that key, matching the pre-freeze
+    /// COALESCE read. From then on the session reads its frozen snapshot like
+    /// any new session. `harness_version` stays "1.0" — only the flags
+    /// freeze. A no-op for rows that already carry a snapshot; before first
+    /// activation NULL keeps the read-time live projection. Best-effort: a
+    /// failed write WARNs and leaves the live-settings fallback in place.
+    pub(crate) async fn materialize_legacy_harness_features(&self, session: &mut AgentSession) {
+        if session.harness_features.is_some() {
+            return;
+        }
+        let mut features = self.effective_settings().agent_features;
+        match self
+            .store
+            .get_agent_session_task_graph_enabled(&session.id)
+            .await
+        {
+            Ok(pinned) => features.task_graph = pinned,
+            Err(e) => {
+                tracing::warn!(agent_id = %session.id, error = %e,
+                    "legacy feature freeze: taskGraph pin read failed; skipping");
+                return;
+            }
+        }
+        let Ok(snapshot) = serde_json::to_value(&features) else {
+            tracing::warn!(agent_id = %session.id,
+                "legacy feature freeze: agentFeatures snapshot encode failed; skipping");
+            return;
+        };
+        match self
+            .store
+            .materialize_agent_session_harness_features(&session.id, &snapshot)
+            .await
+        {
+            Ok(persisted) => session.harness_features = persisted,
+            Err(e) => {
+                tracing::warn!(agent_id = %session.id, error = %e,
+                    "legacy feature freeze: snapshot write failed; session keeps live fallback");
+            }
+        }
+    }
+
     /// Shared runtime-flag overlay behind the two `project_lite_with_flags*`
     /// entry points: compute the flags from the session, project it via
     /// `project`, then overlay.
@@ -1960,7 +2007,9 @@ impl Services {
     ) -> AgentLite {
         // Legacy rows (pre-0096) carry no captured agentFeatures snapshot:
         // project the CURRENT effective settings on read so the wire always
-        // carries a value. Never persisted — a legacy row stays NULL.
+        // carries a value. This read path never persists — the row stays NULL
+        // until its first activation freezes the snapshot
+        // (`materialize_legacy_harness_features`).
         if session.harness_features.is_none() {
             session.harness_features = self.current_agent_features_snapshot();
         }

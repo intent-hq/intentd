@@ -2524,10 +2524,13 @@ pub struct AgentSession {
     pub harness_version: String,
     /// JSON snapshot of the effective `agentFeatures` on/off values captured
     /// at session creation ([`crate::settings_file::AgentFeaturesSettings`]
-    /// in its camelCase wire form). Immutable like `harness_version`; later
-    /// settings changes affect only new sessions. `None` for pre-snapshot
-    /// rows — the service layer projects the current settings on read so the
-    /// wire always carries a value.
+    /// in its camelCase wire form). Immutable like `harness_version` once
+    /// set; later settings changes affect only new sessions. `None` only for
+    /// legacy pre-snapshot rows that have not been activated since the
+    /// feature landed: the service layer projects the current settings on
+    /// read so the wire always carries a value, and the row's first
+    /// activation freezes the snapshot lazily (one-time materialization;
+    /// the legacy `task_graph_enabled` pin wins over the live setting).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_features: Option<serde_json::Value>,
     pub created_at: String,

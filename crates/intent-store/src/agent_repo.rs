@@ -605,6 +605,42 @@ impl Store {
         .ok_or_else(|| Error::NotFound(format!("agent session {id}")))
     }
 
+    /// Lazy legacy freeze (intent-hq/monorepo#2459): persist `snapshot` as the
+    /// session's `harness_features` ONLY if the column is still NULL — the
+    /// one-time materialization a legacy (pre-0096) row gets at its first
+    /// activation. The `IS NULL` guard makes the write idempotent at the DB
+    /// level (a second activation, or a concurrent one, never rewrites), and
+    /// `updated_at` is deliberately untouched so the freeze is invisible to
+    /// list ordering. Returns the persisted value after the conditional write
+    /// (a lost race returns the winner's snapshot). `NotFound` if the session
+    /// is absent.
+    pub async fn materialize_agent_session_harness_features(
+        &self,
+        id: &AgentId,
+        snapshot: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        let encoded = serde_json::to_string(snapshot)
+            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
+        sqlx::query(
+            "UPDATE agent_session SET harness_features = ? \
+             WHERE id = ? AND harness_features IS NULL",
+        )
+        .bind(&encoded)
+        .bind(&id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("materialize harness_features failed: {e}")))?;
+        let raw = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT harness_features FROM agent_session WHERE id = ?",
+        )
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("read back harness_features failed: {e}")))?
+        .ok_or_else(|| Error::NotFound(format!("agent session {id}")))?;
+        json_col_from_db(raw, "harness_features")
+    }
+
     /// Lightweight status-only lookup used by hot paths that just need the
     /// session's lifecycle status (e.g. the STAB-52 queue-drain gate). Selects
     /// a single column and skips the full message-log fetch that
