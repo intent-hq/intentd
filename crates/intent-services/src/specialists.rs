@@ -646,6 +646,12 @@ impl SpecialistsService {
     /// (H2): session-scoped resolution (prompt injection, role reminder)
     /// resolves specialists against the doctrine the session was stamped
     /// with, so a respawn under a newer binary keeps the pinned prompts.
+    ///
+    /// The pin deliberately covers PROMPT CONTENT only: frontmatter scalar
+    /// resolutions (e.g. `specialist_agent_type` → spawn-time tool denylist)
+    /// stay latest-bound, so if a future bundle changes a specialist's
+    /// scalar, pinned sessions adopt the new behavior while keeping their
+    /// pinned prompt text.
     pub(crate) fn with_embedded(mut self, bundle: &'static [(&'static str, &'static str)]) -> Self {
         self.embedded = bundle;
         self
