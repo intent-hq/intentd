@@ -7443,7 +7443,7 @@ impl Services {
             return None;
         }
         let json = serde_json::to_string(&snapshot).ok()?;
-        Some(format!("current ws.agent.snapshot() => {json}"))
+        Some(crate::harness::latest().snapshot_line(&json))
     }
 
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,

@@ -86,6 +86,7 @@ mod github_auth_ops;
 mod github_browse_ops;
 
 mod agent_list_cache;
+mod harness;
 mod history_xml;
 mod hook_manager;
 mod line_attribution;
@@ -1222,7 +1223,7 @@ impl Services {
         let (name, reminder) = self
             .specialists_service()
             .resolve_role_reminder(specialist_id, workspace_path.as_deref())?;
-        Some(format!("[Role Reminder: You are a {name}. {reminder}]"))
+        Some(crate::harness::latest().role_reminder_prefix(&name, &reminder))
     }
 
     /// Resolve the spawn-prompt specialist injection for an agent (PP-1): the

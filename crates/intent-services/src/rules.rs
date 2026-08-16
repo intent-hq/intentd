@@ -33,11 +33,9 @@ fn now_ms() -> i64 {
 }
 
 /// Wrap user-rule content for prompt injection (port of
-/// `formatUserRulesForContext`).
+/// `formatUserRulesForContext`). Wording owned by the harness (H5).
 pub(crate) fn format_user_rules_for_context(content: &str, source: &str) -> String {
-    format!(
-        "## User Rules & Guidelines\n\nThe following rules and guidelines have been configured for this project. Please follow these conventions and best practices:\n\n```\n{content}\n```\n\nThese rules are loaded from: {source}"
-    )
+    crate::harness::latest().user_rules_wrapper(content, source)
 }
 
 /// A workspace rule file resolved off the worktree.
@@ -308,26 +306,9 @@ pub(crate) fn build_isolation_hint(
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
-
-        // We don't have base_commit_sha in AgentSession, but we can get it from the
-        // Sandbox record if needed. For now, use a placeholder as the base is tracked
-        // in the sandbox record.
-        let base_sha_note = "base commit tracked in sandbox metadata";
-
-        return Some(format!(
-            "## Workspace Isolation\n\n\
-             You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
-             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
-             target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
-             **Critical constraints:**\n\
-             - Do NOT switch branches or checkout other refs in your sandbox.\n\
-             - On completion, the system automatically merges your branch back to the canonical workspace.\n\
-             - If your changes conflict with canonical, you will be **woken with the conflicting paths** \
-             and a ref to reconcile against. When that happens, resolve the conflicts **in your sandbox only** \
-             (rebase or merge onto the fetched canonical ref), then end your turn again. The system will \
-             retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
-             - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
-        ));
+        return Some(
+            crate::harness::latest().sandboxed_implementor_hint(sandbox_path, sandbox_branch),
+        );
     }
 
     // Case 2: Coordinator in CoW-enabled direct-mode workspace
@@ -341,23 +322,7 @@ pub(crate) fn build_isolation_hint(
             let cow_supported = ws.cow_supported.unwrap_or(false);
 
             if is_direct_mode && cow_supported {
-                return Some(
-                    "## Agent Delegation & Isolation\n\n\
-                     Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
-                     use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
-                     Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
-                     so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
-                     stomp each other's work.\n\n\
-                     **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
-                     commits back into the canonical workspace **before** waking you. Clean merges propagate \
-                     completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
-                     with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
-                     the merge (up to 2 attempts).\n\n\
-                     **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
-                     overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
-                     with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
-                     to commit/stash their WIP, then manually merge.".to_string()
-                );
+                return Some(crate::harness::latest().coordinator_cow_hint());
             }
         }
     }
@@ -366,12 +331,10 @@ pub(crate) fn build_isolation_hint(
     None
 }
 
-/// Format the RTK instruction line for the given usable subcommands.
+/// Format the RTK instruction line for the given usable subcommands. Wording
+/// owned by the harness (H5).
 pub(crate) fn rtk_instruction_line(subcommands: &[String]) -> String {
-    format!(
-        "Prefix these commands with rtk for compressed, LLM-friendly output: {}",
-        subcommands.join(", ")
-    )
+    crate::harness::latest().rtk_instruction_line(subcommands)
 }
 
 /// Build the RTK instruction line when enabled and available.
@@ -503,27 +466,14 @@ pub(crate) async fn assemble_system_prompt(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        parts.push(format!(
-            "# Your Specialist Role\n\n<specialist_role>\n{bp}\n</specialist_role>\n\n\
-             The instructions in <specialist_role> define your primary function. \
-             Prioritize them above general guidance."
-        ));
+        parts.push(crate::harness::latest().specialist_role_section(bp));
     }
     // Commit-policy layer: one status-neutral clause, injected for every agent
     // (top-level and sub-agents alike) regardless of the auto-commit state.
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    parts.push(
-        "## Commit Policy\n\n\
-         Commit through `ws.git.commit` — never run `git commit` yourself \
-         unless the user explicitly asks for a git workflow that \
-         `ws.git.commit` cannot express (e.g. multiple scoped commits on a \
-         branch). You may commit when it makes sense for the work; the system \
-         may also automatically commit any remaining changes when your turn \
-         ends."
-            .to_string(),
-    );
+    parts.push(crate::harness::latest().commit_policy_clause());
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -540,9 +490,8 @@ pub(crate) async fn assemble_system_prompt(
         let reminder = specialist
             .and_then(|s| s.role_reminder.as_deref())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Follow the instructions in <specialist_role> above.");
-        parts.push(format!("## Role Reminder\n\nYou are a {name}. {reminder}"));
+            .filter(|s| !s.is_empty());
+        parts.push(crate::harness::latest().role_reminder_footer(name, reminder));
     }
     // Asking the User Questions + Suggested Next Steps — top-level
     // interactive agents only. Sub-agents don't own a user-facing chat turn
@@ -551,17 +500,7 @@ pub(crate) async fn assemble_system_prompt(
     // `agentFeatures.structuredQuestions` (spec audit row 8).
     if !is_sub_agent {
         if agent_features.structured_questions {
-            parts.push(
-                "## Asking the User Questions\n\n\
-                 When requirements are ambiguous or a decision needs user input, ask \
-                 structured clarifying questions with `ws.app.question.ask` via the \
-                 `workspace_api` tool instead of burying questions in prose. Call it once \
-                 per question with 2-4 options; do not add an \"Other\" option — a \
-                 free-form answer is always offered automatically. Ask all your \
-                 questions, then end the turn: questions are presented when your turn \
-                 ends, and the answers arrive in the next user message."
-                    .to_string(),
-            );
+            parts.push(crate::harness::latest().ask_questions_block());
         }
         // Per-session effective state for the SP-1 footer wording: a session
         // that opted out via `skipAutoCommit` (delegation/creation while the
@@ -570,34 +509,12 @@ pub(crate) async fn assemble_system_prompt(
         // commit-policy clause above is deliberately status-neutral.
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
-        let example_second_line = if effective_auto_commit {
-            "Check the changes in the diff view."
-        } else {
-            "Review changes before committing."
-        };
-        let auto_commit_clause = if effective_auto_commit {
-            " Auto-commit is enabled; do not include prompts about committing or reviewing changes before committing."
-        } else {
-            ""
-        };
-        parts.push(format!(
-            "## Suggested Next Steps\n\n\
-             At the end of your response, offer the user clear next actions as a \
-             `<!-- suggested-prompts ... -->` HTML comment block:\n\n\
-             ```\n\
-             <!-- suggested-prompts\n\
-             Run the tests to verify the implementation.\n\
-             {example_second_line}\n\
-             -->\n\
-             ```\n\n\
-             Write 2–4 prompts, each a short directive sentence phrased as \
-             something the user might say next.{auto_commit_clause}"
-        ));
+        parts.push(crate::harness::latest().suggested_next_steps_block(effective_auto_commit));
     }
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join("\n\n---\n\n"))
+        Some(crate::harness::latest().join_prompt_layers(&parts))
     }
 }
 
