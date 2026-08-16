@@ -8692,6 +8692,227 @@ mod mcp_callback {
             )
             .is_empty());
     }
+
+    /// Regression (monorepo#2637): registration must NOT depend on the JS
+    /// return value. A script that calls `ws.app.proposal.show` but discards
+    /// the envelope (returns something else) still registers the proposal in
+    /// the turn-attachment registry, claimable via the `workspace_api` FIFO
+    /// fallback — otherwise no card ever renders while JS saw `ok: true`.
+    #[tokio::test]
+    async fn proposal_show_discarded_result_still_registers_turn_attachment() {
+        use intent_core::AgentId;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store);
+        let registry = services.turn_attachments();
+        let agent_id = AgentId::from_string("agent-discarder");
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api, chief)
+            .with_caller_agent_id(Some(agent_id.clone()))
+            .with_turn_attachments(Some(registry.clone()));
+
+        let code = r#"
+            const result = await ws.app.proposal.show({
+                kind: "settings-change",
+                payload: { key: "test.setting", value: "v" },
+                preview: { title: "Discarded Envelope" }
+            });
+            return { ok: result.ok };
+        "#;
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "discard envelope" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        // No nonce can be echoed (the envelope was discarded), so the claim
+        // rides the workspace_api FIFO fallback.
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        assert_eq!(
+            batch.len(),
+            1,
+            "proposal registered despite discarded JS return value"
+        );
+        assert_eq!(batch[0].mime_type, "application/vnd.intent.proposal+json");
+        assert_eq!(
+            batch[0].uri,
+            "intent-proposal://settings-change/Discarded%20Envelope"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&batch[0].text).expect("registered text parses");
+        assert!(
+            payload["attachmentId"].as_str().is_some(),
+            "registered payload carries a stamped nonce"
+        );
+    }
+
+    /// Regression (monorepo#2637): returning the envelope registers the
+    /// proposal exactly ONCE — binding-time collection and the top-level
+    /// `__mcpContentItems` path must not each register a copy.
+    #[tokio::test]
+    async fn proposal_show_returned_envelope_registers_single_batch() {
+        use intent_core::AgentId;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store);
+        let registry = services.turn_attachments();
+        let agent_id = AgentId::from_string("agent-returner");
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api, chief)
+            .with_caller_agent_id(Some(agent_id.clone()))
+            .with_turn_attachments(Some(registry.clone()));
+
+        let code = r#"
+            return await ws.app.proposal.show({
+                kind: "settings-change",
+                payload: { key: "k" },
+                preview: { title: "Once Only" }
+            });
+        "#;
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "return envelope" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let first = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        assert_eq!(first.len(), 1, "exactly one entry in the claimed batch");
+        assert!(
+            registry
+                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .is_empty(),
+            "no second batch left behind (double registration)"
+        );
+    }
+
+    /// Regression (monorepo#2637): several proposal calls in ONE
+    /// `workspace_api` invocation all register — as a single batch, in call
+    /// order — so the claim at the tool result attaches every card.
+    #[tokio::test]
+    async fn multiple_proposals_in_one_call_register_all_in_order() {
+        use intent_core::AgentId;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store);
+        let registry = services.turn_attachments();
+        let agent_id = AgentId::from_string("agent-multi");
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api, chief)
+            .with_caller_agent_id(Some(agent_id.clone()))
+            .with_turn_attachments(Some(registry.clone()));
+
+        let code = r#"
+            await ws.app.proposal.show({
+                kind: "settings-change",
+                payload: { key: "a" },
+                preview: { title: "First" }
+            });
+            await ws.app.proposal.show({
+                kind: "settings-change",
+                payload: { key: "b" },
+                preview: { title: "Second" }
+            });
+            return "done";
+        "#;
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "two proposals" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        assert_eq!(batch.len(), 2, "both proposals registered as one batch");
+        assert_eq!(batch[0].name, "First");
+        assert_eq!(batch[1].name, "Second");
+        assert!(
+            registry
+                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .is_empty(),
+            "single batch — nothing left after the claim"
+        );
+    }
+
+    /// Regression (monorepo#2637): the bulk-op bindings register too. A
+    /// `ws.app.workspaces.bulkDelete` call whose result is discarded still
+    /// leaves a claimable bulk-op proposal in the registry.
+    #[tokio::test]
+    async fn bulk_delete_discarded_result_still_registers_turn_attachment() {
+        use intent_core::AgentId;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws1 = WorkspaceId::new();
+        let ws2 = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
+        store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
+        let root = super::WorkspacesRoot::new();
+        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let registry = services.turn_attachments();
+        let agent_id = AgentId::from_string("agent-bulk");
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api, chief)
+            .with_caller_agent_id(Some(agent_id.clone()))
+            .with_turn_attachments(Some(registry.clone()));
+
+        let code = format!(
+            r#"
+            const r = await ws.app.workspaces.bulkDelete(["{}", "{}"]);
+            return {{ ok: r.ok }};
+        "#,
+            ws1.0, ws2.0
+        );
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "bulk delete discard" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        assert_eq!(batch.len(), 1, "bulk-op proposal registered");
+        assert_eq!(batch[0].mime_type, "application/vnd.intent.proposal+json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&batch[0].text).expect("registered text parses");
+        assert_eq!(payload["kind"], json!("bulk-op"));
+        assert_eq!(
+            payload["payload"]["operation"],
+            json!("workspace.bulkDelete")
+        );
+    }
 }
 
 // ============================================================================
