@@ -1680,7 +1680,12 @@ fn session_from_legacy_json(
     metadata.insert("legacyImport".to_string(), Value::Object(legacy_import));
 
     let session = AgentSession {
-        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        // Imported sessions predate harness stamping, so they get the same
+        // backfill values migration 0096 gives pre-existing rows: literal
+        // "1.0" (NOT the current constant — a future bump must not relabel
+        // legacy imports) and a NULL features snapshot (projections overlay
+        // current settings on read).
+        harness_version: "1.0".to_string(),
         harness_features: None,
         id,
         workspace_id: workspace.id.clone(),
@@ -3561,6 +3566,11 @@ mod tests {
         assert!(session.is_background);
         assert_eq!(session.created_at, "2025-06-01T00:00:00Z");
         assert_eq!(session.updated_at, "2025-06-02T00:00:00Z");
+        // Imported sessions predate harness stamping: literal "1.0" (pinned
+        // even if CURRENT_HARNESS_VERSION bumps) + NULL snapshot, exactly like
+        // migration 0096's backfill of pre-existing rows.
+        assert_eq!(session.harness_version, "1.0");
+        assert_eq!(session.harness_features, None);
         // Metadata behavior fields lifted to columns.
         assert_eq!(session.specialist, Some("implementor".to_string()));
         assert_eq!(session.task_note_id, Some(NoteId::from("task-1")));
