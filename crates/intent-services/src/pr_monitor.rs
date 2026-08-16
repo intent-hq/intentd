@@ -196,194 +196,7 @@ pub(crate) async fn fetch_snapshot(
 /// reporting that as "no longer required" would be a lie about the branch
 /// rules rather than an observation about the PR.
 pub(crate) fn diff_snapshots(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
-    let mut changes = Vec::new();
-    let (o, n) = (&old.requirements, &new.requirements);
-
-    if o.state != n.state {
-        changes.push(format!("state: {} → {}", o.state, n.state));
-    }
-    if o.is_draft != n.is_draft {
-        changes.push(if n.is_draft {
-            "marked as draft".to_string()
-        } else {
-            "marked ready for review".to_string()
-        });
-    }
-    if old.head_sha != new.head_sha {
-        let sha = new.head_sha.as_deref().unwrap_or("unknown");
-        let short: String = sha.chars().take(8).collect();
-        changes.push(format!("new commits pushed (head is now {short})"));
-    }
-
-    // Review decision + approval counts.
-    if o.approvals.decision != n.approvals.decision {
-        changes.push(format!(
-            "review decision: {} → {}",
-            o.approvals.decision, n.approvals.decision
-        ));
-    }
-    if o.approvals.have != n.approvals.have {
-        let verb = if n.approvals.have > o.approvals.have {
-            "new approval"
-        } else {
-            "approval withdrawn"
-        };
-        changes.push(format!(
-            "{verb} ({} → {} approving)",
-            o.approvals.have, n.approvals.have
-        ));
-    }
-    if o.approvals.changes_requested != n.approvals.changes_requested {
-        changes.push(format!(
-            "changes-requested reviews: {} → {}",
-            o.approvals.changes_requested, n.approvals.changes_requested
-        ));
-    }
-    if o.approvals.needed != n.approvals.needed {
-        changes.push(format!(
-            "required approvals: {} → {}",
-            describe_opt(o.approvals.needed),
-            describe_opt(n.approvals.needed)
-        ));
-    }
-
-    // Comments + threads.
-    if old.conversation_count != new.conversation_count {
-        let delta = new.conversation_count - old.conversation_count;
-        changes.push(format!(
-            "{} conversation comment{} ({} total)",
-            signed(delta),
-            plural(delta.abs()),
-            new.conversation_count
-        ));
-    }
-    if old.review_comment_count != new.review_comment_count {
-        let delta = new.review_comment_count - old.review_comment_count;
-        changes.push(format!(
-            "{} review comment{} ({} total)",
-            signed(delta),
-            plural(delta.abs()),
-            new.review_comment_count
-        ));
-    }
-    if o.threads.unresolved != n.threads.unresolved {
-        let verb = if n.threads.unresolved < o.threads.unresolved {
-            "thread(s) resolved"
-        } else {
-            "thread(s) unresolved/opened"
-        };
-        changes.push(format!(
-            "{verb}: {} → {} unresolved",
-            o.threads.unresolved, n.threads.unresolved
-        ));
-    }
-
-    changes.extend(diff_checks(old, new));
-
-    // Suite completion: the last pending check finishing is reported as ONE
-    // aggregate line (individual success lines are suppressed above).
-    if o.checks.pending > 0 && n.checks.pending == 0 && n.checks.total > 0 {
-        changes.push(if n.checks.failed == 0 {
-            format!("all checks passed ({})", n.checks.total)
-        } else {
-            format!(
-                "all checks completed: {} passed, {} failed",
-                n.checks.passed, n.checks.failed
-            )
-        });
-    }
-
-    // Mergeability + residual signals.
-    if o.has_conflicts != n.has_conflicts {
-        changes.push(if n.has_conflicts {
-            "merge conflicts appeared".to_string()
-        } else {
-            "merge conflicts resolved".to_string()
-        });
-    }
-    if o.is_behind != n.is_behind {
-        changes.push(if n.is_behind {
-            "branch is now behind its base".to_string()
-        } else {
-            "branch is no longer behind its base".to_string()
-        });
-    }
-    if o.mergeable != n.mergeable {
-        changes.push(format!(
-            "mergeable: {} → {}",
-            describe_opt(o.mergeable),
-            describe_opt(n.mergeable)
-        ));
-    }
-    if o.merge_state_status != n.merge_state_status {
-        changes.push(format!(
-            "merge state: {} → {}",
-            o.merge_state_status.as_deref().unwrap_or("unknown"),
-            n.merge_state_status.as_deref().unwrap_or("unknown")
-        ));
-    }
-    if o.merge_blocked_reason != n.merge_blocked_reason {
-        changes.push(match &n.merge_blocked_reason {
-            Some(reason) => format!("merge blocked: {reason}"),
-            None => "merge is no longer blocked".to_string(),
-        });
-    }
-    changes
-}
-
-/// Per-check state transitions between two snapshots: added, removed, and
-/// state-changed checks, plus a required-flag flip when both sides report
-/// trustworthy `requiredKnown` flags.
-///
-/// Normal success transitions are suppressed: a check going `pending` →
-/// `passed`, or appearing already green, is expected progress rather than a
-/// reportable change — the suite-completion summary in [`diff_snapshots`]
-/// covers the "everything finished" moment. A `failed` → `passed` recovery
-/// IS reported, since it resolves a previously reported failure.
-fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
-    let (o, n) = (&old.requirements.checks, &new.requirements.checks);
-    let required_known = o.required_known && n.required_known;
-    let by_name = |items: &[pr_ops::MergeRequirementCheck]| {
-        items
-            .iter()
-            .map(|c| (c.name.clone(), c.clone()))
-            .collect::<HashMap<_, _>>()
-    };
-    let before = by_name(&o.items);
-    let mut changes = Vec::new();
-    for check in &n.items {
-        match before.get(&check.name) {
-            None => {
-                if check.status != "passed" {
-                    changes.push(format!("check started: {} ({})", check.name, check.status));
-                }
-            }
-            Some(prev) => {
-                if prev.status != check.status
-                    && !(check.status == "passed" && prev.status == "pending")
-                {
-                    changes.push(format!(
-                        "check {}: {} → {}",
-                        check.name, prev.status, check.status
-                    ));
-                }
-                if required_known && prev.required != check.required {
-                    changes.push(format!(
-                        "check {} is {} required to merge",
-                        check.name,
-                        if check.required { "now" } else { "no longer" }
-                    ));
-                }
-            }
-        }
-    }
-    let after: HashSet<&str> = n.items.iter().map(|c| c.name.as_str()).collect();
-    for check in &o.items {
-        if !after.contains(check.name.as_str()) {
-            changes.push(format!("check removed: {}", check.name));
-        }
-    }
-    changes
+    crate::harness::latest().pr_diff_lines(old, new)
 }
 
 /// Whether a row's persisted pending set is what the coalescing poll would
@@ -405,30 +218,10 @@ fn pending_survives_recompute(m: &PrMonitor) -> bool {
     diff_snapshots(&baseline, &last) == m.pending_changes
 }
 
-fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn signed(delta: i64) -> String {
-    if delta > 0 {
-        format!("+{delta}")
-    } else {
-        delta.to_string()
-    }
-}
-
-fn plural(n: i64) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 /// The `<owner>/<name>#<number>` label every wake and event payload uses.
+/// Wording owned by the harness (H6).
 pub(crate) fn monitor_label(m: &PrMonitor) -> String {
-    format!("{}/{}#{}", m.repo_owner, m.repo_name, m.pr_number)
+    crate::harness::latest().pr_monitor_label(&m.repo_owner, &m.repo_name, m.pr_number)
 }
 
 /// Light metadata for one ACTIVE PR monitor — the idle-visibility
@@ -552,126 +345,34 @@ fn pr_monitor_wire(m: &PrMonitor) -> Value {
 }
 
 /// Render the refreshed merge-requirements checklist as the wake's
-/// "where the PR stands now" section.
+/// "where the PR stands now" section. Wording owned by the harness (H6);
+/// production callers ride [`render_change_wake`], which composes the
+/// checklist inside the harness — this delegator remains for the golden
+/// fixtures.
+#[cfg(test)]
 pub(crate) fn render_checklist(s: &PrMonitorSnapshot) -> String {
-    let r = &s.requirements;
-    let mut lines = vec![format!("state: {}", r.state)];
-    let approvals = match r.approvals.needed {
-        Some(needed) => format!(
-            "approvals: {} ({}/{} required)",
-            r.approvals.decision, r.approvals.have, needed
-        ),
-        None => format!(
-            "approvals: {} ({} approving)",
-            r.approvals.decision, r.approvals.have
-        ),
-    };
-    lines.push(approvals);
-    if r.approvals.changes_requested > 0 {
-        lines.push(format!(
-            "changes requested by {} reviewer{}",
-            r.approvals.changes_requested,
-            plural(r.approvals.changes_requested)
-        ));
-    }
-    let mut checks = format!(
-        "checks: {} passed, {} failed, {} pending (of {})",
-        r.checks.passed, r.checks.failed, r.checks.pending, r.checks.total
-    );
-    if !r.checks.failing_required.is_empty() {
-        checks.push_str(&format!(
-            "; failing required: {}",
-            r.checks.failing_required.join(", ")
-        ));
-    }
-    if !r.checks.pending_required.is_empty() {
-        checks.push_str(&format!(
-            "; pending required: {}",
-            r.checks.pending_required.join(", ")
-        ));
-    }
-    if !r.checks.required_known {
-        checks.push_str(" (required-check flags unavailable)");
-    }
-    lines.push(checks);
-    let threads = match r.threads.resolution_required {
-        Some(true) => format!(
-            "unresolved threads: {} (resolution required to merge)",
-            r.threads.unresolved
-        ),
-        _ => format!("unresolved threads: {}", r.threads.unresolved),
-    };
-    lines.push(threads);
-    if r.has_conflicts {
-        lines.push("merge conflicts present".to_string());
-    }
-    if r.is_behind {
-        lines.push("branch is behind its base".to_string());
-    }
-    if let Some(reason) = &r.merge_blocked_reason {
-        lines.push(format!("blocked: {reason}"));
-    }
-    if !r.rules_known {
-        lines.push("(branch rules unreadable — approval/thread requirements unknown)".to_string());
-    }
-    lines
-        .into_iter()
-        .map(|l| format!("- {l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    crate::harness::latest().pr_checklist(s)
 }
 
 /// The consolidated change wake: what moved since the last emit, followed by
-/// the refreshed checklist.
+/// the refreshed checklist. Wording owned by the harness (H6).
 pub(crate) fn render_change_wake(
     m: &PrMonitor,
     changes: &[String],
     snapshot: &PrMonitorSnapshot,
 ) -> String {
-    let label = monitor_label(m);
-    let bullets = changes
-        .iter()
-        .map(|c| format!("- {c}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "[PR monitor {label}] {} change{} detected on \"{}\" ({}):\n{bullets}\n\nWhere the PR \
-         stands now:\n{}",
-        changes.len(),
-        plural(changes.len() as i64),
-        snapshot.title,
-        snapshot.url,
-        render_checklist(snapshot)
-    )
+    crate::harness::latest().pr_change_wake(&monitor_label(m), changes, snapshot)
 }
 
 /// The terminal wake: the PR merged or closed, so monitoring stopped. States
 /// that explicitly, with the reason, so the model does not keep waiting.
+/// Wording owned by the harness (H6).
 pub(crate) fn render_terminal_wake(
     m: &PrMonitor,
     changes: &[String],
     snapshot: &PrMonitorSnapshot,
 ) -> String {
-    let label = monitor_label(m);
-    let outcome = if snapshot.requirements.state == "merged" {
-        "was MERGED"
-    } else {
-        "was CLOSED without merging"
-    };
-    let mut body = format!(
-        "[PR monitor {label}] \"{}\" {outcome} ({}).\n\nMonitoring has STOPPED — this monitor \
-         is retired and will not report again.",
-        snapshot.title, snapshot.url
-    );
-    if !changes.is_empty() {
-        let bullets = changes
-            .iter()
-            .map(|c| format!("- {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        body.push_str(&format!("\n\nChanges since the last report:\n{bullets}"));
-    }
-    body
+    crate::harness::latest().pr_terminal_wake(&monitor_label(m), changes, snapshot)
 }
 
 impl Services {
@@ -927,11 +628,7 @@ impl Services {
         // FE-cancel (no agent caller) wakes the owner with a notice;
         // owner-side cancel (`ws.pr.unmonitor`) delivers no wake.
         let notice = caller.is_none().then(|| {
-            let label = monitor_label(&monitor);
-            format!(
-                "[PR monitor {label}] This monitor was cancelled from the app — it will not \
-                 report again."
-            )
+            crate::harness::latest().pr_monitor_cancelled_from_app_notice(&monitor_label(&monitor))
         });
         match self
             .cancel_active_pr_monitor(monitor, notice.as_deref())
@@ -1032,11 +729,8 @@ impl Services {
         };
         for monitor in monitors {
             let monitor_id = monitor.monitor_id.clone();
-            let label = monitor_label(&monitor);
-            let notice = format!(
-                "[PR monitor {label}] This monitor was cancelled because its workspace was \
-                 archived — it will not report again."
-            );
+            let notice = crate::harness::latest()
+                .pr_monitor_cancelled_workspace_archived_notice(&monitor_label(&monitor));
             // `Ok(None)` = a concurrent cancel/complete won the CAS between
             // the list read and the guarded write; no longer active either way.
             if let Err(e) = self.cancel_active_pr_monitor(monitor, Some(&notice)).await {

@@ -121,8 +121,9 @@ fn run_git(args: &[&str], dir: &Path) -> String {
 /// succeeds over WSS: the daemon initializes the directory (`git init -b
 /// main` + initial commit) and the workspace works directly in the
 /// initialized repository folder on its workspace branch — the result
-/// carries `checkoutMode: "direct"`, no `worktreePath`, and `baseCommitSha`
-/// matches the seeded initial commit (PROTOCOL §5.1).
+/// carries `checkoutMode: "direct"`, `worktreePath` = the repository folder
+/// (intent-hq/monorepo#2611), and `baseCommitSha` matches the seeded initial
+/// commit (PROTOCOL §5.1).
 #[tokio::test]
 async fn workspace_create_is_new_repo_initializes_and_provisions() {
     let fx = boot().await;
@@ -158,10 +159,12 @@ async fn workspace_create_is_new_repo_initializes_and_provisions() {
     assert!(project.0.join("README.md").exists(), "starter files seeded");
 
     // ...and the workspace works directly in the initialized repository
-    // folder (standalone repo, no worktree) on its workspace branch.
-    assert!(
-        workspace["worktreePath"].is_null(),
-        "no worktree for isNewRepo creates, got: {workspace}"
+    // folder (standalone repo) on its workspace branch — the row carries the
+    // repository folder as `worktreePath` (intent-hq/monorepo#2611).
+    assert_eq!(
+        workspace["worktreePath"],
+        json!(project.0.to_string_lossy()),
+        "worktreePath carries the initialized repository folder, got: {workspace}"
     );
     assert_eq!(
         workspace["checkoutMode"],

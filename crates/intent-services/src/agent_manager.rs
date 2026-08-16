@@ -68,19 +68,16 @@ fn title_case_ascii(s: &str) -> String {
 
 /// Deterministic system note appended to a STALE queued-message redrive (#576)
 /// so a delegated child that already delivered its completion report does not
-/// blindly re-report the same content (duplicate parent wake).
+/// blindly re-report the same content (duplicate parent wake). Wording owned
+/// by the harness (H6).
 pub(crate) fn stale_redrive_note(report_timestamp: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued before you completed; your completion report \
-         was already delivered to your parent at {report_timestamp}. Only call reportToParent \
-         again if this message materially changes the outcome — do not re-send the same report."
-    )
+    crate::harness::latest().stale_redrive_note(report_timestamp)
 }
 
 /// Stable prefix of [`stale_redrive_note`], used to keep the annotation
-/// idempotent when a stale entry is requeued and redriven again.
-const STALE_REDRIVE_NOTE_PREFIX: &str =
-    "[SYSTEM NOTE] This message was queued before you completed";
+/// idempotent when a stale entry is requeued and redriven again. Owned by
+/// the harness (H6) alongside the note wording.
+use crate::harness::v1::STALE_REDRIVE_NOTE_PREFIX;
 
 /// Deterministic system note appended to a drained queue entry so the
 /// target agent knows when the message entered the queue and how long it
@@ -88,20 +85,17 @@ const STALE_REDRIVE_NOTE_PREFIX: &str =
 /// are NOT annotated — the note is applied only on the queue-drain paths,
 /// and only when the wait reached [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`]
 /// (monorepo#2353). Coexists with the #576 stale-redrive note (both may
-/// appear).
+/// appear). Wording owned by the harness (H6).
 pub(crate) fn dequeue_wait_note(queued_at: &str, waited: &str) -> String {
-    format!(
-        "[SYSTEM NOTE] This message was queued at {queued_at} and waited {waited} before delivery."
-    )
+    crate::harness::latest().dequeue_wait_note(queued_at, waited)
 }
 
 /// Stable prefix of [`dequeue_wait_note`], used to keep the annotation
 /// idempotent when an already-annotated entry is requeued and drained again
 /// (the original wait deliberately stays — a terminal-failure requeue keeps
-/// its first-delivery numbers). Distinct from [`STALE_REDRIVE_NOTE_PREFIX`]
-/// ("…queued before you completed"), so the two checks never shadow each
-/// other.
-const DEQUEUE_WAIT_NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued at";
+/// its first-delivery numbers). Owned by the harness (H6) alongside the note
+/// wording.
+use crate::harness::v1::DEQUEUE_WAIT_NOTE_PREFIX;
 
 /// Minimum wait (milliseconds) before a drained entry earns the dequeue-wait
 /// annotation (monorepo#2353). Incidental queue hops — e.g. a question-wizard
@@ -127,16 +121,9 @@ fn dequeue_wait_annotation_min_ms() -> i128 {
 
 /// Human-readable wait for [`dequeue_wait_note`]: `Ns` under a minute, then
 /// `Nm Ss`, then `Nh Mm`. Negative waits (clock skew) clamp to `0s`.
+/// Wording owned by the harness (H6).
 pub(crate) fn format_wait_duration(secs: i64) -> String {
-    let secs = secs.max(0);
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
+    crate::harness::latest().wait_duration(secs)
 }
 
 /// Dequeue-wait annotation: appends [`dequeue_wait_note`] to a drained
@@ -6339,7 +6326,16 @@ impl AgentManager {
         // settled sandbox fields. No-op when no provisioning is in flight —
         // the common case for every turn after the first.
         self.services.await_sandbox_provisioning(agent_id).await;
-        let session = self.services.store.get_agent_session(agent_id).await?;
+        let mut session = self.services.store.get_agent_session(agent_id).await?;
+        // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
+        // row still carrying harness_features = NULL gets its snapshot
+        // materialized at this activation choke point — every turn (first
+        // spawn, resume, respawn, wake) funnels through here. One-time and
+        // idempotent; a no-op for stamped rows.
+        self.services
+            .materialize_legacy_harness_features(&mut session)
+            .await;
+        let session = session;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();
         let mut resolved = resolve_spawn(
@@ -7312,28 +7308,21 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
 }
 
 /// The system notice appended after note-referenced images are inlined
-/// (Fidelity B, PROTOCOL §5.5).
+/// (Fidelity B, PROTOCOL §5.5). Wording owned by the harness (H6).
 pub(crate) fn note_images_notice(n: usize) -> String {
-    format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+    crate::harness::latest().note_images_notice(n)
 }
 
 /// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
 /// `ws.file.getAttachment` retrieval instruction — the file bytes never ride
-/// the prompt for reference blocks.
+/// the prompt for reference blocks. Wording owned by the harness (H6).
 pub(crate) fn attachment_reference_notice(
     name: &str,
     mime: Option<&str>,
     size: Option<u64>,
     id: &str,
 ) -> String {
-    let mime_note = mime.map(|m| format!(", type {m}")).unwrap_or_default();
-    let size_note = size.map(|s| format!(", {s} bytes")).unwrap_or_default();
-    format!(
-        "[Attachment: \"{name}\"{mime_note}{size_note} — attachmentId: {id}. The \
-         file is NOT inlined in this message. Call \
-         ws.file.getAttachment(\"{id}\") to copy it into your working directory, \
-         then read it from the returned path.]"
-    )
+    crate::harness::latest().attachment_reference_notice(name, mime, size, id)
 }
 
 /// Push one content block per well-formed file entry: inline
@@ -7514,16 +7503,31 @@ fn resolve_spawn(
     // catch-all rather than blocking the spawn.
     //
     // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
+    //
+    // Workspace chain (TS agent-factory parity): `path` → `worktree_path` →
+    // `repository_path`. Each candidate is `is_dir()`-checked individually so
+    // a stale entry (e.g. an obsolete `path` on a legacy row) never suppresses
+    // a live checkout further down the chain. The last covers direct-mode rows
+    // without a persisted checkout path (legacy `isNewRepo` rows,
+    // skip-worktree workspaces) so their agents spawn in the repository
+    // folder, never the temp dir (intent-hq/monorepo#2611).
     let cwd = session
         .sandbox_path
         .clone()
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
         .or_else(|| {
-            workspace
-                .and_then(|w| w.path.clone().or_else(|| w.worktree_path.clone()))
+            workspace.and_then(|w| {
+                [
+                    w.path.as_deref(),
+                    w.worktree_path.as_deref(),
+                    w.repository_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
                 .map(PathBuf::from)
-                .filter(|p| p.is_dir())
+                .find(|p| p.is_dir())
+            })
         })
         .or_else(|| {
             workspace
@@ -9831,7 +9835,8 @@ fn idle_timeout_turn_streamed(err: &Error) -> bool {
 /// Render the warn-and-continue message injected after an idle timeout. The
 /// window is the ACTUAL configured value ([`intent_acp::session::prompt_idle_timeout`],
 /// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
-/// literal.
+/// literal. Wording owned by the harness (H6); the caller renders the
+/// seconds value (integer form for whole windows, float otherwise).
 pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     let secs = window.as_secs_f64();
     let rendered = if secs.fract() == 0.0 {
@@ -9839,13 +9844,7 @@ pub(crate) fn idle_timeout_warning_text(window: std::time::Duration) -> String {
     } else {
         secs.to_string()
     };
-    format!(
-        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
-         and was interrupted. If you were waiting on something external, schedule a \
-         `ws.hook.schedule` background hook to watch the condition and end your turn instead \
-         of blocking — the hook's wake message resumes you. Assess where you left off and \
-         continue the work."
-    )
+    crate::harness::latest().idle_timeout_warning(&rendered)
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
@@ -10740,7 +10739,7 @@ mod dead_child_respawn_tests {
     /// and unset the behavior knobs so a spawned child can't inherit
     /// exit-inducing behavior leaked by a concurrently guarded test (the
     /// guard also holds `ENV_LOCK`, serializing all env-mutating tests).
-    fn mock_env(script: &str) -> EnvGuard {
+    pub(super) fn mock_env(script: &str) -> EnvGuard {
         EnvGuard::apply(&[
             ("MOCK_AGENT_SCRIPT_PATH", Some(script)),
             ("MOCK_AGENT_BEHAVIOR", None),
@@ -10750,7 +10749,7 @@ mod dead_child_respawn_tests {
 
     /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
     /// reused here so the respawn fall-through spawns a real child.
-    fn mock_agent_script() -> String {
+    pub(super) fn mock_agent_script() -> String {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
             .canonicalize()
@@ -10932,6 +10931,254 @@ mod dead_child_respawn_tests {
         assert!(
             mgr.handles.lock().unwrap().contains_key(&agent_id),
             "only the mapping drops out; the handle awaits the exit watcher"
+        );
+        mgr.stop(&agent_id).await;
+    }
+}
+
+#[cfg(test)]
+mod legacy_feature_freeze_tests {
+    //! Lazy legacy feature freeze (intent-hq/monorepo#2459, H2 scope
+    //! addition): a pre-0096 session whose `harness_features` is NULL gets
+    //! its snapshot materialized at its first activation
+    //! (`ensure_started`), one-time and idempotent; before activation the
+    //! row keeps the read-time live projection, and the legacy
+    //! `task_graph_enabled` pin folds into the frozen snapshot.
+
+    use super::dead_child_respawn_tests::{install_fake_handle, mock_agent_script, mock_env};
+    use super::role_reminder_tests::{session, workspace};
+    use super::*;
+    use crate::events::EventBus;
+    use intent_store::Store;
+
+    /// Manager over a temp store with a settings registry wired (so tests
+    /// can flip `agentFeatures.*`) and NO seeded session — each test seeds
+    /// its own legacy-shaped row.
+    async fn registry_manager() -> (AgentManager, tempfile::TempDir, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-freeze-");
+        let path = db_dir.path().join("store.db");
+        let store = Store::open(&path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_settings_registry(registry);
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from("ws-1")))
+            .await
+            .unwrap();
+        let sink = Arc::new(BusEventSink::new(bus));
+        (AgentManager::new(services, sink, 4), db_dir, config_dir)
+    }
+
+    /// Seed a legacy (pre-0096-shaped) session: `harness_features` NULL,
+    /// provider `mock` with a cached acp id so activation takes the
+    /// live-child reuse path, and the given legacy taskGraph pin (0095).
+    async fn seed_legacy_session(mgr: &AgentManager, agent_id: &AgentId, task_graph_pin: bool) {
+        let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some("acp-legacy".to_string());
+        assert!(s.harness_features.is_none(), "seed must be legacy-shaped");
+        mgr.services
+            .store
+            .insert_agent_session_with_task_graph(&s, task_graph_pin)
+            .await
+            .unwrap();
+    }
+
+    fn toggle_host_exec(mgr: &AgentManager, value: bool) {
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.hostExec".to_string(),
+                serde_json::json!(value),
+            )])
+            .expect("apply toggle");
+    }
+
+    /// Activate `agent_id` through the choke point: a live fake handle +
+    /// cached acp id means `ensure_started` reuses the session (no real
+    /// spawn), but the freeze — which runs right after the session read —
+    /// still fires.
+    async fn activate(mgr: &AgentManager, agent_id: &AgentId) {
+        let acp = mgr
+            .ensure_started(agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("activation succeeds via live-child reuse");
+        assert_eq!(acp, "acp-legacy");
+    }
+
+    /// The persisted `harness_features` column for `agent_id` (raw row read,
+    /// no service-layer projection).
+    async fn stored_features(mgr: &AgentManager, agent_id: &AgentId) -> Option<serde_json::Value> {
+        mgr.services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .expect("session exists")
+            .harness_features
+    }
+
+    /// (1) Activation freezes the flag values current at that moment;
+    /// subsequent settings toggles no longer affect the session.
+    #[tokio::test]
+    async fn legacy_session_freezes_features_at_first_activation() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-1");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        toggle_host_exec(&mgr, false);
+        activate(&mgr, &agent_id).await;
+
+        let frozen = stored_features(&mgr, &agent_id)
+            .await
+            .expect("activation materialized the snapshot");
+        assert_eq!(frozen["hostExec"], serde_json::json!(false));
+
+        // A later toggle affects neither the persisted snapshot nor the
+        // resolved features.
+        toggle_host_exec(&mgr, true);
+        let after = stored_features(&mgr, &agent_id).await.expect("still set");
+        assert_eq!(
+            after, frozen,
+            "settings toggle must not rewrite the snapshot"
+        );
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(
+            !mgr.services.session_agent_features(&session).host_exec,
+            "resolved features read the frozen snapshot, not the live setting"
+        );
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (2) A legacy session with a taskGraph pin freezes the PINNED value,
+    /// not the live setting.
+    #[tokio::test]
+    async fn legacy_task_graph_pin_wins_over_live_setting() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-2");
+        // Pin ON while the live setting stays OFF (the default).
+        seed_legacy_session(&mgr, &agent_id, true).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+        assert!(
+            !mgr.services.effective_settings().agent_features.task_graph,
+            "live taskGraph setting is off (default)"
+        );
+
+        activate(&mgr, &agent_id).await;
+
+        let frozen = stored_features(&mgr, &agent_id)
+            .await
+            .expect("activation materialized the snapshot");
+        assert_eq!(
+            frozen["taskGraph"],
+            serde_json::json!(true),
+            "the legacy pin wins over the live setting"
+        );
+        // The fold matches the COALESCE read path.
+        assert!(mgr
+            .services
+            .store
+            .get_agent_session_task_graph_enabled(&agent_id)
+            .await
+            .unwrap());
+        mgr.stop(&agent_id).await;
+    }
+
+    /// (3) A not-yet-activated legacy session still follows live settings on
+    /// read, and its row stays NULL.
+    #[tokio::test]
+    async fn unactivated_legacy_session_keeps_live_projection() {
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-3");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+
+        toggle_host_exec(&mgr, false);
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(session.harness_features.is_none(), "row stays NULL");
+        assert!(!mgr.services.session_agent_features(&session).host_exec);
+
+        toggle_host_exec(&mgr, true);
+        let session = mgr
+            .services
+            .store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap();
+        assert!(session.harness_features.is_none(), "row still NULL");
+        assert!(
+            mgr.services.session_agent_features(&session).host_exec,
+            "pre-activation reads keep following live settings"
+        );
+    }
+
+    /// (4) The freeze is idempotent: a second activation (with different
+    /// live settings) does not rewrite the persisted snapshot.
+    #[tokio::test]
+    async fn second_activation_does_not_rewrite_snapshot() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-4");
+        seed_legacy_session(&mgr, &agent_id, false).await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        toggle_host_exec(&mgr, false);
+        activate(&mgr, &agent_id).await;
+        let first = stored_features(&mgr, &agent_id)
+            .await
+            .expect("first activation materialized the snapshot");
+
+        toggle_host_exec(&mgr, true);
+        activate(&mgr, &agent_id).await;
+        let second = stored_features(&mgr, &agent_id).await.expect("still set");
+        assert_eq!(
+            second, first,
+            "second activation must not rewrite the snapshot"
+        );
+        mgr.stop(&agent_id).await;
+    }
+
+    /// New (post-0096) sessions are untouched: their creation-time snapshot
+    /// is never overwritten by the activation path.
+    #[tokio::test]
+    async fn stamped_session_is_a_no_op() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _db, _cfg) = registry_manager().await;
+        let agent_id = AgentId::from("agent-freeze-5");
+        let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some("acp-legacy".to_string());
+        s.harness_features = Some(serde_json::json!({ "hostExec": false }));
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        activate(&mgr, &agent_id).await;
+        assert_eq!(
+            stored_features(&mgr, &agent_id).await,
+            Some(serde_json::json!({ "hostExec": false })),
+            "a stamped row is never rewritten"
         );
         mgr.stop(&agent_id).await;
     }

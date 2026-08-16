@@ -17,7 +17,7 @@ use intent_core::{AgentId, AgentSession, Error, Event, NoteId, WorkspaceApi};
 use intent_git::commit::CLEAN_TREE_ERROR;
 
 use crate::events::SubscriptionFilter;
-use crate::instructions::get_instruction_with_common;
+use crate::instructions::get_instruction_with_common_for;
 use crate::Services;
 
 /// Subject-line cap for auto-commit fallback messages (TS
@@ -413,7 +413,12 @@ impl Services {
         );
         // `commit-message` is a non-interactive background body with no
         // feature-gated sections, so default flags are always correct here.
-        let system_prompt = get_instruction_with_common(
+        // Pinned to the session's stamped harness version (H2): the
+        // background body tracks the doctrine the owning session runs on.
+        let system_prompt = get_instruction_with_common_for(
+            crate::harness::resolve_entry(&session.harness_version)
+                .doctrine
+                .instructions,
             "commit-message",
             &intent_core::settings_file::AgentFeaturesSettings::default(),
         );

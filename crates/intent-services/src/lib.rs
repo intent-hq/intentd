@@ -1220,8 +1220,12 @@ impl Services {
             .ok()
             .and_then(|w| w.path.or(w.worktree_path))
             .map(PathBuf::from);
+        // Embedded floor pinned to the session's stamped harness version
+        // (H2); the wrapper wording stays latest-owned (turn envelope, H6).
+        let entry = crate::harness::resolve_entry(&session.harness_version);
         let (name, reminder) = self
             .specialists_service()
+            .with_embedded(entry.doctrine.specialists)
             .resolve_role_reminder(specialist_id, workspace_path.as_deref())?;
         Some(crate::harness::latest().role_reminder_prefix(&name, &reminder))
     }
@@ -1246,8 +1250,12 @@ impl Services {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // Embedded floor pinned to the session's stamped harness version
+        // (H2) so respawns under a newer binary keep the pinned prompts.
+        let entry = crate::harness::resolve_entry(&session.harness_version);
         let resolved = session.specialist.as_deref().and_then(|id| {
             self.specialists_service()
+                .with_embedded(entry.doctrine.specialists)
                 .resolve_prompt_injection(id, workspace_path)
         });
         match (override_bp, resolved) {
@@ -6879,20 +6887,39 @@ pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
 /// that must stay OUT of the `known_repo` registry
 /// (intent-hq/monorepo#2227): either the workspace's `repository_path` IS its
 /// checkout (standalone clone / cache hydration, where
-/// `repository_path == worktree_path`), or the path lives under one of the
-/// daemon's workspace roots (covers `ws.path` fallbacks, worktree-less rows,
-/// and leftovers from deleted workspaces). Genuine user repos live outside
-/// the roots and are never their own checkout.
+/// `repository_path == worktree_path`) AND it follows the daemon-owned
+/// `<parent>/<workspaceId>/<slug>` layout (parent directory named after the
+/// workspace id — covers checkouts under a former worktrees location), or the
+/// path lives under one of the daemon's workspace roots (covers `ws.path`
+/// fallbacks, worktree-less rows, and leftovers from deleted workspaces).
+/// The layout gate keeps `isNewRepo` direct rows — whose checkout IS the
+/// user's own repository folder (`repository_path == worktree_path`,
+/// intent-hq/monorepo#2611) — registered and visible like any other
+/// user-picked local repo. Genuine user repos live outside the roots and
+/// never match the daemon-owned layout.
 fn is_workspace_owned_checkout(
+    workspace_id: &WorkspaceId,
     repo_path: &str,
     worktree_path: Option<&str>,
     workspaces_roots: &[PathBuf],
 ) -> bool {
-    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path) {
+    if worktree_path.is_some_and(|w| !w.is_empty() && w == repo_path)
+        && checkout_parent_is_workspace_dir(repo_path, workspace_id)
+    {
         return true;
     }
     let path = Path::new(repo_path);
     workspaces_roots.iter().any(|root| path.starts_with(root))
+}
+
+/// True when `checkout`'s parent directory is named after `workspace_id` —
+/// the daemon-owned `<parent>/<workspaceId>/<slug>` provisioning layout.
+fn checkout_parent_is_workspace_dir(checkout: &str, workspace_id: &WorkspaceId) -> bool {
+    Path::new(checkout)
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n == std::ffi::OsStr::new(workspace_id.as_str()))
+        .unwrap_or(false)
 }
 
 /// Derive a repository display name from a local `repositoryPath` basename,
@@ -6992,6 +7019,51 @@ fn default_workspaces_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("intent")
         .join("workspaces")
+}
+
+/// Non-panicking [`default_workspaces_root`] for boot-time consumers that must
+/// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
+/// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
+/// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
+/// `$HOME` default would panic — else the same root the service layer uses.
+pub fn try_default_workspaces_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
+        return None;
+    }
+    Some(
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("intent")
+            .join("workspaces"),
+    )
+}
+
+/// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
+/// observability consumers (the `system.status` workspaces-disk sampler in the
+/// composition root): the parent directory `workspace.create` would provision
+/// new checkouts under, with the same precedence — the startup-pinned
+/// `workspaces.root` (`root_pinned`, `INTENTD_WORKSPACES_DIR`) wins, then a
+/// non-empty absolute `workspace.worktreesLocation` (tilde-expanded), then the
+/// default root. Unlike the create-path resolver it never creates directories,
+/// never errors (a relative location — which would fail the create — falls
+/// back to the default root), and never fires the hermetic guard (`None` via
+/// [`try_default_workspaces_root`] in that posture).
+pub fn try_workspaces_provisioning_parent(
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Option<PathBuf> {
+    let location = worktrees_location.trim();
+    if !root_pinned && !location.is_empty() {
+        let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+    try_default_workspaces_root()
 }
 
 /// Structural guard against `~/intent/workspaces` leaks from tests. Fires only
@@ -7737,7 +7809,12 @@ async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf])
         if repo_path.is_empty() {
             continue;
         }
-        if is_workspace_owned_checkout(repo_path, ws.worktree_path.as_deref(), workspaces_roots) {
+        if is_workspace_owned_checkout(
+            &ws.id,
+            repo_path,
+            ws.worktree_path.as_deref(),
+            workspaces_roots,
+        ) {
             continue;
         }
         let name = known_repo_name(ws.repository_name.as_deref(), repo_path);
@@ -7748,19 +7825,29 @@ async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf])
     // Self-heal: drop rows registered before the skip above existed. A row is
     // workspace-owned when it sits under a workspaces root (also covers
     // leftovers from deleted workspaces) or matches a live workspace's
-    // standalone checkout (`repository_path == worktree_path`) that lives
-    // outside the current roots (e.g. under a former worktrees location).
+    // standalone checkout (`repository_path == worktree_path` in the
+    // daemon-owned `<parent>/<wsId>/<slug>` layout) that lives outside the
+    // current roots (e.g. under a former worktrees location). An `isNewRepo`
+    // direct row also has `repository_path == worktree_path` but the folder
+    // is the user's own repository (intent-hq/monorepo#2611): the layout gate
+    // keeps it in the registry.
     let standalone: std::collections::HashSet<&str> = workspaces
         .iter()
         .filter(|ws| {
             ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
                 && ws.repository_path == ws.worktree_path
+                && ws
+                    .repository_path
+                    .as_deref()
+                    .is_some_and(|p| checkout_parent_is_workspace_dir(p, &ws.id))
         })
         .filter_map(|ws| ws.repository_path.as_deref())
         .collect();
     for repo in store.list_known_repos().await? {
         if standalone.contains(repo.path.as_str())
-            || is_workspace_owned_checkout(&repo.path, None, workspaces_roots)
+            || workspaces_roots
+                .iter()
+                .any(|root| Path::new(&repo.path).starts_with(root))
         {
             store.remove_known_repo(&repo.path).await?;
         }
@@ -9476,71 +9563,59 @@ pub(crate) fn format_completion_wake(
     stall: Option<&StallSuspicion>,
     watch_retired: bool,
 ) -> String {
-    let kind = match event.event_type.as_str() {
-        AGENT_IDLE => "completed",
-        AGENT_FAILED => "failed",
-        AGENT_DELETED => "was deleted",
-        other => other,
+    harness::latest().completion_wake(
+        &child_settlement_params(child_id, event, None, stall),
+        watch_retired,
+    )
+}
+
+/// Extract the data half of a child-settlement report from its `agent:*`
+/// event into the harness's typed params: resolve the display name, the
+/// report (an explicit `completion_report` wins; else the event's
+/// `completionReport`, canonical, falling back to the legacy `report` key),
+/// summary, error, attention fold, and stall context. Empty strings resolve
+/// to `None`; precedence between the fields is wording and lives in the
+/// harness.
+fn child_settlement_params<'a>(
+    child_id: &'a AgentId,
+    event: &'a Event,
+    completion_report: Option<&'a str>,
+    stall: Option<&'a StallSuspicion>,
+) -> harness::ChildSettlementParams<'a> {
+    let data_str = |key: &str| {
+        event
+            .data
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
     };
-    let label = event
-        .data
-        .get("agentName")
-        .and_then(|v| v.as_str())
-        .or(event.actor.name.as_deref())
-        .map(|name| format!("{name} ({})", child_id.0))
-        .unwrap_or_else(|| child_id.0.clone());
-    let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
-    let mut report_rendered = false;
-    if let Some(report) = event
-        .data
-        .get("completionReport")
-        .or_else(|| event.data.get("report"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        msg.push_str(&format!(" Report: {report}"));
-        report_rendered = true;
-    } else if let Some(summary) = event
-        .data
-        .get("lastResponseSummary")
-        .and_then(|v| v.as_str())
-    {
-        if !summary.is_empty() {
-            msg.push_str(&format!(" Summary: {summary}"));
-        }
+    let attention = data_str("attentionRequestKind").map(|kind| {
+        (
+            kind,
+            event
+                .data
+                .get("attentionRequestReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+    });
+    harness::ChildSettlementParams {
+        child_id: &child_id.0,
+        agent_name: event
+            .data
+            .get("agentName")
+            .and_then(|v| v.as_str())
+            .or(event.actor.name.as_deref()),
+        event_type: &event.event_type,
+        completion_report: completion_report
+            .filter(|r| !r.is_empty())
+            .or_else(|| data_str("completionReport"))
+            .or_else(|| data_str("report")),
+        last_response_summary: data_str("lastResponseSummary"),
+        error: data_str("error"),
+        attention,
+        stall: stall.map(|s| (s.task_title.as_str(), s.task_status.as_str())),
     }
-    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            msg.push_str(&format!(" Error: {err}"));
-        }
-    }
-    // monorepo#1898: the stall suspicion and the report can come from
-    // different session reads, so the tail is derived from what was actually
-    // rendered — a wake carrying a `Report:` clause never gets the
-    // contradictory "No completion report … may have stalled" suffix.
-    if let Some(stall) = stall {
-        if !report_rendered {
-            msg.push_str(&stall.annotation_suffix());
-        }
-    }
-    if watch_retired {
-        // A deleted agent fails closed in `agent.watch` (rejected as unknown)
-        // and has no next completion, so the deleted-kind wake must not carry
-        // the re-arm pointer — say the agent cannot be re-watched instead.
-        if event.event_type == AGENT_DELETED {
-            msg.push_str(
-                " NOTE: this wake consumed your one-shot watch on this agent — the watch is \
-                 now retired. The agent was deleted, so it cannot be re-watched.",
-            );
-        } else {
-            msg.push_str(&format!(
-                " NOTE: this wake consumed your one-shot watch on this agent — the watch is now \
-                 retired. Call ws.agent.watch(\"{}\") again to be woken at its next completion.",
-                child_id.0
-            ));
-        }
-    }
-    msg
 }
 
 /// Build one per-child summary line for a delegation group's aggregated wake.
@@ -9556,79 +9631,12 @@ pub(crate) fn format_group_child_line(
     completion_report: Option<&str>,
     stall: Option<&StallSuspicion>,
 ) -> String {
-    let kind = match event.event_type.as_str() {
-        AGENT_IDLE => "completed",
-        AGENT_FAILED => "failed",
-        AGENT_DELETED => "was deleted",
-        other => other,
-    };
-    let label = event
-        .data
-        .get("agentName")
-        .and_then(|v| v.as_str())
-        .or(event.actor.name.as_deref())
-        .map(|name| format!("{name} ({})", child_id.0))
-        .unwrap_or_else(|| child_id.0.clone());
-    let mut line = format!("- {label} {kind}.");
-    let mut report_rendered = false;
-    if let Some(report) = completion_report
-        .or_else(|| {
-            event
-                .data
-                .get("completionReport")
-                .or_else(|| event.data.get("report"))
-                .and_then(|v| v.as_str())
-        })
-        .filter(|r| !r.is_empty())
-    {
-        line.push_str(&format!(" Report: {report}"));
-        report_rendered = true;
-    } else if let Some(summary) = event
-        .data
-        .get("lastResponseSummary")
-        .and_then(|v| v.as_str())
-    {
-        if !summary.is_empty() {
-            line.push_str(&format!(" Summary: {summary}"));
-        }
-    }
-    if let Some(err) = event.data.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            line.push_str(&format!(" Error: {err}"));
-        }
-    }
-    // Pending attention request (agent:attention-requested): the child's
-    // immediate parent wake already fired at raise time (the alert); the
-    // aggregated line carries the kind-flavored attention text as the record
-    // (annotated onto the event data by the group-record sites from the
-    // persisted session fields).
-    if let Some(kind) = event
-        .data
-        .get("attentionRequestKind")
-        .and_then(|v| v.as_str())
-        .filter(|k| !k.is_empty())
-    {
-        let verb = if kind == "blocker" {
-            "Reported a blocker"
-        } else {
-            "Requested a discussion"
-        };
-        let reason = event
-            .data
-            .get("attentionRequestReason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        line.push_str(&format!(" {verb}: {reason}"));
-    }
-    // monorepo#1898: same consistency guard as `format_completion_wake` —
-    // never append the "No completion report" tail to a line that already
-    // rendered a `Report:` clause.
-    if let Some(stall) = stall {
-        if !report_rendered {
-            line.push_str(&stall.annotation_suffix());
-        }
-    }
-    line
+    harness::latest().group_child_line(&child_settlement_params(
+        child_id,
+        event,
+        completion_report,
+        stall,
+    ))
 }
 
 /// A suspected-stall completion (monorepo#1016): the child went idle WITHOUT
@@ -9644,16 +9652,6 @@ pub(crate) struct StallSuspicion {
 }
 
 impl StallSuspicion {
-    /// The suffix appended to the wake text / per-child group line.
-    pub(crate) fn annotation_suffix(&self) -> String {
-        format!(
-            " No completion report and assigned task \"{}\" is still {} — the agent may have \
-             stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
-             resume it.",
-            self.task_title, self.task_status
-        )
-    }
-
     /// Fields merged into the event's `data` so the FE metadata (and the
     /// grouped raw_events) carry the machine-readable flag.
     pub(crate) fn annotate_event_data(&self, data: &mut serde_json::Value) {
@@ -9742,15 +9740,7 @@ pub(crate) fn format_group_wake(group: &agent_subscriptions::DelegationGroup) ->
         .iter()
         .any(|e| e.event_type == AGENT_FAILED);
     let partial = !group.deleted_agent_ids.is_empty() || any_failed;
-    let status = if partial { "partial" } else { "completed" };
-    let mut msg = format!(
-        "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
-    );
-    for line in &group.event_summaries {
-        msg.push('\n');
-        msg.push_str(line);
-    }
-    msg
+    harness::latest().group_settlement_wake(total, partial, &group.event_summaries)
 }
 
 /// Human-readable identifier for a `@@@task` block in conversion warnings:
@@ -13325,6 +13315,18 @@ impl WorkspaceApi for Services {
                                     })
                                     .await?;
                                 ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+                                // The repository folder IS the checkout:
+                                // persist it as `worktreePath` (standalone-row
+                                // parity with cache hydration) so agent spawn
+                                // cwd resolution and the workspace file
+                                // watcher see the checkout
+                                // (intent-hq/monorepo#2611). The delete
+                                // cleanup never trashes it — its standalone
+                                // arm is gated on the daemon-owned
+                                // `<parent>/<wsId>/<slug>` layout, which a
+                                // user-chosen folder never matches.
+                                ws.worktree_path =
+                                    Some(repo_dir.to_string_lossy().into_owned());
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
@@ -13668,6 +13670,7 @@ impl WorkspaceApi for Services {
                         .filter(|p| !p.is_empty())
                         .filter(|p| {
                             !is_workspace_owned_checkout(
+                                &ws.id,
                                 p,
                                 ws.worktree_path.as_deref(),
                                 &registry_roots,
@@ -14654,6 +14657,45 @@ impl WorkspaceApi for Services {
                 let deleted_worktree_path = ws_for_cleanup
                     .as_ref()
                     .and_then(|w| w.worktree_path.clone());
+                // Root-anchored ownership: the persisted checkout counts as
+                // daemon-provisioned only when its parent directory is named
+                // after the workspace id AND it lives under a root the daemon
+                // provisions into (the boot workspaces root or the currently
+                // configured `workspace.worktreesLocation`). The parent
+                // basename alone is spoofable — the workspace id derives from
+                // the initial prompt, so an `isNewRepo` caller could place
+                // their repository at `<anywhere>/<wsId>/<repo>` and a
+                // basename-only gate would route the user's folder into the
+                // delete paths below. Trade-off: a checkout provisioned under
+                // a since-changed custom location is no longer matched and its
+                // `<oldLocation>/<wsId>/` directory leaks instead of being
+                // swept — leaking is the safe direction (never delete what we
+                // cannot prove we created).
+                let checkout_owned = deleted_worktree_path.as_deref().is_some_and(|wt| {
+                    checkout_parent_is_workspace_dir(wt, &id_bg)
+                        && (Path::new(wt).starts_with(&workspaces_root_bg)
+                            || worktrees_location_bg
+                                .as_deref()
+                                .is_some_and(|loc| Path::new(wt).starts_with(loc)))
+                });
+                // A standalone row's checkout path is caller-influenced
+                // (`repository_path == worktree_path`), so unless ownership is
+                // proven above it must not seed the final
+                // `workspace_dir_candidates` sweep either — that sweep
+                // recursively removes the checkout's parent directory.
+                // Worktree-mode rows keep their persisted path: the daemon
+                // derived it at provision time (covers a since-changed custom
+                // location).
+                let is_standalone_row = ws_for_cleanup.as_ref().is_some_and(|w| {
+                    matches!(
+                        w.checkout_mode,
+                        Some(intent_core::CheckoutMode::Cow)
+                            | Some(intent_core::CheckoutMode::Direct)
+                    )
+                });
+                let sweep_worktree_path = deleted_worktree_path
+                    .as_deref()
+                    .filter(|_| !is_standalone_row || checkout_owned);
                 if let Some(ws_cleanup) = ws_for_cleanup {
                     // Only run the worktree cleanup if the workspace is still
                     // deleted (no recreate) or the recreate has a different
@@ -14691,67 +14733,86 @@ impl WorkspaceApi for Services {
                                     Some(intent_core::CheckoutMode::Cow)
                                         | Some(intent_core::CheckoutMode::Direct)
                                 );
-                                // Under the per-repo lock: git-metadata work
-                                // only (registration prune, rename of the
-                                // checkout to a trash path, branch-delete
-                                // guard; for CoW just the rename + metadata
-                                // dir removal). On the rename-success path
-                                // the multi-GB recursive removal runs below,
-                                // after the lock is released, so concurrent
-                                // `workspace.create` provisioning on the same
-                                // repo is not starved by bulk deletes; only
-                                // the rare rename-failure fallback removes
-                                // in place under the lock.
-                                let trash = worktree_locks_bg
-                                    .with_lock(&repo_dir, move || async move {
-                                        let task = tokio::task::spawn_blocking(move || {
-                                            if is_standalone {
-                                                cleanup_workspace_cow_checkout_locked(&wt_locked)
-                                            } else {
-                                                cleanup_workspace_worktree_locked(
-                                                    &repo,
-                                                    &wt_locked,
-                                                    &branch,
-                                                    branch_flag,
-                                                )
+                                // Standalone-checkout removal is gated on the
+                                // root-anchored `checkout_owned` proof above
+                                // (`<root>/<wsId>/<slug>` under a daemon
+                                // root). An `isNewRepo` direct row's checkout
+                                // IS the user's repository folder
+                                // (`worktree_path == repository_path`,
+                                // intent-hq/monorepo#2611): never provisioned
+                                // by the daemon, never deleted with the
+                                // workspace.
+                                if is_standalone && !checkout_owned {
+                                    tracing::debug!(
+                                        workspace = %ws_cleanup.id.as_str(),
+                                        checkout = %wt_locked.display(),
+                                        "workspace.delete: standalone checkout is the user's repository folder; keeping it"
+                                    );
+                                } else {
+                                    // Under the per-repo lock: git-metadata work
+                                    // only (registration prune, rename of the
+                                    // checkout to a trash path, branch-delete
+                                    // guard; for CoW just the rename + metadata
+                                    // dir removal). On the rename-success path
+                                    // the multi-GB recursive removal runs below,
+                                    // after the lock is released, so concurrent
+                                    // `workspace.create` provisioning on the same
+                                    // repo is not starved by bulk deletes; only
+                                    // the rare rename-failure fallback removes
+                                    // in place under the lock.
+                                    let trash = worktree_locks_bg
+                                        .with_lock(&repo_dir, move || async move {
+                                            let task = tokio::task::spawn_blocking(move || {
+                                                if is_standalone {
+                                                    cleanup_workspace_cow_checkout_locked(
+                                                        &wt_locked,
+                                                    )
+                                                } else {
+                                                    cleanup_workspace_worktree_locked(
+                                                        &repo,
+                                                        &wt_locked,
+                                                        &branch,
+                                                        branch_flag,
+                                                    )
+                                                }
+                                            })
+                                            .await;
+                                            match task {
+                                                Ok(trash) => trash,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "background worktree cleanup task failed"
+                                                    );
+                                                    None
+                                                }
                                             }
                                         })
                                         .await;
-                                        match task {
-                                            Ok(trash) => trash,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "background worktree cleanup task failed"
-                                                );
-                                                None
-                                            }
+                                    if let Some(trash) = trash {
+                                        let removal = tokio::task::spawn_blocking(move || {
+                                            cleanup_detached_worktree(&trash)
+                                        })
+                                        .await;
+                                        if let Err(e) = removal {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "background detached-worktree removal task failed"
+                                            );
                                         }
-                                    })
-                                    .await;
-                                if let Some(trash) = trash {
-                                    let removal = tokio::task::spawn_blocking(move || {
-                                        cleanup_detached_worktree(&trash)
-                                    })
-                                    .await;
-                                    if let Err(e) = removal {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "background detached-worktree removal task failed"
-                                        );
-                                    }
-                                    // Retry the empty-only parent `remove_dir`
-                                    // the trash sibling blocked — back under
-                                    // the per-repo lock, so it can't race a
-                                    // same-slug recreate's freshly created
-                                    // parent between its `create_dir_all` and
-                                    // `git worktree add`. O(1) while held.
-                                    if let Some(parent) = wt.parent().map(Path::to_path_buf) {
-                                        worktree_locks_bg
-                                            .with_lock(&repo_dir, move || async move {
-                                                let _ = std::fs::remove_dir(&parent);
-                                            })
-                                            .await;
+                                        // Retry the empty-only parent `remove_dir`
+                                        // the trash sibling blocked — back under
+                                        // the per-repo lock, so it can't race a
+                                        // same-slug recreate's freshly created
+                                        // parent between its `create_dir_all` and
+                                        // `git worktree add`. O(1) while held.
+                                        if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                            worktree_locks_bg
+                                                .with_lock(&repo_dir, move || async move {
+                                                    let _ = std::fs::remove_dir(&parent);
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -14785,7 +14846,7 @@ impl WorkspaceApi for Services {
                     .map(Path::to_path_buf);
                 for dir in workspace_dir_candidates(
                     &id_bg,
-                    deleted_worktree_path.as_deref(),
+                    sweep_worktree_path,
                     &workspaces_root_bg,
                     worktrees_location_bg.as_deref(),
                 ) {
