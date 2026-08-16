@@ -288,6 +288,153 @@ fn list_directory_with_returns_error_for_missing_path() {
     assert!(err.contains("nope"));
 }
 
+/// Collect `(id, path)` pairs from a favorites array for compact assertions.
+fn favorite_pairs(favs: &[Value]) -> Vec<(String, String)> {
+    favs.iter()
+        .map(|f| {
+            (
+                f["id"].as_str().unwrap().to_string(),
+                f["path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn favorites_include_only_existing_standard_dirs() {
+    let home = unique_temp_dir("fav-exist");
+    let home = home.path();
+    std::fs::create_dir_all(home.join("Desktop")).unwrap();
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    // No Documents — it must be excluded.
+    let pairs = favorite_pairs(&favorites_with(home));
+    assert_eq!(
+        pairs,
+        vec![
+            ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "desktop".into(),
+                home.join("Desktop").to_string_lossy().into_owned()
+            ),
+            (
+                "downloads".into(),
+                home.join("Downloads").to_string_lossy().into_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn favorites_always_include_home_even_when_nothing_else_exists() {
+    let home = unique_temp_dir("fav-home-only");
+    let home = home.path();
+    let pairs = favorite_pairs(&favorites_with(home));
+    assert_eq!(
+        pairs,
+        vec![("home".into(), home.to_string_lossy().into_owned())]
+    );
+}
+
+#[test]
+fn favorites_resolve_xdg_user_dirs_overrides() {
+    // Relocated + localized dirs via `~/.config/user-dirs.dirs` must resolve:
+    // `$HOME/...` values, absolute values, a `$HOME` "disabled" entry (falls
+    // back to the conventional name), plus comments and malformed lines.
+    let home = unique_temp_dir("fav-xdg");
+    let home = home.path();
+    let outside = unique_temp_dir("fav-xdg-outside");
+    let outside = outside.path();
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    std::fs::create_dir_all(home.join("T\u{e9}l\u{e9}chargements")).unwrap();
+    std::fs::create_dir_all(outside.join("Docs")).unwrap();
+    std::fs::write(
+        home.join(".config").join("user-dirs.dirs"),
+        format!(
+            "# This file is written by xdg-user-dirs-update\n\
+             XDG_DESKTOP_DIR=\"$HOME\"\n\
+             XDG_DOCUMENTS_DIR=\"{}\"\n\
+             XDG_DOWNLOAD_DIR=\"$HOME/T\u{e9}l\u{e9}chargements\"\n\
+             not a key value line\n",
+            outside.join("Docs").display()
+        ),
+    )
+    .unwrap();
+    let pairs = favorite_pairs(&favorites_with(home));
+    // Desktop is "disabled" ($HOME) and the conventional ~/Desktop does not
+    // exist, so it is excluded; documents resolves to the absolute override;
+    // downloads resolves to the localized $HOME-relative override.
+    assert_eq!(
+        pairs,
+        vec![
+            ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "documents".into(),
+                outside.join("Docs").to_string_lossy().into_owned()
+            ),
+            (
+                "downloads".into(),
+                home.join("T\u{e9}l\u{e9}chargements")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn favorites_fall_back_to_conventional_on_invalid_xdg_values() {
+    // Unquoted / relative XDG values are invalid per the spec and must be
+    // ignored — the conventional home-joined name is used instead.
+    let home = unique_temp_dir("fav-xdg-invalid");
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".config")).unwrap();
+    std::fs::create_dir_all(home.join("Documents")).unwrap();
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    std::fs::write(
+        home.join(".config").join("user-dirs.dirs"),
+        "XDG_DOCUMENTS_DIR=$HOME/Unquoted\nXDG_DOWNLOAD_DIR=\"relative/path\"\n",
+    )
+    .unwrap();
+    let pairs = favorite_pairs(&favorites_with(home));
+    assert_eq!(
+        pairs,
+        vec![
+            ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "documents".into(),
+                home.join("Documents").to_string_lossy().into_owned()
+            ),
+            (
+                "downloads".into(),
+                home.join("Downloads").to_string_lossy().into_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn list_directory_with_carries_favorites() {
+    // The favorites ride the listing result regardless of the listed path,
+    // resolved against `home` (not the listed directory).
+    let home = unique_temp_dir("ls-favs");
+    let home = home.path();
+    std::fs::create_dir_all(home.join("Desktop")).unwrap();
+    std::fs::create_dir_all(home.join("sub")).unwrap();
+    let v = list_directory_with(Some("~/sub"), home).unwrap();
+    let favs = v["favorites"].as_array().unwrap();
+    let pairs = favorite_pairs(favs);
+    assert_eq!(
+        pairs,
+        vec![
+            ("home".into(), home.to_string_lossy().into_owned()),
+            (
+                "desktop".into(),
+                home.join("Desktop").to_string_lossy().into_owned()
+            ),
+        ]
+    );
+}
+
 #[test]
 fn create_directory_with_creates_directory() {
     let home = unique_temp_dir("mkdir-basic");

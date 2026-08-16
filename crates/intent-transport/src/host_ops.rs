@@ -743,10 +743,86 @@ fn has_git_marker(dir: &Path) -> bool {
     }
 }
 
+/// The standard user directories surfaced as `host.listDirectory` favorites,
+/// as `(id, XDG user-dirs key, conventional home-joined name)` rows.
+const FAVORITE_DIRS: [(&str, &str, &str); 3] = [
+    ("desktop", "XDG_DESKTOP_DIR", "Desktop"),
+    ("documents", "XDG_DOCUMENTS_DIR", "Documents"),
+    ("downloads", "XDG_DOWNLOAD_DIR", "Downloads"),
+];
+
+/// Parse `home/.config/user-dirs.dirs` (the XDG user-dirs config, present on
+/// Linux) into `XDG_*_DIR` key → resolved absolute path. Lines must look like
+/// `XDG_DESKTOP_DIR="$HOME/Desktop"`: values are double-quoted, and per the
+/// XDG spec must be absolute or start with `$HOME/` — anything else (and
+/// comments / malformed lines) is skipped. A missing/unreadable file yields an
+/// empty map, which is also the expected macOS behavior (no such file).
+fn parse_xdg_user_dirs(home: &Path) -> std::collections::HashMap<String, PathBuf> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(content) = std::fs::read_to_string(home.join(".config").join("user-dirs.dirs")) else {
+        return map;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !key.starts_with("XDG_") || !key.ends_with("_DIR") {
+            continue;
+        }
+        let Some(value) = value
+            .trim()
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+        else {
+            continue;
+        };
+        let path = if let Some(rest) = value.strip_prefix("$HOME") {
+            home.join(rest.trim_start_matches('/'))
+        } else if Path::new(value).is_absolute() {
+            PathBuf::from(value)
+        } else {
+            continue;
+        };
+        map.insert(key.to_string(), path);
+    }
+    map
+}
+
+/// Build the `favorites` array for the `host.listDirectory` result: `{ id,
+/// path }` rows for the standard user directories that exist on the daemon
+/// host. `home` is always included; `desktop`/`documents`/`downloads` resolve
+/// via the XDG user-dirs config when it has an entry (so relocated/localized
+/// folders resolve correctly on Linux) and fall back to the conventional
+/// home-joined names otherwise (the macOS path, and the Linux default) —
+/// included only when the resolved directory exists. An XDG entry "disabled"
+/// by pointing at `$HOME` itself falls back to the conventional name too.
+fn favorites_with(home: &Path) -> Vec<Value> {
+    let xdg = parse_xdg_user_dirs(home);
+    let mut out = vec![json!({ "id": "home", "path": home.to_string_lossy() })];
+    for (id, xdg_key, conventional) in FAVORITE_DIRS {
+        let path = xdg
+            .get(xdg_key)
+            .filter(|p| p.as_path() != home)
+            .cloned()
+            .unwrap_or_else(|| home.join(conventional));
+        if path.is_dir() {
+            out.push(json!({ "id": id, "path": path.to_string_lossy() }));
+        }
+    }
+    out
+}
+
 /// Build the `host.listDirectory` result. `path` defaults to `home` when
 /// `None`/empty. `parent` is `null` at the filesystem root. Entries include
 /// hidden files (the FE filters), sorted directories-first then by name.
-/// Returns the error message (mapped to `-32603` by the caller) on IO errors.
+/// `favorites` reports the standard user directories that exist on the daemon
+/// host (see [`favorites_with`]). Returns the error message (mapped to
+/// `-32603` by the caller) on IO errors.
 pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Value, String> {
     let target = match path {
         Some(p) if !p.is_empty() => expand_path(p, home),
@@ -793,6 +869,7 @@ pub(crate) fn list_directory_with(path: Option<&str>, home: &Path) -> Result<Val
             .unwrap_or(Value::Null),
         "home": home.to_string_lossy(),
         "entries": entries_json,
+        "favorites": favorites_with(home),
     }))
 }
 
