@@ -10324,6 +10324,100 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
+/// A workspace with only `repository_path` on disk (an `isNewRepo`
+/// direct-mode row missing `worktree_path`, intent-hq/monorepo#2611)
+/// resolves its spawn cwd to the repository folder — never the temp dir.
+#[tokio::test]
+async fn resolve_spawn_falls_back_to_repository_path() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let session = session_with_specialist(None);
+    let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let mut workspace = intent_core::Workspace {
+        id: WorkspaceId::from("ws-repo-fb"),
+        title: "WS".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        status_image_asset_id: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: Some(repo_dir.display().to_string()),
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+        cow_supported: None,
+        display_status: None,
+        waiting: false,
+        checkout_mode: Some(intent_core::CheckoutMode::Direct),
+        disk_usage: None,
+        pending_delete_at: None,
+    };
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
+        .expect("repository_path fallback resolves");
+    assert_eq!(resolved.cwd, repo_dir, "cwd is the repository folder");
+    assert_ne!(resolved.cwd, std::env::temp_dir(), "never the temp dir");
+
+    // `worktree_path` still wins over `repository_path` when both exist.
+    let wt_dir = std::env::temp_dir().join(format!("intentd-rs-wt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    workspace.worktree_path = Some(wt_dir.display().to_string());
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
+        .expect("worktree_path still wins");
+    assert_eq!(resolved.cwd, wt_dir);
+
+    // A stale (non-directory) `path` must not suppress a live candidate
+    // further down the chain — each entry is `is_dir()`-checked individually.
+    workspace.path = Some(
+        std::env::temp_dir()
+            .join(format!("intentd-stale-path-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+    );
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
+        .expect("stale path skipped, worktree_path resolves");
+    assert_eq!(resolved.cwd, wt_dir, "stale `path` never wins the chain");
+    workspace.path = None;
+
+    // A missing repository_path directory falls through to the temp dir.
+    workspace.worktree_path = None;
+    workspace.repository_path = Some(
+        std::env::temp_dir()
+            .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string(),
+    );
+    let resolved =
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
+    let _ = std::fs::remove_dir_all(&repo_dir);
+    let _ = std::fs::remove_dir_all(&wt_dir);
+}
+
 // --- Prompt block shape helpers ----------------------------------------------
 
 /// The persisted/prompt wire shape for a user text message without attachments

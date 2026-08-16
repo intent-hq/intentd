@@ -18514,13 +18514,14 @@ mod known_repo {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
         // Standalone checkout OUTSIDE the current roots (e.g. a former
-        // worktrees location): repository_path == worktree_path.
+        // worktrees location): repository_path == worktree_path in the
+        // daemon-owned `<parent>/<wsId>/<slug>` layout.
         let standalone = "/old/worktrees/ws-a/monorepo";
         store
             .insert_workspace(&Workspace {
                 worktree_path: Some(standalone.to_string()),
                 ..ws_with_repo(
-                    &WorkspaceId::new(),
+                    &WorkspaceId::from("ws-a"),
                     Some(standalone),
                     Some("monorepo"),
                     None,
@@ -18528,6 +18529,23 @@ mod known_repo {
             })
             .await
             .expect("standalone ws");
+        // `isNewRepo` direct row (intent-hq/monorepo#2611): also
+        // `repository_path == worktree_path`, but the folder is the USER'S
+        // repository — not the daemon-owned layout — so it must sync.
+        let direct_repo = "/home/me/Developer/newproject";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(direct_repo.to_string()),
+                checkout_mode: Some(intent_core::CheckoutMode::Direct),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(direct_repo),
+                    Some("newproject"),
+                    None,
+                )
+            })
+            .await
+            .expect("direct ws");
         // Checkout under the workspaces root, no worktree_path (e.g. a
         // materialized import).
         let under_root = ws_root.path().join("ws-b").join("monorepo");
@@ -18566,10 +18584,15 @@ mod known_repo {
             .expect("sync");
 
         let repos = store.list_known_repos().await.expect("list");
+        let mut paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+        paths.sort_unstable();
         assert_eq!(
-            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
-            vec!["/home/me/Developer/monorepo"],
-            "only the user repo syncs"
+            paths,
+            vec![
+                "/home/me/Developer/monorepo",
+                "/home/me/Developer/newproject"
+            ],
+            "the user repo and the isNewRepo direct repo sync; owned checkouts stay out"
         );
     }
 
@@ -18582,13 +18605,14 @@ mod known_repo {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_root = WorkspacesRoot::new();
-        // Live standalone workspace outside the roots.
+        // Live standalone workspace outside the roots (daemon-owned
+        // `<parent>/<wsId>/<slug>` layout).
         let standalone = "/old/worktrees/ws-a/monorepo";
         store
             .insert_workspace(&Workspace {
                 worktree_path: Some(standalone.to_string()),
                 ..ws_with_repo(
-                    &WorkspaceId::new(),
+                    &WorkspaceId::from("ws-a"),
                     Some(standalone),
                     Some("monorepo"),
                     None,
@@ -18596,6 +18620,23 @@ mod known_repo {
             })
             .await
             .expect("standalone ws");
+        // Live `isNewRepo` direct workspace (intent-hq/monorepo#2611): same
+        // `repository_path == worktree_path` shape but the folder is the
+        // user's repository — its registry row must survive the sweep.
+        let direct_repo = "/home/me/Developer/newproject";
+        store
+            .insert_workspace(&Workspace {
+                worktree_path: Some(direct_repo.to_string()),
+                checkout_mode: Some(intent_core::CheckoutMode::Direct),
+                ..ws_with_repo(
+                    &WorkspaceId::new(),
+                    Some(direct_repo),
+                    Some("newproject"),
+                    None,
+                )
+            })
+            .await
+            .expect("direct ws");
         // Pollution: the standalone checkout, an under-root leftover with no
         // surviving workspace row, and a genuine user repo.
         let leftover = ws_root.path().join("ws-gone").join("monorepo");
@@ -18611,16 +18652,25 @@ mod known_repo {
             .upsert_known_repo("/home/me/Developer/monorepo", "monorepo", Some("intent-hq"))
             .await
             .expect("seed user row");
+        store
+            .upsert_known_repo(direct_repo, "newproject", None)
+            .await
+            .expect("seed direct row");
 
         sync_repos_from_workspaces(&store, &[ws_root.path().to_path_buf()])
             .await
             .expect("sync");
 
         let repos = store.list_known_repos().await.expect("list");
+        let mut paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+        paths.sort_unstable();
         assert_eq!(
-            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
-            vec!["/home/me/Developer/monorepo"],
-            "workspace-owned rows swept, user repo untouched"
+            paths,
+            vec![
+                "/home/me/Developer/monorepo",
+                "/home/me/Developer/newproject"
+            ],
+            "workspace-owned rows swept; user repo and isNewRepo direct repo untouched"
         );
     }
 
@@ -18655,9 +18705,12 @@ mod known_repo {
 
     /// The `workspace.create` registration hook never registers
     /// daemon-provisioned paths (intent-hq/monorepo#2227): a `repositoryPath`
-    /// under the workspaces root, a standalone checkout
-    /// (`repository_path == worktree_path`), and the `ws.path` fallback
-    /// pointing under the root are all skipped.
+    /// under the workspaces root and the `ws.path` fallback pointing under
+    /// the root are skipped. A caller-supplied standalone shape
+    /// (`repository_path == worktree_path`) OUTSIDE the roots and outside the
+    /// daemon-owned `<parent>/<wsId>/<slug>` layout is user-owned and DOES
+    /// register (intent-hq/monorepo#2611 — ownership is layout-gated, not
+    /// bare path equality).
     #[tokio::test]
     async fn create_workspace_skips_registry_for_workspace_owned_paths() {
         let tmp = TempDb::new();
@@ -18679,8 +18732,8 @@ mod known_repo {
         .await
         .expect("create under root");
 
-        // Standalone checkout outside the roots: repository_path IS the
-        // caller-supplied worktree_path.
+        // Caller-supplied standalone shape outside the roots: the parent dir
+        // is NOT the workspace id, so this is a user repo and registers.
         svc.create_workspace(
             WorkspaceCreate {
                 repository_path: Some("/old/worktrees/ws-y/monorepo".to_string()),
@@ -18711,10 +18764,11 @@ mod known_repo {
         .await
         .expect("create path fallback");
 
+        let repos = store.list_known_repos().await.expect("list");
         assert_eq!(
-            store.list_known_repos().await.expect("list"),
-            vec![],
-            "no workspace-owned path is registered"
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/old/worktrees/ws-y/monorepo"],
+            "workspace-owned paths skipped; the user-owned standalone shape registers"
         );
     }
 
@@ -19374,7 +19428,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let repo_dir = unique_dir("intentd-newrepo-src");
         let root = unique_dir("intentd-newrepo-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
 
         let ws = svc
             .create_workspace(
@@ -19402,12 +19456,29 @@ mod worktree_provisioning {
             "workspace branch checked out directly in the repository folder"
         );
 
-        // Direct mode: standalone repo, no worktree provisioned.
-        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        // Direct mode: the repository folder IS the checkout — the row
+        // carries it as `worktree_path` so spawn cwd resolution and the file
+        // watcher see it (intent-hq/monorepo#2611).
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_dir.0.to_string_lossy().as_ref()),
+            "worktree_path carries the initialized repository folder"
+        );
         assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             ws.base_commit_sha.as_deref(),
             Some(head.id().to_string().as_str())
+        );
+
+        // Despite `repository_path == worktree_path`, the folder is the
+        // user's own repository — it registers in `known_repos` like any
+        // other user-picked local repo (the ownership predicate is
+        // layout-gated, not bare path equality).
+        let repos = store.list_known_repos().await.expect("list repos");
+        assert_eq!(
+            repos.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec![repo_dir.0.to_string_lossy().as_ref()],
+            "isNewRepo direct repo registers in known_repos"
         );
     }
 
@@ -19487,7 +19558,11 @@ mod worktree_provisioning {
             "init\n",
             "existing files must not be overwritten"
         );
-        assert_eq!(ws.worktree_path, None, "no worktree for isNewRepo creates");
+        assert_eq!(
+            ws.worktree_path.as_deref(),
+            Some(repo_dir.0.to_string_lossy().as_ref()),
+            "worktree_path carries the repository folder (the checkout)"
+        );
         assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Direct));
         assert_eq!(
             src.head().unwrap().shorthand().unwrap(),
@@ -19495,6 +19570,124 @@ mod worktree_provisioning {
             "workspace branch checked out in place"
         );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// Delete safety for `isNewRepo` direct workspaces
+    /// (intent-hq/monorepo#2611): the row carries
+    /// `worktree_path == repository_path`, but that directory is the USER'S
+    /// repository folder — not a daemon-provisioned checkout under the
+    /// workspaces root — so `workspace.delete` must remove only the row and
+    /// never the directory.
+    #[tokio::test]
+    async fn delete_is_new_repo_workspace_keeps_user_repository_dir() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-del-src");
+        let root = unique_dir("intentd-newrepo-del-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(repo_dir.0.join(".git").exists());
+
+        svc.delete_workspace(ws.id.clone()).await.expect("delete");
+
+        // Fast-ack: the checkout cleanup runs in the background. Anchor on
+        // its positive completion signal — the final sweep removes the
+        // `<workspaces_root>/<id>/` directory (created by the metadata
+        // write) — so the survival assertions run after the standalone
+        // cleanup phase has demonstrably executed.
+        let ws_dir = root.0.join(ws.id.as_str());
+        for _ in 0..200 {
+            if !ws_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(!ws_dir.exists(), "background cleanup swept <root>/<id>");
+        assert!(
+            repo_dir.0.join(".git").exists(),
+            "user repository folder must survive workspace.delete"
+        );
+        let repo_name = repo_dir
+            .0
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let trashed = std::fs::read_dir(repo_dir.0.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{repo_name}.deleting-"))
+            });
+        assert!(!trashed, "no trash rename of the user repository folder");
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+    }
+
+    /// The standalone-checkout ownership gate is root-anchored, not
+    /// basename-matched: a user repository living at
+    /// `<any-parent>/<workspaceId>/<repo>` OUTSIDE the daemon's workspace
+    /// roots (the id is derivable from the initial prompt, so this layout is
+    /// caller-reachable) must survive `workspace.delete` — both the
+    /// trash-rename of the checkout and the recursive
+    /// `workspace_dir_candidates` sweep of its parent directory.
+    #[tokio::test]
+    async fn delete_direct_workspace_outside_roots_keeps_spoofed_id_layout() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-spoof-del-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        // `<any-parent>/<wsId>/<repo>` outside the workspaces root.
+        let ws_id = WorkspaceId::new();
+        let outer = unique_dir("intentd-spoof-del-parent");
+        let repo_dir = outer.0.join(ws_id.as_str()).join("myrepo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        git2::Repository::init(&repo_dir).unwrap();
+
+        let mut ws = workspace(&ws_id);
+        ws.repository_path = Some(repo_dir.to_string_lossy().to_string());
+        ws.worktree_path = Some(repo_dir.to_string_lossy().to_string());
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Direct);
+        store.insert_workspace(&ws).await.expect("insert ws");
+        // Sentinel: the background cleanup's final sweep removes
+        // `<workspaces_root>/<id>/` — seed it so its disappearance is the
+        // positive signal that the cleanup (including the standalone arm)
+        // has run.
+        let ws_dir = root.0.join(ws_id.as_str());
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        svc.delete_workspace(ws_id.clone()).await.expect("delete");
+
+        for _ in 0..200 {
+            if !ws_dir.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(!ws_dir.exists(), "background cleanup swept <root>/<id>");
+        assert!(
+            repo_dir.join(".git").exists(),
+            "repository under a spoofed <parent>/<wsId>/<repo> layout must survive"
+        );
+        assert!(
+            repo_dir.parent().unwrap().exists(),
+            "the <parent>/<wsId>/ directory must not be swept outside daemon roots"
+        );
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
     }
 
     /// An `isNewRepo` create on an already-initialized repo honors a
