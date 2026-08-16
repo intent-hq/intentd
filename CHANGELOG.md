@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.7] - 2026-08-16
+
+### 🚀 Features
+
+- *(services)* Versioned doctrine bundles + per-session harness resolution (H2) ([#1259](https://github.com/intent-hq/intentd/pull/1259))
+
+
 ## [0.7.6] - 2026-08-16
 
 ### 🧪 Testing
