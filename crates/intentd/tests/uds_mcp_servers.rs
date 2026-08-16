@@ -303,3 +303,195 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Spawn the mock MCP server in `--http` mode and return (child, base url).
+/// The fixture announces its ephemeral port as `PORT=<n>` on stdout.
+async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
+    let mut child = tokio::process::Command::new("node")
+        .arg(script)
+        .arg("--http")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn mock http mcp server");
+    let stdout = child.stdout.take().expect("fixture stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("timed out waiting for fixture PORT line")
+        .expect("read fixture stdout")
+        .expect("fixture exited before announcing PORT");
+    let port = line
+        .strip_prefix("PORT=")
+        .expect("fixture PORT line")
+        .trim()
+        .to_string();
+    (child, format!("http://127.0.0.1:{port}"))
+}
+
+/// Remote `http` transport: the daemon probes the endpoint over the network
+/// (MCP handshake via streamable HTTP POST) — reachable server → `running` with
+/// the advertised toolCount, dead port → `error` with a reachability message.
+#[tokio::test]
+async fn mcp_servers_http_probe_running_and_unreachable() {
+    if !node_available() {
+        eprintln!("skipping mcp.servers http E2E: node not on PATH");
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mock-mcp-server.mjs"
+    );
+    if !PathBuf::from(script).exists() {
+        eprintln!("skipping mcp.servers http E2E: fixture not found at {script}");
+        return;
+    }
+    let (_fixture, base_url) = spawn_http_fixture(script).await;
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(InMemorySecretStore::default())),
+    );
+    let sock_dir = common::test_tempdir_in("/tmp", "itd-mcph-");
+    let socket = sock_dir.path().join("uds.sock");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let bus = bus.clone();
+        let socket = socket.clone();
+        async move {
+            let _ = serve_uds(services, bus, &socket, None, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        }
+    });
+
+    let (rpc_read, mut w) = connect_retry(&socket).await.into_split();
+    let mut r = BufReader::new(rpc_read);
+
+    // Subscribe to the status-changed stream on a second connection.
+    let (sub_read, mut sw) = connect_retry(&socket).await.into_split();
+    let mut sr = BufReader::new(sub_read);
+    send(
+        &mut sw,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "events.subscribe",
+            "params": { "eventTypes": ["mcp.servers:status-changed"] },
+        }))
+        .unwrap(),
+    )
+    .await;
+    let _ = read_json(&mut sr).await;
+    wait_for_subscriber_count(&bus, 1).await;
+
+    // create an http server pointing at the live fixture (headers redacted).
+    let created = rpc(
+        &mut w,
+        &mut r,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "Mock HTTP",
+            "transport": "http",
+            "url": base_url,
+            "headers": { "Authorization": SECRET },
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().expect("id").to_string();
+    assert_eq!(created["server"]["transport"], "http");
+    assert!(
+        !serde_json::to_string(&created).unwrap().contains(SECRET),
+        "secret leaked in create result"
+    );
+
+    // toggle enable → daemon probes the endpoint; running, no pid, toolCount 2.
+    let toggled = rpc(
+        &mut w,
+        &mut r,
+        3,
+        "mcp.servers.toggle",
+        json!({ "serverId": server_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(toggled["status"]["state"], "running");
+    assert!(
+        toggled["status"]["pid"].is_null(),
+        "remote servers have no pid"
+    );
+    assert_eq!(toggled["status"]["toolCount"], json!(2));
+    let ev = wait_for_state(&mut sr, "running").await;
+    assert_eq!(ev["toolCount"], json!(2));
+
+    // getStatus → live running snapshot.
+    let got = rpc(
+        &mut w,
+        &mut r,
+        4,
+        "mcp.servers.getStatus",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(got["status"]["state"], "running");
+
+    // restart on a remote server = re-probe; still running.
+    let restarted = rpc(
+        &mut w,
+        &mut r,
+        5,
+        "mcp.servers.restart",
+        json!({ "serverId": server_id }),
+    )
+    .await;
+    assert_eq!(restarted["status"]["state"], "running");
+
+    // A dead port: bind + drop a listener so the address is closed at probe
+    // time; the daemon reports error with a reachability message.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_url = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let created = rpc(
+        &mut w,
+        &mut r,
+        6,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "Dead HTTP",
+            "transport": "http",
+            "url": dead_url,
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let dead_id = created["server"]["id"].as_str().expect("id").to_string();
+    let toggled = rpc(
+        &mut w,
+        &mut r,
+        7,
+        "mcp.servers.toggle",
+        json!({ "serverId": dead_id, "enabled": true }),
+    )
+    .await;
+    assert_eq!(toggled["status"]["state"], "error");
+    assert!(
+        toggled["status"]["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("unreachable from daemon host"),
+        "got: {}",
+        toggled["status"]["lastError"]
+    );
+    let _ = wait_for_state(&mut sr, "error").await;
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
