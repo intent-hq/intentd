@@ -3388,10 +3388,11 @@ impl AgentManager {
         // context/naming/reminder, after only the fire-once FirstTurnPrepend.
         // Rebuilt every turn for ALL agents (specialist and
         // non-specialist, unlike the role reminder) and never persisted.
-        // `agent_state_snapshot_line` reads `agentFeatures.stateSnapshot`
-        // LIVE and returns `None` when the toggle is off or the snapshot is
-        // trivial (all counts zero, no pending attention), leaving the
-        // prompt byte-identical to pre-feature output.
+        // `agent_state_snapshot_line` gates on the session's captured
+        // harness feature snapshot (`agentFeatures.stateSnapshot`, like
+        // every other toggle) and returns `None` when the toggle is off or
+        // the snapshot is trivial (all counts zero, no pending attention),
+        // leaving the prompt byte-identical to pre-feature output.
         let snapshot_line = self.services.agent_state_snapshot_line(agent_id).await;
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
         // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
@@ -10394,7 +10395,7 @@ mod role_reminder_tests {
 
     /// Like [`manager_with`] but with a writable TOML-backed settings
     /// registry wired, so tests can flip `agentFeatures.stateSnapshot` and
-    /// observe the live per-turn read.
+    /// observe how the per-turn injection gate resolves it.
     async fn manager_with_registry() -> (AgentManager, AgentId, tempfile::TempDir, tempfile::TempDir)
     {
         let db_dir = crate::tests::test_tempdir("intentd-snap-");
@@ -10536,12 +10537,14 @@ mod role_reminder_tests {
         );
     }
 
-    /// Live-read toggle: flipping `agentFeatures.stateSnapshot` off removes
-    /// the injection from the very next turn of the SAME session (prompt
-    /// byte-identical to pre-feature output), and flipping it back restores
-    /// it — no session recreation involved.
+    /// Legacy fallback: a pre-0096 session whose `harness_features` is still
+    /// NULL keeps following the LIVE setting (via the
+    /// `session_agent_features` fallback) until its first-activation freeze —
+    /// flipping `agentFeatures.stateSnapshot` off removes the injection from
+    /// its very next turn, and flipping it back restores it. Sessions WITH a
+    /// captured snapshot are covered by the gating test below.
     #[tokio::test]
-    async fn snapshot_toggle_is_read_live_each_turn() {
+    async fn snapshot_legacy_null_row_follows_live_setting() {
         let (mgr, agent_id, _db, _cfg) = manager_with_registry().await;
         make_snapshot_nontrivial(&mgr, &agent_id);
         let ws = WorkspaceId::from("ws-1");
@@ -10581,6 +10584,86 @@ mod role_reminder_tests {
         assert!(
             back_on.starts_with("current ws.agent.snapshot() => {"),
             "toggle back on → next turn injects again: {back_on:?}"
+        );
+    }
+
+    /// Snapshot gating (regression): the injection follows the SESSION's
+    /// captured `harness_features` snapshot, not the live setting. Flipping
+    /// `agentFeatures.stateSnapshot` after creation does not change an
+    /// existing session's injection, while a session stamped after the flip
+    /// is gated accordingly — even once the live setting flips back on.
+    #[tokio::test]
+    async fn snapshot_gated_by_session_feature_snapshot_not_live_setting() {
+        let (mgr, _null_row, _db, _cfg) = manager_with_registry().await;
+        let ws = WorkspaceId::from("ws-1");
+        // A stamped session: snapshot captured at creation with stateSnapshot
+        // ON (the default).
+        let stamped_on = AgentId::from("agent-2");
+        let mut on_session = session(&stamped_on, &ws, None);
+        on_session.harness_features = Some(
+            serde_json::to_value(intent_core::settings_file::AgentFeaturesSettings::default())
+                .expect("encode snapshot"),
+        );
+        mgr.services
+            .store()
+            .insert_agent_session(&on_session)
+            .await
+            .expect("insert stamped-on row");
+        make_snapshot_nontrivial(&mgr, &stamped_on);
+
+        // Flip the live setting OFF: the stamped-on session keeps injecting.
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(false),
+            )])
+            .expect("apply toggle");
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&stamped_on, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert!(
+            text.starts_with("current ws.agent.snapshot() => {"),
+            "captured-on session must keep injecting after a live flip: {text:?}"
+        );
+
+        // A session created after the flip captures stateSnapshot OFF.
+        let stamped_off = AgentId::from("agent-3");
+        let mut off_session = session(&stamped_off, &ws, None);
+        off_session.harness_features = Some(
+            serde_json::to_value(mgr.services.effective_settings().agent_features)
+                .expect("encode snapshot"),
+        );
+        mgr.services
+            .store()
+            .insert_agent_session(&off_session)
+            .await
+            .expect("insert stamped-off row");
+        make_snapshot_nontrivial(&mgr, &stamped_off);
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&stamped_off, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(text, "turn", "captured-off session never injects");
+
+        // Flipping the live setting back ON does not resurrect it.
+        mgr.services
+            .settings_registry()
+            .expect("registry wired")
+            .apply(&[(
+                "agentFeatures.stateSnapshot".to_string(),
+                serde_json::json!(true),
+            )])
+            .expect("apply toggle");
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&stamped_off, &ws, "turn", &TurnOptions::default())
+                .await,
+        );
+        assert_eq!(
+            text, "turn",
+            "captured-off session stays gated after the live setting flips back on"
         );
     }
 
