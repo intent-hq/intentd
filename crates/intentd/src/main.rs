@@ -1476,22 +1476,27 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let proc_usage = spawn_proc_usage_sampler();
     spawn_child_tree_sampler(manager.clone(), child_usage.clone());
     let route_info = spawn_route_info_sampler();
-    // Workspaces-root disk sampler: same resolution as the service layer —
-    // the effective `workspaces.root` setting (startup-pinned from
-    // `INTENTD_WORKSPACES_DIR` above, tilde-expanded) wins, else the default
-    // root. Fixed for the daemon's lifetime (the setting applies on restart).
-    // The non-panicking default resolver returns `None` under the hermetic
-    // test guard with no workspaces dir; the fields then stay absent.
-    let workspaces_root = boot_settings
+    // Workspaces-root disk sampler: report the volume `workspace.create`
+    // actually provisions under, resolved with the same precedence as the
+    // create path (`resolve_workspaces_parent`) — the startup-pinned
+    // `workspaces.root` (`INTENTD_WORKSPACES_DIR`, pinned above) wins, then a
+    // non-empty `workspace.worktreesLocation`, then the default root. Resolved
+    // once at boot from the boot snapshot; a `worktreesLocation` change
+    // applies to the sampler on restart. The non-panicking resolver returns
+    // `None` under the hermetic test guard with no workspaces dir; the fields
+    // then stay absent.
+    let workspaces_root_pinned =
+        boot_settings.origin("workspaces.root") == Some(intent_services::SettingOrigin::Flag);
+    let worktrees_location = boot_settings
         .effective
-        .workspaces
-        .root
-        .as_deref()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .map(|r| PathBuf::from(intent_core::expand_tilde_string(r)))
-        .or_else(intent_services::try_default_workspaces_root);
-    let workspaces_disk = match workspaces_root {
+        .workspace
+        .worktrees_location
+        .clone()
+        .unwrap_or_default();
+    let workspaces_disk = match intent_services::try_workspaces_provisioning_parent(
+        workspaces_root_pinned,
+        &worktrees_location,
+    ) {
         Some(root) => spawn_workspaces_disk_sampler(root),
         None => Arc::new(WorkspacesDiskUsage::default()),
     };
@@ -1972,9 +1977,10 @@ fn workspaces_disk_sample(root: &Path) -> Option<(u64, u64)> {
 /// listeners come up, then refreshes on a slow tick — free space moves slowly
 /// at the granularity clients care about (disk-pressure warnings), so a
 /// short-TTL cache keeps the status read path free of `statfs(2)` calls, per
-/// the derived-field ladder. The root is resolved once at boot: `serve` pins
-/// `INTENTD_WORKSPACES_DIR` into `workspaces.root` before this runs, and the
-/// setting requires a daemon restart to change.
+/// the derived-field ladder. The root is the provisioning parent resolved once
+/// at boot with `workspace.create` precedence
+/// (`intent_services::try_workspaces_provisioning_parent`); a
+/// `workspace.worktreesLocation` change applies to the sampler on restart.
 fn spawn_workspaces_disk_sampler(root: PathBuf) -> Arc<WorkspacesDiskUsage> {
     let usage = Arc::new(WorkspacesDiskUsage::default());
     let sample = move |usage: &WorkspacesDiskUsage| {

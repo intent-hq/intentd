@@ -7015,6 +7015,30 @@ pub fn try_default_workspaces_root() -> Option<PathBuf> {
     )
 }
 
+/// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
+/// observability consumers (the `system.status` workspaces-disk sampler in the
+/// composition root): the parent directory `workspace.create` would provision
+/// new checkouts under, with the same precedence — the startup-pinned
+/// `workspaces.root` (`root_pinned`, `INTENTD_WORKSPACES_DIR`) wins, then a
+/// non-empty absolute `workspace.worktreesLocation` (tilde-expanded), then the
+/// default root. Unlike the create-path resolver it never creates directories,
+/// never errors (a relative location — which would fail the create — falls
+/// back to the default root), and never fires the hermetic guard (`None` via
+/// [`try_default_workspaces_root`] in that posture).
+pub fn try_workspaces_provisioning_parent(
+    root_pinned: bool,
+    worktrees_location: &str,
+) -> Option<PathBuf> {
+    let location = worktrees_location.trim();
+    if !root_pinned && !location.is_empty() {
+        let dir = PathBuf::from(intent_core::expand_tilde_string(location));
+        if dir.is_absolute() {
+            return Some(dir);
+        }
+    }
+    try_default_workspaces_root()
+}
+
 /// Structural guard against `~/intent/workspaces` leaks from tests. Fires only
 /// inside crate unit tests (`cfg(test)`) or when the harness explicitly opts
 /// in via `INTENTD_ASSERT_HERMETIC_ROOT`; production `intentd` binaries never
