@@ -84,17 +84,19 @@ web-browser clients (which cannot open a local listener) no tunnel backend exist
 
 ### Lifecycle & recovery
 
-Forwards live in the client process, not the daemon: they all drop when the client
-restarts, a new client takes over, or the daemon connection/transport changes.
+Forwards are persistent client-side state: once opened, a forward keeps its `localPort`
+for the lifetime of the Electron app. Transient drops of the underlying daemon
+connection do not kill it — the forward stays registered on the same `localPort` and
+lazily reconnects on the next inbound connection.
 
-- `localPort` is ephemeral — always use the value returned by the latest `openTunnel`;
-  never cache it across calls.
-- Connection refused on a previously returned `localPort`, or the forward missing from
-  `listTunnels`? Just call `openTunnel { remotePort }` again — it reuses a live forward
-  (`reused: true`) or transparently recreates a dead one, and returns the current
-  `localPort`. `openTunnel` is cheap and idempotent per `remotePort`; re-establishing is
-  the standard move, not an error condition to diagnose.
-- A definitively refused connect to the daemon-side port (server gone) drops the whole
-  forward immediately; forwards idle for ~10 minutes are swept as the backstop.
+- A forward is closed only by: an explicit `closeTunnel`, switching the daemon
+  backend/connection, quitting the app, or all of its owning workspaces being
+  archived/deleted. Forwards not tied to any workspace live for the app lifetime.
+- `openTunnel` is cheap and idempotent per `remotePort`: it returns the existing
+  forward (`reused: true`) when one is already registered, so calling it again is
+  always safe and returns the current `localPort`.
+- Older Electron clients may still exhibit the previous ephemeral behavior (forwards
+  dropping on transport changes or after idling); if a previously returned `localPort`
+  refuses connections there, re-open with `openTunnel { remotePort }`.
 
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.
