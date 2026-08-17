@@ -18980,7 +18980,7 @@ mod rules {
             "isolation header"
         );
         assert!(
-            prompt.contains("isolated inside a microVM sandbox"),
+            prompt.contains("isolated sandbox (microVM)"),
             "microVM mention"
         );
         assert!(
@@ -18992,8 +18992,12 @@ mod rules {
             "CoW clone mention"
         );
         assert!(
-            prompt.contains("merges your changes back"),
+            prompt.contains("automatic merging of your changes back"),
             "merge-back mention"
+        );
+        assert!(
+            prompt.contains("isolated at the filesystem level from other agents"),
+            "filesystem isolation mention"
         );
         assert!(
             prompt.contains("host filesystem outside your workspace is not accessible"),

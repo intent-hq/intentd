@@ -1735,7 +1735,10 @@ fn golden_isolation_hints() {
         hint,
         "## Workspace Isolation\n\n\
          You are working in an **isolated CoW (copy-on-write) sandbox** at `/sandboxes/sb-1` \
-         on branch `sb/one` (base commit tracked in sandbox metadata). Your dependency caches (node_modules, \
+         on branch `sb/one` (base commit tracked in sandbox metadata). Your workspace is **isolated at the \
+         filesystem level from other agents**: each agent works in its own copy-on-write \
+         clone, so your file reads and writes cannot see or affect other agents' concurrent \
+         changes (or the canonical checkout) until merge-back. Your dependency caches (node_modules, \
          target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
          **Critical constraints:**\n\
          - Do NOT switch branches or checkout other refs in your sandbox.\n\

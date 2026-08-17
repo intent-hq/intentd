@@ -228,7 +228,10 @@ impl Harness for V1 {
         format!(
             "## Workspace Isolation\n\n\
              You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
-             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
+             on branch `{sandbox_branch}` ({base_sha_note}). Your workspace is **isolated at the \
+             filesystem level from other agents**: each agent works in its own copy-on-write \
+             clone, so your file reads and writes cannot see or affect other agents' concurrent \
+             changes (or the canonical checkout) until merge-back. Your dependency caches (node_modules, \
              target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
              **Critical constraints:**\n\
              - Do NOT switch branches or checkout other refs in your sandbox.\n\
@@ -244,11 +247,15 @@ impl Harness for V1 {
     fn microvm_isolation_hint(&self, guest_dir: &str) -> String {
         format!(
             "## Workspace Isolation\n\n\
-             You are running **isolated inside a microVM sandbox**. The workspace at `{guest_dir}` \
-             is your own copy-on-write clone of the canonical checkout, mounted into the VM. \
-             When your work completes, the system automatically merges your changes back to the \
-             canonical checkout. The host filesystem outside your workspace is not accessible \
-             from inside the VM."
+             You are running in an **isolated sandbox (microVM)** with **a copy of the \
+             workspace provided** to you: the workspace at `{guest_dir}` is your own \
+             copy-on-write clone of the canonical checkout, mounted into the VM. Your \
+             workspace is **isolated at the filesystem level from other agents**: each \
+             agent's VM has its own private clone, so your file reads and writes cannot \
+             see or affect other agents' concurrent changes until merge-back. When your \
+             work completes, **automatic merging of your changes back** to the canonical \
+             checkout is offered. The host filesystem outside your workspace is not \
+             accessible from inside the VM."
         )
     }
 
