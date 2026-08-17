@@ -47,6 +47,21 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 /// Max events drained per batch by the writer task (to bound transaction size).
 const WRITER_BATCH_SIZE: usize = 64;
 
+/// Total attempts for a batch insert that fails transiently (write-pool
+/// acquire timeout / SQLITE_BUSY under contention — the write pool has
+/// `max_connections=1`, so bursts serialize at `pool.acquire()`). Because the
+/// bus is append-then-broadcast, a failed batch is lost for live subscribers
+/// too (monorepo#2673), so transient contention is worth a couple of retries
+/// before declaring the batch dead. Permanent failures (constraint
+/// violations, serialization errors) never retry.
+pub(crate) const INSERT_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff between insert retry attempts; attempt N sleeps N times this
+/// (25ms, then 50ms). Short on purpose: the contention observed in practice
+/// clears in tens of milliseconds, and while retrying the writer task is not
+/// draining its channel, so publishers feel backpressure sooner.
+const INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Byte cap on the persisted `data_json` of `agent:tool:call` events. Payloads
 /// at or under the cap persist verbatim; larger ones have their free-form
 /// fields (`output`, `input`, `registeredAttachments`) replaced with a bounded
@@ -66,7 +81,7 @@ const TOOL_CALL_FIELD_PREVIEW_BYTES: usize = 2 * 1024;
 
 /// Request sent to the writer task: the event to persist and a oneshot to
 /// return the result (or error).
-type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
+pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 
 /// In-process broadcast bus layered over the durable event [`Store`]. Cheap to
 /// clone (the store handle, broadcast sender, and writer channel are all shared).
@@ -265,7 +280,44 @@ async fn flush_batch(
         .iter()
         .map(|(ev, _)| truncate_tool_call_for_persist(ev).unwrap_or_else(|| ev.clone()))
         .collect();
-    let result = store.insert_events(&events).await;
+    flush_prepared(|| store.insert_events(&events), pending, broadcast_tx).await;
+}
+
+/// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
+/// insert operation so tests can inject failures (monorepo#2673).
+///
+/// Transient insert failures ([`is_transient_insert_error`]) retry up to
+/// [`INSERT_RETRY_MAX_ATTEMPTS`] total attempts with a short linear backoff
+/// ([`INSERT_RETRY_BACKOFF`]); permanent failures fail immediately. On final
+/// failure the batch is dropped for live subscribers too (append-then-
+/// broadcast: no durable append → no broadcast), so the drop is logged at
+/// error level with the event count and types before the publishers'
+/// oneshots resolve with the error.
+pub(crate) async fn flush_prepared<F, Fut>(
+    mut insert: F,
+    pending: &mut Vec<WriterRequest>,
+    broadcast_tx: &broadcast::Sender<Arc<Event>>,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>>>,
+{
+    let mut attempt = 1u32;
+    let result = loop {
+        match insert().await {
+            Ok(stored) => break Ok(stored),
+            Err(e) if attempt < INSERT_RETRY_MAX_ATTEMPTS && is_transient_insert_error(&e) => {
+                tracing::warn!(
+                    attempt,
+                    events = pending.len(),
+                    error = %e,
+                    "transient event batch insert failure; retrying"
+                );
+                tokio::time::sleep(INSERT_RETRY_BACKOFF * attempt).await;
+                attempt += 1;
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
     match result {
         Ok(stored) => {
@@ -280,6 +332,19 @@ async fn flush_batch(
             }
         }
         Err(e) => {
+            // The batch is lost both durably and live: publishers get the
+            // error, but subscribers (FE UI, agent subscriptions, hooks) see
+            // nothing at all — log loudly so drops are visible (monorepo#2673).
+            let mut event_types: Vec<&str> =
+                pending.iter().map(|(ev, _)| ev.event_type.as_str()).collect();
+            event_types.sort_unstable();
+            event_types.dedup();
+            tracing::error!(
+                events = pending.len(),
+                event_types = ?event_types,
+                error = %e,
+                "event batch insert failed; dropping batch (not persisted, not broadcast)"
+            );
             // On batch failure, resolve all oneshots with the same error message.
             let err_msg = format!("batch insert failed: {e}");
             for (_, tx) in pending.drain(..) {
@@ -287,6 +352,23 @@ async fn flush_batch(
             }
         }
     }
+}
+
+/// Whether a batch-insert error is transient — worth retrying because it
+/// reflects momentary contention, not a defect in the batch itself: the
+/// single-connection write pool's acquire timed out (`insert_events` maps
+/// this to "acquire connection failed: pool timed out …"), or SQLite
+/// reported the database busy/locked (a cross-process writer holding the
+/// lock past `busy_timeout`). Everything else (constraint violations,
+/// payload serialization failures, I/O errors) is permanent and fails the
+/// batch immediately. String matching is the only classification available:
+/// `insert_events` flattens every failure into `Error::Internal(String)`.
+fn is_transient_insert_error(e: &Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("acquire connection failed")
+        || msg.contains("pool timed out")
+        || msg.contains("database is locked")
+        || msg.contains("database table is locked")
 }
 
 /// Per-subscriber delivery loop: filter, then coalesce within `batch_window`.
