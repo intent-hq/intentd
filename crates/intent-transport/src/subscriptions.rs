@@ -996,6 +996,12 @@ impl ChatDeltaState {
     /// frame entirely: the transcript then stays silently stale mid-turn while
     /// the turn looks ended (the lifecycle flags clear via the separate agent
     /// lifecycle lane), permanently, until the client resubscribes.
+    ///
+    /// Cost stays bounded regardless of transcript length: the re-read is the
+    /// server-clamped newest page (SQL-side pagination, monorepo#958) and the
+    /// retry re-issues that same bounded read — worst case two page reads per
+    /// turn end, never full-history hydration — while the fallback frame is
+    /// built purely from the already-accumulated [`Self::live_blocks`].
     async fn reconcile(&self, api: &dyn WorkspaceApi) -> Option<Value> {
         let message_id = self.message_id.clone()?;
         let read = || {
