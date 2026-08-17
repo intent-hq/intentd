@@ -9715,7 +9715,6 @@ async fn persist_error_and_requeue(
     .await;
 }
 
-/// Handle terminal spawn failure after all retries are exhausted. Persists
 /// Fail-closed vanished-session guard shared by the terminal failure
 /// handlers (intent-hq/monorepo#2762). When the `agent_session` row is GONE
 /// (concurrent `agent.delete` / workspace cascade), the whole
@@ -9729,6 +9728,14 @@ async fn persist_error_and_requeue(
 /// the session), the in-memory queue registry entry is removed, and the
 /// caller must skip its failure handling. `false` = session still exists;
 /// handle the failure normally.
+///
+/// Scope of the no-ghost-events guarantee: this guard suppresses only the
+/// emissions OWED BY THE HANDLERS THEMSELVES. Paths that publish their
+/// terminal pair before reaching a handler — the streaming path when
+/// `turn_failure_events_already_emitted` is set, and the idle-timeout-cap
+/// branch that publishes `AGENT_FAILED` itself — can still surface one
+/// ghost `agent:failed` for a delete that lands mid-stream. The wedge is
+/// prevented either way (no Error park, no requeue).
 async fn discard_failure_for_vanished_session(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -9746,13 +9753,19 @@ async fn discard_failure_for_vanished_session(
         "agent session vanished; discarding failed message instead of requeueing (monorepo#2762)"
     );
     mgr.services.drop_queue(agent_id);
-    // Registry hygiene, same terms as `agent_delete_op`: the streak and any
-    // stashed streaming terminal-error context name a gone agent.
+    // Registry hygiene, same terms as `agent_delete_op`: the streak, any
+    // stashed streaming terminal-error context, and the silent-tail entry
+    // (monorepo#2669 — the raced turn can re-record one AFTER the delete's
+    // own sweep ran, which would then leak for the daemon's lifetime) all
+    // name a gone agent. The failure-wake dedup needs no re-clear: no
+    // failure wake is sent on this path, so it cannot repopulate.
     mgr.services.clear_failure_streak(agent_id);
     mgr.services.discard_pending_terminal_error(agent_id);
+    mgr.services.clear_turn_silent_tail(agent_id);
     true
 }
 
+/// Handle terminal spawn failure after all retries are exhausted. Persists
 /// the agent status as `Error` with the error text into `stop_reason`
 /// (durable-before-observable, monorepo#2009), publishes terminal
 /// `agent:failed` and `agent:stream:end` events, requeues the failed message
