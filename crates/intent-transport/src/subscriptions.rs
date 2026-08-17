@@ -84,12 +84,31 @@ pub(crate) struct CommentSubscribeParams {
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
 /// scoped by `agentId` (like the comment channel's `noteId`, NOT `workspaceId`);
 /// `replaceGroup` is optional. `sinceMessageId` (optional) requests a resumed
-/// seq-0 snapshot: only messages AFTER that id (§7.1 resume).
+/// seq-0 snapshot: only messages AFTER that id (§7.1 resume). `deltaEncoding`
+/// (optional) selects the text-chunk delta encoding for the subscription's
+/// lifetime (D2): `"full"`/absent for full accumulated text per chunk,
+/// `"incremental"` for append-only `textDelta` fragments.
 #[derive(Debug)]
 pub(crate) struct ChatSubscribeParams {
     pub agent_id: String,
     pub since_message_id: Option<String>,
+    pub delta_encoding: DeltaEncoding,
     pub replace_group: Option<String>,
+}
+
+/// The text-chunk delta encoding for one chat subscription (CS-0 D2). Fixed at
+/// subscribe time; every snapshot the subscription emits echoes the active
+/// mode when it is not the default (`stamp_delta_encoding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DeltaEncoding {
+    /// Each text/thinking chunk delta carries the FULL accumulated `text`
+    /// (the pre-#2675 wire shape; the newest delta supersedes).
+    #[default]
+    Full,
+    /// Each text/thinking chunk delta carries only the new fragment as
+    /// `textDelta`; the client appends. Eliminates the quadratic wire
+    /// amplification of full-text re-sends (monorepo#2675).
+    Incremental,
 }
 
 /// Classify a parsed frame as a subscription fast-path request, or `None` to
@@ -217,6 +236,10 @@ pub(crate) fn parse_comment_subscribe_params(
 /// error (the chat channel is per-agent, CS-0). `sinceMessageId` is optional:
 /// absent / `null` / empty string all mean "no resume" (standard snapshot,
 /// no `resumed` key); a present non-string value is a `-32602` error.
+/// `deltaEncoding` is optional: absent / `null` / `"full"` select the default
+/// full-text encoding, `"incremental"` selects append-only text deltas; any
+/// other value is a `-32602` error (a silently ignored typo would leave the
+/// client appending fragments the daemon never sends as fragments).
 pub(crate) fn parse_chat_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<ChatSubscribeParams, String> {
@@ -230,9 +253,16 @@ pub(crate) fn parse_chat_subscribe_params(
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => return Err("sinceMessageId must be a string".to_string()),
     };
+    let delta_encoding = match params.get("deltaEncoding") {
+        None | Some(Value::Null) => DeltaEncoding::Full,
+        Some(Value::String(s)) if s == "full" => DeltaEncoding::Full,
+        Some(Value::String(s)) if s == "incremental" => DeltaEncoding::Incremental,
+        Some(_) => return Err("deltaEncoding must be \"full\" or \"incremental\"".to_string()),
+    };
     Ok(ChatSubscribeParams {
         agent_id,
         since_message_id,
+        delta_encoding,
         replace_group: replace_group(params),
     })
 }
@@ -243,6 +273,19 @@ fn replace_group(params: &Map<String, Value>) -> Option<String> {
         .get("replaceGroup")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Echo a non-default delta encoding on a chat snapshot (CS-0 D2): every
+/// snapshot an incremental subscription emits (seq-0 and lag recovery) carries
+/// `deltaEncoding: "incremental"`, so the client can assert the daemon honored
+/// the requested mode before appending fragments. Full mode stamps nothing —
+/// default subscriptions stay byte-identical to the pre-#2675 wire shape.
+pub(crate) fn stamp_delta_encoding(snapshot: &mut Value, encoding: DeltaEncoding) {
+    if encoding == DeltaEncoding::Incremental {
+        if let Some(obj) = snapshot.as_object_mut() {
+            obj.insert("deltaEncoding".to_string(), json!("incremental"));
+        }
+    }
 }
 
 /// Build a `subscription.push { kind: "snapshot", seq, snapshot }` notification
@@ -642,7 +685,15 @@ fn merge_live_turn(snapshot: &mut Value, agent_id: &AgentId, live: &Value, is_st
 /// `agent.getConversation` snapshot (the CS-3 reconciliation invariant).
 pub(crate) struct ChatDeltaState {
     agent_id: String,
-    /// `blockId` → accumulated text for `text` blocks (deltas carry full text, D2).
+    /// The subscription's text-chunk encoding (D2): full accumulated text per
+    /// chunk, or append-only `textDelta` fragments (monorepo#2675).
+    encoding: DeltaEncoding,
+    /// `blockId` → accumulated text for `text` blocks. In full mode every
+    /// chunk delta re-materializes it (D2); in incremental mode it is kept
+    /// (O(chunk) appends, linear memory) but consulted only by the degraded
+    /// best-effort terminal frame, which must carry authoritative full text
+    /// in both modes — a fragment there would clobber the client's
+    /// accumulation.
     text_acc: HashMap<String, String>,
     /// `blockId`s emitted at least once this turn (added vs updated discriminator).
     seen_ids: HashSet<String>,
@@ -660,10 +711,14 @@ pub(crate) struct ChatDeltaState {
 
 impl ChatDeltaState {
     /// A fresh mapper for one chat subscription (one agent). The same instance is
-    /// reused across turns; `finalize` resets the per-turn accumulation.
-    pub(crate) fn new(agent_id: &AgentId) -> Self {
+    /// reused across turns; `finalize` resets the per-turn accumulation. The
+    /// encoding is fixed for the subscription's lifetime (chosen at subscribe
+    /// time) — a lag-recovery replacement mapper must be built with the SAME
+    /// encoding.
+    pub(crate) fn new(agent_id: &AgentId, encoding: DeltaEncoding) -> Self {
         Self {
             agent_id: agent_id.as_str().to_string(),
+            encoding,
             text_acc: HashMap::new(),
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
@@ -676,10 +731,14 @@ impl ChatDeltaState {
     /// in-flight assistant message (CS-0 D5): the message arriving mid-turn has
     /// already streamed some blocks, so prime `message_id`, mark each block id as
     /// already seen+emitted (subsequent chunks arrive as `updated`, not `added`),
-    /// and pre-load each `text` block's accumulated text so the NEXT chunk delta
-    /// carries the FULL text (D2), not just the new fragment. Without this, a
-    /// resuming subscriber's first chunk would restart the text from empty until
-    /// the terminal reconcile. No-op when the snapshot has no in-flight message.
+    /// and pre-load each `text` block's accumulated text. In full mode the NEXT
+    /// chunk delta then carries the FULL text (D2), not just the new fragment —
+    /// without this, a resuming subscriber's first chunk would restart the text
+    /// from empty until the terminal reconcile. In incremental mode
+    /// (monorepo#2675) deltas carry only the post-snapshot fragment, so the
+    /// pre-load doesn't shape the wire — but the accumulation still backs the
+    /// DEGRADED terminal frame's best-effort full text, so seeding is identical
+    /// in both modes. No-op when the snapshot has no in-flight message.
     pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
         let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
             return;
@@ -852,9 +911,11 @@ impl ChatDeltaState {
         Some(json!({ "added": added, "updated": updated, "removedIds": [] }))
     }
 
-    /// Map a `chat:stream:delta`: accumulate the chunk and emit the full block
+    /// Map a `chat:stream:delta`: accumulate the chunk and emit the block
     /// (D2/D4). Text chunks — and the `thinking` chunks streamed reasoning
-    /// flushes into — coalesce onto one `blockId` (`updated` on growth);
+    /// flushes into — coalesce onto one `blockId` (`updated` on growth),
+    /// carrying the FULL accumulated `text` in full mode or only the new
+    /// fragment as `textDelta` in incremental mode (monorepo#2675);
     /// non-text chunks pass through as the full block (`added`), stamped with the
     /// same id the persisted block carries.
     fn chunk_delta(&mut self, event: &Event) -> Option<Value> {
@@ -868,7 +929,18 @@ impl ChatDeltaState {
             let chunk = content.as_str().unwrap_or_default();
             let acc = self.text_acc.entry(block_id.clone()).or_default();
             acc.push_str(chunk);
-            let block = json!({ "type": block_type, "id": block_id, "text": acc.clone() });
+            let block = match self.encoding {
+                DeltaEncoding::Full => {
+                    json!({ "type": block_type, "id": block_id, "text": acc.clone() })
+                }
+                // Only the fragment travels — per-chunk wire cost is
+                // O(chunk), not O(accumulated text). The accumulation above
+                // still runs (O(chunk) append) so the degraded best-effort
+                // terminal frame can carry authoritative full text.
+                DeltaEncoding::Incremental => {
+                    json!({ "type": block_type, "id": block_id, "textDelta": chunk })
+                }
+            };
             // A marker only — the full text lives once in `text_acc` and the
             // best-effort frame rebuilds it at emit time, so per-chunk cost
             // stays O(chunk), not O(accumulated text).

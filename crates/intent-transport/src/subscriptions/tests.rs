@@ -163,6 +163,50 @@ fn chat_params_since_message_id() {
 }
 
 #[test]
+fn chat_params_delta_encoding() {
+    // "incremental" opts into append-only text deltas (monorepo#2675).
+    let inc = parse(r#"{"agentId":"a","deltaEncoding":"incremental"}"#);
+    let p = parse_chat_subscribe_params(inc.as_object().unwrap()).unwrap();
+    assert_eq!(p.delta_encoding, DeltaEncoding::Incremental);
+
+    // Absent / null / "full" all select the default full-text encoding.
+    for full in [
+        r#"{"agentId":"a"}"#,
+        r#"{"agentId":"a","deltaEncoding":null}"#,
+        r#"{"agentId":"a","deltaEncoding":"full"}"#,
+    ] {
+        let v = parse(full);
+        let p = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.delta_encoding, DeltaEncoding::Full, "full for {full}");
+    }
+
+    // Any other value is a -32602 error, never silently ignored.
+    for bad in [
+        r#"{"agentId":"a","deltaEncoding":"Incremental"}"#,
+        r#"{"agentId":"a","deltaEncoding":""}"#,
+        r#"{"agentId":"a","deltaEncoding":5}"#,
+        r#"{"agentId":"a","deltaEncoding":["incremental"]}"#,
+    ] {
+        let v = parse(bad);
+        let err = parse_chat_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert!(err.contains("deltaEncoding"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn stamp_delta_encoding_echoes_only_incremental() {
+    // Incremental snapshots carry the echo (seq-0 and lag recovery alike).
+    let mut snapshot = json!({ "agentId": "a", "messages": [] });
+    stamp_delta_encoding(&mut snapshot, DeltaEncoding::Incremental);
+    assert_eq!(snapshot["deltaEncoding"], "incremental");
+
+    // Full-mode snapshots stay byte-identical to the pre-#2675 shape.
+    let mut snapshot = json!({ "agentId": "a", "messages": [] });
+    stamp_delta_encoding(&mut snapshot, DeltaEncoding::Full);
+    assert!(snapshot.get("deltaEncoding").is_none());
+}
+
+#[test]
 fn chat_channel_tails_stream_family_and_message() {
     let chat = channel_event_types(Channel::Chat);
     assert_eq!(
@@ -500,7 +544,7 @@ fn tool_event_with_ids(
 
 #[test]
 fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     // First text chunk for blk-0 → `added`, with the full text so far.
     let d1 = s
         .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
@@ -520,7 +564,7 @@ fn chat_chunk_delta_accumulates_text_and_flips_added_to_updated() {
 
 #[test]
 fn chat_chunk_delta_handles_non_text_block() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .chunk_delta(&chunk_event(
             "msg-2",
@@ -540,7 +584,7 @@ fn chat_chunk_delta_handles_non_text_block() {
 
 #[test]
 fn chat_chunk_delta_returns_none_for_missing_required_fields() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     // Missing blockId.
     let mut e = chunk_event("msg-3", "ignored", "text", json!("x"));
     e.data.as_object_mut().unwrap().remove("blockId");
@@ -557,7 +601,7 @@ fn chat_chunk_delta_returns_none_for_missing_required_fields() {
 
 #[test]
 fn chat_tool_delta_started_emits_only_use_block() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event("msg-4", "msg-4:0", "tc-1", "started", None))
         .expect("tool started delta");
@@ -572,7 +616,7 @@ fn chat_tool_delta_started_emits_only_use_block() {
 
 #[test]
 fn chat_tool_delta_completed_emits_use_and_result_blocks() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event(
             "msg-5",
@@ -597,7 +641,7 @@ fn chat_tool_delta_completed_emits_use_and_result_blocks() {
 
 #[test]
 fn chat_tool_delta_error_status_marks_is_error_true() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event(
             "msg-6",
@@ -621,7 +665,7 @@ fn chat_tool_delta_synthesizes_name_and_acp_title_from_event() {
     // tool name on the wire and the raw ACP title travels separately as
     // `title`; the block's `name` is the toolName verbatim and the title is
     // echoed as `input._acpTitle`.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None))
         .expect("tool started delta");
@@ -651,7 +695,7 @@ fn chat_tool_delta_proposal_output_emits_standalone_resource_block() {
     // A completed tool whose output carries a proposal-MIME resource item emits
     // the standalone proposal block right after the tool_result (§7.1), with
     // the resource left in `tool_result.output` untouched.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let output = json!([{ "type": "text", "text": "shown" }, proposal_output_item()]);
     let d = s
         .tool_delta(&tool_event(
@@ -681,7 +725,7 @@ fn chat_tool_delta_collapsed_proposal_output_emits_standalone_resource_block() {
     // Provider-collapsed output (auggie flattens the MCP content items into
     // `{ "output": "<stringified {ok, proposal}>" }`, dropping the resource
     // item): the fallback lift still emits the standalone proposal block.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let proposal = json!({
         "kind": "settings-change",
         "preview": { "title": "Update" },
@@ -719,7 +763,7 @@ fn chat_tool_delta_collapsed_proposal_output_emits_standalone_resource_block() {
 fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
     // An errored tool must not surface an actionable ProposalCard, even when
     // its output still carries a proposal-MIME resource item.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event(
             "msg-e",
@@ -734,7 +778,7 @@ fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
 
 #[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event(
             "msg-q",
@@ -750,7 +794,7 @@ fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
 #[test]
 fn chat_tool_delta_malformed_proposal_resource_emits_no_extra_block() {
     // Wrong MIME / missing text → not a proposal resource; no standalone block.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let mut wrong_mime = proposal_output_item();
     wrong_mime["resource"]["mimeType"] = json!("text/plain");
     let mut no_text = proposal_output_item();
@@ -769,7 +813,7 @@ fn chat_tool_delta_malformed_proposal_resource_emits_no_extra_block() {
 
 #[test]
 fn chat_tool_delta_completed_without_output_only_emits_use_block() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event("msg-7", "msg-7:0", "tc-x", "completed", None))
         .expect("completed-no-output delta");
@@ -780,7 +824,7 @@ fn chat_tool_delta_completed_without_output_only_emits_use_block() {
 
 #[test]
 fn chat_tool_delta_returns_none_for_missing_required_fields() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let base = || tool_event("msg-8", "msg-8:0", "tc-1", "started", None);
     for key in ["blockId", "messageId", "toolCallId"] {
         let mut e = base();
@@ -794,7 +838,7 @@ fn chat_tool_delta_use_then_completed_marks_use_as_updated() {
     // Tool started, then completes: the second event re-emits the `tool_use` block
     // which is now a known id → goes into `updated`, while the `tool_result` block
     // is brand new → goes into `added`.
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let _ = s.tool_delta(&tool_event("msg-9", "msg-9:0", "tc-1", "started", None));
     let d = s
         .tool_delta(&tool_event(
@@ -843,7 +887,7 @@ fn reduce_deltas(deltas: &[Value]) -> Vec<(String, String)> {
 /// overwritten. Predicting `tool_use + 1` clobbered it for the rest of the turn.
 #[test]
 fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let deltas = vec![
         s.chunk_delta(&chunk_event(
             "msg-i",
@@ -899,7 +943,7 @@ fn chat_tool_delta_uses_the_event_result_id_when_text_interleaves() {
 /// `stream:end`. With the real ids on the event both rows survive.
 #[test]
 fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let started = |block_id: &str, tc: &str| {
         tool_event_with_ids("msg-p2", block_id, tc, "started", None, None, Vec::new())
     };
@@ -943,7 +987,7 @@ fn chat_tool_delta_uses_the_event_result_id_for_parallel_completions() {
 /// chained from the `tool_result` id, which is wrong for the same reasons.
 #[test]
 fn chat_tool_delta_proposal_ids_come_from_the_event() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let output = json!([proposal_output_item()]);
     let d = s
         .tool_delta(&tool_event_with_ids(
@@ -971,7 +1015,7 @@ fn chat_tool_delta_proposal_ids_come_from_the_event() {
 /// id — the terminal reconcile delivers whatever the turn actually persisted.
 #[test]
 fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d = s
         .tool_delta(&tool_event_with_ids(
             "msg-nr",
@@ -990,7 +1034,7 @@ fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
 
 #[test]
 fn chat_seed_from_snapshot_primes_in_flight_message_state() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let snapshot = json!({
         "agentId": "agent-1",
         "messages": [
@@ -1027,7 +1071,7 @@ fn chat_seed_from_snapshot_primes_in_flight_message_state() {
 /// `thinking` type.
 #[test]
 fn chat_chunk_delta_accumulates_thinking_blocks() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     let d1 = s
         .chunk_delta(&chunk_event(
             "msg-6",
@@ -1061,7 +1105,7 @@ fn chat_chunk_delta_accumulates_thinking_blocks() {
 /// too, so the resumed reasoning stream is not truncated to its tail.
 #[test]
 fn chat_seed_from_snapshot_primes_thinking_blocks() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     s.seed_from_snapshot(&json!({
         "agentId": "agent-1",
         "messages": [{
@@ -1088,7 +1132,7 @@ fn chat_seed_from_snapshot_primes_thinking_blocks() {
 
 #[test]
 fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
-    let mut s = ChatDeltaState::new(&agent());
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
     // No `messages` at all.
     s.seed_from_snapshot(&json!({ "agentId": "agent-1" }));
     // `messages` present but no streaming entry.
@@ -1105,6 +1149,89 @@ fn chat_seed_from_snapshot_is_noop_without_streaming_message() {
         .unwrap();
     assert_eq!(d["added"][0]["block"]["text"], "hi");
     assert!(d["updated"].as_array().unwrap().is_empty());
+}
+
+/// Incremental encoding (monorepo#2675): each text/thinking chunk delta
+/// carries only the new fragment as `textDelta` (never the accumulated
+/// `text`), with the same added→updated bucket flip as full mode.
+#[test]
+fn incremental_chunk_delta_carries_only_the_fragment() {
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    let d1 = s
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+        .expect("first chunk");
+    assert_eq!(d1["added"][0]["block"]["textDelta"], "Hello");
+    assert_eq!(d1["added"][0]["block"]["type"], "text");
+    assert_eq!(d1["added"][0]["block"]["id"], "msg-1:0");
+    assert!(
+        d1["added"][0]["block"].get("text").is_none(),
+        "incremental deltas never carry the accumulated text: {d1}"
+    );
+    let d2 = s
+        .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+        .expect("second chunk");
+    assert!(d2["added"].as_array().unwrap().is_empty());
+    assert_eq!(
+        d2["updated"][0]["block"]["textDelta"], ", world",
+        "only the NEW fragment travels, not the accumulation: {d2}"
+    );
+    // Thinking chunks take the same shape.
+    let d3 = s
+        .chunk_delta(&chunk_event("msg-1", "msg-1:1", "thinking", json!("Hmm")))
+        .expect("thinking chunk");
+    assert_eq!(d3["added"][0]["block"]["textDelta"], "Hmm");
+    assert_eq!(d3["added"][0]["block"]["type"], "thinking");
+}
+
+/// Non-text chunks are encoding-independent: they pass through as the full
+/// block in incremental mode exactly as in full mode.
+#[test]
+fn incremental_chunk_delta_passes_non_text_blocks_through() {
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    let d = s
+        .chunk_delta(&chunk_event(
+            "msg-2",
+            "msg-2:0",
+            "image",
+            json!({ "url": "data:image/png;base64,..." }),
+        ))
+        .expect("non-text chunk delta");
+    let block = &d["added"][0]["block"];
+    assert_eq!(block["id"], "msg-2:0");
+    assert_eq!(block["url"], "data:image/png;base64,...");
+    assert!(block.get("textDelta").is_none());
+}
+
+/// D5 mid-turn resume in incremental mode: the snapshot already carries the
+/// accumulated text, so the post-seed chunk is an `updated` fragment the
+/// client appends — the daemon must NOT replay the seeded prefix.
+#[test]
+fn incremental_seed_from_snapshot_appends_fragments_after_the_snapshot_text() {
+    let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+    s.seed_from_snapshot(&json!({
+        "agentId": "agent-1",
+        "messages": [{
+            "id": "msg-live",
+            "role": "assistant",
+            "isStreaming": true,
+            "contentBlocks": [
+                { "id": "msg-live:0", "type": "text", "text": "Hello" }
+            ]
+        }],
+    }));
+    let d = s
+        .chunk_delta(&chunk_event(
+            "msg-live",
+            "msg-live:0",
+            "text",
+            json!(", world"),
+        ))
+        .expect("post-seed chunk");
+    assert!(d["added"].as_array().unwrap().is_empty());
+    assert_eq!(
+        d["updated"][0]["block"]["textDelta"], ", world",
+        "the seeded prefix lives in the snapshot; only the fragment travels: {d}"
+    );
 }
 
 #[test]
@@ -1788,7 +1915,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn user_row_message_emits_added_entities_with_real_role() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1842,7 +1969,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1858,7 +1985,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn user_row_message_without_metadata_omits_the_field() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1898,7 +2025,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1918,7 +2045,7 @@ mod chat_message_delta {
         // Rows without a client id keep the lean entity shape — the field is
         // omitted entirely, never serialized as null.
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-1", "user"))
             .await
@@ -1937,7 +2064,7 @@ mod chat_message_delta {
         // `agent:message` echo for one must NOT emit (double-emission guard)
         // and must not even cost a conversation read.
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "asst-msg-1", "assistant"))
             .await;
@@ -1948,7 +2075,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn unknown_message_id_maps_to_none() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let d = s
             .delta(&api, &message_event("agent-1", "user-msg-GONE", "user"))
             .await;
@@ -1958,7 +2085,7 @@ mod chat_message_delta {
     #[tokio::test]
     async fn redelivery_upserts_known_blocks_as_updated() {
         let api = ConvApi::new(user_row_conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         let e = message_event("agent-1", "user-msg-1", "user");
         let first = s.delta(&api, &e).await.expect("first delivery");
         assert_eq!(first["added"].as_array().unwrap().len(), 2);
@@ -2001,7 +2128,7 @@ mod chat_message_delta {
             "nextToken": Value::Null,
         });
         let api = ConvApi::new(conv);
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         // Turn in flight: first assistant chunk accumulated.
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("chunk 1");
@@ -2593,7 +2720,7 @@ mod chat_terminal_message_id_fallback {
         // Pre-fix the terminal event mapped to `None` and the partial turn stayed
         // missing for the rest of the subscription's life.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.seed_from_snapshot(&conversation()); // no `isStreaming` row → no id learned
         let d = s
             .delta(&api, &end_event(Some("msg-1")))
@@ -2629,7 +2756,7 @@ mod chat_terminal_message_id_fallback {
         // used (not the event's), the blocks the client already saw come back as
         // `updated` — one terminal frame, no re-added duplicates.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Working")))
             .expect("first chunk");
         let d = s
@@ -2658,7 +2785,7 @@ mod chat_terminal_message_id_fallback {
         // A turn that persisted no assistant row (e.g. an empty interrupted
         // turn) omits `messageId` — there is nothing to reconcile against.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         assert!(s.delta(&api, &end_event(None)).await.is_none());
         assert_eq!(
             api.calls.load(Ordering::SeqCst),
@@ -2672,7 +2799,7 @@ mod chat_terminal_message_id_fallback {
         // `finalize` resets the per-turn accumulation whichever way the id was
         // resolved, so the recovered id cannot reconcile a later turn.
         let api = ConvApi::new(conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.delta(&api, &end_event(Some("msg-1")))
             .await
             .expect("first turn recovered");
@@ -2787,7 +2914,7 @@ mod chat_terminal_reconcile_failure {
     #[tokio::test]
     async fn a_failed_re_read_retries_once_then_emits_the_best_effort_frame() {
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
@@ -2851,7 +2978,7 @@ mod chat_terminal_reconcile_failure {
     #[tokio::test]
     async fn the_per_turn_state_resets_after_the_best_effort_frame() {
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         s.delta(&api, &end_event("msg-1"))
@@ -2879,12 +3006,68 @@ mod chat_terminal_reconcile_failure {
         assert_eq!(updated[0]["messageId"], "msg-2");
     }
 
+    /// The terminal reconcile is encoding-independent (monorepo#2675): it
+    /// re-reads the persisted message and emits authoritative FULL blocks
+    /// (`text`, never `textDelta`), converging the client whatever the live
+    /// encoding was (§7.1 / CS-3).
+    #[tokio::test]
+    async fn incremental_terminal_reconcile_emits_full_authoritative_blocks() {
+        let api = FailingConvApi::failing_once_then(conversation());
+        api.calls.store(1, Ordering::SeqCst); // consume the failing call
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("first chunk");
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+            .expect("second chunk");
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("terminal reconcile");
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0]["block"]["text"], "Hello, world",
+            "the terminal frame carries the persisted FULL text: {d}"
+        );
+        assert!(
+            updated[0]["block"].get("textDelta").is_none(),
+            "the terminal frame is never incremental: {d}"
+        );
+        assert_eq!(updated[0]["streamingComplete"], true);
+    }
+
+    /// The degraded best-effort terminal frame (re-read failed twice) also
+    /// carries authoritative FULL text in incremental mode — a fragment there
+    /// would clobber the client's accumulation. This is why the mapper keeps
+    /// `text_acc` up to date in incremental mode too.
+    #[tokio::test]
+    async fn incremental_best_effort_terminal_carries_the_full_accumulated_text() {
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Incremental);
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("first chunk");
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+            .expect("second chunk");
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("a failed reconcile must still emit a terminal frame");
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0]["block"]["text"], "Hello, world",
+            "the degraded frame rebuilds the FULL text from text_acc: {d}"
+        );
+        assert!(updated[0]["block"].get("textDelta").is_none());
+        assert_eq!(updated[0]["streamingComplete"], true);
+    }
+
     #[tokio::test]
     async fn a_transient_failure_recovers_on_the_retry_with_the_authoritative_frame() {
         // First read fails, the retry succeeds → the AUTHORITATIVE terminal
         // frame is emitted (persisted seq/timestamp), not the degraded one.
         let api = FailingConvApi::failing_once_then(conversation());
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
             .expect("first chunk");
         let d = s
@@ -2916,7 +3099,7 @@ mod chat_terminal_reconcile_failure {
         // entity for that row — an empty frame would leave the blank row
         // permanently streaming.
         let api = FailingConvApi::new();
-        let mut s = ChatDeltaState::new(&agent());
+        let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full);
         s.seed_from_snapshot(&json!({
             "agentId": "agent-1",
             "messages": [{

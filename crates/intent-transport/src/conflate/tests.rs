@@ -331,6 +331,123 @@ fn chat_blocks_do_not_merge_across_blocks() {
     assert_eq!(second["added"][0]["block"]["text"], json!("two"));
 }
 
+fn incremental_chunk_delta(added: bool, block_id: &str, text_delta: &str) -> Value {
+    let entity = json!({
+        "agentId": "ag-1",
+        "messageId": "m-1",
+        "role": "assistant",
+        "block": { "type": "text", "id": block_id, "textDelta": text_delta },
+    });
+    if added {
+        json!({ "added": [entity], "updated": [], "removedIds": [] })
+    } else {
+        json!({ "added": [], "updated": [entity], "removedIds": [] })
+    }
+}
+
+#[test]
+fn incremental_chat_blocks_concatenate_fragments_in_arrival_order() {
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        incremental_chunk_delta(true, "m-1:0", "Hel"),
+        incremental_chunk_delta(false, "m-1:0", "lo "),
+        incremental_chunk_delta(false, "m-1:0", "world"),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    // All fragments composed, delivered in the FIRST pending delta's bucket.
+    assert_eq!(only["added"][0]["block"]["textDelta"], json!("Hello world"));
+    assert!(only["updated"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn incremental_chat_blocks_do_not_merge_across_blocks() {
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        incremental_chunk_delta(true, "m-1:0", "one"),
+        incremental_chunk_delta(true, "m-1:1", "two"),
+        incremental_chunk_delta(false, "m-1:0", " more"),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let first = buf.pop().unwrap().into_delta();
+    let second = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    assert_eq!(first["added"][0]["block"]["textDelta"], json!("one more"));
+    assert_eq!(second["added"][0]["block"]["textDelta"], json!("two"));
+}
+
+#[test]
+fn oversized_incremental_merge_seals_the_entry_and_starts_a_new_one() {
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    let big = "a".repeat(CHAT_TEXT_CONCAT_CAP_BYTES - 1);
+    for delta in [
+        incremental_chunk_delta(true, "m-1:0", &big),
+        incremental_chunk_delta(false, "m-1:0", "bb"),
+        incremental_chunk_delta(false, "m-1:0", "cc"),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    // The refused merge sealed the big entry; the later fragments merged into
+    // a fresh tail entry, so no frame exceeds the cap and nothing is lost.
+    let first = buf.pop().unwrap().into_delta();
+    let second = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    assert_eq!(first["added"][0]["block"]["textDelta"], json!(big));
+    assert_eq!(second["updated"][0]["block"]["textDelta"], json!("bbcc"));
+}
+
+#[test]
+fn foreign_text_delta_field_on_non_text_block_takes_latest_wins() {
+    // A non-text chunk passes provider content through verbatim; a foreign
+    // block carrying its own `textDelta` string must NOT take the concatenate
+    // path — latest entity wins, exactly like the full-text encoding.
+    let foreign = |delta: &str, extra: &str| {
+        json!({
+            "added": [],
+            "updated": [{
+                "agentId": "ag-1",
+                "messageId": "m-1",
+                "role": "assistant",
+                "block": { "type": "custom", "id": "m-1:9", "textDelta": delta, "state": extra },
+            }],
+            "removedIds": [],
+        })
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [foreign("old", "stale"), foreign("new", "fresh")] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    // Newest entity's full state kept, strings not concatenated.
+    assert_eq!(only["updated"][0]["block"]["textDelta"], json!("new"));
+    assert_eq!(only["updated"][0]["block"]["state"], json!("fresh"));
+}
+
+#[test]
+fn mixed_encoding_merge_is_refused_defensively() {
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [
+        chunk_delta(true, "m-1:0", "full"),
+        incremental_chunk_delta(false, "m-1:0", "frag"),
+    ] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let first = buf.pop().unwrap().into_delta();
+    let second = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    assert_eq!(first["added"][0]["block"]["text"], json!("full"));
+    assert_eq!(second["updated"][0]["block"]["textDelta"], json!("frag"));
+}
+
 #[test]
 fn multi_entity_and_removal_deltas_are_not_conflatable() {
     // Two entities (a tool_use + tool_result pair).
