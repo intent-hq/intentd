@@ -10,9 +10,14 @@
 //! §5.30 `effortLevels` list on a single base row — codex from adapter evidence
 //! and collapsed variants, other providers from adapter-advertised per-model
 //! `supportedEffortLevels` / `effortLevels`, falling back to the session's
-//! global `thought_level` select.
+//! global `thought_level` select. The adapter's `default` pseudo-row is
+//! resolved to the real model it stands for — that row is marked
+//! `isDefault: true` and the pseudo-row is dropped; an unresolvable
+//! pseudo-row is kept as-is (fail-soft).
 
 use serde_json::{json, Map, Value};
+
+use crate::usage_stats;
 
 /// Reasoning effort levels used by codex model variants.
 const CODEX_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -273,13 +278,15 @@ struct CodexModelGroup {
 /// Parse an ACP payload (session/new result or session-update notification)
 /// into wire rows for `provider`. Used by claude-code, pi, and droid. Models
 /// carry per-model effort metadata when present, else levels from the session's
-/// global `thought_level` select.
+/// global `thought_level` select. The catalog's default is resolved via
+/// [`resolve_default_row`]: the real default row is marked `isDefault: true`
+/// and the adapter's `default` pseudo-row is dropped when it resolves.
 pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
     let Some(candidates) = extract_available_models(payload) else {
         return Vec::new();
     };
     let session_effort_levels = extract_thought_level_values(payload);
-    candidates
+    let mut rows: Vec<Value> = candidates
         .iter()
         .filter_map(|entry| {
             let (id, name, desc) = entry_fields(entry)?;
@@ -288,7 +295,98 @@ pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
                 entry_effort_levels(entry).or_else(|| session_effort_levels.clone()),
             ))
         })
-        .collect()
+        .collect();
+    resolve_default_row(&mut rows, extract_model_current_value(payload));
+    rows
+}
+
+/// The model select's `currentValue` from the probed payload's
+/// `configOptions`: the same select [`extract_config_options_models`] reads
+/// the catalog from (`id == "model"` with non-empty options, falling back to
+/// `category == "model"`) — and the same select the D13 effective-model
+/// resolution in `agent_session` uses. `None` when absent or blank.
+fn extract_model_current_value(payload: &Value) -> Option<&str> {
+    let update = payload
+        .get("update")
+        .or_else(|| payload.get("sessionUpdate"))
+        .unwrap_or(payload);
+    let options = update.get("configOptions").and_then(Value::as_array)?;
+    let by_key = |key: &str| {
+        options
+            .iter()
+            .filter(|o| o.get(key).and_then(Value::as_str) == Some("model"))
+            .find(|o| {
+                o.get("options")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            })
+    };
+    by_key("id")
+        .or_else(|| by_key("category"))?
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a wire row is the adapter's `default` pseudo-row (id `"default"`,
+/// case-insensitive) — a stand-in for a real sibling model, not a model.
+fn is_default_pseudo_row(row: &Value) -> bool {
+    row.get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.eq_ignore_ascii_case("default"))
+}
+
+/// A wire row's version-bearing model-family display, from its name then
+/// description (e.g. name "Default (recommended)" is family-less, description
+/// "Opus 4.8 with 1M context · …" → `"Opus 4.8"`). Same heuristic as the D13
+/// effective-model resolution.
+fn row_family_display(row: &Value) -> Option<String> {
+    usage_stats::version_bearing_display(
+        ["name", "description"]
+            .into_iter()
+            .filter_map(|key| row.get(key).and_then(Value::as_str)),
+    )
+}
+
+/// Resolve which sibling real row the `default` pseudo-row at `pseudo` stands
+/// for: the row whose version-bearing family display matches the pseudo-row's
+/// own. `None` unless exactly one sibling matches — an ambiguous family match
+/// must not guess a default.
+fn resolve_pseudo_default_sibling(rows: &[Value], pseudo: usize) -> Option<usize> {
+    let family = row_family_display(&rows[pseudo])?;
+    let mut matches = rows.iter().enumerate().filter(|(index, row)| {
+        *index != pseudo && row_family_display(row).as_deref() == Some(family.as_str())
+    });
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+/// Resolve the catalog's default row: mark the real default `isDefault: true`
+/// and drop the adapter's `default` pseudo-row. The real default is the model
+/// select's `currentValue` when it names a real (non-`default`) row; else the
+/// pseudo-row is resolved to the unique sibling sharing its version-bearing
+/// model family ([`resolve_pseudo_default_sibling`]). Fail-soft: when neither
+/// resolves, the rows are returned unchanged — the pseudo-row is kept, nothing
+/// is marked, and the catalog never comes back empty because of this logic.
+fn resolve_default_row(rows: &mut Vec<Value>, current_value: Option<&str>) {
+    let pseudo = rows.iter().position(is_default_pseudo_row);
+    let target = current_value
+        .filter(|value| !value.eq_ignore_ascii_case("default"))
+        .and_then(|value| {
+            rows.iter()
+                .position(|row| row.get("id").and_then(Value::as_str) == Some(value))
+        })
+        .or_else(|| pseudo.and_then(|pseudo| resolve_pseudo_default_sibling(rows, pseudo)));
+    let Some(target) = target else {
+        return;
+    };
+    if let Some(row) = rows[target].as_object_mut() {
+        row.insert("isDefault".to_string(), json!(true));
+    }
+    if let Some(pseudo) = pseudo.filter(|pseudo| *pseudo != target) {
+        rows.remove(pseudo);
+    }
 }
 
 /// Codex variant of [`parse_acp_models`]: adapter-expanded effort variants are
