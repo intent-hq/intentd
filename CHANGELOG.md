@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.13] - 2026-08-17
+
+### 🚀 Features
+
+- *(services)* Resolve and hide the "default" pseudo-row in ACP model catalogs ([#1278](https://github.com/intent-hq/intentd/pull/1278))
+- *(services)* Pin the cached catalog default model at agent create time ([#1279](https://github.com/intent-hq/intentd/pull/1279))
+- Freeze resolved specialist injection at agent creation ([#1280](https://github.com/intent-hq/intentd/pull/1280))
+- *(transport)* Chat forwarder self-heals after upstream event loss ([#1281](https://github.com/intent-hq/intentd/pull/1281))
+
+### 📚 Documentation
+
+- Point protocol references at docs/protocol/ directory ([#1283](https://github.com/intent-hq/intentd/pull/1283))
+
+
 ## [0.7.12] - 2026-08-17
 
 ### 🚀 Features
