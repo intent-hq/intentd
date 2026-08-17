@@ -5983,7 +5983,15 @@ impl Services {
         // - Legacy rows (`execution_environment` unset, pre-v3.3): preserve
         //   the original param-then-setting resolution so pre-existing
         //   workspaces keep their behavior.
-        let workspace = self.store.get_workspace(&workspace_id).await.ok();
+        // A store error fails the delegate rather than silently resolving as
+        // "no workspace" — that would skip the execution-environment
+        // authority and degrade isolation. Only a genuinely absent workspace
+        // (NotFound) falls through to the legacy param-then-setting path.
+        let workspace = match self.store.get_workspace(&workspace_id).await {
+            Ok(w) => Some(w),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
         let execution_env = workspace.as_ref().and_then(|w| w.execution_environment);
         let isolation: Option<String> = match execution_env {
             Some(intent_core::SandboxType::Cow) | Some(intent_core::SandboxType::Microvm) => {

@@ -6118,6 +6118,39 @@ async fn delegate_cow_param_does_not_sandbox_direct_environment_workspace() {
     );
 }
 
+/// Execution-environment authority, fault path: a store ERROR on the
+/// workspace read must FAIL the delegate — never resolve as "no workspace"
+/// and fall through to the legacy param-then-setting path, which would
+/// delegate an agent into a sandboxed (cow/microvm) workspace without a
+/// sandbox. Only a genuine `NotFound` may take the legacy path.
+#[tokio::test]
+async fn delegate_store_error_on_workspace_read_fails_instead_of_unsandboxing() {
+    let (_t, svc, ws) = setup().await;
+    // Break every `workspace` read while keeping the rows (SQLite rewrites
+    // FK references on rename, so the child session insert still succeeds
+    // and the failure is pinned to the isolation resolution's read).
+    sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("rename workspace table");
+
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("Do work".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a store error must fail the delegate, not skip isolation");
+    assert!(
+        matches!(&err, Error::Internal(m) if m.contains("get workspace failed")),
+        "the isolation resolution's store error propagates, got: {err:?}"
+    );
+}
+
 /// The top-level (RPC / user) front door stays parentless and is never
 /// subject to the depth guard even when a foreground parent exists.
 #[tokio::test]

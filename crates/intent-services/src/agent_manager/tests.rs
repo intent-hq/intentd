@@ -2453,6 +2453,47 @@ async fn stop_many_fence_blocks_lazy_respawn_until_dropped() {
     );
 }
 
+/// Isolation-bypass regression: a store ERROR on the workspace read in
+/// `ensure_started` must FAIL the spawn — never read as "no workspace",
+/// which would skip sandbox provisioning and spawn a microvm-workspace
+/// agent as an unsandboxed host child. Only a genuine `NotFound` proceeds
+/// without a workspace.
+#[tokio::test]
+async fn ensure_started_store_error_on_workspace_read_fails_spawn() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-store-err");
+    let agent_id = AgentId::from("a-store-err");
+    let mut workspace = super::role_reminder_tests::workspace(&ws);
+    workspace.execution_environment = Some(intent_core::SandboxType::Microvm);
+    mgr.services
+        .store
+        .insert_workspace(&workspace)
+        .await
+        .expect("insert workspace");
+    mgr.services
+        .store
+        .insert_agent_session(&super::role_reminder_tests::session(&agent_id, &ws, None))
+        .await
+        .expect("insert session");
+    // Break every `workspace` read while keeping the rows (SQLite rewrites
+    // FK references on rename) — the session read still succeeds, so the
+    // failure is pinned to the workspace lookup.
+    sqlx::query("ALTER TABLE workspace RENAME TO workspace_gone")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("rename workspace table");
+
+    let err = mgr
+        .ensure_started(&agent_id, &ws)
+        .await
+        .expect_err("a store error must fail the spawn, not skip provisioning");
+    assert!(
+        matches!(&err, Error::Internal(m) if m.contains("get workspace failed")),
+        "the workspace read's store error propagates, got: {err:?}"
+    );
+    assert!(mgr.is_empty(), "no handle installed for the failed spawn");
+}
+
 /// Signal-0 liveness probe used by the process-group teardown test.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {

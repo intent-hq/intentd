@@ -2202,14 +2202,16 @@ impl AgentManager {
         // microVM workspaces (monorepo#1120, EE-5) spawn the provider inside a
         // per-agent libkrun VM instead of a host child: MCP delivery, rules
         // staging, and the spawn transport all differ, so the decision is
-        // made once up front.
-        let microvm_ws = self
-            .services
-            .store
-            .get_workspace(&workspace_id)
-            .await
-            .ok()
-            .filter(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm));
+        // made once up front. A store error must fail the spawn — silently
+        // treating it as "no workspace" would drop a microvm workspace to a
+        // host-child spawn, degrading isolation. Only a genuinely absent
+        // workspace (NotFound) proceeds without one.
+        let microvm_ws = match self.services.store.get_workspace(&workspace_id).await {
+            Ok(w) => Some(w),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        }
+        .filter(|w| w.execution_environment == Some(intent_core::SandboxType::Microvm));
 
         // Whether the sandbox doc clauses (`mergeOnTurnEnd`, sandbox fields)
         // appear in this bridge's `workspace_api` description: the machine
@@ -6799,7 +6801,15 @@ impl AgentManager {
         self.services
             .materialize_legacy_harness_features(&mut session)
             .await;
-        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        // A store error propagates (fails the spawn) rather than silently
+        // skipping sandbox provisioning below — consistent with the microVM
+        // hard-fail on ProvisionOutcome::Unsupported. Only a genuinely
+        // absent workspace (NotFound) is treated as "no workspace".
+        let workspace = match self.services.store.get_workspace(workspace_id).await {
+            Ok(w) => Some(w),
+            Err(Error::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
         // Per-agent isolation execution environments: every agent in the
         // workspace — top-level `agent.create` included, not just delegates —
         // gets its own CoW sandbox clone, provisioned synchronously on first
