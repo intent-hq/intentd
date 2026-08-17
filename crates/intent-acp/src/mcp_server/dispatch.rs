@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -46,6 +46,64 @@ impl PendingAttachmentState {
 /// Shared handle to [`PendingAttachmentState`] between the host closure and
 /// `dispatch_workspace_api`.
 type PendingAttachments = Arc<Mutex<PendingAttachmentState>>;
+
+/// Per-dispatch stage tracker (monorepo#2709): names the stage a dispatch is
+/// currently in so the sentinel task can attribute a wedge at default log
+/// level. Shared between the dispatch body (which advances it) and the
+/// sentinel task (which reads it when the eval budget elapses with the
+/// dispatch still in flight).
+struct DispatchStage(Mutex<&'static str>);
+
+impl DispatchStage {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new("eval")))
+    }
+
+    fn set(&self, stage: &'static str) {
+        *self.0.lock().unwrap() = stage;
+    }
+
+    fn get(&self) -> &'static str {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Sentinel guard for one dispatch: a separate task that fires ONE warn —
+/// naming the in-flight stage and the `summary` arg — when the dispatch is
+/// still running well past the eval budget. Because it polls in its own
+/// task, it fires even when the dispatch future is wedged inside a single
+/// synchronous poll (the exact state the bridge watchdog aborts, which would
+/// otherwise preempt any completion-time logging), and warn-level is visible
+/// at the daemon's default `info` filter. Dropping the guard (normal
+/// completion) aborts the task, so a within-budget call logs nothing extra.
+///
+/// Fires at 1.5× the eval budget: enough grace that an ordinary eval timeout
+/// (which returns shortly after the budget and already warns at completion)
+/// never double-warns, and strictly before the bridge watchdog deadline
+/// (`max(120s, 2×budget)`) so an await-wedged dispatch is attributed before
+/// the watchdog abort drops this guard.
+struct StageSentinel(tokio::task::JoinHandle<()>);
+
+impl StageSentinel {
+    fn arm(stage: Arc<DispatchStage>, budget: Duration, summary: String) -> Self {
+        Self(tokio::spawn(async move {
+            tokio::time::sleep(budget + budget / 2).await;
+            tracing::warn!(
+                summary,
+                stage = stage.get(),
+                elapsed_ms = (budget + budget / 2).as_millis() as u64,
+                budget_ms = budget.as_millis() as u64,
+                "workspace_api dispatch still in flight past the JS eval budget"
+            );
+        }))
+    }
+}
+
+impl Drop for StageSentinel {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 use super::WorkspaceMcpServer;
 
@@ -93,6 +151,7 @@ impl WorkspaceMcpServer {
     /// success, `(no return value)` for `undefined`, and a readable text
     /// body with `isError: true` on any JS-side failure).
     pub(super) async fn dispatch_workspace_api(&self, args: &Value) -> Value {
+        let started = Instant::now();
         let Some(code) = args.get("code").and_then(Value::as_str) else {
             return workspace_api_error("`code` is required and must be a string");
         };
@@ -135,7 +194,29 @@ impl WorkspaceMcpServer {
             timeout: self.workspace_api_timeout,
             ..EvalOptions::default()
         };
+        // Stage breadcrumbs (monorepo#2709): trace-level markers bracket each
+        // dispatch stage so a wedged dispatch — one the bridge watchdog later
+        // aborts — leaves a trail naming the stage it never left. Normal
+        // calls emit exactly one debug event (below); a dispatch exceeding
+        // the eval budget upgrades it to warn. The stage tracker + sentinel
+        // additionally warn IN FLIGHT — visible at the default `info` filter —
+        // when the dispatch is still running well past the budget, because a
+        // watchdog abort would preempt all completion-time logging.
+        let stage = DispatchStage::new();
+        let _sentinel = StageSentinel::arm(
+            stage.clone(),
+            self.workspace_api_timeout,
+            args.get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+        tracing::trace!("workspace_api dispatch: eval starting");
+        let eval_started = Instant::now();
         let eval_result = js_eval(&full_code, &opts, Some(host)).await;
+        let eval_ms = eval_started.elapsed().as_millis() as u64;
+        let eval_ok = eval_result.is_ok();
+        tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
         // Drain the binding-time collection unconditionally: the attachments
         // were stamped and handed to the agent's JS with `ok: true`, so they
         // register no matter what the script did afterwards — discarded the
@@ -143,7 +224,9 @@ impl WorkspaceMcpServer {
         let pending_batch: Vec<TurnAttachment> = pending
             .map(|p| p.lock().unwrap().drain_in_call_order())
             .unwrap_or_default();
-        match eval_result {
+        let mut settings_ms: Option<u64> = None;
+        let mut finalize_ms: Option<u64> = None;
+        let result = match eval_result {
             Ok(v) => match v.get("__k").and_then(Value::as_str) {
                 Some("u") => {
                     self.register_pending_attachments(pending_batch);
@@ -167,20 +250,34 @@ impl WorkspaceMcpServer {
                         let content_items =
                             self.register_turn_attachments(content_items, pending_batch);
                         // Return MCP content items directly
-                        return json!({
+                        json!({
                             "content": content_items,
                             "isError": false,
-                        });
+                        })
+                    } else {
+                        self.register_pending_attachments(pending_batch);
+                        // Error results and the `__mcpContentItems` pass-through
+                        // above are exempt from both knobs: only the plain
+                        // success body is TOON-encoded / size-limited.
+                        // Each post-eval stage gets its own start marker: a
+                        // dispatch that wedges in one of these awaits never
+                        // reaches the tail event, so the last marker in the
+                        // log names the stage it never left.
+                        stage.set("settings read");
+                        tracing::trace!("workspace_api dispatch: settings read starting");
+                        let stage_started = Instant::now();
+                        let (toon_output, max_chars) = self.workspace_api_output_settings().await;
+                        settings_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        let (body, ext) = render_workspace_api_value(&value, toon_output);
+                        stage.set("output finalize");
+                        tracing::trace!("workspace_api dispatch: output finalize starting");
+                        let stage_started = Instant::now();
+                        let out = self
+                            .finalize_workspace_api_output(body, ext, max_chars)
+                            .await;
+                        finalize_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        out
                     }
-
-                    self.register_pending_attachments(pending_batch);
-                    // Error results and the `__mcpContentItems` pass-through
-                    // above are exempt from both knobs: only the plain
-                    // success body is TOON-encoded / size-limited.
-                    let (toon_output, max_chars) = self.workspace_api_output_settings().await;
-                    let (body, ext) = render_workspace_api_value(&value, toon_output);
-                    self.finalize_workspace_api_output(body, ext, max_chars)
-                        .await
                 }
                 _ => {
                     self.register_pending_attachments(pending_batch);
@@ -191,7 +288,36 @@ impl WorkspaceMcpServer {
                 self.register_pending_attachments(pending_batch);
                 workspace_api_error(&format_js_error(&e))
             }
+        };
+        let total = started.elapsed();
+        let total_ms = total.as_millis() as u64;
+        if total > self.workspace_api_timeout {
+            // Slow-dispatch marker (monorepo#2709): the whole dispatch took
+            // longer than the JS eval budget, so the post-eval awaits (or a
+            // stalled eval that beat the timeout by little) ate real time.
+            // `summary` is the caller's UI hint for the call — safe to log.
+            let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            tracing::warn!(
+                summary,
+                eval_ms,
+                eval_ok,
+                settings_ms = ?settings_ms,
+                finalize_ms = ?finalize_ms,
+                total_ms,
+                budget_ms = self.workspace_api_timeout.as_millis() as u64,
+                "workspace_api dispatch exceeded the JS eval budget"
+            );
+        } else {
+            tracing::debug!(
+                eval_ms,
+                eval_ok,
+                settings_ms = ?settings_ms,
+                finalize_ms = ?finalize_ms,
+                total_ms,
+                "workspace_api dispatch complete"
+            );
         }
+        result
     }
 
     /// Read the `workspaceApi.*` output knobs live for one invocation via
