@@ -4,7 +4,7 @@
 //! `uds_chief_workspace.rs` and satisfies the WSS-e2e requirement from
 //! `packages/intentd/AGENTS.md` — every method that lands in the router
 //! also has to be exercised over the real `/ws` upgrade, byte-for-byte,
-//! against the JSON-RPC contract in the monorepo's `docs/PROTOCOL.md`.
+//! against the JSON-RPC contract in the monorepo's `docs/protocol/`.
 //!
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve
 //! with the WSS listener enabled and asserts the exact envelope + payload shapes for:
