@@ -2467,7 +2467,7 @@ impl Services {
             provider,
             reasoning_effort,
             agent_type: _,
-            metadata,
+            mut metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
             workspace_context: _,
             context_references,
@@ -2523,8 +2523,9 @@ impl Services {
         // workspacePath and read specialist files from other workspaces.
         // Use worktree_path if available, otherwise repository_path. Read once
         // and only when a specialist tier is actually consulted (model
-        // resolution and/or the specialist reasoning-effort rungs below).
-        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+        // resolution, the specialist reasoning-effort rungs, and/or the
+        // specialist prompt snapshot below).
+        let spec_wp = match model.is_none() || specialist.is_some() {
             true => self
                 .store
                 .get_workspace(&workspace_id)
@@ -2663,6 +2664,43 @@ impl Services {
                 resolved_model.as_deref(),
             ),
         };
+        // Specialist prompt snapshot: freeze the resolved specialist injection
+        // for the session's lifetime by persisting it into the metadata JSON,
+        // so later edits/deletes of user/project-tier specialist files never
+        // change this agent on respawn. The resolved body reuses the
+        // `behaviorPrompt` override slot — written only when the caller
+        // supplied no explicit override (a caller override is left untouched
+        // and is itself the frozen body); the resolved identity lands in
+        // `specialistName` / `specialistRoleReminder`. The bundled floor
+        // consulted here is the latest bundle — the same doctrine the
+        // `harnessVersion` stamp below pins — so no H2 interplay changes.
+        // Unknown specialist / resolution failure writes no snapshot and
+        // never fails the create; a non-object caller `metadata` is left
+        // untouched.
+        if let Some(spec_id) = specialist.as_deref() {
+            if let Some((body, spec_name, reminder)) = self
+                .specialists_service()
+                .resolve_prompt_injection(spec_id, spec_wp.as_deref())
+            {
+                let meta_value =
+                    metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(obj) = meta_value.as_object_mut() {
+                    let has_override = obj
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_override {
+                        if let Some(body) = body {
+                            obj.insert("behaviorPrompt".to_string(), json!(body));
+                        }
+                    }
+                    obj.insert("specialistName".to_string(), json!(spec_name));
+                    if let Some(reminder) = reminder {
+                        obj.insert("specialistRoleReminder".to_string(), json!(reminder));
+                    }
+                }
+            }
+        }
         // Harness stamp (intent-hq/monorepo#2459): every new session gets the
         // CURRENT harness version and a snapshot of the effective
         // agentFeatures values, captured once here and immutable for the
