@@ -731,10 +731,14 @@ impl ChatDeltaState {
     /// in-flight assistant message (CS-0 D5): the message arriving mid-turn has
     /// already streamed some blocks, so prime `message_id`, mark each block id as
     /// already seen+emitted (subsequent chunks arrive as `updated`, not `added`),
-    /// and pre-load each `text` block's accumulated text so the NEXT chunk delta
-    /// carries the FULL text (D2), not just the new fragment. Without this, a
-    /// resuming subscriber's first chunk would restart the text from empty until
-    /// the terminal reconcile. No-op when the snapshot has no in-flight message.
+    /// and pre-load each `text` block's accumulated text. In full mode the NEXT
+    /// chunk delta then carries the FULL text (D2), not just the new fragment —
+    /// without this, a resuming subscriber's first chunk would restart the text
+    /// from empty until the terminal reconcile. In incremental mode
+    /// (monorepo#2675) deltas carry only the post-snapshot fragment, so the
+    /// pre-load doesn't shape the wire — but the accumulation still backs the
+    /// DEGRADED terminal frame's best-effort full text, so seeding is identical
+    /// in both modes. No-op when the snapshot has no in-flight message.
     pub(crate) fn seed_from_snapshot(&mut self, snapshot: &Value) {
         let Some(messages) = snapshot.get("messages").and_then(Value::as_array) else {
             return;

@@ -403,6 +403,35 @@ fn oversized_incremental_merge_seals_the_entry_and_starts_a_new_one() {
 }
 
 #[test]
+fn foreign_text_delta_field_on_non_text_block_takes_latest_wins() {
+    // A non-text chunk passes provider content through verbatim; a foreign
+    // block carrying its own `textDelta` string must NOT take the concatenate
+    // path — latest entity wins, exactly like the full-text encoding.
+    let foreign = |delta: &str, extra: &str| {
+        json!({
+            "added": [],
+            "updated": [{
+                "agentId": "ag-1",
+                "messageId": "m-1",
+                "role": "assistant",
+                "block": { "type": "custom", "id": "m-1:9", "textDelta": delta, "state": extra },
+            }],
+            "removedIds": [],
+        })
+    };
+    let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
+    for delta in [foreign("old", "stale"), foreign("new", "fresh")] {
+        let (key, item) = ChatItem::from_delta(&delta).unwrap();
+        assert!(buf.push(key, item).is_none());
+    }
+    let only = buf.pop().unwrap().into_delta();
+    assert!(buf.pop().is_none());
+    // Newest entity's full state kept, strings not concatenated.
+    assert_eq!(only["updated"][0]["block"]["textDelta"], json!("new"));
+    assert_eq!(only["updated"][0]["block"]["state"], json!("fresh"));
+}
+
+#[test]
 fn mixed_encoding_merge_is_refused_defensively() {
     let mut buf: ConflationBuffer<ChatItem> = ConflationBuffer::new();
     for delta in [

@@ -399,13 +399,13 @@ impl Conflate for ChatItem {
                 if acc.len() + add.len() > CHAT_TEXT_CONCAT_CAP_BYTES {
                     return Some(newer);
                 }
-                let merged = format!("{acc}{add}");
-                if let Some(slot) = self
+                let add = add.to_string();
+                if let Some(Value::String(slot)) = self
                     .entity
                     .get_mut("block")
                     .and_then(|b| b.get_mut("textDelta"))
                 {
-                    *slot = Value::String(merged);
+                    slot.push_str(&add);
                 }
                 None
             }
@@ -424,12 +424,17 @@ impl Conflate for ChatItem {
 }
 
 /// The `block.textDelta` string of a chat delta entity, or `None` for the
-/// full-text encoding's entities (which carry `block.text` instead).
+/// full-text encoding's entities (which carry `block.text` instead). Gated on
+/// the mapper-owned `text`/`thinking` block types: non-text chunks pass
+/// provider content through verbatim, so a foreign block that happens to carry
+/// its own `textDelta` field must take the latest-entity-wins path, never the
+/// concatenate path.
 fn text_delta_of(entity: &Value) -> Option<&str> {
-    entity
-        .get("block")
-        .and_then(|b| b.get("textDelta"))
-        .and_then(Value::as_str)
+    let block = entity.get("block")?;
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") | Some("thinking") => block.get("textDelta").and_then(Value::as_str),
+        _ => None,
+    }
 }
 
 /// Approximate in-memory payload size of a JSON value: string/byte content
