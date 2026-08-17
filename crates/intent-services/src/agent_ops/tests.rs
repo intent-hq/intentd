@@ -8257,6 +8257,106 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     );
 }
 
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `lastTurnSilentTailMs` (the last ended turn's stream-silence tail,
+/// recorded in-memory at turn end; omitted when no turn ended this daemon
+/// lifetime), and a tail at/past the suspect threshold raises a
+/// `long-silent-tail` stuck-risk warning naming the agent, the tail, and the
+/// threshold. Diagnostics-only: the field never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
+    let (_t, svc, ws) = setup().await;
+    let quick = create_agent(&svc, &ws, "Quick").await;
+    let stalled = create_agent(&svc, &ws, "Stalled").await;
+    let fresh = create_agent(&svc, &ws, "Fresh").await;
+
+    let threshold = crate::agent_session::silent_tail_suspect_ms();
+    svc.record_turn_silent_tail(&quick, 1_200);
+    svc.record_turn_silent_tail(&stalled, threshold + 60_000);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(row_for(&quick)["lastTurnSilentTailMs"], json!(1_200));
+    assert_eq!(
+        row_for(&stalled)["lastTurnSilentTailMs"],
+        json!(threshold + 60_000)
+    );
+    assert!(
+        row_for(&fresh).get("lastTurnSilentTailMs").is_none(),
+        "no ended turn, field omitted"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let long: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("long-silent-tail"))
+        .collect();
+    assert_eq!(long.len(), 1, "risks: {risks:?}");
+    assert_eq!(long[0]["agentId"], json!(stalled.0));
+    assert_eq!(long[0]["severity"], json!("warning"));
+    assert_eq!(long[0]["silentTailMs"], json!(threshold + 60_000));
+    assert_eq!(long[0]["thresholdMs"], json!(threshold));
+    assert!(
+        long[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("silently truncated"),
+        "message: {}",
+        long[0]["message"]
+    );
+
+    // A later turn's record replaces the previous one — a healthy follow-up
+    // turn clears the risk.
+    svc.record_turn_silent_tail(&stalled, 800);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics after healthy turn");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let stalled_row = rows
+        .iter()
+        .find(|r| r["id"].as_str() == Some(stalled.0.as_str()))
+        .expect("agent row");
+    assert_eq!(stalled_row["lastTurnSilentTailMs"], json!(800));
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("long-silent-tail")),
+        "healthy turn clears the risk: {result}"
+    );
+
+    // Diagnostics-only: the hot list payloads never carry the field.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = serde_json::to_value(&agents).expect("serialize");
+    for row in listed.as_array().expect("agents array") {
+        assert!(
+            row.get("lastTurnSilentTailMs").is_none(),
+            "agent.list omits lastTurnSilentTailMs: {row}"
+        );
+    }
+
+    // Agent delete drops the in-memory record.
+    svc.agent_delete_op(quick.clone(), Some(ws.clone()))
+        .await
+        .expect("delete");
+    assert!(
+        svc.last_turn_silent_tail(&quick).is_none(),
+        "delete clears the silent-tail record"
+    );
+}
+
 /// intent-hq/monorepo#1897: a ready-to-send queue entry older than
 /// `STALE_QUEUE_ENTRY_AFTER_MS` on an agent that is not actively responding
 /// raises a `stale-queue-entry` stuck risk naming the agent and the oldest

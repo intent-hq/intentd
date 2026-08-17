@@ -696,6 +696,31 @@ pub(crate) const ACTIVITY_THROTTLE: std::time::Duration = std::time::Duration::f
 /// writer observe the same state.
 pub(crate) type LiveTurns = Arc<Mutex<HashMap<AgentId, LiveTurn>>>;
 
+/// Per-agent silent tail (ms of `session/update` silence before the prompt
+/// resolved) of the most recently ended turn (intent-hq/monorepo#2669):
+/// recorded at turn end by [`run_prompt_turn`](Services::run_prompt_turn) and
+/// served by `agent.diagnostics` as `lastTurnSilentTailMs`. In-memory only —
+/// the signal is a live-session health indicator, so losing it on restart is
+/// fine. Shared across [`Services`] clones.
+pub(crate) type LastTurnSilentTails = Arc<Mutex<HashMap<AgentId, u64>>>;
+
+/// Silent-tail threshold past which a bare `end_turn` is suspected to be a
+/// silently-truncated turn (intent-hq/monorepo#2669): in that incident,
+/// bloated sessions resolved `session/prompt` with a clean `end_turn` after
+/// 11–13 minutes of total silence. 5 minutes sits comfortably past normal
+/// tool-free inference tails while catching the incident signature well
+/// before the 30-minute prompt idle timeout. Advisory only — the annotation
+/// never interrupts or fails the turn, because healthy long silent tails
+/// exist. Overridable via `INTENTD_SILENT_TAIL_SUSPECT_MS` (test seam).
+pub(crate) fn silent_tail_suspect_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_SILENT_TAIL_SUSPECT_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    5 * 60 * 1000
+}
+
 /// Per-agent chain of detached turn-end usage-bookkeeping tasks
 /// (monorepo#738): the `JoinHandle` of the most recently spawned bookkeeping
 /// task per agent. Each new turn's task awaits its predecessor before
@@ -1148,6 +1173,41 @@ impl Services {
         if let Ok(mut slots) = self.live_turns.lock() {
             slots.remove(agent_id);
         }
+    }
+
+    /// Record the just-ended turn's silent tail (intent-hq/monorepo#2669) —
+    /// ms of `session/update` silence between the turn's last streamed
+    /// activity and the prompt resolving. One slot per agent, latest turn
+    /// wins; served by `agent.diagnostics` as `lastTurnSilentTailMs`.
+    /// `pub(crate)` as a test seam so in-crate tests can seed the map
+    /// without driving a real turn. The map is a plain `HashMap` with no
+    /// invariant to tear, so a poisoned lock recovers via `into_inner()`
+    /// (matching the workspace-delete sweep in `lib.rs`).
+    pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
+        self.last_turn_silent_tails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(agent_id.clone(), silent_tail_ms);
+    }
+
+    /// The recorded silent tail of the agent's most recently ended turn, if
+    /// any turn ended this daemon lifetime — see
+    /// [`record_turn_silent_tail`](Self::record_turn_silent_tail).
+    pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
+        self.last_turn_silent_tails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent_id)
+            .copied()
+    }
+
+    /// Drop the agent's recorded silent tail (agent delete / workspace delete
+    /// teardown) so the in-memory map never leaks entries for dead agents.
+    pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
+        self.last_turn_silent_tails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
     }
 
     /// Clear an agent's live-turn slot at a NORMAL turn end, leaving a pinned
@@ -1951,13 +2011,29 @@ impl Services {
                 },
             }
         };
-        // Drain updates buffered before the prompt response resolved.
+        // Drain updates buffered before the prompt response resolved. Each
+        // drained note is streamed activity that arrived BEFORE the prompt
+        // settled (`prompt_fut` can win the `select!` while updates sit
+        // buffered — e.g. an agent sending its final update and response
+        // back-to-back), so `activity.touch()` here counts it against the
+        // silent tail captured below; without it such a turn would read as
+        // carrying a long tail it never had.
         while let Ok(note) = notifications.try_recv() {
+            activity.touch();
             any_update_received = true;
             updates_applied |= self
                 .route_notification(&note, agent_id, workspace_id, &mut transcript)
                 .await;
         }
+        // Silent tail of the turn (intent-hq/monorepo#2669): ms of
+        // `session/update` silence between the turn's last streamed activity
+        // (buffered drain included) and the prompt resolving. In that
+        // incident bloated sessions resolved a clean `end_turn` after
+        // 11-13 min of total silence — the daemon held this exact signal
+        // (`activity.idle_ms()`) and discarded it; now it is recorded for
+        // `agent.diagnostics` and, past [`silent_tail_suspect_ms`], stamped
+        // on the terminal `agent:idle` payload below.
+        let silent_tail_ms = activity.idle_ms();
         // §7.1 deterministic attach — turn-end drain: append the registered
         // `AtTurnEnd` attachments as trailing resource blocks, and clear ALL
         // remaining registry entries for this agent (unclaimed `AtToolResult`
@@ -2060,6 +2136,48 @@ impl Services {
                     err,
                 )
                 .await;
+        }
+        // Record the silent tail for `agent.diagnostics`
+        // (intent-hq/monorepo#2669). A pre-output transport failure is
+        // excluded: the attempt is invisible (the worker may silently
+        // redrive it), so its tail must not overwrite the last VISIBLE
+        // turn's record. Also skipped when the agent's session row is
+        // already gone: `agent.delete` does not stop a running turn, so a
+        // turn settling after the delete's `clear_turn_silent_tail` sweep
+        // would otherwise resurrect the entry for the daemon lifetime.
+        // Best-effort — a delete interleaving between this check and the
+        // insert leaves one stale u64, which the diagnostics read (it
+        // iterates live sessions) never serves.
+        if !pre_output_transport_failure
+            && self.store.get_agent_session_summary(agent_id).await.is_ok()
+        {
+            self.record_turn_silent_tail(agent_id, silent_tail_ms);
+        }
+        // Suspicious bare normal ending (intent-hq/monorepo#2669): the turn
+        // completed normally after a sustained silent tail — the incident
+        // signature of a silently-truncated turn under session bloat. Both
+        // normal stop reasons (`end_turn` / `stream_complete`, the same set
+        // the abnormal-finish filter below treats as unremarkable) qualify:
+        // the incident harness happened to resolve `end_turn`, but a harness
+        // ending a truncated turn with `stream_complete` reads identically
+        // everywhere else and must not dodge the annotation. Advisory only
+        // (healthy long tool-free inference tails exist): stamped on the
+        // terminal `agent:idle` payload below as `silentTailMs` +
+        // `suspectedTruncated: true` so coordinators and the monorepo#1016
+        // stall-annotation consumers get a machine-readable signal; the turn
+        // itself is never failed.
+        let suspected_truncated = silent_tail_ms >= silent_tail_suspect_ms()
+            && result
+                .as_ref()
+                .ok()
+                .and_then(|stop| serde_json::to_value(stop).ok())
+                .is_some_and(|v| matches!(v.as_str(), Some("end_turn" | "stream_complete")));
+        if suspected_truncated {
+            tracing::warn!(
+                agent = %agent_id,
+                silent_tail_ms,
+                "turn resolved normally after a sustained silent tail — suspected truncation (monorepo#2669)"
+            );
         }
         // Abnormal finish reason (PROTOCOL §7): a turn that resolved with a
         // non-`end_turn` stop reason (`refusal`, `max_tokens`,
@@ -2279,6 +2397,16 @@ impl Services {
                 });
                 if let Some(summary) = last_response_summary {
                     data["lastResponseSummary"] = Value::String(summary);
+                }
+                // Suspicious bare `end_turn` after a sustained silent tail
+                // (intent-hq/monorepo#2669): additive advisory fields —
+                // `silentTailMs` (the measured gap) + `suspectedTruncated:
+                // true` — omitted entirely on healthy turns (absent, never
+                // `false`), so subscribers get a machine-readable truncation
+                // signal without any change to the normal payload.
+                if suspected_truncated {
+                    data["silentTailMs"] = json!(silent_tail_ms);
+                    data["suspectedTruncated"] = json!(true);
                 }
                 // DELIV-1: enrich the idle payload with `agentName` (so
                 // subscribers don't fall back to a generic "Agent" label)
