@@ -47,6 +47,64 @@ impl PendingAttachmentState {
 /// `dispatch_workspace_api`.
 type PendingAttachments = Arc<Mutex<PendingAttachmentState>>;
 
+/// Per-dispatch stage tracker (monorepo#2709): names the stage a dispatch is
+/// currently in so the sentinel task can attribute a wedge at default log
+/// level. Shared between the dispatch body (which advances it) and the
+/// sentinel task (which reads it when the eval budget elapses with the
+/// dispatch still in flight).
+struct DispatchStage(Mutex<&'static str>);
+
+impl DispatchStage {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new("eval")))
+    }
+
+    fn set(&self, stage: &'static str) {
+        *self.0.lock().unwrap() = stage;
+    }
+
+    fn get(&self) -> &'static str {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Sentinel guard for one dispatch: a separate task that fires ONE warn —
+/// naming the in-flight stage and the `summary` arg — when the dispatch is
+/// still running well past the eval budget. Because it polls in its own
+/// task, it fires even when the dispatch future is wedged inside a single
+/// synchronous poll (the exact state the bridge watchdog aborts, which would
+/// otherwise preempt any completion-time logging), and warn-level is visible
+/// at the daemon's default `info` filter. Dropping the guard (normal
+/// completion) aborts the task, so a within-budget call logs nothing extra.
+///
+/// Fires at 1.5× the eval budget: enough grace that an ordinary eval timeout
+/// (which returns shortly after the budget and already warns at completion)
+/// never double-warns, and strictly before the bridge watchdog deadline
+/// (`max(120s, 2×budget)`) so an await-wedged dispatch is attributed before
+/// the watchdog abort drops this guard.
+struct StageSentinel(tokio::task::JoinHandle<()>);
+
+impl StageSentinel {
+    fn arm(stage: Arc<DispatchStage>, budget: Duration, summary: String) -> Self {
+        Self(tokio::spawn(async move {
+            tokio::time::sleep(budget + budget / 2).await;
+            tracing::warn!(
+                summary,
+                stage = stage.get(),
+                elapsed_ms = (budget + budget / 2).as_millis() as u64,
+                budget_ms = budget.as_millis() as u64,
+                "workspace_api dispatch still in flight past the JS eval budget"
+            );
+        }))
+    }
+}
+
+impl Drop for StageSentinel {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 use super::WorkspaceMcpServer;
 
 /// Wall-clock budget for one `workspace_api` invocation — matches the 30s
@@ -140,7 +198,19 @@ impl WorkspaceMcpServer {
         // dispatch stage so a wedged dispatch — one the bridge watchdog later
         // aborts — leaves a trail naming the stage it never left. Normal
         // calls emit exactly one debug event (below); a dispatch exceeding
-        // the eval budget upgrades it to warn.
+        // the eval budget upgrades it to warn. The stage tracker + sentinel
+        // additionally warn IN FLIGHT — visible at the default `info` filter —
+        // when the dispatch is still running well past the budget, because a
+        // watchdog abort would preempt all completion-time logging.
+        let stage = DispatchStage::new();
+        let _sentinel = StageSentinel::arm(
+            stage.clone(),
+            self.workspace_api_timeout,
+            args.get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
         tracing::trace!("workspace_api dispatch: eval starting");
         let eval_started = Instant::now();
         let eval_result = js_eval(&full_code, &opts, Some(host)).await;
@@ -193,11 +263,13 @@ impl WorkspaceMcpServer {
                         // dispatch that wedges in one of these awaits never
                         // reaches the tail event, so the last marker in the
                         // log names the stage it never left.
+                        stage.set("settings read");
                         tracing::trace!("workspace_api dispatch: settings read starting");
                         let stage_started = Instant::now();
                         let (toon_output, max_chars) = self.workspace_api_output_settings().await;
                         settings_ms = Some(stage_started.elapsed().as_millis() as u64);
                         let (body, ext) = render_workspace_api_value(&value, toon_output);
+                        stage.set("output finalize");
                         tracing::trace!("workspace_api dispatch: output finalize starting");
                         let stage_started = Instant::now();
                         let out = self
