@@ -2,7 +2,7 @@
 //! agent-owned JavaScript script the daemon runs periodically (fixed
 //! `delayMs` between runs) until it signals a dispatch, fails, is cancelled,
 //! or its TTL expires (`expiresAt` = creation + clamped `ttlMs`, capped at
-//! 60 minutes — on expiry the owner is woken so it can reschedule). Each
+//! 24 hours — on expiry the owner is woken so it can reschedule). Each
 //! active hook owns one tokio task; schedules persist to the `hook` table
 //! and rehydrate at boot ([`Services::rehydrate_hooks`]).
 //!
@@ -54,11 +54,11 @@ use crate::{publish_event, system_actor, Services};
 /// rejected at schedule time.
 pub(crate) const MIN_HOOK_DELAY_MS: i64 = 10_000;
 
-/// Default and maximum hook TTL: every hook expires at most 60 minutes after
+/// Default and maximum hook TTL: every hook expires at most 24 hours after
 /// creation. A schedulable `ttlMs` is clamped into
 /// `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]` (the floor is shared with
 /// `delayMs`); expiry counts from creation, not the last run.
-pub(crate) const MAX_HOOK_TTL_MS: i64 = 3_600_000;
+pub(crate) const MAX_HOOK_TTL_MS: i64 = 86_400_000;
 pub(crate) const DEFAULT_HOOK_TTL_MS: i64 = MAX_HOOK_TTL_MS;
 
 /// Maximum hook name length (spec: name > 50 chars fails validation).
@@ -163,7 +163,7 @@ fn next_run_at_iso(delay_ms: i64) -> String {
 }
 
 /// Clamp a schedulable `ttlMs` into `[MIN_HOOK_DELAY_MS, MAX_HOOK_TTL_MS]`;
-/// `None` (omitted) takes the default (= the 60-minute cap).
+/// `None` (omitted) takes the default (= the 24-hour cap).
 fn clamp_ttl_ms(ttl_ms: Option<i64>) -> i64 {
     ttl_ms
         .unwrap_or(DEFAULT_HOOK_TTL_MS)
@@ -469,8 +469,8 @@ impl Services {
                 "hook.schedule: `delayMs` must be at least {MIN_HOOK_DELAY_MS}"
             )));
         }
-        // TTL (spec: 60-minute cap): optional `ttlMs`, clamped — never
-        // rejected — into [10s, 60min]; omitted takes the 60-minute default.
+        // TTL (spec: 24-hour cap): optional `ttlMs`, clamped — never
+        // rejected — into [10s, 24h]; omitted takes the 24-hour default.
         let ttl_ms = clamp_ttl_ms(params.get("ttlMs").and_then(Value::as_i64));
         // Perpetual hooks survive a dispatch; omitted defaults to one-shot.
         let perpetual = params
@@ -3637,11 +3637,12 @@ mod tests {
     #[test]
     fn ttl_clamp_defaults_and_bounds() {
         assert_eq!(clamp_ttl_ms(None), MAX_HOOK_TTL_MS);
-        assert_eq!(clamp_ttl_ms(Some(7_200_000)), MAX_HOOK_TTL_MS);
+        assert_eq!(clamp_ttl_ms(Some(100_000_000)), MAX_HOOK_TTL_MS);
         assert_eq!(clamp_ttl_ms(Some(1)), MIN_HOOK_DELAY_MS);
         assert_eq!(clamp_ttl_ms(Some(0)), MIN_HOOK_DELAY_MS);
         assert_eq!(clamp_ttl_ms(Some(-5)), MIN_HOOK_DELAY_MS);
         assert_eq!(clamp_ttl_ms(Some(300_000)), 300_000);
+        assert_eq!(clamp_ttl_ms(Some(7_200_000)), 7_200_000);
     }
 
     /// Milliseconds between a hook's `created_at` and `expires_at`.
@@ -3656,7 +3657,7 @@ mod tests {
     #[tokio::test]
     async fn schedule_persists_clamped_expires_at() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        // Omitted ttlMs → the 60-minute default.
+        // Omitted ttlMs → the 24-hour default.
         let out = svc
             .hook_schedule_op(
                 &ws,
@@ -3674,7 +3675,7 @@ mod tests {
                 &ws,
                 &owner,
                 &json!({ "name": "big-ttl", "code": "return { dispatch: false };",
-                         "delayMs": 10_000, "ttlMs": 7_200_000 }),
+                         "delayMs": 10_000, "ttlMs": 100_000_000 }),
             )
             .await
             .expect("schedule");
