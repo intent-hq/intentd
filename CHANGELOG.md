@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.16] - 2026-08-17
+
+### 🚀 Features
+
+- Add aroundIndex ordinal seek to agent.getConversation ([#1297](https://github.com/intent-hq/intentd/pull/1297))
+
+### 🐛 Bug Fixes
+
+- *(services)* Fail closed on appends to a vanished agent session (intent-hq/monorepo#2762)
+
+
 ## [0.7.15] - 2026-08-17
 
 ### 🐛 Bug Fixes
