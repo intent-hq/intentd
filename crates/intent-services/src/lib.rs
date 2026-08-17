@@ -1207,6 +1207,21 @@ impl Services {
         self.specialist_model_options(wp.as_deref())
     }
 
+    /// Non-empty trimmed string at `key` in a session's raw metadata JSON —
+    /// the read shape shared by the `behaviorPrompt` override slot and the
+    /// frozen specialist-identity snapshot keys (`specialistName` /
+    /// `specialistRoleReminder`) persisted at creation by `agent_create_op`.
+    fn session_metadata_str(session: &AgentSession, key: &str) -> Option<String> {
+        session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// Resolve the `[Role Reminder: You are a {name}. {reminder}]` prefix to
     /// prepend to a specialist agent's next turn, or `None` when the agent has no
     /// specialist or its specialist yields no reminder (port of acp-provider.ts
@@ -1215,6 +1230,16 @@ impl Services {
     pub(crate) async fn agent_role_reminder(&self, agent_id: &AgentId) -> Option<String> {
         let session = self.store.get_agent_session(agent_id).await.ok()?;
         let specialist_id = session.specialist.as_deref()?;
+        // Frozen identity snapshot (persisted at creation by `agent_create_op`):
+        // when present it wins over live 3-tier resolution, so later edits or
+        // deletes of specialist files never change this agent's reminder. A
+        // frozen name without a frozen reminder means creation resolved no
+        // usable reminder — stay silent rather than falling back live.
+        if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
+            let reminder = Self::session_metadata_str(&session, "specialistRoleReminder")?;
+            return Some(crate::harness::latest().role_reminder_prefix(&name, &reminder));
+        }
+        // Legacy sessions (no frozen keys): live 3-tier resolution, unchanged.
         let workspace_path = self
             .store
             .get_workspace(&session.workspace_id)
@@ -1244,14 +1269,27 @@ impl Services {
         workspace_path: Option<&Path>,
     ) -> Option<crate::rules::SpecialistPromptInjection> {
         let session = self.store.get_agent_session(agent_id).await.ok()?;
-        let override_bp = session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("behaviorPrompt"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let override_bp = Self::session_metadata_str(&session, "behaviorPrompt");
+        // Frozen identity snapshot (persisted at creation by `agent_create_op`):
+        // on a specialist session, `specialistName` presence marks a snapshot
+        // and the whole triple is read frozen — the body from the
+        // `behaviorPrompt` override slot (absent when the specialist had no
+        // body at creation), skipping live resolution entirely so file
+        // edits/deletes never change the injection. Gated on
+        // `session.specialist` (mirroring `agent_role_reminder` and the
+        // write-side invariant that snapshots are only written for specialist
+        // sessions), so a caller-supplied `specialistName` on a
+        // non-specialist session stays inert. Legacy sessions fall through to
+        // live resolution below.
+        if session.specialist.is_some() {
+            if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
+                return Some(crate::rules::SpecialistPromptInjection {
+                    behavior_prompt: override_bp,
+                    specialist_name: Some(name),
+                    role_reminder: Self::session_metadata_str(&session, "specialistRoleReminder"),
+                });
+            }
+        }
         // Embedded floor pinned to the session's stamped harness version
         // (H2) so respawns under a newer binary keep the pinned prompts.
         let entry = crate::harness::resolve_entry(&session.harness_version);
