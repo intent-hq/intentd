@@ -9027,6 +9027,7 @@ impl Services {
                     return Ok(json!({
                         "success": true,
                         "queued": true,
+                        "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
                     }));
                 }
