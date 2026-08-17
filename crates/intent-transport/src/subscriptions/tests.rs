@@ -2941,4 +2941,56 @@ mod chat_terminal_reconcile_failure {
             "the blank row flips out of streaming: {d}"
         );
     }
+
+    /// The lag-recovery snapshot must never degrade to an empty page: it is
+    /// emitted at a LATER seq than content the client already rendered, so an
+    /// empty value would rebuild the transcript as blank. It retries the read
+    /// once and reports failure (`None`) instead of degrading.
+    mod chat_recovery_snapshot_fallible {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_persistent_read_failure_returns_none_after_one_retry() {
+            let api = FailingConvApi::new();
+            let snapshot = chat_recovery_snapshot(&api, &agent()).await;
+            assert!(
+                snapshot.is_none(),
+                "a persistent failure must NOT degrade to an empty page"
+            );
+            assert_eq!(
+                api.calls.load(Ordering::SeqCst),
+                2,
+                "the read is retried exactly once"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_transient_failure_recovers_on_the_retry() {
+            let api = FailingConvApi::failing_once_then(conversation());
+            let snapshot = chat_recovery_snapshot(&api, &agent())
+                .await
+                .expect("the retry served the page");
+            assert_eq!(api.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                snapshot["messages"][0]["contentBlocks"][0]["text"], "Hello, world",
+                "the recovered snapshot carries the persisted page: {snapshot}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_healthy_read_serves_the_page_first_try() {
+            let api = FailingConvApi::failing_once_then(conversation());
+            api.calls.store(1, Ordering::SeqCst); // consume the failing call
+            let before = api.calls.load(Ordering::SeqCst);
+            let snapshot = chat_recovery_snapshot(&api, &agent())
+                .await
+                .expect("healthy read");
+            assert_eq!(
+                api.calls.load(Ordering::SeqCst) - before,
+                1,
+                "exactly one bounded page read on the happy path"
+            );
+            assert_eq!(snapshot["messages"][0]["id"], "msg-1");
+        }
+    }
 }
