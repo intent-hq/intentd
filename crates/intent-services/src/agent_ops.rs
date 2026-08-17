@@ -10273,14 +10273,66 @@ const RESUME_RECAP_SEGMENT_MAX_CHARS: usize = 8_000;
 /// whole recap exists to preserve; the freshest partials matter most).
 const RESUME_RECAP_MAX_SEGMENTS: usize = 8;
 
-/// The restart-resume continuation message (`resume_interrupted_agent`).
-/// Re-sent verbatim on every resume, so persisted copies of it in the
-/// transcript tail are never replayed by the recap — a second restart would
-/// otherwise stop the tail walk at the previous resume's continuation row
-/// and lose the original request again.
-pub(crate) const RESUME_CONTINUATION_TEXT: &str = "You were interrupted because the harness shut \
-     down. You now have a chance to continue the work — review your last steps and pick up where \
-     you left off.";
+/// Stable prefix shared by every restart-resume continuation message
+/// (`resume_interrupted_agent`): the duration-bearing variant, the
+/// no-duration fallback, and the legacy pre-duration wording ("You were
+/// interrupted because the harness shut down. …") all start with it. A fresh
+/// continuation is re-sent on every resume, so persisted copies in the
+/// transcript tail are never replayed by the recap — the walk skips them by
+/// THIS prefix (not exact text) because the message now embeds a per-resume
+/// outage duration, and legacy transcripts written before the rewording must
+/// keep the skip behavior. The prefix match is safe only because it is
+/// compared against user-role rows in the interrupted tail; an ordinary user
+/// message not starting with the prefix is always replayed.
+pub(crate) const RESUME_CONTINUATION_PREFIX: &str = "You were interrupted ";
+
+/// Fallback restart-resume continuation, sent unchanged when the claimed
+/// row's `interrupted_at` cannot be parsed or the delta is negative — the
+/// resume never fails on the timestamp. Starts with
+/// [`RESUME_CONTINUATION_PREFIX`].
+pub(crate) const RESUME_CONTINUATION_FALLBACK_TEXT: &str = "You were interrupted due to a \
+     harness shutdown and restart. You can now continue your work and pick up where you left \
+     off.";
+
+/// Humanize an outage duration coarsely for the resume continuation: a
+/// single unit — seconds under 2 minutes, minutes under 2 hours, hours under
+/// 2 days, else days — matching the wording's "for about {duration}" framing.
+fn humanize_outage_duration(seconds: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let (value, unit) = if seconds < 2 * MINUTE {
+        (seconds, "second")
+    } else if seconds < 2 * HOUR {
+        (seconds / MINUTE, "minute")
+    } else if seconds < 2 * DAY {
+        (seconds / HOUR, "hour")
+    } else {
+        (seconds / DAY, "day")
+    };
+    let plural = if value == 1 { "" } else { "s" };
+    format!("{value} {unit}{plural}")
+}
+
+/// Build the restart-resume continuation message: the approved wording with
+/// the humanized outage duration (`now` − `interrupted_at`), or
+/// [`RESUME_CONTINUATION_FALLBACK_TEXT`] when the timestamp is unparseable
+/// or in the future. Both variants start with
+/// [`RESUME_CONTINUATION_PREFIX`], which the recap skip depends on.
+fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> String {
+    let Some(at) = parse_iso(interrupted_at) else {
+        return RESUME_CONTINUATION_FALLBACK_TEXT.to_string();
+    };
+    let seconds = (now - at).whole_seconds();
+    if seconds < 0 {
+        return RESUME_CONTINUATION_FALLBACK_TEXT.to_string();
+    }
+    format!(
+        "You were interrupted for about {} due to a harness shutdown and restart. You can now \
+         continue your work and pick up where you left off.",
+        humanize_outage_duration(seconds)
+    )
+}
 
 /// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
 /// recap text plus any attachment blocks the replayed user rows carried.
@@ -10323,7 +10375,8 @@ enum TailSegment {
 /// assistant rows (skipping system rows) until the completed-turn boundary.
 /// A single restart leaves `user + partial`; repeated restarts stack further
 /// partials, and the previous resumes' persisted continuation rows are
-/// skipped (each resume re-sends [`RESUME_CONTINUATION_TEXT`] verbatim).
+/// skipped by the [`RESUME_CONTINUATION_PREFIX`] prefix (each resume
+/// re-sends a fresh continuation).
 /// Replayed text is XML-escaped like `format_history_as_xml`, so a message
 /// containing closing tags cannot break out of its quoting element. Returns
 /// `None` when the tail has no incomplete rows (the provider checkpoint is
@@ -10358,9 +10411,10 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
             "user" => {
                 let blocks = m.content.as_array().map(Vec::as_slice).unwrap_or(&[]);
                 let text = crate::agent_session::text_block_strings(blocks).join("\n");
-                if text == RESUME_CONTINUATION_TEXT {
-                    // A previous resume's continuation row — re-sent fresh by
-                    // every resume, never replayed.
+                if text.starts_with(RESUME_CONTINUATION_PREFIX) {
+                    // A previous resume's continuation row (any variant,
+                    // including legacy wording) — re-sent fresh by every
+                    // resume, never replayed.
                     continue;
                 }
                 let mut row_images: Vec<Value> = Vec::new();
@@ -10743,8 +10797,10 @@ impl Services {
             .await;
         }
 
-        // Deliver continuation message
-        let continuation = RESUME_CONTINUATION_TEXT;
+        // Deliver continuation message (with the humanized outage duration
+        // when the claimed row's `interrupted_at` yields one).
+        let continuation =
+            resume_continuation_text(&interrupted.interrupted_at, time::OffsetDateTime::now_utc());
 
         // Mid-turn tail recap (monorepo#2539): a `session/load` resume replays
         // the PROVIDER's session checkpoint, which contains only completed
@@ -10793,7 +10849,7 @@ impl Services {
                     .send_message(
                         agent_id.clone(),
                         workspace_id.clone(),
-                        continuation.to_string(),
+                        continuation.clone(),
                         None,
                         options,
                     )
@@ -10803,7 +10859,7 @@ impl Services {
                 self.agent_send_message(
                     workspace_id.clone(),
                     agent_id.clone(),
-                    continuation.to_string(),
+                    continuation,
                     None,
                     None,
                     None,
