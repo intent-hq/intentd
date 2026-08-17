@@ -758,6 +758,26 @@ fn transient_error() -> intent_core::Error {
     )
 }
 
+/// Drift guard: classify an error built through the SAME construction path as
+/// `insert_events` — `format!("acquire connection failed: {e}")` over a real
+/// `sqlx::Error::PoolTimedOut` — so a wording change on either side (the
+/// `event_repo.rs` prefix or sqlx's Display) breaks this test instead of
+/// silently disabling retries.
+#[test]
+fn transient_classification_matches_insert_events_wording() {
+    let sqlx_err = sqlx::Error::PoolTimedOut;
+    let as_insert_events_builds_it =
+        intent_core::Error::Internal(format!("acquire connection failed: {sqlx_err}"));
+    assert!(
+        super::bus::is_transient_insert_error(&as_insert_events_builds_it),
+        "acquire-timeout error must classify as transient: {as_insert_events_builds_it}"
+    );
+    // And a permanent failure through the same lens stays permanent.
+    let permanent =
+        intent_core::Error::Internal("insert failed: UNIQUE constraint failed: event.id".into());
+    assert!(!super::bus::is_transient_insert_error(&permanent));
+}
+
 /// Regression (monorepo#2673): a transient acquire failure must not drop the
 /// batch — the retry succeeds and the events are delivered both to the
 /// publisher (oneshot) and to live subscribers (broadcast).

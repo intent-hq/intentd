@@ -550,7 +550,10 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 /// read connection re-executed `PRAGMA auto_vacuum = INCREMENTAL` on every
 /// fresh pool connection, which surfaced as slow-statement WARNs inside hot
 /// read RPCs under load and amplified write-pool contention
-/// (intent-hq/monorepo#2673).
+/// (intent-hq/monorepo#2673). For the same reason the read pool does NOT
+/// create the file (`create_if_missing(false)`): the read pool never
+/// establishes database-file properties, so it must never be the first to
+/// create the file.
 ///
 /// The read pool size (32) is
 /// sized to absorb the client-driven startup burst (FE rehydrating several
@@ -563,7 +566,7 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
-        .create_if_missing(true)
+        .create_if_missing(false)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))

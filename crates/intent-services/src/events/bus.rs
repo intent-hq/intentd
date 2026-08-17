@@ -337,6 +337,20 @@ async fn flush_batch(
 /// broadcast: no durable append → no broadcast), so the drop is logged at
 /// error level with the event count and types before the publishers'
 /// oneshots resolve with the error.
+///
+/// Worst-case stall: the backoff sleeps are small, but each attempt can
+/// itself block for the write pool's acquire timeout (10s) or SQLite's
+/// `busy_timeout` (5s) on `BEGIN IMMEDIATE`, so a hard stall costs up to
+/// roughly 3× today's single-attempt bound per batch before the drop —
+/// accepted for monorepo#2673, where observed contention clears in tens of
+/// milliseconds.
+///
+/// Retrying a batch insert cannot duplicate events: event ids are minted
+/// INSIDE `insert_events` per call, and its rollback guard unwinds failed
+/// attempts, so each retry is a fresh, self-contained transaction. If id
+/// minting is ever hoisted out of `insert_events` (e.g. into the bus), a
+/// retry after an ambiguous commit failure could double-insert — revisit
+/// this retry loop then.
 pub(crate) async fn flush_prepared<F, Fut>(
     mut insert: F,
     pending: &mut Vec<WriterRequest>,
@@ -409,7 +423,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
 /// payload serialization failures, I/O errors) is permanent and fails the
 /// batch immediately. String matching is the only classification available:
 /// `insert_events` flattens every failure into `Error::Internal(String)`.
-fn is_transient_insert_error(e: &Error) -> bool {
+pub(crate) fn is_transient_insert_error(e: &Error) -> bool {
     let msg = e.to_string();
     msg.contains("acquire connection failed")
         || msg.contains("pool timed out")
