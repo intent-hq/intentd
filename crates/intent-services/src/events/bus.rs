@@ -17,6 +17,7 @@
 //! high-volume noise that no read path queries back out of the log.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use intent_core::{ActorType, Error, Event, Result};
 use intent_store::{NewEvent, Store};
@@ -30,7 +31,13 @@ use super::filter::{event_matches, SubscriptionFilter};
 /// Capacity of the broadcast channel that fans published events out to every
 /// subscriber's delivery task. Slow subscribers that fall this far behind are
 /// signalled via `Lagged` and skip the dropped events (they remain in the log).
-const BROADCAST_CAPACITY: usize = 1024;
+pub(crate) const BROADCAST_CAPACITY: usize = 1024;
+
+/// Minimum interval between broadcast-lag WARNs per subscriber. Lag reports
+/// arrive once per `recv()` that fell behind, so a sustained burst would spam
+/// the log without this throttle; skipped counts accumulate across suppressed
+/// reports and ride the next allowed WARN.
+pub(crate) const LAG_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Capacity of each subscriber's outbound batch queue.
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
@@ -185,18 +192,55 @@ impl Drop for EventBus {
     }
 }
 
+/// One item yielded by [`Subscription::recv_delivery`]: a batch of matched
+/// events, or an in-band lag marker sitting exactly at the gap position in the
+/// delivery order — everything queued before it was received before the drop,
+/// everything after it was published after. The marker is conservative: the
+/// filter is applied AFTER the broadcast receive, so the dropped events MAY or
+/// may not have matched this subscription's filter.
+#[derive(Debug)]
+pub enum Delivery {
+    /// A batch of matched events (single-element when `batch_window` is `None`).
+    Batch(Vec<Event>),
+    /// The subscriber fell behind and the broadcast ring dropped `n` events
+    /// before delivery (slow consumer). Persisted events remain in the log;
+    /// transient events are lost. Consumers that need convergence (the chat
+    /// forwarder) recover with a bounded re-read; [`Subscription::recv`]
+    /// consumers see no marker (skipped transparently).
+    Lagged(u64),
+}
+
 /// A live subscription. Yields filtered (and optionally batched) events via
 /// [`Subscription::recv`]; dropping it aborts the backing delivery task.
 pub struct Subscription {
-    rx: mpsc::Receiver<Vec<Event>>,
+    rx: mpsc::Receiver<Delivery>,
     handle: JoinHandle<()>,
 }
 
 impl Subscription {
     /// Await the next batch of matched events. Returns `None` once the bus is
-    /// dropped and all buffered batches have been drained.
+    /// dropped and all buffered batches have been drained. Lag markers are
+    /// skipped transparently — consumers that must react to upstream loss
+    /// (the chat forwarder) use [`Subscription::recv_delivery`] instead.
     pub async fn recv(&mut self) -> Option<Vec<Event>> {
+        loop {
+            match self.rx.recv().await? {
+                Delivery::Batch(batch) => return Some(batch),
+                Delivery::Lagged(_) => continue,
+            }
+        }
+    }
+
+    /// Await the next [`Delivery`] — a batch OR an in-band lag marker.
+    /// Returns `None` once the bus is dropped and the queue is drained.
+    pub async fn recv_delivery(&mut self) -> Option<Delivery> {
         self.rx.recv().await
+    }
+
+    /// Non-blocking [`Subscription::recv_delivery`]: the next queued delivery,
+    /// or `None` when the queue is currently empty (or closed and drained).
+    pub fn try_recv_delivery(&mut self) -> Option<Delivery> {
+        self.rx.try_recv().ok()
     }
 }
 
@@ -289,14 +333,40 @@ async fn flush_batch(
     }
 }
 
+/// Per-subscriber throttle state for the broadcast-lag WARN: at most one WARN
+/// per [`LAG_WARN_INTERVAL`], with skipped counts accumulated across
+/// suppressed reports so no drop goes uncounted in the next WARN.
+#[derive(Default)]
+pub(crate) struct LagWarnThrottle {
+    skipped: u64,
+    last_warn: Option<Instant>,
+}
+
+impl LagWarnThrottle {
+    /// Record `n` skipped events at `now`. Returns the accumulated skipped
+    /// total (resetting it) when a WARN is due — on the first lag, then at
+    /// most once per [`LAG_WARN_INTERVAL`] — or `None` while throttled.
+    pub(crate) fn record(&mut self, n: u64, now: Instant) -> Option<u64> {
+        self.skipped = self.skipped.saturating_add(n);
+        match self.last_warn {
+            Some(prev) if now.duration_since(prev) < LAG_WARN_INTERVAL => None,
+            _ => {
+                self.last_warn = Some(now);
+                Some(std::mem::take(&mut self.skipped))
+            }
+        }
+    }
+}
+
 /// Per-subscriber delivery loop: filter, then coalesce within `batch_window`.
 async fn delivery_task(
     mut rx: broadcast::Receiver<Arc<Event>>,
     filter: SubscriptionFilter,
-    out: mpsc::Sender<Vec<Event>>,
+    out: mpsc::Sender<Delivery>,
 ) {
     let batch_window = filter.batch_window;
     let mut buffer: Vec<Event> = Vec::new();
+    let mut lag_warn = LagWarnThrottle::default();
     // A pending flush deadline, armed on the first matched event of a batch.
     let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     loop {
@@ -308,7 +378,7 @@ async fn delivery_task(
                     }
                     match batch_window {
                         None => {
-                            if out.send(vec![(*ev).clone()]).await.is_err() {
+                            if out.send(Delivery::Batch(vec![(*ev).clone()])).await.is_err() {
                                 return;
                             }
                         }
@@ -321,12 +391,47 @@ async fn delivery_task(
                     }
                 }
                 // Slow consumer: skip dropped events (persisted events remain in
-                // the log; transient events are lost, matching their semantics).
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // the log; transient events are lost, matching their semantics),
+                // but surface the loss twice over — a throttled WARN with the
+                // skipped count and the subscription's filter scope, so silent
+                // event loss (e.g. a stalled chat transcript) is diagnosable
+                // from the log, AND an in-band [`Delivery::Lagged`] marker at
+                // the gap position so consumers that need convergence (the
+                // chat forwarder) can run a bounded recovery. Any buffered
+                // batch flushes FIRST: its events were received before the
+                // drop, so the marker stays at the true gap position.
+                // Constant-cost invariant: `n` comes from the ring's cursor
+                // jump (the dropped events are never touched) and the WARN
+                // logs only that count plus the already-in-memory filter
+                // summary — no store reads, no per-dropped-event work.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    if let Some(skipped) = lag_warn.record(n, Instant::now()) {
+                        tracing::warn!(
+                            skipped,
+                            event_types = ?filter.event_types,
+                            workspace = %filter.workspace_id.as_deref().unwrap_or("all"),
+                            "event bus subscriber lagged; broadcast dropped events before delivery"
+                        );
+                    }
+                    if !buffer.is_empty() {
+                        deadline = None;
+                        if out
+                            .send(Delivery::Batch(std::mem::take(&mut buffer)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if out.send(Delivery::Lagged(n)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 // Bus dropped: flush any buffered batch, then stop.
                 Err(broadcast::error::RecvError::Closed) => {
                     if !buffer.is_empty() {
-                        let _ = out.send(std::mem::take(&mut buffer)).await;
+                        let _ = out.send(Delivery::Batch(std::mem::take(&mut buffer))).await;
                     }
                     return;
                 }
@@ -334,7 +439,12 @@ async fn delivery_task(
             // Batch window elapsed → flush the coalesced events.
             _ = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
                 deadline = None;
-                if !buffer.is_empty() && out.send(std::mem::take(&mut buffer)).await.is_err() {
+                if !buffer.is_empty()
+                    && out
+                        .send(Delivery::Batch(std::mem::take(&mut buffer)))
+                        .await
+                        .is_err()
+                {
                     return;
                 }
             }
