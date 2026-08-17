@@ -2784,6 +2784,91 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
     srv.ws.stop().await;
 }
 
+/// The catalog-default rung of the creation-time default-model resolution
+/// (PROTOCOL §5.5), over the real WSS transport: with a warm cached catalog
+/// whose `isDefault` row is `sonnet5` and no settings default, a no-model
+/// `agent.create` pins that row's id to `session.model` (served on the
+/// `AgentLite` payload); a configured settings default still outranks it; and
+/// the settings default reasoning effort does NOT companion a
+/// catalog-default-resolved model.
+#[tokio::test]
+async fn wss_agent_create_pins_the_catalog_default_model() {
+    let dir = test_tempdir("intentd-wss-catalog-default-");
+    let cache = serde_json::json!({
+        "version": 2,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] },
+                    { "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
+                      "isDefault": true }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Catalog Default"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Catalog default"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 2);
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("sonnet5"),
+        "the cached catalog's isDefault row is pinned: {created}"
+    );
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "the settings default effort must not companion a catalog-default model: {created}"
+    );
+
+    // A configured settings default outranks the catalog rung.
+    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings wins"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 3);
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("auggie:fable-5"),
+        "the settings chain outranks the catalog default: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
 /// params and no workspaceId. The result is a plain object whose optional
 /// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
