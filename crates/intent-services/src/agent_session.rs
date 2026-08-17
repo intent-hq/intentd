@@ -923,7 +923,7 @@ fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Op
         }
     }
     candidates.push(current);
-    version_bearing_display(candidates)
+    usage_stats::version_bearing_display(candidates)
 }
 
 /// Resolve the display identity of an EXPLICITLY selected model id against
@@ -949,7 +949,7 @@ fn resolve_explicit_display_model(
     if let Some(desc) = entry.description.as_deref() {
         candidates.push(desc);
     }
-    version_bearing_display(candidates)
+    usage_stats::version_bearing_display(candidates)
 }
 
 /// The model select of a `session/new` / `session/load` response's
@@ -1020,17 +1020,6 @@ fn select_entry<'a>(
             .find(|e| e.value.0.as_ref() == value),
         _ => None,
     }
-}
-
-/// First candidate that resolves to a known model family WITH a version
-/// (bare "Opus" is rejected — it would merge sibling versions and, persisted,
-/// is indistinguishable from a real option id in the post-session
-/// model-application gate).
-fn version_bearing_display<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
-    candidates
-        .into_iter()
-        .filter_map(usage_stats::known_family_model_name)
-        .find(|name| name.chars().any(|c| c.is_ascii_digit()))
 }
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the

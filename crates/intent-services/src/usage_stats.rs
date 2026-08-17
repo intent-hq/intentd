@@ -184,6 +184,20 @@ pub fn known_family_model_name(raw: &str) -> Option<String> {
     None
 }
 
+/// First candidate that resolves to a known model family WITH a version
+/// (bare "Opus" is rejected — it would merge sibling versions and, persisted,
+/// is indistinguishable from a real option id in the post-session
+/// model-application gate). Shared by the session-open effective-model
+/// resolutions (D13/D14) and the ACP catalog's default-row resolution.
+pub(crate) fn version_bearing_display<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    candidates
+        .into_iter()
+        .filter_map(known_family_model_name)
+        .find(|name| name.chars().any(|c| c.is_ascii_digit()))
+}
+
 /// Normalize a host-specific model id to one canonical display name, so the
 /// same model reached via different hosts (auggie / claude / pi / opencode)
 /// lands in one `usage_stats_hourly` row: strip provider path prefixes, find
