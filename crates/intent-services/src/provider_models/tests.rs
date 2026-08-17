@@ -294,10 +294,13 @@ fn parse_acp_models_current_value_wins_over_unresolvable_pseudo_row() {
 }
 
 #[test]
-fn parse_acp_models_without_config_options_never_mark_default() {
-    // Catalogs from the models.availableModels shapes have no model select
-    // to read a currentValue from — no row is marked, none dropped (a
-    // "default"-named row there stays, matching the pre-resolution behavior).
+fn parse_acp_models_family_less_default_row_stays_without_config_options() {
+    // Catalogs from the models.availableModels shapes have no model select to
+    // read a currentValue from, so only the family-match fallback applies.
+    // This family-less "default" row cannot resolve — it stays and no row is
+    // marked, matching the pre-resolution behavior. (A legacy default row
+    // whose name/description DOES carry a version-bearing family shared with
+    // exactly one sibling would still resolve via the fallback.)
     let payload = json!({
         "models": {
             "availableModels": [
