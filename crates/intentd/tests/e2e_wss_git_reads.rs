@@ -1,8 +1,8 @@
 //! WSS end-to-end for the read-side `git.*` extensions added in
-//! PROTOCOL.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
+//! docs/protocol/methods/git.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
 //! and `git.getConfig` (STAB-10a).
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via
-//! config) and asserts the response envelope shape from PROTOCOL.md §5 plus the
+//! config) and asserts the response envelope shape from docs/protocol/methods/git.md §5.6 plus the
 //! `-32602` error envelope for the validation paths.
 //!
 //! Uses a tiny local repository as the workspace source so the test never

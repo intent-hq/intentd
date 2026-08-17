@@ -509,7 +509,7 @@ async fn hook_archiving_its_own_workspace_publishes_the_archive_delta_over_wss()
     assert_eq!(
         archive_delta["changes"]["status"],
         json!("Archived"),
-        "archive delta per PROTOCOL.md §6.5: {archive_delta}"
+        "archive delta per docs/protocol/06-events.md §6.5: {archive_delta}"
     );
     assert!(
         archive_delta["changes"]["archivedAt"].is_string(),

@@ -234,6 +234,14 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// The effective wall-clock budget for one `workspace_api` invocation
+    /// (30s default, `INTENTD_WORKSPACE_API_TIMEOUT_MS` override, or the
+    /// builder override above). The bridge derives its dispatch watchdog
+    /// deadline from this so the two budgets can never cross (monorepo#2709).
+    pub(crate) fn workspace_api_timeout(&self) -> Duration {
+        self.workspace_api_timeout
+    }
+
     /// Whether `name` is denied for this agent.
     pub fn is_denied(&self, name: &str) -> bool {
         self.denylist.contains(name)

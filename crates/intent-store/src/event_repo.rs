@@ -133,6 +133,10 @@ impl Store {
         // DEFERRED-mode lock upgrade race). With max_connections=1 on the write
         // pool, concurrent insert_events calls serialize at pool.acquire() instead
         // of hitting SQLITE_BUSY during transaction upgrade.
+        // NOTE: this exact wording ("acquire connection failed: …", with sqlx's
+        // "pool timed out" inside) is matched by `is_transient_insert_error` in
+        // intent-services' events/bus.rs to classify the failure as retryable —
+        // keep them in sync if the message changes.
         let mut conn = self
             .write_pool()
             .acquire()

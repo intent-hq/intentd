@@ -517,3 +517,125 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         "user content last on turn 2: {second_text:?}"
     );
 }
+
+/// Specialist prompt freeze over the real WSS transport: `agent.create`
+/// snapshots the resolved specialist injection into the session, so a
+/// user-tier specialist file edited AFTER creation but BEFORE the first spawn
+/// must not change the agent — the assembled prompt the provider receives
+/// carries the ORIGINAL body, name, and role reminder, not the edited ones.
+#[tokio::test]
+async fn specialist_prompt_frozen_across_file_edit_over_wss() {
+    let Some(script) = gate("WSS specialist freeze E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Hermetic USER tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/ — the tier whose edits the freeze guards.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists");
+    let specialist_path = specialists_dir.join("freeze-e2e-tester.md");
+    std::fs::write(
+        &specialist_path,
+        "---\nname: \"FrozenTester\"\ndescription: \"d\"\nroleReminder: \"Original reminder.\"\n---\n\nFREEZE_E2E_ORIGINAL_MARKER: original body.",
+    )
+    .expect("write specialist");
+    let prompt_log = data_dir.join("prompt-log.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok" }).to_string();
+    let home = data_dir.to_string_lossy().into_owned();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+        ("HOME", &home),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — events.subscribe BEFORE the turn so we miss nothing.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // Create the specialist agent over WSS — this is where the snapshot is
+    // persisted.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "Freeze",
+            "model": "mock:default",
+            "specialistId": "freeze-e2e-tester",
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Edit the specialist file AFTER creation, BEFORE the first spawn: new
+    // name, reminder, and body.
+    std::fs::write(
+        &specialist_path,
+        "---\nname: \"EditedTester\"\ndescription: \"d\"\nroleReminder: \"Edited reminder.\"\n---\n\nFREEZE_E2E_EDITED_MARKER: edited body.",
+    )
+    .expect("edit specialist");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first user turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // The mock child logged the exact prompt text it received: the assembled
+    // spawn prompt must carry the ORIGINAL frozen triple, not the edit.
+    let log = read_prompt_log(&prompt_log);
+    assert!(!log.is_empty(), "expected a logged prompt: {log:?}");
+    let (first_turn, first_text) = &log[0];
+    assert_eq!(*first_turn, 1, "first logged prompt is the child's turn 1");
+    assert!(
+        first_text.contains("FREEZE_E2E_ORIGINAL_MARKER"),
+        "frozen original body must survive the file edit: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains("FREEZE_E2E_EDITED_MARKER"),
+        "edited body must NOT reach the spawned prompt: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("[Role Reminder: You are a FrozenTester. Original reminder.]"),
+        "frozen name + reminder must survive the file edit: {first_text:?}"
+    );
+}

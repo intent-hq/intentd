@@ -1511,7 +1511,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         boolean(
             "agentFeatures.stateSnapshot",
             "State snapshot",
-            "Inject the per-turn agent state snapshot line into turn prompts; applies to the next turn of every session (live)",
+            "Inject the per-turn agent state snapshot line into turn prompts; applies to new sessions only",
             "agentFeatures",
             true,
         ),

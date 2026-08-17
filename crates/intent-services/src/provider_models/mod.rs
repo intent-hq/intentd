@@ -125,8 +125,9 @@ pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the
 /// `session/new` result — `configOptions[id="model"].options` on current
 /// adapters (≥ 0.60), `models.availableModels` on older ones — or a
-/// `session/update` notification. The adapter's real `default` row is
-/// returned as-is.
+/// `session/update` notification. The adapter's `default` pseudo-row is
+/// resolved to the real model it stands for (marked `isDefault: true`) and
+/// dropped; an unresolvable pseudo-row is kept as-is.
 pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(

@@ -11,8 +11,11 @@
 //! * Turn 2: the prompt STARTS with the snapshot line (outermost recurring
 //!   decoration), whose single-line JSON parses and reports
 //!   `eventSubscriptions: 1`.
-//! * Toggle (live, same session): flip `agentFeatures.stateSnapshot` off via
-//!   `settings.update` — turn 3 on the SAME session has no snapshot line.
+//! * Toggle (session-bound): flip `agentFeatures.stateSnapshot` off via
+//!   `settings.update` — turn 3 on the SAME session STILL injects the line
+//!   (the toggle was captured ON in the session's harness feature snapshot
+//!   at creation), while an agent created AFTER the flip captures it OFF and
+//!   never injects, even once its own snapshot turns non-trivial.
 //! * The `ws.agent.snapshot()` MCP tool is never gated: called through the
 //!   agent's own bridge AFTER the flip it still returns
 //!   `{ time, eventSubscriptions: 1 }` with zero-count fields omitted.
@@ -520,8 +523,18 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
     await_stream_end(&mut sub, &agent).await;
 
-    // Live toggle: flip stateSnapshot off; turn 3 on the SAME session must
-    // drop the line (no new session involved).
+    // The first agent's bridge config, captured while it is the only one so
+    // the un-gated-tool probe below targets the right bridge.
+    let first_configs = mcp_config_files(&data_dir);
+    assert_eq!(
+        first_configs.len(),
+        1,
+        "one agent → one mcp config: {first_configs:?}"
+    );
+
+    // Session-bound toggle: flip stateSnapshot off. The EXISTING session
+    // captured the toggle ON in its harness feature snapshot at creation, so
+    // turn 3 on the SAME session must still inject the line.
     let upd = wss_rpc(
         &mut rpc,
         12,
@@ -544,11 +557,51 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     assert_eq!(sent3["result"]["success"], true, "sendMessage ok: {sent3}");
     await_stream_end(&mut sub, &agent).await;
 
+    // An agent created AFTER the flip captures stateSnapshot OFF: its turn 1
+    // registers a subscription (same marker rule), and its turn 2 — snapshot
+    // now non-trivial — must still carry no line.
+    let created2 = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Gated Agent", "model": "mock:default" }),
+    )
+    .await;
+    let agent2 = created2["result"]["agent"]["id"]
+        .as_str()
+        .expect("second agent id")
+        .to_string();
+    let sent4 = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent2,
+            "content": format!("gated first turn {SUBSCRIBE_MARKER}"),
+        }),
+    )
+    .await;
+    assert_eq!(sent4["result"]["success"], true, "sendMessage ok: {sent4}");
+    await_stream_end(&mut sub, &agent2).await;
+    let sent5 = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent2, "content": "gated second turn" }),
+    )
+    .await;
+    assert_eq!(sent5["result"]["success"], true, "sendMessage ok: {sent5}");
+    await_stream_end(&mut sub, &agent2).await;
+
     // ---- Prompt-log assertions ----
+    // Both mock children append to the same log; the first agent's three
+    // turns complete before the second agent is created, so the order is
+    // deterministic: agent-1 turns 1-3, then agent-2 turns 1-2.
     let log = read_prompt_log(&prompt_log);
     assert!(
-        log.len() >= 3,
-        "expected 3 logged prompts, got {}: {log:?}",
+        log.len() >= 5,
+        "expected 5 logged prompts, got {}: {log:?}",
         log.len()
     );
 
@@ -584,17 +637,53 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
         "user content after the snapshot line: {second:?}"
     );
 
-    // Turn 3 (toggle off, SAME session): no snapshot line.
+    // Turn 3 (toggle flipped off, SAME session): the line STILL leads the
+    // prompt — the session's captured snapshot, not the live setting, gates
+    // the injection.
     let (_, third) = &log[2];
+    let (snap3, rest3) = split_snapshot(third).unwrap_or_else(|| {
+        panic!("existing session must keep injecting after the flip: {third:?}")
+    });
+    assert_eq!(
+        snap3["eventSubscriptions"],
+        json!(1),
+        "subscription count on turn 3: {snap3}"
+    );
+    let rest3_tail = rest3
+        .split("\n\n[SYSTEM NOTE] This message was queued at")
+        .next()
+        .unwrap();
     assert!(
-        !third.contains(SNAPSHOT_PREFIX),
-        "toggle off must suppress the line on the very next turn: {third:?}"
+        rest3_tail.ends_with("third turn"),
+        "user content after the snapshot line: {third:?}"
+    );
+
+    // Agent-2 turn 1: trivial snapshot, no line (and captured OFF anyway).
+    let (_, fourth) = &log[3];
+    assert!(
+        !fourth.contains(SNAPSHOT_PREFIX),
+        "no line on the gated agent's first turn: {fourth:?}"
+    );
+    assert!(
+        fourth.contains("gated first turn"),
+        "log[3] is the gated agent's first turn: {fourth:?}"
+    );
+
+    // Agent-2 turn 2: snapshot now non-trivial (1 event subscription), but
+    // the session captured stateSnapshot OFF at creation → still no line.
+    let (_, fifth) = &log[4];
+    assert!(
+        !fifth.contains(SNAPSHOT_PREFIX),
+        "captured-off session must never inject: {fifth:?}"
+    );
+    assert!(
+        fifth.contains("gated second turn"),
+        "log[4] is the gated agent's second turn: {fifth:?}"
     );
 
     // ---- ws.agent.snapshot() tool stays un-gated after the flip ----
-    let configs = mcp_config_files(&data_dir);
-    assert_eq!(configs.len(), 1, "one agent → one mcp config: {configs:?}");
-    let addr = bridge_addr_from_config(&configs[0]);
+    // Probe the FIRST agent's bridge (captured before agent 2 existed)...
+    let addr = bridge_addr_from_config(&first_configs[0]);
     let mut bridge = BridgeClient::connect(&addr).await;
     let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
     assert!(!err, "ws.agent.snapshot must stay callable: {text}");
@@ -608,5 +697,30 @@ async fn state_snapshot_injection_toggle_and_tool_over_wss() {
     assert!(
         v.get("hooks").is_none(),
         "zero-count fields omitted from the tool result: {v}"
+    );
+
+    // ...and the SECOND (captured-off) agent's bridge: the tool is never
+    // gated by the toggle, only the prompt injection is.
+    let configs = mcp_config_files(&data_dir);
+    assert_eq!(
+        configs.len(),
+        2,
+        "two agents → two mcp configs: {configs:?}"
+    );
+    let second_config = configs
+        .iter()
+        .find(|p| !first_configs.contains(p))
+        .expect("second agent's mcp config");
+    let mut bridge2 = BridgeClient::connect(&bridge_addr_from_config(second_config)).await;
+    let (err2, text2) = bridge2.call_js("return await ws.agent.snapshot()").await;
+    assert!(
+        !err2,
+        "ws.agent.snapshot must stay callable on a captured-off session: {text2}"
+    );
+    let v2: Value = serde_json::from_str(&text2).expect("snapshot tool returns JSON");
+    assert_eq!(
+        v2["eventSubscriptions"],
+        json!(1),
+        "gated session's tool still reports its subscription: {v2}"
     );
 }

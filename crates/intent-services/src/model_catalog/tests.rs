@@ -527,6 +527,64 @@ fn cached_catalog_claims_none_without_usable_entry() {
 }
 
 #[test]
+fn cached_default_model_reads_is_default_row() {
+    let cache = ModelCatalogCache::new(None);
+    cache.store(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
+            json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
+                    "isDefault": true }),
+        ],
+        1_000,
+    );
+    assert_eq!(
+        cache.cached_default_model("auggie"),
+        Some("sonnet5".to_string())
+    );
+}
+
+#[test]
+fn cached_default_model_none_without_usable_entry() {
+    let cache = ModelCatalogCache::new(None);
+    // No entry at all → None.
+    assert_eq!(cache.cached_default_model("auggie"), None);
+    // Catalog without an isDefault row (including an explicit false) → None.
+    cache.store(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
+            json!({ "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
+                    "isDefault": false }),
+        ],
+        1_000,
+    );
+    assert_eq!(cache.cached_default_model("auggie"), None);
+    // Unregistered provider id → None.
+    cache.store(
+        "not-a-provider",
+        "",
+        vec![
+            json!({ "id": "m", "name": "M", "provider": "not-a-provider",
+                     "isDefault": true }),
+        ],
+        1_000,
+    );
+    assert_eq!(cache.cached_default_model("not-a-provider"), None);
+    // Version-key mismatch (stale pin) → the entry is not usable.
+    cache.store(
+        "codex",
+        "stale-pin",
+        vec![json!({ "id": "gpt-5", "name": "GPT-5", "provider": "codex",
+                     "isDefault": true })],
+        1_000,
+    );
+    assert_eq!(cache.cached_default_model("codex"), None);
+}
+
+#[test]
 fn providers_claiming_model_cached_walks_registry() {
     let cache = ModelCatalogCache::new(None);
     assert!(cache.providers_claiming_model_cached("fable-5").is_empty());

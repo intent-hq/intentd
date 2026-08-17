@@ -754,6 +754,215 @@ async fn abnormal_finish_reason_persists_on_transcript_over_wss() {
     );
 }
 
+/// intent-hq/monorepo#2669 over the real WSS wire: a turn that resolves a
+/// clean `end_turn` after a sustained stream-silence tail (the incident
+/// signature of a silently-truncated turn under session bloat) gets the
+/// advisory annotation — the terminal `agent:idle` carries `silentTailMs` +
+/// `suspectedTruncated: true`, `agent.diagnostics` reports the row's
+/// `lastTurnSilentTailMs` and raises the `long-silent-tail` stuck-risk — while
+/// a healthy quick turn carries none of it. Also asserts the field stays off
+/// the hot `agent.get` / `agent.list` payloads (diagnostics-only by design).
+/// The suspect threshold is lowered via `INTENTD_SILENT_TAIL_SUSPECT_MS` so
+/// the mock's parked tail crosses it without a minutes-long test.
+#[tokio::test]
+async fn silent_tail_annotation_and_diagnostics_over_wss() {
+    let Some(script) = gate("WSS silent-tail annotation E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The stalled prompt streams a chunk, then parks in total silence before
+    // resolving `end_turn`; the quick prompt resolves immediately. Margins
+    // are ~1 s of tolerance each way for saturated CI runners: the stalled
+    // side parks 1 s past the threshold, the quick side must merely resolve
+    // in under 2 s.
+    let behavior = json!({
+        "response": "stalled reply",
+        "silentTailBeforeResultMs": 3000,
+        "rules": [
+            { "ifPromptContains": "quick", "response": "quick reply" },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_SILENT_TAIL_SUSPECT_MS", "2000"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let stalled = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Stalled", "model": "mock:default" }),
+    )
+    .await;
+    let stalled_id = stalled["agent"]["id"]
+        .as_str()
+        .expect("stalled id")
+        .to_string();
+    let quick = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Quick", "model": "mock:default" }),
+    )
+    .await;
+    let quick_id = quick["agent"]["id"].as_str().expect("quick id").to_string();
+
+    // Drive the stalled turn: chunk → 1.5s silent tail → clean end_turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": stalled_id, "content": "go stall" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut stalled_idle: Option<Value> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == json!("agent:idle")
+            && event["data"]["agentId"].as_str() == Some(stalled_id.as_str())
+        {
+            stalled_idle = Some(event.clone());
+            break;
+        }
+    }
+    let idle = stalled_idle.expect("stalled agent:idle observed");
+    assert_eq!(
+        idle["data"]["finishReason"].as_str(),
+        Some("end_turn"),
+        "the truncation-suspect turn still completes normally: {idle}"
+    );
+    assert_eq!(
+        idle["data"]["suspectedTruncated"],
+        json!(true),
+        "agent:idle carries suspectedTruncated: {idle}"
+    );
+    let tail_ms = idle["data"]["silentTailMs"]
+        .as_u64()
+        .expect("agent:idle carries silentTailMs");
+    assert!(
+        tail_ms >= 2000,
+        "tail past the lowered threshold: {tail_ms}"
+    );
+
+    // Drive the healthy quick turn: no annotation on its idle.
+    let sent = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": quick_id, "content": "quick please" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut quick_idle: Option<Value> = None;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == json!("agent:idle")
+            && event["data"]["agentId"].as_str() == Some(quick_id.as_str())
+        {
+            quick_idle = Some(event.clone());
+            break;
+        }
+    }
+    let idle = quick_idle.expect("quick agent:idle observed");
+    assert!(
+        idle["data"].get("suspectedTruncated").is_none()
+            && idle["data"].get("silentTailMs").is_none(),
+        "healthy turn's idle omits the annotation (absent, never false): {idle}"
+    );
+
+    // Diagnostics: both rows carry lastTurnSilentTailMs; only the stalled
+    // agent raises the long-silent-tail stuck-risk.
+    let diag = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let agents = diag["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &str| {
+        agents
+            .iter()
+            .find(|a| a["id"].as_str() == Some(id))
+            .expect("agent row in diagnostics")
+    };
+    let stalled_tail = row_for(&stalled_id)["lastTurnSilentTailMs"]
+        .as_u64()
+        .expect("stalled row carries lastTurnSilentTailMs");
+    assert!(stalled_tail >= 2000, "stalled tail: {stalled_tail}");
+    let quick_tail = row_for(&quick_id)["lastTurnSilentTailMs"]
+        .as_u64()
+        .expect("quick row carries lastTurnSilentTailMs");
+    assert!(quick_tail < 2000, "quick tail stays short: {quick_tail}");
+    let risks = diag["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let long: Vec<&Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("long-silent-tail"))
+        .collect();
+    assert_eq!(
+        long.len(),
+        1,
+        "exactly one long-silent-tail risk: {risks:?}"
+    );
+    assert_eq!(long[0]["agentId"], json!(stalled_id), "risk: {:?}", long[0]);
+    assert_eq!(long[0]["silentTailMs"], json!(stalled_tail));
+    assert_eq!(long[0]["thresholdMs"], json!(2000));
+
+    // Diagnostics-only by design: the hot payloads never carry the field.
+    let got = wss_rpc(&mut rpc, 30, "agent.get", json!({ "agentId": stalled_id })).await;
+    assert!(
+        got["agent"].get("lastTurnSilentTailMs").is_none(),
+        "agent.get omits lastTurnSilentTailMs: {}",
+        got["agent"]
+    );
+    let list = wss_rpc(&mut rpc, 31, "agent.list", json!({ "workspaceId": ws_id })).await;
+    for row in list["agents"].as_array().expect("agents array") {
+        assert!(
+            row.get("lastTurnSilentTailMs").is_none(),
+            "agent.list omits lastTurnSilentTailMs: {row}"
+        );
+    }
+}
+
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
 /// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
 /// turn as

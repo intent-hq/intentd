@@ -1802,6 +1802,86 @@ async fn host_create_directory_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for host.listDirectory (§5.14): the listing envelope (`path` /
+/// `parent` / `home` / `entries`) plus the additive `favorites` field —
+/// `home` always present, standard dirs existence-checked on the daemon host
+/// (pinned via `HOME` on the spawned daemon), and XDG user-dirs overrides
+/// honored for relocated folders.
+#[tokio::test]
+async fn host_list_directory_over_wss() {
+    let data_dir = temp_data_dir();
+
+    // Pin the daemon-host home so the favorites assertions are exact:
+    // Desktop exists conventionally, Downloads is relocated via the XDG
+    // user-dirs config, Documents does not exist at all.
+    let home = data_dir.join("home");
+    std::fs::create_dir_all(home.join("Desktop")).expect("mkdir Desktop");
+    std::fs::create_dir_all(home.join("Fetched")).expect("mkdir Fetched");
+    std::fs::create_dir_all(home.join(".config")).expect("mkdir .config");
+    std::fs::write(
+        home.join(".config").join("user-dirs.dirs"),
+        "XDG_DOWNLOAD_DIR=\"$HOME/Fetched\"\n",
+    )
+    .expect("write user-dirs.dirs");
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", home.to_str().unwrap()),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Omitted `path` defaults to the daemon-host home (PROTOCOL §5.14).
+    let result = wss_rpc(&mut ws, 600, "host.listDirectory", json!({})).await;
+    assert_eq!(
+        result["path"],
+        json!(home.to_str().unwrap()),
+        "defaults to the daemon-host home: {result}"
+    );
+    assert_eq!(result["home"], json!(home.to_str().unwrap()));
+    let entries = result["entries"].as_array().expect("entries array");
+    assert!(
+        entries.iter().any(|e| e["name"] == "Desktop"),
+        "listing includes Desktop: {result}"
+    );
+
+    // Favorites: home always leads; desktop exists conventionally; downloads
+    // resolves through the XDG override; documents is absent (no such dir).
+    let desktop = home.join("Desktop");
+    let fetched = home.join("Fetched");
+    let favorites = result["favorites"].as_array().expect("favorites array");
+    let pairs: Vec<(&str, &str)> = favorites
+        .iter()
+        .map(|f| (f["id"].as_str().unwrap(), f["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("home", home.to_str().unwrap()),
+            ("desktop", desktop.to_str().unwrap()),
+            ("downloads", fetched.to_str().unwrap()),
+        ],
+        "favorites are existence-checked and XDG-resolved: {result}"
+    );
+
+    drop(daemon);
+}
+
 /// WSS e2e for discovery cache behavior (host.findBinary / host.toolAvailability
 /// / host.providerDiscovery): repeated calls within the TTL window reuse cached
 /// results instead of re-scanning PATH/filesystem. A binary installed between

@@ -32,6 +32,16 @@ const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 /// catching a wedged queue well before the incident's timescale.
 const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// Persisted-conversation size past which `agent.diagnostics` raises a
+/// `large-conversation` stuck-risk warning (intent-hq/monorepo#2669): in that
+/// incident, turns started silently dying (bare `end_turn` after an 11-13 min
+/// silent gap) once the conversation reached ~5.3-5.5 MB. 4 MiB is well past
+/// the transport's 1 MiB large-frame WARN while still comfortably before the
+/// observed failure sizes, so coordinators can rotate to a fresh agent BEFORE
+/// turns start dying. Diagnostics-only: the byte total never rides the hot
+/// `agent.list`/`agent.get` payloads.
+const LARGE_CONVERSATION_WARN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -161,6 +171,9 @@ mod tests_delegate_provider_resolution;
 #[cfg(test)]
 mod tests_settings_default_effort;
 
+#[cfg(test)]
+mod tests_catalog_default_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -221,7 +234,12 @@ pub(crate) enum DefaultModelSource {
     Specialist,
     /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
     Settings,
-    /// Step 4 — nothing resolved; the provider CLI default applies.
+    /// Step 4 — the cached provider catalog's `isDefault` row
+    /// ([`crate::model_catalog::ModelCatalogCache::cached_default_model`]).
+    /// Not a settings default: the settings default reasoning effort does
+    /// NOT apply to it.
+    CatalogDefault,
+    /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
 }
 
@@ -232,13 +250,17 @@ pub(crate) enum DefaultModelSource {
 /// by the caller. Also reusable standalone (e.g. `specialist.get/list`
 /// `resolvedModel`) so previews match what a no-model create actually pins.
 ///
-/// Precedence (steps 2–4; the former `modelTier` step is retired — the key
+/// Precedence (steps 2–5; the former `modelTier` step is retired — the key
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
 /// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
-/// 4. `None` → provider CLI default (`session.model` stays unset).
+/// 4. The **cached** provider catalog's `isDefault` row (PROTOCOL §5.30) —
+///    cache-only, never a probe: pinning it freezes the model even if the
+///    provider later changes its default. Cold cache or no marked row falls
+///    through.
+/// 5. `None` → provider CLI default (`session.model` stays unset).
 ///
 /// The chain is background-agnostic (monorepo#1729): the quick-action model
 /// settings apply to single-shot quick actions only, so a delegated
@@ -299,21 +321,33 @@ pub(crate) fn resolve_agent_default_model_with_source(
     }
 
     // Step 3: settings chain, provider-guarded — a configured default owned
-    // by another provider must not be pinned (monorepo#607); drop to the CLI
-    // default instead of rejecting a model the caller never sent.
-    let Some(m) = resolve_default_model_from_settings(services, provider) else {
-        return (None, DefaultModelSource::CliDefault);
-    };
-    if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return (Some(m), DefaultModelSource::Settings);
+    // by another provider must not be pinned (monorepo#607); drop to the
+    // catalog/CLI default instead of rejecting a model the caller never sent.
+    if let Some(m) = resolve_default_model_from_settings(services, provider) {
+        if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+            return (Some(m), DefaultModelSource::Settings);
+        }
+        tracing::warn!(
+            model = m,
+            provider = effective_provider,
+            "configured default model belongs to another provider; \
+             falling back to the catalog/CLI default"
+        );
     }
-    tracing::warn!(
-        model = m,
-        provider = effective_provider,
-        "configured default model belongs to another provider; \
-         falling back to the CLI default"
-    );
-    // Step 4: None → provider CLI default.
+
+    // Step 4: the cached catalog's `isDefault` row for the resolved provider
+    // (PROTOCOL §5.5). Cache-only — never a probe on the creation path; the
+    // row is the provider's own by construction, so no ownership guard is
+    // needed. Pinning it to session.model freezes the model for the
+    // session's lifetime even if the provider later changes its default.
+    if let Some(m) = services
+        .models_catalog
+        .cached_default_model(effective_provider)
+    {
+        return (Some(m), DefaultModelSource::CatalogDefault);
+    }
+
+    // Step 5: None → provider CLI default.
     (None, DefaultModelSource::CliDefault)
 }
 
@@ -2457,7 +2491,7 @@ impl Services {
             provider,
             reasoning_effort,
             agent_type: _,
-            metadata,
+            mut metadata,
             workspace_path: _, // Ignored; derived from workspace record for security
             workspace_context: _,
             context_references,
@@ -2513,8 +2547,9 @@ impl Services {
         // workspacePath and read specialist files from other workspaces.
         // Use worktree_path if available, otherwise repository_path. Read once
         // and only when a specialist tier is actually consulted (model
-        // resolution and/or the specialist reasoning-effort rungs below).
-        let spec_wp = match model.is_none() || (specialist.is_some() && !reasoning_effort_decided) {
+        // resolution, the specialist reasoning-effort rungs, and/or the
+        // specialist prompt snapshot below).
+        let spec_wp = match model.is_none() || specialist.is_some() {
             true => self
                 .store
                 .get_workspace(&workspace_id)
@@ -2653,6 +2688,53 @@ impl Services {
                 resolved_model.as_deref(),
             ),
         };
+        // Specialist prompt snapshot: freeze the resolved specialist injection
+        // for the session's lifetime by persisting it into the metadata JSON,
+        // so later edits/deletes of user/project-tier specialist files never
+        // change this agent on respawn. The resolved body reuses the
+        // `behaviorPrompt` override slot — written only when the caller
+        // supplied no explicit override (a caller override is left untouched
+        // and is itself the frozen body); the resolved identity lands in
+        // `specialistName` / `specialistRoleReminder`. The bundled floor
+        // consulted here is the latest bundle — the same doctrine the
+        // `harnessVersion` stamp below pins — so no H2 interplay changes.
+        // Unknown specialist / resolution failure writes no snapshot and
+        // never fails the create; a non-object caller `metadata` is left
+        // untouched.
+        if let Some(spec_id) = specialist.as_deref() {
+            if let Some((body, spec_name, reminder)) = self
+                .specialists_service()
+                .resolve_prompt_injection(spec_id, spec_wp.as_deref())
+            {
+                let meta_value =
+                    metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(obj) = meta_value.as_object_mut() {
+                    let has_override = obj
+                        .get("behaviorPrompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_override {
+                        if let Some(body) = body {
+                            obj.insert("behaviorPrompt".to_string(), json!(body));
+                        }
+                    }
+                    obj.insert("specialistName".to_string(), json!(spec_name));
+                    // The reminder key always reflects the resolution
+                    // outcome: a resolved reminder overwrites, a None
+                    // resolution REMOVES any caller-supplied key so the
+                    // frozen readers never consume free-form caller input
+                    // as a trusted reminder.
+                    match reminder {
+                        Some(reminder) => {
+                            obj.insert("specialistRoleReminder".to_string(), json!(reminder));
+                        }
+                        None => {
+                            obj.remove("specialistRoleReminder");
+                        }
+                    }
+                }
+            }
+        }
         // Harness stamp (intent-hq/monorepo#2459): every new session gets the
         // CURRENT harness version and a snapshot of the effective
         // agentFeatures values, captured once here and immutable for the
@@ -2982,6 +3064,10 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
+        // agent — drop it with the session so the map never leaks entries
+        // for deleted agents.
+        self.clear_turn_silent_tail(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
@@ -7497,18 +7583,20 @@ impl Services {
     }
 
     /// The per-turn snapshot injection line for `agent_id`, or `None` when
-    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off
-    /// (read LIVE each turn — a deliberate deviation from the
-    /// captured-at-creation agentFeatures convention, so flipping the toggle
-    /// affects the very next turn of every session), the snapshot is trivial
-    /// (every field other than `time` zero/absent — `time` alone never forces
-    /// an injection), or the snapshot could not be built (fails open to no
-    /// line so a store error never blocks a turn).
+    /// the injection is suppressed: `agentFeatures.stateSnapshot` is off in
+    /// the session's captured harness feature snapshot
+    /// ([`Services::session_agent_features`] — like every other toggle,
+    /// flipping the setting affects new sessions only; legacy NULL-snapshot
+    /// rows fall back to the live settings until their first-activation
+    /// freeze), the snapshot is trivial (every field other than `time`
+    /// zero/absent — `time` alone never forces an injection), or the
+    /// snapshot could not be built (fails open to no line so a store error
+    /// never blocks a turn).
     pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
-        if !self.effective_settings().agent_features.state_snapshot {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        if !self.session_agent_features(&session).state_snapshot {
             return None;
         }
-        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
         let snapshot = self.build_agent_snapshot(&session).await.ok()?;
         if snapshot.is_trivial() {
             return None;
@@ -7809,8 +7897,8 @@ impl Services {
                 .and_then(|s| agent_status_wire(s.status))
                 .unwrap_or("unknown");
             // Use lightweight message stats instead of full hydration
-            let (message_count_val, has_assistant) =
-                message_stats.get(id).copied().unwrap_or((0, false));
+            let (message_count_val, has_assistant, conversation_bytes) =
+                message_stats.get(id).copied().unwrap_or((0, false, 0));
             let message_count = if message_count_val > 0 {
                 Some(message_count_val)
             } else {
@@ -7847,6 +7935,13 @@ impl Services {
             if let Some(mc) = message_count {
                 row.insert("messageCount".into(), json!(mc));
             }
+            // Persisted-conversation size (intent-hq/monorepo#2669): session-
+            // size pressure signal so coordinators can rotate agents before
+            // turns start dying under context bloat. Omitted when zero (no
+            // messages), like `messageCount`.
+            if conversation_bytes > 0 {
+                row.insert("conversationBytes".into(), json!(conversation_bytes));
+            }
             row.insert("subscriptionCount".into(), json!(subscription_count));
             row.insert(
                 "eventSubscriptionCount".into(),
@@ -7875,6 +7970,15 @@ impl Services {
             }
             if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
                 row.insert("subtreeMemoryBytes".into(), json!(bytes));
+            }
+            // Silent tail of the most recently ended turn
+            // (intent-hq/monorepo#2669): ms of stream silence before the
+            // prompt resolved, recorded in-memory at turn end. Omitted when
+            // no turn ended this daemon lifetime. Diagnostics-only by design
+            // (like `subtreeMemoryBytes`): never on the hot
+            // `agent.list`/`agent.get` payloads.
+            if let Some(tail_ms) = self.last_turn_silent_tail(&AgentId(id.clone())) {
+                row.insert("lastTurnSilentTailMs".into(), json!(tail_ms));
             }
             agent_rows.push(Value::Object(row));
         }
@@ -7933,6 +8037,49 @@ impl Services {
                     risk.insert("ageMs".into(), json!(a));
                 }
                 stuck_risks.push(Value::Object(risk));
+            }
+            // Large persisted conversation (intent-hq/monorepo#2669): past
+            // [`LARGE_CONVERSATION_WARN_BYTES`] the session is at risk of
+            // silently-truncated turns — surface it so coordinators rotate to
+            // a fresh agent before turns start dying.
+            if let Some(bytes) = row["conversationBytes"].as_u64() {
+                if bytes > LARGE_CONVERSATION_WARN_BYTES {
+                    stuck_risks.push(json!({
+                        "type": "large-conversation",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid} has a large persisted conversation ({bytes} bytes > {LARGE_CONVERSATION_WARN_BYTES}); turns may start silently truncating under session bloat — consider rotating to a fresh agent"
+                        ),
+                        "agentId": aid,
+                        "conversationBytes": bytes,
+                        "thresholdBytes": LARGE_CONVERSATION_WARN_BYTES,
+                    }));
+                }
+            }
+            // Long silent tail on the last ended turn
+            // (intent-hq/monorepo#2669): the incident signature of a
+            // silently-truncated turn is a clean `end_turn` after 11-13 min
+            // of stream silence — surface a tail past the suspect threshold
+            // so coordinators see the turn likely died rather than finished.
+            // The tail is recorded for every resolution (completed,
+            // cancelled, or timed out — only invisible pre-output redrives
+            // are excluded), so the wording covers all of them: a deliberate
+            // interrupt aimed at a stalled agent legitimately lands here,
+            // and its follow-up turn overwrites the record anyway.
+            if let Some(tail_ms) = row["lastTurnSilentTailMs"].as_u64() {
+                let threshold_ms = crate::agent_session::silent_tail_suspect_ms();
+                if tail_ms >= threshold_ms {
+                    stuck_risks.push(json!({
+                        "type": "long-silent-tail",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid}'s last turn ended (completed, cancelled, or timed out) after {tail_ms}ms of stream silence (>= {threshold_ms}ms); if it completed, it may have been silently truncated under session bloat rather than finishing"
+                        ),
+                        "agentId": aid,
+                        "silentTailMs": tail_ms,
+                        "thresholdMs": threshold_ms,
+                    }));
+                }
             }
         }
         // Stale undelivered queue entries (intent-hq/monorepo#1897): a

@@ -328,9 +328,10 @@ async fn workspace_duplicate_of_direct_survives_original_deletion_over_wss() {
         json!("direct"),
         "source is a standalone direct workspace: {source}"
     );
-    assert!(
-        source["worktreePath"].is_null(),
-        "direct source works in the repository folder itself: {source}"
+    assert_eq!(
+        source["worktreePath"].as_str(),
+        source["repositoryPath"].as_str(),
+        "direct source works in the repository folder itself (worktreePath carries it, intent-hq/monorepo#2611): {source}"
     );
     let source_head = run_git(&["rev-parse", "HEAD"], &source_repo);
 

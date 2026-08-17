@@ -4175,6 +4175,240 @@ mod mcp_bridge_tests {
         }
     }
 
+    /// Dispatch watchdog (monorepo#2709): a dispatch wedged forever must
+    /// still produce an error response line within the watchdog deadline —
+    /// the deadline is enforced from a separate task, so it fires even when
+    /// the dispatch future is stuck inside a single synchronous poll. These
+    /// tests drive `serve_mcp_tcp_with_timeout` with a shortened deadline
+    /// and a mock whose `wedge` method never resolves.
+    mod watchdog {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use serde_json::{json, Value};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+        use tokio::net::TcpStream;
+        use tokio::time::timeout;
+
+        use crate::mcp_bridge::{
+            effective_dispatch_timeout, serve_mcp_tcp_with_timeout, BridgeDispatch, McpBridge,
+            BRIDGE_DISPATCH_TIMEOUT_CODE, BRIDGE_DISPATCH_TIMEOUT_MESSAGE,
+            DISPATCH_WATCHDOG_TIMEOUT, MAX_IN_FLIGHT_REQUESTS,
+        };
+
+        /// Generous relative to the per-line read budget below so a stalled
+        /// CI runner cannot invert response ordering into a flake.
+        const TEST_DEADLINE: Duration = Duration::from_millis(500);
+
+        /// Mock dispatch: `wedge` parks forever (request or notification);
+        /// any other request answers immediately; non-wedged notifications
+        /// are recorded and yield `None`. A drop-guard counts wedged futures
+        /// cancelled before completion, which is how the watchdog abort is
+        /// observed.
+        #[derive(Default)]
+        struct WedgeDispatch {
+            notifications: Mutex<Vec<String>>,
+            cancelled: Arc<AtomicUsize>,
+        }
+
+        struct AbortGuard(Arc<AtomicUsize>);
+
+        impl Drop for AbortGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl BridgeDispatch for WedgeDispatch {
+            fn dispatch(
+                self: Arc<Self>,
+                message: Value,
+            ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>> {
+                Box::pin(async move {
+                    let method = message["method"].as_str().unwrap_or_default().to_string();
+                    if method == "wedge" {
+                        let _guard = AbortGuard(self.cancelled.clone());
+                        std::future::pending::<()>().await;
+                        unreachable!("wedge dispatch never resolves");
+                    }
+                    let Some(id) = message.get("id") else {
+                        self.notifications.lock().unwrap().push(method);
+                        return None;
+                    };
+                    Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }))
+                })
+            }
+        }
+
+        async fn start() -> (
+            Arc<WedgeDispatch>,
+            McpBridge,
+            OwnedWriteHalf,
+            BufReader<OwnedReadHalf>,
+        ) {
+            let dispatch = Arc::new(WedgeDispatch::default());
+            let bridge = serve_mcp_tcp_with_timeout(dispatch.clone(), TEST_DEADLINE)
+                .await
+                .unwrap();
+            let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+            let (read, write) = stream.into_split();
+            (dispatch, bridge, write, BufReader::new(read))
+        }
+
+        async fn send(write: &mut OwnedWriteHalf, line: &str) {
+            write.write_all(line.as_bytes()).await.unwrap();
+            write.write_all(b"\n").await.unwrap();
+            write.flush().await.unwrap();
+        }
+
+        async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> Value {
+            let mut buf = String::new();
+            timeout(Duration::from_secs(2), reader.read_line(&mut buf))
+                .await
+                .expect("read_line timed out")
+                .expect("read_line ok");
+            serde_json::from_str(buf.trim()).expect("response line must be whole JSON")
+        }
+
+        async fn wait_cancelled(dispatch: &WedgeDispatch, n: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while dispatch.cancelled.load(Ordering::SeqCst) < n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "wedged dispatch task not aborted by the watchdog"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn wedged_request_gets_timeout_error_and_concurrent_fast_request_succeeds() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            send(&mut write, r#"{"jsonrpc":"2.0","id":1,"method":"wedge"}"#).await;
+            send(&mut write, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#).await;
+            // Collect both responses id-keyed rather than asserting arrival
+            // order (CI-scheduler tolerant). The wedged dispatch parks
+            // forever, so the fast response arriving at all — within the
+            // read budget — already proves it did not queue behind it.
+            let mut by_id = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let response = read_response(&mut reader).await;
+                by_id.insert(response["id"].as_i64().unwrap(), response);
+            }
+            assert_eq!(by_id[&2]["result"]["ok"], json!(true));
+            let timed_out = &by_id[&1];
+            assert_eq!(
+                timed_out["error"]["code"],
+                json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
+            );
+            assert_eq!(
+                timed_out["error"]["message"],
+                json!(BRIDGE_DISPATCH_TIMEOUT_MESSAGE)
+            );
+            assert_eq!(timed_out["error"]["data"]["retryable"], json!(false));
+            wait_cancelled(&dispatch, 1).await;
+            // The connection keeps serving after the watchdog fired.
+            send(&mut write, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).await;
+            let third = read_response(&mut reader).await;
+            assert_eq!(third["id"], json!(3));
+        }
+
+        /// `id: null` marks a request (matching `handle_message` and the
+        /// stdio proxy's `request_id`), so a wedged null-id request gets a
+        /// synthesized error line carrying `id: null`.
+        #[tokio::test]
+        async fn wedged_null_id_request_gets_timeout_error_with_null_id() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            send(
+                &mut write,
+                r#"{"jsonrpc":"2.0","id":null,"method":"wedge"}"#,
+            )
+            .await;
+            let response = read_response(&mut reader).await;
+            assert!(response["id"].is_null());
+            assert_eq!(
+                response["error"]["code"],
+                json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
+            );
+            wait_cancelled(&dispatch, 1).await;
+        }
+
+        /// Saturation: with every in-flight permit held by wedged requests,
+        /// the watchdog path must release the permits — the one queued
+        /// request behind the full semaphore can only be answered if it does.
+        #[tokio::test]
+        async fn watchdog_releases_semaphore_permits_at_saturation() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            for i in 0..MAX_IN_FLIGHT_REQUESTS {
+                send(
+                    &mut write,
+                    &format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"wedge"}}"#),
+                )
+                .await;
+            }
+            send(&mut write, r#"{"jsonrpc":"2.0","id":100,"method":"ping"}"#).await;
+            let mut timeout_errors = 0;
+            let mut ping_ok = false;
+            for _ in 0..=MAX_IN_FLIGHT_REQUESTS {
+                let response = read_response(&mut reader).await;
+                if response["id"] == json!(100) {
+                    assert_eq!(response["result"]["ok"], json!(true));
+                    ping_ok = true;
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
+                    );
+                    timeout_errors += 1;
+                }
+            }
+            assert!(ping_ok, "queued request must run once a permit frees");
+            assert_eq!(timeout_errors, MAX_IN_FLIGHT_REQUESTS);
+            wait_cancelled(&dispatch, MAX_IN_FLIGHT_REQUESTS).await;
+        }
+
+        /// The production deadline keeps clear of a raised eval budget: the
+        /// 120s floor holds for the 30s default, and an
+        /// `INTENTD_WORKSPACE_API_TIMEOUT_MS` override past half the floor
+        /// scales the deadline to twice the budget.
+        #[test]
+        fn effective_dispatch_timeout_floors_and_scales() {
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(30)),
+                DISPATCH_WATCHDOG_TIMEOUT
+            );
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(60)),
+                DISPATCH_WATCHDOG_TIMEOUT
+            );
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(90)),
+                Duration::from_secs(180)
+            );
+        }
+
+        #[tokio::test]
+        async fn wedged_notification_is_aborted_without_a_response_line() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            send(&mut write, r#"{"jsonrpc":"2.0","method":"wedge"}"#).await;
+            // Wait for the watchdog to abort the wedged notification, then
+            // prove no error line was synthesized for it: the next response
+            // on the wire belongs to the ping sent afterwards.
+            wait_cancelled(&dispatch, 1).await;
+            send(&mut write, r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#).await;
+            let response = read_response(&mut reader).await;
+            assert_eq!(
+                response["id"],
+                json!(7),
+                "a wedged notification must not synthesize a response line"
+            );
+        }
+    }
+
     /// Stdio-bridge resilience (monorepo#871, monorepo#908): initial-connect
     /// retry with stdin buffering, mid-session reconnect, and synthesized
     /// errors while disconnected mid-session — retryable for ids never

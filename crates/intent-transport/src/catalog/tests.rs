@@ -1,7 +1,7 @@
 //! Golden freeze tests for the v2.0 protocol catalog.
 //!
 //! These tests enforce that any surface drift (added/removed/renamed methods)
-//! fails CI with a clear "update the catalog + PROTOCOL.md + bump protocol
+//! fails CI with a clear "update the catalog + docs/protocol/ + bump protocol
 //! version" message.
 //!
 //! Router and fast-path methods are mechanically extracted from source at test
@@ -119,7 +119,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// This constant must match the sum below. If it doesn't, you've added or
 /// removed methods without updating the catalog. The catalog freeze is
 /// intentional: any surface change requires a protocol version bump and a
-/// PROTOCOL.md update.
+/// docs/protocol/ update.
 const EXPECTED_TOTAL_METHODS: usize = 336;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
@@ -159,7 +159,7 @@ fn router_methods_match_actual_source() {
     if !missing.is_empty() || !extra.is_empty() {
         let mut msg = String::from(
             "Router method drift detected!\n\
-             Update ROUTER_METHODS in catalog.rs, update PROTOCOL.md v2.0, and bump the protocol version.\n"
+             Update ROUTER_METHODS in catalog.rs, update docs/protocol/05-method-catalog.md, and bump the protocol version.\n"
         );
 
         if !missing.is_empty() {
@@ -204,7 +204,7 @@ fn fastpath_methods_match_actual_source() {
     if !missing.is_empty() || !extra.is_empty() {
         let mut msg = String::from(
             "Fast-path method drift detected!\n\
-             Update FASTPATH_METHODS in catalog.rs, update PROTOCOL.md v2.0, and bump the protocol version.\n"
+             Update FASTPATH_METHODS in catalog.rs, update docs/protocol/05-method-catalog.md, and bump the protocol version.\n"
         );
 
         if !missing.is_empty() {
@@ -242,7 +242,7 @@ fn catalog_counts_frozen() {
         router_count, EXPECTED_ROUTER_METHODS,
         "Router method count drift detected: expected {}, got {}. \
          If you added/removed router methods, update ROUTER_METHODS in catalog.rs, \
-         bump EXPECTED_ROUTER_METHODS, update PROTOCOL.md v2.0, and bump the protocol version.",
+         bump EXPECTED_ROUTER_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_ROUTER_METHODS, router_count
     );
 
@@ -250,7 +250,7 @@ fn catalog_counts_frozen() {
         fastpath_count, EXPECTED_FASTPATH_METHODS,
         "Fast-path method count drift detected: expected {}, got {}. \
          If you added/removed fast-path methods, update FASTPATH_METHODS in catalog.rs, \
-         bump EXPECTED_FASTPATH_METHODS, update PROTOCOL.md v2.0, and bump the protocol version.",
+         bump EXPECTED_FASTPATH_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_FASTPATH_METHODS, fastpath_count
     );
 
@@ -258,14 +258,14 @@ fn catalog_counts_frozen() {
         alias_count, EXPECTED_ALIASES,
         "Alias count drift detected: expected {}, got {}. \
          If you added/removed aliases, update METHOD_ALIASES in catalog.rs, \
-         bump EXPECTED_ALIASES, update PROTOCOL.md v2.0, and bump the protocol version.",
+         bump EXPECTED_ALIASES, update docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_ALIASES, alias_count
     );
 
     assert_eq!(
         total, EXPECTED_TOTAL_METHODS,
         "Total method count drift detected: expected {}, got {} ({} router + {} fastpath + {} aliases). \
-         Update the catalog, PROTOCOL.md v2.0, and bump the protocol version.",
+         Update the catalog, docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_TOTAL_METHODS, total, router_count, fastpath_count, alias_count
     );
 
@@ -273,7 +273,7 @@ fn catalog_counts_frozen() {
     assert_eq!(
         notification_count, EXPECTED_NOTIFICATIONS,
         "Notification count drift detected: expected {}, got {}. \
-         Update NOTIFICATIONS in catalog.rs, PROTOCOL.md v2.0, and bump the protocol version.",
+         Update NOTIFICATIONS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_NOTIFICATIONS, notification_count
     );
 
@@ -281,7 +281,7 @@ fn catalog_counts_frozen() {
     assert_eq!(
         reverse_count, EXPECTED_REVERSE_METHODS,
         "Reverse RPC count drift detected: expected {}, got {}. \
-         Update REVERSE_METHODS in catalog.rs, PROTOCOL.md v2.0, and bump the protocol version.",
+         Update REVERSE_METHODS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version.",
         EXPECTED_REVERSE_METHODS, reverse_count
     );
 }

@@ -448,7 +448,7 @@ async fn send_message_into_archived_workspace_auto_unarchives_over_wss() {
                 },
             }
         }),
-        "auto-unarchive delta shape per PROTOCOL.md §6.5"
+        "auto-unarchive delta shape per docs/protocol/06-events.md §6.5"
     );
 
     // The turn ran to a NORMAL completion (no stopReason): the unarchive

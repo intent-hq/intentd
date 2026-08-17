@@ -6,7 +6,7 @@
 //! ACP provider, `blockUntilCancel`) → `workspace.archive` → asserts:
 //! - the §5.1 archive response (refreshed record: `archived: true`,
 //!   `status: "Archived"`, `archivedAt` set),
-//! - the `workspace:updated` archive delta shape per docs/PROTOCOL.md §6.5
+//! - the `workspace:updated` archive delta shape per docs/protocol/06-events.md §6.5
 //!   (`changes: { archived: true, status: "Archived", archivedAt: <ts> }`),
 //! - the terminal `agent:stream:end` carrying `stopReason: "interrupted"`
 //!   over `events.subscribe` (the turn was stopped, not completed),
@@ -484,7 +484,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
                 "archivedAt": archived_at,
             }
         }),
-        "archive delta shape per PROTOCOL.md §6.5"
+        "archive delta shape per docs/protocol/06-events.md §6.5"
     );
 
     let interrupt_end = interrupt_end.expect("archive interrupted the in-flight turn");
@@ -500,7 +500,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
 
     // The STAB-28 interrupt-path idle fires AFTER the archive persisted
     // `Archived`, so it carries the additive `workspaceArchived: true`
-    // suppression hint per PROTOCOL.md §6.5 (notification clients stay
+    // suppression hint per docs/protocol/06-events.md §6.5 (notification clients stay
     // quiet for parked workspaces without a follow-up workspace.get).
     let interrupt_idle = interrupt_idle.expect("archive interrupt emitted agent:idle");
     assert_eq!(
@@ -577,7 +577,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
                 "archivedAt": null,
             }
         }),
-        "unarchive delta shape per PROTOCOL.md §6.5"
+        "unarchive delta shape per docs/protocol/06-events.md §6.5"
     );
 
     // Keep-alive across the archive: the follow-up resumes the SAME provider
@@ -629,7 +629,7 @@ async fn archive_interrupts_in_flight_agent_and_preserves_session_over_wss() {
 
     // The resumed turn's settlement idle fires in the now-Active workspace:
     // `workspaceArchived` is OMITTED (absent, never `false`) per the
-    // additive-field convention in PROTOCOL.md §6.5.
+    // additive-field convention in docs/protocol/06-events.md §6.5.
     let mut resume_idle = None;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;

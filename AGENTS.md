@@ -47,7 +47,7 @@ only on `intent-services`, never on `intent-store`.
 
 | Working on…                  | Open                                                         |
 | ---------------------------- | ------------------------------------------------------------ |
-| wire protocol / envelopes    | `../../docs/PROTOCOL.md`                                     |
+| wire protocol / envelopes    | `../../docs/protocol/`                                     |
 | architecture / crate map     | `../../docs/ARCHITECTURE.md`                                 |
 | UDS JSON-RPC router          | `crates/intent-transport/`                                   |
 | WSS / TLS                    | `crates/intent-transport/` (WSS listener, fingerprint)      |
@@ -124,7 +124,7 @@ client depends on, and only an e2e test exercises it.
     origin allow-list, fingerprint pinning all in play).
   - Sends the JSON-RPC **request** envelope for each new method.
   - Asserts the **response** envelope shape — `id`, `jsonrpc`, `result` / `error` —
-    matches what `../../docs/PROTOCOL.md` defines for that method, byte-for-byte.
+    matches what `../../docs/protocol/` defines for that method, byte-for-byte.
   - For methods that emit events, subscribes via `events.subscribe`, drives the action,
     and asserts the resulting `events.event` notifications.
 - Crate-level unit tests for non-trivial logic stay alongside the implementation; the WSS
@@ -154,22 +154,22 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   tests assert exact request/response shapes without external dependencies. There is also
   a mock MCP server fixture next to it (`mock-mcp-server.mjs`) for MCP-touching tests.
 - **UDS integration tests** — `uds_*.rs` files exercise the same router over UDS. The
-  envelope and method catalog are identical across UDS and WSS (per PROTOCOL.md §1), so
+  envelope and method catalog are identical across UDS and WSS (per docs/protocol/01-transport.md §1), so
   the UDS suites are a useful reference for shaping new tests, but they do **not** replace
   the WSS e2e requirement; the WSS path has its own concerns (TLS upgrade, bearer auth,
   origin allow-list, fingerprint pinning, heartbeat) that only the WSS harness covers.
 
 ### Asserting the protocol contract
 
-`../../docs/PROTOCOL.md` in the monorepo is the single source of truth for the wire
+`../../docs/protocol/` in the monorepo is the single source of truth for the wire
 contract. When adding or changing a method, the WSS e2e is what proves the daemon meets
 that contract:
 
-- Assert the request shape the client sends matches PROTOCOL.md §5 for that method.
+- Assert the request shape the client sends matches the method's subsection file under docs/protocol/methods/ (§5.x).
 - Assert the success response carries the documented `result` payload (field names,
   optional vs required, nested envelope shapes).
-- Assert error responses use the codes from PROTOCOL.md §9, not ad-hoc strings.
-- For event-emitting methods, assert the `events.event` payload shape from PROTOCOL.md §6.
+- Assert error responses use the codes from docs/protocol/09-error-codes.md §9, not ad-hoc strings.
+- For event-emitting methods, assert the `events.event` payload shape from docs/protocol/06-events.md §6.
 
 ## Gates — keep them green
 

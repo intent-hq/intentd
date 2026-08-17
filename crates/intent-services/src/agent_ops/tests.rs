@@ -8240,6 +8240,92 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `conversationBytes` (total persisted conversation size, omitted at zero),
+/// and a conversation past `LARGE_CONVERSATION_WARN_BYTES` raises a
+/// `large-conversation` stuck-risk warning naming the agent and sizes.
+/// Diagnostics-only: the byte total never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
+    let (_t, svc, ws) = setup().await;
+    let small = create_agent(&svc, &ws, "Small").await;
+    let bloated = create_agent(&svc, &ws, "Bloated").await;
+    let empty = create_agent(&svc, &ws, "Empty").await;
+
+    svc.store()
+        .append_agent_message(
+            &small,
+            "assistant",
+            &json!([{ "type": "text", "text": "short reply" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append small");
+    // Push the bloated agent past the 4 MiB threshold with a few large rows.
+    let big_text = "x".repeat(1024 * 1024);
+    for _ in 0..5 {
+        svc.store()
+            .append_agent_message(
+                &bloated,
+                "assistant",
+                &json!([{ "type": "text", "text": big_text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append bloated");
+    }
+
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    let small_bytes = row_for(&small)["conversationBytes"]
+        .as_u64()
+        .expect("small conversationBytes");
+    assert!(small_bytes > 0 && small_bytes < super::LARGE_CONVERSATION_WARN_BYTES);
+    let bloated_bytes = row_for(&bloated)["conversationBytes"]
+        .as_u64()
+        .expect("bloated conversationBytes");
+    assert!(
+        bloated_bytes > super::LARGE_CONVERSATION_WARN_BYTES,
+        "bytes: {bloated_bytes}"
+    );
+    assert!(
+        row_for(&empty).get("conversationBytes").is_none(),
+        "zero-message agent omits the field"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let large: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("large-conversation"))
+        .collect();
+    assert_eq!(large.len(), 1, "risks: {risks:?}");
+    assert_eq!(large[0]["agentId"], json!(bloated.0));
+    assert_eq!(large[0]["severity"], json!("warning"));
+    assert_eq!(large[0]["conversationBytes"], json!(bloated_bytes));
+    assert_eq!(
+        large[0]["thresholdBytes"],
+        json!(super::LARGE_CONVERSATION_WARN_BYTES)
+    );
+    assert!(
+        large[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("rotating to a fresh agent"),
+        "message: {}",
+        large[0]["message"]
+    );
+}
+
 /// monorepo#2063 A2: `agent.diagnostics` agent rows carry `subtreeMemoryBytes`
 /// from the runtime manager's tree probe — present only for agents the probe
 /// attributed bytes to, omitted otherwise (no bucket, no probe, or no manager
@@ -8304,6 +8390,106 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     assert!(
         row_for(&unsampled).get("subtreeMemoryBytes").is_none(),
         "no bucket for this agent, field omitted"
+    );
+}
+
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `lastTurnSilentTailMs` (the last ended turn's stream-silence tail,
+/// recorded in-memory at turn end; omitted when no turn ended this daemon
+/// lifetime), and a tail at/past the suspect threshold raises a
+/// `long-silent-tail` stuck-risk warning naming the agent, the tail, and the
+/// threshold. Diagnostics-only: the field never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
+    let (_t, svc, ws) = setup().await;
+    let quick = create_agent(&svc, &ws, "Quick").await;
+    let stalled = create_agent(&svc, &ws, "Stalled").await;
+    let fresh = create_agent(&svc, &ws, "Fresh").await;
+
+    let threshold = crate::agent_session::silent_tail_suspect_ms();
+    svc.record_turn_silent_tail(&quick, 1_200);
+    svc.record_turn_silent_tail(&stalled, threshold + 60_000);
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    assert_eq!(row_for(&quick)["lastTurnSilentTailMs"], json!(1_200));
+    assert_eq!(
+        row_for(&stalled)["lastTurnSilentTailMs"],
+        json!(threshold + 60_000)
+    );
+    assert!(
+        row_for(&fresh).get("lastTurnSilentTailMs").is_none(),
+        "no ended turn, field omitted"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let long: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("long-silent-tail"))
+        .collect();
+    assert_eq!(long.len(), 1, "risks: {risks:?}");
+    assert_eq!(long[0]["agentId"], json!(stalled.0));
+    assert_eq!(long[0]["severity"], json!("warning"));
+    assert_eq!(long[0]["silentTailMs"], json!(threshold + 60_000));
+    assert_eq!(long[0]["thresholdMs"], json!(threshold));
+    assert!(
+        long[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("silently truncated"),
+        "message: {}",
+        long[0]["message"]
+    );
+
+    // A later turn's record replaces the previous one — a healthy follow-up
+    // turn clears the risk.
+    svc.record_turn_silent_tail(&stalled, 800);
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics after healthy turn");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let stalled_row = rows
+        .iter()
+        .find(|r| r["id"].as_str() == Some(stalled.0.as_str()))
+        .expect("agent row");
+    assert_eq!(stalled_row["lastTurnSilentTailMs"], json!(800));
+    assert!(
+        result["diagnostics"]["stuckRisks"]
+            .as_array()
+            .expect("stuckRisks")
+            .iter()
+            .all(|r| r["type"] != json!("long-silent-tail")),
+        "healthy turn clears the risk: {result}"
+    );
+
+    // Diagnostics-only: the hot list payloads never carry the field.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    let listed = serde_json::to_value(&agents).expect("serialize");
+    for row in listed.as_array().expect("agents array") {
+        assert!(
+            row.get("lastTurnSilentTailMs").is_none(),
+            "agent.list omits lastTurnSilentTailMs: {row}"
+        );
+    }
+
+    // Agent delete drops the in-memory record.
+    svc.agent_delete_op(quick.clone(), Some(ws.clone()))
+        .await
+        .expect("delete");
+    assert!(
+        svc.last_turn_silent_tail(&quick).is_none(),
+        "delete clears the silent-tail record"
     );
 }
 
@@ -24324,6 +24510,53 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     let parsed: serde_json::Value = serde_json::from_str(json_part).expect("valid JSON");
     assert_eq!(parsed["queuedMessages"], json!(2));
     assert_eq!(parsed["pendingAttention"], json!("blocker"));
+}
+
+/// Regression (snapshot gating): the injection line follows the session's
+/// captured harness feature snapshot, not the live setting — flipping
+/// `agentFeatures.stateSnapshot` after creation never changes an existing
+/// session's injection, while a session created after the flip captures the
+/// new value. The `ws.agent.snapshot()` op itself stays un-gated.
+#[tokio::test]
+async fn agent_snapshot_line_gated_by_session_snapshot_not_live_setting() {
+    let (_t, svc, ws, registry, _cfg) = setup_with_task_graph(false).await;
+    let before = create_agent(&svc, &ws, "Before").await;
+    svc.enqueue_message(&before, "pending".into(), None, None, None, None, false);
+    assert!(
+        svc.agent_state_snapshot_line(&before).await.is_some(),
+        "stamped-on session injects"
+    );
+
+    registry
+        .apply(&[("agentFeatures.stateSnapshot".into(), json!(false))])
+        .expect("flip off");
+    assert!(
+        svc.agent_state_snapshot_line(&before).await.is_some(),
+        "a live flip must not change an existing session's injection"
+    );
+
+    let after = create_agent(&svc, &ws, "After").await;
+    svc.enqueue_message(&after, "pending".into(), None, None, None, None, false);
+    assert_eq!(
+        svc.agent_state_snapshot_line(&after).await,
+        None,
+        "session created after the flip captures stateSnapshot off"
+    );
+    // The MCP snapshot op is never gated by the toggle.
+    let v = svc
+        .agent_snapshot_op(ws.clone(), after.clone())
+        .await
+        .expect("snapshot op un-gated");
+    assert_eq!(v["queuedMessages"], json!(1));
+
+    registry
+        .apply(&[("agentFeatures.stateSnapshot".into(), json!(true))])
+        .expect("flip back on");
+    assert_eq!(
+        svc.agent_state_snapshot_line(&after).await,
+        None,
+        "captured-off session stays gated after the setting flips back on"
+    );
 }
 
 /// A settled (terminal) child no longer counts toward `runningSubAgents`.

@@ -17,6 +17,7 @@
 //! high-volume noise that no read path queries back out of the log.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use intent_core::{ActorType, Error, Event, Result};
 use intent_store::{NewEvent, Store};
@@ -30,7 +31,13 @@ use super::filter::{event_matches, SubscriptionFilter};
 /// Capacity of the broadcast channel that fans published events out to every
 /// subscriber's delivery task. Slow subscribers that fall this far behind are
 /// signalled via `Lagged` and skip the dropped events (they remain in the log).
-const BROADCAST_CAPACITY: usize = 1024;
+pub(crate) const BROADCAST_CAPACITY: usize = 1024;
+
+/// Minimum interval between broadcast-lag WARNs per subscriber. Lag reports
+/// arrive once per `recv()` that fell behind, so a sustained burst would spam
+/// the log without this throttle; skipped counts accumulate across suppressed
+/// reports and ride the next allowed WARN.
+pub(crate) const LAG_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Capacity of each subscriber's outbound batch queue.
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
@@ -46,6 +53,21 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 
 /// Max events drained per batch by the writer task (to bound transaction size).
 const WRITER_BATCH_SIZE: usize = 64;
+
+/// Total attempts for a batch insert that fails transiently (write-pool
+/// acquire timeout / SQLITE_BUSY under contention — the write pool has
+/// `max_connections=1`, so bursts serialize at `pool.acquire()`). Because the
+/// bus is append-then-broadcast, a failed batch is lost for live subscribers
+/// too (monorepo#2673), so transient contention is worth a couple of retries
+/// before declaring the batch dead. Permanent failures (constraint
+/// violations, serialization errors) never retry.
+pub(crate) const INSERT_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff between insert retry attempts; attempt N sleeps N times this
+/// (25ms, then 50ms). Short on purpose: the contention observed in practice
+/// clears in tens of milliseconds, and while retrying the writer task is not
+/// draining its channel, so publishers feel backpressure sooner.
+const INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Byte cap on the persisted `data_json` of `agent:tool:call` events. Payloads
 /// at or under the cap persist verbatim; larger ones have their free-form
@@ -66,7 +88,7 @@ const TOOL_CALL_FIELD_PREVIEW_BYTES: usize = 2 * 1024;
 
 /// Request sent to the writer task: the event to persist and a oneshot to
 /// return the result (or error).
-type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
+pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 
 /// In-process broadcast bus layered over the durable event [`Store`]. Cheap to
 /// clone (the store handle, broadcast sender, and writer channel are all shared).
@@ -185,18 +207,55 @@ impl Drop for EventBus {
     }
 }
 
+/// One item yielded by [`Subscription::recv_delivery`]: a batch of matched
+/// events, or an in-band lag marker sitting exactly at the gap position in the
+/// delivery order — everything queued before it was received before the drop,
+/// everything after it was published after. The marker is conservative: the
+/// filter is applied AFTER the broadcast receive, so the dropped events MAY or
+/// may not have matched this subscription's filter.
+#[derive(Debug)]
+pub enum Delivery {
+    /// A batch of matched events (single-element when `batch_window` is `None`).
+    Batch(Vec<Event>),
+    /// The subscriber fell behind and the broadcast ring dropped `n` events
+    /// before delivery (slow consumer). Persisted events remain in the log;
+    /// transient events are lost. Consumers that need convergence (the chat
+    /// forwarder) recover with a bounded re-read; [`Subscription::recv`]
+    /// consumers see no marker (skipped transparently).
+    Lagged(u64),
+}
+
 /// A live subscription. Yields filtered (and optionally batched) events via
 /// [`Subscription::recv`]; dropping it aborts the backing delivery task.
 pub struct Subscription {
-    rx: mpsc::Receiver<Vec<Event>>,
+    rx: mpsc::Receiver<Delivery>,
     handle: JoinHandle<()>,
 }
 
 impl Subscription {
     /// Await the next batch of matched events. Returns `None` once the bus is
-    /// dropped and all buffered batches have been drained.
+    /// dropped and all buffered batches have been drained. Lag markers are
+    /// skipped transparently — consumers that must react to upstream loss
+    /// (the chat forwarder) use [`Subscription::recv_delivery`] instead.
     pub async fn recv(&mut self) -> Option<Vec<Event>> {
+        loop {
+            match self.rx.recv().await? {
+                Delivery::Batch(batch) => return Some(batch),
+                Delivery::Lagged(_) => continue,
+            }
+        }
+    }
+
+    /// Await the next [`Delivery`] — a batch OR an in-band lag marker.
+    /// Returns `None` once the bus is dropped and the queue is drained.
+    pub async fn recv_delivery(&mut self) -> Option<Delivery> {
         self.rx.recv().await
+    }
+
+    /// Non-blocking [`Subscription::recv_delivery`]: the next queued delivery,
+    /// or `None` when the queue is currently empty (or closed and drained).
+    pub fn try_recv_delivery(&mut self) -> Option<Delivery> {
+        self.rx.try_recv().ok()
     }
 }
 
@@ -265,7 +324,58 @@ async fn flush_batch(
         .iter()
         .map(|(ev, _)| truncate_tool_call_for_persist(ev).unwrap_or_else(|| ev.clone()))
         .collect();
-    let result = store.insert_events(&events).await;
+    flush_prepared(|| store.insert_events(&events), pending, broadcast_tx).await;
+}
+
+/// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
+/// insert operation so tests can inject failures (monorepo#2673).
+///
+/// Transient insert failures ([`is_transient_insert_error`]) retry up to
+/// [`INSERT_RETRY_MAX_ATTEMPTS`] total attempts with a short linear backoff
+/// ([`INSERT_RETRY_BACKOFF`]); permanent failures fail immediately. On final
+/// failure the batch is dropped for live subscribers too (append-then-
+/// broadcast: no durable append → no broadcast), so the drop is logged at
+/// error level with the event count and types before the publishers'
+/// oneshots resolve with the error.
+///
+/// Worst-case stall: the backoff sleeps are small, but each attempt can
+/// itself block for the write pool's acquire timeout (10s) or SQLite's
+/// `busy_timeout` (5s) on `BEGIN IMMEDIATE`, so a hard stall costs up to
+/// roughly 3× today's single-attempt bound per batch before the drop —
+/// accepted for monorepo#2673, where observed contention clears in tens of
+/// milliseconds.
+///
+/// Retrying a batch insert cannot duplicate events: event ids are minted
+/// INSIDE `insert_events` per call, and its rollback guard unwinds failed
+/// attempts, so each retry is a fresh, self-contained transaction. If id
+/// minting is ever hoisted out of `insert_events` (e.g. into the bus), a
+/// retry after an ambiguous commit failure could double-insert — revisit
+/// this retry loop then.
+pub(crate) async fn flush_prepared<F, Fut>(
+    mut insert: F,
+    pending: &mut Vec<WriterRequest>,
+    broadcast_tx: &broadcast::Sender<Arc<Event>>,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>>>,
+{
+    let mut attempt = 1u32;
+    let result = loop {
+        match insert().await {
+            Ok(stored) => break Ok(stored),
+            Err(e) if attempt < INSERT_RETRY_MAX_ATTEMPTS && is_transient_insert_error(&e) => {
+                tracing::warn!(
+                    attempt,
+                    events = pending.len(),
+                    error = %e,
+                    "transient event batch insert failure; retrying"
+                );
+                tokio::time::sleep(INSERT_RETRY_BACKOFF * attempt).await;
+                attempt += 1;
+            }
+            Err(e) => break Err(e),
+        }
+    };
 
     match result {
         Ok(stored) => {
@@ -280,6 +390,21 @@ async fn flush_batch(
             }
         }
         Err(e) => {
+            // The batch is lost both durably and live: publishers get the
+            // error, but subscribers (FE UI, agent subscriptions, hooks) see
+            // nothing at all — log loudly so drops are visible (monorepo#2673).
+            let mut event_types: Vec<&str> = pending
+                .iter()
+                .map(|(ev, _)| ev.event_type.as_str())
+                .collect();
+            event_types.sort_unstable();
+            event_types.dedup();
+            tracing::error!(
+                events = pending.len(),
+                event_types = ?event_types,
+                error = %e,
+                "event batch insert failed; dropping batch (not persisted, not broadcast)"
+            );
             // On batch failure, resolve all oneshots with the same error message.
             let err_msg = format!("batch insert failed: {e}");
             for (_, tx) in pending.drain(..) {
@@ -289,14 +414,57 @@ async fn flush_batch(
     }
 }
 
+/// Whether a batch-insert error is transient — worth retrying because it
+/// reflects momentary contention, not a defect in the batch itself: the
+/// single-connection write pool's acquire timed out (`insert_events` maps
+/// this to "acquire connection failed: pool timed out …"), or SQLite
+/// reported the database busy/locked (a cross-process writer holding the
+/// lock past `busy_timeout`). Everything else (constraint violations,
+/// payload serialization failures, I/O errors) is permanent and fails the
+/// batch immediately. String matching is the only classification available:
+/// `insert_events` flattens every failure into `Error::Internal(String)`.
+pub(crate) fn is_transient_insert_error(e: &Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("acquire connection failed")
+        || msg.contains("pool timed out")
+        || msg.contains("database is locked")
+        || msg.contains("database table is locked")
+}
+
+/// Per-subscriber throttle state for the broadcast-lag WARN: at most one WARN
+/// per [`LAG_WARN_INTERVAL`], with skipped counts accumulated across
+/// suppressed reports so no drop goes uncounted in the next WARN.
+#[derive(Default)]
+pub(crate) struct LagWarnThrottle {
+    skipped: u64,
+    last_warn: Option<Instant>,
+}
+
+impl LagWarnThrottle {
+    /// Record `n` skipped events at `now`. Returns the accumulated skipped
+    /// total (resetting it) when a WARN is due — on the first lag, then at
+    /// most once per [`LAG_WARN_INTERVAL`] — or `None` while throttled.
+    pub(crate) fn record(&mut self, n: u64, now: Instant) -> Option<u64> {
+        self.skipped = self.skipped.saturating_add(n);
+        match self.last_warn {
+            Some(prev) if now.duration_since(prev) < LAG_WARN_INTERVAL => None,
+            _ => {
+                self.last_warn = Some(now);
+                Some(std::mem::take(&mut self.skipped))
+            }
+        }
+    }
+}
+
 /// Per-subscriber delivery loop: filter, then coalesce within `batch_window`.
 async fn delivery_task(
     mut rx: broadcast::Receiver<Arc<Event>>,
     filter: SubscriptionFilter,
-    out: mpsc::Sender<Vec<Event>>,
+    out: mpsc::Sender<Delivery>,
 ) {
     let batch_window = filter.batch_window;
     let mut buffer: Vec<Event> = Vec::new();
+    let mut lag_warn = LagWarnThrottle::default();
     // A pending flush deadline, armed on the first matched event of a batch.
     let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     loop {
@@ -308,7 +476,7 @@ async fn delivery_task(
                     }
                     match batch_window {
                         None => {
-                            if out.send(vec![(*ev).clone()]).await.is_err() {
+                            if out.send(Delivery::Batch(vec![(*ev).clone()])).await.is_err() {
                                 return;
                             }
                         }
@@ -321,12 +489,47 @@ async fn delivery_task(
                     }
                 }
                 // Slow consumer: skip dropped events (persisted events remain in
-                // the log; transient events are lost, matching their semantics).
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // the log; transient events are lost, matching their semantics),
+                // but surface the loss twice over — a throttled WARN with the
+                // skipped count and the subscription's filter scope, so silent
+                // event loss (e.g. a stalled chat transcript) is diagnosable
+                // from the log, AND an in-band [`Delivery::Lagged`] marker at
+                // the gap position so consumers that need convergence (the
+                // chat forwarder) can run a bounded recovery. Any buffered
+                // batch flushes FIRST: its events were received before the
+                // drop, so the marker stays at the true gap position.
+                // Constant-cost invariant: `n` comes from the ring's cursor
+                // jump (the dropped events are never touched) and the WARN
+                // logs only that count plus the already-in-memory filter
+                // summary — no store reads, no per-dropped-event work.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    if let Some(skipped) = lag_warn.record(n, Instant::now()) {
+                        tracing::warn!(
+                            skipped,
+                            event_types = ?filter.event_types,
+                            workspace = %filter.workspace_id.as_deref().unwrap_or("all"),
+                            "event bus subscriber lagged; broadcast dropped events before delivery"
+                        );
+                    }
+                    if !buffer.is_empty() {
+                        deadline = None;
+                        if out
+                            .send(Delivery::Batch(std::mem::take(&mut buffer)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if out.send(Delivery::Lagged(n)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 // Bus dropped: flush any buffered batch, then stop.
                 Err(broadcast::error::RecvError::Closed) => {
                     if !buffer.is_empty() {
-                        let _ = out.send(std::mem::take(&mut buffer)).await;
+                        let _ = out.send(Delivery::Batch(std::mem::take(&mut buffer))).await;
                     }
                     return;
                 }
@@ -334,7 +537,12 @@ async fn delivery_task(
             // Batch window elapsed → flush the coalesced events.
             _ = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
                 deadline = None;
-                if !buffer.is_empty() && out.send(std::mem::take(&mut buffer)).await.is_err() {
+                if !buffer.is_empty()
+                    && out
+                        .send(Delivery::Batch(std::mem::take(&mut buffer)))
+                        .await
+                        .is_err()
+                {
                     return;
                 }
             }

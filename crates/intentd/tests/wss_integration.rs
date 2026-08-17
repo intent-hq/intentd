@@ -1296,6 +1296,109 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
     server.stop().await;
 }
 
+/// intent-hq/monorepo#2669 over the real WSS wire: `agent.diagnostics` agent
+/// rows carry `conversationBytes` (total persisted conversation size), and a
+/// conversation past the 4 MiB threshold raises a `large-conversation`
+/// stuck-risk naming the agent and sizes so coordinators can rotate to a
+/// fresh agent before turns start silently truncating.
+#[tokio::test]
+async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
+    let dir = test_tempdir("intentd-wss-largeconv-");
+    let store = Store::open(&dir.path().join("intentd.db"))
+        .await
+        .expect("open store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
+    let registry = Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("load settings registry"),
+    );
+    let services = Services::new(store.clone())
+        .with_assets_root(dir.path().join("assets"))
+        .with_workspaces_root(workspaces_root)
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let tls = ensure_tls_certificate(dir.path()).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    let mut opts = WsOptions {
+        base_port: 0,
+        ..WsOptions::default()
+    };
+    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let server = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
+    let port = server.start().await.expect("start");
+
+    let created_ws = wss_call(
+        port,
+        cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Large Conversation"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bloated Target"}}}}"#
+    );
+    let created = wss_call(port, cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+
+    // Seed a >4 MiB persisted conversation directly in the store.
+    let big_text = "x".repeat(1024 * 1024);
+    for _ in 0..5 {
+        store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": big_text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append bloated message");
+    }
+
+    let diag_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.diagnostics","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let diag = wss_call(port, cfg.clone(), &diag_frame).await;
+    assert_eq!(diag["jsonrpc"], Value::String("2.0".into()), "{diag}");
+    let d = &diag["result"]["diagnostics"];
+    let rows = d["agents"].as_array().expect("agents array");
+    let row = rows
+        .iter()
+        .find(|r| r["id"] == Value::String(agent_id.clone()))
+        .expect("agent row");
+    let bytes = row["conversationBytes"]
+        .as_u64()
+        .expect("conversationBytes on the wire");
+    assert!(bytes > 4 * 1024 * 1024, "bytes: {bytes}");
+    let risks = d["stuckRisks"].as_array().expect("stuckRisks array");
+    let risk = risks
+        .iter()
+        .find(|r| r["type"] == serde_json::json!("large-conversation"))
+        .expect("large-conversation risk on the wire");
+    assert_eq!(risk["severity"], Value::String("warning".into()), "{risk}");
+    assert_eq!(risk["agentId"], Value::String(agent_id.clone()), "{risk}");
+    assert_eq!(risk["conversationBytes"], Value::from(bytes), "{risk}");
+    assert_eq!(
+        risk["thresholdBytes"],
+        Value::from(4u64 * 1024 * 1024),
+        "{risk}"
+    );
+
+    server.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
@@ -2679,6 +2782,91 @@ async fn wss_agent_create_applies_settings_default_reasoning_effort() {
             .get("reasoningEffort")
             .is_none(),
         "a blank `reasoningEffort` is an explicit clear, not a fall-through: {created}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// The catalog-default rung of the creation-time default-model resolution
+/// (PROTOCOL §5.5), over the real WSS transport: with a warm cached catalog
+/// whose `isDefault` row is `sonnet5` and no settings default, a no-model
+/// `agent.create` pins that row's id to `session.model` (served on the
+/// `AgentLite` payload); a configured settings default still outranks it; and
+/// the settings default reasoning effort does NOT companion a
+/// catalog-default-resolved model.
+#[tokio::test]
+async fn wss_agent_create_pins_the_catalog_default_model() {
+    let dir = test_tempdir("intentd-wss-catalog-default-");
+    let cache = serde_json::json!({
+        "version": 2,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [
+                    { "id": "fable-5", "name": "Fable 5", "provider": "auggie",
+                      "effortLevels": ["low", "high"] },
+                    { "id": "sonnet5", "name": "Sonnet 5", "provider": "auggie",
+                      "isDefault": true }
+                ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.path().join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv = start_with_auggie_and_models_cache(
+        WsOptions::default(),
+        None,
+        Some(dir.path().to_path_buf()),
+    )
+    .await;
+    srv.set_setting("model.defaultReasoningEffort", serde_json::json!("high"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Catalog Default"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Catalog default"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 2);
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("sonnet5"),
+        "the cached catalog's isDefault row is pinned: {created}"
+    );
+    assert!(
+        created["result"]["agent"]
+            .as_object()
+            .expect("agent object")
+            .get("reasoningEffort")
+            .is_none(),
+        "the settings default effort must not companion a catalog-default model: {created}"
+    );
+
+    // A configured settings default outranks the catalog rung.
+    srv.set_setting("model.default", serde_json::json!("auggie:fable-5"));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Settings wins"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(created["jsonrpc"], "2.0");
+    assert_eq!(created["id"], 3);
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("auggie:fable-5"),
+        "the settings chain outranks the catalog default: {created}"
     );
 
     srv.ws.stop().await;
@@ -7145,7 +7333,7 @@ async fn wss_repo_remove_round_trip() {
 }
 
 /// End-to-end WSS coverage for the workspace lifecycle helpers added by the
-/// thin-FE remediation (PROTOCOL.md §5.1): `workspace.duplicate`,
+/// thin-FE remediation (docs/protocol/methods/workspace.md §5.1): `workspace.duplicate`,
 /// `workspace.restore`, `workspace.cleanup`, `workspace.findRepositories`,
 /// and `workspace.initializeRepository`. Every method is driven over the
 /// real pinned-TLS WebSocket transport and its response envelope is asserted

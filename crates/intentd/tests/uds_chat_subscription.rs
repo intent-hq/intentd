@@ -1584,3 +1584,207 @@ async fn chat_subscribe_snapshot_is_bounded_for_large_transcript() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+/// Lag self-heal: a broadcast-ring drop that swallows the turn's tail (the
+/// trailing chunk delta AND `agent:stream:end`) must not strand the transcript
+/// mid-turn. The forwarder sees the in-band lag marker and re-emits a fresh
+/// bounded snapshot at the next seq — the client converges to the persisted
+/// message (all blocks, no `isStreaming`) with no seq gap and no resubscribe —
+/// and the subscription stays live for the next turn's deltas.
+///
+/// The drop is forced deterministically: on the test's current-thread runtime a
+/// non-yielding `publish_transient` loop starves the delivery task, so the ring
+/// (capacity 1024) drops the oldest undelivered events — the tail published
+/// first — before the task ever runs.
+#[tokio::test]
+async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    // A persisted user message anchors the seq-0 snapshot.
+    let store = bus.store();
+    let user_id = Uuid::now_v7().to_string();
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &user_id,
+            "user",
+            &json!([{ "type": "text", "id": format!("{user_id}:0"), "text": "Run the tests" }]),
+            None,
+            &now_iso(),
+        )
+        .await
+        .expect("append user message");
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].as_str().is_some());
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+
+    // The turn starts normally: the first chunk arrives as delta seq 1.
+    let mid = Uuid::now_v7().to_string();
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        CHAT_STREAM_DELTA,
+        json!({
+            "agentId": agent_id, "content": "I'll run ", "messageId": mid,
+            "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
+        }),
+    )
+    .await;
+    let first = read_json(&mut sub_reader).await;
+    assert_eq!(first["params"]["kind"], "delta");
+    assert_eq!(first["params"]["seq"], 1);
+
+    // The turn completes durably (as run_prompt_turn persists before
+    // `stream:end`), but its live tail is LOST: the trailing chunk and
+    // `stream:end` are published into the ring and then buried under a
+    // non-yielding flood that overflows the ring before the delivery task
+    // can drain — exactly the slow-consumer drop of the incident.
+    store
+        .append_agent_message_with_id(
+            &AgentId::from(agent_id.as_str()),
+            &mid,
+            "assistant",
+            &json!([
+                { "type": "text", "id": format!("{mid}:0"), "text": "I'll run the tests." },
+            ]),
+            None,
+            &now_iso(),
+        )
+        .await
+        .expect("append assistant message");
+    let stream_event = |event_type: &str, data: Value| NewEvent {
+        workspace_id: WorkspaceId::from(ws_id.as_str()),
+        timestamp: now_iso(),
+        event_type: event_type.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(agent_id.clone()),
+            ..Default::default()
+        },
+        session_id: Some(agent_id.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data,
+    };
+    bus.publish_transient(&stream_event(
+        CHAT_STREAM_DELTA,
+        json!({
+            "agentId": agent_id, "content": "the tests.", "messageId": mid,
+            "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text",
+        }),
+    ));
+    bus.publish_transient(&stream_event(
+        AGENT_STREAM_END,
+        json!({ "agentId": agent_id }),
+    ));
+    // 2048 filler events push the ring (capacity 1024) far past the tail.
+    for _ in 0..2048 {
+        bus.publish_transient(&NewEvent {
+            workspace_id: WorkspaceId::from(ws_id.as_str()),
+            timestamp: now_iso(),
+            event_type: "note:created".to_string(),
+            actor: EventActor {
+                actor_type: ActorType::User,
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({}),
+        });
+    }
+
+    // Self-heal: the next frame is a fresh snapshot at the next seq (no gap),
+    // carrying the fully persisted transcript with no in-flight message.
+    let recovery = read_json(&mut sub_reader).await;
+    assert_eq!(
+        recovery["params"]["kind"], "snapshot",
+        "lag recovery re-emits a snapshot, got: {recovery}"
+    );
+    assert_eq!(recovery["params"]["seq"], 2, "recovery takes the next seq");
+    let want = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let mut want = want;
+    let want_obj = want.as_object_mut().unwrap();
+    want_obj.insert("isResponding".into(), json!(false));
+    want_obj.insert("isWaitingOnTool".into(), json!(false));
+    want_obj.insert("isWaitingForOtherAgents".into(), json!(false));
+    want_obj.insert("waitingForAgentIds".into(), json!([]));
+    assert_eq!(
+        recovery["params"]["snapshot"], want,
+        "recovery snapshot equals a fresh getConversation page"
+    );
+    let messages = recovery["params"]["snapshot"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(messages.len(), 2, "user + persisted assistant message");
+    assert!(
+        messages.iter().all(|m| m.get("isStreaming").is_none()),
+        "the recovered transcript is not stranded mid-turn"
+    );
+
+    // The subscription stays live: the next turn's chunk arrives as a delta
+    // at the following seq.
+    let mid2 = Uuid::now_v7().to_string();
+    publish_stream(
+        &bus,
+        &ws_id,
+        &agent_id,
+        CHAT_STREAM_DELTA,
+        json!({
+            "agentId": agent_id, "content": "Next", "messageId": mid2,
+            "blockIndex": 0, "blockId": format!("{mid2}:0"), "blockType": "text",
+        }),
+    )
+    .await;
+    let next = read_json(&mut sub_reader).await;
+    assert_eq!(next["params"]["kind"], "delta");
+    assert_eq!(next["params"]["seq"], 3);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

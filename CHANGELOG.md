@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.13] - 2026-08-17
+
+### 🚀 Features
+
+- *(services)* Resolve and hide the "default" pseudo-row in ACP model catalogs ([#1278](https://github.com/intent-hq/intentd/pull/1278))
+- *(services)* Pin the cached catalog default model at agent create time ([#1279](https://github.com/intent-hq/intentd/pull/1279))
+- Freeze resolved specialist injection at agent creation ([#1280](https://github.com/intent-hq/intentd/pull/1280))
+- *(transport)* Chat forwarder self-heals after upstream event loss ([#1281](https://github.com/intent-hq/intentd/pull/1281))
+
+### 📚 Documentation
+
+- Point protocol references at docs/protocol/ directory ([#1283](https://github.com/intent-hq/intentd/pull/1283))
+
+
+## [0.7.12] - 2026-08-17
+
+### 🚀 Features
+
+- *(services)* Expose conversationBytes and large-conversation stuck-risk in agent.diagnostics ([#1276](https://github.com/intent-hq/intentd/pull/1276))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Never silently skip the chat terminal frame on reconcile failure ([#1277](https://github.com/intent-hq/intentd/pull/1277))
+- *(services)* Gate stateSnapshot injection on the session's captured feature snapshot ([#1273](https://github.com/intent-hq/intentd/pull/1273))
+- Add compound-op statement-budget tier for workspace.create (39-40 stmts vs flat 25) ([#1275](https://github.com/intent-hq/intentd/pull/1275))
+
+
+## [0.7.11] - 2026-08-16
+
+### 🚀 Features
+
+- *(host)* Report validated standard-directory favorites on host.listDirectory ([#1268](https://github.com/intent-hq/intentd/pull/1268))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Register proposal turn attachments at binding call time ([#1270](https://github.com/intent-hq/intentd/pull/1270))
+
+### 📚 Documentation
+
+- *(acp)* Update browser_docs tunnel lifecycle for persistent forwards ([#1269](https://github.com/intent-hq/intentd/pull/1269))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(core)* Stop seeding taskGraph into the first-boot config template ([#1271](https://github.com/intent-hq/intentd/pull/1271))
+
+
+## [0.7.10] - 2026-08-16
+
+### 🐛 Bug Fixes
+
+- *(workspace)* Persist worktreePath for isNewRepo direct-mode creates and fall back to repositoryPath in spawn cwd ([#1265](https://github.com/intent-hq/intentd/pull/1265))
+
+
 ## [0.7.9] - 2026-08-16
 
 ### 🚀 Features
