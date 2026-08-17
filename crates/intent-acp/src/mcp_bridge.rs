@@ -31,7 +31,7 @@ use crate::mcp_server::WorkspaceMcpServer;
 /// Per-connection cap on concurrently dispatched requests. Small on purpose:
 /// enough that a long `tools/call` never blocks a liveness ping behind it
 /// (monorepo#871), bounded so a misbehaving client cannot spawn unboundedly.
-const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
 /// Capacity of the per-connection response channel feeding the writer task.
 const RESPONSE_CHANNEL_CAPACITY: usize = 32;
@@ -44,7 +44,22 @@ const RESPONSE_CHANNEL_CAPACITY: usize = 32;
 /// escape, because the wedged task never yields to let its timer fire.
 /// Generously above that 30s eval budget plus the post-eval awaits, so the
 /// watchdog only fires when the normal timeout machinery has already failed.
-const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// This is a floor, not the effective deadline: the eval budget can be raised
+/// via `INTENTD_WORKSPACE_API_TIMEOUT_MS`, so the production entry point
+/// derives the deadline with [`effective_dispatch_timeout`] to keep the two
+/// knobs from crossing.
+pub(crate) const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The effective watchdog deadline for a server whose eval budget may have
+/// been raised via `INTENTD_WORKSPACE_API_TIMEOUT_MS`: the
+/// [`DISPATCH_WATCHDOG_TIMEOUT`] floor, or twice the eval budget when the
+/// override exceeds half of it — so a raised budget can never cross the
+/// watchdog and get legitimate, still-in-budget calls aborted with a
+/// non-retryable error.
+pub(crate) fn effective_dispatch_timeout(eval_budget: Duration) -> Duration {
+    DISPATCH_WATCHDOG_TIMEOUT.max(eval_budget * 2)
+}
 
 /// Dispatch seam for the bridge listener: production is [`WorkspaceMcpServer`];
 /// tests inject controllable handlers to exercise concurrency semantics.
@@ -98,22 +113,26 @@ impl Drop for McpBridge {
 
 /// Bind a loopback TCP listener and serve `server` over newline-delimited
 /// JSON-RPC. Each accepted connection is handled concurrently; a request line
-/// yields one response line, a notification (no `id`) yields nothing.
+/// yields one response line, a notification (no `id`) yields nothing. The
+/// dispatch watchdog deadline is derived from the server's (possibly
+/// env-overridden) eval budget via [`effective_dispatch_timeout`].
 pub async fn serve_workspace_mcp_tcp(
     server: Arc<WorkspaceMcpServer>,
 ) -> std::io::Result<McpBridge> {
-    serve_mcp_tcp(server).await
+    let dispatch_timeout = effective_dispatch_timeout(server.workspace_api_timeout());
+    serve_mcp_tcp_with_timeout(server, dispatch_timeout).await
 }
 
 /// Generic body of [`serve_workspace_mcp_tcp`], parameterized over the dispatch
 /// seam so tests can serve a mock handler over a real loopback socket.
+#[cfg(test)]
 pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io::Result<McpBridge> {
     serve_mcp_tcp_with_timeout(server, DISPATCH_WATCHDOG_TIMEOUT).await
 }
 
-/// [`serve_mcp_tcp`] with an injectable dispatch watchdog deadline, so tests
-/// can shorten [`DISPATCH_WATCHDOG_TIMEOUT`] and exercise the timeout path
-/// without waiting minutes.
+/// [`serve_workspace_mcp_tcp`] body with an injectable dispatch watchdog
+/// deadline, so tests can shorten [`DISPATCH_WATCHDOG_TIMEOUT`] and exercise
+/// the timeout path without waiting minutes.
 pub(crate) async fn serve_mcp_tcp_with_timeout<S: BridgeDispatch>(
     server: Arc<S>,
     dispatch_timeout: Duration,
@@ -212,7 +231,15 @@ async fn serve_connection<S: BridgeDispatch>(
                     let response_tx = response_tx.clone();
                     in_flight.spawn(async move {
                         let _permit = permit;
-                        let id = message.get("id").cloned().filter(|id| !id.is_null());
+                        // A request is `method` + `id` — with any present
+                        // `id`, including `null`, counting — matching the
+                        // stdio proxy's `request_id`, so a wedged null-id
+                        // request still gets its synthesized error line.
+                        let id = if message.get("method").is_some() {
+                            message.get("id").cloned()
+                        } else {
+                            None
+                        };
                         let method = message
                             .get("method")
                             .and_then(Value::as_str)

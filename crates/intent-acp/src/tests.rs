@@ -4169,11 +4169,14 @@ mod mcp_bridge_tests {
         use tokio::time::timeout;
 
         use crate::mcp_bridge::{
-            serve_mcp_tcp_with_timeout, BridgeDispatch, McpBridge, BRIDGE_DISPATCH_TIMEOUT_CODE,
-            BRIDGE_DISPATCH_TIMEOUT_MESSAGE,
+            effective_dispatch_timeout, serve_mcp_tcp_with_timeout, BridgeDispatch, McpBridge,
+            BRIDGE_DISPATCH_TIMEOUT_CODE, BRIDGE_DISPATCH_TIMEOUT_MESSAGE,
+            DISPATCH_WATCHDOG_TIMEOUT, MAX_IN_FLIGHT_REQUESTS,
         };
 
-        const TEST_DEADLINE: Duration = Duration::from_millis(200);
+        /// Generous relative to the per-line read budget below so a stalled
+        /// CI runner cannot invert response ordering into a flake.
+        const TEST_DEADLINE: Duration = Duration::from_millis(500);
 
         /// Mock dispatch: `wedge` parks forever (request or notification);
         /// any other request answers immediately; non-wedged notifications
@@ -4261,26 +4264,105 @@ mod mcp_bridge_tests {
             let (dispatch, _bridge, mut write, mut reader) = start().await;
             send(&mut write, r#"{"jsonrpc":"2.0","id":1,"method":"wedge"}"#).await;
             send(&mut write, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#).await;
-            let first = read_response(&mut reader).await;
+            // Collect both responses id-keyed rather than asserting arrival
+            // order (CI-scheduler tolerant). The wedged dispatch parks
+            // forever, so the fast response arriving at all — within the
+            // read budget — already proves it did not queue behind it.
+            let mut by_id = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let response = read_response(&mut reader).await;
+                by_id.insert(response["id"].as_i64().unwrap(), response);
+            }
+            assert_eq!(by_id[&2]["result"]["ok"], json!(true));
+            let timed_out = &by_id[&1];
             assert_eq!(
-                first["id"],
-                json!(2),
-                "fast request must not wait behind the wedged one"
+                timed_out["error"]["code"],
+                json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
             );
-            assert_eq!(first["result"]["ok"], json!(true));
-            let second = read_response(&mut reader).await;
-            assert_eq!(second["id"], json!(1));
-            assert_eq!(second["error"]["code"], json!(BRIDGE_DISPATCH_TIMEOUT_CODE));
             assert_eq!(
-                second["error"]["message"],
+                timed_out["error"]["message"],
                 json!(BRIDGE_DISPATCH_TIMEOUT_MESSAGE)
             );
-            assert_eq!(second["error"]["data"]["retryable"], json!(false));
+            assert_eq!(timed_out["error"]["data"]["retryable"], json!(false));
             wait_cancelled(&dispatch, 1).await;
             // The connection keeps serving after the watchdog fired.
             send(&mut write, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).await;
             let third = read_response(&mut reader).await;
             assert_eq!(third["id"], json!(3));
+        }
+
+        /// `id: null` marks a request (matching `handle_message` and the
+        /// stdio proxy's `request_id`), so a wedged null-id request gets a
+        /// synthesized error line carrying `id: null`.
+        #[tokio::test]
+        async fn wedged_null_id_request_gets_timeout_error_with_null_id() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            send(
+                &mut write,
+                r#"{"jsonrpc":"2.0","id":null,"method":"wedge"}"#,
+            )
+            .await;
+            let response = read_response(&mut reader).await;
+            assert!(response["id"].is_null());
+            assert_eq!(
+                response["error"]["code"],
+                json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
+            );
+            wait_cancelled(&dispatch, 1).await;
+        }
+
+        /// Saturation: with every in-flight permit held by wedged requests,
+        /// the watchdog path must release the permits — the one queued
+        /// request behind the full semaphore can only be answered if it does.
+        #[tokio::test]
+        async fn watchdog_releases_semaphore_permits_at_saturation() {
+            let (dispatch, _bridge, mut write, mut reader) = start().await;
+            for i in 0..MAX_IN_FLIGHT_REQUESTS {
+                send(
+                    &mut write,
+                    &format!(r#"{{"jsonrpc":"2.0","id":{i},"method":"wedge"}}"#),
+                )
+                .await;
+            }
+            send(&mut write, r#"{"jsonrpc":"2.0","id":100,"method":"ping"}"#).await;
+            let mut timeout_errors = 0;
+            let mut ping_ok = false;
+            for _ in 0..=MAX_IN_FLIGHT_REQUESTS {
+                let response = read_response(&mut reader).await;
+                if response["id"] == json!(100) {
+                    assert_eq!(response["result"]["ok"], json!(true));
+                    ping_ok = true;
+                } else {
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(BRIDGE_DISPATCH_TIMEOUT_CODE)
+                    );
+                    timeout_errors += 1;
+                }
+            }
+            assert!(ping_ok, "queued request must run once a permit frees");
+            assert_eq!(timeout_errors, MAX_IN_FLIGHT_REQUESTS);
+            wait_cancelled(&dispatch, MAX_IN_FLIGHT_REQUESTS).await;
+        }
+
+        /// The production deadline keeps clear of a raised eval budget: the
+        /// 120s floor holds for the 30s default, and an
+        /// `INTENTD_WORKSPACE_API_TIMEOUT_MS` override past half the floor
+        /// scales the deadline to twice the budget.
+        #[test]
+        fn effective_dispatch_timeout_floors_and_scales() {
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(30)),
+                DISPATCH_WATCHDOG_TIMEOUT
+            );
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(60)),
+                DISPATCH_WATCHDOG_TIMEOUT
+            );
+            assert_eq!(
+                effective_dispatch_timeout(Duration::from_secs(90)),
+                Duration::from_secs(180)
+            );
         }
 
         #[tokio::test]
