@@ -9002,6 +9002,24 @@ impl Services {
         content: &str,
         message_metadata: Option<&Value>,
     ) -> Result<Value> {
+        // Up-front vanished-session gate (intent-hq/monorepo#2762): reject
+        // nonexistent targets BEFORE any state change (the monorepo#564
+        // contract). This covers the enqueue-only routes below
+        // (archived-workspace park, question hold, busy-agent fast enqueue)
+        // that return queued success without ever touching `agent_message` —
+        // without it a wake racing an `agent.delete` parks a phantom entry no
+        // drain can ever deliver. The append-failure arms keep their own
+        // NotFound re-check as the check-then-act race guard.
+        if matches!(
+            self.store.get_agent_session_status(agent_id).await,
+            Err(Error::NotFound(_))
+        ) {
+            self.drop_queue(agent_id);
+            return Err(Error::InvalidParams(format!(
+                "unknown agent id: {}",
+                agent_id.0
+            )));
+        }
         let build_block = || match message_metadata {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),
@@ -9166,8 +9184,31 @@ impl Services {
                 self.invalidate_agent_list_cache(workspace_id);
                 msg
             }
-            Err(_) => {
+            Err(append_err) => {
                 manager.release_slot(agent_id).await;
+                // Fail closed on a vanished session (intent-hq/monorepo#2762):
+                // the only FK on `agent_message` is `agent_id →
+                // agent_session(id)`, so an append failure against a gone row
+                // means the agent was deleted. Auto-queueing here would park a
+                // phantom entry no drain can ever deliver (every re-append
+                // re-fails 787) — reject with the same `unknown agent id`
+                // contract as `agent.sendMessage`'s monorepo#564 guard and
+                // drop any stale queue entries for the gone agent.
+                if matches!(
+                    self.store.get_agent_session_status(agent_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        error = %append_err,
+                        "agent session vanished mid-wake; rejecting instead of queueing (monorepo#2762)"
+                    );
+                    self.drop_queue(agent_id);
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
                 let (queued, position) = self.enqueue_message(
                     agent_id,
                     content_owned,
@@ -9308,7 +9349,25 @@ impl Services {
                 .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
-            Err(_) => {
+            Err(append_err) => {
+                // Fail closed on a vanished session (intent-hq/monorepo#2762):
+                // same contract as the runtime branch above — never park a
+                // phantom entry for a deleted agent.
+                if matches!(
+                    self.store.get_agent_session_status(agent_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        error = %append_err,
+                        "agent session vanished mid-wake; rejecting instead of queueing (monorepo#2762)"
+                    );
+                    self.drop_queue(agent_id);
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
                 let (queued, position) = self.enqueue_message(
                     agent_id,
                     content.to_string(),
@@ -9691,6 +9750,19 @@ impl Services {
             .entry(agent_id.clone())
             .or_default()
             .insert(0, message);
+    }
+
+    /// Drop an agent's ENTIRE in-memory queue (intent-hq/monorepo#2762): the
+    /// fail-closed contract for a vanished session. The durable `agent_queue`
+    /// rows already cascaded with the deleted `agent_session` row, so this
+    /// only clears the in-memory registry a raced delivery may have
+    /// repopulated — no write-through, no `agent:queue:updated` (the agent no
+    /// longer exists to subscribe on).
+    pub(crate) fn drop_queue(&self, agent_id: &AgentId) {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .remove(agent_id);
     }
 
     /// `true` iff the agent has at least one queued message that is **not**
