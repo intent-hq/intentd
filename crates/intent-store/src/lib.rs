@@ -540,8 +540,19 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 /// enforced read-only configuration — and supports concurrent readers without
 /// contention (SQLite WAL mode allows many simultaneous readers).
 ///
-/// The PRAGMAs match the write pool: `journal_mode = WAL`, `foreign_keys = ON`,
-/// `busy_timeout = 5000`, `synchronous = NORMAL`. The read pool size (32) is
+/// The PRAGMAs match the write pool — `journal_mode = WAL`, `foreign_keys =
+/// ON`, `busy_timeout = 5000`, `synchronous = NORMAL` — except `auto_vacuum`,
+/// which is deliberately NOT set here: auto_vacuum is a property of the
+/// database file, established at creation by [`connect_write`] ([`Store::open`]
+/// opens the write pool first) or by the startup activation VACUUM
+/// ([`Store::activate_incremental_vacuum`]), and only
+/// [`Store::incremental_vacuum`] (write pool) ever acts on it. Setting it per
+/// read connection re-executed `PRAGMA auto_vacuum = INCREMENTAL` on every
+/// fresh pool connection, which surfaced as slow-statement WARNs inside hot
+/// read RPCs under load and amplified write-pool contention
+/// (intent-hq/monorepo#2673).
+///
+/// The read pool size (32) is
 /// sized to absorb the client-driven startup burst (FE rehydrating several
 /// workspaces at once) without saturating the pool and tripping sqlx's
 /// `slow_acquire_threshold` warnings (STAB-6, STAB-46). The original size of
@@ -553,7 +564,6 @@ pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))

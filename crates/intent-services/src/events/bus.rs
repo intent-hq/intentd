@@ -335,8 +335,10 @@ pub(crate) async fn flush_prepared<F, Fut>(
             // The batch is lost both durably and live: publishers get the
             // error, but subscribers (FE UI, agent subscriptions, hooks) see
             // nothing at all — log loudly so drops are visible (monorepo#2673).
-            let mut event_types: Vec<&str> =
-                pending.iter().map(|(ev, _)| ev.event_type.as_str()).collect();
+            let mut event_types: Vec<&str> = pending
+                .iter()
+                .map(|(ev, _)| ev.event_type.as_str())
+                .collect();
             event_types.sort_unstable();
             event_types.dedup();
             tracing::error!(
