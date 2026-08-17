@@ -32,6 +32,16 @@ const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 /// catching a wedged queue well before the incident's timescale.
 const STALE_QUEUE_ENTRY_AFTER_MS: i64 = 5 * 60 * 1000;
 
+/// Persisted-conversation size past which `agent.diagnostics` raises a
+/// `large-conversation` stuck-risk warning (intent-hq/monorepo#2669): in that
+/// incident, turns started silently dying (bare `end_turn` after an 11-13 min
+/// silent gap) once the conversation reached ~5.3-5.5 MB. 4 MiB is well past
+/// the transport's 1 MiB large-frame WARN while still comfortably before the
+/// observed failure sizes, so coordinators can rotate to a fresh agent BEFORE
+/// turns start dying. Diagnostics-only: the byte total never rides the hot
+/// `agent.list`/`agent.get` payloads.
+const LARGE_CONVERSATION_WARN_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Per-entry `content` cap (chars) for the shared queue *preview* projection
 /// ([`Services::queue_snapshot_preview`]) used by surfaces that embed other
 /// agents' queues (e.g. `agent.diagnostics`). `agent.getQueue` itself stays
@@ -7756,8 +7766,8 @@ impl Services {
                 .and_then(|s| agent_status_wire(s.status))
                 .unwrap_or("unknown");
             // Use lightweight message stats instead of full hydration
-            let (message_count_val, has_assistant) =
-                message_stats.get(id).copied().unwrap_or((0, false));
+            let (message_count_val, has_assistant, conversation_bytes) =
+                message_stats.get(id).copied().unwrap_or((0, false, 0));
             let message_count = if message_count_val > 0 {
                 Some(message_count_val)
             } else {
@@ -7793,6 +7803,13 @@ impl Services {
             row.insert("status".into(), json!(status));
             if let Some(mc) = message_count {
                 row.insert("messageCount".into(), json!(mc));
+            }
+            // Persisted-conversation size (intent-hq/monorepo#2669): session-
+            // size pressure signal so coordinators can rotate agents before
+            // turns start dying under context bloat. Omitted when zero (no
+            // messages), like `messageCount`.
+            if conversation_bytes > 0 {
+                row.insert("conversationBytes".into(), json!(conversation_bytes));
             }
             row.insert("subscriptionCount".into(), json!(subscription_count));
             row.insert(
@@ -7880,6 +7897,24 @@ impl Services {
                     risk.insert("ageMs".into(), json!(a));
                 }
                 stuck_risks.push(Value::Object(risk));
+            }
+            // Large persisted conversation (intent-hq/monorepo#2669): past
+            // [`LARGE_CONVERSATION_WARN_BYTES`] the session is at risk of
+            // silently-truncated turns — surface it so coordinators rotate to
+            // a fresh agent before turns start dying.
+            if let Some(bytes) = row["conversationBytes"].as_u64() {
+                if bytes > LARGE_CONVERSATION_WARN_BYTES {
+                    stuck_risks.push(json!({
+                        "type": "large-conversation",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid} has a large persisted conversation ({bytes} bytes > {LARGE_CONVERSATION_WARN_BYTES}); turns may start silently truncating under session bloat — consider rotating to a fresh agent"
+                        ),
+                        "agentId": aid,
+                        "conversationBytes": bytes,
+                        "thresholdBytes": LARGE_CONVERSATION_WARN_BYTES,
+                    }));
+                }
             }
         }
         // Stale undelivered queue entries (intent-hq/monorepo#1897): a
