@@ -209,19 +209,23 @@ impl Budget {
         let scaled = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
         scaled.min(self.end)
     }
+
+    /// Deadline for one RPC round-trip (a live daemon answers in ms), clamped
+    /// to the whole-test budget so a stall near the budget's end still panics
+    /// before nextest's 180s kill.
+    fn rpc_deadline(&self) -> tokio::time::Instant {
+        let per_rpc =
+            tokio::time::Instant::now() + common::rpc_read_timeout().min(Duration::from_secs(45));
+        per_rpc.min(self.end)
+    }
 }
 
-/// Bound for one RPC round-trip (clamped — a live daemon answers in ms).
-fn rpc_read_budget() -> Duration {
-    common::rpc_read_timeout().min(Duration::from_secs(45))
-}
-
-async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc(ws: &mut TlsWs, budget: Budget, id: i64, method: &str, params: Value) -> Value {
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
-    let deadline = tokio::time::Instant::now() + rpc_read_budget();
+    let deadline = budget.rpc_deadline();
     loop {
         let next = tokio::time::timeout_at(deadline, ws.next())
             .await
@@ -321,9 +325,10 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
     ws.0
 }
 
-async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> String {
+async fn create_agent(rpc: &mut TlsWs, budget: Budget, id: i64, ws_id: &str, name: &str) -> String {
     let created = wss_rpc(
         rpc,
+        budget,
         id,
         "agent.create",
         json!({ "workspaceId": ws_id, "name": name, "model": "mock:default" }),
@@ -336,9 +341,16 @@ async fn create_agent(rpc: &mut TlsWs, id: i64, ws_id: &str, name: &str) -> Stri
 }
 
 /// Serialize the agent's conversation for substring assertions.
-async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str) -> String {
+async fn conversation_text(
+    rpc: &mut TlsWs,
+    budget: Budget,
+    id: i64,
+    ws_id: &str,
+    agent_id: &str,
+) -> String {
     let convo = wss_rpc(
         rpc,
+        budget,
         id,
         "agent.getConversation",
         json!({ "workspaceId": ws_id, "agentId": agent_id }),
@@ -351,6 +363,7 @@ async fn conversation_text(rpc: &mut TlsWs, id: i64, ws_id: &str, agent_id: &str
 /// deadline). Returns the conversation text containing the needle.
 async fn await_conversation_contains(
     rpc: &mut TlsWs,
+    budget: Budget,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
@@ -358,7 +371,7 @@ async fn await_conversation_contains(
     deadline: tokio::time::Instant,
 ) -> String {
     loop {
-        let text = conversation_text(rpc, *req_id, ws_id, agent_id).await;
+        let text = conversation_text(rpc, budget, *req_id, ws_id, agent_id).await;
         *req_id += 1;
         if text.contains(needle) {
             return text;
@@ -372,8 +385,10 @@ async fn await_conversation_contains(
 }
 
 /// Poll `agent.getQueue` until the predicate holds (or panic at the deadline).
+#[allow(clippy::too_many_arguments)]
 async fn await_queue<F>(
     rpc: &mut TlsWs,
+    budget: Budget,
     req_id: &mut i64,
     ws_id: &str,
     agent_id: &str,
@@ -387,6 +402,7 @@ where
     loop {
         let result = wss_rpc(
             rpc,
+            budget,
             *req_id,
             "agent.getQueue",
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
@@ -473,10 +489,11 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
 
     // Target FIRST (so the watcher's ws.agent.list lookup finds it), then the
     // watcher registers the watch through the bridge and settles idle.
-    let target = create_agent(&mut rpc, 10, &ws_id, "WatchTarget").await;
-    let watcher = create_agent(&mut rpc, 11, &ws_id, "Watcher").await;
+    let target = create_agent(&mut rpc, budget, 10, &ws_id, "WatchTarget").await;
+    let watcher = create_agent(&mut rpc, budget, 11, &ws_id, "Watcher").await;
     let sent = wss_rpc(
         &mut rpc,
+        budget,
         12,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": watcher, "content": DO_WATCH }),
@@ -486,6 +503,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     let mut req_id = 20i64;
     let text = await_conversation_contains(
         &mut rpc,
+        budget,
         &mut req_id,
         &ws_id,
         &watcher,
@@ -503,6 +521,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     // must PARK (the workspace is archived by the time it is delivered).
     let sent = wss_rpc(
         &mut rpc,
+        budget,
         13,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": target, "content": TARGET_PARK }),
@@ -515,6 +534,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     loop {
         let got = wss_rpc(
             &mut rpc,
+            budget,
             req_id,
             "agent.get",
             json!({ "workspaceId": ws_id, "agentId": target }),
@@ -533,6 +553,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
 
     let archived = wss_rpc(
         &mut rpc,
+        budget,
         100,
         "workspace.archive",
         json!({ "workspaceId": ws_id }),
@@ -544,6 +565,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     let mut q_id = 200i64;
     await_queue(
         &mut rpc,
+        budget,
         &mut q_id,
         &ws_id,
         &watcher,
@@ -557,6 +579,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     // that auto-unarchives it (the pre-fix loop).
     let fetched = wss_rpc(
         &mut rpc,
+        budget,
         300,
         "workspace.get",
         json!({ "workspaceId": ws_id }),
@@ -571,6 +594,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     // Unarchive delivers the parked wake: the watcher runs the wake turn.
     let unarchived = wss_rpc(
         &mut rpc,
+        budget,
         301,
         "workspace.unarchive",
         json!({ "workspaceId": ws_id }),
@@ -580,6 +604,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     let mut c_id = 400i64;
     await_conversation_contains(
         &mut rpc,
+        budget,
         &mut c_id,
         &ws_id,
         &watcher,
@@ -591,6 +616,7 @@ async fn archived_workspace_parks_completion_wake_until_unarchive_over_wss() {
     let mut fq_id = 500i64;
     await_queue(
         &mut rpc,
+        budget,
         &mut fq_id,
         &ws_id,
         &watcher,
