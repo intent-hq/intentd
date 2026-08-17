@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.12] - 2026-08-17
+
+### 🚀 Features
+
+- *(services)* Expose conversationBytes and large-conversation stuck-risk in agent.diagnostics ([#1276](https://github.com/intent-hq/intentd/pull/1276))
+
+### 🐛 Bug Fixes
+
+- *(transport)* Never silently skip the chat terminal frame on reconcile failure ([#1277](https://github.com/intent-hq/intentd/pull/1277))
+- *(services)* Gate stateSnapshot injection on the session's captured feature snapshot ([#1273](https://github.com/intent-hq/intentd/pull/1273))
+- Add compound-op statement-budget tier for workspace.create (39-40 stmts vs flat 25) ([#1275](https://github.com/intent-hq/intentd/pull/1275))
+
+
 ## [0.7.11] - 2026-08-16
 
 ### 🚀 Features
