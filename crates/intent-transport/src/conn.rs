@@ -823,6 +823,7 @@ async fn handle_sub_fast_path(
                 let subscriptions::ChatSubscribeParams {
                     agent_id,
                     since_message_id,
+                    delta_encoding,
                     replace_group,
                 } = p;
                 if let Some(group) = replace_group.as_deref() {
@@ -851,6 +852,7 @@ async fn handle_sub_fast_path(
                     api.clone(),
                     AgentId::from(agent_id),
                     since_message_id,
+                    delta_encoding,
                     subscription,
                     subscription_id.clone(),
                     out_tx.clone(),
@@ -1019,6 +1021,7 @@ async fn forward_chat_subscription(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
     since_message_id: Option<String>,
+    delta_encoding: subscriptions::DeltaEncoding,
     mut subscription: Subscription,
     subscription_id: String,
     out_tx: OutboundSender,
@@ -1026,20 +1029,24 @@ async fn forward_chat_subscription(
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
-    let snapshot =
+    let mut snapshot =
         subscriptions::chat_snapshot(api.as_ref(), &agent_id, since_message_id.as_deref()).await;
+    subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send(frame).await.is_err() {
         return;
     }
-    let mut state = subscriptions::ChatDeltaState::new(&agent_id);
+    let mut state = subscriptions::ChatDeltaState::new(&agent_id, delta_encoding);
     // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
     // seed the delta state from it so the next chunk continues the streamed text
-    // (full-text deltas) instead of restarting from empty.
+    // (full-text deltas append server-side; incremental deltas append
+    // client-side onto the snapshot's text) instead of restarting from empty.
     state.seed_from_snapshot(&snapshot);
     // Backpressure conflation (see `crate::conflate`): built chunk deltas are
-    // conflatable latest-wins per block — each carries the FULL accumulated
-    // text (D2), so the newest supersedes. The buffer sits post-state (the
+    // conflatable per block — full-text deltas merge latest-wins (each
+    // carries the FULL accumulated text, D2, so the newest supersedes);
+    // incremental deltas merge by `textDelta` concat (append-only fragments
+    // compose, same as `terminal:data`). The buffer sits post-state (the
     // mapper consumed every event in order) and pre-seq: `seq` is assigned
     // only when a frame actually goes out, staying contiguous. Every other
     // delta (tool calls, `stream:end` reconcile, message rows) is a barrier
@@ -1067,7 +1074,7 @@ async fn forward_chat_subscription(
             // client is not left stale until the next event happens to arrive.
             _ = tokio::time::sleep(CHAT_RECOVERY_RETRY), if pending_recovery.is_some() => {
                 if !attempt_chat_recovery(
-                    api.as_ref(), &agent_id, &subscription_id,
+                    api.as_ref(), &agent_id, &subscription_id, delta_encoding,
                     &mut seq, &out_tx, &mut state, &mut pending_recovery,
                 ).await {
                     return;
@@ -1090,7 +1097,7 @@ async fn forward_chat_subscription(
                     // supersedes them — and each delivery re-attempts the read.
                     Delivery::Batch(_) if pending_recovery.is_some() => {
                         if !attempt_chat_recovery(
-                            api.as_ref(), &agent_id, &subscription_id,
+                            api.as_ref(), &agent_id, &subscription_id, delta_encoding,
                             &mut seq, &out_tx, &mut state, &mut pending_recovery,
                         ).await {
                             return;
@@ -1126,7 +1133,7 @@ async fn forward_chat_subscription(
                             pending_recovery.unwrap_or(0).saturating_add(skipped),
                         );
                         if !attempt_chat_recovery(
-                            api.as_ref(), &agent_id, &subscription_id,
+                            api.as_ref(), &agent_id, &subscription_id, delta_encoding,
                             &mut seq, &out_tx, &mut state, &mut pending_recovery,
                         ).await {
                             return;
@@ -1211,28 +1218,31 @@ const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
 /// Returns `false` only when the outbound lane is closed (caller returns).
+#[allow(clippy::too_many_arguments)]
 async fn attempt_chat_recovery(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
     subscription_id: &str,
+    delta_encoding: subscriptions::DeltaEncoding,
     seq: &mut u64,
     out_tx: &mpsc::Sender<String>,
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
 ) -> bool {
-    let Some(snapshot) = subscriptions::chat_recovery_snapshot(api, agent_id).await else {
+    let Some(mut snapshot) = subscriptions::chat_recovery_snapshot(api, agent_id).await else {
         tracing::warn!(
             agent = %agent_id,
             "chat lag recovery read failed; keeping recovery pending"
         );
         return true;
     };
+    subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
     if out_tx.send(frame).await.is_err() {
         return false;
     }
-    *state = subscriptions::ChatDeltaState::new(agent_id);
+    *state = subscriptions::ChatDeltaState::new(agent_id, delta_encoding);
     state.seed_from_snapshot(&snapshot);
     *pending_recovery = None;
     true
