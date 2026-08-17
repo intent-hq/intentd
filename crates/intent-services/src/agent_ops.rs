@@ -9002,6 +9002,24 @@ impl Services {
         content: &str,
         message_metadata: Option<&Value>,
     ) -> Result<Value> {
+        // Up-front vanished-session gate (intent-hq/monorepo#2762): reject
+        // nonexistent targets BEFORE any state change (the monorepo#564
+        // contract). This covers the enqueue-only routes below
+        // (archived-workspace park, question hold, busy-agent fast enqueue)
+        // that return queued success without ever touching `agent_message` —
+        // without it a wake racing an `agent.delete` parks a phantom entry no
+        // drain can ever deliver. The append-failure arms keep their own
+        // NotFound re-check as the check-then-act race guard.
+        if matches!(
+            self.store.get_agent_session_status(agent_id).await,
+            Err(Error::NotFound(_))
+        ) {
+            self.drop_queue(agent_id);
+            return Err(Error::InvalidParams(format!(
+                "unknown agent id: {}",
+                agent_id.0
+            )));
+        }
         let build_block = || match message_metadata {
             Some(md) => json!({ "type": "text", "text": content, "messageMetadata": md }),
             None => json!({ "type": "text", "text": content }),

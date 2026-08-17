@@ -9540,6 +9540,100 @@ async fn wake_delivery_to_vanished_session_fails_closed() {
     assert!(!mgr.is_busy(&id), "slot released after the rejected wake");
 }
 
+/// intent-hq/monorepo#2762 regression, wake enqueue-only route: a wake for a
+/// BUSY agent whose session vanished never touches `agent_message` (the
+/// busy-agent branch returns queued success without any append), so the
+/// append-failure guard alone cannot catch it — the up-front vanished-session
+/// gate must reject it before the phantom entry is parked.
+#[tokio::test]
+async fn wake_to_busy_vanished_session_fails_closed() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-busy"),
+        AgentId::from("a-2762-busy"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(
+        mgr.try_begin_turn(&id, &ws).await,
+        "claim the in-flight slot so the wake takes the busy enqueue branch"
+    );
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+
+    let err = mgr
+        .services
+        .deliver_wake_message(&ws, &id, "[Agent Completed] raced wake", None)
+        .await
+        .expect_err("wake to a busy-but-vanished session is rejected");
+    assert!(
+        matches!(&err, Error::InvalidParams(msg) if msg.contains("unknown agent id")),
+        "monorepo#564 fail-closed contract: {err:?}"
+    );
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry parked by the enqueue-only route"
+    );
+}
+
+/// intent-hq/monorepo#2762 regression, batch flush interleaving: when a
+/// flush persists an earlier entry and the session vanishes while persisting
+/// a later one, the fail-closed restore must NOT put the already-persisted
+/// head entries back — the vanished-session discard dropped the whole queue,
+/// and restoring `head` would recreate a ghost in-memory queue (plus a
+/// failed write-through) for the deleted agent.
+#[tokio::test]
+async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-flush"),
+        AgentId::from("a-2762-flush"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+
+    // Head entry already durable (`persisted: true`, e.g. a terminal-failure
+    // requeue), second entry needs the row append — which fails NotFound
+    // against the deleted session.
+    let entry = |suffix: &str, persisted: bool| crate::agent_ops::QueuedMessage {
+        id: format!("qm-2762-{suffix}"),
+        turn_id: format!("qm-2762-{suffix}"),
+        content: format!("entry {suffix}"),
+        image_blocks: None,
+        file_blocks: None,
+        queued_at: now_iso(),
+        editing: false,
+        persisted,
+        requeued_after_failure: false,
+        message_metadata: None,
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
+    };
+    let batch = vec![entry("head", true), entry("tail", false)];
+
+    let prep = super::prepare_flush_turn(&mgr, &id, &ws, batch).await;
+    assert!(
+        matches!(prep, super::FlushPrep::Parked),
+        "vanished-session flush parks instead of starting a turn"
+    );
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no ghost queue restored from already-persisted head entries"
+    );
+}
+
 /// Absolute path to the deterministic mock ACP agent fixture so a unit test
 /// can exercise a REAL successful turn (node child, ACP handshake, default
 /// "Mock agent completed." response) through the drain paths.

@@ -8944,7 +8944,16 @@ async fn prepare_flush_turn(
         let head = entries;
         let options = turn_options_for_entry(&failed, stale);
         mgr.services.requeue_front_batch(agent_id, tail);
-        handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options).await;
+        let vanished =
+            handle_drain_persist_failure(mgr, agent_id, workspace_id, &failed.content, &options)
+                .await;
+        if vanished {
+            // The session is GONE (monorepo#2762): the handler dropped the
+            // whole in-memory queue (the tail requeued above included).
+            // Restoring the already-persisted head entries would recreate a
+            // ghost queue for the deleted agent — discard them instead.
+            return FlushPrep::Parked;
+        }
         mgr.services.requeue_front_batch(agent_id, head);
         // The handler's queue publish preceded the head requeue: re-publish
         // so clients see the fully-restored queue.
@@ -9791,16 +9800,20 @@ async fn handle_terminal_spawn_failure(
 /// and no partial stream to close; the terminal event pair + Error park +
 /// front requeue (`persisted: false`) make the failure observable and
 /// redrivable via `agent.retry`. Callers release the in-flight slot after.
+/// Returns `true` when the session VANISHED and the failure was discarded
+/// wholesale (monorepo#2762) — the in-memory queue is gone, so callers that
+/// restore surrounding queue state afterwards (the batch flush path) must
+/// skip that restore instead of recreating a ghost queue.
 async fn handle_drain_persist_failure(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     content: &str,
     options: &TurnOptions,
-) {
+) -> bool {
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
     if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
-        return;
+        return true;
     }
     tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
     // Durable-before-observable (monorepo#2009): persist Error + stop_reason
@@ -9824,6 +9837,7 @@ async fn handle_drain_persist_failure(
         persist,
     )
     .await;
+    false
 }
 
 /// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
