@@ -25414,14 +25414,15 @@ async fn task_graph_off_suppresses_unblocked_section() {
 /// by the interrupted turn.
 mod resume_tail_recap {
     use crate::agent_ops::{
-        build_resume_tail_recap, RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_CONTINUATION_PREFIX,
+        build_resume_tail_recap, LEGACY_RESUME_CONTINUATION_TEXT,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_CONTINUATION_METADATA_TYPE,
     };
     use intent_core::{AgentId, AgentMessage};
     use serde_json::{json, Value};
 
     /// A duration-suffixed continuation as `resume_interrupted_agent`
-    /// delivers it — persisted rows carry a per-resume duration, which is
-    /// why the recap skip is a prefix match, not exact equality.
+    /// delivers it — persisted rows embed a per-resume duration and carry
+    /// the [`RESUME_CONTINUATION_METADATA_TYPE`] tag the recap skip keys off.
     const DURATION_CONTINUATION: &str = "You were interrupted for about 15 seconds due to a \
          harness shutdown and restart. You can now continue your work and pick up where you \
          left off.";
@@ -25441,6 +25442,16 @@ mod resume_tail_recap {
 
     fn user(text: &str) -> AgentMessage {
         message("user", json!([{ "type": "text", "text": text }]), None)
+    }
+
+    /// A persisted continuation row as `resume_interrupted_agent` delivers
+    /// it: user role with the [`RESUME_CONTINUATION_METADATA_TYPE`] tag.
+    fn continuation_row(text: &str) -> AgentMessage {
+        message(
+            "user",
+            json!([{ "type": "text", "text": text }]),
+            Some(json!({ "type": RESUME_CONTINUATION_METADATA_TYPE, "source": "system" })),
+        )
     }
 
     fn assistant(text: &str) -> AgentMessage {
@@ -25569,7 +25580,7 @@ mod resume_tail_recap {
             user("original lost request"),
             interrupted_assistant("first partial..."),
             system_marker(),
-            user(DURATION_CONTINUATION),
+            continuation_row(DURATION_CONTINUATION),
             interrupted_assistant("second partial..."),
             system_marker(),
         ];
@@ -25588,29 +25599,24 @@ mod resume_tail_recap {
         )));
     }
 
-    /// The recap skip is a stable-prefix match on
-    /// [`RESUME_CONTINUATION_PREFIX`]: the duration-suffixed variant, the
-    /// no-duration fallback, AND legacy persisted rows of the pre-duration
-    /// wording are all suppressed from the replay.
+    /// The recap skips tagged continuation rows of every wording — the
+    /// duration-suffixed variant and the no-duration fallback — plus
+    /// untagged legacy rows matched by exact equality with
+    /// [`LEGACY_RESUME_CONTINUATION_TEXT`].
     #[test]
     fn recap_skips_all_continuation_variants() {
-        let legacy = "You were interrupted because the harness shut down. You now have a \
-             chance to continue the work — review your last steps and pick up where you left \
-             off.";
-        for continuation in [
-            DURATION_CONTINUATION,
-            RESUME_CONTINUATION_FALLBACK_TEXT,
-            legacy,
-        ] {
-            assert!(
-                continuation.starts_with(RESUME_CONTINUATION_PREFIX),
-                "variant must carry the stable prefix: {continuation}"
-            );
+        let variants = [
+            continuation_row(DURATION_CONTINUATION),
+            continuation_row(RESUME_CONTINUATION_FALLBACK_TEXT),
+            user(LEGACY_RESUME_CONTINUATION_TEXT),
+        ];
+        for row in variants {
+            let text = row.content[0]["text"].as_str().unwrap().to_string();
             let messages = vec![
                 user("original lost request"),
                 interrupted_assistant("first partial..."),
                 system_marker(),
-                user(continuation),
+                row,
                 interrupted_assistant("second partial..."),
             ];
             let recap = build_resume_tail_recap(&messages).expect("recap");
@@ -25618,24 +25624,30 @@ mod resume_tail_recap {
             assert!(
                 !recap
                     .text
-                    .contains(&format!("<interrupted_user_message>\n{continuation}")),
-                "continuation variant must not be replayed: {continuation}"
+                    .contains(&format!("<interrupted_user_message>\n{text}")),
+                "continuation variant must not be replayed: {text}"
             );
         }
     }
 
-    /// The prefix skip only suppresses continuation rows: an ordinary user
-    /// message that does not start with the prefix is still replayed.
+    /// The skip is keyed on the metadata tag, not the text: an ORDINARY
+    /// user request that happens to carry the exact continuation wording
+    /// (untagged, non-legacy) is still replayed — losing it would drop the
+    /// user's request from the provider-side context after a restart.
     #[test]
-    fn recap_replays_ordinary_user_message_despite_prefix_skip() {
-        let messages = vec![
-            user("please investigate why I was interrupted earlier"),
-            interrupted_assistant("partial..."),
-        ];
-        let recap = build_resume_tail_recap(&messages).expect("recap");
-        assert!(recap
-            .text
-            .contains("please investigate why I was interrupted earlier"));
+    fn recap_replays_untagged_message_with_continuation_wording() {
+        for text in [
+            DURATION_CONTINUATION,
+            RESUME_CONTINUATION_FALLBACK_TEXT,
+            "You were interrupted earlier — please investigate why",
+        ] {
+            let messages = vec![user(text), interrupted_assistant("partial...")];
+            let recap = build_resume_tail_recap(&messages).expect("recap");
+            assert!(
+                recap.text.contains(text),
+                "untagged user message must be replayed: {text}"
+            );
+        }
     }
 
     /// Replayed text is XML-escaped: a user message containing closing tags
@@ -25711,7 +25723,7 @@ mod resume_tail_recap {
         for i in 0..20 {
             messages.push(interrupted_assistant(&format!("partial-{i}")));
             messages.push(system_marker());
-            messages.push(user(DURATION_CONTINUATION));
+            messages.push(continuation_row(DURATION_CONTINUATION));
         }
         messages.push(interrupted_assistant("partial-final"));
         let recap = build_resume_tail_recap(&messages).expect("recap");
@@ -25727,7 +25739,6 @@ mod resume_tail_recap {
 mod resume_continuation {
     use crate::agent_ops::{
         humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
-        RESUME_CONTINUATION_PREFIX,
     };
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
@@ -25753,8 +25764,7 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
     }
 
-    /// The delivered wording embeds the duration and carries the stable
-    /// recap-skip prefix.
+    /// The delivered wording embeds the duration.
     #[test]
     fn continuation_carries_duration() {
         let text = resume_continuation_text("2026-08-15T12:00:00Z", parse("2026-08-15T12:00:15Z"));
@@ -25763,7 +25773,6 @@ mod resume_continuation {
             "You were interrupted for about 15 seconds due to a harness shutdown and restart. \
              You can now continue your work and pick up where you left off."
         );
-        assert!(text.starts_with(RESUME_CONTINUATION_PREFIX));
     }
 
     /// An unparseable `interrupted_at` never fails the resume: the base
@@ -25772,7 +25781,6 @@ mod resume_continuation {
     fn continuation_falls_back_on_unparseable_timestamp() {
         let text = resume_continuation_text("not-a-timestamp", parse("2026-08-15T12:00:00Z"));
         assert_eq!(text, RESUME_CONTINUATION_FALLBACK_TEXT);
-        assert!(text.starts_with(RESUME_CONTINUATION_PREFIX));
     }
 
     /// A negative delta (clock skew: `interrupted_at` in the future) also
