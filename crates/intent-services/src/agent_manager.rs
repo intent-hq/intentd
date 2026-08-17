@@ -4676,6 +4676,67 @@ impl AgentManager {
             }
             return Ok(result);
         }
+        // Archived-workspace gate (intent-hq/monorepo#2732): an AUTOMATIC
+        // delivery into an archived workspace must NOT claim the slot — the
+        // claim's `try_begin` auto-unarchive would flip the workspace
+        // straight back to Active, so an internal parent wake (completion
+        // watch, event subscription, reportToParent) or agent-to-agent send
+        // landing right after `workspace.archive` silently un-archived it
+        // (the archive/auto-unarchive loop). Park the message in the queue
+        // instead (mirroring the `deliver_wake_message` / `try_drain_queue`
+        // gates); `unarchive_workspace`'s drain kick delivers it. Only
+        // `MessageOrigin::User` (FE `agent.sendMessage`) keeps the revive
+        // behavior. Keyed on the DELIVERY workspace (the target's home
+        // workspace, the one `try_begin` would unarchive), so cross-workspace
+        // watchers in Active workspaces are unaffected. Chief is virtual and
+        // never archived, so skip the row read; fail open on a lookup error
+        // — the gate only parks affirmatively-archived workspaces.
+        if !options.origin.is_user() && !workspace_id.is_chief() {
+            match self.services.store.get_workspace(&workspace_id).await {
+                Ok(ws) if ws.archived => {
+                    let (queued, position) = self.services.enqueue_message(
+                        &agent_id,
+                        content,
+                        options.image_blocks.clone(),
+                        options.file_blocks.clone(),
+                        options.message_metadata.clone(),
+                        options.queued_prepend(),
+                        options.interrupt_priority,
+                    );
+                    let result = json!({
+                        "success": true,
+                        "queued": true,
+                        "queuedMessage": queued.to_value(position),
+                        "turnId": queued.turn_id,
+                    });
+                    self.services.publish_queue_updated(&agent_id).await;
+                    // Race close (archived-check → enqueue vs a concurrent
+                    // `workspace.unarchive`): the unarchive's own drain kick
+                    // may have fired against a still-empty queue before this
+                    // enqueue landed, stranding the entry. Re-check and kick
+                    // the drain if the workspace is no longer archived; the
+                    // archived gate in `try_drain_queue` makes this a no-op
+                    // while still archived.
+                    if let Ok(current) = self.services.store.get_workspace(&workspace_id).await {
+                        if !current.archived {
+                            self.clone()
+                                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                                .await;
+                        }
+                    }
+                    return Ok(result);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        workspace = %workspace_id.as_str(),
+                        error = %e,
+                        "automatic send: workspace archived-state lookup failed; proceeding"
+                    );
+                }
+            }
+        }
         // Question hold (PROTOCOL §5.5): an automatic delivery to an agent
         // with un-dismissed pending questions must NOT start a turn — its
         // turn would bury the pending Q&A under later transcript rows and
@@ -5572,6 +5633,23 @@ impl AgentManager {
         // agent's hold cannot be active since the Q&A message is terminal)
         // and let `send_message`'s hold gate park the message front-of-queue.
         if !options.origin.is_user() && self.services.question_hold_active(&agent_id).await {
+            return self
+                .send_message(agent_id, workspace_id, content, message_id, options)
+                .await;
+        }
+        // Archived-workspace gate (intent-hq/monorepo#2732): an automatic
+        // interrupt into an archived workspace is ALSO parked — skip the
+        // preemption (cancelling a turn only to park the interrupt behind
+        // the archived gate would be pure loss) and let `send_message`'s
+        // archived gate park the message front-of-queue. Same fail-open
+        // semantics as that gate: only an affirmatively-archived row parks.
+        if !options.origin.is_user()
+            && !workspace_id.is_chief()
+            && matches!(
+                self.services.store.get_workspace(&workspace_id).await,
+                Ok(ws) if ws.archived
+            )
+        {
             return self
                 .send_message(agent_id, workspace_id, content, message_id, options)
                 .await;
