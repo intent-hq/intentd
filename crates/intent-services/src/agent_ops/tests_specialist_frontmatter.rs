@@ -728,3 +728,95 @@ async fn unknown_specialist_creates_without_snapshot() {
     let session = svc.store().get_agent_session(&id).await.expect("session");
     assert!(session.metadata.is_none(), "no snapshot for unknown id");
 }
+
+// ---- Regression: prompt frozen across specialist file edits (end-to-end) ----
+
+/// End-to-end freeze invariant: an agent created from a user-tier specialist
+/// file keeps its original behavior prompt, display name, and role reminder
+/// in the spawn assembly (`agent_specialist_injection`) after the file is
+/// edited — and after it is deleted.
+#[tokio::test]
+async fn injection_frozen_after_specialist_file_edit() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
+
+    // Edit the file after creation: new name, reminder, and body.
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Edited Name",
+        "Edited reminder",
+        "Edited body.",
+    );
+
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection");
+    assert_eq!(
+        inj.behavior_prompt.as_deref(),
+        Some("Original behavior prompt body.")
+    );
+    assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
+
+    // Delete the file: the frozen triple must still survive intact.
+    std::fs::remove_file(specialists_dir.path().join("frozen.md")).expect("delete specialist");
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection after delete");
+    assert_eq!(
+        inj.behavior_prompt.as_deref(),
+        Some("Original behavior prompt body.")
+    );
+    assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Stay frozen"));
+}
+
+/// Companion pin: a pre-change-style session (no frozen snapshot keys in its
+/// metadata) resolves live and DOES pick up the file edit — legacy behavior
+/// unchanged.
+#[tokio::test]
+async fn legacy_session_without_snapshot_picks_up_file_edit() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
+
+    // Simulate a pre-change row by stripping the creation-time snapshot.
+    svc.store()
+        .update_agent_session_metadata(&ws, &id, None, &intent_core::now_iso())
+        .await
+        .expect("strip snapshot");
+
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Edited Name",
+        "Edited reminder",
+        "Edited body.",
+    );
+
+    let inj = svc
+        .agent_specialist_injection(&id, None)
+        .await
+        .expect("injection");
+    assert_eq!(inj.behavior_prompt.as_deref(), Some("Edited body."));
+    assert_eq!(inj.specialist_name.as_deref(), Some("Edited Name"));
+    assert_eq!(inj.role_reminder.as_deref(), Some("Edited reminder"));
+}
