@@ -171,6 +171,9 @@ mod tests_delegate_provider_resolution;
 #[cfg(test)]
 mod tests_settings_default_effort;
 
+#[cfg(test)]
+mod tests_catalog_default_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -231,7 +234,12 @@ pub(crate) enum DefaultModelSource {
     Specialist,
     /// Step 3 — the settings chain ([`resolve_default_model_from_settings`]).
     Settings,
-    /// Step 4 — nothing resolved; the provider CLI default applies.
+    /// Step 4 — the cached provider catalog's `isDefault` row
+    /// ([`crate::model_catalog::ModelCatalogCache::cached_default_model`]).
+    /// Not a settings default: the settings default reasoning effort does
+    /// NOT apply to it.
+    CatalogDefault,
+    /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
 }
 
@@ -242,13 +250,17 @@ pub(crate) enum DefaultModelSource {
 /// by the caller. Also reusable standalone (e.g. `specialist.get/list`
 /// `resolvedModel`) so previews match what a no-model create actually pins.
 ///
-/// Precedence (steps 2–4; the former `modelTier` step is retired — the key
+/// Precedence (steps 2–5; the former `modelTier` step is retired — the key
 /// is tolerated-and-ignored in frontmatter/wire specs, PROTOCOL §5.11):
 /// 2. Specialist frontmatter `model` — only if it belongs to the resolved
 ///    provider.
 /// 3. Settings chain ([`resolve_default_model_from_settings`]) —
 ///    provider-guarded.
-/// 4. `None` → provider CLI default (`session.model` stays unset).
+/// 4. The **cached** provider catalog's `isDefault` row (PROTOCOL §5.30) —
+///    cache-only, never a probe: pinning it freezes the model even if the
+///    provider later changes its default. Cold cache or no marked row falls
+///    through.
+/// 5. `None` → provider CLI default (`session.model` stays unset).
 ///
 /// The chain is background-agnostic (monorepo#1729): the quick-action model
 /// settings apply to single-shot quick actions only, so a delegated
@@ -309,21 +321,33 @@ pub(crate) fn resolve_agent_default_model_with_source(
     }
 
     // Step 3: settings chain, provider-guarded — a configured default owned
-    // by another provider must not be pinned (monorepo#607); drop to the CLI
-    // default instead of rejecting a model the caller never sent.
-    let Some(m) = resolve_default_model_from_settings(services, provider) else {
-        return (None, DefaultModelSource::CliDefault);
-    };
-    if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
-        return (Some(m), DefaultModelSource::Settings);
+    // by another provider must not be pinned (monorepo#607); drop to the
+    // catalog/CLI default instead of rejecting a model the caller never sent.
+    if let Some(m) = resolve_default_model_from_settings(services, provider) {
+        if default_model_belongs_to_provider(services, provider, effective_provider, &m) {
+            return (Some(m), DefaultModelSource::Settings);
+        }
+        tracing::warn!(
+            model = m,
+            provider = effective_provider,
+            "configured default model belongs to another provider; \
+             falling back to the catalog/CLI default"
+        );
     }
-    tracing::warn!(
-        model = m,
-        provider = effective_provider,
-        "configured default model belongs to another provider; \
-         falling back to the CLI default"
-    );
-    // Step 4: None → provider CLI default.
+
+    // Step 4: the cached catalog's `isDefault` row for the resolved provider
+    // (PROTOCOL §5.5). Cache-only — never a probe on the creation path; the
+    // row is the provider's own by construction, so no ownership guard is
+    // needed. Pinning it to session.model freezes the model for the
+    // session's lifetime even if the provider later changes its default.
+    if let Some(m) = services
+        .models_catalog
+        .cached_default_model(effective_provider)
+    {
+        return (Some(m), DefaultModelSource::CatalogDefault);
+    }
+
+    // Step 5: None → provider CLI default.
     (None, DefaultModelSource::CliDefault)
 }
 

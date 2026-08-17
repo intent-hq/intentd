@@ -133,7 +133,8 @@ fn parse_acp_models_from_claude_code_config_options() {
     // (2026-07-21): models live in configOptions[id="model"].options; the
     // sibling mode/fast select options are ignored; the effort select supplies
     // the catalog-wide fallback. Model values remain verbatim (including
-    // effort-suffixed ids like "opus[1m]").
+    // effort-suffixed ids like "opus[1m]"). The select's currentValue names a
+    // real row, so it is marked isDefault and the "default" pseudo-row drops.
     let payload = json!({
         "sessionId": "sess_1",
         "modes": { "currentModeId": "acceptEdits", "availableModes": [] },
@@ -167,24 +168,153 @@ fn parse_acp_models_from_claude_code_config_options() {
     });
     let rows = parse_acp_models(&payload, "claude-code");
     let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
-    assert_eq!(
-        ids,
-        [
-            "default",
-            "opus[1m]",
-            "claude-fable-5[1m]",
-            "sonnet",
-            "haiku"
-        ]
-    );
+    assert_eq!(ids, ["opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku"]);
     assert_eq!(
         rows[0],
-        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code",
+        json!({ "id": "opus[1m]", "name": "Opus", "provider": "claude-code",
                 "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks",
-                "effortLevels": ["low"] })
+                "effortLevels": ["low"], "isDefault": true })
     );
-    assert_eq!(rows[2]["name"], "Fable");
+    assert_eq!(rows[1]["name"], "Fable");
     assert!(rows.iter().all(|r| r["provider"] == "claude-code"));
+}
+
+#[test]
+fn parse_acp_models_resolves_default_pseudo_row_via_family_match() {
+    // currentValue is the pseudo-row itself, so the default resolves by
+    // matching the pseudo-row's version-bearing family ("Opus 4.8") against
+    // the sibling rows: the pseudo-row drops, the sibling gains isDefault.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "category": "model", "type": "select",
+              "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "opus[1m]", "name": "Opus",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "sonnet", "name": "Sonnet",
+                  "description": "Sonnet 5 · Efficient for routine tasks" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["opus[1m]", "sonnet"]);
+    assert_eq!(rows[0]["isDefault"], json!(true));
+    assert!(!rows[1].as_object().unwrap().contains_key("isDefault"));
+}
+
+#[test]
+fn parse_acp_models_keeps_unresolvable_default_pseudo_row() {
+    // Fail-soft: a pseudo-row whose name/description carry no version-bearing
+    // family (or whose family matches zero or several siblings) is kept as-is
+    // and nothing is marked isDefault.
+    let no_family = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)" },
+                { "value": "opus", "name": "Opus 4.8" },
+                { "value": "sonnet", "name": "Sonnet 5" }
+              ] }
+        ]
+    });
+    let ambiguous = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default", "description": "Opus 4.8" },
+                { "value": "opus", "name": "Opus 4.8" },
+                { "value": "opus[1m]", "name": "Opus 4.8 (1M context)" }
+              ] }
+        ]
+    });
+    for payload in [no_family, ambiguous] {
+        let rows = parse_acp_models(&payload, "claude-code");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["id"], "default");
+        assert!(rows
+            .iter()
+            .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
+    }
+
+    // A lone pseudo-row can never resolve — the catalog must not come back
+    // empty.
+    let only_default = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "default",
+              "options": [ { "value": "default", "name": "Default (recommended)" } ] }
+        ]
+    });
+    let rows = parse_acp_models(&only_default, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "default");
+}
+
+#[test]
+fn parse_acp_models_current_value_marks_default_without_pseudo_row() {
+    // A real (non-"default") currentValue marks its row isDefault even when
+    // the catalog carries no pseudo-row at all.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "sonnet",
+              "options": [
+                { "value": "opus", "name": "Opus" },
+                { "value": "sonnet", "name": "Sonnet" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(!rows[0].as_object().unwrap().contains_key("isDefault"));
+    assert_eq!(rows[1]["isDefault"], json!(true));
+}
+
+#[test]
+fn parse_acp_models_current_value_wins_over_unresolvable_pseudo_row() {
+    // The currentValue resolution is authoritative: it marks its row and
+    // drops the pseudo-row even when the family match alone could not have
+    // resolved it (family-less pseudo-row description).
+    let payload = json!({
+        "configOptions": [
+            { "id": "model", "currentValue": "haiku",
+              "options": [
+                { "value": "Default", "name": "Default (recommended)" },
+                { "value": "opus", "name": "Opus" },
+                { "value": "haiku", "name": "Haiku" }
+              ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    // The pseudo-row id matches case-insensitively.
+    assert_eq!(ids, ["opus", "haiku"]);
+    assert_eq!(rows[1]["isDefault"], json!(true));
+}
+
+#[test]
+fn parse_acp_models_family_less_default_row_stays_without_config_options() {
+    // Catalogs from the models.availableModels shapes have no model select to
+    // read a currentValue from, so only the family-match fallback applies.
+    // This family-less "default" row cannot resolve — it stays and no row is
+    // marked, matching the pre-resolution behavior. (A legacy default row
+    // whose name/description DOES carry a version-bearing family shared with
+    // exactly one sibling would still resolve via the fallback.)
+    let payload = json!({
+        "models": {
+            "availableModels": [
+                { "modelId": "default", "name": "Default" },
+                { "modelId": "opus", "name": "Opus" }
+            ],
+            "currentModelId": "opus"
+        }
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| !r.as_object().unwrap().contains_key("isDefault")));
 }
 
 #[test]
