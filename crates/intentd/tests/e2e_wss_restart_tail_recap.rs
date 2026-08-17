@@ -49,10 +49,14 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 const LOST_USER_MSG: &str = "build a simple local webapp that surfaces the board";
 /// The chunk `blockUntilCancel` streams before parking — the partial output.
 const PARTIAL_MARKER: &str = "streaming-before-cancel";
-/// Must match the approved continuation wording in
-/// `Services::resume_interrupted_agent`.
-const CONTINUATION_TEXT: &str = "You were interrupted because the harness shut down. You now \
-     have a chance to continue the work — review your last steps and pick up where you left off.";
+/// Stable prefix of the continuation wording in
+/// `Services::resume_interrupted_agent` — the delivered message embeds a
+/// per-resume humanized outage duration after it, so asserts match on the
+/// prefix plus [`CONTINUATION_SUFFIX`].
+const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
+/// The fixed remainder after the duration clause.
+const CONTINUATION_SUFFIX: &str = "due to a harness shutdown and restart. You can now continue \
+     your work and pick up where you left off.";
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -508,19 +512,15 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     // The continuation prompt (turn 1 of the NEW child process — a fresh pid)
     // must carry the recap: the interrupting user message, the partial-output
     // marker, the cut-off disclosure, and the approved continuation wording.
+    let is_continuation =
+        |t: &str| t.contains(CONTINUATION_PREFIX) && t.contains(CONTINUATION_SUFFIX);
     let prompts = await_log_lines(&prompt_log, "continuation prompt", |l| {
-        l["text"]
-            .as_str()
-            .is_some_and(|t| t.contains(CONTINUATION_TEXT))
+        l["text"].as_str().is_some_and(is_continuation)
     })
     .await;
     let continuation = prompts
         .iter()
-        .find(|l| {
-            l["text"]
-                .as_str()
-                .is_some_and(|t| t.contains(CONTINUATION_TEXT))
-        })
+        .find(|l| l["text"].as_str().is_some_and(is_continuation))
         .expect("continuation prompt line");
     let text = continuation["text"].as_str().unwrap();
     assert!(

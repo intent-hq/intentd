@@ -43,10 +43,10 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 const START_MSG: &str = "Start the long-running task";
 const QUEUED_ONE: &str = "preserved queue message one";
 const QUEUED_TWO: &str = "preserved queue message two";
-/// Must match the approved continuation wording in
-/// `Services::resume_interrupted_agent`.
-const CONTINUATION_TEXT: &str = "You were interrupted because the harness shut down. You now \
-     have a chance to continue the work — review your last steps and pick up where you left off.";
+/// Stable prefix of the continuation wording in
+/// `Services::resume_interrupted_agent` — the delivered message embeds a
+/// per-resume humanized outage duration, so asserts match on this prefix.
+const CONTINUATION_PREFIX: &str = "You were interrupted for about ";
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -570,9 +570,13 @@ fn assert_continuation_first_then_fifo(users: &[String]) {
             .unwrap_or_else(|| panic!("missing user message {needle:?} in transcript: {users:?}"))
     };
     let i_start = idx(START_MSG);
-    let i_cont = idx(CONTINUATION_TEXT);
+    let i_cont = idx(CONTINUATION_PREFIX);
     let i_one = idx(QUEUED_ONE);
     let i_two = idx(QUEUED_TWO);
+    assert!(
+        users[i_cont].contains("due to a harness shutdown and restart"),
+        "continuation must carry the duration sentence: {users:?}"
+    );
     assert!(
         i_start < i_cont,
         "original message must precede continuation: {users:?}"
@@ -585,7 +589,7 @@ fn assert_continuation_first_then_fifo(users: &[String]) {
         i_one < i_two,
         "preserved queued messages must drain FIFO: {users:?}"
     );
-    for needle in [CONTINUATION_TEXT, QUEUED_ONE, QUEUED_TWO] {
+    for needle in [CONTINUATION_PREFIX, QUEUED_ONE, QUEUED_TWO] {
         assert_eq!(
             users.iter().filter(|t| t.starts_with(needle)).count(),
             1,
@@ -774,7 +778,7 @@ async fn abandon_keeps_preserved_queue_inert() {
         "abandon must not auto-send preserved queue: {users:?}"
     );
     assert!(
-        !users.iter().any(|t| t == CONTINUATION_TEXT),
+        !users.iter().any(|t| t.starts_with("You were interrupted ")),
         "abandon must not send the continuation: {users:?}"
     );
     {
