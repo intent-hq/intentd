@@ -7600,6 +7600,81 @@ async fn archive_workspace_parks_wake_deliveries() {
     );
 }
 
+/// Regression (intent-hq/monorepo#2739): the archived-check → enqueue window
+/// in `deliver_wake_message` vs a concurrent `workspace.unarchive`. The
+/// unarchive's drain kick fires against the still-empty queue before the
+/// gate's enqueue lands, so without a post-enqueue re-check the parked wake
+/// strands until the next organic drain trigger. The re-check must self-heal
+/// by kicking the drain once it observes the workspace no longer archived
+/// (mirroring `AgentManager::send_message`'s archived-gate re-check).
+#[tokio::test]
+async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let services = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_wake_archived_park(park.clone());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = Arc::new(AgentManager::new(services.clone(), sink, 8));
+    services.attach_agent_manager(&mgr);
+
+    let ws = WorkspaceId::from("ws-archive-wake-race");
+    let id = AgentId::from("a-archive-wake-race");
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+
+    <Services as WorkspaceApi>::archive_workspace(&services, ws.clone(), None)
+        .await
+        .expect("archive workspace");
+
+    // The wake enters the archived gate and parks in the seam window with
+    // the enqueue still pending.
+    let deliver = {
+        let services = services.clone();
+        let (ws, id) = (ws.clone(), id.clone());
+        tokio::spawn(async move {
+            services
+                .deliver_wake_message(&ws, &id, "[Agent Completed] raced wake", None)
+                .await
+        })
+    };
+    park.entered.notified().await;
+
+    // The unarchive lands inside the window: its drain kick sees no
+    // ready-to-send work (the enqueue has not happened yet) and does
+    // nothing — the strand this regression guards against.
+    <Services as WorkspaceApi>::unarchive_workspace(&services, ws.clone())
+        .await
+        .expect("unarchive workspace");
+    assert!(
+        services.queue_snapshot(&id).is_empty(),
+        "unarchive's drain kick fired against a still-empty queue"
+    );
+
+    // Release the enqueue; the post-enqueue re-check observes the workspace
+    // no longer archived and kicks the drain itself.
+    park.release.notify_one();
+    let out = deliver
+        .await
+        .expect("join wake delivery")
+        .expect("wake delivery");
+    assert_eq!(out["queued"], json!(true), "wake parked behind the gate");
+    assert_eq!(out["archivedParked"], json!(true), "archived park marker");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if services.queue_snapshot(&id).is_empty() && !services.has_ready_to_send(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-check drain delivers the raced wake without an organic kick");
+}
+
 /// Regression (intent-hq/monorepo#2732): an AUTOMATIC `send_message` into an
 /// archived workspace must park in the queue — NOT claim the slot (whose
 /// `try_begin` would auto-unarchive the workspace). The workspace stays

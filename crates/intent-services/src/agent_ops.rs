@@ -9014,6 +9014,14 @@ impl Services {
         if !workspace_id.is_chief() {
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {
+                    // Test seam (intent-hq/monorepo#2739): park in the
+                    // archived-check → enqueue window so a test can land a
+                    // concurrent `workspace.unarchive` between the gate's
+                    // read above and the enqueue below.
+                    if let Some(park) = &self.wake_archived_park {
+                        park.entered.notify_one();
+                        park.release.notified().await;
+                    }
                     let (queued, position) = self.enqueue_message(
                         agent_id,
                         content.to_string(),

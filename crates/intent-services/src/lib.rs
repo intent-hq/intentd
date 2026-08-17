@@ -455,6 +455,13 @@ pub struct Services {
     /// interleave a concurrent row mutation. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
     attention_write_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/monorepo#2739) for the
+    /// `deliver_wake_message` archived-gate read → enqueue window: parks the
+    /// wake delivery after the gate observed the workspace archived and
+    /// before the enqueue, so a concurrent `workspace.unarchive` landing
+    /// inside that window is deterministic. `None` in production wiring;
+    /// tests inject via the `#[cfg(test)]`-only `with_wake_archived_park`.
+    wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -856,6 +863,7 @@ impl Services {
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
             attention_write_park: None,
+            wake_archived_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -1425,6 +1433,19 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.attention_write_park = Some(park);
+        self
+    }
+
+    /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
+    /// its archived-gate read → enqueue window so a concurrent
+    /// `workspace.unarchive` inside that window is deterministic. Production
+    /// wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_wake_archived_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.wake_archived_park = Some(park);
         self
     }
 
