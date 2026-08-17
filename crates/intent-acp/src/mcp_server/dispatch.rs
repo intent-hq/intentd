@@ -189,10 +189,16 @@ impl WorkspaceMcpServer {
                         // Error results and the `__mcpContentItems` pass-through
                         // above are exempt from both knobs: only the plain
                         // success body is TOON-encoded / size-limited.
+                        // Each post-eval stage gets its own start marker: a
+                        // dispatch that wedges in one of these awaits never
+                        // reaches the tail event, so the last marker in the
+                        // log names the stage it never left.
+                        tracing::trace!("workspace_api dispatch: settings read starting");
                         let stage_started = Instant::now();
                         let (toon_output, max_chars) = self.workspace_api_output_settings().await;
                         settings_ms = Some(stage_started.elapsed().as_millis() as u64);
                         let (body, ext) = render_workspace_api_value(&value, toon_output);
+                        tracing::trace!("workspace_api dispatch: output finalize starting");
                         let stage_started = Instant::now();
                         let out = self
                             .finalize_workspace_api_output(body, ext, max_chars)
