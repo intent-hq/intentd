@@ -11,7 +11,7 @@
 
 use intent_core::events::{NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED};
 use intent_core::{AgentId, ClientId, NoteId, WorkspaceApi, WorkspaceId};
-use intent_services::{EventBus, Subscription, SubscriptionFilter};
+use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -983,6 +983,25 @@ async fn forward_note_subscription(
 /// `since_message_id` (§7.1 resume) trims the seq-0 snapshot to the messages
 /// after that id (`resumed: true`) or falls back to the standard full page
 /// (`resumed: false`) — see [`subscriptions::chat_snapshot`].
+///
+/// **Lag self-heal.** The broadcast ring drops this subscriber's oldest
+/// undelivered events when it falls behind (slow consumer — e.g. the bulk lane
+/// starved by large priority-lane responses). The loss is silent on the wire:
+/// `seq` is assigned only to frames actually sent, so the client sees no gap —
+/// a dropped turn tail (`chat:stream:delta` + `agent:stream:end`) would strand
+/// the transcript mid-turn forever. On an in-band [`Delivery::Lagged`] marker
+/// the forwarder therefore re-emits a fresh snapshot at the next `seq` (the
+/// client's reconciler rebuilds from any snapshot with `seq >= expected`) and
+/// reseeds the mapper from it — chosen over replaying the finalize/reconcile
+/// path because a drop can also swallow whole `agent:message` rows and
+/// tool-call events that reconcile (scoped to the in-flight assistant message)
+/// would never restore, while the snapshot converges every §7.1 case with zero
+/// protocol churn. Cost stays bounded: one [`subscriptions::chat_snapshot`]
+/// (one server-clamped newest page) per lag burst — queued markers and batches
+/// are drained first, so a burst coalesces into ONE recovery read, and the
+/// discarded queued events are already reflected in the snapshot (persisted
+/// rows in the page, in-flight streamed content via the live-turn slot merge —
+/// the same coherence argument as a fresh mid-turn subscribe).
 async fn forward_chat_subscription(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
@@ -1028,8 +1047,8 @@ async fn forward_chat_subscription(
                 }
                 Err(_) => return,
             },
-            maybe = subscription.recv() => {
-                let Some(batch) = maybe else {
+            maybe = subscription.recv_delivery() => {
+                let Some(delivery) = maybe else {
                     let _ = buffer
                         .drain_all(&out_tx, |item| {
                             let frame = item.into_frame(&subscription_id, seq);
@@ -1038,6 +1057,45 @@ async fn forward_chat_subscription(
                         })
                         .await;
                     return;
+                };
+                let batch = match delivery {
+                    Delivery::Batch(batch) => batch,
+                    // Upstream loss: the ring dropped events before delivery,
+                    // possibly this agent's turn tail. Self-heal by re-emitting
+                    // a fresh bounded snapshot at the next seq (see the doc
+                    // comment above). Coalesce first: discard everything still
+                    // queued (all published before the snapshot read below, so
+                    // the snapshot supersedes it — persisted rows land in the
+                    // page, in-flight content rides the live-turn slot merge)
+                    // and fold further lag markers in, so one burst triggers
+                    // exactly ONE bounded recovery read. Pending conflated
+                    // deltas are superseded the same way and dropped with the
+                    // pre-lag mapper state.
+                    Delivery::Lagged(n) => {
+                        let mut skipped = n;
+                        while let Some(queued) = subscription.try_recv_delivery() {
+                            if let Delivery::Lagged(more) = queued {
+                                skipped = skipped.saturating_add(more);
+                            }
+                        }
+                        tracing::warn!(
+                            agent = %agent_id,
+                            skipped,
+                            "chat subscription lagged; re-emitting a fresh snapshot to converge"
+                        );
+                        buffer = ConflationBuffer::new();
+                        let snapshot =
+                            subscriptions::chat_snapshot(api.as_ref(), &agent_id, None).await;
+                        let frame =
+                            subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot);
+                        seq += 1;
+                        if out_tx.send(frame).await.is_err() {
+                            return;
+                        }
+                        state = subscriptions::ChatDeltaState::new(&agent_id);
+                        state.seed_from_snapshot(&snapshot);
+                        continue;
+                    }
                 };
                 for event in batch {
                     // Cross-agent isolation: only this agent's stream events
