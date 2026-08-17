@@ -3,8 +3,8 @@
 //! `git.renameBranch`, `git.stageHunk`, `git.unstageHunk`,
 //! `git.removeLockFile`, `git.push`, and `git.fetch`. Drives a real
 //! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config) and
-//! asserts the response envelope shape from docs/protocol/05-method-catalog.md §5 (`{ ok, ... }`)
-//! plus the `-32602` error envelope from §9 for the validation paths.
+//! asserts the response envelope shape from docs/protocol/methods/git.md §5.6 (`{ ok, ... }`)
+//! plus the `-32602` error envelope from docs/protocol/09-error-codes.md §9 for the validation paths.
 //!
 //! `git.push`/`git.fetch` add a local bare-remote fixture wired up as
 //! `origin` on the source repo (linked worktrees share the object store

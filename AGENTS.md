@@ -165,7 +165,7 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
 contract. When adding or changing a method, the WSS e2e is what proves the daemon meets
 that contract:
 
-- Assert the request shape the client sends matches docs/protocol/05-method-catalog.md §5 for that method.
+- Assert the request shape the client sends matches the method's subsection file under docs/protocol/methods/ (§5.x).
 - Assert the success response carries the documented `result` payload (field names,
   optional vs required, nested envelope shapes).
 - Assert error responses use the codes from docs/protocol/09-error-codes.md §9, not ad-hoc strings.

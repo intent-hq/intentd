@@ -3,8 +3,8 @@
 //! config), exercising both the happy path (tracked-file restore + untracked
 //! deletion via a single request) and the `-32602` path-safety guard
 //! (`..` traversal). Asserts the response envelope shape from
-//! `docs/protocol/05-method-catalog.md` §5 (`{ ok: true, paths: [...] }`) and the JSON-RPC
-//! error envelope shape from §9.
+//! `docs/protocol/methods/git.md` §5.6 (`{ ok: true, paths: [...] }`) and the JSON-RPC
+//! error envelope shape from `docs/protocol/09-error-codes.md` §9.
 //!
 //! Uses a tiny local repository as the workspace source so the test never
 //! touches the network. Gated on `git` being on PATH; skips cleanly
@@ -269,7 +269,7 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
 /// Happy path: `workspace.create` provisions a worktree; the client dirties
 /// a tracked file + drops an untracked file; a single `git.discard` call
 /// restores the tracked file from the index and unlinks the untracked one.
-/// Asserts the response envelope shape from docs/protocol/05-method-catalog.md §5 —
+/// Asserts the response envelope shape from docs/protocol/methods/git.md §5.6 —
 /// `{ ok: true, paths: [...] }` echoing the input `paths`.
 #[tokio::test]
 async fn git_discard_restores_tracked_and_deletes_untracked_over_wss() {

@@ -2,7 +2,7 @@
 //! docs/protocol/methods/git.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
 //! and `git.getConfig` (STAB-10a).
 //! Drives a real pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via
-//! config) and asserts the response envelope shape from docs/protocol/05-method-catalog.md §5 plus the
+//! config) and asserts the response envelope shape from docs/protocol/methods/git.md §5.6 plus the
 //! `-32602` error envelope for the validation paths.
 //!
 //! Uses a tiny local repository as the workspace source so the test never

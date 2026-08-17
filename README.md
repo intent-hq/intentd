@@ -580,8 +580,9 @@ The design docs live in the monorepo under `docs/`:
 
 - `ARCHITECTURE.md` — system overview, crate layout, module responsibilities, and
   dependency-direction rules.
-- `protocol/` — the canonical wire contract (protocol v2.0), split into per-section
-  files: transport, JSON-RPC envelope, full method catalog, events, and error codes.
+- `protocol/` — the canonical wire contract (current version in `protocol/README.md`),
+  split into per-section files: transport, JSON-RPC envelope, full method catalog,
+  events, and error codes.
 
 ## Related Repositories
 

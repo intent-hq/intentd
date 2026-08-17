@@ -3237,7 +3237,8 @@ async fn task_subscribe_snapshot_and_deltas_carry_spec_linked_over_wss() {
     );
 }
 
-/// End-to-end readiness-over-dependsOn (docs/protocol/methods/notes-tasks.md §5.4/§6.5; spec §2.2,
+/// End-to-end readiness-over-dependsOn (docs/protocol/methods/notes-tasks.md §5.4 /
+/// docs/protocol/06-events.md §6.5; spec §2.2,
 /// monorepo#1974) over WSS: a task with `dependsOn` edges onto two
 /// sibling-subtree tasks stays out of `task:ready-tasks-changed`'s
 /// `readyTaskIds` until BOTH deps are `complete` — the event shape itself is

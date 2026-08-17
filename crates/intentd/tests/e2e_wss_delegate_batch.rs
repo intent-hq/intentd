@@ -181,7 +181,7 @@ async fn connect_ws(
 
 /// One WSS JSON-RPC round-trip, returning the raw envelope (caller checks
 /// `error`/`result` itself). Asserts the JSON-RPC 2.0 response envelope
-/// shape per docs/protocol/01-transport.md §1: `jsonrpc: "2.0"`, the echoed `id`, and exactly
+/// shape per docs/protocol/03-envelope.md §3: `jsonrpc: "2.0"`, the echoed `id`, and exactly
 /// one of `result` / `error`.
 async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where

@@ -2,7 +2,7 @@
 //! `git.clone` method over a real pinned-TLS WebSocket against a live
 //! `intentd serve` (WSS listener enabled via config). Asserts the JSON-RPC ack shape from
 //! docs/protocol/methods/git.md §5.6 and the streamed `git:clone:progress` / `git:clone:done`
-//! bus events (§6.5) — including the failure branch where a bogus URL yields
+//! bus events (docs/protocol/06-events.md §6.5) — including the failure branch where a bogus URL yields
 //! `done { ok: false }`.
 //!
 //! Uses a tiny local bare repository as the clone source so the test never
