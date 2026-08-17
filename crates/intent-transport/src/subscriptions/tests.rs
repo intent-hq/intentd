@@ -2865,6 +2865,7 @@ mod chat_terminal_reconcile_failure {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();

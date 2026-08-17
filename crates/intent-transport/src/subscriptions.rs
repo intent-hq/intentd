@@ -540,7 +540,7 @@ pub(crate) async fn chat_recovery_snapshot(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
 ) -> Option<Value> {
-    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None);
+    let read = || api.agent_get_conversation(agent_id.clone(), None, None, None, None, None);
     let mut snapshot = match read().await {
         Ok(v) => v,
         Err(_) => read().await.ok()?,
