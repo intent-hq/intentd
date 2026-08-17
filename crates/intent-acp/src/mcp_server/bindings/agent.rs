@@ -347,6 +347,23 @@ fn parse_vm_resources(args: &Value) -> Result<Option<intent_core::VmResources>, 
     Ok(Some(vm))
 }
 
+/// Resolve the effective delivery priority for `ws.agent.send` /
+/// `ws.agent.sendToTask`. These MCP bindings deliver with INTERRUPT priority
+/// by default: an omitted (or `null`) `priority` resolves to `"interrupt"`,
+/// and the explicit `priority: "queue"` opt-out restores queue-if-busy
+/// delivery by mapping to `"normal"` (any value other than `"interrupt"` is
+/// non-interrupt at the service layer). Every other explicit value passes
+/// through unchanged. Binding-local by design: the wire-level
+/// `agent.sendMessage` / `agent.sendToTask` RPC defaults (FE front door,
+/// automated deliveries) are untouched.
+fn effective_priority(args: &Value) -> Option<String> {
+    match opt_str(args, "priority") {
+        None => Some("interrupt".to_string()),
+        Some(p) if p == "queue" => Some("normal".to_string()),
+        other => other,
+    }
+}
+
 /// `ws.agent.send`. Guarded by the single-pending-message rule: when the
 /// caller (an agent) already has a pending entry in the target's queue, the
 /// send is refused with an `ok: false` result echoing the target's queue —
@@ -371,7 +388,7 @@ async fn send(
             None,
             None,
             None,
-            opt_str(args, "priority"),
+            effective_priority(args),
             None,
             None,
             None,
@@ -428,7 +445,7 @@ async fn send_to_task(
             ws.clone(),
             NoteId::from_string(&task_note_id),
             message,
-            opt_str(args, "priority"),
+            effective_priority(args),
             sender_metadata(api, ws, caller, args).await,
         )
         .await

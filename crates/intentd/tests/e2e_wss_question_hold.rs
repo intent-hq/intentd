@@ -7,12 +7,14 @@
 //!   `application/vnd.intent.question+json` resource block) — the hold
 //!   activates.
 //! * A sibling agent fires AUTOMATIC deliveries at the asker through the
-//!   `ws.agent.send` host binding (one normal, one `priority: "interrupt"`):
-//!   both must park in the queue (`heldForQuestions: true` on the send
-//!   results, captured via a note), with the interrupt entry ordered FIRST
-//!   (`interruptPriority: true`), and NO user row reaches the asker's
-//!   transcript while the hold is active. `agent:queue:updated` snapshots
-//!   carry the held entries in interrupt-first order.
+//!   `ws.agent.send` host binding (one `priority: "queue"` opt-out, one
+//!   default-interrupt — the binding delivers with interrupt priority when
+//!   `priority` is omitted): both must park in the queue
+//!   (`heldForQuestions: true` on the send results, captured via a note),
+//!   with the interrupt entry ordered FIRST (`interruptPriority: true`),
+//!   and NO user row reaches the asker's transcript while the hold is
+//!   active. `agent:queue:updated` snapshots carry the held entries in
+//!   interrupt-first order.
 //! * Release path 1 (user answer): `agent.sendMessage` (user origin) delivers
 //!   IMMEDIATELY (`queued: false` — never held), the hold flips false at turn
 //!   end and the queue drains interrupt-first.
@@ -679,13 +681,15 @@ fn dismissal_metadata(dismissed_mid: &str) -> Value {
 /// 1. The asker's kickoff turn emits a `ws.app.question.ask` question — the
 ///    hold activates (last transcript message = assistant question row).
 /// 2. Two siblings each fire one AUTOMATIC `ws.agent.send` at the asker
-///    (one normal, one `priority: "interrupt"` — one sender per message, the
-///    single-pending-message guard refuses a second parked send from the
-///    same caller): both park in the queue with `heldForQuestions: true` on
-///    the send results, the interrupt entry FIRST (`interruptPriority: true`
-///    — spec §Decisions: interrupts are held too, no exceptions), and NO
-///    user row reaches the asker's transcript. `agent:queue:updated` carries
-///    the held snapshot in interrupt-first order.
+///    (one `priority: "queue"` opt-out, one default-interrupt — omitted
+///    `priority` resolves to interrupt in the binding; one sender per
+///    message, the single-pending-message guard refuses a second parked
+///    send from the same caller): both park in the queue with
+///    `heldForQuestions: true` on the send results, the interrupt entry
+///    FIRST (`interruptPriority: true` — spec §Decisions: interrupts are
+///    held too, no exceptions), and NO user row reaches the asker's
+///    transcript. `agent:queue:updated` carries the held snapshot in
+///    interrupt-first order.
 /// 3. The user sends an UNTAGGED message: user origin is never held, but with
 ///    a parked backlog it converts to a user-origin enqueue + drain kick
 ///    (monorepo#1791 — FIFO restore): the flush delivers the held entries and
@@ -703,17 +707,20 @@ async fn question_hold_parks_automatic_sends_until_user_answer_over_wss() {
     let Some(script) = gate("WSS question-hold user-answer E2E") else {
         return;
     };
+    // The normal entry uses the explicit `priority: "queue"` opt-out (also
+    // covering the opt-out path e2e); the urgent entry relies on the
+    // binding's interrupt-by-default resolution (omitted priority).
     let send_normal_code = format!(
         "const agents = await ws.agent.list(true); \
          const target = agents.find(a => a.name === 'AskerA'); \
-         const first = await ws.agent.send(target.id, '{HELD_NORMAL}'); \
+         const first = await ws.agent.send(target.id, '{HELD_NORMAL}', 'queue'); \
          await ws.note.create('hold-results', JSON.stringify({{ first }})); \
          return 'sent';"
     );
     let send_urgent_code = format!(
         "const agents = await ws.agent.list(true); \
          const target = agents.find(a => a.name === 'AskerA'); \
-         const second = await ws.agent.send(target.id, '{HELD_URGENT}', 'interrupt'); \
+         const second = await ws.agent.send(target.id, '{HELD_URGENT}'); \
          await ws.note.create('hold-results-urgent', JSON.stringify({{ second }})); \
          return 'sent';"
     );
