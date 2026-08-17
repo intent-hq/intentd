@@ -357,6 +357,32 @@ impl ModelCatalogCache {
             .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
     }
 
+    /// The cached catalog's default-model id for `provider_id` (PROTOCOL
+    /// §5.5 "Creation-time default-model resolution", catalog-default rung):
+    /// the `id` of the row marked `isDefault: true` in the provider's
+    /// last-good entry under its **current** registry version key
+    /// ([`source_for`]). Synchronous, read-only, and probe-free like
+    /// [`Self::cached_catalog_claims`]: the creation path must never block on
+    /// or trigger a fetch — an unregistered provider, cold cache, stale-pin
+    /// entry, or a catalog with no marked row all return `None` (the provider
+    /// CLI default applies).
+    pub(crate) fn cached_default_model(&self, provider_id: &str) -> Option<String> {
+        let source = source_for(provider_id)?;
+        let version_key = (source.version_key)();
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        if entry.version_key != version_key {
+            return None;
+        }
+        entry
+            .models
+            .iter()
+            .find(|row| row.get("isDefault").and_then(Value::as_bool) == Some(true))
+            .and_then(|row| row.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     /// Cached `effortLevels` evidence for a model id (PROTOCOL §5.30/§5.11).
     /// `model_id` may be compound (`provider:model`, restricting the search to
     /// that provider) or bare (searched across every registered provider in
