@@ -733,9 +733,10 @@ impl Store {
     /// alternative to full message-log fetch for `agent.diagnostics`). One aggregate
     /// statement — the LEFT JOIN keeps zero-message sessions — instead of two
     /// queries per session (monorepo#958). The byte total sums
-    /// `LENGTH(CAST(content AS BLOB))` — raw stored bytes, never decoded as
-    /// JSON — so coordinators can see session-size pressure before turns start
-    /// dying under context bloat (intent-hq/monorepo#2669). Returns a map keyed
+    /// `OCTET_LENGTH(content)` — raw stored bytes read from the row header,
+    /// never decoded as JSON and never loading overflow pages — so
+    /// coordinators can see session-size pressure before turns start dying
+    /// under context bloat (intent-hq/monorepo#2669). Returns a map keyed
     /// by agent_id with `(message_count, has_assistant, conversation_bytes)`
     /// tuples.
     pub async fn get_agent_session_message_stats(
@@ -744,7 +745,7 @@ impl Store {
     ) -> Result<std::collections::HashMap<String, (u64, bool, u64)>> {
         let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
             COALESCE(SUM(m.role = 'assistant'), 0) AS assistant_count, \
-            COALESCE(SUM(LENGTH(CAST(m.content AS BLOB))), 0) AS conversation_bytes \
+            COALESCE(SUM(OCTET_LENGTH(m.content)), 0) AS conversation_bytes \
             FROM agent_session s \
             LEFT JOIN agent_message m ON m.agent_id = s.id \
             WHERE s.workspace_id = ? \

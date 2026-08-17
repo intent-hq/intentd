@@ -8152,11 +8152,14 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
     let small_bytes = row_for(&small)["conversationBytes"]
         .as_u64()
         .expect("small conversationBytes");
-    assert!(small_bytes > 0 && small_bytes < 4 * 1024 * 1024);
+    assert!(small_bytes > 0 && small_bytes < super::LARGE_CONVERSATION_WARN_BYTES);
     let bloated_bytes = row_for(&bloated)["conversationBytes"]
         .as_u64()
         .expect("bloated conversationBytes");
-    assert!(bloated_bytes > 4 * 1024 * 1024, "bytes: {bloated_bytes}");
+    assert!(
+        bloated_bytes > super::LARGE_CONVERSATION_WARN_BYTES,
+        "bytes: {bloated_bytes}"
+    );
     assert!(
         row_for(&empty).get("conversationBytes").is_none(),
         "zero-message agent omits the field"
@@ -8173,7 +8176,10 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
     assert_eq!(large[0]["agentId"], json!(bloated.0));
     assert_eq!(large[0]["severity"], json!("warning"));
     assert_eq!(large[0]["conversationBytes"], json!(bloated_bytes));
-    assert_eq!(large[0]["thresholdBytes"], json!(4 * 1024 * 1024));
+    assert_eq!(
+        large[0]["thresholdBytes"],
+        json!(super::LARGE_CONVERSATION_WARN_BYTES)
+    );
     assert!(
         large[0]["message"]
             .as_str()
