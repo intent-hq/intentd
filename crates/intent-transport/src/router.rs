@@ -1238,13 +1238,39 @@ async fn dispatch(
             let limit = opt_int(params, "limit");
             let ws = opt_workspace_id(params);
             let page_token = opt_str(params, "nextToken");
-            // Additive seek param: the page containing this message (§5.5).
-            // Unknown ids surface as `-32602` naming the id via domain_to_rpc;
-            // empty/whitespace ids are treated as absent.
+            // Additive seek params (§5.5): `aroundMessageId` — the page
+            // containing this message (unknown ids surface as `-32602`
+            // naming the id via domain_to_rpc; empty/whitespace ids are
+            // treated as absent) — and `aroundIndex` — the page containing
+            // this 0-based ordinal from the oldest message (out-of-range
+            // clamps in the service; negative or non-integer is `-32602`).
+            // Supplying both is `-32602` naming the conflict.
             let around_message_id =
                 opt_str(params, "aroundMessageId").filter(|s| !s.trim().is_empty());
+            let around_index = match params.get("aroundIndex") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_i64() {
+                    Some(i) if i >= 0 => Some(i),
+                    // Integers beyond i64::MAX are still valid overshoots —
+                    // clamp them like any other out-of-range estimate.
+                    None if v.as_u64().is_some() => Some(i64::MAX),
+                    _ => return Err(invalid_params("aroundIndex must be a non-negative integer")),
+                },
+            };
+            if around_message_id.is_some() && around_index.is_some() {
+                return Err(invalid_params(
+                    "aroundMessageId and aroundIndex are mutually exclusive",
+                ));
+            }
             match api
-                .agent_get_conversation(agent_id, limit, ws, page_token, around_message_id)
+                .agent_get_conversation(
+                    agent_id,
+                    limit,
+                    ws,
+                    page_token,
+                    around_message_id,
+                    around_index,
+                )
                 .await
             {
                 Ok(v) => Ok(v),
