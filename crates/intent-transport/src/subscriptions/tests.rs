@@ -2682,3 +2682,263 @@ mod chat_terminal_message_id_fallback {
         );
     }
 }
+
+/// The terminal reconcile must never silently skip the terminal frame: when
+/// the `agent.getConversation` re-read fails at turn end (transient store
+/// failure), it is retried once, and a persistent failure still emits a
+/// best-effort terminal frame — the accumulated live state stamped
+/// `streamingComplete: true` — plus a WARN, so the transcript converges
+/// instead of staying silently stale while the turn looks ended.
+mod chat_terminal_reconcile_failure {
+    use super::*;
+    use crate::protocol::test_capture::Capture;
+    use intent_core::events::AGENT_STREAM_END;
+    use intent_core::{BoxFuture, Error, Result, WorkspaceApi};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal `WorkspaceApi` whose conversation read fails the first
+    /// `fail_first` calls, then serves `conversation` (a `Value::Null`
+    /// conversation keeps failing forever). Counts the attempts.
+    struct FailingConvApi {
+        calls: AtomicUsize,
+        fail_first: usize,
+        conversation: Value,
+    }
+
+    impl FailingConvApi {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail_first: usize::MAX,
+                conversation: Value::Null,
+            }
+        }
+
+        fn failing_once_then(conversation: Value) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail_first: 1,
+                conversation,
+            }
+        }
+    }
+
+    impl WorkspaceApi for FailingConvApi {
+        fn agent_get_conversation(
+            &self,
+            _agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let conv = self.conversation.clone();
+            let fail = call < self.fail_first;
+            Box::pin(async move {
+                if fail {
+                    Err(Error::Internal("store read failed".to_string()))
+                } else {
+                    Ok(conv)
+                }
+            })
+        }
+    }
+
+    /// The turn's persisted assistant row, as served once a read succeeds.
+    fn conversation() -> Value {
+        json!({
+            "agentId": "agent-1",
+            "messages": [
+                {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "seq": 8,
+                    "timestamp": "2026-08-11T00:00:01Z",
+                    "contentBlocks": [
+                        { "type": "text", "id": "msg-1:0", "text": "Hello, world" }
+                    ]
+                }
+            ],
+            "truncated": false,
+            "totalMessages": 9,
+            "nextToken": Value::Null,
+        })
+    }
+
+    fn end_event(message_id: &str) -> Event {
+        Event {
+            id: "evt-end".into(),
+            event_type: AGENT_STREAM_END.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from("w"),
+            session_id: Some("agent-1".to_string()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "agentId": "agent-1", "messageId": message_id }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_re_read_retries_once_then_emits_the_best_effort_frame() {
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent());
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("first chunk");
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!(", world")))
+            .expect("second chunk");
+        s.tool_delta(&tool_event("msg-1", "msg-1:1", "call-1", "started", None))
+            .expect("tool call");
+
+        let capture = Capture::default();
+        let d = {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            s.delta(&api, &end_event("msg-1"))
+                .await
+                .expect("a failed reconcile must still emit a terminal frame")
+        };
+
+        assert_eq!(
+            api.calls.load(Ordering::SeqCst),
+            2,
+            "the re-read is retried exactly once"
+        );
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(
+            updated.len(),
+            2,
+            "every live-accumulated block returns in the frame: {d}"
+        );
+        for e in updated {
+            assert_eq!(e["messageId"], "msg-1");
+            assert_eq!(e["role"], "assistant");
+            assert_eq!(
+                e["streamingComplete"], true,
+                "the frame must flip streamingComplete: {d}"
+            );
+            assert!(
+                e.get("messageSeq").is_none(),
+                "no authoritative seq without the store read: {d}"
+            );
+        }
+        assert_eq!(
+            updated[0]["block"]["text"], "Hello, world",
+            "text blocks carry the FULL accumulated text: {d}"
+        );
+        assert_eq!(updated[1]["block"]["type"], "tool_use");
+        assert_eq!(d["added"], json!([]));
+        assert_eq!(
+            d["removedIds"],
+            json!([]),
+            "no orphan is provable without the persisted message: {d}"
+        );
+        assert!(
+            capture
+                .lines()
+                .iter()
+                .any(|(level, line)| *level == tracing::Level::WARN
+                    && line.contains("terminal reconcile")),
+            "the persistent failure logs a WARN: {:?}",
+            capture.lines()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_per_turn_state_resets_after_the_best_effort_frame() {
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent());
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("first chunk");
+        s.delta(&api, &end_event("msg-1"))
+            .await
+            .expect("terminal frame");
+
+        // The next turn starts clean: its first chunk arrives as `added` with
+        // the text restarted from the fragment…
+        let d = s
+            .chunk_delta(&chunk_event("msg-2", "msg-2:0", "text", json!("Next")))
+            .expect("next turn chunk");
+        assert_eq!(d["added"][0]["block"]["text"], "Next");
+        // …and its own failed reconcile carries only ITS accumulated blocks.
+        let d = s
+            .delta(&api, &end_event("msg-2"))
+            .await
+            .expect("terminal frame");
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(
+            updated.len(),
+            1,
+            "the previous turn's live state was cleared: {d}"
+        );
+        assert_eq!(updated[0]["block"]["id"], "msg-2:0");
+        assert_eq!(updated[0]["messageId"], "msg-2");
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_recovers_on_the_retry_with_the_authoritative_frame() {
+        // First read fails, the retry succeeds → the AUTHORITATIVE terminal
+        // frame is emitted (persisted seq/timestamp), not the degraded one.
+        let api = FailingConvApi::failing_once_then(conversation());
+        let mut s = ChatDeltaState::new(&agent());
+        s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", json!("Hello")))
+            .expect("first chunk");
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("terminal frame");
+
+        assert_eq!(
+            api.calls.load(Ordering::SeqCst),
+            2,
+            "the transient failure consumed the one retry"
+        );
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1, "the persisted block, reconciled: {d}");
+        assert_eq!(updated[0]["block"]["text"], "Hello, world");
+        assert_eq!(
+            updated[0]["messageSeq"], 8,
+            "the authoritative frame carries the persisted seq: {d}"
+        );
+        assert_eq!(updated[0]["timestamp"], "2026-08-11T00:00:01Z");
+        assert_eq!(updated[0]["streamingComplete"], true);
+    }
+
+    #[tokio::test]
+    async fn a_blank_streaming_snapshot_still_gets_a_terminal_entity_on_failure() {
+        // monorepo#2105-adjacent: the seq-0 snapshot carried a just-started
+        // streaming row with NO blocks yet. If the terminal re-read then fails
+        // twice, the degraded frame must still carry one `streamingComplete`
+        // entity for that row — an empty frame would leave the blank row
+        // permanently streaming.
+        let api = FailingConvApi::new();
+        let mut s = ChatDeltaState::new(&agent());
+        s.seed_from_snapshot(&json!({
+            "agentId": "agent-1",
+            "messages": [{
+                "id": "msg-1",
+                "role": "assistant",
+                "isStreaming": true,
+                "contentBlocks": []
+            }],
+        }));
+        let d = s
+            .delta(&api, &end_event("msg-1"))
+            .await
+            .expect("terminal frame");
+
+        let updated = d["updated"].as_array().unwrap();
+        assert_eq!(updated.len(), 1, "one placeholder entity for the row: {d}");
+        assert_eq!(updated[0]["block"]["id"], "msg-1:0");
+        assert_eq!(updated[0]["block"]["type"], "text");
+        assert_eq!(updated[0]["block"]["text"], "");
+        assert_eq!(
+            updated[0]["streamingComplete"], true,
+            "the blank row flips out of streaming: {d}"
+        );
+    }
+}
