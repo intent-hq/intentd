@@ -727,18 +727,24 @@ impl Store {
         rows.iter().map(map_session_summary_row).collect()
     }
 
-    /// Get message count and whether any assistant message exists for each session in
-    /// a workspace, without hydrating message bodies (finding F1/F3: lightweight
+    /// Get message count, whether any assistant message exists, and the total
+    /// persisted conversation size in bytes for each session in a workspace,
+    /// without hydrating message bodies (finding F1/F3: lightweight
     /// alternative to full message-log fetch for `agent.diagnostics`). One aggregate
     /// statement — the LEFT JOIN keeps zero-message sessions — instead of two
-    /// queries per session (monorepo#958). Returns a map keyed by agent_id with
-    /// `(message_count, has_assistant)` tuples.
+    /// queries per session (monorepo#958). The byte total sums
+    /// `LENGTH(CAST(content AS BLOB))` — raw stored bytes, never decoded as
+    /// JSON — so coordinators can see session-size pressure before turns start
+    /// dying under context bloat (intent-hq/monorepo#2669). Returns a map keyed
+    /// by agent_id with `(message_count, has_assistant, conversation_bytes)`
+    /// tuples.
     pub async fn get_agent_session_message_stats(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<std::collections::HashMap<String, (u64, bool)>> {
+    ) -> Result<std::collections::HashMap<String, (u64, bool, u64)>> {
         let sql = "SELECT s.id AS agent_id, COUNT(m.id) AS message_count, \
-            COALESCE(SUM(m.role = 'assistant'), 0) AS assistant_count \
+            COALESCE(SUM(m.role = 'assistant'), 0) AS assistant_count, \
+            COALESCE(SUM(LENGTH(CAST(m.content AS BLOB))), 0) AS conversation_bytes \
             FROM agent_session s \
             LEFT JOIN agent_message m ON m.agent_id = s.id \
             WHERE s.workspace_id = ? \
@@ -753,7 +759,15 @@ impl Store {
             let agent_id: String = row.get("agent_id");
             let message_count: i64 = row.get("message_count");
             let assistant_count: i64 = row.get("assistant_count");
-            stats.insert(agent_id, (message_count as u64, assistant_count != 0));
+            let conversation_bytes: i64 = row.get("conversation_bytes");
+            stats.insert(
+                agent_id,
+                (
+                    message_count as u64,
+                    assistant_count != 0,
+                    conversation_bytes.max(0) as u64,
+                ),
+            );
         }
         Ok(stats)
     }
@@ -5206,13 +5220,18 @@ mod tests {
 
         assert_eq!(stats.len(), 2, "should have stats for both agents");
 
-        let (count1, has_assistant1) = stats.get(&agent1.0).expect("agent1 stats");
+        let (count1, has_assistant1, bytes1) = stats.get(&agent1.0).expect("agent1 stats");
         assert_eq!(*count1, 1, "agent1 should have 1 message");
         assert!(!has_assistant1, "agent1 should have no assistant message");
+        assert!(*bytes1 > 0, "agent1 conversation bytes should be non-zero");
 
-        let (count2, has_assistant2) = stats.get(&agent2.0).expect("agent2 stats");
+        let (count2, has_assistant2, bytes2) = stats.get(&agent2.0).expect("agent2 stats");
         assert_eq!(*count2, 3, "agent2 should have 3 messages");
         assert!(has_assistant2, "agent2 should have assistant message");
+        assert!(
+            bytes2 > bytes1,
+            "agent2's 3-message conversation should outweigh agent1's 1 message"
+        );
     }
 
     /// `get_agent_messages_page` returns exactly the `offset..offset+limit`
@@ -6029,7 +6048,8 @@ mod tests {
             .get_agent_session_message_stats(&ws_id)
             .await
             .expect("stats");
-        assert_eq!(stats.get(&agent_id.0), Some(&(2, true)));
+        let raw_len = "{not-valid-json".len() as u64;
+        assert_eq!(stats.get(&agent_id.0), Some(&(2, true, 2 * raw_len)));
     }
 
     /// Raw `(last_assistant_preview, last_user_preview)` column values for a
