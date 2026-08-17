@@ -1441,10 +1441,7 @@ impl Services {
     /// `workspace.unarchive` inside that window is deterministic. Production
     /// wiring keeps `None` (no parking).
     #[cfg(test)]
-    pub(crate) fn with_wake_archived_park(
-        mut self,
-        park: Arc<script_ops::SupervisePark>,
-    ) -> Self {
+    pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
         self.wake_archived_park = Some(park);
         self
     }
