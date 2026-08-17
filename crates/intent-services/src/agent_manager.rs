@@ -10274,6 +10274,179 @@ mod role_reminder_tests {
             .is_none());
     }
 
+    // ---- Frozen specialist snapshot consumption (creation-time keys) ----
+
+    /// Insert a second specialist session carrying the given metadata JSON
+    /// (the frozen snapshot keys `agent_create_op` persists at creation).
+    async fn insert_session_with_metadata(
+        mgr: &AgentManager,
+        agent_id: &str,
+        specialist: Option<&str>,
+        metadata: serde_json::Value,
+    ) -> AgentId {
+        let agent_id = AgentId::from(agent_id);
+        let mut s = session(&agent_id, &WorkspaceId::from("ws-1"), specialist);
+        s.metadata = Some(metadata);
+        mgr.services
+            .store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn specialist_injection_frozen_snapshot_wins_over_file() {
+        // A session carrying the creation-time snapshot keys reads the whole
+        // triple frozen; the (since-edited) live file no longer contributes.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Edited Name\"\ndescription: \"d\"\nroleReminder: \"Edited reminder.\"\n---\n\nEdited body.",
+        );
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            Some("implementor"),
+            serde_json::json!({
+                "behaviorPrompt": "Frozen body.",
+                "specialistName": "Frozen Name",
+                "specialistRoleReminder": "Frozen reminder.",
+            }),
+        )
+        .await;
+        let inj = mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .expect("injection");
+        assert_eq!(inj.behavior_prompt.as_deref(), Some("Frozen body."));
+        assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+        assert_eq!(inj.role_reminder.as_deref(), Some("Frozen reminder."));
+    }
+
+    #[tokio::test]
+    async fn specialist_injection_frozen_snapshot_survives_file_delete() {
+        // No specialist file resolves at spawn time (deleted since creation),
+        // but the snapshot keys keep the full triple intact.
+        let (mgr, _first, _db) = manager_with(Some("implementor"), None).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            Some("implementor"),
+            serde_json::json!({
+                "behaviorPrompt": "Frozen body.",
+                "specialistName": "Frozen Name",
+                "specialistRoleReminder": "Frozen reminder.",
+            }),
+        )
+        .await;
+        let inj = mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .expect("injection");
+        assert_eq!(inj.behavior_prompt.as_deref(), Some("Frozen body."));
+        assert_eq!(inj.specialist_name.as_deref(), Some("Frozen Name"));
+        assert_eq!(inj.role_reminder.as_deref(), Some("Frozen reminder."));
+    }
+
+    #[tokio::test]
+    async fn role_reminder_prefers_frozen_snapshot() {
+        // The per-turn reminder prefix reads the frozen identity, not the
+        // (since-edited) live file.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Edited reminder.\"\n---\n\nbody",
+        );
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            Some("implementor"),
+            serde_json::json!({
+                "specialistName": "Frozen Name",
+                "specialistRoleReminder": "Frozen reminder.",
+            }),
+        )
+        .await;
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "go",
+                &TurnOptions::default(),
+            )
+            .await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("[Role Reminder: You are a Frozen Name. Frozen reminder.]\n\n"),
+            "frozen reminder not used: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_reminder_frozen_name_without_reminder_stays_silent() {
+        // A frozen name with no frozen reminder means creation resolved no
+        // usable reminder — the live file's reminder must not leak back in.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Edited reminder.\"\n---\n\nbody",
+        );
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            Some("implementor"),
+            serde_json::json!({ "specialistName": "Frozen Name" }),
+        )
+        .await;
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "go",
+                &TurnOptions::default(),
+            )
+            .await;
+        assert_eq!(prompt_text(&prompt), "go");
+    }
+
+    #[tokio::test]
+    async fn role_reminder_body_override_only_falls_back_live() {
+        // Body-override-only session (no frozen identity keys — pre-snapshot
+        // rows): identity still resolves live, byte-identical to before.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nFile body.",
+        );
+        let (mgr, _first, _db) =
+            manager_with(Some("implementor"), Some(dir.path().to_path_buf())).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            Some("implementor"),
+            serde_json::json!({ "behaviorPrompt": "Custom override." }),
+        )
+        .await;
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-role"),
+                "go",
+                &TurnOptions::default(),
+            )
+            .await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("[Role Reminder: You are a Implementor. Stay in scope.]\n\n"),
+            "live fallback reminder missing: {text:?}"
+        );
+    }
+
     // ---- FirstTurnPrepend fallback (§18.1) ----
 
     /// Persist an assembled system prompt on the seeded agent session (the
