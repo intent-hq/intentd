@@ -170,7 +170,9 @@ pub use agent_session::SuspendOverlapQuery;
 // The individual watcher families are constructed only by `WatcherRegistry`
 // (they now take the crate-private shared-stream hub), so only the registry and
 // the bus/refresher surface leave the crate.
-pub use events::{EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry};
+pub use events::{
+    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatcherRegistry,
+};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::{
     fetch_merge_requirements, MergeRequirementCheck, MergeRequirements, MergeRequirementsApprovals,
