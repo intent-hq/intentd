@@ -1178,12 +1178,16 @@ impl Services {
     /// Record the just-ended turn's silent tail (intent-hq/monorepo#2669) —
     /// ms of `session/update` silence between the turn's last streamed
     /// activity and the prompt resolving. One slot per agent, latest turn
-    /// wins; served by `agent.diagnostics` as `lastTurnSilentTailMs`. Public
-    /// so tests can seed the map without driving a real turn.
-    pub fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
-        if let Ok(mut tails) = self.last_turn_silent_tails.lock() {
-            tails.insert(agent_id.clone(), silent_tail_ms);
-        }
+    /// wins; served by `agent.diagnostics` as `lastTurnSilentTailMs`.
+    /// `pub(crate)` as a test seam so in-crate tests can seed the map
+    /// without driving a real turn. The map is a plain `HashMap` with no
+    /// invariant to tear, so a poisoned lock recovers via `into_inner()`
+    /// (matching the workspace-delete sweep in `lib.rs`).
+    pub(crate) fn record_turn_silent_tail(&self, agent_id: &AgentId, silent_tail_ms: u64) {
+        self.last_turn_silent_tails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(agent_id.clone(), silent_tail_ms);
     }
 
     /// The recorded silent tail of the agent's most recently ended turn, if
@@ -1192,16 +1196,18 @@ impl Services {
     pub(crate) fn last_turn_silent_tail(&self, agent_id: &AgentId) -> Option<u64> {
         self.last_turn_silent_tails
             .lock()
-            .ok()
-            .and_then(|tails| tails.get(agent_id).copied())
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent_id)
+            .copied()
     }
 
     /// Drop the agent's recorded silent tail (agent delete / workspace delete
     /// teardown) so the in-memory map never leaks entries for dead agents.
     pub(crate) fn clear_turn_silent_tail(&self, agent_id: &AgentId) {
-        if let Ok(mut tails) = self.last_turn_silent_tails.lock() {
-            tails.remove(agent_id);
-        }
+        self.last_turn_silent_tails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
     }
 
     /// Clear an agent's live-turn slot at a NORMAL turn end, leaving a pinned
@@ -2132,25 +2138,30 @@ impl Services {
         if !pre_output_transport_failure {
             self.record_turn_silent_tail(agent_id, silent_tail_ms);
         }
-        // Suspicious bare `end_turn` (intent-hq/monorepo#2669): the turn
+        // Suspicious bare normal ending (intent-hq/monorepo#2669): the turn
         // completed normally after a sustained silent tail — the incident
-        // signature of a silently-truncated turn under session bloat.
-        // Advisory annotation only (healthy long tool-free inference tails
-        // exist): stamped on the terminal `agent:idle` payload below as
-        // `silentTailMs` + `suspectedTruncated: true` so coordinators and
-        // the monorepo#1016 stall-annotation consumers get a
-        // machine-readable signal; the turn itself is never failed.
+        // signature of a silently-truncated turn under session bloat. Both
+        // normal stop reasons (`end_turn` / `stream_complete`, the same set
+        // the abnormal-finish filter below treats as unremarkable) qualify:
+        // the incident harness happened to resolve `end_turn`, but a harness
+        // ending a truncated turn with `stream_complete` reads identically
+        // everywhere else and must not dodge the annotation. Advisory only
+        // (healthy long tool-free inference tails exist): stamped on the
+        // terminal `agent:idle` payload below as `silentTailMs` +
+        // `suspectedTruncated: true` so coordinators and the monorepo#1016
+        // stall-annotation consumers get a machine-readable signal; the turn
+        // itself is never failed.
         let suspected_truncated = silent_tail_ms >= silent_tail_suspect_ms()
             && result
                 .as_ref()
                 .ok()
                 .and_then(|stop| serde_json::to_value(stop).ok())
-                .is_some_and(|v| v.as_str() == Some("end_turn"));
+                .is_some_and(|v| matches!(v.as_str(), Some("end_turn" | "stream_complete")));
         if suspected_truncated {
             tracing::warn!(
                 agent = %agent_id,
                 silent_tail_ms,
-                "turn resolved end_turn after a sustained silent tail — suspected truncation (monorepo#2669)"
+                "turn resolved normally after a sustained silent tail — suspected truncation (monorepo#2669)"
             );
         }
         // Abnormal finish reason (PROTOCOL §7): a turn that resolved with a

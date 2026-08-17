@@ -773,10 +773,13 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     // The stalled prompt streams a chunk, then parks in total silence before
-    // resolving `end_turn`; the quick prompt resolves immediately.
+    // resolving `end_turn`; the quick prompt resolves immediately. Margins
+    // are ~1 s of tolerance each way for saturated CI runners: the stalled
+    // side parks 1 s past the threshold, the quick side must merely resolve
+    // in under 2 s.
     let behavior = json!({
         "response": "stalled reply",
-        "silentTailBeforeResultMs": 1500,
+        "silentTailBeforeResultMs": 3000,
         "rules": [
             { "ifPromptContains": "quick", "response": "quick reply" },
         ],
@@ -787,7 +790,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("INTENTD_SILENT_TAIL_SUSPECT_MS", "1000"),
+        ("INTENTD_SILENT_TAIL_SUSPECT_MS", "2000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -873,7 +876,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
         .as_u64()
         .expect("agent:idle carries silentTailMs");
     assert!(
-        tail_ms >= 1000,
+        tail_ms >= 2000,
         "tail past the lowered threshold: {tail_ms}"
     );
 
@@ -923,11 +926,11 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
     let stalled_tail = row_for(&stalled_id)["lastTurnSilentTailMs"]
         .as_u64()
         .expect("stalled row carries lastTurnSilentTailMs");
-    assert!(stalled_tail >= 1000, "stalled tail: {stalled_tail}");
+    assert!(stalled_tail >= 2000, "stalled tail: {stalled_tail}");
     let quick_tail = row_for(&quick_id)["lastTurnSilentTailMs"]
         .as_u64()
         .expect("quick row carries lastTurnSilentTailMs");
-    assert!(quick_tail < 1000, "quick tail stays short: {quick_tail}");
+    assert!(quick_tail < 2000, "quick tail stays short: {quick_tail}");
     let risks = diag["diagnostics"]["stuckRisks"]
         .as_array()
         .expect("stuckRisks");
@@ -942,7 +945,7 @@ async fn silent_tail_annotation_and_diagnostics_over_wss() {
     );
     assert_eq!(long[0]["agentId"], json!(stalled_id), "risk: {:?}", long[0]);
     assert_eq!(long[0]["silentTailMs"], json!(stalled_tail));
-    assert_eq!(long[0]["thresholdMs"], json!(1000));
+    assert_eq!(long[0]["thresholdMs"], json!(2000));
 
     // Diagnostics-only by design: the hot payloads never carry the field.
     let got = wss_rpc(&mut rpc, 30, "agent.get", json!({ "agentId": stalled_id })).await;

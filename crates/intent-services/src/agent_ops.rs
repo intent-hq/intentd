@@ -8006,6 +8006,11 @@ impl Services {
             // silently-truncated turn is a clean `end_turn` after 11-13 min
             // of stream silence — surface a tail past the suspect threshold
             // so coordinators see the turn likely died rather than finished.
+            // The tail is recorded for every resolution (completed,
+            // cancelled, or timed out — only invisible pre-output redrives
+            // are excluded), so the wording covers all of them: a deliberate
+            // interrupt aimed at a stalled agent legitimately lands here,
+            // and its follow-up turn overwrites the record anyway.
             if let Some(tail_ms) = row["lastTurnSilentTailMs"].as_u64() {
                 let threshold_ms = crate::agent_session::silent_tail_suspect_ms();
                 if tail_ms >= threshold_ms {
@@ -8013,7 +8018,7 @@ impl Services {
                         "type": "long-silent-tail",
                         "severity": "warning",
                         "message": format!(
-                            "Agent {aid}'s last turn ended after {tail_ms}ms of stream silence (>= {threshold_ms}ms); the turn may have been silently truncated under session bloat rather than finishing"
+                            "Agent {aid}'s last turn ended (completed, cancelled, or timed out) after {tail_ms}ms of stream silence (>= {threshold_ms}ms); if it completed, it may have been silently truncated under session bloat rather than finishing"
                         ),
                         "agentId": aid,
                         "silentTailMs": tail_ms,
