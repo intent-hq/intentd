@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.15] - 2026-08-17
+
+### 🐛 Bug Fixes
+
+- *(services)* Exclude soft-deleted sessions from agentSummary ([#1295](https://github.com/intent-hq/intentd/pull/1295))
+
+
 ## [0.7.14] - 2026-08-17
 
 ### 🚀 Features
