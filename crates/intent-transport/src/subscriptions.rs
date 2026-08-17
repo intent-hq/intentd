@@ -621,6 +621,10 @@ pub(crate) struct ChatDeltaState {
     emitted_ids: HashSet<String>,
     /// The in-flight assistant message id (block-id prefix), learned from events.
     message_id: Option<String>,
+    /// Last-known full block per live block id, in first-sighting order — the
+    /// content of the best-effort terminal frame when the terminal reconcile's
+    /// re-read fails (the client must always receive a terminal frame).
+    live_blocks: Vec<(String, Value)>,
 }
 
 impl ChatDeltaState {
@@ -633,6 +637,7 @@ impl ChatDeltaState {
             seen_ids: HashSet::new(),
             emitted_ids: HashSet::new(),
             message_id: None,
+            live_blocks: Vec::new(),
         }
     }
 
@@ -667,6 +672,7 @@ impl ChatDeltaState {
             };
             self.seen_ids.insert(bid.to_string());
             self.emitted_ids.insert(bid.to_string());
+            self.remember_block(bid, block);
             if matches!(
                 block.get("type").and_then(Value::as_str),
                 Some("text") | Some("thinking")
@@ -825,6 +831,7 @@ impl ChatDeltaState {
             Value::Object(obj)
         };
         let added = self.note_block(&block_id);
+        self.remember_block(&block_id, &block);
         let entity = self.entity(&message_id, block, None, None, false);
         Some(single_delta(added, entity))
     }
@@ -865,6 +872,7 @@ impl ChatDeltaState {
             status,
         );
         let use_added = self.note_block(&block_id);
+        self.remember_block(&block_id, &use_block);
         let mut added = Vec::new();
         let mut updated = Vec::new();
         push_entity(
@@ -888,6 +896,7 @@ impl ChatDeltaState {
                     "is_error": status == "error",
                 });
                 let res_added = self.note_block(&result_id);
+                self.remember_block(&result_id, &result_block);
                 push_entity(
                     &mut added,
                     &mut updated,
@@ -926,6 +935,7 @@ impl ChatDeltaState {
                                 attach_id, item,
                             );
                         let attach_added = self.note_block(attach_id);
+                        self.remember_block(attach_id, &attach_block);
                         push_entity(
                             &mut added,
                             &mut updated,
@@ -969,6 +979,7 @@ impl ChatDeltaState {
         self.seen_ids.clear();
         self.emitted_ids.clear();
         self.message_id = None;
+        self.live_blocks.clear();
         delta
     }
 
@@ -978,18 +989,41 @@ impl ChatDeltaState {
     /// the authoritative `messageSeq`/`timestamp` and `streamingComplete:true`,
     /// plus `removedIds` for any block emitted live that the persisted message
     /// does not contain (e.g. a mispredicted `tool_result` index).
+    ///
+    /// The re-read is retried once, and a persistent failure still emits a
+    /// terminal frame — the best-effort one built from the accumulated live
+    /// state — plus a WARN. Returning `None` here would suppress the terminal
+    /// frame entirely: the transcript then stays silently stale mid-turn while
+    /// the turn looks ended (the lifecycle flags clear via the separate agent
+    /// lifecycle lane), permanently, until the client resubscribes.
     async fn reconcile(&self, api: &dyn WorkspaceApi) -> Option<Value> {
         let message_id = self.message_id.clone()?;
-        let conv = api
-            .agent_get_conversation(
+        let read = || {
+            api.agent_get_conversation(
                 AgentId::from(self.agent_id.as_str()),
                 None,
                 None,
                 None,
                 None,
             )
-            .await
-            .ok()?;
+        };
+        let conv = match read().await {
+            Ok(conv) => conv,
+            Err(first) => match read().await {
+                Ok(conv) => conv,
+                Err(retry) => {
+                    tracing::warn!(
+                        agent = %self.agent_id,
+                        message = %message_id,
+                        first_error = %first,
+                        retry_error = %retry,
+                        "terminal reconcile re-read failed twice; emitting best-effort \
+                         terminal frame from accumulated live state"
+                    );
+                    return Some(self.best_effort_terminal(&message_id));
+                }
+            },
+        };
         let messages = conv.get("messages").and_then(Value::as_array)?;
         let mut added = Vec::new();
         let mut updated = Vec::new();
@@ -1020,6 +1054,32 @@ impl ChatDeltaState {
             .collect();
         removed.sort();
         Some(json!({ "added": added, "updated": updated, "removedIds": removed }))
+    }
+
+    /// The degraded terminal frame for a reconcile whose re-read failed twice:
+    /// every accumulated live block re-emitted as `updated` (each was already
+    /// delivered live or seeded from the seq-0 snapshot) stamped
+    /// `streamingComplete: true`, so the client still flips out of the
+    /// streaming state on the content it has. No authoritative
+    /// `messageSeq`/`timestamp` (the store read failed) and no `removedIds`
+    /// (without the persisted message no orphan is provable).
+    fn best_effort_terminal(&self, message_id: &str) -> Value {
+        let updated: Vec<Value> = self
+            .live_blocks
+            .iter()
+            .map(|(_, block)| self.entity(message_id, block.clone(), None, None, true))
+            .collect();
+        json!({ "added": [], "updated": updated, "removedIds": [] })
+    }
+
+    /// Upsert a live block's last-known full JSON into [`Self::live_blocks`]
+    /// (first-sighting order preserved) so a failed terminal reconcile can
+    /// still emit it in the best-effort frame.
+    fn remember_block(&mut self, block_id: &str, block: &Value) {
+        match self.live_blocks.iter_mut().find(|(id, _)| id == block_id) {
+            Some((_, existing)) => *existing = block.clone(),
+            None => self.live_blocks.push((block_id.to_string(), block.clone())),
+        }
     }
 
     /// Wrap one upserted block as a delta entity: the message pointer plus the
