@@ -10,7 +10,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use super::bus::EventBus;
+use super::bus::{Delivery, EventBus, LagWarnThrottle, BROADCAST_CAPACITY, LAG_WARN_INTERVAL};
 use super::filter::SubscriptionFilter;
 
 struct TempDb {
@@ -879,5 +879,186 @@ async fn transient_batch_insert_failure_exhausts_retries() {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ),
         "nothing broadcast when retries are exhausted"
+    );
+}
+
+/// Test-only capturing `tracing` subscriber (mirrors the hand-rolled
+/// `test_capture` in `intent-transport/src/protocol.rs`; `tracing-subscriber`
+/// is not a dependency of this crate). Records `(level, rendered fields)` per
+/// event.
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl Capture {
+    fn warns(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={:?} ", field.name(), value);
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), visitor.0));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Deterministic throttle semantics: the first lag warns immediately, reports
+/// inside [`LAG_WARN_INTERVAL`] are suppressed with their counts accumulated,
+/// and the next allowed WARN carries the accumulated total.
+#[test]
+fn lag_warn_throttle_rate_limits_and_accumulates() {
+    let t0 = std::time::Instant::now();
+    let mut throttle = LagWarnThrottle::default();
+    assert_eq!(
+        throttle.record(5, t0),
+        Some(5),
+        "first lag warns immediately"
+    );
+    assert_eq!(throttle.record(3, t0 + LAG_WARN_INTERVAL / 2), None);
+    assert_eq!(throttle.record(2, t0 + LAG_WARN_INTERVAL / 2), None);
+    assert_eq!(
+        throttle.record(1, t0 + LAG_WARN_INTERVAL),
+        Some(6),
+        "post-interval WARN carries the counts accumulated while throttled"
+    );
+}
+
+/// A subscriber driven past BROADCAST_CAPACITY must surface the loss: the
+/// delivery task's `Lagged` arm emits a WARN carrying the skipped count and
+/// the subscription's filter scope (event types + workspace).
+#[tokio::test]
+async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    filter.workspace_id = Some("ws-1".to_string());
+    let mut sub = bus.subscribe(filter);
+
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    // Flood the broadcast ring in one non-yielding loop (`publish_transient`
+    // never awaits) so the delivery task cannot drain in between: its receiver
+    // falls exactly OVERFLOW events behind and reports `Lagged` on next recv.
+    const OVERFLOW: usize = 64;
+    for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    // Delivery resumes after the lag report: the surviving events arrive.
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(!batch.is_empty());
+
+    let warns = capture.warns();
+    let warn = warns
+        .iter()
+        .find(|l| l.contains("skipped="))
+        .unwrap_or_else(|| panic!("no broadcast-lag WARN captured; got: {warns:?}"));
+    assert!(
+        warn.contains(&format!("skipped={OVERFLOW}")),
+        "WARN must carry the exact skipped count, got: {warn}"
+    );
+    assert!(
+        warn.contains("note:*"),
+        "WARN must carry the filter's event types, got: {warn}"
+    );
+    assert!(
+        warn.contains("ws-1"),
+        "WARN must carry the workspace scope, got: {warn}"
+    );
+    assert!(
+        warn.contains("subscriber lagged"),
+        "WARN must describe the lag drop, got: {warn}"
+    );
+}
+
+/// A subscriber driven past BROADCAST_CAPACITY must ALSO see the loss in-band:
+/// `recv_delivery` yields a `Delivery::Lagged(n)` marker at the gap position
+/// (before the surviving post-drop events), carrying the ring's skipped count,
+/// so consumers like the chat forwarder can run a bounded recovery. Plain
+/// `recv` consumers keep seeing only event batches.
+#[tokio::test]
+async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    const OVERFLOW: usize = 64;
+    for _ in 0..(BROADCAST_CAPACITY + OVERFLOW) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    let first = timeout(Duration::from_secs(5), sub.recv_delivery())
+        .await
+        .expect("recv_delivery timed out")
+        .expect("subscription closed");
+    match first {
+        Delivery::Lagged(n) => assert_eq!(
+            n, OVERFLOW as u64,
+            "marker carries the ring's exact skipped count"
+        ),
+        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+    }
+    let second = timeout(Duration::from_secs(5), sub.recv_delivery())
+        .await
+        .expect("recv_delivery timed out")
+        .expect("subscription closed");
+    assert!(
+        matches!(second, Delivery::Batch(ref b) if !b.is_empty()),
+        "surviving events follow the marker"
+    );
+}
+
+/// [`Subscription::recv`] must skip lag markers transparently: existing
+/// consumers (watchers, script/terminal streams) see only event batches.
+#[tokio::test]
+async fn recv_skips_lag_markers_transparently() {
+    let (_tmp, bus) = bus().await;
+    let mut filter = SubscriptionFilter::for_subscriber(&["note:*".to_string()], None, false, None);
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    for _ in 0..(BROADCAST_CAPACITY + 8) {
+        bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
+    }
+
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert!(
+        !batch.is_empty(),
+        "recv yields the surviving events, never a marker"
     );
 }
