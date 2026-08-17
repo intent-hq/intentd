@@ -8104,6 +8104,92 @@ async fn diagnostics_reports_queue_snapshots() {
     assert!(!text.contains("Pending message queues:"), "text: {text}");
 }
 
+/// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
+/// `conversationBytes` (total persisted conversation size, omitted at zero),
+/// and a conversation past `LARGE_CONVERSATION_WARN_BYTES` raises a
+/// `large-conversation` stuck-risk warning naming the agent and sizes.
+/// Diagnostics-only: the byte total never rides `agent.list` payloads.
+#[tokio::test]
+async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
+    let (_t, svc, ws) = setup().await;
+    let small = create_agent(&svc, &ws, "Small").await;
+    let bloated = create_agent(&svc, &ws, "Bloated").await;
+    let empty = create_agent(&svc, &ws, "Empty").await;
+
+    svc.store()
+        .append_agent_message(
+            &small,
+            "assistant",
+            &json!([{ "type": "text", "text": "short reply" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append small");
+    // Push the bloated agent past the 4 MiB threshold with a few large rows.
+    let big_text = "x".repeat(1024 * 1024);
+    for _ in 0..5 {
+        svc.store()
+            .append_agent_message(
+                &bloated,
+                "assistant",
+                &json!([{ "type": "text", "text": big_text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append bloated");
+    }
+
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics");
+    let rows = result["diagnostics"]["agents"].as_array().expect("agents");
+    let row_for = |id: &AgentId| {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(id.0.as_str()))
+            .expect("agent row")
+    };
+    let small_bytes = row_for(&small)["conversationBytes"]
+        .as_u64()
+        .expect("small conversationBytes");
+    assert!(small_bytes > 0 && small_bytes < super::LARGE_CONVERSATION_WARN_BYTES);
+    let bloated_bytes = row_for(&bloated)["conversationBytes"]
+        .as_u64()
+        .expect("bloated conversationBytes");
+    assert!(
+        bloated_bytes > super::LARGE_CONVERSATION_WARN_BYTES,
+        "bytes: {bloated_bytes}"
+    );
+    assert!(
+        row_for(&empty).get("conversationBytes").is_none(),
+        "zero-message agent omits the field"
+    );
+
+    let risks = result["diagnostics"]["stuckRisks"]
+        .as_array()
+        .expect("stuckRisks");
+    let large: Vec<&serde_json::Value> = risks
+        .iter()
+        .filter(|r| r["type"] == json!("large-conversation"))
+        .collect();
+    assert_eq!(large.len(), 1, "risks: {risks:?}");
+    assert_eq!(large[0]["agentId"], json!(bloated.0));
+    assert_eq!(large[0]["severity"], json!("warning"));
+    assert_eq!(large[0]["conversationBytes"], json!(bloated_bytes));
+    assert_eq!(
+        large[0]["thresholdBytes"],
+        json!(super::LARGE_CONVERSATION_WARN_BYTES)
+    );
+    assert!(
+        large[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("rotating to a fresh agent"),
+        "message: {}",
+        large[0]["message"]
+    );
+}
+
 /// monorepo#2063 A2: `agent.diagnostics` agent rows carry `subtreeMemoryBytes`
 /// from the runtime manager's tree probe — present only for agents the probe
 /// attributed bytes to, omitted otherwise (no bucket, no probe, or no manager
