@@ -9014,6 +9014,14 @@ impl Services {
         if !workspace_id.is_chief() {
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {
+                    // Test seam (intent-hq/monorepo#2739): park in the
+                    // archived-check → enqueue window so a test can land a
+                    // concurrent `workspace.unarchive` between the gate's
+                    // read above and the enqueue below.
+                    if let Some(park) = &self.wake_archived_park {
+                        park.entered.notify_one();
+                        park.release.notified().await;
+                    }
                     let (queued, position) = self.enqueue_message(
                         agent_id,
                         content.to_string(),
@@ -9023,13 +9031,29 @@ impl Services {
                         None,
                         false,
                     );
-                    self.publish_queue_updated(agent_id).await;
-                    return Ok(json!({
+                    let result = json!({
                         "success": true,
                         "queued": true,
                         "archivedParked": true,
                         "queuedMessage": queued.to_value(position),
-                    }));
+                    });
+                    self.publish_queue_updated(agent_id).await;
+                    // Race close (archived-check → enqueue vs a concurrent
+                    // `workspace.unarchive`): the unarchive's own drain kick
+                    // may have fired against a still-empty queue before this
+                    // enqueue landed, stranding the wake. Re-check and kick
+                    // the drain if the workspace is no longer archived; the
+                    // archived gate in `try_drain_queue` makes this a no-op
+                    // while still archived.
+                    if let Ok(current) = self.store.get_workspace(workspace_id).await {
+                        if !current.archived {
+                            manager
+                                .clone()
+                                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                                .await;
+                        }
+                    }
+                    return Ok(result);
                 }
                 Ok(_) => {}
                 Err(e) => {
