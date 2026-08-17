@@ -3,8 +3,8 @@
 //! config), exercising both the happy path (tracked-file restore + untracked
 //! deletion via a single request) and the `-32602` path-safety guard
 //! (`..` traversal). Asserts the response envelope shape from
-//! `PROTOCOL.md` §5 (`{ ok: true, paths: [...] }`) and the JSON-RPC
-//! error envelope shape from §9.
+//! `docs/protocol/methods/git.md` §5.6 (`{ ok: true, paths: [...] }`) and the JSON-RPC
+//! error envelope shape from `docs/protocol/09-error-codes.md` §9.
 //!
 //! Uses a tiny local repository as the workspace source so the test never
 //! touches the network. Gated on `git` being on PATH; skips cleanly
@@ -269,7 +269,7 @@ async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
 /// Happy path: `workspace.create` provisions a worktree; the client dirties
 /// a tracked file + drops an untracked file; a single `git.discard` call
 /// restores the tracked file from the index and unlinks the untracked one.
-/// Asserts the response envelope shape from PROTOCOL.md §5 —
+/// Asserts the response envelope shape from docs/protocol/methods/git.md §5.6 —
 /// `{ ok: true, paths: [...] }` echoing the input `paths`.
 #[tokio::test]
 async fn git_discard_restores_tracked_and_deletes_untracked_over_wss() {
@@ -324,7 +324,7 @@ async fn git_discard_restores_tracked_and_deletes_untracked_over_wss() {
     )
     .await;
 
-    // Envelope shape (PROTOCOL.md §5): { jsonrpc, id, result: { ok, paths } }.
+    // Envelope shape (docs/protocol/05-method-catalog.md §5): { jsonrpc, id, result: { ok, paths } }.
     assert_eq!(resp["jsonrpc"], json!("2.0"));
     assert_eq!(resp["id"], json!(3));
     assert!(resp.get("error").is_none(), "unexpected error: {resp}");
@@ -351,7 +351,7 @@ async fn git_discard_restores_tracked_and_deletes_untracked_over_wss() {
 }
 
 /// `git.discard` refuses a pathspec containing `..` up-front with `-32602`
-/// (JSON-RPC error envelope from PROTOCOL.md §9) and never touches the
+/// (JSON-RPC error envelope from docs/protocol/09-error-codes.md §9) and never touches the
 /// worktree — regression for the traversal-bypass vector where the OS
 /// resolves `..` at unlink time and would unlink a tracked file.
 #[tokio::test]
@@ -400,7 +400,7 @@ async fn git_discard_refuses_traversal_over_wss() {
     )
     .await;
 
-    // Error envelope shape (PROTOCOL.md §9): { jsonrpc, id, error: { code, message } }.
+    // Error envelope shape (docs/protocol/09-error-codes.md §9): { jsonrpc, id, error: { code, message } }.
     assert_eq!(resp["jsonrpc"], json!("2.0"));
     assert_eq!(resp["id"], json!(3));
     assert!(resp.get("result").is_none(), "unexpected result: {resp}");

@@ -1,5 +1,5 @@
 //! `providers.catalog` payload builder (monorepo#928; documented in the
-//! monorepo `docs/PROTOCOL.md` as of protocol 2.6).
+//! monorepo `docs/protocol/` as of protocol 2.6).
 //!
 //! Serves the static `intent-providers` registry over the wire so clients no
 //! longer need a local copy of `provider-config.ts`. Every registered

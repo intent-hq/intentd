@@ -7141,7 +7141,7 @@ async fn wss_repo_remove_round_trip() {
 }
 
 /// End-to-end WSS coverage for the workspace lifecycle helpers added by the
-/// thin-FE remediation (PROTOCOL.md §5.1): `workspace.duplicate`,
+/// thin-FE remediation (docs/protocol/methods/workspace.md §5.1): `workspace.duplicate`,
 /// `workspace.restore`, `workspace.cleanup`, `workspace.findRepositories`,
 /// and `workspace.initializeRepository`. Every method is driven over the
 /// real pinned-TLS WebSocket transport and its response envelope is asserted

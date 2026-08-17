@@ -1,10 +1,10 @@
 //! WSS end-to-end for the write-side `git.*` methods added in
-//! PROTOCOL.md §5.6: `git.createBranch`, `git.checkoutBranch`,
+//! docs/protocol/methods/git.md §5.6: `git.createBranch`, `git.checkoutBranch`,
 //! `git.renameBranch`, `git.stageHunk`, `git.unstageHunk`,
 //! `git.removeLockFile`, `git.push`, and `git.fetch`. Drives a real
 //! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config) and
-//! asserts the response envelope shape from PROTOCOL.md §5 (`{ ok, ... }`)
-//! plus the `-32602` error envelope from §9 for the validation paths.
+//! asserts the response envelope shape from docs/protocol/methods/git.md §5.6 (`{ ok, ... }`)
+//! plus the `-32602` error envelope from docs/protocol/09-error-codes.md §9 for the validation paths.
 //!
 //! `git.push`/`git.fetch` add a local bare-remote fixture wired up as
 //! `origin` on the source repo (linked worktrees share the object store
@@ -342,7 +342,7 @@ where
 
 /// Exercises the branch write triad (`git.createBranch` → `git.checkoutBranch`
 /// → `git.renameBranch`) over WSS, plus the empty-name `-32602` guard. Each
-/// response envelope is verified against PROTOCOL.md §5.6, and the observable
+/// response envelope is verified against docs/protocol/methods/git.md §5.6, and the observable
 /// side effect (`git.status.branch` reflecting the new HEAD) is asserted after
 /// each mutation.
 #[tokio::test]
@@ -424,7 +424,7 @@ async fn git_branch_ops_round_trip_over_wss() {
     let status = wss_rpc(&mut ws, 9, "git.status", json!({ "workspaceId": ws_id })).await;
     assert_eq!(status["result"]["branch"], json!("trunk"));
 
-    // Empty new name ⇒ InvalidParams (-32602) per PROTOCOL.md §9.
+    // Empty new name ⇒ InvalidParams (-32602) per docs/protocol/09-error-codes.md §9.
     let resp = wss_rpc(
         &mut ws,
         10,
@@ -459,7 +459,7 @@ async fn git_branch_ops_round_trip_over_wss() {
 }
 
 /// Exercises `git.push` and `git.fetch` over WSS against a local bare-remote
-/// fixture. Response envelopes are checked against PROTOCOL.md §5.6 and the
+/// fixture. Response envelopes are checked against docs/protocol/methods/git.md §5.6 and the
 /// bare-remote / local tracking ref advance is asserted after each call.
 #[tokio::test]
 async fn git_push_and_fetch_round_trip_over_wss() {
@@ -550,7 +550,7 @@ async fn git_push_and_fetch_round_trip_over_wss() {
 }
 
 /// Exercises the working-tree write pair (`git.stageHunk` → `git.unstageHunk`)
-/// plus `git.removeLockFile`. Each call is checked against its PROTOCOL.md §5.6
+/// plus `git.removeLockFile`. Each call is checked against its docs/protocol/methods/git.md §5.6
 /// response shape and the resulting `git.status` file entry's `staged` flag.
 /// Also covers the `git.agentCommit` no-`files` fallback semantics
 /// (monorepo#939): the transport path carries no agent context, so an
@@ -720,7 +720,7 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
 /// WSS counterpart of the UDS submodule-gitlink guard (monorepo#1714 follow-up):
 /// over the production TLS/WebSocket envelope, `git.agentCommit`'s explicit
 /// `files` list refuses a path strictly inside a registered submodule with the
-/// PROTOCOL.md §9 `-32603` error naming the path and its containing submodule,
+/// docs/protocol/09-error-codes.md §9 `-32603` error naming the path and its containing submodule,
 /// and no commit lands. Both the relative and the in-worktree absolute spelling
 /// are refused — the absolute form used to slip past the guard and be
 /// normalized into the submodule-internal relative path on the way to the index.
@@ -797,7 +797,7 @@ async fn git_agent_commit_rejects_submodule_internal_file_over_wss() {
 
 /// WSS counterpart of the discard submodule-gitlink guard (monorepo#1733):
 /// over the production TLS/WebSocket envelope, `git.discard` refuses a path
-/// strictly inside a registered submodule with the PROTOCOL.md §9 `-32603`
+/// strictly inside a registered submodule with the docs/protocol/09-error-codes.md §9 `-32603`
 /// error naming the path and its containing submodule — instead of treating it
 /// as untracked in the superproject and unlinking it. Both the relative and the
 /// in-worktree absolute spelling are refused, the file survives on disk, and
