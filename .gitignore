@@ -1,3 +1,4 @@
 /target
 lcov.info
 /guest-image/out/
+*.rlib
