@@ -30,8 +30,11 @@
 //!     `n` reaches 2, then `{ dispatch: true, message }`) — `lastState`
 //!     advances in `hook.list` after each run and the hook dispatches on the
 //!     run where the carried count reaches the threshold.
-//!  7. TTL expiry (v3.1): agent turn 5 schedules a hook with `ttlMs: 1`
-//!     (clamped to the 10s floor) — `expiresAt` surfaces in `hook.list`, the
+//!  7. TTL expiry (v3.1): agent turn 5 schedules three hooks probing the
+//!     clamp on the wire — omitted `ttlMs` (the 24-hour default), an in-range
+//!     `ttlMs: 7_200_000` (2 h, persists as-is), and `ttlMs: 1` (clamped to
+//!     the 10s floor). `hook.list` surfaces each persisted `expiresAt` (the
+//!     `createdAt`→`expiresAt` delta is asserted exactly); the short hook's
 //!     deadline passes, `hook:expired` fires, the row goes terminal
 //!     (`runNow` → -32602), and the owner is woken with the expiry notice.
 //!  8. Perpetual hooks: agent turn 6 schedules a `perpetual: true` hook whose
@@ -511,12 +514,18 @@ async fn hook_lifecycle_over_wss() {
         "return await ws.hook.schedule({{ name: 'counter', code: {}, delayMs: 60000 }});",
         json!(counter_inner)
     );
-    // TTL section: `ttlMs: 1` clamps to the 10s floor, so the hook expires
-    // ~10s after creation — well inside the event-read budget — while the
-    // 60s delayMs guarantees no second run ever starts.
+    // TTL section: three schedules in one turn probe the clamp over the
+    // production wire path. Omitted ttlMs takes the 24-hour default; an
+    // in-range 2h ttlMs persists as-is; `ttlMs: 1` clamps to the 10s floor,
+    // so that hook expires ~10s after creation — well inside the event-read
+    // budget — while the 60s delayMs guarantees no second run ever starts.
     let schedule_ttl_js = format!(
-        "return await ws.hook.schedule({{ name: 'shortttl', code: {}, delayMs: 60000, ttlMs: 1 }});",
-        json!("return { dispatch: false };")
+        "await ws.hook.schedule({{ name: 'defaultttl', code: {code}, delayMs: 60000 }}); \
+         await ws.hook.schedule({{ name: 'midttl', code: {code}, delayMs: 60000, \
+         ttlMs: 7200000 }}); \
+         return await ws.hook.schedule({{ name: 'shortttl', code: {code}, delayMs: 60000, \
+         ttlMs: 1 }});",
+        code = json!("return { dispatch: false };")
     );
     // Perpetual section: every run dispatches, so the validation run fires and
     // the hook STILL persists as active. `delayMs: 60000` keeps the cadence out
@@ -1147,7 +1156,7 @@ async fn hook_lifecycle_over_wss() {
         .to_string();
 
     // hook.list surfaces the persisted expiresAt (ttlMs: 1 clamps to the
-    // 10s floor: expiresAt ≈ createdAt + 10s, well under the 60-min cap).
+    // 10s floor: expiresAt ≈ createdAt + 10s, well under the 24-hour cap).
     let listed = wss_rpc(&mut rpc, 701, "hook.list", json!({ "workspaceId": ws_id })).await;
     let ttl_hook = listed["hooks"]
         .as_array()
@@ -1160,6 +1169,32 @@ async fn hook_lifecycle_over_wss() {
         ttl_hook["expiresAt"].is_string(),
         "expiresAt persisted: {ttl_hook}"
     );
+
+    // Clamp coverage on the wire: milliseconds between a listed hook's
+    // createdAt and expiresAt (both derive from the same schedule-time
+    // instant, so the delta is the persisted clamped ttlMs, exactly).
+    let ttl_of = |listed: &Value, name: &str| -> i64 {
+        let hook = listed["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .find(|h| h["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} in hook.list: {listed}"))
+            .clone();
+        let parse = |field: &str| {
+            chrono::DateTime::parse_from_rfc3339(
+                hook[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name} {field}: {hook}")),
+            )
+            .unwrap_or_else(|e| panic!("{name} {field} parses: {e}"))
+        };
+        (parse("expiresAt") - parse("createdAt")).num_milliseconds()
+    };
+    // Omitted ttlMs → the 24-hour default; in-range 2h ttlMs persists as-is.
+    assert_eq!(ttl_of(&listed, "defaultttl"), 86_400_000, "{listed}");
+    assert_eq!(ttl_of(&listed, "midttl"), 7_200_000, "{listed}");
+    assert_eq!(ttl_of(&listed, "shortttl"), 10_000, "{listed}");
 
     // The deadline (~10s out) passes without another run: hook:expired with
     // payload parity with hook:cancelled (base data object, no extras).
