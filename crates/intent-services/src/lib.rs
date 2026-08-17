@@ -6797,9 +6797,15 @@ fn note_to_workspace_task(
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
 /// `parentAgentId` (v2.9) carries the session's delegation parent (the value
 /// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
-/// root agents.
+/// root agents. Soft-deleted sessions (`AgentStatus::Deleted`) are excluded
+/// from `count`/`agents`/`agentIds` so clients never render deleted rows
+/// (mirrors the `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
-    let agents: Vec<WorkspaceAgentInfo> = sessions
+    let live: Vec<&AgentSession> = sessions
+        .iter()
+        .filter(|s| s.status != intent_core::AgentStatus::Deleted)
+        .collect();
+    let agents: Vec<WorkspaceAgentInfo> = live
         .iter()
         .map(|s| WorkspaceAgentInfo {
             id: s.id.clone(),
@@ -6812,7 +6818,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             parent_agent_id: s.parent_agent_id.clone(),
         })
         .collect();
-    let agent_ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+    let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
     WorkspaceAgentSummary {
         count: agents.len(),
         agents,
