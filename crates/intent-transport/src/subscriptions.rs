@@ -464,7 +464,7 @@ pub(crate) async fn chat_snapshot(
     since_message_id: Option<&str>,
 ) -> Value {
     let mut snapshot = match api
-        .agent_get_conversation(agent_id.clone(), None, None, None, None)
+        .agent_get_conversation(agent_id.clone(), None, None, None, None, None)
         .await
     {
         Ok(v) => v,
@@ -716,6 +716,7 @@ impl ChatDeltaState {
         let conv = api
             .agent_get_conversation(
                 AgentId::from(self.agent_id.as_str()),
+                None,
                 None,
                 None,
                 None,
@@ -983,6 +984,7 @@ impl ChatDeltaState {
         let conv = api
             .agent_get_conversation(
                 AgentId::from(self.agent_id.as_str()),
+                None,
                 None,
                 None,
                 None,

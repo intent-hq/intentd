@@ -2191,15 +2191,20 @@ impl Services {
     /// implementation (`page_window` over the same oldest→newest indexing),
     /// so previously minted tokens still resolve to the same rows.
     ///
-    /// Seek (`aroundMessageId`): when present it takes precedence over any
-    /// token and resolves to the page containing that message (`page_window_
-    /// around`). Seek pages — and the forward continuations minted from them —
-    /// additionally carry a `prevToken` cursor that walks newer toward the
-    /// live tail (`null` once the newest message has been returned); their
-    /// `nextToken` is the standard backward cursor, so older continuation is
-    /// ordinary paging. An unknown message id is `-32602` naming the id.
-    /// Absent the param (and any seek-minted forward token), the response is
-    /// byte-identical to before — no `prevToken` key is added.
+    /// Seek (`aroundMessageId` / `aroundIndex`): when present either takes
+    /// precedence over any token and resolves to the page containing the
+    /// target (`page_window_around`). `aroundMessageId` targets the row with
+    /// that id (unknown id is `-32602` naming the id); `aroundIndex` targets
+    /// the 0-based ordinal from the OLDEST message, clamped into
+    /// `[0, totalMessages - 1]` so approximate client estimates never reject
+    /// (negative values are rejected `-32602` at the transport boundary, as
+    /// is supplying both seek params). Seek pages — and the forward
+    /// continuations minted from them — additionally carry a `prevToken`
+    /// cursor that walks newer toward the live tail (`null` once the newest
+    /// message has been returned); their `nextToken` is the standard backward
+    /// cursor, so older continuation is ordinary paging. Absent both params
+    /// (and any seek-minted forward token), the response is byte-identical
+    /// to before — no `prevToken` key is added.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -2207,6 +2212,7 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
         around_message_id: Option<String>,
+        around_index: Option<i64>,
     ) -> Result<Value> {
         // Metadata-only scope check — the transcript is never hydrated here.
         let session = self.store.get_agent_session_summary(&agent_id).await?;
@@ -2226,9 +2232,10 @@ impl Services {
         // positions never shift — a racing `replace_agent_messages` degrades
         // no worse than an already-stale page token).
         let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
-        // Seek resolution: `aroundMessageId` wins over any token; a forward
-        // (`prevToken`-minted) cursor is recognized next; otherwise the
-        // legacy backward contract applies unchanged. `prev_token` is
+        // Seek resolution: `aroundMessageId` / `aroundIndex` win over any
+        // token (mutual exclusivity is enforced at the transport boundary);
+        // a forward (`prevToken`-minted) cursor is recognized next; otherwise
+        // the legacy backward contract applies unchanged. `prev_token` is
         // `Some(..)` only on seek/forward pages — the legacy path never adds
         // the `prevToken` key, keeping absent-param responses byte-identical.
         let seek_win = if let Some(mid) = around_message_id {
@@ -2242,6 +2249,12 @@ impl Services {
                 limit,
                 index.max(0) as usize,
             ))
+        } else if let Some(idx) = around_index {
+            // Ordinal seek: clamp into [0, total - 1] — client estimates are
+            // approximate, so an overshooting index lands on the newest page
+            // instead of erroring (negatives were rejected at the boundary).
+            let clamped = (idx.max(0) as usize).min(total.saturating_sub(1));
+            Some(crate::pagination::page_window_around(total, limit, clamped))
         } else {
             page_token
                 .as_deref()

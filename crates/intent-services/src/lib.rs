@@ -20808,6 +20808,7 @@ impl WorkspaceApi for Services {
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
         around_message_id: Option<String>,
+        around_index: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.agent_get_conversation_op(
@@ -20816,6 +20817,7 @@ impl WorkspaceApi for Services {
                 workspace_id,
                 page_token,
                 around_message_id,
+                around_index,
             )
             .await
         })

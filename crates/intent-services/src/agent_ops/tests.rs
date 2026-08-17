@@ -2827,7 +2827,7 @@ async fn get_conversation_surfaces_turn_liveness() {
 
     // Idle: turnInFlight false, lastStreamActivityAt null (always present).
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
@@ -2841,7 +2841,7 @@ async fn get_conversation_surfaces_turn_liveness() {
         vec![json!({ "type": "text", "id": "msg-1:0", "text": "streaming…" })],
     );
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], true);
@@ -2854,7 +2854,7 @@ async fn get_conversation_surfaces_turn_liveness() {
     svc.clear_live_turn(&id);
     svc.set_test_busy(&id, false);
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(res["turnInFlight"], false);
@@ -2987,7 +2987,7 @@ async fn get_conversation_truncates_to_limit() {
             .expect("append");
     }
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(res["totalMessages"], 5);
@@ -3018,7 +3018,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 1: newest two, oldest→newest within the page, nextToken present.
     let p1 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None)
         .await
         .expect("p1");
     assert_eq!(p1["totalMessages"], 5);
@@ -3033,7 +3033,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 2 follows the token to the next-older window.
     let p2 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t1), None, None)
         .await
         .expect("p2");
     let m2 = p2["messages"].as_array().unwrap();
@@ -3043,7 +3043,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
 
     // Page 3 is the final page: oldest message, no further token.
     let p3 = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, Some(t2), None, None)
         .await
         .expect("p3");
     let m3 = p3["messages"].as_array().unwrap();
@@ -3055,13 +3055,13 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     // No limit → default page returns all five with no token; an over-max limit
     // clamps to 200 and likewise fits all five in one page.
     let all = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None)
         .await
         .expect("all");
     assert_eq!(all["messages"].as_array().unwrap().len(), 5);
     assert!(all["nextToken"].is_null());
     let clamped = svc
-        .agent_get_conversation_op(id, Some(10_000), None, None, None)
+        .agent_get_conversation_op(id, Some(10_000), None, None, None, None)
         .await
         .expect("clamped");
     assert_eq!(clamped["messages"].as_array().unwrap().len(), 5);
@@ -3090,7 +3090,7 @@ async fn get_conversation_seeks_around_message_id() {
 
     // Seek to m5 with limit 4: page is [m3..m7), target inside, both cursors.
     let seek = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[5].clone()))
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[5].clone()), None)
         .await
         .expect("seek");
     let m = seek["messages"].as_array().unwrap();
@@ -3110,7 +3110,7 @@ async fn get_conversation_seeks_around_message_id() {
 
     // nextToken continues into strictly older rows (ordinary backward paging).
     let older = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None)
         .await
         .expect("older");
     let mo = older["messages"].as_array().unwrap();
@@ -3123,7 +3123,7 @@ async fn get_conversation_seeks_around_message_id() {
 
     // prevToken walks newer to the live tail; the tail page has no prev.
     let newer = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None)
+        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None)
         .await
         .expect("newer");
     let mn = newer["messages"].as_array().unwrap();
@@ -3157,7 +3157,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
 
     // Oldest edge: seek to m0 pins the page to the start of history.
     let oldest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[0].clone()))
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[0].clone()), None)
         .await
         .expect("oldest seek");
     let m = oldest["messages"].as_array().unwrap();
@@ -3169,7 +3169,7 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
 
     // Newest edge: seek to the newest message clamps to the tail window.
     let newest = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[5].clone()))
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, Some(ids[5].clone()), None)
         .await
         .expect("newest seek");
     let m = newest["messages"].as_array().unwrap();
@@ -3179,14 +3179,21 @@ async fn get_conversation_seek_clamps_at_edges_and_beats_token() {
 
     // Precedence: aroundMessageId wins when a token is also supplied.
     let token = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None)
         .await
         .expect("mint token")["nextToken"]
         .as_str()
         .expect("token")
         .to_string();
     let both = svc
-        .agent_get_conversation_op(id.clone(), Some(4), None, Some(token), Some(ids[0].clone()))
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(4),
+            None,
+            Some(token),
+            Some(ids[0].clone()),
+            None,
+        )
         .await
         .expect("seek beats token");
     assert_eq!(
@@ -3215,7 +3222,7 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
         .expect("append other");
 
     let err = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, Some("msg-nope".into()))
+        .agent_get_conversation_op(id.clone(), None, None, None, Some("msg-nope".into()), None)
         .await
         .expect_err("unknown id");
     assert!(
@@ -3223,16 +3230,144 @@ async fn get_conversation_seek_unknown_message_id_is_invalid_params() {
         "error names the unknown id: {err:?}"
     );
     // A message id from another agent's log is equally unknown here.
-    svc.agent_get_conversation_op(id.clone(), None, None, None, Some(foreign.id))
+    svc.agent_get_conversation_op(id.clone(), None, None, None, Some(foreign.id), None)
         .await
         .expect_err("foreign message id");
 
     // Seek-free reads stay byte-compatible: no prevToken key is added.
     let plain = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("plain");
     assert!(plain.get("prevToken").is_none());
+}
+
+/// §5.5 ordinal seek: `aroundIndex` returns the page containing that
+/// 0-based ordinal (from the oldest message) with the same centered split
+/// and dual cursors as `aroundMessageId`, and both cursors walk correctly
+/// from the seek page.
+#[tokio::test]
+async fn get_conversation_seeks_around_index() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "OrdinalSeeker").await;
+    for i in 0..10 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Seek to ordinal 5 with limit 4: page is [m3..m7), both cursors minted
+    // — identical to the aroundMessageId seek targeting the same row.
+    let seek = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(5))
+        .await
+        .expect("seek");
+    let m = seek["messages"].as_array().unwrap();
+    assert_eq!(m.len(), 4);
+    assert_eq!(m[0]["contentBlocks"][0]["text"], "m3");
+    assert_eq!(m[3]["contentBlocks"][0]["text"], "m6");
+    assert_eq!(seek["totalMessages"], 10);
+    let next = seek["nextToken"]
+        .as_str()
+        .expect("older cursor")
+        .to_string();
+    let prev = seek["prevToken"]
+        .as_str()
+        .expect("newer cursor")
+        .to_string();
+
+    // nextToken continues into strictly older rows (ordinary backward paging).
+    let older = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, Some(next), None, None)
+        .await
+        .expect("older");
+    let mo = older["messages"].as_array().unwrap();
+    assert_eq!(mo[0]["contentBlocks"][0]["text"], "m0");
+    assert!(older.get("prevToken").is_none());
+
+    // prevToken walks newer to the live tail; the tail page has no prev.
+    let newer = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, Some(prev), None, None)
+        .await
+        .expect("newer");
+    let mn = newer["messages"].as_array().unwrap();
+    assert_eq!(mn[0]["contentBlocks"][0]["text"], "m7");
+    assert_eq!(mn[2]["contentBlocks"][0]["text"], "m9");
+    assert!(newer["prevToken"].is_null(), "newest message reached");
+}
+
+/// §5.5 ordinal seek clamping: index 0 pins the page to the start of
+/// history, an overshooting index clamps to the newest window (client
+/// estimates are approximate — never an error), and a transcript smaller
+/// than the limit returns everything with both cursors null.
+#[tokio::test]
+async fn get_conversation_around_index_clamps_out_of_range() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "OrdinalClamp").await;
+    for i in 0..6 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Oldest edge: index 0 pins to the start of history.
+    let oldest = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(0))
+        .await
+        .expect("oldest seek");
+    let m = oldest["messages"].as_array().unwrap();
+    assert_eq!(m[0]["contentBlocks"][0]["text"], "m0");
+    assert_eq!(m[3]["contentBlocks"][0]["text"], "m3");
+    assert!(oldest["nextToken"].is_null(), "nothing older remains");
+    assert!(oldest["prevToken"].is_string());
+
+    // Overshoot: index far past the end clamps to the newest window.
+    let newest = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, None, None, Some(1_000_000))
+        .await
+        .expect("overshoot clamps");
+    let m = newest["messages"].as_array().unwrap();
+    assert_eq!(m[0]["contentBlocks"][0]["text"], "m2");
+    assert_eq!(m[3]["contentBlocks"][0]["text"], "m5");
+    assert!(newest["prevToken"].is_null(), "already at the live tail");
+
+    // Ordinal seek wins over a simultaneously supplied token.
+    let token = svc
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None)
+        .await
+        .expect("mint token")["nextToken"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    let both = svc
+        .agent_get_conversation_op(id.clone(), Some(4), None, Some(token), None, Some(0))
+        .await
+        .expect("seek beats token");
+    assert_eq!(
+        both["messages"][0]["contentBlocks"][0]["text"], "m0",
+        "ordinal anchor wins over the token"
+    );
+
+    // Small transcript (< limit): everything returned, both cursors null.
+    let small_id = create_agent(&svc, &ws, "OrdinalSmall").await;
+    for i in 0..3 {
+        let c = json!([{ "type": "text", "text": format!("s{i}") }]);
+        svc.store()
+            .append_agent_message(&small_id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    let small = svc
+        .agent_get_conversation_op(small_id, Some(10), None, None, None, Some(1))
+        .await
+        .expect("small seek");
+    assert_eq!(small["messages"].as_array().unwrap().len(), 3);
+    assert!(small["nextToken"].is_null());
+    assert!(small["prevToken"].is_null());
 }
 
 /// monorepo#958: `agent.getConversation` paginates in SQL — a `limit=N` read
@@ -3260,7 +3395,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
         .expect("corrupt older rows");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), Some(2), None, None, None)
+        .agent_get_conversation_op(id.clone(), Some(2), None, None, None, None)
         .await
         .expect("newest page must not decode rows outside its window");
     assert_eq!(res["totalMessages"], 5);
@@ -3272,7 +3407,7 @@ async fn get_conversation_reads_only_the_requested_page_from_store() {
     // Following the token into the corrupted region decodes those rows and
     // fails — confirming the corruption is real and only page rows decode.
     let t = res["nextToken"].as_str().expect("token").to_string();
-    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None)
+    svc.agent_get_conversation_op(id, Some(2), None, Some(t), None, None)
         .await
         .expect_err("older page decodes the corrupted rows");
 }
@@ -3306,7 +3441,7 @@ async fn get_conversation_strips_anonymous_tool_use_pairs() {
         .expect("append");
 
     let res = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     let blocks = res["messages"][0]["contentBlocks"].as_array().unwrap();
@@ -3422,7 +3557,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
         .expect("append assistant");
 
     let res = svc
-        .agent_get_conversation_op(id.clone(), None, None, None, None)
+        .agent_get_conversation_op(id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     let messages = res["messages"].as_array().unwrap();
@@ -3442,7 +3577,7 @@ async fn get_conversation_stamps_synthetic_block_ids() {
     // Serve-time only: a second read re-derives the same ids from unmutated
     // stored rows.
     let again = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv again");
     assert_eq!(again["messages"], res["messages"]);
@@ -6394,7 +6529,7 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(r["queued"], false);
     assert_eq!(r["messageId"], "m1");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -6753,7 +6888,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
         .expect("send");
     assert_eq!(r["queued"], false);
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -6801,7 +6936,7 @@ async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
         "the dequeued entry left the queue"
     );
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     let content = &conv["messages"][0]["contentBlocks"];
@@ -6836,7 +6971,7 @@ async fn send_queued_message_now_op_not_found_has_no_side_effects() {
     let queue = svc.queue_snapshot(&id);
     assert_eq!(queue.len(), 1, "queue untouched: {queue:?}");
     let conv = svc
-        .agent_get_conversation_op(id, None, None, None, None)
+        .agent_get_conversation_op(id, None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(
@@ -10627,7 +10762,7 @@ async fn delegate_delivers_agent_instructions_as_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1, "child got exactly one message");
@@ -10656,7 +10791,7 @@ async fn delegate_falls_back_to_task_text_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -10716,7 +10851,7 @@ async fn delegate_falls_back_to_task_note_content_for_child_first_message() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child.clone(), None, None, None, None)
+        .agent_get_conversation_op(child.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 1);
@@ -11073,7 +11208,7 @@ async fn delegate_without_message_source_delivers_nothing() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let conv = svc
-        .agent_get_conversation_op(child, None, None, None, None)
+        .agent_get_conversation_op(child, None, None, None, None, None)
         .await
         .expect("conv");
     assert_eq!(conv["totalMessages"], 0, "no message delivered");
@@ -16927,7 +17062,7 @@ async fn wake_or_create_delivers_message_metadata_on_block() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id, None, None, None, None)
+        .agent_get_conversation_op(new_id, None, None, None, None, None)
         .await
         .expect("conv");
     // The delivered message is the first user message; its content block
@@ -16962,7 +17097,7 @@ async fn wake_or_create_store_only_persists_row_level_metadata() {
         .expect("wake");
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(new_id.clone(), None, None, None, None)
+        .agent_get_conversation_op(new_id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -17187,7 +17322,7 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
         .expect("wake");
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -17222,7 +17357,7 @@ async fn deliv1_wake_runtime_idle_branch_persists_row_level_metadata() {
     assert_eq!(resp["ok"], true);
     let agent_id = AgentId::from(resp["agentId"].as_str().unwrap());
     let conv = svc
-        .agent_get_conversation_op(agent_id.clone(), None, None, None, None)
+        .agent_get_conversation_op(agent_id.clone(), None, None, None, None, None)
         .await
         .expect("conv");
     let msg = &conv["messages"][0];
@@ -17455,7 +17590,7 @@ async fn agent_ops_reject_cross_workspace_bare_id_probes() {
     assert!(matches!(err, Error::NotFound(_)), "get: {err:?}");
 
     let err = svc
-        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None, None)
+        .agent_get_conversation_op(id.clone(), None, Some(ws_b.clone()), None, None, None)
         .await
         .expect_err("cross-ws conversation must not observe");
     assert!(matches!(err, Error::NotFound(_)), "conversation: {err:?}");

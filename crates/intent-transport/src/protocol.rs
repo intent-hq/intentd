@@ -176,13 +176,20 @@
 //! to force it past the conflict hold"), the batch result no longer echoes
 //! `greedy`, `started` rows never carry conflict overlap, and the
 //! `held:conflict` reason now points at individual delegation — no
-//! method-catalog change, 293 router methods, 332 total.
+//! method-catalog change, 293 router methods, 332 total. Version 7.1 adds
+//! the ordinal seek param `aroundIndex` on `agent.getConversation`
+//! (additive; §5.5): the page containing the 0-based ordinal from the
+//! OLDEST message, clamped into `[0, totalMessages - 1]` (negative or
+//! non-integer is `-32602`; supplying it together with `aroundMessageId`
+//! is `-32602` naming the conflict), carrying the same `nextToken` /
+//! `prevToken` seek cursors as `aroundMessageId` pages — no method-catalog
+//! change, 293 router methods, 332 total.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "7.0";
+pub const PROTOCOL_VERSION: &str = "7.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

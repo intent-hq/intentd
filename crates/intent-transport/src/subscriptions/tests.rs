@@ -1560,6 +1560,7 @@ mod chat_snapshot_bounded {
             _workspace_id: Option<WorkspaceId>,
             page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // The snapshot must ask for the newest page (no cursor) and must
@@ -1733,6 +1734,7 @@ mod chat_message_delta {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
@@ -2091,6 +2093,7 @@ mod chat_snapshot_interrupt_window {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             let flushed = self.phase() == Phase::Flushed;
             Box::pin(async move {
@@ -2160,6 +2163,7 @@ mod chat_snapshot_interrupt_window {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2213,6 +2217,7 @@ mod chat_snapshot_interrupt_window {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2269,6 +2274,7 @@ mod chat_snapshot_interrupt_window {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move {
                 Ok(json!({
@@ -2524,6 +2530,7 @@ mod chat_terminal_message_id_fallback {
             _workspace_id: Option<WorkspaceId>,
             _page_token: Option<String>,
             _around_message_id: Option<String>,
+            _around_index: Option<i64>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let conv = self.conversation.clone();
