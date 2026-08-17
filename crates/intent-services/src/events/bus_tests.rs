@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use intent_core::{ActorType, EventActor, WorkspaceId};
+use intent_core::{ActorType, Event, EventActor, WorkspaceId};
 use intent_store::{EventQuery, NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
@@ -724,6 +724,181 @@ async fn oneshot_receiver_drop_is_handled_gracefully() {
     assert!(
         result.is_ok(),
         "subsequent publish should succeed after oneshot receiver drop"
+    );
+}
+
+// --- Batch-insert retry on transient failure (monorepo#2673) ---------------
+//
+// `flush_prepared` is the insert-retry + resolve/broadcast core of the writer
+// task's `flush_batch`, generic over the insert operation so these tests can
+// inject failures without a real contended pool. `start_paused` auto-advances
+// the retry backoff sleeps.
+
+/// A stored `Event` as `insert_events` would return it for `ev`.
+fn stored_event(id: &str, ev: &NewEvent) -> Event {
+    Event {
+        id: id.to_string(),
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data: ev.data.clone(),
+    }
+}
+
+/// The observed failure mode: `pool.acquire()` timing out under contention.
+fn transient_error() -> intent_core::Error {
+    intent_core::Error::Internal(
+        "acquire connection failed: pool timed out while waiting for an open connection"
+            .to_string(),
+    )
+}
+
+/// Drift guard: classify an error built through the SAME construction path as
+/// `insert_events` — `format!("acquire connection failed: {e}")` over a real
+/// `sqlx::Error::PoolTimedOut` — so a wording change on either side (the
+/// `event_repo.rs` prefix or sqlx's Display) breaks this test instead of
+/// silently disabling retries.
+#[test]
+fn transient_classification_matches_insert_events_wording() {
+    let sqlx_err = sqlx::Error::PoolTimedOut;
+    let as_insert_events_builds_it =
+        intent_core::Error::Internal(format!("acquire connection failed: {sqlx_err}"));
+    assert!(
+        super::bus::is_transient_insert_error(&as_insert_events_builds_it),
+        "acquire-timeout error must classify as transient: {as_insert_events_builds_it}"
+    );
+    // And a permanent failure through the same lens stays permanent.
+    let permanent =
+        intent_core::Error::Internal("insert failed: UNIQUE constraint failed: event.id".into());
+    assert!(!super::bus::is_transient_insert_error(&permanent));
+}
+
+/// Regression (monorepo#2673): a transient acquire failure must not drop the
+/// batch — the retry succeeds and the events are delivered both to the
+/// publisher (oneshot) and to live subscribers (broadcast).
+#[tokio::test(start_paused = true)]
+async fn transient_batch_insert_failure_retries_and_delivers() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let stored = stored_event("evt-1", &ev);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            let fail = attempts.get() == 1;
+            let stored = stored.clone();
+            async move {
+                if fail {
+                    Err(transient_error())
+                } else {
+                    Ok(vec![stored])
+                }
+            }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(attempts.get(), 2, "one transient failure, one retry");
+    assert!(pending.is_empty());
+    let resolved = orx
+        .await
+        .expect("oneshot resolved")
+        .expect("publisher sees Ok after retry");
+    assert_eq!(resolved.id, "evt-1");
+    let broadcast = brx.recv().await.expect("broadcast delivered");
+    assert_eq!(broadcast.id, "evt-1");
+}
+
+/// Permanent failures (e.g. a constraint violation) must NOT retry: one
+/// attempt, publishers resolve with the error, nothing broadcast.
+#[tokio::test(start_paused = true)]
+async fn permanent_batch_insert_failure_does_not_retry() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            async {
+                Err(intent_core::Error::Internal(
+                    "insert events failed: UNIQUE constraint failed: event.id".to_string(),
+                ))
+            }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(attempts.get(), 1, "permanent failures never retry");
+    assert!(pending.is_empty());
+    let err = orx
+        .await
+        .expect("oneshot resolved")
+        .expect_err("publisher sees the error");
+    assert!(
+        err.to_string().contains("batch insert failed"),
+        "existing error shape preserved: {err}"
+    );
+    assert!(
+        matches!(
+            brx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing broadcast on durable failure"
+    );
+}
+
+/// A persistently transient failure exhausts the bounded retry budget, then
+/// resolves publishers with the error (existing behavior) without broadcast.
+#[tokio::test(start_paused = true)]
+async fn transient_batch_insert_failure_exhausts_retries() {
+    let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
+
+    let attempts = std::cell::Cell::new(0u32);
+    super::bus::flush_prepared(
+        || {
+            attempts.set(attempts.get() + 1);
+            async { Err(transient_error()) }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    assert_eq!(
+        attempts.get(),
+        super::bus::INSERT_RETRY_MAX_ATTEMPTS,
+        "retry budget is bounded"
+    );
+    assert!(pending.is_empty());
+    let err = orx
+        .await
+        .expect("oneshot resolved")
+        .expect_err("publisher sees the error after exhausted retries");
+    assert!(err.to_string().contains("batch insert failed"));
+    assert!(
+        matches!(
+            brx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ),
+        "nothing broadcast when retries are exhausted"
     );
 }
 
