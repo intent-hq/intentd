@@ -1037,7 +1037,9 @@ async fn agent_bindings_send_single_pending_message_guard() {
         serde_json::from_str(last_output).expect("tool output should be JSON");
 
     // First send parks (question hold) despite the pre-seeded FOREIGN entry:
-    // another sender's pending message never triggers the guard.
+    // another sender's pending message never triggers the guard. Omitted
+    // priority resolves to interrupt in the binding, so the entry parks
+    // AHEAD of the foreign normal entry.
     assert_eq!(out["first"]["ok"], true, "{out}");
     assert_eq!(out["first"]["queued"], true, "{out}");
     assert_eq!(out["first"]["heldForQuestions"], true, "{out}");
@@ -1067,12 +1069,13 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let echo_ids: Vec<&str> = echo.iter().map(|e| e["id"].as_str().unwrap()).collect();
     assert_eq!(
         echo_ids,
-        ["qmsg-foreign", first_id],
-        "echo is the full queue in drain order"
+        [first_id, "qmsg-foreign"],
+        "echo is the full queue in drain order (caller's default-interrupt \
+         entry ahead of the foreign normal entry)"
     );
-    assert_eq!(echo[0]["fromAgentId"], "agent-other", "{second}");
-    assert_eq!(echo[1]["fromAgentId"], caller_id.0, "{second}");
-    let foreign_echo = echo[0]["content"].as_str().unwrap();
+    assert_eq!(echo[0]["fromAgentId"], caller_id.0, "{second}");
+    assert_eq!(echo[1]["fromAgentId"], "agent-other", "{second}");
+    let foreign_echo = echo[1]["content"].as_str().unwrap();
     assert_eq!(
         foreign_echo.chars().count(),
         201,
@@ -1100,7 +1103,8 @@ async fn agent_bindings_send_single_pending_message_guard() {
     assert_eq!(out["resend"]["queued"], true, "{out}");
 
     // Backend state: foreign entry untouched, caller's queue slot holds ONLY
-    // the combined re-send (the refused sends never parked).
+    // the combined re-send (the refused sends never parked). The re-send is
+    // default-interrupt, so it parks ahead of the foreign normal entry.
     let remaining = services
         .agent_get_queue(target_id.clone(), Some(ws.clone()))
         .await
@@ -1111,13 +1115,13 @@ async fn agent_bindings_send_single_pending_message_guard() {
         .map(|e| e["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids.len(), 2, "foreign + one caller entry: {ids:?}");
-    assert_eq!(ids[0], "qmsg-foreign");
+    assert_eq!(ids[1], "qmsg-foreign");
     let contents: Vec<&str> = remaining
         .iter()
         .map(|e| e["content"].as_str().unwrap())
         .collect();
     assert!(
-        contents[1].starts_with("combined:"),
+        contents[0].starts_with("combined:"),
         "only the re-send parked: {contents:?}"
     );
 

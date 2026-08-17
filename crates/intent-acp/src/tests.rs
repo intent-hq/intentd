@@ -7981,7 +7981,7 @@ mod wsapi4_bindings_tests {
     use crate::WorkspaceMcpServer;
 
     type SendCall = (String, String, Option<String>, Option<Value>);
-    type SendToTaskCall = (String, String, Option<Value>);
+    type SendToTaskCall = (String, String, Option<String>, Option<Value>);
     type WatchSenderCall = (String, String);
     type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
     type DelegateCall = (Option<String>, Option<String>);
@@ -8166,12 +8166,13 @@ mod wsapi4_bindings_tests {
             _ws: WorkspaceId,
             task_note_id: intent_core::NoteId,
             message: String,
-            _priority: Option<String>,
+            priority: Option<String>,
             message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_send_to_task_calls.lock().unwrap().push((
                 task_note_id.as_str().to_string(),
                 message,
+                priority,
                 message_metadata,
             ));
             Box::pin(async move {
@@ -8528,6 +8529,64 @@ mod wsapi4_bindings_tests {
         assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
     }
 
+    /// Omitted `priority` defaults to INTERRUPT delivery: the binding
+    /// resolves the absent argument to `"interrupt"` before hitting the
+    /// service layer (binding-local — wire RPC defaults are untouched).
+    #[tokio::test]
+    async fn agent_send_omitted_priority_defaults_to_interrupt() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+    }
+
+    /// A `null` priority is the same as omitting it — interrupt delivery.
+    #[tokio::test]
+    async fn agent_send_null_priority_defaults_to_interrupt() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi', null);").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+    }
+
+    /// `priority: "queue"` is the explicit opt-out: it maps to the
+    /// non-interrupt `"normal"` so the send queues if the target is busy.
+    #[tokio::test]
+    async fn agent_send_priority_queue_opts_out_of_interrupt() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi', 'queue');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// `sendToTask` shares the interrupt-by-default resolution and the
+    /// `"queue"` opt-out.
+    #[tokio::test]
+    async fn agent_send_to_task_priority_defaults_and_queue_opt_out() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', 'interrupt');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_to_task_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("interrupt"));
+        assert_eq!(calls[1].2.as_deref(), Some("normal"));
+        assert_eq!(calls[2].2.as_deref(), Some("interrupt"));
+    }
+
     #[tokio::test]
     async fn agent_send_with_caller_registers_sub1_watch() {
         let (srv, api) = server_with_caller("caller-1");
@@ -8615,7 +8674,7 @@ mod wsapi4_bindings_tests {
         let calls = api.agent_send_to_task_calls.lock().unwrap();
         assert_eq!(calls[0].0, "tn-1");
         assert_eq!(
-            calls[0].2,
+            calls[0].3,
             Some(json!({
                 "type": "agent_message",
                 "fromAgentId": "caller-1",
@@ -8630,7 +8689,7 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_to_task_calls.lock().unwrap();
-        assert_eq!(calls[0].2, None);
+        assert_eq!(calls[0].3, None);
     }
 
     /// `create()`'s initial-message delivery to the child is also an
@@ -8710,7 +8769,7 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(false));
         let calls = api.agent_send_to_task_calls.lock().unwrap();
         assert_eq!(
-            calls[0].2,
+            calls[0].3,
             Some(json!({
                 "type": "custom",
                 "fromAgentId": "caller-1",
