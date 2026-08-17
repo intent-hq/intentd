@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -93,6 +93,7 @@ impl WorkspaceMcpServer {
     /// success, `(no return value)` for `undefined`, and a readable text
     /// body with `isError: true` on any JS-side failure).
     pub(super) async fn dispatch_workspace_api(&self, args: &Value) -> Value {
+        let started = Instant::now();
         let Some(code) = args.get("code").and_then(Value::as_str) else {
             return workspace_api_error("`code` is required and must be a string");
         };
@@ -135,7 +136,17 @@ impl WorkspaceMcpServer {
             timeout: self.workspace_api_timeout,
             ..EvalOptions::default()
         };
+        // Stage breadcrumbs (monorepo#2709): trace-level markers bracket each
+        // dispatch stage so a wedged dispatch — one the bridge watchdog later
+        // aborts — leaves a trail naming the stage it never left. Normal
+        // calls emit exactly one debug event (below); a dispatch exceeding
+        // the eval budget upgrades it to warn.
+        tracing::trace!("workspace_api dispatch: eval starting");
+        let eval_started = Instant::now();
         let eval_result = js_eval(&full_code, &opts, Some(host)).await;
+        let eval_ms = eval_started.elapsed().as_millis() as u64;
+        let eval_ok = eval_result.is_ok();
+        tracing::trace!(eval_ms, eval_ok, "workspace_api dispatch: eval finished");
         // Drain the binding-time collection unconditionally: the attachments
         // were stamped and handed to the agent's JS with `ok: true`, so they
         // register no matter what the script did afterwards — discarded the
@@ -143,7 +154,9 @@ impl WorkspaceMcpServer {
         let pending_batch: Vec<TurnAttachment> = pending
             .map(|p| p.lock().unwrap().drain_in_call_order())
             .unwrap_or_default();
-        match eval_result {
+        let mut settings_ms: Option<u64> = None;
+        let mut finalize_ms: Option<u64> = None;
+        let result = match eval_result {
             Ok(v) => match v.get("__k").and_then(Value::as_str) {
                 Some("u") => {
                     self.register_pending_attachments(pending_batch);
@@ -167,20 +180,26 @@ impl WorkspaceMcpServer {
                         let content_items =
                             self.register_turn_attachments(content_items, pending_batch);
                         // Return MCP content items directly
-                        return json!({
+                        json!({
                             "content": content_items,
                             "isError": false,
-                        });
+                        })
+                    } else {
+                        self.register_pending_attachments(pending_batch);
+                        // Error results and the `__mcpContentItems` pass-through
+                        // above are exempt from both knobs: only the plain
+                        // success body is TOON-encoded / size-limited.
+                        let stage_started = Instant::now();
+                        let (toon_output, max_chars) = self.workspace_api_output_settings().await;
+                        settings_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        let (body, ext) = render_workspace_api_value(&value, toon_output);
+                        let stage_started = Instant::now();
+                        let out = self
+                            .finalize_workspace_api_output(body, ext, max_chars)
+                            .await;
+                        finalize_ms = Some(stage_started.elapsed().as_millis() as u64);
+                        out
                     }
-
-                    self.register_pending_attachments(pending_batch);
-                    // Error results and the `__mcpContentItems` pass-through
-                    // above are exempt from both knobs: only the plain
-                    // success body is TOON-encoded / size-limited.
-                    let (toon_output, max_chars) = self.workspace_api_output_settings().await;
-                    let (body, ext) = render_workspace_api_value(&value, toon_output);
-                    self.finalize_workspace_api_output(body, ext, max_chars)
-                        .await
                 }
                 _ => {
                     self.register_pending_attachments(pending_batch);
@@ -191,7 +210,36 @@ impl WorkspaceMcpServer {
                 self.register_pending_attachments(pending_batch);
                 workspace_api_error(&format_js_error(&e))
             }
+        };
+        let total = started.elapsed();
+        let total_ms = total.as_millis() as u64;
+        if total > self.workspace_api_timeout {
+            // Slow-dispatch marker (monorepo#2709): the whole dispatch took
+            // longer than the JS eval budget, so the post-eval awaits (or a
+            // stalled eval that beat the timeout by little) ate real time.
+            // `summary` is the caller's UI hint for the call — safe to log.
+            let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
+            tracing::warn!(
+                summary,
+                eval_ms,
+                eval_ok,
+                settings_ms = ?settings_ms,
+                finalize_ms = ?finalize_ms,
+                total_ms,
+                budget_ms = self.workspace_api_timeout.as_millis() as u64,
+                "workspace_api dispatch exceeded the JS eval budget"
+            );
+        } else {
+            tracing::debug!(
+                eval_ms,
+                eval_ok,
+                settings_ms = ?settings_ms,
+                finalize_ms = ?finalize_ms,
+                total_ms,
+                "workspace_api dispatch complete"
+            );
         }
+        result
     }
 
     /// Read the `workspaceApi.*` output knobs live for one invocation via
