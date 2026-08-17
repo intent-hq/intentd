@@ -3002,6 +3002,10 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        // Silent-tail record (intent-hq/monorepo#2669): in-memory, keyed by
+        // agent — drop it with the session so the map never leaks entries
+        // for deleted agents.
+        self.clear_turn_silent_tail(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
         // failure-wake dedup records naming the deleted agent as parent OR
         // child — delegation churns short-lived agents in both roles, so a
@@ -7864,6 +7868,15 @@ impl Services {
             if let Some(bytes) = agent_memory.get(&AgentId(id.clone())) {
                 row.insert("subtreeMemoryBytes".into(), json!(bytes));
             }
+            // Silent tail of the most recently ended turn
+            // (intent-hq/monorepo#2669): ms of stream silence before the
+            // prompt resolved, recorded in-memory at turn end. Omitted when
+            // no turn ended this daemon lifetime. Diagnostics-only by design
+            // (like `subtreeMemoryBytes`): never on the hot
+            // `agent.list`/`agent.get` payloads.
+            if let Some(tail_ms) = self.last_turn_silent_tail(&AgentId(id.clone())) {
+                row.insert("lastTurnSilentTailMs".into(), json!(tail_ms));
+            }
             agent_rows.push(Value::Object(row));
         }
 
@@ -7937,6 +7950,26 @@ impl Services {
                         "agentId": aid,
                         "conversationBytes": bytes,
                         "thresholdBytes": LARGE_CONVERSATION_WARN_BYTES,
+                    }));
+                }
+            }
+            // Long silent tail on the last ended turn
+            // (intent-hq/monorepo#2669): the incident signature of a
+            // silently-truncated turn is a clean `end_turn` after 11-13 min
+            // of stream silence — surface a tail past the suspect threshold
+            // so coordinators see the turn likely died rather than finished.
+            if let Some(tail_ms) = row["lastTurnSilentTailMs"].as_u64() {
+                let threshold_ms = crate::agent_session::silent_tail_suspect_ms();
+                if tail_ms >= threshold_ms {
+                    stuck_risks.push(json!({
+                        "type": "long-silent-tail",
+                        "severity": "warning",
+                        "message": format!(
+                            "Agent {aid}'s last turn ended after {tail_ms}ms of stream silence (>= {threshold_ms}ms); the turn may have been silently truncated under session bloat rather than finishing"
+                        ),
+                        "agentId": aid,
+                        "silentTailMs": tail_ms,
+                        "thresholdMs": threshold_ms,
                     }));
                 }
             }

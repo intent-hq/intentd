@@ -494,6 +494,11 @@ pub struct Services {
     /// (monorepo#738): see [`agent_session::TurnBookkeeping`]. Shared across
     /// clones so consecutive turns of one agent chain onto the same handle.
     turn_bookkeeping: agent_session::TurnBookkeeping,
+    /// Per-agent silent tail of the most recently ended turn
+    /// (intent-hq/monorepo#2669): see [`agent_session::LastTurnSilentTails`].
+    /// Shared across clones so the turn writer and the `agent.diagnostics`
+    /// read door observe the same state.
+    last_turn_silent_tails: agent_session::LastTurnSilentTails,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -859,6 +864,7 @@ impl Services {
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
+            last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -14385,6 +14391,7 @@ impl WorkspaceApi for Services {
         let manager = self.agent_manager();
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
+        let last_turn_silent_tails = self.last_turn_silent_tails.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
         // Full handle for the direct completion delivery below (Services is
         // Clone — the same capture pattern the spawn helpers use).
@@ -14451,6 +14458,10 @@ impl WorkspaceApi for Services {
                 // last chance to unlink this state, so best-effort teardown
                 // outweighs propagating a mutex-poison panic.
                 live_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&session.id);
+                last_turn_silent_tails
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);
