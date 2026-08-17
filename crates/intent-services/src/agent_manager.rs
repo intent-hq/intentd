@@ -5096,6 +5096,20 @@ impl AgentManager {
                 return;
             }
             Ok(_) => {}
+            // Vanished session (intent-hq/monorepo#2762): the row is GONE
+            // (concurrent `agent.delete` / workspace cascade), so the queued
+            // entries can never be delivered — every future drain would
+            // re-fail the `agent_message.agent_id` FK (SQLite 787). Drop the
+            // in-memory queue (the durable rows already cascaded) instead of
+            // leaving a permanently wedged queue behind the silent skip.
+            Err(Error::NotFound(_)) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    "dropping queued messages: agent session vanished (monorepo#2762)"
+                );
+                self.services.drop_queue(&agent_id);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -9054,6 +9068,24 @@ async fn persist_user(
                 break message;
             }
             Err(e) => {
+                // Vanished-session fast exit (intent-hq/monorepo#2762): the
+                // only FK on `agent_message` is `agent_id → agent_session(id)`,
+                // so an append failure against a deleted session is permanent
+                // — sleeping through the bounded backoff cannot heal it. Bail
+                // out now; the fail-closed call sites route to
+                // `handle_drain_persist_failure`, whose own vanished-session
+                // check discards the entry instead of requeueing.
+                if matches!(
+                    mgr.services.store.get_agent_session_status(agent_id).await,
+                    Err(Error::NotFound(_))
+                ) {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "failed to persist queued user message: agent session vanished (monorepo#2762)"
+                    );
+                    return false;
+                }
                 let Some(&delay_ms) = backoff.get(attempt) else {
                     tracing::warn!(
                         agent = %agent_id,
@@ -9675,6 +9707,43 @@ async fn persist_error_and_requeue(
 }
 
 /// Handle terminal spawn failure after all retries are exhausted. Persists
+/// Fail-closed vanished-session guard shared by the terminal failure
+/// handlers (intent-hq/monorepo#2762). When the `agent_session` row is GONE
+/// (concurrent `agent.delete` / workspace cascade), the whole
+/// persist-Error → terminal-events → front-requeue sequence is wrong:
+/// there is no row to park in `Error`, the FE already saw `agent:deleted`
+/// (an `agent:failed` toast would resurrect a ghost card with a Retry that
+/// can never succeed), and a requeued entry wedges the queue — every
+/// redrive re-fails the `agent_message.agent_id` FK (SQLite 787) against
+/// the missing session forever. Returns `true` after discarding: the
+/// message is dropped (its durable `agent_queue` rows already cascaded with
+/// the session), the in-memory queue registry entry is removed, and the
+/// caller must skip its failure handling. `false` = session still exists;
+/// handle the failure normally.
+async fn discard_failure_for_vanished_session(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    error_text: &str,
+) -> bool {
+    if !matches!(
+        mgr.services.store.get_agent_session_status(agent_id).await,
+        Err(Error::NotFound(_))
+    ) {
+        return false;
+    }
+    tracing::warn!(
+        agent = %agent_id,
+        error = %error_text,
+        "agent session vanished; discarding failed message instead of requeueing (monorepo#2762)"
+    );
+    mgr.services.drop_queue(agent_id);
+    // Registry hygiene, same terms as `agent_delete_op`: the streak and any
+    // stashed streaming terminal-error context name a gone agent.
+    mgr.services.clear_failure_streak(agent_id);
+    mgr.services.discard_pending_terminal_error(agent_id);
+    true
+}
+
 /// the agent status as `Error` with the error text into `stop_reason`
 /// (durable-before-observable, monorepo#2009), publishes terminal
 /// `agent:failed` and `agent:stream:end` events, requeues the failed message
@@ -9689,6 +9758,9 @@ async fn handle_terminal_spawn_failure(
     error: &Error,
 ) {
     let error_text = error.to_string();
+    if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
+        return;
+    }
     // Durable-before-observable (monorepo#2009): the Error + stop_reason store
     // write completes before the terminal pair reaches the bus, so a client
     // reading agent.getSession on agent:stream:end sees the persisted `error`.
@@ -9727,6 +9799,9 @@ async fn handle_drain_persist_failure(
     options: &TurnOptions,
 ) {
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
+    if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
+        return;
+    }
     tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
     // Durable-before-observable (monorepo#2009): persist Error + stop_reason
     // before the terminal pair reaches the bus.
@@ -9949,6 +10024,9 @@ async fn handle_terminal_turn_failure(
     mgr.kill_child_only(agent_id).await;
 
     let error_text = error.to_string();
+    if discard_failure_for_vanished_session(mgr, agent_id, &error_text).await {
+        return;
+    }
     // Durable-before-observable (monorepo#2009/#2050): persist Error +
     // stop_reason before the terminal pair (when this path still owes it)
     // reaches the bus. The streaming path (`run_prompt_turn`) that already

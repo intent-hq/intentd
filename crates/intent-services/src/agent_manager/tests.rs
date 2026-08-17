@@ -9370,6 +9370,176 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
     );
 }
 
+/// intent-hq/monorepo#2762 regression: a queue drain against a VANISHED
+/// session (concurrent `agent.delete` raced the drain trigger) must drop the
+/// undeliverable queue instead of skipping silently — before the fix the
+/// status-gate `Err` arm returned with the in-memory entries intact, leaving
+/// a permanently wedged queue (every future kick re-skips or re-fails the
+/// `agent_message.agent_id` FK, SQLite 787).
+#[tokio::test]
+async fn drain_against_vanished_session_drops_queue() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-drain"),
+        AgentId::from("a-2762-drain"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.services
+        .enqueue_message(&id, "wedged".to_string(), None, None, None, None, false);
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "queued messages for a vanished session are dropped, not wedged"
+    );
+    assert!(!mgr.is_busy(&id), "no slot claimed for a vanished session");
+}
+
+/// intent-hq/monorepo#2762 regression: a pre-turn persist failure whose
+/// session row is GONE must discard the message — no Error park (there is no
+/// row to park), no `agent:failed`/`agent:status-changed` ghost events for an
+/// agent the FE already saw deleted, and NO front requeue (the requeue is
+/// what wedged the queue: every retry re-failed the FK against the missing
+/// session, reproducing the issue's "Retry failed" loop).
+#[tokio::test]
+async fn drain_persist_failure_for_vanished_session_discards_message() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-persist"),
+        AgentId::from("a-2762-persist"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+    // Simulate the drain arm's fail-closed handoff after `persist_user`
+    // failed against the deleted row (the drain already dequeued the entry).
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::handle_drain_persist_failure(
+        &mgr,
+        &id,
+        &ws,
+        "raced with delete",
+        &super::TurnOptions::default(),
+    )
+    .await;
+
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no front requeue for a vanished session"
+    );
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"
+            || e.event_type == "agent:status-changed"
+            || e.event_type == "agent:queue:updated"),
+        "no ghost failure events for a deleted agent: {events:?}"
+    );
+}
+
+/// intent-hq/monorepo#2762 regression, terminal turn-failure arm: a turn that
+/// dies mid-flight because the session was deleted under it (the assistant/
+/// user append fails the `agent_message` FK) must NOT surface `agent:failed`
+/// + requeue for the gone agent — that is the "Agent failed … Retry failed"
+/// wedge from the issue. The message is discarded and any stashed streaming
+/// terminal-error context is dropped with it.
+#[tokio::test]
+async fn terminal_turn_failure_for_vanished_session_discards_message() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-turn"),
+        AgentId::from("a-2762-turn"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let fk_err = Error::Internal(
+        "append agent message failed: error returned from database: (code: 787) FOREIGN KEY constraint failed".to_string(),
+    );
+    super::handle_terminal_turn_failure(
+        &mgr,
+        &id,
+        &ws,
+        "raced with delete",
+        &super::TurnOptions::default(),
+        false,
+        &fk_err,
+    )
+    .await;
+
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no front requeue for a vanished session"
+    );
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"
+            || e.event_type == "agent:status-changed"
+            || e.event_type == "agent:queue:updated"),
+        "no ghost failure events for a deleted agent: {events:?}"
+    );
+}
+
+/// intent-hq/monorepo#2762 regression, wake-delivery arm: a wake whose target
+/// session vanished between validation and the user-row append must fail
+/// closed with the monorepo#564 `unknown agent id` contract — before the fix
+/// the append-failure fallback auto-queued the wake as a phantom entry no
+/// drain could ever deliver.
+#[tokio::test]
+async fn wake_delivery_to_vanished_session_fails_closed() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-2762-wake"),
+        AgentId::from("a-2762-wake"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .delete_agent_session(&ws, &id)
+        .await
+        .expect("delete agent session");
+
+    let err = mgr
+        .services
+        .deliver_wake_message(&ws, &id, "[Agent Completed] raced wake", None)
+        .await
+        .expect_err("wake against a vanished session is rejected");
+    assert!(
+        matches!(&err, Error::InvalidParams(msg) if msg.contains("unknown agent id")),
+        "monorepo#564 fail-closed contract: {err:?}"
+    );
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry for a vanished session"
+    );
+    assert!(!mgr.is_busy(&id), "slot released after the rejected wake");
+}
+
 /// Absolute path to the deterministic mock ACP agent fixture so a unit test
 /// can exercise a REAL successful turn (node child, ACP handshake, default
 /// "Mock agent completed." response) through the drain paths.
