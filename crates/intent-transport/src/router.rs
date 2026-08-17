@@ -1228,6 +1228,9 @@ async fn dispatch(
                 None | Some(Value::Null) => None,
                 Some(v) => match v.as_i64() {
                     Some(i) if i >= 0 => Some(i),
+                    // Integers beyond i64::MAX are still valid overshoots —
+                    // clamp them like any other out-of-range estimate.
+                    None if v.as_u64().is_some() => Some(i64::MAX),
                     _ => return Err(invalid_params("aroundIndex must be a non-negative integer")),
                 },
             };

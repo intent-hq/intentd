@@ -7702,6 +7702,43 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         "clamped to the live tail: {result}"
     );
 
+    // An integer beyond i64::MAX is still a valid overshoot — it clamps to
+    // the newest window like any other out-of-range estimate.
+    let idx_huge = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":37,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10,"aroundIndex":18446744073709551615}}}}"#
+        ),
+    )
+    .await;
+    let result = &idx_huge["result"];
+    let seqs: Vec<i64> = result["messages"]
+        .as_array()
+        .expect("u64-overshoot messages")
+        .iter()
+        .map(|m| m["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, (110..=119).collect::<Vec<i64>>());
+
+    // Non-integer aroundIndex → -32602 naming the param.
+    let frac_idx = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":38,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","aroundIndex":60.5}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(frac_idx["error"]["code"], -32602);
+    assert!(
+        frac_idx["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("aroundIndex"),
+        "error names the param: {frac_idx}"
+    );
+
     // Negative aroundIndex → -32602 (PROTOCOL §9).
     let neg_idx = wss_call(
         srv.port,
