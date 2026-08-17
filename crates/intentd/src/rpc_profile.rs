@@ -19,12 +19,19 @@
 //! ([`DEFAULT_NETWORK_DURATION_WARN_MS`]) so normal upstream latency doesn't
 //! drown out the local-regression signal; every other method keeps the
 //! default budget ([`DEFAULT_DURATION_WARN_MS`]; catches fs walks / git scans
-//! that never touch SQLite). The statement-count budget is not tiered.
+//! that never touch SQLite). The statement-count budget is tiered the same
+//! way: legitimately compound multi-entity ops
+//! ([`is_compound_statement_method`] — `workspace.create`) get a higher
+//! default budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`]) so their
+//! deterministic statement count doesn't drown out the N+1 signal; every
+//! other method keeps the default budget
+//! ([`DEFAULT_STATEMENT_WARN_THRESHOLD`]).
 //!
 //! All thresholds are overridable via [`STATEMENT_THRESHOLD_ENV`],
-//! [`DURATION_THRESHOLD_ENV`], and [`NETWORK_DURATION_THRESHOLD_ENV`] (read
-//! once at layer construction). Logging only — no wire-contract impact;
-//! overhead is one span per dispatch plus a counter increment per statement.
+//! [`COMPOUND_STATEMENT_THRESHOLD_ENV`], [`DURATION_THRESHOLD_ENV`], and
+//! [`NETWORK_DURATION_THRESHOLD_ENV`] (read once at layer construction).
+//! Logging only — no wire-contract impact; overhead is one span per dispatch
+//! plus a counter increment per statement.
 
 use std::time::{Duration, Instant};
 
@@ -40,6 +47,12 @@ use intent_transport::router::{RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET}
 /// Default statement-count threshold: a dispatch executing more than this
 /// many SQL statements draws a WARN.
 pub const DEFAULT_STATEMENT_WARN_THRESHOLD: u64 = 25;
+/// Default statement-count threshold for compound-op-tier methods (see
+/// [`is_compound_statement_method`]): a dispatch executing more than this
+/// many SQL statements draws a WARN. Higher than
+/// [`DEFAULT_STATEMENT_WARN_THRESHOLD`] so a legitimately compound
+/// multi-entity op doesn't trip the guardrail.
+pub const DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD: u64 = 50;
 /// Default duration threshold in milliseconds for non-network-tier methods: a
 /// dispatch running longer than this draws a WARN.
 pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
@@ -50,6 +63,8 @@ pub const DEFAULT_DURATION_WARN_MS: u64 = 1000;
 pub const DEFAULT_NETWORK_DURATION_WARN_MS: u64 = 10_000;
 /// Env override for the statement-count threshold (u64).
 pub const STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_STATEMENT_WARN_THRESHOLD";
+/// Env override for the compound-op-tier statement-count threshold (u64).
+pub const COMPOUND_STATEMENT_THRESHOLD_ENV: &str = "INTENTD_RPC_COMPOUND_STATEMENT_WARN_THRESHOLD";
 /// Env override for the non-network-tier duration threshold in milliseconds
 /// (u64).
 pub const DURATION_THRESHOLD_ENV: &str = "INTENTD_RPC_DURATION_WARN_MS";
@@ -74,6 +89,20 @@ fn is_network_tier_method(method: &str) -> bool {
         || NETWORK_TIER_METHODS.contains(&method)
 }
 
+/// Exact method names of legitimately compound multi-entity ops (see
+/// [`is_compound_statement_method`]).
+const COMPOUND_STATEMENT_METHODS: &[&str] = &["workspace.create"];
+
+/// Whether `method` is a legitimately compound multi-entity op — it
+/// deterministically executes many statements by design (e.g.
+/// `workspace.create` persists the workspace, spec note, initial agent, and
+/// bookkeeping rows in one dispatch) — and should use the compound-op
+/// statement budget ([`DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD`] /
+/// [`COMPOUND_STATEMENT_THRESHOLD_ENV`]) instead of the default one.
+fn is_compound_statement_method(method: &str) -> bool {
+    COMPOUND_STATEMENT_METHODS.contains(&method)
+}
+
 /// Target sqlx logs each executed statement under (`sqlx-core` `QueryLogger`).
 const SQLX_QUERY_TARGET: &str = "sqlx::query";
 /// Target the layer's own WARN events are emitted under.
@@ -92,6 +121,7 @@ pub fn profile_filter() -> Targets {
 /// warning when either exceeds its budget. See the module docs.
 pub struct RpcProfileLayer {
     statement_threshold: u64,
+    compound_statement_threshold: u64,
     duration_threshold: Duration,
     network_duration_threshold: Duration,
 }
@@ -99,19 +129,22 @@ pub struct RpcProfileLayer {
 impl RpcProfileLayer {
     pub fn new(
         statement_threshold: u64,
+        compound_statement_threshold: u64,
         duration_threshold: Duration,
         network_duration_threshold: Duration,
     ) -> Self {
         Self {
             statement_threshold,
+            compound_statement_threshold,
             duration_threshold,
             network_duration_threshold,
         }
     }
 
     /// Build with defaults, honoring the [`STATEMENT_THRESHOLD_ENV`] /
-    /// [`DURATION_THRESHOLD_ENV`] / [`NETWORK_DURATION_THRESHOLD_ENV`]
-    /// overrides (unparseable values fall back to the defaults).
+    /// [`COMPOUND_STATEMENT_THRESHOLD_ENV`] / [`DURATION_THRESHOLD_ENV`] /
+    /// [`NETWORK_DURATION_THRESHOLD_ENV`] overrides (unparseable values fall
+    /// back to the defaults).
     pub fn from_env() -> Self {
         Self::from_env_with(|var| std::env::var(var).ok())
     }
@@ -127,12 +160,27 @@ impl RpcProfileLayer {
         };
         Self::new(
             parse(STATEMENT_THRESHOLD_ENV, DEFAULT_STATEMENT_WARN_THRESHOLD),
+            parse(
+                COMPOUND_STATEMENT_THRESHOLD_ENV,
+                DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD,
+            ),
             Duration::from_millis(parse(DURATION_THRESHOLD_ENV, DEFAULT_DURATION_WARN_MS)),
             Duration::from_millis(parse(
                 NETWORK_DURATION_THRESHOLD_ENV,
                 DEFAULT_NETWORK_DURATION_WARN_MS,
             )),
         )
+    }
+
+    /// The statement budget that applies to `method`: the compound-op tier
+    /// for [`is_compound_statement_method`] matches, the default tier
+    /// otherwise.
+    fn statement_threshold_for(&self, method: &str) -> u64 {
+        if is_compound_statement_method(method) {
+            self.compound_statement_threshold
+        } else {
+            self.statement_threshold
+        }
     }
 
     /// The duration budget that applies to `method`: the network tier for
@@ -215,12 +263,13 @@ where
         };
         let elapsed = profile.started.elapsed();
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
-        if profile.statements > self.statement_threshold {
+        let statement_threshold = self.statement_threshold_for(&profile.method);
+        if profile.statements > statement_threshold {
             tracing::warn!(
                 target: WARN_TARGET,
                 method = %profile.method,
                 statements = profile.statements,
-                threshold = self.statement_threshold,
+                threshold = statement_threshold,
                 elapsed_ms,
                 "rpc dispatch exceeded SQL statement budget"
             );
@@ -308,7 +357,8 @@ mod tests {
 
     #[test]
     fn over_threshold_emits_exactly_one_statement_warn() {
-        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600), Duration::from_secs(3600));
+        let layer =
+            RpcProfileLayer::new(2, 2, Duration::from_secs(3600), Duration::from_secs(3600));
         let warns = run_dispatch(layer, "workspace.list", || {
             sqlx_event();
             sqlx_event();
@@ -321,7 +371,8 @@ mod tests {
 
     #[test]
     fn at_threshold_emits_no_warn() {
-        let layer = RpcProfileLayer::new(2, Duration::from_secs(3600), Duration::from_secs(3600));
+        let layer =
+            RpcProfileLayer::new(2, 2, Duration::from_secs(3600), Duration::from_secs(3600));
         let warns = run_dispatch(layer, "workspace.list", || {
             sqlx_event();
             sqlx_event();
@@ -331,8 +382,12 @@ mod tests {
 
     #[test]
     fn slow_dispatch_emits_duration_warn() {
-        let layer =
-            RpcProfileLayer::new(u64::MAX, Duration::from_millis(0), Duration::from_millis(0));
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            u64::MAX,
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+        );
         let warns = run_dispatch(layer, "git.diffs", || {
             std::thread::sleep(Duration::from_millis(2));
         });
@@ -346,6 +401,7 @@ mod tests {
         let capture = Capture::default();
         let subscriber = tracing_subscriber::registry()
             .with(RpcProfileLayer::new(
+                0,
                 0,
                 Duration::from_secs(3600),
                 Duration::from_secs(3600),
@@ -367,6 +423,7 @@ mod tests {
         // the network budget should apply to a network-tier method.
         let layer = RpcProfileLayer::new(
             u64::MAX,
+            u64::MAX,
             Duration::from_millis(0),
             Duration::from_secs(3600),
         );
@@ -379,6 +436,7 @@ mod tests {
     #[test]
     fn network_tier_method_over_network_threshold_warns_with_network_threshold() {
         let layer = RpcProfileLayer::new(
+            u64::MAX,
             u64::MAX,
             Duration::from_secs(3600),
             Duration::from_millis(0),
@@ -397,6 +455,7 @@ mod tests {
         // it should still warn against the default threshold.
         let layer = RpcProfileLayer::new(
             u64::MAX,
+            u64::MAX,
             Duration::from_millis(0),
             Duration::from_secs(3600),
         );
@@ -409,14 +468,69 @@ mod tests {
     }
 
     #[test]
+    fn compound_tier_method_under_compound_threshold_emits_no_warn() {
+        // Above the default statement budget but within the compound-op one:
+        // only the compound budget should apply to a compound-tier method.
+        let layer =
+            RpcProfileLayer::new(2, 5, Duration::from_secs(3600), Duration::from_secs(3600));
+        let warns = run_dispatch(layer, "workspace.create", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert!(warns.is_empty(), "warns: {warns:?}");
+    }
+
+    #[test]
+    fn compound_tier_method_over_compound_threshold_warns_with_compound_threshold() {
+        let layer = RpcProfileLayer::new(
+            u64::MAX,
+            2,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "workspace.create", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=workspace.create"), "{warns:?}");
+        assert!(warns[0].contains("statements=3"), "{warns:?}");
+        assert!(warns[0].contains("threshold=2"), "{warns:?}");
+    }
+
+    #[test]
+    fn non_compound_method_over_default_statement_threshold_still_warns() {
+        // A high compound-op budget must not affect a non-compound method:
+        // it should still warn against the default statement threshold.
+        let layer = RpcProfileLayer::new(
+            2,
+            u64::MAX,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        let warns = run_dispatch(layer, "workspace.list", || {
+            sqlx_event();
+            sqlx_event();
+            sqlx_event();
+        });
+        assert_eq!(warns.len(), 1, "warns: {warns:?}");
+        assert!(warns[0].contains("method=workspace.list"), "{warns:?}");
+        assert!(warns[0].contains("threshold=2"), "{warns:?}");
+    }
+
+    #[test]
     fn from_env_overrides_defaults() {
         let layer = RpcProfileLayer::from_env_with(|var| match var {
             STATEMENT_THRESHOLD_ENV => Some("3".to_string()),
+            COMPOUND_STATEMENT_THRESHOLD_ENV => Some("70".to_string()),
             DURATION_THRESHOLD_ENV => Some("50".to_string()),
             NETWORK_DURATION_THRESHOLD_ENV => Some("500".to_string()),
             _ => None,
         });
         assert_eq!(layer.statement_threshold, 3);
+        assert_eq!(layer.compound_statement_threshold, 70);
         assert_eq!(layer.duration_threshold, Duration::from_millis(50));
         assert_eq!(layer.network_duration_threshold, Duration::from_millis(500));
 
@@ -424,6 +538,10 @@ mod tests {
         assert_eq!(
             defaults.statement_threshold,
             DEFAULT_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            defaults.compound_statement_threshold,
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
         );
         assert_eq!(
             defaults.duration_threshold,
@@ -438,6 +556,10 @@ mod tests {
         assert_eq!(
             unparseable.statement_threshold,
             DEFAULT_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            unparseable.compound_statement_threshold,
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
         );
         assert_eq!(
             unparseable.duration_threshold,
@@ -459,5 +581,27 @@ mod tests {
         assert!(!is_network_tier_method("workspace.list"));
         assert!(!is_network_tier_method("pr.list"));
         assert!(!is_network_tier_method("github"));
+    }
+
+    #[test]
+    fn is_compound_statement_method_matches_workspace_create_only() {
+        assert!(is_compound_statement_method("workspace.create"));
+        assert!(!is_compound_statement_method("workspace.list"));
+        assert!(!is_compound_statement_method("workspace.get"));
+        assert!(!is_compound_statement_method("workspace.duplicate"));
+        assert!(!is_compound_statement_method("workspace"));
+    }
+
+    #[test]
+    fn statement_threshold_for_selects_tier() {
+        let layer = RpcProfileLayer::from_env_with(|_| None);
+        assert_eq!(
+            layer.statement_threshold_for("workspace.create"),
+            DEFAULT_COMPOUND_STATEMENT_WARN_THRESHOLD
+        );
+        assert_eq!(
+            layer.statement_threshold_for("workspace.list"),
+            DEFAULT_STATEMENT_WARN_THRESHOLD
+        );
     }
 }
