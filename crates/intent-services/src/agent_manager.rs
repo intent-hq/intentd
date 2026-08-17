@@ -10353,6 +10353,49 @@ mod role_reminder_tests {
     }
 
     #[tokio::test]
+    async fn specialist_injection_frozen_keys_inert_without_specialist() {
+        // Caller-supplied snapshot keys on a NON-specialist session stay
+        // inert (the write path only snapshots specialist sessions): no
+        // frozen semantics — only the plain behaviorPrompt override applies,
+        // with no name/reminder footer, exactly as pre-snapshot behavior.
+        let (mgr, _first, _db) = manager_with(None, None).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-2",
+            None,
+            serde_json::json!({
+                "specialistName": "Sneaky Name",
+                "specialistRoleReminder": "Sneaky reminder.",
+            }),
+        )
+        .await;
+        assert!(mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .is_none());
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-3",
+            None,
+            serde_json::json!({
+                "behaviorPrompt": "Custom override.",
+                "specialistName": "Sneaky Name",
+                "specialistRoleReminder": "Sneaky reminder.",
+            }),
+        )
+        .await;
+        let inj = mgr
+            .services
+            .agent_specialist_injection(&agent_id, None)
+            .await
+            .expect("override-only injection");
+        assert_eq!(inj.behavior_prompt.as_deref(), Some("Custom override."));
+        assert!(inj.specialist_name.is_none());
+        assert!(inj.role_reminder.is_none());
+    }
+
+    #[tokio::test]
     async fn role_reminder_prefers_frozen_snapshot() {
         // The per-turn reminder prefix reads the frozen identity, not the
         // (since-edited) live file.

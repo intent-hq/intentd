@@ -2695,8 +2695,18 @@ impl Services {
                         }
                     }
                     obj.insert("specialistName".to_string(), json!(spec_name));
-                    if let Some(reminder) = reminder {
-                        obj.insert("specialistRoleReminder".to_string(), json!(reminder));
+                    // The reminder key always reflects the resolution
+                    // outcome: a resolved reminder overwrites, a None
+                    // resolution REMOVES any caller-supplied key so the
+                    // frozen readers never consume free-form caller input
+                    // as a trusted reminder.
+                    match reminder {
+                        Some(reminder) => {
+                            obj.insert("specialistRoleReminder".to_string(), json!(reminder));
+                        }
+                        None => {
+                            obj.remove("specialistRoleReminder");
+                        }
                     }
                 }
             }

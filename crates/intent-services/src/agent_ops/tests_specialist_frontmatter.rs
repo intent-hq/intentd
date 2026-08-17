@@ -710,6 +710,85 @@ async fn caller_behavior_prompt_override_preserved() {
     assert_eq!(meta["specialistRoleReminder"].as_str(), Some("Stay frozen"));
 }
 
+/// A non-object caller `metadata` is left untouched: the snapshot write is a
+/// no-op (`as_object_mut` fails), the create still succeeds, and the opaque
+/// value survives uncorrupted.
+#[tokio::test]
+async fn non_object_metadata_left_untouched() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_specialist_with_body(
+        specialists_dir.path(),
+        "frozen",
+        "Frozen Name",
+        "Stay frozen",
+        "Original behavior prompt body.",
+    );
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!("opaque")),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("frozen".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create succeeds with non-object metadata");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.metadata, Some(json!("opaque")));
+}
+
+/// When the specialist resolves with NO role reminder, a caller-supplied
+/// free-form `metadata.specialistRoleReminder` is removed by the snapshot
+/// write — the reminder key always reflects the resolution outcome — so the
+/// frozen readers never consume it and the per-turn reminder stays silent.
+#[tokio::test]
+async fn caller_reminder_removed_when_resolution_has_none() {
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    // Specialist with a name but no roleReminder frontmatter AND no body, so
+    // the auto-generated fallback is empty and resolution yields no reminder.
+    let content = "---\nname: \"Frozen Name\"\ndescription: \"Test specialist\"\n---\n";
+    std::fs::write(specialists_dir.path().join("frozen.md"), content).expect("write specialist");
+
+    let extra = intent_core::AgentCreateExtra {
+        metadata: Some(json!({ "specialistRoleReminder": "BOGUS CALLER REMINDER" })),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".to_string()),
+            None,
+            Some("frozen".to_string()),
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let meta = session.metadata.expect("metadata");
+    assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
+    assert!(
+        meta.get("specialistRoleReminder").is_none(),
+        "caller reminder must be removed: {meta:?}"
+    );
+    // Per-turn reminder stays silent (frozen name without frozen reminder).
+    assert!(svc.agent_role_reminder(&id).await.is_none());
+}
+
 /// An unknown specialist writes no snapshot and never fails the create
 /// (existing leniency), leaving caller metadata absent.
 #[tokio::test]

@@ -1269,17 +1269,24 @@ impl Services {
         let session = self.store.get_agent_session(agent_id).await.ok()?;
         let override_bp = Self::session_metadata_str(&session, "behaviorPrompt");
         // Frozen identity snapshot (persisted at creation by `agent_create_op`):
-        // `specialistName` presence marks a snapshot session, and the whole
-        // triple is read frozen — the body from the `behaviorPrompt` override
-        // slot (absent when the specialist had no body at creation), skipping
-        // live resolution entirely so file edits/deletes never change the
-        // injection. Legacy sessions fall through to live resolution below.
-        if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
-            return Some(crate::rules::SpecialistPromptInjection {
-                behavior_prompt: override_bp,
-                specialist_name: Some(name),
-                role_reminder: Self::session_metadata_str(&session, "specialistRoleReminder"),
-            });
+        // on a specialist session, `specialistName` presence marks a snapshot
+        // and the whole triple is read frozen — the body from the
+        // `behaviorPrompt` override slot (absent when the specialist had no
+        // body at creation), skipping live resolution entirely so file
+        // edits/deletes never change the injection. Gated on
+        // `session.specialist` (mirroring `agent_role_reminder` and the
+        // write-side invariant that snapshots are only written for specialist
+        // sessions), so a caller-supplied `specialistName` on a
+        // non-specialist session stays inert. Legacy sessions fall through to
+        // live resolution below.
+        if session.specialist.is_some() {
+            if let Some(name) = Self::session_metadata_str(&session, "specialistName") {
+                return Some(crate::rules::SpecialistPromptInjection {
+                    behavior_prompt: override_bp,
+                    specialist_name: Some(name),
+                    role_reminder: Self::session_metadata_str(&session, "specialistRoleReminder"),
+                });
+            }
         }
         // Embedded floor pinned to the session's stamped harness version
         // (H2) so respawns under a newer binary keep the pinned prompts.
